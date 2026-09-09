@@ -3974,3 +3974,144 @@ The handover named four. Two are closed, two are not, deliberately.
 Wave 3 is abort, revert, the per-repo in-flight lock, and crash reconciliation
 with `unknown` — plus the operation id that makes `/metrics`' "unattended"
 number derivable. **Do not roll into it from here.**
+
+---
+
+## 42. Wave 2 — the boundary review, and the seven things it found
+
+A fresh reviewer with **no context from the session that did the work** checked
+the diff and the running system against `DESIGN.md` and `FLOWS.md`. It re-derived
+the headline claim with its own harness, re-ran twelve of the wave's mutations,
+and recomputed `/metrics`' arithmetic by hand against its own read-only queries.
+
+It confirmed all four stop-condition items, **and found seven defects — three of
+them in claims this file made.** §§37-41 stay as written; corrections are here,
+because the corrections are the useful part.
+
+### Its independent re-derivation of the churn fix
+
+```
+AFTER  (its own snapshot @ schema 4, HEAD code)
+  pass 1: transitions = 1  {'new -> quiet': 1}
+  pass 2: transitions = 0  {}
+BEFORE (same snapshot downgraded to schema 2, code from 8906d06)
+  pass 1: transitions = 45 {'resolved -> new': 22, 'new -> resolved': 23}
+  pass 2: transitions = 44 {'resolved -> new': 22, 'new -> resolved': 22}
+```
+
+44-45, not §38's 46, because the live ledger moved on between the two snapshots
+(events 260/261 left the quiet set). Same magnitude, same mechanism, zero after.
+It also confirmed `_SILENCE_RESOLVE_ELIGIBLE_STATES` is still `(STATE_NEW,)` and
+that widening it fails 5 tests by name.
+
+### The seven defects and what happened to each
+
+| # | Defect | Disposition |
+|-|-|-|
+| 1 | **`/metrics` metric 1 divided dispatch counts while breaking them down by ITEM counts**, and 10 of its 17 denominators were interactive Slack dispatches (`origin_event_id IS NULL`, `origin_channel`/`origin_thread_ts` set) that were never items in warden's funnel and can never enter the numerator. | **FIXED** (`b2866b2`). Denominator gated on `origin_event_id IS NOT NULL`; `excluded_interactive` disclosed with a reason; `states` → `item_states` with a note that its total may exceed the denominator. Live: **5/7 = 0.714**, 10 excluded. |
+| 2 | **Two leaves served a fabricated `0`** — `reopen_after_fixed` and `fixes_in_window` on an empty `item_transitions` — which `api.py`'s own bolded rule forbids. `history_since` was advisory; a consumer had to remember to cross-reference it. | **FIXED.** `_history_guard_reason()` at the **leaf**: empty table, or a window starting before `history_since`, serves `null` with a reason naming it. Live, all three history-derived leaves are `null` and will be for seven days. That is the correct output. |
+| 3 | **The read-only property was untested and a test docstring lied about it.** Mutating `_serve()` to a writable `connect()` left both read-only tests green; `test_handler_connection_refuses_an_insert` opened its own hardcoded connection and could never observe the handler's call site. | **FIXED.** `test_serve_opens_connection_with_readonly_true` monkeypatches `api._ledger.connect` and observes `_serve()`'s own call. False docstring replaced. The socket test's fixed sleep became a bounded retry that tears the server down on failure — a gate test that can fail for unrelated reasons is its own defect. |
+| 4 | **`DESIGN.md` contradicts itself about metric 2's numerator**, and the wave picked a side silently. | **ESCALATED AND RESOLVED BY THE OPERATOR** — see below. |
+| 5 | **A second reopen-latency class §41 did not list**: state sources with a continuously-open event, bounded by `REM_HOURS` — 6h for `uk`, 72h `github_pr`, **168h** `github_issue`/`stray_skill`. | **DOCUMENTED** in `docs/triage.md`, both ways: under the old predicate such a row reopened next pass, which meant `dismissed` was *effectively unreachable* for a state source that never clears — the 7-day fuse could never retire anything. The bound is the price of a `dismissed` that works. |
+| 6 | **Two of three heartbeats stamped the pass's START** while their comments and `api.py`'s thresholds treat the cursor as "when did this COMPLETE". `triage.py`'s docstring had said the false thing since before this wave. | **FIXED, structurally.** `record_heartbeat()` now takes **no timestamp** in any of the three scripts and reads the clock at the write. Three call sites each remembering to pass a fresh clock is three chances to pass the stale one; removing the parameter makes it unexpressible — the same argument `_set_state()` makes for owning `state_deadline`. |
+| 7 | **`item_transitions` has no birth row** — `ingest()` INSERTs `STATE_NEW` directly rather than through `_set_state()`, so entry into `new` is never recorded. | **DOCUMENTED** in `docs/api.md`. It is history *after* the first state. Affects none of the six numbers. |
+
+### Defect 4 — the contradiction, and the decision
+
+Three passages, all real, that cannot all hold:
+
+- `DESIGN.md:59` — *"Closes that are verified fixes vs. silence | **2 / 28**"*.
+- `DESIGN.md:27` — sources those 2 as *"closed on an observed recovery message"*,
+  and `REVIEW.md:54` names them as items 931/932 via `resolve_recovery_paired()`.
+- `DESIGN.md:547` — *"Recovery-pairing is the strong path, the 2h timer the
+  fallback, and **neither ever claims a fix**."*
+
+So the document's own baseline counted, in the "verified fixes" numerator, closes
+its own must-not-be-lost list forbids from claiming a fix. §39 cited `:547`
+correctly and never mentioned the two passages that say the opposite.
+
+**Decided by the operator, 2026-09-09: amend the document** (`e7d5be5`). Row 2 is
+now `0 / 28`, with the reasoning and — more importantly — the *consequence*
+stated in `DESIGN.md` itself: `fixed` has exactly one producer
+(`maybe_check_liveness()`'s positive branch), reachable only through the
+merge → deploy → liveness chain, and **zero rows have ever carried a liveness
+confirmation**. Metric 2 therefore reads 0 and **cannot move until at least one
+repo has a deploy target and a liveness probe** — Wave 3+. That is a real
+constraint on the project's headline number, and it is now written where a reader
+meets the number rather than discovered from a dashboard reading zero.
+
+### Corrections to what §§37-41 asserted
+
+Own errors, listed because this file is checkable or it is nothing.
+
+- **§40 and §41 both misread metric 1's own payload.** §40 said *"ten of the
+  seventeen verdicts with a recorded disposition went to `quiet`"* — wrong twice
+  over: the 10 is a count of **items** (belonging to 3 distinct dispatches), and
+  `quiet` is by `api.py`'s own definition **not** a recorded disposition. §41
+  repeated the 5/17 framing. The true figure is **5/7**, and the payload shape
+  that invited the misreading is defect 1, now fixed. This is the sharpest lesson
+  of the review: the orchestrator misread its own instrument, in exactly the way
+  the instrument's shape encouraged.
+- **§37 said "`DESIGN.md` § Why this exists and `REVIEW.md` § Facts corrected both
+  name items 931 and 932".** `grep -n "931\|932" DESIGN.md` returns nothing —
+  `DESIGN.md` describes the two closes without naming ids; only `REVIEW.md` names
+  them. Pedantic, and exactly the kind of claim this file exists to make
+  checkable.
+- **§38 said "11 of the 30 stamped rows carry an empty `ts_last` slot; 6 are
+  `hermes_log`"** and then dropped the other 5 without saying what they were.
+  They are `uk` — a whole second source class, which is defect 5. Live now: 13 of
+  32, `hermes_log` 7 + `uk` 6.
+- **§40's read-only guarantee overstated its test coverage.** The code was
+  correct; nothing stopped it regressing (defect 3). §41 item 3's evidence line is
+  true of the code and was not true of the tests behind it.
+- **§40 said `history_since` prevents "0 fixes this week" reading as a
+  measurement.** It did not — it moved the problem somewhere a consumer had to
+  remember to look (defect 2).
+
+### Amended roll-up — the stop condition after remediation
+
+| # | Condition | Status |
+|-|-|-|
+| 1 | Grouped item no longer reopens every pass, proven by two passes | **MET** — independently re-derived, 45 → 0 |
+| 2 | `resolved` split, 30 rows migrated, each in a defensible bucket | **MET** — 0 rows in `resolved`; the one qualification (defect 4) resolved by amending `DESIGN.md` |
+| 3 | `/metrics` serves the six funnel numbers from a read-only handle | **MET** — the three qualifications (defects 1, 2, 3) all fixed; read-only now actually tested |
+| 4 | `make test` green with a count you can account for | **MET** — `test_triage.py` **108** (107 + the heartbeat regression), `test_api.py` **23** (18 + 5), `test_ledger.py` 16, `test_intents.py` 19, `test_watchdog_locking.py` 3, three "all cases" suites |
+
+Live after remediation:
+
+```
+$ make status
+    ✓ warden-{loop,poll,sweep,backup}  [last exit 0]
+    ✓ com.jkrumm.warden-api  [pid 10635, last exit 0]
+  api (/health)            ✓ reachable, ok
+  policy                   ✓ both copies agree on all 30 repos
+
+$ curl -s 127.0.0.1:7734/metrics
+  metric1  5/7 = 0.714   excluded_interactive 10   item_states {needs_human: 6, quiet: 10}
+  metric2  0.0           fixed 0 · quiet 11 · closed 0 · dismissed 0
+  metric3  null          window start predates history_since (2026-09-09T19:43:30Z)
+  metric4  null          fixes_in_window null (same guard) · approvals_spent 1
+  metric5  0.31 min      all three pollers live
+  metric6  reopen null (same guard) · reverts null (no primitive)
+```
+
+Five mutations re-run on the remediation, each red **by name**, each restored:
+`test_metric1_excludes_interactive_dispatches_and_item_states_can_exceed_denominator`,
+`test_metric6_reopen_after_fixed_is_null_not_zero_when_history_is_young`,
+`test_serve_opens_connection_with_readonly_true`,
+`test_heartbeat_is_stamped_when_the_pass_ENDS_not_when_it_began` (verified here,
+by re-adding the timestamp parameter and threading the pass's `now` back through
+it — 107/108, red by name, restored), and the F1 denominator drop.
+
+### One thing the review could not check, and one it deferred
+
+- The ~20 one-time `chat.update` calls §39 predicted require reading the Slack
+  channel. `slack_update_ts` moved at 19:43:30Z, consistent with it; neither the
+  count nor "updated, never posted" is confirmed from here.
+- Defect 5's latency bound is documented, not fixed. It belongs with the
+  self-tuning quiet window, which is the same subject and is now unblocked.
+
+**Wave 2 is closed.** Wave 3 is abort, revert, the per-repo in-flight lock, and
+crash reconciliation with `unknown` — plus the operation id that makes
+`/metrics`' "unattended" number derivable and the deploy target that lets metric 2
+ever be non-zero. Do not roll into it from here.
