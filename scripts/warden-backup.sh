@@ -23,6 +23,8 @@
 
 set -u
 
+REPO="${WARDEN_REPO:-${0:A:h:h}}"   # this script lives in <repo>/scripts/
+PY="$REPO/.venv/bin/python3"
 SRC_DIR="$HOME/.warden"
 DB="$SRC_DIR/warden.db"
 SNAP_DIR="$SRC_DIR/backups"
@@ -76,7 +78,23 @@ if [[ -f "$DB" ]]; then
   # VACUUM INTO refuses to overwrite, so a colliding name is an error, not a silent
   # clobber. The quoting is safe by construction: $OUT is built from a fixed directory
   # and a date -u format string, neither of which can contain a quote.
-  if sqlite3 "file:$DB?mode=ro" "VACUUM INTO '$OUT'" 2>/dev/null; then
+  # Through warden's own venv and scripts/ledger.py, NOT the `sqlite3` CLI. Measured
+  # 2026-09-09: macOS ships /usr/bin/sqlite3 3.51 with no `-uri` flag, so
+  # `sqlite3 "file:$DB?mode=ro" ...` opens that whole URI as a LITERAL FILENAME and
+  # dies with "unable to open database file (14)" — a snapshot that silently never
+  # happened while rsync still reported success. Using ledger.snapshot() also means
+  # there is one VACUUM INTO implementation in this repo rather than two that can
+  # disagree about what a consistent copy is.
+  if "$PY" -c "
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('ledger', '$REPO/scripts/ledger.py')
+led = importlib.util.module_from_spec(spec); spec.loader.exec_module(led)
+import sqlite3
+conn = sqlite3.connect('file:$DB?mode=ro', uri=True)
+led.snapshot(conn, '$OUT')
+conn.close()
+"; then
     echo "snapshot $OUT ($(du -h "$OUT" | cut -f1))"
   else
     echo "snapshot FAILED for $DB — shipping the live file only" >&2
@@ -84,8 +102,10 @@ if [[ -f "$DB" ]]; then
     SNAP_RC=1
   fi
   # Rotate: keep the newest $KEEP. restic holds the long tail, so this is only about
-  # not growing the rsync source without bound.
-  ls -1t "$SNAP_DIR"/warden-*.db 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do
+  # not growing the rsync source without bound. `(N)` is zsh's null_glob qualifier —
+  # without it an unmatched glob is a hard error here, which is what the very first
+  # run (no snapshots yet) always is.
+  for old in "$SNAP_DIR"/warden-*.db(NOm[$((KEEP + 1)),-1]); do
     rm -f "$old"
   done
 else
