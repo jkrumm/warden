@@ -33,6 +33,15 @@ KEEP=7
 
 SECRETS_RUN="$HOME/.local/bin/secrets-run"
 PUSH_REF="${WARDEN_BACKUP_PUSH_REF:-op://hermes/uptime-kuma/warden-backup-push-url}"
+# Fallback, and the one that actually resolves today. 1Password is the convention
+# for push URLs on this host — the three hermes ones live there — but a new secret
+# cannot be put there from the mini: `op` is not interactively signed in, and
+# seeding the offline cache is a biometric step. So the URL for the "Warden Backup
+# - Push" monitor lives in a mode-600 file instead, which is the same shape
+# homelab already uses for garmin-relogin-push-url and for the same class of
+# reason. op:// stays FIRST so this converges the moment the ref exists, and this
+# file can be deleted then.
+PUSH_FILE="${WARDEN_BACKUP_PUSH_FILE:-$HOME/.config/uptime-kuma/warden-backup-push-url}"
 
 # launchd hands the job a minimal PATH (as cron did); prepend Homebrew so secrets-run
 # finds its tools and `sqlite3` resolves. Prepend, not replace.
@@ -116,6 +125,7 @@ fi
 # --- ship -------------------------------------------------------------------------
 PUSH_URL=""
 [[ -x "$SECRETS_RUN" ]] && PUSH_URL=$(timeout 10 "$SECRETS_RUN" read "$PUSH_REF" 2>/dev/null)
+[[ -z "$PUSH_URL" && -r "$PUSH_FILE" ]] && PUSH_URL=$(<"$PUSH_FILE")
 
 /usr/bin/rsync -az --delete \
   --exclude='*.lock' \

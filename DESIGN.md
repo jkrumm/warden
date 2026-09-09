@@ -127,6 +127,16 @@ sideclaw, in Wave 0.** Warden's copy is defence in depth; sideclaw's is the
 boundary. Moving the only check out of the executor and calling that a
 separation of concerns is how the tiers table becomes advisory.
 
+**Two limits of that pin, measured 2026-09-09 once it was built, because the
+sentence above reads as if it were absolute and it is not.** The policy keys on
+the **directory basename**, not on git identity: a clone or worktree of `warden`
+sitting under any other name, directly under a dispatch root, resolves to the
+default tier and defeats its own pinned entry. And **`~/IuRoot` is a dispatch
+root with no rules at all** — every work repo under it is reachable at
+`implement`. Neither was introduced by the boundary work; both are what a
+basename-keyed allowlist over two roots means. Naming them here so the next
+reader does not have to rediscover that "pinned" is narrower than it sounds.
+
 **And warden may never hold tier ≥ 1 on `sideclaw` or on `warden` itself.**
 sideclaw is a valid dispatch target today; auto-merging PRs against your own
 executor closes a loop that has no outside.
