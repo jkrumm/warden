@@ -2079,3 +2079,170 @@ re-create the two cron jobs from `jobs.json.bak`, and set `HERMES_CC_DB` back.
    assuming it survived** — it has not run successfully since before the move.
 
 **Do not start Wave 1 without reading §24 and this section.**
+
+---
+
+## 26. Wave 1 — reconnaissance against the running system (2026-09-09, ~13:15Z)
+
+Run before any edit, against the live system rather than this file. Four of the
+five checks confirm what §25 says. The fifth found a **live crash** §25 does not
+mention, because it happened after §25 was written.
+
+### What was run
+
+```
+$ make status
+warden
+  venv                     Python 3.11.15
+  agents:
+    ✓ com.jkrumm.warden-loop  [-	1	com.jkrumm.warden-loop]
+    ✓ com.jkrumm.warden-poll  [-	0	com.jkrumm.warden-poll]
+    ✓ com.jkrumm.warden-sweep  [-	0	com.jkrumm.warden-sweep]
+    ✓ com.jkrumm.warden-backup  [-	0	com.jkrumm.warden-backup]
+  policy                   ✓ both copies agree on all 30 repos
+  ledger                   980K Sep 9 15:05
+
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_ledger.py                   11/11 passed
+  test_triage.py                   68/68 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ make check-policy
+✓ both copies agree on all 30 repos
+notes: sideclaw also admits roots hermes-cc.sh never uses: ['/Users/jkrumm/IuRoot']
+```
+
+`test_triage.py` is **68/68**, the number §25 pins. Policy copies agree on all 30.
+
+### FINDING 1 (live, new) — the act-loop is crashing on `database is locked`
+
+`make status` prints `✓` for `com.jkrumm.warden-loop`, but the middle column of
+launchd's own row is the **last exit status**, and it is **1**:
+
+```
+$ launchctl list | grep -i warden
+-	0	com.jkrumm.warden-sweep
+-	0	com.jkrumm.warden-backup
+-	0	com.jkrumm.warden-poll
+-	1	com.jkrumm.warden-loop
+```
+
+`~/Library/Logs/warden-loop.err`, in full:
+
+```
+Traceback (most recent call last):
+  File ".../scripts/triage.py", line 3351, in <module>
+    sys.exit(main())
+  File ".../scripts/triage.py", line 3345, in main
+    return run(conn, dry_run="--dry-run" in argv)
+  File ".../scripts/triage.py", line 3160, in run
+    ingest(conn, now)
+  File ".../scripts/triage.py", line 959, in ingest
+    conn.execute(
+sqlite3.OperationalError: database is locked
+```
+
+Line 959 is `ingest()`'s `INSERT INTO triage_items` — the first DML of the pass,
+i.e. the statement that opens the deferred write transaction and therefore the
+one that has to take the write lock. The ledger says the same story from the
+other side: `cursors.triage_last_run` is stamped **12:55:38Z** (the last pass
+that completed), while the poller-offset cursors carry **13:05:36Z** — the
+crashed pass got far enough to commit those and then died taking the lock.
+
+`ledger.py:429` sets `PRAGMA busy_timeout=5000` on every writable handle, so this
+means **a writer held the ledger's write lock for more than five seconds**.
+`dispatch-sweep.py` is not it — its network I/O (`poll_job()`) sits outside the
+write transaction and every branch commits immediately. The remaining candidates
+are the other five writers. This is not a mystery to be solved before item 2 so
+much as **the argument for item 2**: six writers against one SQLite file, and the
+loop is the one that dies.
+
+Two consequences, both worth stating:
+
+- **Nothing noticed.** `make status` renders the agent `✓` while its last exit
+  was 1. A loop whose whole job is noticing that something stopped, stopped, and
+  its own status surface said fine. That is the same class as the Wave 0
+  heartbeat that skipped the normal case.
+- **The failure is unhandled, not retried.** A `SQLITE_BUSY` on one INSERT kills
+  the entire pass; the 600s tick is the only retry there is.
+
+Disposition: **fold into Wave 1 item 2** (intent queue / one writer), which is
+the structural fix, plus an immediate mitigation in the same slice — a longer
+`busy_timeout` and a bounded retry around the pass, and `make status` reading the
+exit-status column instead of only presence. Recorded here rather than hot-fixed
+first so the fix lands with the tests that prove it.
+
+### FINDING 2 (confirms §24) — `hermes-cc.sh` asserts, it does not migrate
+
+```
+$ grep -c 'ALTER TABLE\|executescript' ~/.hermes/scripts/hermes-cc.sh
+0
+```
+
+`WARDEN_SCHEMA_VERSION="${WARDEN_SCHEMA_VERSION:-1}"` at line 116; the assert
+block at 794-815 exits `EX_PRECONDITION` on mismatch and names the loop as the
+only migrator in its own error text. The audit's critical finding is closed.
+
+### FINDING 3 (confirms) — the ledger
+
+```
+journal_mode      wal
+schema_version    [(1, '2026-09-09T11:57:27.019920+00:00')]
+tables            cursors, dispatch_approvals, dispatches, events,
+                  schema_version, sqlite_sequence, triage_items
+rows              triage_items 50 | dispatches 23 | dispatch_approvals 5
+                  events 959 | cursors 9
+states            resolved 28 | note 8 | ignored 7 | needs_human 4 | new 3
+```
+
+WAL confirmed, `schema_version` 1 confirmed. **There are four items sitting in
+`needs_human` right now** — which is exactly the population Wave 1 item 1 (the
+quiet rule) is about, so that bug is not hypothetical on this ledger today.
+
+### FINDING 4 (was NOT provable from the ledger) — `propose_mappings()`
+
+The ledger cannot answer this: `cursors.triage_propose_mappings_last_run` reads
+**2026-09-08T22:33:07Z** — stamped *before* the move, and the 24h budget means it
+has not been *eligible* since. So it has neither succeeded nor failed; it has not
+run. §25 item 5 is right that it must be re-verified rather than assumed.
+
+Verified instead by exercising the real module's real globals read-only, with no
+monkeypatching and no write:
+
+```
+TRIAGE_REPO_DIR :  /Users/jkrumm/SourceRoot/warden
+POLICY_PATH     :  /Users/jkrumm/SourceRoot/warden/config/triage-policy.json  exists: True
+_policy_git_rel_path()    : config/triage-policy.json      <- was None before the move
+_policy_path_is_dirty()   : False
+_discoverable_repos()     : 28 repos
+live candidates           : 17
+base_url resolves: True | api_key resolves: True
+```
+
+`_policy_git_rel_path()` returning `config/triage-policy.json` instead of `None`
+**is** the inertness being gone — that `None` was the early return that silently
+discarded every proposal for the whole extraction. Every other precondition the
+function checks before its model call now also passes against live state, and
+there are 17 real candidates waiting.
+
+What is still unproven, and deliberately: the model call and the
+`git commit` itself, because proving those means an LLM call and a real commit to
+this repo. The write-and-commit half is covered by `test_triage.py`'s temp-repo
+fixture (`test_propose_mappings_policy_round_trip_preserves_readme_and_key_order`
+and five siblings); what those tests monkeypatch away is precisely the path
+resolution just verified above against the live globals. **Next eligible run is
+2026-09-09T22:33Z** — it will fire on its own, unattended, and the result will
+show up as an auto-authored `config/triage-policy.json` commit plus a line in the
+daily digest. Check for it.
+
+### Not re-litigated
+
+Nothing in this section contradicts `REVIEW.md`. Finding 1 is new evidence about
+a running process, not an argument against a settled disposition.
+
+### Next action
+
+Wave 1 item 1 — the quiet rule (`_GROUPED_RESOLVE_EXCLUDED_STATES` in
+`scripts/triage.py`). Test first.
