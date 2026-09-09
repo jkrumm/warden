@@ -3576,3 +3576,152 @@ decisions already taken and to be recorded with it: all 30 live rows migrate to
 `quiet` (the `fixed` provenance for 931/932 is unrecoverable from the ledger —
 §37 finding 2), and an append-only `item_transitions` table lands with the split,
 because three of `/metrics`' six numbers are not derivable without it.
+
+---
+
+## 39. Wave 2, item 2 — honest states (DONE, schema_version 4)
+
+`resolved` is three states now. `DESIGN.md` § the state machine defines them;
+this section records which producer got which bucket and why, because the
+mapping is the whole slice and one line of it is counter-intuitive.
+
+| Producer | Bucket | Why |
+|-|-|-|
+| `apply_resolutions()` — disappearance from observation | `quiet` | pure silence |
+| `resolve_quiet_grouped()` — the 2h timer | `quiet` | its own note already says "NOT a confirmed fix" |
+| `resolve_recovery_paired()` — an explicit ✅ | **`quiet`** | see below |
+| `maybe_check_liveness()`, positive branch | **`fixed`** | the only producer of `fixed` in the system |
+| `merged` deadline expiry (1h, no deploy target) | `closed` | DESIGN.md's deadline table and FLOWS.md flow 2 |
+| `cmd_close --close <sig> --reason <text>` | `closed` | new; see below |
+
+**Recovery-pairing is `quiet`, not `fixed`, and that is the line a future
+reader will try to "fix".** A ✅ is a positive signal, so `fixed` looks right.
+`DESIGN.md` § What must not be lost, item 4 forbids it in as many words:
+*"Recovery-pairing is the strong path, the 2h timer the fallback, and neither
+ever claims a fix."* Nothing shipped — the service recovered, by our hand or its
+own, and a ✅ cannot tell those apart any better than silence can. The
+distinction from the timer path stays where it already was, in
+`RECOVERY_PAIRED_NOTE_PREFIX`. There is now a test whose only job is to fail if
+someone changes it: `test_recovery_paired_never_produces_fixed`.
+
+`STATE_RESOLVED` was **deleted**, not aliased, so every one of its ~15 references
+had to be re-decided by hand and a missed one is an import-time `NameError`
+rather than a silent string mismatch.
+
+### `cmd_close`, because a state nothing can produce is not honest
+
+After the mapping above, `closed`'s only producer would have been a 1h clock —
+while its definition is *"a human said done"*. `cmd_close` (`--close <signature>
+--reason <text>`) is that producer, following `cmd_snooze`/`cmd_ignore`/
+`cmd_reopen`'s exact shape. The reason is required, for the same reason
+`_set_state()` already requires one for `dismissed`.
+
+### `item_transitions`, and why it is not scope creep
+
+Append-only history: `event_id`, `from_state`, `to_state`, `at`, `note`. Written
+by `_set_state()` and nothing else — it is already the only writer of
+`triage_items.state`, and a second writer of history is a second source of truth
+about it.
+
+It is here because **three of `/metrics`' six funnel numbers are not derivable
+from the ledger without it**: median `needs_human` → decision, verified
+unattended fixes per week, and reopen-after-`fixed`. All three need when an item
+entered and left a state, and `triage_items.updated_at` cannot answer that —
+`ingest()` rewrites it on every open row on every pass regardless of state.
+Slice 2.3 would otherwise have had to fabricate half of itself.
+
+Two properties worth keeping:
+
+- A row is appended **only on a real change** (`rowcount > 0` **and**
+  `prev_state != state`). `_set_state()` also serves callers that write columns
+  with the state unchanged — `sync_card()` writing `card_ts`/`card_hash` — and
+  recording those would corrupt every duration computed from the table.
+- The table starts **empty and records nothing retroactively**. A `/metrics`
+  window predating it is empty *by construction*, not zero. That distinction is
+  in the migration comment, because "0 fixes last week" reads as a measurement.
+
+### All 30 live rows become `quiet`, none becomes `fixed`
+
+Recorded in `_MIGRATION_4`'s comment as well as here, because it reads like
+laziness. Every one of the 30 is a silence close by note (`signal quiet since …`)
+or by an empty note. `RECOVERY_PAIRED_NOTE_PREFIX` is on **zero** rows.
+`DESIGN.md` and `REVIEW.md` name items 931/932 as the only two verified-recovery
+closes this system has produced — but the pre-`occurrence_mark` churn overwrote
+both notes, `dispatches.merged_at` is NULL for both, `vps#8` is recorded on a
+dispatch whose `origin_event_id` is NULL, and each row's `dispatch_job` points at
+a *later* investigate episode. **Back-dating a state from a prose document is not
+a migration.** `/metrics` will read 0 verified fixes for the period before the
+history table existed, understating true history by two — the correct direction
+to be wrong.
+
+### Also fixed here, because the line was being edited anyway
+
+`sync_card()`'s never-carded guard covered only `resolved`, so a `dismissed` row
+that somehow lacked `card_ts` would have posted a *first* card. It now checks
+`_NEVER_CARDED_FIRST_STATES = (fixed, quiet, closed, dismissed)`. That closes
+known-open item 1 from §35.
+
+### Verified, not claimed
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   16/16 passed
+  test_triage.py                   107/107 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+```
+
+Two `run()` passes against a `VACUUM INTO` copy of the live ledger (taken 19:12Z,
+`WARDEN_DB` and the intents spool redirected, `--dry-run`):
+
+```
+pass 1: transitions = 1     quiet -> new: 1
+pass 2: transitions = 0
+final census: {'ignored': 7, 'needs_human': 4, 'new': 5, 'note': 8, 'quiet': 29}
+schema_version 4 · rows still in 'resolved': 0 · item_transitions: 1
+```
+
+The single pass-1 transition is **correct, not churn**, and was chased down
+rather than assumed: event 261 (`hermes_log`, `slack_bolt.AsyncApp: Failed to
+connect`) carries `last_reminder_at = 2026-09-09T19:07:18Z`, an emit-path
+occurrence that landed *after* that row's `occurrence_mark` was stamped. A real
+recurrence, reopened exactly as intended, and it re-clustered into a would-be
+`investigate` for `hermes-agent`. The other census delta is event 260, a fresh
+ingest. Pass 2 is the churn measurement, and it is 0.
+
+Mutation-tested, each broken → red **by name** → restored → green:
+
+| Mutation | Caught by |
+|-|-|
+| `resolve_recovery_paired()` → `fixed` | `test_recovery_paired_never_produces_fixed` |
+| `maybe_check_liveness()` positive → `quiet` | `test_liveness_confirmed_resolves_the_item` |
+| `merged` expiry → `quiet` | `test_merged_expires_to_closed` |
+| drop the `from_state != to_state` guard | `test_set_state_records_transitions_only_on_real_change` |
+| `sync_card()` guard back to `fixed` only | `test_sync_card_never_posts_a_first_card_for_any_never_carded_terminal_state` |
+
+`grep -rn "triage_items" hermes-agent/{scripts,plugins}` returns only
+`hermes-cc.sh`'s `--auto-from-item`, which gates on `verdict`. **No dependency on
+the literal `resolved` exists anywhere in hermes-agent** — verified, not assumed.
+
+### Expect a one-time card burst on the first live pass
+
+~20 clusters render differently now (`resolved` / `:white_check_mark:` →
+`quiet` / `:mute:`), so `card_hash` will miss and each already-carded cluster
+gets one `chat.update`. **Updates, never posts** — `sync_card()`'s never-carded
+guard holds, so nothing new appears in the channel. One-time, and it is the
+correct behaviour: the cards were claiming something the ledger no longer says.
+
+### Process, carried over from §38
+
+The four LaunchAgents were **unloaded for the whole slice** (`make unload`),
+because in this repo the agents execute `scripts/*.py` from the working tree and
+this change renames a live state value. §38 learned that the hard way with an
+additive migration; this one did not repeat it.
+
+### Next action
+
+Reload the agents and let the loop migrate the live ledger to 4, then slice 2.3 —
+`/metrics`.

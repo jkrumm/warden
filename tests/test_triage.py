@@ -700,7 +700,7 @@ def test_resolution_updates_card_once_then_stops():
         conn.commit()
         triage.run(conn, dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_RESOLVED
+        assert item["state"] == triage.STATE_QUIET
         calls_after_resolve = ctx.total_calls()
         assert calls_after_resolve == calls_before + 1, "resolution must update the card exactly once"
 
@@ -759,7 +759,7 @@ def test_reopen_after_resolve_preserves_artifact_url():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-recur", title="Recurring", first_seen=OLD)
         triage.ingest(conn, NOW)
-        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW,
+        triage._set_state(conn, eid, triage.STATE_QUIET, NOW,
                            artifact_url="https://github.com/jkrumm/demo-repo/pull/1")
 
         # A fresh occurrence — the cooldown-suppressed-recurrence shape (see
@@ -1206,7 +1206,7 @@ def test_quiet_grouped_resolves_after_window_and_updates_card_once():
 
         triage.run(conn, dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_RESOLVED
+        assert item["state"] == triage.STATE_QUIET
         assert item["note"].startswith(triage.QUIET_RESOLVE_NOTE_PREFIX)
         assert "fixed" not in item["note"].lower()
         assert len(ctx.updated) == 1 and len(ctx.posted) == 0, (
@@ -1231,7 +1231,7 @@ def test_quiet_grouped_resolves_after_window_and_updates_card_once():
         # why that is exactly why occurrence_mark, not updated_at, has to be
         # the anchor here.)
         item_after = triage._get_item(conn, eid)
-        assert item_after["state"] == triage.STATE_RESOLVED
+        assert item_after["state"] == triage.STATE_QUIET
         assert item_after["occurrence_mark"] == first_mark, "quiet-resolved grouped item churned"
         assert item_after["note"] == first_note, "quiet-resolved grouped item churned"
         assert ctx.total_calls() == calls_after_first, (
@@ -1262,7 +1262,7 @@ def test_new_to_resolved_with_no_card_is_silent():
         triage.run(conn, dry_run=False)
 
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_RESOLVED
+        assert item["state"] == triage.STATE_QUIET
         assert item["card_ts"] is None
         assert ctx.total_calls() == 0, "new -> resolved with no prior card must make zero Slack calls"
 
@@ -1353,7 +1353,7 @@ def test_recovery_paired_resolves_immediately_without_waiting_for_quiet():
 
         triage.run(conn, dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_RESOLVED
+        assert item["state"] == triage.STATE_QUIET
         assert item["note"].startswith(triage.RECOVERY_PAIRED_NOTE_PREFIX)
         assert recovery_text in item["note"]
         assert "fixed" not in item["note"].lower()
@@ -1861,7 +1861,8 @@ def test_liveness_confirmed_resolves_the_item():
         triage.maybe_check_liveness(conn, policy, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_RESOLVED
+        assert item["state"] == triage.STATE_FIXED, (
+            "a positive liveness probe is the only producer of STATE_FIXED in the file")
         assert item["note"].startswith(triage.LIVENESS_CONFIRMED_NOTE_PREFIX)
         assert len(ctx.updated) == 1 and len(ctx.posted) == 0
 
@@ -2394,13 +2395,14 @@ def test_pr_open_expires_to_dismissed_expired():
         assert "336h" in item["note"], item["note"]
 
 
-def test_merged_expires_to_resolved():
-    """DESIGN.md says `closed` here; `closed` is part of the Wave 2 `resolved`
-    split and does not exist yet, so this lands in `resolved` until it does."""
+def test_merged_expires_to_closed():
+    """DESIGN.md's own deadline table and FLOWS.md flow 2, verbatim: landed,
+    no deploy target, closed after 1h with no deploy — done without a
+    verified positive signal, which is exactly STATE_CLOSED's definition."""
     with _triage_env() as (conn, _ctx):
         item = _expire(conn, triage.STATE_MERGED, "sig-dl-merged",
                         pr_url="https://github.com/jkrumm/demo-repo/pull/42")
-        assert item["state"] == triage.STATE_RESOLVED, item["state"]
+        assert item["state"] == triage.STATE_CLOSED, item["state"]
         assert item["note"].startswith(triage.DEADLINE_EXPIRED_NOTE_PREFIX), item["note"]
 
 
@@ -2650,13 +2652,13 @@ def test_quiet_resolved_grouped_item_does_not_churn_with_no_new_occurrence():
                              title="🚨 quiet", first_seen=OLD,
                              payload={"ts_last": "1700000000.000001"})
         triage.ingest(conn, NOW)
-        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note="signal quiet since 2026-09-01")
+        triage._set_state(conn, eid, triage.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
         stamped = triage._get_item(conn, eid)
         assert stamped["occurrence_mark"] is not None, "a fresh _set_state() call must stamp a mark"
 
         triage.reopen_if_needed(conn, NOW)
         after = triage._get_item(conn, eid)
-        assert after["state"] == triage.STATE_RESOLVED, "a quiet row with no new occurrence must not reopen"
+        assert after["state"] == triage.STATE_QUIET, "a quiet row with no new occurrence must not reopen"
         assert after["occurrence_mark"] == stamped["occurrence_mark"], "quiet row's mark must not move"
         assert after["note"] == stamped["note"], "quiet row's note must not be overwritten"
 
@@ -2670,7 +2672,7 @@ def test_new_ts_last_alone_reopens_a_quiet_resolved_grouped_item():
                              title="🚨 quiet", first_seen=OLD,
                              payload={"ts_last": "1700000000.000001"})
         triage.ingest(conn, NOW)
-        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note="signal quiet since 2026-09-01")
+        triage._set_state(conn, eid, triage.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
 
         conn.execute("UPDATE events SET payload_json=? WHERE id=?",
                      (json.dumps({"ts_last": "1700000500.000002"}), eid))
@@ -2690,7 +2692,7 @@ def test_new_last_reminder_at_alone_reopens_a_quiet_resolved_item():
         eid = _insert_event(conn, source="slack_alert", external_id="sig-emit-recur",
                              title="🚨 quiet", first_seen=OLD)
         triage.ingest(conn, NOW)
-        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note="signal quiet since 2026-09-01")
+        triage._set_state(conn, eid, triage.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
 
         conn.execute(
             "UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
@@ -2714,7 +2716,7 @@ def test_state_source_reopen_via_resolved_at_reset_still_reopens():
         eid = _insert_event(conn, source="uk", external_id="uk-monitor-1",
                              title="[X] [:red_circle: Down] uk monitor", first_seen=OLD)
         triage.ingest(conn, NOW)
-        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note=None)
+        triage._set_state(conn, eid, triage.STATE_QUIET, NOW, note=None)
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (OLD.isoformat(), eid))
         conn.commit()
 
@@ -2744,7 +2746,7 @@ def test_adoption_null_occurrence_mark_does_not_reopen_but_gets_stamped():
         conn.execute(
             "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
             "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (eid, "slack_alert:sig-legacy-null-mark", "demo-repo", triage.STATE_RESOLVED,
+            (eid, "slack_alert:sig-legacy-null-mark", "demo-repo", triage.STATE_QUIET,
              "signal quiet since ...", 5, OLD.isoformat(), OLD.isoformat(),
              NOW.isoformat(), NOW.isoformat()),
         )
@@ -2753,7 +2755,7 @@ def test_adoption_null_occurrence_mark_does_not_reopen_but_gets_stamped():
 
         triage.reopen_if_needed(conn, NOW)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_RESOLVED, "adoption of a NULL mark must not reopen the row"
+        assert item["state"] == triage.STATE_QUIET, "adoption of a NULL mark must not reopen the row"
         assert item["occurrence_mark"] is not None, "adoption must stamp a baseline mark"
 
 
@@ -2824,8 +2826,164 @@ def test_a_transition_writes_the_deadline_its_state_declares():
         assert triage._get_item(conn, eid)["state_deadline"] is None, (
             "`new` is bounded by silence-resolve, not by a clock")
 
-        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note=None)
+        triage._set_state(conn, eid, triage.STATE_QUIET, NOW, note=None)
         assert triage._get_item(conn, eid)["state_deadline"] is None, "terminal states carry no clock"
+
+
+# --- the `resolved` -> fixed/quiet/closed split ------------------------------
+
+def test_recovery_paired_never_produces_fixed():
+    """Guardrail against the plausible-looking-wrong fix: an explicit ✅
+    recovery message IS a positive signal, so `fixed` looks correct here — it
+    is not. DESIGN.md § What must not be lost, item 4: "Recovery-pairing is
+    the strong path, the 2h timer the fallback, and neither ever claims a
+    fix." Nothing SHIPPED — the service recovered, by our hand or its own,
+    and this ledger cannot tell which."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="research-gateway-job-reaped-1-15m",
+                             title="🚨 research-gateway job.reaped >= 1 (15m) (×3 in batch)", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+            "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (eid, "slack_alert:research-gateway-job-reaped-1-15m", "vps", triage.STATE_NEW, 3,
+             OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+        triage._watchdog_poll = _fake_wp_module(
+            [_slack_msg("999.000001", "✅ research-gateway job.reaped >= 1 (15m)")])
+
+        triage.resolve_recovery_paired(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] != triage.STATE_FIXED, (
+            "DESIGN.md § What must not be lost, item 4: recovery-pairing is a positive OBSERVATION, "
+            "never a confirmed fix — the service recovering does not tell us whether we caused it"
+        )
+        assert item["state"] == triage.STATE_QUIET, item["state"]
+
+
+def test_quiet_fixed_closed_cards_render_with_caveat_and_reason():
+    """render_card_blocks()'s caveat branch must reach BOTH `quiet` and
+    `fixed` rows (see QUIET_RESOLVE_NOTE_PREFIX/RECOVERY_PAIRED_NOTE_PREFIX/
+    LIVENESS_CONFIRMED_NOTE_PREFIX's own comment) — and a `closed` row must
+    render its human reason, the same way `dismissed` already does."""
+    with _triage_env() as (conn, _ctx):
+        eid_quiet = _insert_event(conn, source="slack_alert", external_id="sig-render-quiet",
+                                   title="🚨 quiet", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
+            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid_quiet, "slack_alert:sig-render-quiet", "demo-repo", triage.STATE_QUIET,
+             f"{triage.QUIET_RESOLVE_NOTE_PREFIX}2026-09-01", 5, OLD.isoformat(), OLD.isoformat(),
+             NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+        item = triage._get_item(conn, eid_quiet)
+        event = triage._get_event(conn, eid_quiet)
+        blocks = triage.render_card_blocks([item], [event], conn)
+        assert triage.QUIET_RESOLVE_NOTE_PREFIX in json.dumps(blocks)
+
+        eid_fixed = _insert_event(conn, source="slack_alert", external_id="sig-render-fixed",
+                                   title="🚨 fixed", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
+            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid_fixed, "slack_alert:sig-render-fixed", "demo-repo", triage.STATE_FIXED,
+             f"{triage.LIVENESS_CONFIRMED_NOTE_PREFIX}2 alert(s) verified live", 5, OLD.isoformat(),
+             OLD.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+        item = triage._get_item(conn, eid_fixed)
+        event = triage._get_event(conn, eid_fixed)
+        blocks = triage.render_card_blocks([item], [event], conn)
+        assert triage.LIVENESS_CONFIRMED_NOTE_PREFIX in json.dumps(blocks)
+
+        eid_closed = _insert_event(conn, source="slack_alert", external_id="sig-render-closed",
+                                    title="🚨 closed", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
+            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid_closed, "slack_alert:sig-render-closed", "demo-repo", triage.STATE_CLOSED,
+             "closed by hand: false alarm, no code change needed", 5, OLD.isoformat(), OLD.isoformat(),
+             NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+        item = triage._get_item(conn, eid_closed)
+        event = triage._get_event(conn, eid_closed)
+        blocks = triage.render_card_blocks([item], [event], conn)
+        assert "closed by hand: false alarm" in json.dumps(blocks)
+
+
+def test_set_state_records_transitions_only_on_real_change():
+    """_set_state() is the only writer of item_transitions, appending exactly
+    one row per REAL state change and nothing for a column-only write with the
+    state unchanged (sync_card() and friends write dispatch_job/card_ts/etc.
+    through here this way) — recording those would fill the table with noise
+    and corrupt every duration /metrics computes from it."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-transitions", title="x",
+                             first_seen=OLD)
+        triage.ingest(conn, NOW)
+
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job="job-t1")
+        rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)).fetchall()
+        assert len(rows) == 1, rows
+        assert rows[0]["from_state"] == triage.STATE_NEW
+        assert rows[0]["to_state"] == triage.STATE_INVESTIGATING
+        assert rows[0]["note"] is None
+
+        # Column-only write, state unchanged — must NOT be recorded.
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job="job-t1")
+        rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=?", (eid,)).fetchall()
+        assert len(rows) == 1, "a column-only write with the state unchanged must not be recorded"
+
+        triage._set_state(conn, eid, triage.STATE_NEEDS_HUMAN, NOW, note="deadline expired: test")
+        rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)).fetchall()
+        assert len(rows) == 2, rows
+        assert rows[1]["from_state"] == triage.STATE_INVESTIGATING
+        assert rows[1]["to_state"] == triage.STATE_NEEDS_HUMAN
+        assert rows[1]["note"] == "deadline expired: test"
+
+
+def test_cmd_close_closes_with_reason_and_refuses_empty_reason_or_unknown_signature():
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-close-me", title="x", first_seen=OLD)
+        triage.ingest(conn, NOW)
+
+        rc = triage.cmd_close(
+            conn, ["--close", "slack_alert:sig-close-me", "--reason", "manual fix, verified by eye"], NOW)
+        assert rc == 0
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_CLOSED
+        assert item["note"] == "manual fix, verified by eye"
+
+        rc = triage.cmd_close(conn, ["--close", "slack_alert:sig-close-me", "--reason", ""], NOW)
+        assert rc != 0, "an empty reason must be refused"
+
+        rc = triage.cmd_close(conn, ["--close", "slack_alert:does-not-exist", "--reason", "whatever"], NOW)
+        assert rc != 0, "an unknown signature must be refused"
+
+
+def test_sync_card_never_posts_a_first_card_for_any_never_carded_terminal_state():
+    """A row that reaches a terminal state directly from `new` (no card_ts)
+    must never get its first Slack post — extends the 2026-09-08 guard (see
+    CARDED_STATES) from `resolved` alone to all three of its successors plus
+    `dismissed`, which was already missing before this slice."""
+    with _triage_env() as (conn, ctx):
+        for state in (triage.STATE_QUIET, triage.STATE_FIXED, triage.STATE_CLOSED, triage.STATE_DISMISSED):
+            eid = _insert_event(conn, source="slack_alert", external_id=f"sig-never-card-{state}",
+                                 title="x", first_seen=OLD)
+            conn.execute(
+                "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
+                "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (eid, f"slack_alert:sig-never-card-{state}", "demo-repo", state, "reason", 1,
+                 OLD.isoformat(), OLD.isoformat(), NOW.isoformat(), NOW.isoformat()),
+            )
+            conn.commit()
+            item = triage._get_item(conn, eid)
+            event = triage._get_event(conn, eid)
+            triage.sync_card(conn, [item], [event], DEFAULT_POLICY, dry_run=False)
+        assert ctx.total_calls() == 0, "a never-carded state must never post a first card"
 
 
 # --- runner ------------------------------------------------------------------

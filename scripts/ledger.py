@@ -58,7 +58,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # frozen at its pre-cutover state and written by nothing, kept as the rollback —
 # so if you are reading this to work out which database is real, it is this one.
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -224,10 +224,56 @@ CREATE INDEX IF NOT EXISTS idx_triage_state_deadline ON triage_items(state_deadl
 # data itself.
 _MIGRATION_3 = "ALTER TABLE triage_items ADD COLUMN occurrence_mark TEXT;"
 
+# Version 4 — the `resolved` -> `fixed`/`quiet`/`closed` split (triage.py's
+# module docstring, DESIGN.md § the state machine) plus `item_transitions`, an
+# append-only history table. Three of the six /metrics funnel numbers (median
+# needs_human -> decision, verified unattended fixes per week, reopen-after-
+# `fixed`) are not derivable from the ledger without it: `triage_items.
+# updated_at` cannot serve — ingest() rewrites it on every open row on every
+# pass regardless of state (see triage.py's _set_state() docstring), so it
+# cannot answer "when did this item enter/leave a state" at all.
+#
+# The literal 'resolved' below, not a symbolic constant: STATE_RESOLVED no
+# longer exists in triage.py after this migration lands, and this module owns
+# the schema and must not import triage's constants to migrate triage's own
+# data. On a fresh database the UPDATE is a harmless no-op — nothing to match.
+#
+# Every one of the live ledger's 30 `resolved` rows becomes `quiet`, and NONE
+# becomes `fixed` — this reads like laziness and is not. All 30 are silence
+# closes: by note (`signal quiet since …`) or by an empty note
+# (apply_resolutions() clears it on a disappearance-resolve). The recovery-
+# pairing note prefix (RECOVERY_PAIRED_NOTE_PREFIX) appears on ZERO rows.
+# DESIGN.md and REVIEW.md both name items 931/932 as the only two verified-
+# recovery closes this system has ever produced (after jkrumm/vps#8 merged) —
+# but the pre-occurrence_mark reopen churn (see migration 3) overwrote both
+# rows' notes with its own text, dispatches.merged_at is NULL for both, the PR
+# is recorded on a dispatch whose origin_event_id is NULL, and each row's
+# dispatch_job points at a LATER investigate episode, not the one that
+# produced the fix. The ledger cannot substantiate `fixed` for either row, and
+# back-dating a state from a prose document is not a migration. Both become
+# `quiet` with the rest — /metrics will read 0 verified fixes for the period
+# before this column existed, understating true history by two. That is the
+# correct direction to be wrong: a window that predates this table is empty
+# by construction, not zero, and a future reader must not mistake the two.
+_MIGRATION_4 = """
+UPDATE triage_items SET state = 'quiet' WHERE state = 'resolved';
+
+CREATE TABLE item_transitions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id   INTEGER NOT NULL REFERENCES triage_items(event_id),
+  from_state TEXT,
+  to_state   TEXT NOT NULL,
+  at         TEXT NOT NULL,
+  note       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_item_transitions_event ON item_transitions(event_id, id);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
+    4: _MIGRATION_4,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live

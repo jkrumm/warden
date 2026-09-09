@@ -27,10 +27,11 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    including op_refs_homelab/op_refs_vps (a dead 1Password
                    ref blocks every future secrets-cache reseal — this must
                    reach at least the digest, never silently drop).
-  2. Reopen/unsnooze — undo a stale `resolved`/`snoozed` state the underlying
-                   event has since moved past (grouped sources reuse the same
-                   events.id across a resolve -> recur cycle, so this is a
-                   state fix-up, never a new row).
+  2. Reopen/unsnooze — undo a stale `quiet`/`fixed`/`closed`/`dismissed`/
+                   `snoozed` state the underlying event has since moved past
+                   (grouped sources reuse the same events.id across a
+                   close -> recur cycle, so this is a state fix-up, never a
+                   new row).
   3. Classify     — fnmatch MULTIPLE targets per event (see MATCH TARGETS
                    below) against config/triage-policy.json, in order: the
                    explicit `ignore` list (genuine recoveries/known-benign —
@@ -49,7 +50,7 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    runs. This is what stops an intent nobody else drained from
                    sitting in the spool forever.
   4. Resolve      — an event whose events.resolved_at is now set flips its
-                   triage_items row to `resolved` — but ONLY a row still in
+                   triage_items row to `quiet` — but ONLY a row still in
                    `new`. events.resolved_at is set by disappearance from
                    observation, and observation ending never discharges an
                    obligation (DESIGN.md principle 5; see
@@ -290,7 +291,31 @@ STATE_INVESTIGATING = "investigating"
 STATE_VERDICT = "verdict"
 STATE_NEEDS_HUMAN = "needs_human"
 STATE_PR_OPEN = "pr_open"
-STATE_RESOLVED = "resolved"
+# Wave 2's `resolved` split — three honest terminal outcomes instead of one
+# number that improves the more questions go unanswered (DESIGN.md § the
+# state machine). Each is produced by exactly the paths its own comment names;
+# see the module docstring's producer table for the full mapping.
+#
+# A change landed AND a positive signal confirmed it. The only genuinely
+# verified-fix state in the file — produced solely by maybe_check_liveness()'s
+# positive branch (a live probe, never silence). See STATE_QUIET for why the
+# two silence-adjacent paths (quiet timer, recovery pairing) do NOT produce
+# this even when a recovery message looks like good news.
+STATE_FIXED = "fixed"
+# The signal stopped and NOTHING SHIPPED — never claims a fix. Produced by all
+# three silence/observation paths that predate the split: apply_resolutions()
+# (disappearance from observation), resolve_quiet_grouped() (a quiet timer),
+# and resolve_recovery_paired() (an explicit ✅ recovery message is still only
+# an OBSERVATION that the alert cleared — DESIGN.md § What must not be lost,
+# item 4: "neither [grouped resolve path] ever claims a fix"). A service that
+# is fully down also stops emitting, so silence alone — however it arrives —
+# can never be proof of a fix.
+STATE_QUIET = "quiet"
+# Done WITHOUT a verified positive signal: a human said so (cmd_close), or it
+# landed and there was nothing left to verify (a `merged` item whose repo has
+# no deploy target — sweep_deadlines() expires it here after 1h, per
+# DESIGN.md's own deadline table).
+STATE_CLOSED = "closed"
 STATE_SNOOZED = "snoozed"
 STATE_IGNORED = "ignored"
 # --- the auto-implement chain (verdict -> implement -> validate -> merge ->
@@ -338,40 +363,44 @@ STATE_DISMISSED = "dismissed"
 # THE INVARIANT (2026-09-08 correction — a 13-card burst reopened this exact
 # failure mode through the resolve path): a card is a conversation with the
 # human about an item they were told about; a state change on an item they
-# were never told about is not news. `STATE_RESOLVED` sits in this tuple
-# because a CARDED item's resolution is real news (the human saw the problem,
-# now sees it close) — but `resolved` is reachable from `new`
+# were never told about is not news. `STATE_QUIET`/`STATE_FIXED` sit in this
+# tuple because a CARDED item's close is real news (the human saw the problem,
+# now sees it close) — but both are also reachable straight from `new`
 # (apply_resolutions()/resolve_quiet_grouped()/resolve_recovery_paired() all
-# flip `new` straight to `resolved` on a quiet/disappeared signal that was
+# flip `new` straight to `quiet` on a silence/observation signal that was
 # never escalated, and `new` is the ONLY state they may flip — see
 # _SILENCE_RESOLVE_ELIGIBLE_STATES), and an item whose whole life was
-# `new -> resolved` was never told about in the first place. Being in
+# `new -> quiet` was never told about in the first place. Being in
 # CARDED_STATES only makes a row ELIGIBLE for a card — sync_card() below is
 # where "already had one" is actually enforced (via `card_ts`), and that is the
 # one place this rule is checked, rather than every caller having to
-# re-derive it.
-# STATE_DISMISSED is in this tuple for the same reason STATE_RESOLVED is: an
-# item that HAD a card and then ran out of time is real news to the human who
-# was asked and did not answer — silently dropping it is what a deadline must
-# never look like. Every state that can expire to `dismissed` (needs_human,
+# re-derive it. `STATE_CLOSED` is here for the same reason: cmd_close()
+# addresses an item a human is looking at (already carded), and the `merged`
+# deadline's expiry to `closed` updates a card that already exists.
+# STATE_DISMISSED is in this tuple for the same reason: an item that HAD a
+# card and then ran out of time is real news to the human who was asked and
+# did not answer — silently dropping it is what a deadline must never look
+# like. Every state that can expire to `dismissed` (needs_human,
 # merge_blocked, pr_open) is itself carded, so in practice this only ever
 # updates a card that already exists.
-CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR_OPEN, STATE_RESOLVED,
+CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR_OPEN,
+                  STATE_FIXED, STATE_QUIET, STATE_CLOSED,
                   STATE_IMPLEMENTING, STATE_VALIDATING, STATE_MERGE_BLOCKED, STATE_MERGED,
                   STATE_LIVENESS_PENDING, STATE_DISMISSED)
 
 # `triage_items.note` prefixes for the grouped-source resolve paths (see
 # resolve_quiet_grouped()/resolve_recovery_paired()) plus the liveness path
 # (see maybe_check_liveness()) — render_card_blocks() only surfaces `note` on
-# a STATE_RESOLVED card when it starts with one of these, specifically so an
-# ordinary event-driven resolve (apply_resolutions, which now clears `note`
-# outright) never accidentally inherits stale text from an earlier phase.
-# Deliberately NOT "fixed"/"resolved" wording for the first two — a service
-# that is fully down also stops emitting, so silence alone is never proof of
-# a fix; see both functions' own docstrings. LIVENESS_CONFIRMED_NOTE_PREFIX is
-# the one genuine "this is actually fixed" claim in the file, because it is
-# backed by a POSITIVE probe (maybe_check_liveness()'s own gatherer), not
-# silence.
+# a STATE_QUIET/STATE_FIXED card when it starts with one of these,
+# specifically so an ordinary event-driven resolve (apply_resolutions, which
+# now clears `note` outright) never accidentally inherits stale text from an
+# earlier phase. Deliberately NOT "fixed"/"resolved" wording for the first
+# two — a service that is fully down also stops emitting, so silence alone is
+# never proof of a fix; see both functions' own docstrings, and STATE_QUIET's.
+# LIVENESS_CONFIRMED_NOTE_PREFIX is the one genuine "this is actually fixed"
+# claim in the file, because it is backed by a POSITIVE probe
+# (maybe_check_liveness()'s own gatherer), not silence — it is the only prefix
+# of the three that ever lands on a STATE_FIXED row rather than STATE_QUIET.
 QUIET_RESOLVE_NOTE_PREFIX = "signal quiet since "
 RECOVERY_PAIRED_NOTE_PREFIX = "recovery message observed: "
 LIVENESS_CONFIRMED_NOTE_PREFIX = "liveness confirmed: "
@@ -382,7 +411,11 @@ STATE_EMOJI = {
     STATE_VERDICT: ":memo:",
     STATE_NEEDS_HUMAN: ":raising_hand:",
     STATE_PR_OPEN: ":twisted_rightwards_arrows:",
-    STATE_RESOLVED: ":white_check_mark:",
+    # `fixed` inherits the old `resolved` emoji — it is the only one of the
+    # three that earns it (a verified positive signal, not silence).
+    STATE_FIXED: ":white_check_mark:",
+    STATE_QUIET: ":mute:",
+    STATE_CLOSED: ":ballot_box_with_check:",
     STATE_SNOOZED: ":zzz:",
     STATE_IMPLEMENTING: ":hammer_and_wrench:",
     STATE_VALIDATING: ":test_tube:",
@@ -397,7 +430,7 @@ STATE_EMOJI = {
 # a reader — DESIGN.md principle 6 is "checked against the diagram, not
 # assumed", and a hand-maintained second list of terminal states is exactly
 # how the two drift apart.
-TERMINAL_STATES = (STATE_RESOLVED, STATE_IGNORED, STATE_NOTE, STATE_DISMISSED)
+TERMINAL_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_IGNORED, STATE_NOTE, STATE_DISMISSED)
 
 
 class _DeadlineRule(NamedTuple):
@@ -432,7 +465,7 @@ _STATE_DEADLINE_COLUMN = "state_deadline"
 # (test_every_non_terminal_state_names_a_poller_and_a_deadline enforces it).
 # The numbers are DESIGN.md's own table, not re-derived here.
 #
-# Three entries deviate from that table, deliberately, because a reader will
+# Two entries deviate from that table, deliberately, because a reader will
 # check:
 #
 #   * `verdict` is not in DESIGN.md's table at all, and it is non-terminal.
@@ -441,9 +474,6 @@ _STATE_DEADLINE_COLUMN = "state_deadline"
 #     every other verdict sits in `verdict` with nothing scheduled to touch it
 #     again. 24h -> needs_human. An ADDITION to the design's table, not a
 #     contradiction of it.
-#   * `merged` expires to `resolved`, where DESIGN.md says `closed`. `closed`
-#     is part of the Wave 2 `resolved` split (fixed/quiet/closed) and does not
-#     exist yet; this line becomes `closed` the day that lands.
 #   * `needs_human`'s "reminder at 1d" is NOT built here. A reminder is a
 #     notification feature, not a deadline — it changes nothing about when the
 #     row may stop existing. Scoped out on purpose, not missed.
@@ -465,8 +495,11 @@ STATE_DEADLINES: dict[str, _DeadlineRule] = {
                                         _STATE_DEADLINE_COLUMN),
     # Nothing polls a `merged` row — the deploy path already declined it (see
     # poll_validation_jobs()), so the clock IS its only exit, and this sweeper
-    # is therefore honestly named as the poller rather than left blank.
-    STATE_MERGED: _DeadlineRule("sweep_deadlines", 1, STATE_RESOLVED, None, _STATE_DEADLINE_COLUMN),
+    # is therefore honestly named as the poller rather than left blank. Expires
+    # to `closed`, per DESIGN.md's own deadline table and FLOWS.md flow 2:
+    # landed, no deploy target, closed after 1h with no deploy — done without a
+    # verified positive signal, which is exactly STATE_CLOSED's definition.
+    STATE_MERGED: _DeadlineRule("sweep_deadlines", 1, STATE_CLOSED, None, _STATE_DEADLINE_COLUMN),
     STATE_NEEDS_HUMAN: _DeadlineRule("operator", 168, STATE_DISMISSED, "expired",
                                       _STATE_DEADLINE_COLUMN),
     STATE_PR_OPEN: _DeadlineRule("operator", 336, STATE_DISMISSED, "expired", _STATE_DEADLINE_COLUMN),
@@ -1217,7 +1250,20 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     state" needs its own column. reopen_if_needed() is the only reader — it
     compares the mark stored here against the event's CURRENT mark to tell a
     resolved/dismissed row that is still quiet from one a fresh occurrence
-    reopened underneath."""
+    reopened underneath.
+
+    Also appends exactly one `item_transitions` row on a REAL state change —
+    rowcount>0 from the UPDATE AND the prior state differs from `state` — and
+    nothing otherwise. This is also the only writer of that table, for the
+    same reason this is the only writer of `triage_items.state`: a second
+    writer of history is a second source of truth about it. The guard matters
+    because this same UPDATE also serves CALLERS THAT DO NOT CHANGE STATE
+    (sync_card() and friends write card_ts/card_hash/etc. through here with
+    `state` unchanged) — recording those as transitions would fill the table
+    with noise and corrupt every duration /metrics computes from it. `note`
+    rides along verbatim when the caller passed one (a dismissal's reason, a
+    quiet-resolve's timestamp) so history stays readable after the item moves
+    on again; a caller that passed none leaves it NULL rather than guessing."""
     rule = STATE_DEADLINES.get(state)
     if rule is None and state not in TERMINAL_STATES:
         raise ValueError(
@@ -1239,6 +1285,12 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
 
     mark = _occurrence_mark(_get_event(conn, event_id))
 
+    # The row's state BEFORE this write — the only way to tell a real
+    # transition from a column-only write below (see this function's own
+    # docstring, item_transitions paragraph).
+    prev_row = conn.execute("SELECT state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
+    prev_state = prev_row["state"] if prev_row is not None else None
+
     sql = "UPDATE triage_items SET state=?, state_deadline=?, occurrence_mark=?, updated_at=?"
     params: list[Any] = [state, deadline, mark, _now_iso(now)]
     for col, value in columns.items():
@@ -1255,7 +1307,17 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
         params.append(expect_state)
     for col in expect_null:
         sql += f" AND {col} IS NULL"
-    return conn.execute(sql, params).rowcount
+    rowcount = conn.execute(sql, params).rowcount
+
+    if rowcount > 0 and prev_state != state:
+        note_value = columns.get("note")
+        if isinstance(note_value, _Coalesce):
+            note_value = note_value.value
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (event_id, prev_state, state, _now_iso(now), note_value),
+        )
+    return rowcount
 
 
 # --- 1. ingest -------------------------------------------------------------
@@ -1342,12 +1404,17 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime) -> None:
     by item 3's clock — a `needs_human` row protected from silence-resolve
     would instead go terminal on a 7-day fuse and never be seen again however
     often its monitor fired. Terminal means "this item is closed", not "this
-    signature may never open another"."""
+    signature may never open another".
+
+    `fixed`/`quiet`/`closed` (the Wave 2 `resolved` split) inherit exactly the
+    behaviour `resolved` had here — none of the three is a human judgement
+    that a signature is benign, so a genuine recurrence is new information for
+    all of them, same as it was for the one state they replaced."""
     rows = conn.execute(
         "SELECT ti.event_id AS event_id, ti.occurrence_mark AS stored_mark, e.* "
         "FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state IN (?, ?)",
-        (STATE_RESOLVED, STATE_DISMISSED),
+        "WHERE ti.state IN (?, ?, ?, ?)",
+        (STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_DISMISSED),
     ).fetchall()
     for row in rows:
         stored_mark = row["stored_mark"]
@@ -1386,7 +1453,11 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime) -> None:
     # eligible: see _SILENCE_RESOLVE_ELIGIBLE_STATES. STATE_NOTE, IGNORED and
     # SNOOZED are covered by the same allowlist rather than by being named
     # here — a `note` row is terminal by design (see that state's docstring)
-    # and must never flip to RESOLVED, which IS a carded state.
+    # and must never flip to QUIET, which IS a carded state.
+    #
+    # -> STATE_QUIET, never STATE_FIXED: disappearance from observation is
+    # pure silence, and nothing here confirms a change actually shipped (see
+    # STATE_QUIET's own comment).
     placeholders = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
     rows = conn.execute(
         f"SELECT ti.event_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
@@ -1401,9 +1472,9 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime) -> None:
         # do is stop a stale QUIET_RESOLVE_NOTE_PREFIX/
         # RECOVERY_PAIRED_NOTE_PREFIX note from a much earlier quiet-resolve
         # surviving a reopen -> genuine fix -> resolve cycle and rendering
-        # under render_card_blocks()'s STATE_RESOLVED branch as if it were
+        # under render_card_blocks()'s STATE_QUIET branch as if it were
         # still current.
-        _set_state(conn, row["event_id"], STATE_RESOLVED, now, note=None)
+        _set_state(conn, row["event_id"], STATE_QUIET, now, note=None)
     conn.commit()
 
 
@@ -1467,7 +1538,18 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
     like every other silence path this one only ever touches a row still in
     `new` (see _SILENCE_RESOLVE_ELIGIBLE_STATES). A human's pending decision
     about a written fix, an open dispatch, an in-flight merge — none of those
-    are discharged by the thing that raised them going away."""
+    are discharged by the thing that raised them going away.
+
+    Resolves to STATE_QUIET, NOT STATE_FIXED — read this paragraph before
+    "fixing" it. A ✅ is a POSITIVE signal, so `fixed` looks like the obviously
+    correct bucket here; it is not. DESIGN.md § What must not be lost, item 4:
+    "Recovery-pairing is the strong path, the 2h timer the fallback, and
+    NEITHER EVER CLAIMS A FIX." Nothing shipped by this function's own
+    knowledge — the service recovered, by our hand or its own, and a ✅
+    message cannot tell the two apart any more than silence can. `fixed` is
+    reserved for maybe_check_liveness()'s positive branch, the one place a
+    POSITIVE PROBE (not an inbound message, not silence) confirms a change
+    that actually shipped — see STATE_QUIET's own comment."""
     if dry_run:
         # Mirrors escalate_cluster()/run_verbs(): --dry-run makes NO outbound
         # call, Slack reads included, so a preview against a throwaway DB
@@ -1518,7 +1600,9 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
         if not text.lstrip().startswith("✅"):
             continue
         note = f"{RECOVERY_PAIRED_NOTE_PREFIX}{text.strip()[:200]}"
-        _set_state(conn, row["event_id"], STATE_RESOLVED, now, note=note)
+        # STATE_QUIET, never STATE_FIXED — see this function's own docstring,
+        # last paragraph, before changing this line.
+        _set_state(conn, row["event_id"], STATE_QUIET, now, note=note)
     conn.commit()
 
 
@@ -1532,7 +1616,7 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     so a months-old row doesn't trigger a notification burst). This is the
     triage-SIDE fix: a row whose underlying event has produced no new
     occurrence in `quietResolveHours` (DEFAULT_QUIET_RESOLVE_HOURS's own
-    comment justifies the default) flips to `resolved` here — a purely
+    comment justifies the default) flips to `quiet` here — a purely
     local state transition that never touches `events.resolved_at` (that
     column stays owned end to end by watchdog-poll.py, per this file's own
     brief: "Do not change watchdog-poll.py's own sweep_stale_grouped").
@@ -1578,7 +1662,7 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
         note = (f"{QUIET_RESOLVE_NOTE_PREFIX}{_fmt_ts(anchor_raw)} — no new occurrence for "
                 f"{quiet_hours:g}h. This closes the item on silence alone; it is NOT a confirmed "
                 f"fix, and the signature reopens automatically the moment it recurs.")
-        _set_state(conn, row["event_id"], STATE_RESOLVED, now, note=note)
+        _set_state(conn, row["event_id"], STATE_QUIET, now, note=note)
     conn.commit()
 
 
@@ -1636,7 +1720,7 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
 def _cluster_groups(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
     """Every carded (state in CARDED_STATES) triage_items row, grouped by
     `dispatch_job` — the derived cluster key (see module docstring). A row
-    with no dispatch_job (e.g. `resolved` without ever having escalated) is
+    with no dispatch_job (e.g. `quiet` without ever having escalated) is
     its own singleton group keyed by its own event_id."""
     placeholders = ",".join("?" * len(CARDED_STATES))
     rows = conn.execute(
@@ -1669,12 +1753,15 @@ def _investigate_dispatches_today(conn: sqlite3.Connection, now: dt.datetime) ->
 
 def _sibling_open_items(conn: sqlite3.Connection, repo: str, exclude_event_ids: list[int],
                          limit: int = 5) -> list[dict[str, str]]:
+    # STATE_RESOLVED's three successors plus STATE_IGNORED — same exclusion,
+    # same reasoning, unchanged behaviour: `note`/`dismissed` still count as
+    # "open" siblings worth mentioning in a brief, exactly as before the split.
     placeholders = ",".join("?" * len(exclude_event_ids)) if exclude_event_ids else "-1"
     rows = conn.execute(
         f"SELECT ti.signature, e.title FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        f"WHERE ti.repo=? AND ti.event_id NOT IN ({placeholders}) AND ti.state NOT IN (?, ?) "
+        f"WHERE ti.repo=? AND ti.event_id NOT IN ({placeholders}) AND ti.state NOT IN (?, ?, ?, ?) "
         f"ORDER BY ti.updated_at DESC LIMIT ?",
-        (repo, *exclude_event_ids, STATE_RESOLVED, STATE_IGNORED, limit),
+        (repo, *exclude_event_ids, STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_IGNORED, limit),
     ).fetchall()
     return [{"signature": r["signature"], "title": r["title"]} for r in rows]
 
@@ -2420,15 +2507,21 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
             "type": "context",
             "elements": [{"type": "mrkdwn", "text": f"Snoozed until {_fmt_ts(primary['snoozed_until'])}"}],
         })
-    elif state == STATE_RESOLVED and (primary["note"] or "").startswith(
+    elif state in (STATE_QUIET, STATE_FIXED) and (primary["note"] or "").startswith(
             (QUIET_RESOLVE_NOTE_PREFIX, RECOVERY_PAIRED_NOTE_PREFIX, LIVENESS_CONFIRMED_NOTE_PREFIX)):
         # Only ever rendered for the grouped-source resolve paths (see
-        # resolve_quiet_grouped()/resolve_recovery_paired()) and the liveness
-        # confirm path (maybe_check_liveness()) — an ordinary event-driven
-        # resolve clears `note` outright (apply_resolutions()), so this never
-        # fires for a genuine state-source (uk/docker/op_refs) recovery,
-        # which needs no caveat.
+        # resolve_quiet_grouped()/resolve_recovery_paired(), both STATE_QUIET)
+        # and the liveness confirm path (maybe_check_liveness(), STATE_FIXED)
+        # — an ordinary event-driven resolve clears `note` outright
+        # (apply_resolutions()), so this never fires for a genuine
+        # state-source (uk/docker/op_refs) recovery, which needs no caveat.
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"↳ _{_escape(primary['note'])}_"}]})
+    elif state == STATE_CLOSED:
+        # `closed`'s reason is the whole point of the state (a human said
+        # done, or a `merged` item ran out its 1h clock with nothing left to
+        # verify) — same principle as STATE_DISMISSED just below.
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+            f"↳ _{_escape(primary['note'] or 'closed, no reason recorded')}_"[:SECTION_TEXT_MAX]}]})
     elif state == STATE_DISMISSED:
         # The reason is the whole point of the state (see STATE_DISMISSED), and
         # the human reading this card is the one who was asked and did not
@@ -2475,6 +2568,16 @@ def _card_hash(blocks: list[dict[str, Any]]) -> str:
     return hashlib.sha256(json.dumps(blocks, sort_keys=True).encode()).hexdigest()
 
 
+# States a row can reach directly from `new` (or, for `dismissed`, from a
+# carded state whose deadline nobody answered) that must never receive a
+# FIRST card — see sync_card()'s own docstring for the incident this guards.
+# `dismissed` was already missing here before this slice (a known-open item);
+# it is in scope now purely because this line is being edited anyway for the
+# `resolved` split. Named once, as a tuple, rather than four inline literals
+# repeated at the one call site that checks them.
+_NEVER_CARDED_FIRST_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_DISMISSED)
+
+
 def sync_card(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: list[sqlite3.Row],
               policy: dict[str, Any], *, dry_run: bool) -> list[sqlite3.Row]:
     """Render this cluster's card and post/update Slack ONLY if the rendered
@@ -2485,19 +2588,19 @@ def sync_card(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: 
     describing even after a process restart. Returns the (possibly reloaded)
     member rows.
 
-    A `resolved` cluster with no `card_ts` was never carded in the first
-    place — every one of the resolve paths (apply_resolutions(),
-    resolve_quiet_grouped(), resolve_recovery_paired()) can flip an
-    unescalated `new` row straight to `resolved` on a quiet/disappeared
-    signal, and a card announcing the resolution of a problem nobody was
-    told about is exactly the noise this loop replaced (see CARDED_STATES's
-    own comment for the incident). The fix is a `chat.postMessage` this
-    branch must never make — an already-carded item still gets its final
-    `chat.update` below, unchanged."""
+    A cluster in one of _NEVER_CARDED_FIRST_STATES with no `card_ts` was
+    never carded in the first place — every one of the resolve paths
+    (apply_resolutions(), resolve_quiet_grouped(), resolve_recovery_paired())
+    can flip an unescalated `new` row straight to `quiet` on a
+    quiet/disappeared signal, and a card announcing the resolution of a
+    problem nobody was told about is exactly the noise this loop replaced
+    (see CARDED_STATES's own comment for the incident). The fix is a
+    `chat.postMessage` this branch must never make — an already-carded item
+    still gets its final `chat.update` below, unchanged."""
     if not members:
         return members
     primary = members[0]
-    if primary["state"] == STATE_RESOLVED and not primary["card_ts"]:
+    if primary["state"] in _NEVER_CARDED_FIRST_STATES and not primary["card_ts"]:
         return members
     blocks = render_card_blocks(members, event_rows, conn)
     new_hash = _card_hash(blocks)
@@ -2943,7 +3046,11 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 print(f"[dry-run] would resolve {item['signature']} on confirmed liveness: {detail}")
                 continue
             note = f"{LIVENESS_CONFIRMED_NOTE_PREFIX}{detail}"
-            _set_state(conn, item["event_id"], STATE_RESOLVED, now, note=note)
+            # -> STATE_FIXED, the only producer of it in this file: a change
+            # landed (merged + deployed) AND a live probe confirmed it, the
+            # one place a POSITIVE PROBE — not silence, not an inbound
+            # message — backs the claim.
+            _set_state(conn, item["event_id"], STATE_FIXED, now, note=note)
             conn.commit()
             fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
             if fresh_item is not None and fresh_event is not None:
@@ -3740,10 +3847,10 @@ def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: boo
     conn.commit()
 
 
-# --- CLI verbs: --snooze / --ignore / --reopen / --list ------------------------
+# --- CLI verbs: --snooze / --ignore / --reopen / --close / --list --------------
 
 def _items_for_signature(conn: sqlite3.Connection, signature: str) -> list[sqlite3.Row]:
-    """The three CLI verbs address a SIGNATURE, not an event, so they resolve
+    """The four CLI verbs address a SIGNATURE, not an event, so they resolve
     it to rows first and transition each through _set_state() — same reason
     unsnooze_if_expired() stopped being one set-based UPDATE: the deadline is
     written with the state, by one function, or it drifts."""
@@ -3812,11 +3919,40 @@ def cmd_reopen(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
     return 0
 
 
+def cmd_close(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> int:
+    """`closed`'s only HUMAN producer (its other producer, the `merged`
+    deadline's expiry, is a clock — see STATE_CLOSED and STATE_DEADLINES).
+    Addressed by signature like every other CLI verb (see
+    _items_for_signature()). A reason is required for the same reason
+    _set_state() already requires one for `dismissed`: a close with no reason
+    is indistinguishable from a bug, and the reason is the whole content of
+    the state."""
+    signature = _arg_value(argv, "--close")
+    reason = _arg_value(argv, "--reason")
+    if not signature:
+        print("triage: --close needs a signature", file=sys.stderr)
+        return 2
+    if not reason or not reason.strip():
+        print("triage: --close needs --reason <text>", file=sys.stderr)
+        return 2
+    rows = _items_for_signature(conn, signature)
+    for row in rows:
+        _set_state(conn, row["event_id"], STATE_CLOSED, now, note=reason.strip())
+    conn.commit()
+    if not rows:
+        print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
+        return 1
+    print(f"closed {signature}: {reason.strip()}")
+    return 0
+
+
 def cmd_list(conn: sqlite3.Connection) -> int:
+    # STATE_RESOLVED's three successors, and nothing else — `note`/`dismissed`/
+    # `ignored` stay listed, exactly as before the split.
     rows = conn.execute(
         "SELECT signature, state, repo, verb, occurrences, first_seen FROM triage_items "
-        "WHERE state != ? ORDER BY updated_at DESC",
-        (STATE_RESOLVED,),
+        "WHERE state NOT IN (?, ?, ?) ORDER BY updated_at DESC",
+        (STATE_FIXED, STATE_QUIET, STATE_CLOSED),
     ).fetchall()
     if not rows:
         print("no open triage items")
@@ -3839,6 +3975,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_ignore(conn, argv, now)
         if "--reopen" in argv:
             return cmd_reopen(conn, argv, now)
+        if "--close" in argv:
+            return cmd_close(conn, argv, now)
         if "--list" in argv:
             return cmd_list(conn)
         return run(conn, dry_run="--dry-run" in argv)

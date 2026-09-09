@@ -60,10 +60,10 @@ edges* and *Clustering* below.
    every poll (verified by reading it), so a second writer there would
    silently lose data. `triage_items` is a fully separate table for exactly
    this reason.
-2. **Reopen / unsnooze** — a `triage_items` row stuck in `resolved` whose
-   underlying event has since reopened flips back to `new` (never clearing
-   `artifact_url`/`dispatch_job`); a `snoozed` row whose `snoozed_until` has
-   passed flips back to `new`.
+2. **Reopen / unsnooze** — a `triage_items` row stuck in `quiet`, `fixed`,
+   `closed` or `dismissed` whose underlying event has since reopened flips
+   back to `new` (never clearing `artifact_url`/`dispatch_job`); a `snoozed`
+   row whose `snoozed_until` has passed flips back to `new`.
 3. **Classify** — fnmatch TWO match targets per event (`source:external_id`
    and `source:normalize_title(title)` — see *Match targets* below) against
    `config/triage-policy.json`, in this order:
@@ -82,7 +82,7 @@ edges* and *Clustering* below.
    A signature matching no rule stays `new` with `repo`/`verb` unset and is
    named in the daily digest so the map can grow deliberately.
 4. **Resolve** — an event whose `resolved_at` is now set flips its
-   `triage_items` row to `resolved` — but ONLY a row still in `new`
+   `triage_items` row to `quiet` — but ONLY a row still in `new`
    (`_SILENCE_RESOLVE_ELIGIBLE_STATES`). `resolved_at` is set by
    disappearance from observation, and observation ending never discharges an
    obligation (DESIGN.md principle 5), so every other state — `ignored`,
@@ -322,7 +322,7 @@ discharge of that obligation.
   has produced no new occurrence in `quietResolveHours` (policy knob, default
   2h — comfortably past the 30-min watchdog-poll cadence and short of either
   source's own 6h/24h reminder window, so one missed poll can never trip a
-  false resolve) flips to `resolved`. No new column needed:
+  false resolve) flips to `quiet`. No new column needed:
   `last_reminder_at`/`notified_at`/`first_seen` (the same idle anchor
   `sweep_stale_grouped()` itself uses) only advances when `watchdog-poll.py`
   re-stamps the row on a fresh occurrence, so a value that has stopped
@@ -332,22 +332,71 @@ discharge of that obligation.
 
 **Neither path ever means "fixed."** A service that is fully down also stops
 emitting, so silence is never proof of anything beyond silence, and a ✅
-message is HyperDX's own claim, not this loop's. The resolved card always
+message is HyperDX's own claim, not this loop's. Both land in `quiet`
+(see *The `resolved` split* below), never `fixed`. The quiet card always
 reads "signal quiet since \<time\>" (`QUIET_RESOLVE_NOTE_PREFIX`) or "recovery
 message observed: …" (`RECOVERY_PAIRED_NOTE_PREFIX`) — `render_card_blocks()`
-only surfaces `note` on a `resolved` card when it starts with one of those two
-prefixes, specifically so an ordinary event-driven resolve (which clears
-`note` outright) never inherits stale text from an earlier phase.
+only surfaces `note` on a `quiet`/`fixed` card when it starts with one of
+those prefixes, specifically so an ordinary event-driven resolve (which
+clears `note` outright) never inherits stale text from an earlier phase.
+
+## The `resolved` split
+
+Wave 2 splits the old single `resolved` state into three honest outcomes,
+because one state answering "closed how" for all three collapsed the
+headline metric *"closes that are verified fixes vs. silence"* to 2/28 —
+`resolved` was the number the loop reported, and a metric that improves the
+more questions go unanswered is precisely the failure this loop exists to
+remove.
+
+| State | Means |
+|-|-|
+| `fixed` | a change landed **and a positive signal confirmed it** |
+| `quiet` | the signal stopped and **nothing shipped** — never claims a fix |
+| `closed` | done without a verified positive signal — a human said so, or it landed and there was nothing left to verify |
+
+Five producers, three buckets:
+
+| Producer | State | Why |
+|-|-|-|
+| `apply_resolutions()` | `quiet` | `events.resolved_at` is set only by disappearance from observation — pure silence. |
+| `resolve_quiet_grouped()` | `quiet` | The 2h no-new-occurrence timer; its own note already says "NOT a confirmed fix". |
+| `resolve_recovery_paired()` | `quiet` | **The non-obvious one.** A `✅` recovery message is a positive OBSERVATION, but DESIGN.md § What must not be lost, item 4, is explicit: "Recovery-pairing is the strong path, the 2h timer the fallback, and neither ever claims a fix." Nothing shipped by this loop's own knowledge — the service recovered, by our hand or its own, and the loop cannot tell which. |
+| `maybe_check_liveness()` positive branch | `fixed` | **The only producer of `fixed` in the file.** A change landed (merged + deployed) AND a live probe confirmed it — a positive PROBE, not an inbound message and not silence. |
+| `merged` deadline expiry (`STATE_DEADLINES[STATE_MERGED]`) | `closed` | Landed, no deploy target configured for the repo — done, with nothing left to verify. |
+
+`cmd_close` (`--close <signature> --reason <text>`) is `closed`'s only HUMAN
+producer, mirroring `--snooze`/`--ignore`/`--reopen` exactly: it resolves a
+signature to its `triage_items` row(s) and transitions each through
+`_set_state()`. A reason is required, refused if empty, for the same reason
+`_set_state()` already requires one for `dismissed` — a close with no reason
+is indistinguishable from a bug.
+
+**`item_transitions`** — an append-only history table, written by
+`_set_state()` and by nothing else (the same reason `_set_state()` is the only
+writer of `triage_items.state`). One row per REAL state change (`from_state`,
+`to_state`, `at`, `note`); a column-only write with the state unchanged
+(`sync_card()` and friends writing `card_ts`/`dispatch_job`/etc. through
+`_set_state()`) is not recorded — recording it would fill the table with
+noise and corrupt every duration `/metrics` computes from it. It exists
+because three of `/metrics`'s six funnel numbers (median `needs_human` →
+decision, verified unattended fixes per week, reopen-after-`fixed`) are not
+derivable from the ledger without it: `triage_items.updated_at` is rewritten
+on every open row on every `ingest()` pass regardless of state, so it cannot
+answer "when did this item enter/leave a state" at all. The table starts
+**empty** — migration 4 records nothing retroactively, so a `/metrics` window
+that predates it reads as empty by construction, not as zero; do not mistake
+the two.
 
 ## Carded states
 
 A card exists ONLY once a cluster has left `new` — state in `investigating`,
-`verdict`, `needs_human`, `pr_open`, `resolved`, `dismissed`, or one of the
-auto-implement chain's own states (`implementing`, `validating`,
+`verdict`, `needs_human`, `pr_open`, `fixed`, `quiet`, `closed`, `dismissed`,
+or one of the auto-implement chain's own states (`implementing`, `validating`,
 `merge_blocked`, `merged`, `liveness_pending` — see *Closing the loop* below).
-`dismissed` is carded for the same reason `resolved` is: an item that HAD a
-card and then ran out of time is real news to the human who was asked and did
-not answer. An item that is mapped
+`dismissed` is carded for the same reason `fixed`/`quiet`/`closed` are: an
+item that HAD a card and then ran out of time is real news to the human who
+was asked and did not answer. An item that is mapped
 but hasn't yet crossed `minOccurrences`/`minOpenMinutes` — or is simply
 unmapped — is carried silently; it appears only in the daily digest (if
 unmapped) or not at all (if mapped but not yet eligible). `ignored` and
@@ -358,20 +407,21 @@ state) used to do.
 
 **Being in this list only makes a row ELIGIBLE for a card — `sync_card()` is
 where "was this item actually told to the human before" is enforced** (2026-09-08
-correction, the sibling failure the list above exists to prevent): `resolved`
+correction, the sibling failure the list above exists to prevent): `quiet`/`fixed`
 is reachable from `new` itself (`apply_resolutions()`,
 `resolve_quiet_grouped()` and `resolve_recovery_paired()` all flip an
-unescalated `new` row straight to `resolved` on a quiet/disappeared signal
+unescalated `new` row straight to `quiet` on a quiet/disappeared signal
 that was never carded — and `new` is the only state they may flip), and a card announcing the resolution of a problem the
 human was never told about is exactly the noise this whole file replaced —
 caught live from a 13-card burst where every card was a `new -> resolved`
-transition. `sync_card()` now refuses outright (zero Slack calls, neither
-`chat.postMessage` nor `chat.update`) whenever `state == resolved` and
-`card_ts` is still `NULL`; an item that had a card already still gets its
-final `chat.update`, unchanged. The invariant, stated once so every future
-state addition can be checked against it: **a card is a conversation with the
-human about an item they were told about; a state change on an item they were
-never told about is not news.**
+transition (today, a `new -> quiet` transition). `sync_card()` now refuses
+outright (zero Slack calls, neither `chat.postMessage` nor `chat.update`)
+whenever `state` is one of `fixed`/`quiet`/`closed`/`dismissed`
+(`_NEVER_CARDED_FIRST_STATES`) and `card_ts` is still `NULL`; an item that had
+a card already still gets its final `chat.update`, unchanged. The invariant,
+stated once so every future state addition can be checked against it: **a
+card is a conversation with the human about an item they were told about; a
+state change on an item they were never told about is not news.**
 
 ## State machine
 
@@ -385,12 +435,12 @@ new ──(escalate, clustered by repo)──> investigating ──(sweeper fold
  ├──(ignore rule / --ignore)──> ignored  (terminal, never carded, never digested)
  ├──(ignoreUnstructuredSlackProse)──> note  (terminal, never carded, but IN the daily digest)
  ├──(--snooze)──> snoozed ──(snoozed_until passes)──> new
- └──(event resolves)──> resolved ──(event reopens)──> new
+ └──(event resolves / quiet timer / recovery ✅)──> quiet ──(event reopens)──> new
 
 investigating ──(2h)──> needs_human      merge_blocked ──(7d)──> dismissed
 verdict ──────(24h)──> needs_human      needs_human ──(7d)──> dismissed
 implementing ─(2h)──> merge_blocked     pr_open ─────(14d)──> dismissed
-validating ───(1h)──> merge_blocked     merged ──────(1h)──> resolved
+validating ───(1h)──> merge_blocked     merged ──────(1h)──> closed
 
 implementing ──(implement episode done, PR opened)──> validating (step 7, a DIFFERENT model)
              └──(implement failed / no PR)──────────> merge_blocked
@@ -398,15 +448,17 @@ implementing ──(implement episode done, PR opened)──> validating (step 7
 validating ──(VALIDATION_CONFIRM_MARKER, merge lands)──> merged | liveness_pending (step 8/9)
            └──(disagree / error / merge refused)───────> merge_blocked
 
-liveness_pending ──(positive liveness match)──────────> resolved (step 10)
+liveness_pending ──(positive liveness match)──────────> fixed (step 10)
                  └──(window elapses, still not live)──> new  (REOPENED, full history on the card)
+
+(any signature, human call)──(--close <sig> --reason <text>)──> closed
 ```
 
-A row in `new` — and ONLY a row in `new` — also goes to `resolved` the
-moment the underlying event's `resolved_at` is set (see step 4). Once resolved, the row's
-rendered content stops changing, so the card-hash short-circuit (below)
-means it is genuinely never touched again — "stop touching it" falls out of
-the state machine, it isn't a separate rule.
+A row in `new` — and ONLY a row in `new` — also goes to `quiet` the
+moment the underlying event's `resolved_at` is set (see step 4). Once quiet,
+`fixed` or `closed`, the row's rendered content stops changing, so the
+card-hash short-circuit (below) means it is genuinely never touched again —
+"stop touching it" falls out of the state machine, it isn't a separate rule.
 
 ## Deadlines
 
@@ -427,25 +479,26 @@ nobody looked at again.
 | `implementing` | `poll_implement_jobs` | 2h | `merge_blocked` |
 | `validating` | `poll_validation_jobs` | 1h | `merge_blocked` |
 | `merge_blocked` | operator | 7d | `dismissed`, reason `unresolved` |
-| `merged` | the clock itself | 1h | `resolved` |
+| `merged` | the clock itself | 1h | `closed` |
 | `needs_human` | operator | 7d | `dismissed`, reason `expired` |
 | `pr_open` | operator | 14d | `dismissed`, reason `expired` |
-| `liveness_pending` | `maybe_check_liveness` | own column `liveness_deadline` | reopens to `new` with history |
+| `liveness_pending` | `maybe_check_liveness` | own column `liveness_deadline` | reopens to `new` with history, or `fixed` on a positive match |
 | `snoozed` | `unsnooze_if_expired` | own column `snoozed_until` | `new` |
 
-Three deviations from DESIGN.md's own table, all deliberate. `verdict` is not
-in it at all and is non-terminal — `maybe_auto_implement()` only advances a
-verdict that reads `nextAction=implement` at `confidence=high`, so every other
-one sits there with nothing scheduled to touch it. `merged` expires to
-`resolved` where the design says `closed`, because `closed` is part of the
-Wave 2 `resolved` split and does not exist yet. And `needs_human`'s "reminder
-at 1d" is NOT built: a reminder is a notification, not a deadline.
+Two deviations from DESIGN.md's own table remain, both deliberate. `verdict`
+is not in it at all and is non-terminal — `maybe_auto_implement()` only
+advances a verdict that reads `nextAction=implement` at `confidence=high`, so
+every other one sits there with nothing scheduled to touch it. `needs_human`'s
+"reminder at 1d" is NOT built: a reminder is a notification, not a deadline.
+(A third deviation — `merged` expiring to `resolved` instead of `closed` —
+was here until the `resolved` split landed; `merged` now expires to `closed`,
+matching DESIGN.md's own table exactly.)
 
 `dismissed` is terminal and always carries its reason in `note` —
 `_set_state()` raises rather than let a reasonless dismissal exist. It is
-deliberately neither `resolved` (nothing was fixed, and `resolved` is the
-number this system reports — a metric that improves the more questions go
-unanswered is the exact failure the loop exists to remove) nor `ignored` (that
+deliberately neither `quiet`/`fixed`/`closed` (nothing was necessarily fixed,
+and conflating "nobody answered" with a genuine close would corrupt the exact
+metric this split exists to make honest) nor `ignored` (that
 is a human calling a signature benign; an expiry is the *absence* of a human).
 
 Two mechanical properties hold this together. **Every transition goes through
@@ -589,8 +642,8 @@ shipped this file.
 
 A grouped or state source's `events` row is reused across a resolve -> recur
 cycle (same `UNIQUE(source, external_id)` constraint `upsert_grouped()`/
-`reconcile()` already rely on). `reopen_if_needed()` flips a `resolved`
-`triage_items` row back to `new` without ever clearing `artifact_url` or
+`reconcile()` already rely on). `reopen_if_needed()` flips a `quiet`/`fixed`/
+`closed`/`dismissed` `triage_items` row back to `new` without ever clearing `artifact_url` or
 `dispatch_job`. The next time that signature escalates, `_build_brief()`
 includes the prior artifact URL and tells the episode to check whether it
 already fixes the problem — including whether it simply hasn't been merged
@@ -678,7 +731,7 @@ the same day, not only discoverable later in `git log`.
 `resolve_quiet_grouped()` (step 4b) runs BEFORE `propose_mappings()` in the
 same cycle, and a `slack_alert`/`hermes_log` (`GROUPED_TRIAGE_SOURCES`) item
 that has produced no new occurrence in `quietResolveHours` (2h default) flips
-to `resolved` there — before `propose_mappings()`'s own `state=new` candidate
+to `quiet` there — before `propose_mappings()`'s own `state=new` candidate
 query ever runs. In practice this means most currently-unmapped grouped-source
 signatures (the majority of a real backlog — 16 of the 19 unmapped signatures
 in the live DB at the time this was built) never reach the candidate pool at
@@ -687,7 +740,7 @@ which disappearance-resolve via `events.resolved_at` instead) stay stably
 `new`. This is a faithful implementation of the brief's literal input
 contract ("every signature in STATE_NEW"), not a bug — but it is a real
 limitation worth a deliberate follow-up decision (e.g. whether the candidate
-query should also examine `resolved` grouped rows that were never escalated,
+query should also examine `quiet` grouped rows that were never escalated,
 i.e. `dispatch_job IS NULL`), not something this change decided unilaterally.
 
 ## `config/triage-policy.json` contract
@@ -810,9 +863,12 @@ committed.
 ## CLI verbs
 
 `--run` (default) · `--dry-run` · `--db <path>` · `--snooze <signature>
---hours N` · `--ignore <signature>` · `--reopen <signature>` · `--list`.
-`--snooze`/`--ignore`/`--reopen` mutate `triage_items` and exit immediately —
-they never call Slack or sideclaw. `--dry-run` runs the local bookkeeping
+--hours N` · `--ignore <signature>` · `--reopen <signature>` ·
+`--close <signature> --reason <text>` · `--list`.
+`--snooze`/`--ignore`/`--reopen`/`--close` mutate `triage_items` and exit
+immediately — they never call Slack or sideclaw. `--close` transitions to
+`closed` and refuses (non-zero) an empty `--reason` or an unknown signature,
+same as `_set_state()` already refuses a reasonless `dismissed`. `--dry-run` runs the local bookkeeping
 passes for real (ingest/reopen/unsnooze/classify/resolve — all side-effect-free
 against `triage_items` alone) so a preview against a throwaway copy of
 `watchdog.db` is meaningful, but never calls Slack (`post_blocks`/
@@ -1059,14 +1115,20 @@ and top-level key order intact after an applied `map` proposal, the commit
 (and the write itself) being skipped when `config/triage-policy.json` already
 carries a pending change, and `--dry-run` making zero model calls.
 
-**The current total is 102.** Every figure above (30 / 42 / 54 / 64 / 96) is
-the running tally *as each group of cases landed*, not the count today — they
-are kept because each paragraph describes what its own group covers. The
+**The current total is 107.** Every figure above (30 / 42 / 54 / 64 / 96 / 102)
+is the running tally *as each group of cases landed*, not the count today —
+they are kept because each paragraph describes what its own group covers. The
 number that governs is the one in `CLAUDE.md`: the regression gate, at
-**102/102**, and any other number is a finding rather than a count to edit.
+**107/107**, and any other number is a finding rather than a count to edit.
 The 32 cases past 64 are Wave 1's: the quiet rule (silence-resolve restricted
 to `new`), the intent queue's loop drain, and the deadline table. The 6 past
-96 are the `occurrence_mark` reopen fix (§ Known: grouped reopen churn).
+96 are the `occurrence_mark` reopen fix (§ Known: grouped reopen churn). The 5
+past 102 are the `resolved` split (§ The `resolved` split above):
+`resolve_recovery_paired()` never producing `fixed`, a `quiet`/`fixed`/`closed`
+card rendering with its caveat/reason, `_set_state()` recording exactly one
+`item_transitions` row per real change and none for a column-only write,
+`cmd_close`, and `sync_card()`'s never-carded guard reaching all four
+never-carded-first states.
 
 ## Known: grouped reopen churn, and why brain-sync is invisible
 

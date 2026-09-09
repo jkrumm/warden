@@ -153,7 +153,8 @@ def _row_counts(conn: sqlite3.Connection, tables) -> dict[str, int]:
 def test_fresh_migrate_creates_all_tables_and_indexes():
     conn = ledger.connect(_tmp_path(), migrate=True)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    for t in ("events", "cursors", "dispatches", "dispatch_approvals", "triage_items", "schema_version"):
+    for t in ("events", "cursors", "dispatches", "dispatch_approvals", "triage_items", "schema_version",
+              "item_transitions"):
         assert t in tables, f"missing table {t}"
     indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
     expected = {
@@ -164,6 +165,7 @@ def test_fresh_migrate_creates_all_tables_and_indexes():
         "idx_approvals_hash",
         "idx_triage_state",
         "idx_triage_state_deadline",   # version 2
+        "idx_item_transitions_event",  # version 4
     }
     assert indexes == expected, f"got {indexes}"
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
@@ -392,6 +394,63 @@ def test_v2_database_migrates_to_v3_matching_a_fresh_one():
     fresh = ledger.connect(_tmp_path(), migrate=True)
     fresh_cols = {t: _table_columns(fresh, t) for t in ledger._ADOPTABLE_TABLES}
     assert fresh_cols == cols, f"v2-upgraded schema diverges from a fresh one: {cols} != {fresh_cols}"
+    fresh.close()
+    conn.close()
+
+
+def test_migration_4_converts_resolved_to_quiet_and_creates_item_transitions():
+    """See _MIGRATION_4 — the literal 'resolved' string, not a symbolic
+    constant: triage.STATE_RESOLVED no longer exists after this migration
+    lands, and ledger.py must not import triage's constants to migrate
+    triage's own data. The table starts empty: migration 4 records nothing
+    retroactively."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    conn.executescript(ledger._MIGRATION_2)
+    conn.executescript(ledger._MIGRATION_3)
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (3, 'test')")
+    conn.execute("INSERT INTO events (source, external_id, title, first_seen) VALUES ('s','e1','one','now')")
+    conn.execute(
+        "INSERT INTO triage_items (event_id, signature, state, created_at, updated_at) "
+        "VALUES (1, 's:e1', 'resolved', 'now', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    row = conn.execute("SELECT state FROM triage_items WHERE event_id=1").fetchone()
+    assert row["state"] == "quiet", "migration 4 must convert every `resolved` row to `quiet`"
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "item_transitions" in tables
+    count = conn.execute("SELECT COUNT(*) FROM item_transitions").fetchone()[0]
+    assert count == 0, "the table starts empty — migration 4 records nothing retroactively"
+    conn.close()
+
+
+def test_v3_database_migrates_to_v4_matching_a_fresh_one():
+    """A real upgrade path, not adoption: a database already stamped at
+    schema_version 3 must reach SCHEMA_VERSION 4 with a schema identical to a
+    fresh database's, including the new item_transitions table."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    conn.executescript(ledger._MIGRATION_2)
+    conn.executescript(ledger._MIGRATION_3)
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (3, 'test')")
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    for table in (*ledger._ADOPTABLE_TABLES, "item_transitions"):
+        assert _table_columns(fresh, table) == _table_columns(conn, table), (
+            f"{table}: a v3-upgraded schema diverges from a fresh one")
     fresh.close()
     conn.close()
 
