@@ -7,8 +7,8 @@ This file records *what is*, not *what should be*.
 | | |
 |-|-|
 | Last updated | 2026-09-09 |
-| Current wave | **0 — reconnaissance complete, no edits made** |
-| Repo state | `master`, clean, 3 commits, docs only. No code. |
+| Current wave | **0 — cut over and live; docs pass + wave review outstanding** |
+| Repo state | `master`. The loop, poller, sweeper and backup run here on four LaunchAgents. |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -1021,12 +1021,12 @@ which. **Do not start Wave 1.**
 | # | Slice | Repo | Stop-condition item | Status |
 |-|-|-|-|-|
 | 0.1 | Repo policy module in sideclaw: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | sideclaw | **3 — sideclaw enforces the allowlist** | **DONE & LIVE** — sideclaw `2d225d4`, verified §20 |
-| 0.2 | Typed `outcome` enum on the dispatch verdict + a schema version, following the `review.ts:127` precedent. Publish the schema as a consumable artifact. | sideclaw | (Wave 0 scope per DESIGN.md § Migration; not in the five-item stop list, but stated work) | not started |
+| 0.2 | Typed `outcome` enum + schema version + `GET /api/dispatch-schema`. | sideclaw | DESIGN.md Wave 0 | **DONE & LIVE** — sideclaw `360990c`, §22 |
 | 0.3 | warden repo skeleton: venv (`cryptography` only), Makefile, `launchd/*.template`, hand-rolled test runner, log-rotate registration. | warden | 1, 5 | **done** — `89b0c12`, see §15 |
 | 0.4a | **Copy** the loop, the poller, the sweeper, the summary reader, the four suites and the two docs into warden. Sever the `agents-overview.py` seam. Repoint `hermes-ops.sh`. No behaviour change anywhere. | warden | 1, 2 | **done** — `040e3eb`, see §16 |
 | 0.4b | Cut over: unload `com.jkrumm.hermes-triage`, delete the two `cron/jobs.json` entries, delete the originals and the two orphan wrappers, load warden's agents. Folded into 0.6 — one short reversible flip, so there is never an interval with two loops or none. | warden + hermes-agent | 1, 5 | not started |
 | 0.5 | Ledger: WAL + `busy_timeout`, one migrator + `schema_version`. Code + tests only; the path move and the heartbeat snapshot go with the cutover. | warden | **4** (partly — see §19) | **done** — `de5d80d` |
-| 0.6 | LaunchAgents for the loop, the poller and the sweeper. Delete the two cron jobs from `cron/jobs.json`. Delete `watchdog-slack.py` + `dispatch-sweep-cron.py` **after** porting the UptimeKuma heartbeat (§5, carry-over #1). | warden + hermes-agent | **1, 5** | not started |
+| 0.6 | The cutover. | warden + hermes-agent | **1, 5** | **DONE & LIVE** — §23 |
 | 0.7 | hermes-agent cleanup: `dispatch-repos.json` ceilings for `sideclaw`/`warden` (§6), `HERMES_PLISTS`, `docs/symlinks-and-agents.md`, `dotfiles/docs/architecture.md:171`. | hermes-agent + dotfiles | 3 (defence in depth) | not started |
 
 **Ordering.** 0.1 and 0.2 are in a different repo and touch nothing warden owns —
@@ -1738,3 +1738,142 @@ artifact, not part of this change.
 - `dotfiles/docs/architecture.md:171`, which describes `com.jkrumm.hermes-triage`
   and why it is a LaunchAgent — rewrite at the cutover, when it stops being true.
 - `hermes-agent`'s `HERMES_PLISTS` and `docs/symlinks-and-agents.md` — same.
+
+---
+
+## 22. Slice 0.2 — the typed verdict (DONE & LIVE, sideclaw `360990c`)
+
+Nine structurally different endings were concatenated onto one prose field, and a
+tenth — the sensitive-withheld verdict — had no type at all. `DISPATCH_OUTPUT` now
+carries a required `outcome` and a `schemaVersion`, and the schema is fetchable.
+
+Live:
+
+```
+$ curl -s http://127.0.0.1:7705/api/dispatch-schema
+ok: True | version: 1
+outcomes: ['verdict_only','issue_declined','issue_failed','issue_filed','no_changes',
+           'diff_refused','branch_no_pr','pr_failed','pr_opened','salvaged','withheld']
+output schema: required = ['confidence','evidence','nextAction','outcome',
+                           'recommendation','schemaVersion','summary','verdict']
+worker tiers: ['author','implement','investigate']
+```
+
+Two precedence rules carry the weight, and both were read in the source rather
+than taken from the report:
+
+- **`withheld` beats everything.** `applySensitiveScan` spreads `...output` first
+  and sets `outcome: "withheld"` last, on **both** return paths. The real verdict
+  has been scanned out, so reporting `pr_opened` would be a lie about what reached
+  the caller.
+- **`salvaged` beats the tier outcomes**, because a salvaged run never reached them.
+
+`WORKER_OUTPUT` is untouched — the worker is not asked to classify this, and would
+be guessing where the handler observes. The prose strings are untouched too;
+humans read those in Slack cards.
+
+**Four of the eleven values are untested** — `verdict_only`, `issue_declined`,
+`issue_filed`, `issue_failed` are set inline after a live worker session returns
+and this repo has no seam for faking one. Recorded as a gap rather than covered by
+a test that asserts nothing. 555 tests pass; typecheck, lint (13 pre-existing
+warnings) and format clean.
+
+---
+
+## 23. Slice 0.6 — THE CUTOVER (DONE & LIVE)
+
+warden commits `e811fed`, `b6ec3d6`; hermes-agent `7db53c7`; dotfiles `d6d6559`.
+
+### Rollback, first, because it is the thing a later session will want
+
+Everything not in git was copied to **`~/.warden-cutover-backup/`** before a single
+change: `jobs.json.bak` (the cron registry — **not** in git, so `hermes cron delete`
+is otherwise unrecoverable), `watchdog.db.pre-cutover`, and the old
+`com.jkrumm.hermes-triage.plist`.
+
+**`~/.hermes/watchdog.db` is still there, untouched, frozen at its pre-cutover
+state.** To roll back: `make unload` in warden, restore the plist, `launchctl
+bootstrap` it, and re-create the two cron jobs from `jobs.json.bak`.
+
+### The sequence, and what was verified at each step
+
+| # | Step | Evidence |
+|-|-|-|
+| 1 | Back up the un-gitted state | three files in `~/.warden-cutover-backup/` |
+| 2 | `launchctl bootout com.jkrumm.hermes-triage` | no longer in `launchctl list` |
+| 3 | `hermes cron delete 4b1faabda97d` / `4dd759917dd1` | *"Removed job: Watchdog"*, *"Removed job: Dispatch sweep"*; 4 jobs remain |
+| 4 | `VACUUM INTO ~/.warden/warden.db` off a **read-only** handle | 956/9/22/5/49 rows, every column set and all six indexes identical, `schema_version` 1, `journal_mode` wal |
+| 5 | Repoint every reader/writer | all five warden scripts, `hermes-cc.sh`, the approval plugin, `briefing-context.py` |
+| 6 | Exercise by hand before trusting a timer | loop `--dry-run` (18 open items, zero Slack), loop `--run` rc=0, poller `--post --dry-run` zero calls, sweeper rc=0 |
+| 7 | `make agents` | four loaded, **all four exit status 0**, empty logs |
+| 8 | Confirm the *agents* (not my manual runs) are writing | `triage_last_run` 19s old, `slack_alert_ts` advanced by the poller |
+| 9 | Delete the originals + the two orphan wrappers | hermes-agent's nine suites all still pass |
+
+### What moved, and the two things that were not just path edits
+
+`config/triage-policy.json` came to warden, and that is **not** tidying:
+`propose_mappings()` writes that file and then `git commit`s it inside
+`TRIAGE_REPO_DIR`. While it lived outside this checkout that whole path returned
+early — the signature map could not extend itself at all (§16). It can again.
+`hermes-cc.sh` reads the same file for the merge/deploy half, via its own default
+now pointing here. One file, two readers, as it always was.
+
+`briefing-context.py` **stays in hermes-agent** and needs `watchdog-summary.py`,
+which left. Its `_run_subscript()` is best-effort and **returns silently on a
+missing file**, so deleting the script without repointing would have dropped the
+Watchdog State block from the morning briefing with nothing said. Repointed to
+warden's copy, env-overridable, with the silence documented at the call site.
+Verified: `WATCHDOG_AVAILABLE=true` and real items.
+
+### A regression caught by reading the code, not by the tests
+
+The `--post` path returned **before** the UptimeKuma heartbeat when the digest was
+empty. An empty digest is the **normal** case — quiet hours, or nothing new — so
+the *"Watchdog last successful run"* monitor would have gone red on every silent
+half hour. That monitor answers *"is the poller still running"*, not *"did it have
+news"*, and an alert that fires on every quiet poll is an alert that gets ignored,
+which is how eleven days of blindness went unnoticed the first time. **The test
+covering it asserted the wrong thing** and was corrected with the reason written
+beside it — my brief was ambiguous there, and the implementer read it reasonably.
+
+### Two more, in the backup script, found by running it
+
+1. macOS ships `/usr/bin/sqlite3` 3.51 **with no `-uri` flag**, so
+   `sqlite3 "file:$DB?mode=ro" "VACUUM INTO …"` opened the whole URI as a literal
+   filename and exited 14. The script degraded exactly as designed — shipped the
+   live file, skipped the heartbeat — so **the backup looked like it worked while
+   the consistent copy it exists to make was never taken.** Now goes through this
+   repo's venv and `ledger.snapshot()`: one `VACUUM INTO` implementation, not two.
+2. The rotation globbed unguarded, which under zsh is a hard error when nothing
+   matches — i.e. on the first run, always. `(N)` fixes it.
+
+**Backup verified end to end, not asserted:** two runs → two rotating snapshots →
+both on `homelab:/mnt/hdd/backups/warden/` → one pulled back and opened:
+
+```
+   events 956 · cursors 9 · dispatches 22 · dispatch_approvals 5 · triage_items 50
+   schema_version 1 · integrity_check ok
+```
+
+`triage_items` moved 49 → 50 between the migration and the restore. That is the
+live loop working.
+
+### Live state
+
+```
+$ make status
+  venv                     Python 3.11.15
+    ✓ com.jkrumm.warden-loop    ✓ com.jkrumm.warden-poll
+    ✓ com.jkrumm.warden-sweep   ✓ com.jkrumm.warden-backup
+  ledger                   968K
+$ launchctl list | grep warden      # second column is last exit status
+  -  0  com.jkrumm.warden-sweep     -  0  com.jkrumm.warden-backup
+  -  0  com.jkrumm.warden-poll      -  0  com.jkrumm.warden-loop
+```
+
+### Known, and expected in the logs
+
+An assert-only process that fires before the migrator on a **fresh** ledger errors
+once and self-heals (§19). It did not happen here — the ledger was migrated
+explicitly at step 4, before any agent was loaded — but it is the shape to expect
+on a rebuild.
