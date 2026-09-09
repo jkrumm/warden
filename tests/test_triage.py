@@ -2530,6 +2530,83 @@ def test_a_non_terminal_row_with_no_deadline_is_stamped_from_now_and_reported():
             "a deadline that moves every pass is the bug this slice exists to close")
 
 
+def test_dry_run_never_expires_an_item():
+    """`--dry-run` defaults to the LIVE ledger, and this sweeper is the one
+    local-bookkeeping step that can move an item TERMINALLY. The three steps
+    the dry-run contract was written around (apply_resolutions, classify,
+    resolve_quiet_grouped) move an item between working states, and the next
+    real pass re-derives whatever they did. A dismissal is not re-derivable:
+    reopen_if_needed() is the only way back and it needs a fresh occurrence.
+    A preview must not be able to end an item."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_expiring_item(conn, external_id="sig-dryrun-expire",
+                                   state=triage.STATE_NEEDS_HUMAN,
+                                   state_deadline=(NOW - dt.timedelta(hours=1)).isoformat())
+        triage.sweep_deadlines(conn, NOW, dry_run=True)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, (
+            f"--dry-run terminally dismissed a live item: {item['state']}")
+
+        triage.sweep_deadlines(conn, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_DISMISSED
+
+
+def test_dry_run_never_stamps_a_legacy_deadline():
+    """Same reason, the other write in this function."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_expiring_item(conn, external_id="sig-dryrun-stamp",
+                                   state=triage.STATE_NEEDS_HUMAN, state_deadline=None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            triage.sweep_deadlines(conn, NOW, dry_run=True)
+        assert triage._get_item(conn, eid)["state_deadline"] is None
+
+
+def test_a_dismissed_signature_that_recurs_comes_back():
+    """`dismissed` means NOBODY answered before the deadline — not that a
+    human looked and said benign, which is what `ignored` and `note` mean and
+    why those two stay closed. A fresh occurrence is new information about a
+    question that was never actually decided.
+
+    Without this, item 1 would be handed straight back by item 3's clock: a
+    `needs_human` row protected from silence-resolve would instead go terminal
+    on a 7-day fuse and never be seen again however often its monitor fired.
+    The four real `uk:*` rows on the live ledger are exactly that shape."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-dismissed-recur",
+                             title="🚨 keeps firing", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
+            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid, "slack_alert:sig-dismissed-recur", "demo-repo", triage.STATE_DISMISSED,
+             "deadline expired: nobody answered", 3, OLD.isoformat(), OLD.isoformat(),
+             NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+
+        triage.reopen_if_needed(conn, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW, (
+            "a dismissed signature that fires again must reopen — nobody ever decided it")
+
+
+def test_ignored_and_note_stay_closed_when_their_signature_recurs():
+    """The other half of the rule above, so the two are not conflated: a human
+    DID look at these and said benign, so a recurrence tells us nothing new."""
+    with _triage_env() as (conn, _ctx):
+        for state, ext in ((triage.STATE_IGNORED, "sig-ign-recur"), (triage.STATE_NOTE, "sig-note-recur")):
+            eid = _insert_event(conn, source="slack_alert", external_id=ext,
+                                 title="🚨 benign", first_seen=OLD)
+            conn.execute(
+                "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, "
+                "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (eid, f"slack_alert:{ext}", "demo-repo", state, 3, OLD.isoformat(),
+                 OLD.isoformat(), NOW.isoformat(), NOW.isoformat()),
+            )
+            conn.commit()
+            triage.reopen_if_needed(conn, NOW)
+            assert triage._get_item(conn, eid)["state"] == state, (
+                f"{state} must stay closed on recurrence — a human decided it was benign")
+
+
 def test_a_stamped_legacy_row_then_actually_expires():
     """End to end on the population that motivated the stamp: a pre-column
     `needs_human` row is bounded on one pass and dismissed on a later one, so

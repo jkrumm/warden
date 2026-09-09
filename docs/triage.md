@@ -1059,6 +1059,14 @@ and top-level key order intact after an applied `map` proposal, the commit
 (and the write itself) being skipped when `config/triage-policy.json` already
 carries a pending change, and `--dry-run` making zero model calls.
 
+**The current total is 96.** Every figure above (30 / 42 / 54 / 64) is the
+running tally *as each group of cases landed*, not the count today — they are
+kept because each paragraph describes what its own group covers. The number
+that governs is the one in `CLAUDE.md`: the regression gate, at **96/96**, and
+any other number is a finding rather than a count to edit. The 32 cases past
+64 are Wave 1's: the quiet rule (silence-resolve restricted to `new`), the
+intent queue's loop drain, and the deadline table.
+
 ## Known: grouped reopen churn, and why brain-sync is invisible
 
 Two related defects, both measured 2026-09-09, neither fixed. They are written
@@ -1066,8 +1074,8 @@ down because each is easy to re-derive wrongly.
 
 ### A grouped item reopens every run
 
-`reopen_if_needed()` reopens a `resolved` triage item whenever its event has
-`resolved_at IS NULL`. For a grouped source (`slack_alert`, `hermes_log`) that
+`reopen_if_needed()` reopens a `resolved` (and, since Wave 1, a `dismissed`)
+triage item whenever its event has `resolved_at IS NULL`. For a grouped source (`slack_alert`, `hermes_log`) that
 column stays NULL for months — `watchdog-poll.py`'s `sweep_stale_grouped()`
 only clears it after 7 idle days, deliberately. So a quiet-resolved grouped item
 is reopened on the very next run, quiet-resolves again, and repeats every ten

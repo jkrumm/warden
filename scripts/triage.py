@@ -1241,11 +1241,22 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime) -> None:
     that has since reopened would otherwise sit invisible forever. Reopening
     to `new` (never clearing artifact_url/dispatch_job) is exactly what lets
     the next escalation's brief say "a PR already exists for this signature"
-    instead of re-discovering it from scratch."""
+    instead of re-discovering it from scratch.
+
+    `dismissed` reopens too, and the distinction matters. `ignored` and `note`
+    do NOT, because a human looked at those and said benign — a recurrence
+    tells us nothing new. `dismissed` is the opposite: it means NOBODY
+    answered before the deadline (see STATE_DEADLINES / sweep_deadlines), so a
+    fresh occurrence is new information about a question that was never
+    actually decided. Without this, item 1's whole point would be handed back
+    by item 3's clock — a `needs_human` row protected from silence-resolve
+    would instead go terminal on a 7-day fuse and never be seen again however
+    often its monitor fired. Terminal means "this item is closed", not "this
+    signature may never open another"."""
     rows = conn.execute(
         "SELECT ti.event_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state=? AND e.resolved_at IS NULL",
-        (STATE_RESOLVED,),
+        "WHERE ti.state IN (?, ?) AND e.resolved_at IS NULL",
+        (STATE_RESOLVED, STATE_DISMISSED),
     ).fetchall()
     for row in rows:
         _set_state(conn, row["event_id"], STATE_NEW, now)
@@ -2882,20 +2893,31 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
     an expiry the human never sees is the same as no expiry at all, so the
     state change has to land before sync_card() renders this pass's cards.
 
-    Local bookkeeping with no outbound call, so it runs FOR REAL under
-    --dry-run, exactly like apply_resolutions()/classify()/
-    resolve_quiet_grouped() — the dry-run contract is "never touches Slack,
-    never shells out, everything else real". It prints every expiry it applies
-    either way, because a deadline that fires silently is indistinguishable
-    from a loop that is not firing them at all.
+    UNDER --dry-run THIS REPORTS AND DOES NOT WRITE, which is a departure from
+    apply_resolutions()/classify()/resolve_quiet_grouped() and is deliberate.
+    Those three move an item between working states; this one can move it
+    TERMINALLY, to `dismissed`, and `--dry-run` defaults to the live ledger.
+    "Never touches Slack, never shells out, everything else real" was written
+    around writes that the next real pass would re-derive anyway. A terminal
+    dismissal is not re-derivable — `reopen_if_needed()` is the only way back
+    and it needs a fresh occurrence. A preview must not be able to end an item.
+    It prints every expiry it WOULD apply, because a deadline that fires
+    silently is indistinguishable from a loop that is not firing them at all.
 
-    A NON-TERMINAL row with a NULL `state_deadline` is reported to stderr and
-    left alone. It is a finding, not permission to sit forever — but it is not
-    backfilled either: `updated_at` is the only anchor available and ingest()
-    rewrites it every pass for every open event, so a deadline derived from it
-    would move further away on every run and never fire, while looking
-    authoritative. The rows that predate schema version 2 are the reason this
-    prints rather than guesses."""
+    A NON-TERMINAL row with a NULL `state_deadline` is stamped `now + hours`
+    and reported. Two anchors were possible and only one is safe: `updated_at`
+    is rewritten by ingest() on every recurrence, so a deadline derived from it
+    would move further away every pass and never fire while looking
+    authoritative. `now` cannot drift that way, and it is deliberately
+    conservative — a row already six days into `needs_human` gets a fresh 168h
+    rather than expiring at once.
+
+    Reporting WITHOUT stamping was the first version and it was wrong in the
+    only case that occurs: every NULL-deadline row on the live ledger is
+    `needs_human`, and only a human transitions one, so "it gets a deadline
+    when it next transitions" meant never. It stays a FINDING because a NULL
+    deadline is either a pre-column legacy row or a bug in a transition site,
+    and silently fixing the second is how it stays a bug."""
     now_iso = _now_iso(now)
     # The string comparison is a prefilter over the state_deadline index (the
     # same shape unsnooze_if_expired() uses on snoozed_until); _parse_ts()
@@ -2925,6 +2947,11 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
         if rule.reason:
             note += f" — reason `{rule.reason}`"
         note += "."
+        if dry_run:
+            print(f"[dry-run] would expire {row['signature']} (event {row['event_id']}): "
+                  f"{row['state']} -> {rule.on_expiry} after {rule.hours:g}h with no advance "
+                  f"from {rule.poller}")
+            continue
         _set_state(conn, row["event_id"], rule.on_expiry, now, note=note)
         print(f"triage: deadline expired for {row['signature']} (event {row['event_id']}): "
               f"{row['state']} -> {rule.on_expiry} after {rule.hours:g}h with no advance "
@@ -2960,6 +2987,10 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
         # transition site, and silently fixing the second is how it stays a bug.
         rule = STATE_DEADLINES[row["state"]]
         stamped = now + dt.timedelta(hours=rule.hours)
+        if dry_run:
+            print(f"[dry-run] would stamp {row['signature']} (event {row['event_id']}) in "
+                  f"{row['state']!r} with a {rule.hours:g}h deadline", file=sys.stderr)
+            continue
         conn.execute(
             "UPDATE triage_items SET state_deadline=? WHERE event_id=? AND state_deadline IS NULL",
             (_now_iso(stamped), row["event_id"]),

@@ -3078,3 +3078,157 @@ section).
   `dismissed` row that somehow lacked `card_ts` would post a first card.
 - `docs/triage.md` §Tests still counts "30 cases"; `CLAUDE.md` still pins the
   gate at 68/68. Both stale.
+
+---
+
+## 35. Wave 1 — final state, against the stop condition
+
+A fresh reviewer with no context checked the diff and the running system against
+DESIGN.md and FLOWS.md. It confirmed items 1-4 by independent measurement
+(including running its own mutations), found **five defects**, and its most
+valuable finding was about this file: §§26-34 contained **no stop-condition
+roll-up and no record of item 5 at all**, so a stranger would have read Wave 1 as
+four items, all done. The escalation existed only in the orchestrator's chat —
+which is the exact thing STATE.md exists to prevent. That omission is corrected
+by this section.
+
+### The stop condition, item by item
+
+| # | Condition | Status | Evidence |
+|-|-|-|-|
+| 1 | Silence-resolve applies only to `new`; a `needs_human` item cannot be discarded by a fault clearing itself | **MET** | `aa30ddc`. Old vs new on live snapshots: the old loop resolved all four real `needs_human` rows and erased all four notes; the new one keeps them. Reviewer's own mutation to `(new, needs_human)` fails 4 tests by name. |
+| 2 | An intent can be recorded by any surface and signed only by Slack or a TTY | **HALF MET** | `c788416` (`intents.py`, records with no DB handle at all), `0245f98` (loop drains as backstop), `3c5d516` (Slack signs). **The TTY half is item 5 and is unbuilt.** |
+| 3 | The approval plugin no longer writes the ledger directly | **MET** | `3c5d516`. Both handles `mode=ro` (`__init__.py:263,393`). Gateway restarted 15:59:27, pubkey rotated — the new plugin is live, verified by the reviewer. |
+| 4 | Every non-terminal state carries a `state_deadline` and a named poller that survives sideclaw pruning | **MET** | `4c3b8c9`. `STATE_DEADLINES` + the principle-6 enumeration test; `grep -c 'UPDATE triage_items SET state='` → 1. The reviewer watched the **17:34:38Z** loop tick stamp all four `needs_human` rows to `2026-09-16T17:34:38Z` while the three `new` rows correctly stayed NULL. |
+| 5 | The CLI decide path works at a TTY with the gateway stopped | **NOT MET — BLOCKED** | See below. |
+
+### Item 5 — blocked on a contradiction inside DESIGN.md, not on effort
+
+Independently confirmed by the reviewer. Three statements that cannot all hold:
+
+- `DESIGN.md:285` — the signer's key is **RAM-only, failure domain "gateway process"**.
+- `DESIGN.md:336` and `FLOWS.md:165` — approval is mintable by "Slack Socket Mode **or a TTY-gated CLI**".
+- `FLOWS.md` flow 5 — the flow the TTY path exists for **is the gateway being wedged**.
+
+`require_signed_approval()` reads exactly one public key from one file
+(`hermes-cc.sh:1131`, `Ed25519PublicKey.from_public_bytes(open(A_PUB).read())`,
+no loop). With the gateway stopped, **no signature can exist at all** — so the
+TTY path is *unimplementable as specified*, not merely unbuilt. The obvious
+shortcut (the CLI asks the running gateway to sign) reintroduces the signing
+oracle REVIEW.md **C1** already rejected.
+
+**Nothing in the diff pretends otherwise** — the reviewer checked: no `isatty`,
+no `--decide`, no signing code anywhere in warden.
+
+**Recommended resolution, awaiting a decision.** Not "no key at all": the threat
+is not the network, it is the episode. warden's own CLAUDE.md — *"an episode is
+not contained … a bearer token on this host is not an authorization boundary
+against an episode"* — and a brief is attacker-influenceable, so an unsigned
+approval row is one an injected episode can write itself, and Tailscale does not
+exclude an adversary that arrived as text inside a brief. But **no key at rest**:
+
+```
+TTY signer: Ed25519 seed = scrypt(passphrase, salt)   # derived, never stored
+  - nothing on disk to steal
+  - the passphrase IS the TTY gate: an episode has no TTY and does not know it
+  - require_signed_approval() reads a pubkey DIRECTORY, not one file, and
+    accepts either signer
+```
+
+This needs a passphrase typed once by a present human to mint the pubkey, which
+is why it is escalated rather than decided.
+
+### The five defects the reviewer found, and their disposition
+
+| # | Defect | Fixed in |
+|-|-|-|
+| 1 | `sweep_deadlines()`'s docstring said a NULL deadline "is not backfilled either" while the code 40 lines down backfilled it — a lying comment inside the function that decides when work is terminally dismissed | this commit |
+| 2 | `CLAUDE.md` pinned the regression gate at 68/68 against an actual 96 — the next stranger, following it literally, reports a healthy suite as a defect | this commit |
+| 3 | `docs/triage.md` counted 30/42/54/64 cases | this commit — now says the current total and that those are the running tally as each group landed |
+| 4 | `scripts/watchdog-summary.py:118` opened the LIVE ledger with a bare writable handle and only ever SELECTed — the exact defect this wave fixed in the plugin's `_load_invocation()` | this commit |
+| 5 | this file had no Wave 1 roll-up and no record of item 5 | this section |
+
+### Corrections to what §§31-34 asserted
+
+- **§31 overstated "a partial poll is self-healing".** The reviewer is right and
+  the correction matters: `reconcile()` stamps `notified_at` when it collects a
+  new event (`watchdog-poll.py:924`), but the digest is composed and posted only
+  after `_run_poll()` returns. Before the per-source commits, a mid-poll
+  exception rolled everything back and nothing was burnt. Now, sources committed
+  before a crash keep `notified_at` and **never appear as NEW in any digest** —
+  they resurface as a reminder up to 24h later. The *rows* re-derive; **the
+  notification stamp does not.** That is a narrower instance of exactly what
+  `reconcile()`'s `deliver=False` exists to prevent. The trade is still right —
+  the alternative was a deadlocked act-loop, and each probe is individually
+  exception-safe so the window is small — but §31 should have said this, and
+  now does.
+- **§32's "six writers → two" omitted `watchdog-summary.py`**, which held a
+  writable handle. It is now genuinely two (warden, `hermes-cc.sh`). And
+  §32's "the gateway is still running the old plugin" was true when written and
+  is now stale: the restart happened at 15:59:27.
+- **`STATE.md:801` said `watchdog-summary.py` was "read-only".** That was false
+  of the handle it opened. It is true now.
+
+### Two things fixed here that the wave itself created
+
+- **`sweep_deadlines()` now honours `--dry-run`.** It was the one
+  local-bookkeeping step that could move an item *terminally*, and `--dry-run`
+  defaults to the live ledger. The three steps the dry-run contract was written
+  around move an item between working states and the next real pass re-derives
+  them; a dismissal is not re-derivable. A preview must not be able to end an
+  item. Its `dry_run` parameter was also accepted and never read.
+- **A `dismissed` signature that recurs now reopens.** Without this, item 1 would
+  have been handed straight back by item 3's clock: a `needs_human` row
+  protected from silence-resolve would instead go terminal on a 7-day fuse and
+  never be seen again however often its monitor fired — and the four real `uk:*`
+  rows now carrying `2026-09-16T17:34Z` deadlines are exactly that shape.
+  `ignored` and `note` deliberately do NOT reopen: a human looked at those and
+  said benign. `dismissed` means *nobody answered*, which is not the same fact.
+
+`~/.warden/warden.db` also went from mode 644 to 600, matching the care already
+taken with the intents spool one directory over.
+
+### Verified, not claimed
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   12/12 passed
+  test_triage.py                   96/96 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+
+hermes-agent: test_dispatch_approval.py 83 checks · test_hermes_cc.py 165 cases
+```
+
+The reviewer separately confirmed, by restoring it: **the rollback still works.**
+`~/.warden-cutover-backup/watchdog.db.pre-cutover` run through
+`ledger.connect(migrate=True)` reaches version 2, gains `state_deadline`, keeps
+49 items / 956 events, and ends with a schema identical to a freshly created one
+— which is precisely the property §33's adoption fix was written to restore.
+
+It also traced the `intents.py` threat model end to end and confirmed it: a
+forged `approve` carrying a garbage signature hits `InvalidSignature` in
+`hermes-cc.sh:1113`, falls through to `pending`, and **nothing dispatches**. The
+one refinement worth recording: a forged row does permanently block the real
+click (`AND decision IS NULL`) and Slack then renders "already decided", so it is
+a *permanent and misleadingly-labelled* denial. Still a denial, still inside "at
+worst deny" — but the label is wrong, and Wave 2 should say "superseded" rather
+than "already decided" when the signature does not verify.
+
+### Still open, in priority order
+
+1. **Item 5** — needs the decision above. Wave 1 is not closed until it lands.
+2. `sync_card()`'s never-carded guard covers only `STATE_RESOLVED`, so a
+   `dismissed` row that somehow lacked `card_ts` would post a first card.
+3. The `needs_human` "reminder at 1d" from DESIGN.md's deadline table is
+   deliberately unbuilt (a reminder is a notification, not a deadline).
+4. `docs/triage.md` § "Known: grouped reopen churn" is still an open defect,
+   unchanged by this wave.
+
+### Next action
+
+**Do not start Wave 2.** Resolve item 5 first — it is the last Wave 1 item, and
+it is one design decision plus roughly a day of work, not a wave.

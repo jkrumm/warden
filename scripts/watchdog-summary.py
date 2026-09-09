@@ -115,7 +115,7 @@ def main() -> int:
         print("WATCHDOG_AVAILABLE=false")
         return 0
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     now = dt.datetime.now(dt.timezone.utc)
 
