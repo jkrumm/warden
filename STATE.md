@@ -1025,7 +1025,7 @@ which. **Do not start Wave 1.**
 | 0.3 | warden repo skeleton: venv (`cryptography` only), Makefile, `launchd/*.template`, hand-rolled test runner, log-rotate registration. | warden | 1, 5 | **done** — `89b0c12`, see §15 |
 | 0.4a | **Copy** the loop, the poller, the sweeper, the summary reader, the four suites and the two docs into warden. Sever the `agents-overview.py` seam. Repoint `hermes-ops.sh`. No behaviour change anywhere. | warden | 1, 2 | **done** — `040e3eb`, see §16 |
 | 0.4b | Cut over: unload `com.jkrumm.hermes-triage`, delete the two `cron/jobs.json` entries, delete the originals and the two orphan wrappers, load warden's agents. Folded into 0.6 — one short reversible flip, so there is never an interval with two loops or none. | warden + hermes-agent | 1, 5 | not started |
-| 0.5 | Ledger: WAL + `busy_timeout`, one migrator + `schema_version`, one writer, `VACUUM INTO` backup on the heartbeat landing on a restic-covered path (§2). Stop-copy-verify if the file moves (Q1). | warden | **4** | not started |
+| 0.5 | Ledger: WAL + `busy_timeout`, one migrator + `schema_version`. Code + tests only; the path move and the heartbeat snapshot go with the cutover. | warden | **4** (partly — see §19) | **done** — `de5d80d` |
 | 0.6 | LaunchAgents for the loop, the poller and the sweeper. Delete the two cron jobs from `cron/jobs.json`. Delete `watchdog-slack.py` + `dispatch-sweep-cron.py` **after** porting the UptimeKuma heartbeat (§5, carry-over #1). | warden + hermes-agent | **1, 5** | not started |
 | 0.7 | hermes-agent cleanup: `dispatch-repos.json` ceilings for `sideclaw`/`warden` (§6), `HERMES_PLISTS`, `docs/symlinks-and-agents.md`, `dotfiles/docs/architecture.md:171`. | hermes-agent + dotfiles | 3 (defence in depth) | not started |
 
@@ -1470,3 +1470,129 @@ $ bun run format:check # All matched files use the correct format.
 Two transient self-inflicted breakages were caught and fixed on the way: an
 unescaped backtick that terminated the MCP tool's template literal, and a
 `raw` shadow in `applySensitiveOverrides` that pushed lint from 13 to 14.
+
+---
+
+## 19. Slice 0.5 — the ledger (DONE, `de5d80d`)
+
+**Nothing running changed.** The live ledger is byte-for-byte where it was, no
+`-wal`/`-shm` appeared beside it, `~/.warden/` was never created, and warden's
+agents are still unloaded.
+
+### What it replaced
+
+| Table | Was declared in |
+|-|-|
+| `dispatches` | **three** places — `hermes-cc.sh:757`, `dispatch-sweep.py:156`, `triage.py:595` |
+| `events` | **two** — `watchdog-poll.py:246`, `triage.py:579` |
+| `cursors` | two |
+
+…plus `ALTER TABLE` blocks duplicated across pairs of files that each believed
+they owned the migration, no `schema_version`, `user_version=0`, and
+`journal_mode=delete`.
+
+`scripts/ledger.py` (403 lines) now owns `BASE_SCHEMA` (5 tables + 6 indexes,
+lifted from a read-only connection to the live database, not retyped),
+`MIGRATIONS`, `schema_version`, `connect()`, `assert_schema_version()` and
+`snapshot()`.
+
+| Caller | Mode |
+|-|-|
+| `triage.py` (the loop) | `connect(migrate=True)` — **the only migrator**, per DESIGN.md |
+| `watchdog-poll.py`, `dispatch-sweep.py` | `connect()` — assert-only; they used to invent their own tables if they ran first |
+
+Pragmas on every writable connection: `journal_mode=WAL`, an **explicit**
+`busy_timeout=5000` (true before only by accident of `sqlite3.connect`'s stdlib
+default, and no non-Python writer of the file got it at all), and
+`synchronous=NORMAL` — which under WAL still cannot corrupt the file and only
+risks losing transactions this loop re-derives on its next 10-minute pass.
+
+### Adoption is the normal case
+
+A database carrying all five tables with no `schema_version` is the **live
+ledger**, not a fresh one: it is a file four processes have been writing to for
+months. It is stamped, never rebuilt — three reads and one small write, and
+`BASE_SCHEMA` never runs against it.
+
+Verified independently by the orchestrator against a read-only `VACUUM INTO` copy
+of the live database:
+
+```
+schema_version before: False | after: True
+  cursors              rows     9 -> 9     OK  cols OK
+  dispatch_approvals   rows     5 -> 5     OK  cols OK
+  dispatches           rows    22 -> 22    OK  cols OK
+  events               rows   956 -> 956   OK  cols OK
+  triage_items         rows    49 -> 49    OK  cols OK
+indexes identical: True [idx_approvals_hash, idx_dispatches_created,
+  idx_dispatches_open, idx_events_open, idx_events_resolved_at, idx_triage_state]
+stamped version: 1
+journal_mode: wal | busy_timeout: 5000 | synchronous: 1
+```
+
+### One trap that adoption sets for itself — closed
+
+Deciding adoption on **table presence alone** means a database with all five
+tables but missing a column that only ever arrived via a runtime `ALTER TABLE`
+would be stamped version 1 and then fail as a bare `no such column` from inside
+the loop, hours later, with nothing connecting it back to the stamp.
+
+`_verify_columns()` now checks the stamp against the schema it claims, on both
+migration paths. Expected columns are derived by running `BASE_SCHEMA` against an
+in-memory database rather than kept as a second hand-written list — a copy of a
+schema is a thing that drifts from the schema. **Missing** columns are fatal and
+named; **extra** ones are not, because a newer warden's column should not be an
+outage. Two tests pin both directions.
+
+### Validation
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_ledger.py                   11/11 passed
+  test_triage.py                   68/68 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ ls -la ~/.hermes/watchdog.db*
+-rw-r--r--@ 1 jkrumm staff 1081344 Sep 9 13:34 /Users/jkrumm/.hermes/watchdog.db
+   (no -wal, no -shm; mtime moves only because the LIVE hermes-triage agent is
+    still running its own 10-minute pass against it, which is expected)
+```
+
+Three test fixtures changed, and they were checked for exactly the failure mode
+that matters: `test_dispatch_sweep.py`, `test_watchdog_delivery.py` and
+`test_watchdog_slack_blindness.py` each gained **one** line calling
+`_ledger.connect(tmp, migrate=True)` before exercising the now-assert-only
+`db_connect()`, standing in for the loop's boot migration. **No assertion was
+changed, weakened or skipped** — the fixtures relied on `db_connect()`
+self-creating tables, which is precisely the behaviour this slice removes.
+
+Also repointed four stale `Source of truth: ~/SourceRoot/hermes-agent/scripts/…`
+docstrings that have been wrong since slice 0.4a.
+
+### Consequences to carry into the cutover
+
+- **`watchdog-poll.py` and `dispatch-sweep.py` now fail loudly against an
+  unmigrated ledger.** That is the design — an assert-only process racing the
+  migrator on a fresh mini must not silently create its own tables. But it means
+  at first boot after the cutover, if the poller (30 min) or the sweeper (5 min)
+  fires before the loop (10 min) has migrated, it errors once and self-heals on
+  the next pass. Expect it in the logs; it is not a regression. `RunAtLoad` on the
+  loop's plist makes the window small.
+- **`--dry-run` against the live `~/.hermes/watchdog.db`** likewise fails until
+  the loop has migrated that file. Verified safe: `watchdog-poll.py --dry-run`
+  does its `shutil.copy2` *before* the failure, so nothing is written to the live
+  file.
+
+### Where this leaves the stop condition's "one writer"
+
+Honestly: **not met, and it cannot be in Wave 0.** WAL, one migrator and
+`schema_version` are done. But "one writer *process*" requires the intent queue
+that DESIGN.md § Migration puts in **Wave 1**, and the approval plugin's direct
+`UPDATE dispatch_approvals` — which DESIGN.md § The ledger also assigns to the
+post-extraction step. Six writers remain: the loop, the poller, the sweeper,
+`hermes-cc.sh` (twice), and the plugin. What Wave 0 delivers is **one writer
+*module*** — a single place that owns the schema, the pragmas and the transaction
+discipline — plus WAL, which removes the reader-blocks-writer failure that made
+multiple writers acute. The gap is named rather than narrowed.
