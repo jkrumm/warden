@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jkrumm.warden-loop</string>
+  <!-- The act-loop. Turns deduplicated ledger events into one durable,
+       updated-in-place Slack card per problem and, once eligible, a real sideclaw
+       episode in the owning repo. No LLM call decides a state transition — the
+       episodes each run one, the loop never does.
+
+       A LaunchAgent and not a `hermes cron` job, and this is the argument the whole
+       repo is built on: a gateway cron job is scheduled and run INSIDE the
+       ai.hermes.gateway process, so the loop whose job is noticing Hermes is broken
+       cannot run when Hermes is down. That was not theoretical — four hermes_log
+       rows sat open in the ledger, one for 11 days with reminder_count 5 and no
+       action ever taken, because the only delivery path a gateway-scheduled job has
+       is the same Slack connection those rows say is broken.
+
+       Safe specifically because Slack delivery here is a plain HTTP client
+       (chat.postMessage / chat.update with a token from resolve_slack_token()),
+       never the gateway's live slack_bolt AsyncApp — so this keeps working with the
+       gateway fully stopped, which is the one case it exists for.
+
+       Inherited from com.jkrumm.hermes-triage, which this replaces. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/SourceRoot/warden/.venv/bin/python3</string>
+    <string>__HOME__/SourceRoot/warden/scripts/triage.py</string>
+    <string>--run</string>
+  </array>
+  <!-- Every 10 minutes. RunAtLoad closes the gap after a reboot: the script is
+       idempotent (an unchanged card short-circuits on card_hash), so firing it early
+       is harmless. -->
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <!-- ~/Library/Logs, never /tmp: launchd opens stdio once at spawn and macOS sweeps
+       untouched /tmp files after 3+ days, leaving the process writing into an
+       unlinked inode nothing reports. Declared in dotfiles/scripts/log-rotate.sh. -->
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/warden-loop.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/warden-loop.err</string>
+</dict>
+</plist>

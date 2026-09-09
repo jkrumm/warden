@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jkrumm.warden-sweep</string>
+  <!-- Folds a terminal sideclaw verdict onto the card the act-loop already wrote.
+       Read-only against sideclaw; the only thing it mutates is the ledger and the
+       card.
+
+       Was gateway cron job 4dd759917dd1 ("Dispatch sweep", */5, no_agent: true).
+       Promoting it removes the scheduling dependency on the gateway — the failure
+       mode this repo exists for was ingest and verdict-folding running inside the
+       process being supervised, which crash-looped seven times in 3m34s on
+       2026-09-07 while the act-loop kept ticking against a ledger that had stopped
+       receiving signals.
+
+       Its cron wrapper (dispatch-sweep-cron.py) existed only to satisfy the gateway
+       runner's contract — invoked with no args, stdout delivered as a Slack body —
+       and is deleted with this move. Nothing is lost: the sweeper posts each verdict
+       into its own origin thread directly and keeps stdout empty on purpose, so
+       there was never a body to deliver. Diagnostics go to stderr, below.
+
+       KNOWN GAP, recorded rather than hidden: the sweeper's delivery still shells out
+       to ~/.local/bin/hermes send (dispatch-sweep.py:93), which does talk to the
+       gateway. Scheduling is now independent; delivery is not yet. Moving it to the
+       same plain-HTTP client the act-loop uses is tracked in STATE.md. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/SourceRoot/warden/.venv/bin/python3</string>
+    <string>__HOME__/SourceRoot/warden/scripts/dispatch-sweep.py</string>
+  </array>
+  <!-- 300s = the */5 the cron job ran on. Unchanged deliberately: the interval is
+       what bounds how long a finished episode sits unfolded. -->
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/warden-sweep.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/warden-sweep.err</string>
+</dict>
+</plist>

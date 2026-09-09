@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jkrumm.warden-backup</string>
+  <!-- Daily ledger backup. scripts/warden-backup.sh takes a VACUUM INTO snapshot and
+       rsyncs ~/.warden/ to homelab:/mnt/hdd/backups/warden/, which the existing restic
+       container already walks on its way to B2 — see the script's own header for why
+       that needs no homelab-side change.
+
+       03:10 sits between hermes-backup (03:00) and restic's 03:30 sweep, so the day's
+       snapshot is on the HDD before restic reads it. StartCalendarInterval and not an
+       interval: this is a daily job, and launchd runs a missed calendar job once at
+       wake rather than replaying every skipped firing. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>__HOME__/SourceRoot/warden/scripts/warden-backup.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>10</integer>
+  </dict>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/warden-backup.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/warden-backup.err</string>
+</dict>
+</plist>
