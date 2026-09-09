@@ -759,13 +759,13 @@ def test_reopen_after_resolve_preserves_artifact_url():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-recur", title="Recurring", first_seen=OLD)
         triage.ingest(conn, NOW)
-        conn.execute(
-            "UPDATE triage_items SET state=?, artifact_url=? WHERE event_id=?",
-            (triage.STATE_RESOLVED, "https://github.com/jkrumm/demo-repo/pull/1", eid),
-        )
-        conn.commit()
+        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW,
+                           artifact_url="https://github.com/jkrumm/demo-repo/pull/1")
 
-        conn.execute("UPDATE events SET resolved_at=NULL WHERE id=?", (eid,))
+        # A fresh occurrence — the cooldown-suppressed-recurrence shape (see
+        # _occurrence_mark()): only payload_json.ts_last moves.
+        conn.execute("UPDATE events SET payload_json=? WHERE id=?",
+                     (json.dumps({"ts_last": "1788850795.862159"}), eid))
         conn.commit()
 
         triage.reopen_if_needed(conn, NOW)
@@ -1213,15 +1213,27 @@ def test_quiet_grouped_resolves_after_window_and_updates_card_once():
             f"an already-carded item's resolve must be exactly one chat.update, never a "
             f"chat.postMessage — got {len(ctx.updated)} update(s), {len(ctx.posted)} post(s)")
         calls_after_first = ctx.total_calls()
+        first_mark = item["occurrence_mark"]
+        first_note = item["note"]
 
         triage.run(conn, dry_run=False)
-        # NOTE: this passes only because the re-rendered card is byte-identical, so
-        # card_hash short-circuits it — NOT because the item stops churning. It is
-        # reopened by reopen_if_needed() every run (a grouped event's resolved_at
-        # stays NULL for months) and quiet-resolved again immediately. Any change
-        # that varies the resolve note by even one character turns that invisible
-        # churn into a chat.update every ten minutes. See docs/triage.md
-        # §Known: grouped reopen churn.
+        # FIXED 2026-09-09 (occurrence_mark, see reopen_if_needed()): the item
+        # no longer round-trips resolved -> new -> resolved every pass. It used
+        # to, silently — the re-rendered card is byte-identical so card_hash
+        # short-circuited the Slack call, but reopen_if_needed() was reopening
+        # and resolve_quiet_grouped() re-resolving this exact row every ten
+        # minutes (see docs/triage.md §Known: grouped reopen churn). Assert on
+        # the absence of that transition directly, not only on the end state —
+        # a full round trip leaves state looking identical while still
+        # rewriting note/occurrence_mark underneath. (updated_at is NOT part of
+        # this assertion: ingest() legitimately rewrites it on every open row
+        # every pass regardless of state — see _set_state()'s own docstring for
+        # why that is exactly why occurrence_mark, not updated_at, has to be
+        # the anchor here.)
+        item_after = triage._get_item(conn, eid)
+        assert item_after["state"] == triage.STATE_RESOLVED
+        assert item_after["occurrence_mark"] == first_mark, "quiet-resolved grouped item churned"
+        assert item_after["note"] == first_note, "quiet-resolved grouped item churned"
         assert ctx.total_calls() == calls_after_first, (
             f"a resolved card must update exactly once — got "
             f"{ctx.total_calls() - calls_after_first} extra call(s) on the second run")
@@ -2574,12 +2586,16 @@ def test_a_dismissed_signature_that_recurs_comes_back():
     with _triage_env() as (conn, _ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-dismissed-recur",
                              title="🚨 keeps firing", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage._set_state(conn, eid, triage.STATE_DISMISSED, NOW, note="deadline expired: nobody answered")
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_DISMISSED
+
+        # "fires again" — the emit-path occurrence shape (see
+        # _occurrence_mark()): last_reminder_at advances and reminder_count
+        # increments.
         conn.execute(
-            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
-            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (eid, "slack_alert:sig-dismissed-recur", "demo-repo", triage.STATE_DISMISSED,
-             "deadline expired: nobody answered", 3, OLD.isoformat(), OLD.isoformat(),
-             NOW.isoformat(), NOW.isoformat()),
+            "UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
+            (NOW.isoformat(), eid),
         )
         conn.commit()
 
@@ -2590,7 +2606,10 @@ def test_a_dismissed_signature_that_recurs_comes_back():
 
 def test_ignored_and_note_stay_closed_when_their_signature_recurs():
     """The other half of the rule above, so the two are not conflated: a human
-    DID look at these and said benign, so a recurrence tells us nothing new."""
+    DID look at these and said benign, so a recurrence tells us nothing new —
+    true whether or not a fresh occurrence actually arrives, unlike
+    `dismissed` (reopen_if_needed()'s WHERE clause never even considers
+    `ignored`/`note` rows, so this holds regardless of _occurrence_mark)."""
     with _triage_env() as (conn, _ctx):
         for state, ext in ((triage.STATE_IGNORED, "sig-ign-recur"), (triage.STATE_NOTE, "sig-note-recur")):
             eid = _insert_event(conn, source="slack_alert", external_id=ext,
@@ -2604,7 +2623,169 @@ def test_ignored_and_note_stay_closed_when_their_signature_recurs():
             conn.commit()
             triage.reopen_if_needed(conn, NOW)
             assert triage._get_item(conn, eid)["state"] == state, (
-                f"{state} must stay closed on recurrence — a human decided it was benign")
+                f"{state} must stay closed with no new occurrence — a human decided it was benign")
+
+            # ...and a genuine new occurrence changes nothing either.
+            conn.execute(
+                "UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
+                (NOW.isoformat(), eid),
+            )
+            conn.commit()
+            triage.reopen_if_needed(conn, NOW)
+            assert triage._get_item(conn, eid)["state"] == state, (
+                f"{state} must stay closed even WITH a new occurrence — a human decided it was benign")
+
+
+def test_quiet_resolved_grouped_item_does_not_churn_with_no_new_occurrence():
+    """Case 1 — the exact bug this slice fixes, isolated from run(): a
+    grouped (slack_alert) event's triage_item is `resolved` and nothing new
+    has happened since. events.resolved_at stays NULL for a grouped source
+    for up to 7 idle days by design, so the OLD predicate
+    (`e.resolved_at IS NULL`) reopened this row on every single pass. Assert
+    on the ABSENCE of the transition (mark and note unchanged), not only on
+    the end state — a resolved -> new -> resolved round trip inside one pass
+    leaves the end state looking identical while still destroying history."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-quiet-no-churn",
+                             title="🚨 quiet", first_seen=OLD,
+                             payload={"ts_last": "1700000000.000001"})
+        triage.ingest(conn, NOW)
+        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note="signal quiet since 2026-09-01")
+        stamped = triage._get_item(conn, eid)
+        assert stamped["occurrence_mark"] is not None, "a fresh _set_state() call must stamp a mark"
+
+        triage.reopen_if_needed(conn, NOW)
+        after = triage._get_item(conn, eid)
+        assert after["state"] == triage.STATE_RESOLVED, "a quiet row with no new occurrence must not reopen"
+        assert after["occurrence_mark"] == stamped["occurrence_mark"], "quiet row's mark must not move"
+        assert after["note"] == stamped["note"], "quiet row's note must not be overwritten"
+
+
+def test_new_ts_last_alone_reopens_a_quiet_resolved_grouped_item():
+    """Case 2 — the cooldown-suppressed-recurrence shape: upsert_grouped()
+    writes ONLY payload_json.ts_last on a suppressed occurrence, never
+    last_reminder_at/notified_at. That alone must still reopen the row."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-ts-last-recur",
+                             title="🚨 quiet", first_seen=OLD,
+                             payload={"ts_last": "1700000000.000001"})
+        triage.ingest(conn, NOW)
+        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note="signal quiet since 2026-09-01")
+
+        conn.execute("UPDATE events SET payload_json=? WHERE id=?",
+                     (json.dumps({"ts_last": "1700000500.000002"}), eid))
+        conn.commit()
+
+        triage.reopen_if_needed(conn, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW, (
+            "a new ts_last alone must reopen a quiet-resolved grouped item")
+
+
+def test_new_last_reminder_at_alone_reopens_a_quiet_resolved_item():
+    """Case 3 — the emit-path shape: upsert_grouped() re-stamps
+    last_reminder_at/reminder_count only when it actually emits. That alone
+    must also reopen the row (neither family alone is sufficient, per
+    _occurrence_mark()'s docstring — this and the previous test cover both)."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-emit-recur",
+                             title="🚨 quiet", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note="signal quiet since 2026-09-01")
+
+        conn.execute(
+            "UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
+            (NOW.isoformat(), eid),
+        )
+        conn.commit()
+
+        triage.reopen_if_needed(conn, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW, (
+            "a new last_reminder_at/reminder_count alone must reopen a quiet-resolved item"
+        )
+
+
+def test_state_source_reopen_via_resolved_at_reset_still_reopens():
+    """Case 4 — the shape the OLD predicate got right, which the new one must
+    not regress: a non-grouped (state) source whose event was resolved via
+    events.resolved_at, then reopened exactly the way watchdog-poll.py:878
+    does it on a state-source recurrence (resolved_at=NULL, first_seen=<now>,
+    notified_at=NULL, last_reminder_at=NULL, reminder_count=0)."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="uk", external_id="uk-monitor-1",
+                             title="[X] [:red_circle: Down] uk monitor", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note=None)
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (OLD.isoformat(), eid))
+        conn.commit()
+
+        # watchdog-poll.py:878's own reopen reset on a state-source recurrence.
+        conn.execute(
+            "UPDATE events SET resolved_at=NULL, first_seen=?, notified_at=NULL, "
+            "last_reminder_at=NULL, reminder_count=0 WHERE id=?",
+            (NOW.isoformat(), eid),
+        )
+        conn.commit()
+
+        triage.reopen_if_needed(conn, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW, (
+            "a state-source reopen (the resolved_at/first_seen/... reset) must still reopen the item")
+
+
+def test_adoption_null_occurrence_mark_does_not_reopen_but_gets_stamped():
+    """Case 6 — exactly the shape of the 23 live churning rows: `resolved`
+    with occurrence_mark IS NULL (closed before the column existed) and
+    events.resolved_at IS NULL (a grouped source, quiet but not yet swept by
+    sweep_stale_grouped()). Must NOT reopen, and must leave the pass with a
+    non-NULL mark so it reopens correctly on the next genuine occurrence
+    instead of the row adopting a guessed history."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-legacy-null-mark",
+                             title="🚨 legacy", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
+            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid, "slack_alert:sig-legacy-null-mark", "demo-repo", triage.STATE_RESOLVED,
+             "signal quiet since ...", 5, OLD.isoformat(), OLD.isoformat(),
+             NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+        assert triage._get_item(conn, eid)["occurrence_mark"] is None
+
+        triage.reopen_if_needed(conn, NOW)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_RESOLVED, "adoption of a NULL mark must not reopen the row"
+        assert item["occurrence_mark"] is not None, "adoption must stamp a baseline mark"
+
+
+def test_occurrence_mark_keeps_the_two_clocks_separate():
+    """Case 7 — what fails if someone later 'simplifies' _occurrence_mark()
+    to a single MAX() across ts_last and the ISO columns: ts_last is a Slack
+    `ts` float-string ("1788850795.862159"), the other four slots are
+    ISO-8601. A lexical MAX()/`>` across them compares "1788…" to "2026…" and
+    is wrong in a way that reads as correct. Fixed slots plus whole-string
+    `!=` never compares one clock against the other."""
+    base = {
+        "payload_json": json.dumps({"ts_last": "1788850795.862159"}),
+        "last_reminder_at": "2026-09-08T07:00:20+00:00",
+        "notified_at": "2026-09-01T00:00:00+00:00",
+        "first_seen": "2026-08-01T00:00:00+00:00",
+        "reminder_count": 3,
+    }
+    mark_a = triage._occurrence_mark(base)
+
+    # Changing ts_last alone must change the mark (case 2's invariant, proven
+    # directly against the function rather than through reopen_if_needed()).
+    bumped = dict(base, payload_json=json.dumps({"ts_last": "1788850900.000000"}))
+    mark_b = triage._occurrence_mark(bumped)
+    assert mark_a != mark_b, "changing ts_last alone must change the mark"
+
+    # The ISO slots must survive INTACT in the string when ts_last is also
+    # present — never folded together with it into one ordinally-compared
+    # value (the "MAX()" failure this test exists to catch).
+    for slot in (base["last_reminder_at"], base["notified_at"], base["first_seen"]):
+        assert slot in mark_a, f"{slot!r} missing from the mark — an ISO clock got merged with ts_last"
+
+    assert triage._occurrence_mark(None) is None
 
 
 def test_a_stamped_legacy_row_then_actually_expires():

@@ -58,7 +58,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # frozen at its pre-cutover state and written by nothing, kept as the rollback —
 # so if you are reading this to work out which database is real, it is this one.
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -206,9 +206,28 @@ ALTER TABLE triage_items ADD COLUMN state_deadline TEXT;
 CREATE INDEX IF NOT EXISTS idx_triage_state_deadline ON triage_items(state_deadline);
 """
 
+# Version 3 — `occurrence_mark`, one column, so triage.py's reopen_if_needed()
+# can tell "this resolved/dismissed row is still quiet" from "a new occurrence
+# arrived" without asking `events.resolved_at IS NULL` — which for a GROUPED
+# source (slack_alert, hermes_log) stays NULL for up to 7 idle days by design,
+# so that question was true on every single pass and reopened (then
+# immediately re-resolved) a quiet-resolved row every 10 minutes, forever.
+# Measured on the live ledger 2026-09-09: 23 of 30 `resolved` rows were stuck
+# in that loop, invisible only because the re-rendered card is byte-identical
+# and card_hash short-circuited the Slack call. It had already destroyed
+# history twice — see triage.py's reopen_if_needed() and docs/triage.md.
+#
+# NULL here is NOT a forgotten stamp — it is a row that closed before this
+# column existed. reopen_if_needed() treats NULL as "baseline unknown",
+# stamps it with the event's current mark, and does not reopen. That adoption
+# rule is the entire backfill this migration needs; it deliberately writes no
+# data itself.
+_MIGRATION_3 = "ALTER TABLE triage_items ADD COLUMN occurrence_mark TEXT;"
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
+    3: _MIGRATION_3,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live

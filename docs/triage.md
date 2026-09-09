@@ -1059,37 +1059,85 @@ and top-level key order intact after an applied `map` proposal, the commit
 (and the write itself) being skipped when `config/triage-policy.json` already
 carries a pending change, and `--dry-run` making zero model calls.
 
-**The current total is 96.** Every figure above (30 / 42 / 54 / 64) is the
-running tally *as each group of cases landed*, not the count today — they are
-kept because each paragraph describes what its own group covers. The number
-that governs is the one in `CLAUDE.md`: the regression gate, at **96/96**, and
-any other number is a finding rather than a count to edit. The 32 cases past
-64 are Wave 1's: the quiet rule (silence-resolve restricted to `new`), the
-intent queue's loop drain, and the deadline table.
+**The current total is 102.** Every figure above (30 / 42 / 54 / 64 / 96) is
+the running tally *as each group of cases landed*, not the count today — they
+are kept because each paragraph describes what its own group covers. The
+number that governs is the one in `CLAUDE.md`: the regression gate, at
+**102/102**, and any other number is a finding rather than a count to edit.
+The 32 cases past 64 are Wave 1's: the quiet rule (silence-resolve restricted
+to `new`), the intent queue's loop drain, and the deadline table. The 6 past
+96 are the `occurrence_mark` reopen fix (§ Known: grouped reopen churn).
 
 ## Known: grouped reopen churn, and why brain-sync is invisible
 
-Two related defects, both measured 2026-09-09, neither fixed. They are written
-down because each is easy to re-derive wrongly.
+One of two related defects, both measured 2026-09-09, is now fixed; the other
+is still open. Both are written down because each is easy to re-derive
+wrongly.
 
-### A grouped item reopens every run
+### A grouped item reopened every run — FIXED
 
-`reopen_if_needed()` reopens a `resolved` (and, since Wave 1, a `dismissed`)
-triage item whenever its event has `resolved_at IS NULL`. For a grouped source (`slack_alert`, `hermes_log`) that
-column stays NULL for months — `watchdog-poll.py`'s `sweep_stale_grouped()`
-only clears it after 7 idle days, deliberately. So a quiet-resolved grouped item
-is reopened on the very next run, quiet-resolves again, and repeats every ten
-minutes forever.
+`reopen_if_needed()` used to reopen a `resolved` (and, since Wave 1, a
+`dismissed`) triage item whenever its event had `resolved_at IS NULL`. For a
+grouped source (`slack_alert`, `hermes_log`) that column stays NULL for
+months — `watchdog-poll.py`'s `sweep_stale_grouped()` only clears it after 7
+idle days, deliberately — so that predicate was true on every single pass. A
+quiet-resolved grouped item was reopened on the very next run, quiet-resolved
+again, and repeated every ten minutes forever.
 
-This is currently **invisible**, and only by luck: the re-rendered card is
-byte-identical, so `card_hash` short-circuits the Slack call. Any change that
-varies the resolve note by a single character — including making the quiet
-window adaptive, which is the obvious fix for the next defect — turns that
-silent churn into a `chat.update` every ten minutes.
+It was invisible only by luck: the re-rendered card is byte-identical, so
+`card_hash` short-circuited the Slack call. It was not harmless — it destroyed
+history. **Measured on the live ledger 2026-09-09: 23 of 30 `resolved` rows**
+were stuck in this loop, and it had already overwritten the only two
+positive-signal closes the system has ever produced (items 931/932, closed by
+`resolve_recovery_paired()` after `jkrumm/vps#8` merged): the very next pass
+reopened them and `resolve_quiet_grouped()` wrote its own `signal quiet
+since …` note over `RECOVERY_PAIRED_NOTE_PREFIX`, which appears on zero rows
+in the live database as a result.
 
-The fix is to reopen on a **new occurrence** (the grouped payload's `ts_last`
-moving) rather than on `resolved_at IS NULL`. That is the item lifecycle's core
-and wants its own change with live validation, not a patch on top of another.
+The fix (ledger schema_version 3, `triage_items.occurrence_mark`) reopens on a
+**new occurrence**, never on `resolved_at IS NULL`. `_occurrence_mark()`
+fingerprints the event with five `|`-separated slots — `payload_json.ts_last`,
+`last_reminder_at`, `notified_at`, `first_seen`, `reminder_count` — and
+`reopen_if_needed()` compares the current fingerprint against the one
+`_set_state()` stamped at the row's last transition, with `!=`, never `>`.
+That `!=`-not-`>` distinction is load-bearing: `ts_last` is a Slack `ts`
+float-string ("1788850795.862159"), the other four slots are ISO-8601
+("2026-09-08T07:00:20…") — two different clocks in two different formats, and
+a `MAX()`/`>` across them is a lexical compare of "1788…" against "2026…"
+that reads as correct and is not. Fixed slots plus whole-string equality never
+compares one clock against the other. Neither family alone would do: a
+suppressed grouped occurrence moves only `ts_last` (`upsert_grouped()`
+re-stamps `last_reminder_at`/`notified_at` only when it actually emits,
+cooldown-gated), and a state source has no `ts_last` at all — its reopen
+signal is `watchdog-poll.py:878` resetting `resolved_at`/`first_seen`/
+`notified_at`/`last_reminder_at`/`reminder_count`, which moves the ISO slots.
+
+A `resolved`/`dismissed` row whose stored `occurrence_mark` is NULL (closed
+before this column existed — every row on the live ledger, at cutover) is
+**not** reopened: `reopen_if_needed()` treats NULL as "baseline unknown",
+stamps the row's current mark, and leaves the state alone. It then reopens on
+the next genuine occurrence like any other row. That adoption rule is the
+entire backfill; the migration writes no data itself.
+
+**One asymmetry the mark inherits, measured 2026-09-09 and deliberately not
+fixed here.** `hermes_log` is a grouped source whose payload has **no
+`ts_last`** — `poll_hermes_logs()` builds `{"first_line": …}`, not the
+`{"ts_first", "ts_last"}` shape `upsert_grouped()`'s Slack grouping produces.
+So on a *cooldown-suppressed* occurrence (`REM_HOURS["hermes_log"]` is 24h)
+that source writes only `batch_count_last`, which is not in the mark, and the
+event row is otherwise byte-identical: 11 of the 30 live `resolved` rows carry
+a mark with an empty first slot, 6 of them `hermes_log`. Such a row does not
+reopen until the 24h cooldown lets `upsert_grouped()` emit and move
+`last_reminder_at`.
+
+That is **not** a regression and not a lost signal. Under the old predicate the
+same row was reopened and then re-resolved by `resolve_quiet_grouped()` inside
+the *same* pass — `escalate()` runs after both — so a suppressed occurrence
+never re-escalated anything then either. Re-escalation latency stays bounded by
+the source's own cooldown, which is what the cooldown is for. It is recorded
+because it looks like an accident and is not, and because it belongs with the
+self-tuning quiet window below: that is where "the signal is still firing but
+suppressed" is the actual subject.
 
 ### brain-sync is never investigated
 
@@ -1110,6 +1158,8 @@ and the loop has never once looked at it. Three causes stack:
 
 A fixed quiet window silently defeats itself on any signal whose own period is
 near it. The intended fix is to widen the window per resolve/recur cycle —
-self-tuning, needing no knowledge of the signal's period — but it must land
-*after* the reopen fix above, because on its own it converts the invisible churn
-into visible card spam.
+self-tuning, needing no knowledge of the signal's period — and it was blocked
+only on the reopen churn above being invisible: widening the window varies the
+resolve note, which used to turn the silent churn into a `chat.update` every
+ten minutes. With `occurrence_mark` in place there is no more churn to
+uncover, so this fix is now **unblocked** and still open.

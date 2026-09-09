@@ -1105,6 +1105,50 @@ def _get_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
 
 
+def _occurrence_mark(event: sqlite3.Row | dict[str, Any] | None) -> str | None:
+    """An opaque fingerprint of which occurrences `event` has produced so far,
+    for reopen_if_needed() to compare with `!=` — never with `>` or `MAX()`.
+
+    Five `|`-separated slots, each the raw string value (empty for None/missing),
+    in fixed position:
+
+        payload_json->$.ts_last | last_reminder_at | notified_at | first_seen | reminder_count
+
+    Slot 1 (grouped sources only, via _safe_json() — never SQL json_extract, so
+    a malformed payload degrades to "absent" instead of raising) is a Slack
+    `ts` float-string ("1788850795.862159"). Slots 2-4 are ISO-8601
+    ("2026-09-08T07:00:20..."). These are TWO DIFFERENT CLOCKS IN TWO DIFFERENT
+    FORMATS — a `MAX()` or `>` across them is a lexical compare of "1788…"
+    against "2026…" that reads as correct and is not. Fixed slots plus whole-
+    string equality never compares one clock against the other.
+
+    All five slots are required, not redundant with each other:
+    watchdog-poll.py's upsert_grouped() re-stamps last_reminder_at/notified_at
+    ONLY when it emits (cooldown-gated) — a suppressed occurrence moves only
+    payload_json.ts_last. A state source has no ts_last at all; its reopen
+    signal is watchdog-poll.py:878 resetting resolved_at=NULL, first_seen=<now>,
+    notified_at=NULL, last_reminder_at=NULL, reminder_count=0 on that same
+    UPDATE — which moves the ISO slots. Every slot moves only on a genuine
+    occurrence, or on that reopen reset (itself a genuine occurrence). Title
+    and URL churn is deliberately NOT in the mark.
+
+    Returns None if `event` is None — reopen_if_needed() reads this as "no
+    event row", which cannot happen for a joined query but keeps the function
+    total rather than partial."""
+    if event is None:
+        return None
+    payload = _safe_json(event["payload_json"])
+    ts_last = payload.get("ts_last")
+    slots = (
+        ts_last if isinstance(ts_last, str) else "",
+        event["last_reminder_at"] or "",
+        event["notified_at"] or "",
+        event["first_seen"] or "",
+        str(event["reminder_count"] if event["reminder_count"] is not None else ""),
+    )
+    return "|".join(slots)
+
+
 # --- the one state transition ------------------------------------------------
 
 # Every column a state transition in this file is allowed to write alongside
@@ -1159,7 +1203,21 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
 
     `expect_state`/`expect_null` turn the UPDATE into a compare-and-swap —
     maybe_auto_implement() claims an item that way, and the returned rowcount
-    is how it learns whether it won."""
+    is how it learns whether it won.
+
+    Also writes `occurrence_mark` (see _occurrence_mark()), on EVERY
+    transition, not only into terminal states — same reasoning as
+    `state_deadline`: a closed list of "states that need a mark" is one more
+    list to forget to update, so stamping unconditionally means the column is
+    never stale. It is computed here, from the event row (_get_event()), and
+    is not caller-settable — like `state_deadline`, it is not in
+    _SET_STATE_COLUMNS. The mark exists because `updated_at` cannot serve the
+    same purpose: ingest() rewrites `updated_at` on every open row on every
+    pass regardless of state, so "when did this item last actually change
+    state" needs its own column. reopen_if_needed() is the only reader — it
+    compares the mark stored here against the event's CURRENT mark to tell a
+    resolved/dismissed row that is still quiet from one a fresh occurrence
+    reopened underneath."""
     rule = STATE_DEADLINES.get(state)
     if rule is None and state not in TERMINAL_STATES:
         raise ValueError(
@@ -1179,8 +1237,10 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     if rule is not None and rule.hours is not None and rule.deadline_column == _STATE_DEADLINE_COLUMN:
         deadline = (now + dt.timedelta(hours=rule.hours)).isoformat()
 
-    sql = "UPDATE triage_items SET state=?, state_deadline=?, updated_at=?"
-    params: list[Any] = [state, deadline, _now_iso(now)]
+    mark = _occurrence_mark(_get_event(conn, event_id))
+
+    sql = "UPDATE triage_items SET state=?, state_deadline=?, occurrence_mark=?, updated_at=?"
+    params: list[Any] = [state, deadline, mark, _now_iso(now)]
     for col, value in columns.items():
         if isinstance(value, _Coalesce):
             sql += f", {col}=COALESCE(?, {col})"
@@ -1236,12 +1296,42 @@ def ingest(conn: sqlite3.Connection, now: dt.datetime) -> None:
 
 def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime) -> None:
     """A grouped or state source reuses the SAME events.id across a
-    resolve -> recur cycle (UNIQUE(source, external_id), resolved_at reset to
-    NULL on reopen) — so a triage_items row stuck in `resolved` for an event
-    that has since reopened would otherwise sit invisible forever. Reopening
-    to `new` (never clearing artifact_url/dispatch_job) is exactly what lets
-    the next escalation's brief say "a PR already exists for this signature"
-    instead of re-discovering it from scratch.
+    resolve -> recur cycle (UNIQUE(source, external_id)) — so a triage_items
+    row stuck in `resolved` for an event that has since produced a NEW
+    occurrence would otherwise sit invisible forever. Reopening to `new`
+    (never clearing artifact_url/dispatch_job) is exactly what lets the next
+    escalation's brief say "a PR already exists for this signature" instead
+    of re-discovering it from scratch.
+
+    The predicate is "the event's _occurrence_mark() has changed since this
+    row's last transition", NOT `events.resolved_at IS NULL`. For a GROUPED
+    source (slack_alert, hermes_log), resolved_at stays NULL for up to 7 idle
+    days by design (sweep_stale_grouped()) — so `resolved_at IS NULL` is true
+    on every pass for months after a quiet-resolve, and used to reopen a row
+    this function had itself just re-closed one pass earlier, forever, every
+    10 minutes, silently (the re-rendered card is byte-identical so
+    card_hash short-circuits the API call — see docs/triage.md). Comparing
+    marks instead of asking "is resolved_at NULL" ties reopening to an actual
+    new occurrence, whichever of the two clocks produced it (see
+    _occurrence_mark()'s own docstring for why both are needed).
+
+    Three-way outcome per resolved/dismissed row, comparing the event's
+    CURRENT mark against the one `_set_state()` stamped at this row's last
+    transition:
+
+    - differs -> a genuine new occurrence arrived since this row closed.
+      Reopen via _set_state(), exactly as before.
+    - same -> still quiet. Leave it alone. This is the whole fix: on a
+      quiet-resolved grouped item, every subsequent pass takes this branch
+      instead of re-opening and re-resolving the row every 10 minutes.
+    - stored mark IS NULL -> this row closed before occurrence_mark existed
+      (or, in principle, missed a stamp). Do not reopen it and do not guess a
+      history it does not have — write the current mark as a baseline via a
+      plain UPDATE (not _set_state(): it writes no `state`, so it is not a
+      state transition) and leave the state alone. It then reopens on the
+      next genuine occurrence like any other row. This is the adoption path;
+      it is what removes the need for a data backfill in ledger.py's
+      migration 3.
 
     `dismissed` reopens too, and the distinction matters. `ignored` and `note`
     do NOT, because a human looked at those and said benign — a recurrence
@@ -1254,12 +1344,21 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime) -> None:
     often its monitor fired. Terminal means "this item is closed", not "this
     signature may never open another"."""
     rows = conn.execute(
-        "SELECT ti.event_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state IN (?, ?) AND e.resolved_at IS NULL",
+        "SELECT ti.event_id AS event_id, ti.occurrence_mark AS stored_mark, e.* "
+        "FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        "WHERE ti.state IN (?, ?)",
         (STATE_RESOLVED, STATE_DISMISSED),
     ).fetchall()
     for row in rows:
-        _set_state(conn, row["event_id"], STATE_NEW, now)
+        stored_mark = row["stored_mark"]
+        current_mark = _occurrence_mark(row)
+        if stored_mark is None:
+            conn.execute(
+                "UPDATE triage_items SET occurrence_mark=? WHERE event_id=?",
+                (current_mark, row["event_id"]),
+            )
+        elif current_mark != stored_mark:
+            _set_state(conn, row["event_id"], STATE_NEW, now)
     conn.commit()
 
 

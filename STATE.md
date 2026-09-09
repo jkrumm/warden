@@ -3437,3 +3437,142 @@ anchor a new-occurrence comparison needs. The comparison needs its own stored ma
 
 Slice 2.1 — the reopen condition, per DESIGN.md's ordering. Design settled by the
 findings above; written up with the slice.
+
+---
+
+## 38. Wave 2, item 1 — the reopen condition (DONE & LIVE, schema_version 3)
+
+`DESIGN.md` § Migration puts this first in Wave 2 and says why: doing the state
+split first would make the churn visible and noisy. It was worse than churn —
+see §37 finding 2.
+
+### What changed
+
+| File | Change |
+|-|-|
+| `scripts/triage.py` | `_occurrence_mark()`; `_set_state()` stamps it on **every** transition; `reopen_if_needed()` compares marks instead of asking `events.resolved_at IS NULL` |
+| `scripts/ledger.py` | `SCHEMA_VERSION` 2 → **3**, `_MIGRATION_3` adds `triage_items.occurrence_mark`. No index, **no data backfill** |
+| `hermes-agent/scripts/hermes-cc.sh` | `WARDEN_SCHEMA_VERSION` 2 → 3 — pinned to warden's, a mismatch is a loud exit 2 |
+| tests | `test_triage.py` 96 → **102**, `test_ledger.py` 12 → **14** |
+| `docs/triage.md`, `CLAUDE.md` | the § Known subsection rewritten; the regression gate re-pinned |
+
+The mark is five `|`-separated slots — `payload_json.ts_last`,
+`last_reminder_at`, `notified_at`, `first_seen`, `reminder_count` — compared with
+`!=`, **never** with `>` or `MAX()`. That is load-bearing: `ts_last` is a Slack
+`ts` float-string and the other four are ISO-8601, so an ordinal comparison
+across them compares `"1788…"` against `"2026…"`. Fixed slots plus whole-string
+equality never compares one clock against the other. Neither family alone is
+sufficient — a cooldown-suppressed grouped occurrence moves only `ts_last`, and a
+state source has no `ts_last` at all.
+
+A NULL mark is **not** a forgotten stamp — it is a row that closed before the
+column existed, which on the live ledger was all 30 of them. `reopen_if_needed()`
+treats NULL as *baseline unknown*: it stamps the current mark and leaves the state
+alone. That adoption rule **is** the backfill, which is why migration 3 writes no
+data and needs no hardcoded row list.
+
+### Verified, not claimed
+
+Two-pass run of the real `run()` against a `VACUUM INTO` copy of the live ledger,
+`WARDEN_DB` redirected, intents spool redirected, `--dry-run`, counting every
+`_set_state()` call that actually changed a state:
+
+```
+BEFORE (snapshot at schema 2, pre-fix code)
+  pass 1: transitions = 46    resolved -> new: 23    new -> resolved: 23
+  pass 2: transitions = 46    resolved -> new: 23    new -> resolved: 23
+  final census: {'ignored': 7, 'needs_human': 4, 'new': 3, 'note': 8, 'resolved': 30}
+
+AFTER (same snapshot, fixed code, migrating itself to 3 on connect)
+  pass 1: transitions = 0
+  pass 2: transitions = 0
+  final census: {'ignored': 7, 'needs_human': 4, 'new': 3, 'note': 8, 'resolved': 30}
+```
+
+Same copy after one real `scripts/triage.py --dry-run`: `schema_version` 3,
+30 rows stamped, **0** `resolved`/`dismissed` rows left with a NULL mark, census
+unchanged.
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   14/14 passed
+  test_triage.py                   102/102 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+```
+
+Mutation-tested, each broken → red **by name** → restored → green:
+
+| Mutation | Caught by |
+|-|-|
+| `reopen_if_needed()` back to `AND e.resolved_at IS NULL` | `test_quiet_resolved_grouped_item_does_not_churn_with_no_new_occurrence`, `test_adoption_null_occurrence_mark_does_not_reopen_but_gets_stamped` |
+| drop `ts_last` from the mark | `test_new_ts_last_alone_reopens_a_quiet_resolved_grouped_item`, `test_occurrence_mark_keeps_the_two_clocks_separate` |
+| NULL mark reopens instead of stamping | `test_adoption_null_occurrence_mark_does_not_reopen_but_gets_stamped` |
+| remove the `occurrence_mark` write from `_set_state()` | 7 tests, incl. `test_a_dismissed_signature_that_recurs_comes_back`, `test_state_source_reopen_via_resolved_at_reset_still_reopens` |
+
+Three existing tests changed their **setup** (raw `INSERT`/`UPDATE` → going
+through `_set_state()`, so the row has a mark at all) and none changed its
+assertion except to strengthen it. The one that documented the churn in a comment
+(`test_quiet_grouped_resolves_after_window_and_updates_card_once`) now asserts its
+absence directly — on `occurrence_mark` and `note` identity, **not** on
+`updated_at`, which `ingest()` legitimately rewrites every pass on every open row.
+
+### The live ledger migrated itself, and that is a lesson about this repo
+
+The plan was: leave both trees dirty, snapshot, then sequence the migration by
+hand. That plan was **wrong on its face and the loop proved it within three
+minutes.** The LaunchAgents execute `scripts/triage.py` *from the working tree*,
+and `~/.hermes/scripts` is a whole-directory symlink into `hermes-agent` — so an
+uncommitted edit to either file is **already in production the moment it is
+saved**. The 18:45Z tick migrated `~/.warden/warden.db` to version 3 and adopted
+all 30 rows on its own.
+
+**In this repo there is no staging window between editing and deploying.** A
+worker editing `scripts/*.py` is editing the running system. It was harmless here
+only because the change is additive, the adoption path is safe, and the
+`hermes-cc.sh` pin was edited in the same window — a mismatch would have been a
+loud exit 2, which is the designed failure. Anything less benign needs
+`make unload` first. This belongs in the next handover.
+
+Post-migration health, live:
+
+```
+schema_version 3 · occurrence_mark on 30 rows · 0 NULL marks in resolved/dismissed
+census unchanged {'ignored': 7, 'needs_human': 4, 'new': 3, 'note': 8, 'resolved': 30}
+four uk:* needs_human rows still at state_deadline 2026-09-16T17:34:38Z
+warden-loop.err mtime unchanged (19:34 local) — no new traceback · last exit 0 · runs 43
+```
+
+### One asymmetry found by reading the migrated data, recorded not fixed
+
+11 of the 30 stamped rows carry a mark whose `ts_last` slot is empty; 6 are
+`hermes_log`, whose payload is `{"first_line": …}` and has **no `ts_last` at all**
+(`poll_hermes_logs()` does not build the Slack grouping's `ts_first`/`ts_last`
+shape). A cooldown-suppressed `hermes_log` occurrence therefore moves nothing in
+the mark and does not reopen the row until the 24h cooldown emits.
+
+Not a regression: under the old predicate that same row was reopened and then
+re-resolved by `resolve_quiet_grouped()` **inside the same pass**, and
+`escalate()` runs after both — so a suppressed occurrence never re-escalated
+anything before either. Re-escalation latency stays bounded by the source's own
+cooldown. Written into `docs/triage.md` next to the self-tuning quiet window,
+which is where "still firing but suppressed" is the actual subject.
+
+### Also observed
+
+The churn was driving phantom work into the recovery-pairing step: with 23 rows
+transiently in `new`, `resolve_recovery_paired()` saw **17 open `slack_alert`
+candidates** every pass (`[dry-run] would check 17 open slack_alert item(s)`),
+each of which is a live Slack read outside dry-run. Post-fix that set is empty and
+the step prints nothing.
+
+### Next action
+
+Slice 2.2 — split `resolved` into `fixed` / `quiet` / `closed`, schema 4. Two
+decisions already taken and to be recorded with it: all 30 live rows migrate to
+`quiet` (the `fixed` provenance for 931/932 is unrecoverable from the ledger —
+§37 finding 2), and an append-only `item_transitions` table lands with the split,
+because three of `/metrics`' six numbers are not derivable without it.

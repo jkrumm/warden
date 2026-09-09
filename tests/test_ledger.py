@@ -251,7 +251,7 @@ def test_migrate_adopts_pre_versioned_database():
     # renamed: adopting a live database stays additive.
     for table, cols in pre_cols.items():
         assert cols <= post_cols[table], f"{table} lost columns: {cols - post_cols[table]}"
-    assert post_cols["triage_items"] - pre_cols["triage_items"] == {"state_deadline"}, (
+    assert post_cols["triage_items"] - pre_cols["triage_items"] == {"state_deadline", "occurrence_mark"}, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
     assert post_counts == pre_counts, f"rows lost: {post_counts} != {pre_counts}"
@@ -360,6 +360,41 @@ def test_snapshot_copies_rows_and_refuses_to_overwrite():
 
 
 # --- runner ------------------------------------------------------------------
+
+def test_migration_3_adds_occurrence_mark():
+    """See _MIGRATION_3 / triage.py's _occurrence_mark() and reopen_if_needed()
+    — the column that stops a quiet-resolved grouped item from being reopened
+    and re-resolved every ten minutes."""
+    conn = ledger.connect(_tmp_path(), migrate=True)
+    cols = _table_columns(conn, "triage_items")
+    assert "occurrence_mark" in cols
+    conn.close()
+
+
+def test_v2_database_migrates_to_v3_matching_a_fresh_one():
+    """A real upgrade path, not adoption: a database already stamped at
+    schema_version 2 (state_deadline present, occurrence_mark not yet) must
+    reach SCHEMA_VERSION 3 with a schema identical to a fresh database's."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    conn.executescript(ledger._MIGRATION_2)
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (2, 'test')")
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    cols = {t: _table_columns(conn, t) for t in ledger._ADOPTABLE_TABLES}
+    assert "occurrence_mark" in cols["triage_items"]
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    fresh_cols = {t: _table_columns(fresh, t) for t in ledger._ADOPTABLE_TABLES}
+    assert fresh_cols == cols, f"v2-upgraded schema diverges from a fresh one: {cols} != {fresh_cols}"
+    fresh.close()
+    conn.close()
+
 
 def test_adoption_refuses_a_structurally_incomplete_database() -> None:
     """The trap adoption sets for itself: it decides on TABLE presence alone,
