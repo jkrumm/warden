@@ -2246,3 +2246,170 @@ a running process, not an argument against a settled disposition.
 
 Wave 1 item 1 — the quiet rule (`_GROUPED_RESOLVE_EXCLUDED_STATES` in
 `scripts/triage.py`). Test first.
+
+---
+
+## 27. Wave 1, item 1 — the quiet rule (DONE)
+
+`DESIGN.md` § "The quiet rule, corrected" and principle 5, implemented.
+**Silence-resolve now applies to `new` and to nothing else.**
+
+### It was three paths, not one
+
+The prompt named `_GROUPED_RESOLVE_EXCLUDED_STATES`. That is one of three
+instances, and it is not the worst one. Stated rather than narrowed:
+
+| Path | Fired on | Old behaviour |
+|-|-|-|
+| `resolve_quiet_grouped()` | `quietResolveHours` of no new occurrence | resolved everything except `resolved/ignored/snoozed/note/investigating` |
+| `resolve_recovery_paired()` | a `✅` recovery message in #alerts | same exclusion list |
+| **`apply_resolutions()`** | `events.resolved_at` set | **worse** — same, minus even the `investigating` exclusion, **and set `note=NULL`** |
+
+`apply_resolutions()` is the one that erases the written fix. The question of
+whether it counts as a *silence* path was settled by reading the only thing that
+sets `events.resolved_at`, and it is `watchdog-poll.py` in exactly two places:
+the ingest sweep (`if row["external_id"] not in obs_ids`, line ~937) and
+`sweep_stale_grouped()`'s 7-idle-day housekeeping (line ~1084). Never a human
+decision, never the episode. So it is disappearance-from-observation, and
+principle 5 covers it.
+
+### The change
+
+`_GROUPED_RESOLVE_EXCLUDED_STATES` → `_SILENCE_RESOLVE_ELIGIBLE_STATES = (STATE_NEW,)`,
+used by all four queries across the three functions.
+
+**An inclusion list of one, deliberately, and this is the load-bearing part.**
+Wave 2 adds `implementing`, `validating`, `deploying`, `verifying` to the chain.
+An exclusion list silently ADMITS every state added after it was written — which
+is exactly how `needs_human` came to be discardable. An inclusion list silently
+EXCLUDES them. It fails closed.
+
+### Evidence
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_ledger.py                   11/11 passed
+  test_triage.py                   73/73 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_slack_blindness.py all cases as expected
+```
+
+**68 → 73 (+5).** All five are new. Two renames and four re-seedings are
+count-neutral. Nothing deleted, skipped, or weakened. The new five:
+`test_recovery_paired_never_discharges_needs_human`,
+`test_quiet_timer_never_discharges_needs_human`,
+`test_event_resolution_never_discharges_needs_human`,
+`test_silence_resolve_eligible_states_is_new_only`,
+`test_no_chain_state_is_silence_resolvable`.
+
+**Mutation check, run here rather than taken from the worker's report** — widen
+the tuple to `(new, needs_human, verdict, pr_open)` and the suite drops to
+**68/73**, with the general test naming the leak:
+
+```
+test_no_chain_state_is_silence_resolvable: silence-resolved a state carrying an
+obligation: {'verdict': 'resolved', 'needs_human': 'resolved', 'pr_open': 'resolved'}
+```
+
+**Old code vs new code, on snapshots of the LIVE ledger.** The four real
+`needs_human` items were each given a written-fix note and their monitor made to
+recover (`events.resolved_at` stamped) — the exact DESIGN.md scenario, on real
+rows:
+
+```
+items where OLD and NEW disagree: 4
+  event 543:  OLD state='resolved'    note=None
+              NEW state='needs_human' note='blocked on a human: the fix is two lines'
+  event 875:  (identical)
+  event 930:  (identical)
+  event 943:  (identical)
+```
+
+The old loop discarded all four human decisions and erased all four fixes. The
+new one keeps them.
+
+**A first attempt at this comparison returned "0 disagreements" and was wrong** —
+the old `triage.py`, copied alone into a temp dir, crashed on its `ledger.py`
+import and never ran. Recorded because the failure mode is a silent pass: a
+comparison harness that reports "no difference" when one side did not execute
+looks exactly like a correct result. The redone version copies the whole
+`scripts/` directory so the imports resolve.
+
+Three of the four live `needs_human` items were sitting at **2.02h quiet against
+a 2h `quietResolveHours`** when this was written. They are `uk`-source, so
+`resolve_quiet_grouped()` (grouped sources only) never reached them — it was
+`apply_resolutions()` that was armed, and `uk` monitors flap green routinely.
+
+### What this deliberately leaves broken until item 3
+
+A non-`new` item now has **no automatic exit at all** — no deadline, no poller.
+That is DESIGN.md's own sequencing ("exits only through its own transition or its
+deadline") and the correct order: stop discarding first, then bound. Four items
+are affected today. Item 3 closes it.
+
+### Also in this slice
+
+`make status` printed `✓` over a last exit status of 1 (§26, finding 1). Fixed in
+`91defbe`, separately. All three branches — ✓, ✗-nonzero, ✗-not-loaded — were
+exercised against a stubbed `launchctl`, because the bug was that the failing
+branch had never run.
+
+### Files
+
+`scripts/triage.py`, `tests/test_triage.py`, `docs/triage.md` (five sentences that
+the change made false; no broader rewrite), `Makefile` (in `91defbe`).
+
+### Noticed, not fixed
+
+`docs/triage.md`'s Tests section still counts "42/54/64 cases" against an actual
+73. Stale before this change.
+
+---
+
+## 28. Decision: the ledger stays SQLite on the mini. Postgres on the VPS was offered and declined.
+
+Raised 2026-09-09 after §26's `database is locked` crash: move the ledger to the
+VPS's Postgres for queues, row locks and richer transactions. **Declined.**
+Recorded here so it stays settled.
+
+- **The crash was six writers, not the engine.** `busy_timeout` is 5s and someone
+  held the write lock longer. Wave 1 item 2 removes the writers; that is the
+  stop condition. Postgres would make the six-writer shape *survivable* instead
+  of fixing it, preserving exactly what DESIGN.md wants gone.
+- **Volume does not motivate it.** 980K, 959 events over 38 days, three agents on
+  600s/1800s/300s. SQLite in WAL is already over-provisioned for this.
+- **It inverts warden's founding property.** This repo is separate from
+  `hermes-agent` because the loop that notices Hermes is broken must not run
+  inside Hermes. DESIGN.md's system table pins warden's failure domain to "mini,
+  own LaunchAgents" and Argo's to "**VPS — separate domain**"; FLOWS.md says it
+  outright — *"the decision surface must not be the thing that is down."* A
+  ledger over the tailnet means a VPS or network outage stops the control plane
+  from recording that there is an outage. That is the 2026-09-07 gateway-crash
+  failure with a longer wire.
+- **Postgres is already in this architecture, deliberately demoted.** DESIGN.md
+  line 365: Argo caches `GET` responses in Postgres "purely so the page renders
+  when the mini is unreachable … **An HTTP cache, not a mirror.**" Promoting that
+  cache to the source of truth is the thing it was written not to be.
+- **It puts a client library in the process that decides whether to touch
+  production.** The loop is pure stdlib plus `cryptography`, on purpose.
+- **The advanced patterns buy nothing at this shape.** SQLite has transactions.
+  Row locks matter with N competing workers; warden has one drainer by design, so
+  the intent queue is a spool plus a single drain and needs no locking.
+- **REVIEW.md's one SQLite-named finding is engine-independent.** *"SQLite cannot
+  atomically change a row and merge a PR"* — neither can Postgres, which is why
+  its disposition is operation-id + remote receipts + an explicit `unknown`.
+
+**Revisit only if** warden needs genuinely concurrent workers, or a second host
+starts writing. Neither is on the Wave 1–3 path.
+
+### Next action
+
+Wave 1 item 2 — the intent/signature split, which is also what closes "one
+writer". Design already settled from reading (record it before building):
+spool at `~/.warden/intents/`, `ledger.py --record-intent` / `--drain-intents`
+as the door (same precedent as `fe95e81`), the plugin signs then spools then
+drains synchronously — because `execute_approved()` re-runs `hermes-cc.sh
+--confirm` in a subprocess IMMEDIATELY after the click, so a 600s loop drain
+would break the flow outright. `require_signed_approval()` is not touched.
+Fold in the `busy_timeout` raise and a bounded retry around the pass (§26).

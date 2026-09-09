@@ -82,11 +82,15 @@ edges* and *Clustering* below.
    A signature matching no rule stays `new` with `repo`/`verb` unset and is
    named in the daily digest so the map can grow deliberately.
 4. **Resolve** — an event whose `resolved_at` is now set flips its
-   `triage_items` row to `resolved` — except `ignored`/`snoozed`/`STATE_NOTE`
-   rows, which stay in their terminal state (a note must never get a
-   one-time "resolved" card either). `note` is also cleared here, so a stale
-   quiet/recovery note (below) never survives into a later, unrelated
-   resolve.
+   `triage_items` row to `resolved` — but ONLY a row still in `new`
+   (`_SILENCE_RESOLVE_ELIGIBLE_STATES`). `resolved_at` is set by
+   disappearance from observation, and observation ending never discharges an
+   obligation (DESIGN.md principle 5), so every other state — `ignored`,
+   `snoozed`, `note`, and every chain state from `investigating` onward — stays
+   put and exits through its own transition or its deadline. `note` is also
+   cleared here, which is safe precisely because the row was `new` and had no
+   prior-phase text to lose: it stops a stale quiet/recovery note (below) from
+   surviving into a later, unrelated resolve.
 4b. **Quiet / recovery-paired resolve** — the two GROUPED sources
    (`slack_alert`, `hermes_log`) never disappearance-resolve via step 4 at
    all: `watchdog-poll.py`'s own `sweep_stale_grouped()` only clears them
@@ -287,9 +291,12 @@ deliberately never touches; that column and that sweep stay owned end to end
 by `watchdog-poll.py` — only clears a grouped row after 7 idle DAYS.
 
 Two triage-SIDE fixes (`triage_items` state only, never `events.resolved_at`),
-checked in this order, both excluding an item mid-investigation
-(`state == investigating` — an open dispatch should finish before either path
-races it):
+checked in this order, both eligible only for a row still in `new`
+(`_SILENCE_RESOLVE_ELIGIBLE_STATES` — the same allowlist step 4 uses). An item
+mid-investigation is excluded not as a special case about racing an open
+dispatch, but as one instance of the general rule: every state past `new`
+carries an obligation, and silence is an observation about the signal, never a
+discharge of that obligation.
 
 - **`resolve_recovery_paired()`** — a `✅ <same alert text>` HyperDX recovery
   message is a strictly better signal than silence: a service that is fully
@@ -344,10 +351,10 @@ state) used to do.
 **Being in this list only makes a row ELIGIBLE for a card — `sync_card()` is
 where "was this item actually told to the human before" is enforced** (2026-09-08
 correction, the sibling failure the list above exists to prevent): `resolved`
-is reachable from EVERY state including `new` itself (`apply_resolutions()`,
-`resolve_quiet_grouped()` and `resolve_recovery_paired()` can all flip an
+is reachable from `new` itself (`apply_resolutions()`,
+`resolve_quiet_grouped()` and `resolve_recovery_paired()` all flip an
 unescalated `new` row straight to `resolved` on a quiet/disappeared signal
-that was never carded), and a card announcing the resolution of a problem the
+that was never carded — and `new` is the only state they may flip), and a card announcing the resolution of a problem the
 human was never told about is exactly the noise this whole file replaced —
 caught live from a 13-card burst where every card was a `new -> resolved`
 transition. `sync_card()` now refuses outright (zero Slack calls, neither
@@ -382,8 +389,8 @@ liveness_pending ──(positive liveness match)──────────> 
                  └──(window elapses, still not live)──> new  (REOPENED, full history on the card)
 ```
 
-Any state EXCEPT `ignored`/`snoozed`/`note` also goes to `resolved` the
-moment the underlying event's `resolved_at` is set. Once resolved, the row's
+A row in `new` — and ONLY a row in `new` — also goes to `resolved` the
+moment the underlying event's `resolved_at` is set (see step 4). Once resolved, the row's
 rendered content stops changing, so the card-hash short-circuit (below)
 means it is genuinely never touched again — "stop touching it" falls out of
 the state machine, it isn't a separate rule.
@@ -952,9 +959,10 @@ Slack calls for the pairing check.
 
 54 cases total as of the auto-implement chain (steps 6-10) — the final 12
 cover: a `new -> resolved` transition with no prior card making zero Slack
-calls and an `investigating -> resolved` transition making exactly one
-`chat.update` and zero `chat.postMessage` (the 2026-09-08 correction, both
-directions); `maybe_auto_implement()` firing on a `confidence: high` verdict
+calls and a carded `new` item's resolve making exactly one `chat.update` and
+zero `chat.postMessage` (the 2026-09-08 correction, both directions), plus an
+`investigating` item NOT being discharged when its signal disappears
+(_SILENCE_RESOLVE_ELIGIBLE_STATES); `maybe_auto_implement()` firing on a `confidence: high` verdict
 and never firing at `medium`; `poll_implement_jobs()` opening the step-7
 validation on a successful implement episode and blocking outright on a
 failed one; a DISAGREEING validation blocking the merge without ever calling

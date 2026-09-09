@@ -667,6 +667,17 @@ def test_dispatch_brief_on_stdin_and_capped():
 
 
 def test_resolution_updates_card_once_then_stops():
+    """A CARDED item's resolve is exactly one chat.update, and the resolved
+    card is then never touched again.
+
+    The item is escalated first (that is what puts a real card on it), then
+    returned to `new` before the resolve — the shape production reaches via
+    `snoozed -> new` (unsnooze_if_expired()), a cluster dissolve
+    (_dissolve_cluster()) and a liveness-window reopen, all of which keep the
+    card. It has to be `new` because a silence resolve may touch nothing else
+    (_SILENCE_RESOLVE_ELIGIBLE_STATES); apply_resolutions() runs before
+    escalate() in run(), so the row resolves on that pass rather than being
+    re-dispatched."""
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-resolve", title="Resolve me", first_seen=OLD)
         calls: list[dict[str, Any]] = []
@@ -675,6 +686,7 @@ def test_resolution_updates_card_once_then_stops():
         calls_before = ctx.total_calls()
         assert calls_before >= 1
 
+        conn.execute("UPDATE triage_items SET state=? WHERE event_id=?", (triage.STATE_NEW, eid))
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
         conn.commit()
         triage.run(conn, dry_run=False)
@@ -1152,11 +1164,19 @@ def test_evidence_total_stays_under_brief_cap():
 # --- grouped-source resolution (quiet timer + recovery pairing) --------------
 
 def test_quiet_grouped_resolves_after_window_and_updates_card_once():
-    """A CARDED item (card_ts already set, as a real escalation would leave
-    it) still gets its final chat.update on a quiet-timer resolve — the
-    positive half of the 2026-09-08 correction, see
-    test_new_to_resolved_with_no_card_is_silent for the negative half."""
-    policy = dict(DEFAULT_POLICY, quietResolveHours=1)
+    """A CARDED item still gets its final chat.update on a quiet-timer
+    resolve — the positive half of the 2026-09-08 correction, see
+    test_new_to_resolved_with_no_card_is_silent for the negative half.
+
+    The seeded shape — state `new` but card_ts/card_channel/card_hash still
+    set — is not artificial: it is exactly what `snoozed -> new` leaves
+    behind (unsnooze_if_expired() clears snoozed_until, never the card), so a
+    previously carded item comes back to `new` carrying its card. It is also
+    the ONLY shape that can reach a silence resolve at all now that
+    _SILENCE_RESOLVE_ELIGIBLE_STATES is `new`-only; the item is held in `new`
+    through the pass (minOccurrences/minOpenMinutes) so escalate() cannot move
+    it before the quiet timer runs."""
+    policy = dict(DEFAULT_POLICY, quietResolveHours=1, minOccurrences=999, minOpenMinutes=999999)
     with _triage_env(policy=policy) as (conn, ctx):
         triage._watchdog_poll = _fake_wp_module([], homelab_key="")  # no token -> pairing path is a no-op
         quiet_first_seen = NOW - dt.timedelta(hours=5)
@@ -1169,7 +1189,7 @@ def test_quiet_grouped_resolves_after_window_and_updates_card_once():
             "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
             "last_seen, created_at, updated_at, card_channel, card_ts, card_hash) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (eid, "slack_alert:sig-quiet", "demo-repo", triage.STATE_VERDICT, 5,
+            (eid, "slack_alert:sig-quiet", "demo-repo", triage.STATE_NEW, 5,
              quiet_first_seen.isoformat(), stale_anchor, NOW.isoformat(), NOW.isoformat(),
              "C0TESTCHAN01", "1000.000001", "stale-hash-from-a-prior-post"),
         )
@@ -1226,11 +1246,12 @@ def test_new_to_resolved_with_no_card_is_silent():
         assert ctx.total_calls() == 0, "new -> resolved with no prior card must make zero Slack calls"
 
 
-def test_investigating_to_resolved_updates_card_exactly_once():
-    """The narrower, exact-shape sibling of the quiet-timer test above: an
-    ordinary event-driven resolve (apply_resolutions(), not the quiet timer)
-    on an already-carded `investigating` item is exactly one chat.update and
-    zero chat.postMessage."""
+def test_investigating_is_not_discharged_by_its_signal_disappearing():
+    """An IN-FLIGHT operation is never discharged by an observation ending
+    (DESIGN.md principle 5): `events.resolved_at` is set by disappearance
+    from observation, never by a human or by the episode itself, so an
+    `investigating` item whose alert stops being seen keeps its dispatch and
+    its state. The episode is still running; nothing has answered it."""
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-inv-resolve",
                              title="🚨 in flight", first_seen=OLD)
@@ -1244,15 +1265,25 @@ def test_investigating_to_resolved_updates_card_exactly_once():
         )
         conn.commit()
 
+        # One settling pass first: the seeded card_hash is deliberately stale
+        # (as a real prior post leaves it), so the first render is one legitimate
+        # chat.update that has nothing to do with the resolve. Everything after
+        # this line must be silent.
+        triage.run(conn, dry_run=False)
+        calls_before = ctx.total_calls()
+
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
         conn.commit()
         triage.run(conn, dry_run=False)
 
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_RESOLVED
-        assert len(ctx.updated) == 1 and len(ctx.posted) == 0, (
-            "investigating -> resolved on an already-carded item must be exactly one "
-            f"chat.update and zero chat.postMessage, got updated={len(ctx.updated)} posted={len(ctx.posted)}"
+        assert item["state"] == triage.STATE_INVESTIGATING, (
+            f"an in-flight investigation must survive its signal disappearing, got {item['state']}"
+        )
+        assert item["dispatch_job"] == "job-in-flight", "the in-flight dispatch pointer must be untouched"
+        assert ctx.total_calls() == calls_before, (
+            f"nothing changed, so nothing is news — got "
+            f"{ctx.total_calls() - calls_before} Slack call(s) on the resolve pass"
         )
 
 
@@ -1291,7 +1322,7 @@ def test_recovery_paired_resolves_immediately_without_waiting_for_quiet():
         conn.execute(
             "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
             "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (eid, "slack_alert:research-gateway-job-reaped-1-15m", "vps", triage.STATE_NEEDS_HUMAN, 3,
+            (eid, "slack_alert:research-gateway-job-reaped-1-15m", "vps", triage.STATE_NEW, 3,
              OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
         )
         conn.commit()
@@ -1305,6 +1336,167 @@ def test_recovery_paired_resolves_immediately_without_waiting_for_quiet():
         assert item["note"].startswith(triage.RECOVERY_PAIRED_NOTE_PREFIX)
         assert recovery_text in item["note"]
         assert "fixed" not in item["note"].lower()
+
+
+def test_recovery_paired_never_discharges_needs_human():
+    """The same ✅ recovery message, on an item that is BLOCKED ON A HUMAN.
+    A positive recovery message is an OBSERVATION that the alert cleared; the
+    human's pending decision about an already-written fix is an OBLIGATION.
+    DESIGN.md principle 5 — the two are different facts, and the first may
+    never discharge the second. The written fix must still be there
+    afterwards, byte for byte: erasing it is how the fix gets abandoned."""
+    policy = dict(DEFAULT_POLICY, quietResolveHours=999)
+    with _triage_env(policy=policy) as (conn, ctx):
+        written_fix = ("blocked on a human: the 1Password rate-limit fix is two lines in "
+                        "scripts/foo.py")
+        eid = _insert_event(conn, source="slack_alert", external_id="research-gateway-job-reaped-1-15m",
+                             title="🚨 research-gateway job.reaped >= 1 (15m) (×3 in batch)", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, first_seen, "
+            "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid, "slack_alert:research-gateway-job-reaped-1-15m", "vps", triage.STATE_NEEDS_HUMAN,
+             written_fix, 3, OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+
+        triage._watchdog_poll = _fake_wp_module(
+            [_slack_msg("999.000001", "✅ research-gateway job.reaped >= 1 (15m)")])
+
+        triage.run(conn, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, (
+            f"a pending human decision must survive its alert recovering, got {item['state']}"
+        )
+        assert item["note"] == written_fix, "the written fix must not be rewritten or erased"
+
+
+def test_quiet_timer_never_discharges_needs_human():
+    """DESIGN.md § "The quiet rule, corrected", verbatim: an intermittent
+    fault alerts, an investigation writes a correct fix, the item reaches
+    `needs_human`, the fault clears on its own — and under the OLD exclusion
+    list the item went terminal after 2h, 90 minutes before this design's own
+    4h SLA for answering one, abandoning the written fix. Silence cancels the
+    need to START work; it never discharges an obligation."""
+    policy = dict(DEFAULT_POLICY, quietResolveHours=1)
+    with _triage_env(policy=policy) as (conn, _ctx):
+        written_fix = ("blocked on a human: the 1Password rate-limit fix is two lines in "
+                        "scripts/foo.py")
+        first_seen = NOW - dt.timedelta(hours=5)
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-quiet-needs-human",
+                             title="🚨 intermittent thing", first_seen=first_seen)
+        stale_anchor = (NOW - dt.timedelta(hours=3)).isoformat()
+        conn.execute("UPDATE events SET notified_at=?, last_reminder_at=? WHERE id=?",
+                     (stale_anchor, stale_anchor, eid))
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, first_seen, "
+            "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid, "slack_alert:sig-quiet-needs-human", "demo-repo", triage.STATE_NEEDS_HUMAN,
+             written_fix, 5, first_seen.isoformat(), stale_anchor, NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+
+        triage.resolve_quiet_grouped(conn, policy, NOW)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, (
+            f"a 3h-quiet signal must not close a pending human decision, got {item['state']}"
+        )
+        assert item["note"] == written_fix, "the written fix must survive the quiet window intact"
+
+
+def test_event_resolution_never_discharges_needs_human():
+    """The same obligation, reached through the OTHER silence path:
+    `events.resolved_at` (disappearance from observation, or watchdog-poll's
+    7-idle-day housekeeping — never a human decision). apply_resolutions()
+    also sets note=NULL, so the note-erasure is a SECOND, distinct defect from
+    the state change and gets its own assertion: an item that quietly kept its
+    state but lost its written fix is just as abandoned."""
+    with _triage_env() as (conn, _ctx):
+        written_fix = ("blocked on a human: the 1Password rate-limit fix is two lines in "
+                        "scripts/foo.py")
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-resolved-needs-human",
+                             title="🚨 disappearing thing", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, first_seen, "
+            "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid, "slack_alert:sig-resolved-needs-human", "demo-repo", triage.STATE_NEEDS_HUMAN,
+             written_fix, 3, OLD.isoformat(), OLD.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
+        conn.commit()
+
+        triage.apply_resolutions(conn, NOW)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, (
+            f"a disappeared signal must not close a pending human decision, got {item['state']}"
+        )
+        assert item["note"] is not None, (
+            "note=NULL erased the written fix — a distinct defect from the state change"
+        )
+        assert item["note"] == written_fix
+
+
+def test_silence_resolve_eligible_states_is_new_only():
+    """Structural guard on the allowlist itself. It is an INCLUSION list of
+    one on purpose: `new` is the only state carrying no obligation yet.
+    Widening this tuple is exactly how the Wave-2 chain states
+    (implementing/validating/deploying/verifying) would silently become
+    discardable again — which is what an EXCLUSION list did, by admitting
+    every state added after it was written."""
+    assert triage._SILENCE_RESOLVE_ELIGIBLE_STATES == (triage.STATE_NEW,), (
+        f"silence-resolve must apply to `new` and nothing else (DESIGN.md § The quiet rule, "
+        f"corrected); widening this tuple to "
+        f"{triage._SILENCE_RESOLVE_ELIGIBLE_STATES} makes every state in it discardable by "
+        f"silence, including any Wave-2 chain state added later"
+    )
+
+
+def test_no_chain_state_is_silence_resolvable():
+    """Every state past `new`, against every silence path there is. One
+    grouped `slack_alert` item per state, each with a stale idle anchor and a
+    matching ✅ recovery message, run through all three: the two grouped paths
+    first (they require `resolved_at IS NULL`, which is what "the signal
+    stopped being observed" looks like to them), then apply_resolutions() with
+    `resolved_at` stamped. None of them may move."""
+    chain_states = (triage.STATE_INVESTIGATING, triage.STATE_VERDICT, triage.STATE_NEEDS_HUMAN,
+                     triage.STATE_PR_OPEN, triage.STATE_IMPLEMENTING, triage.STATE_VALIDATING,
+                     triage.STATE_MERGE_BLOCKED, triage.STATE_MERGED, triage.STATE_LIVENESS_PENDING)
+    policy = dict(DEFAULT_POLICY, quietResolveHours=1)
+    with _triage_env(policy=policy) as (conn, _ctx):
+        stale_anchor = (NOW - dt.timedelta(hours=3)).isoformat()
+        first_seen = NOW - dt.timedelta(hours=5)
+        ids: dict[str, int] = {}
+        messages = []
+        for state in chain_states:
+            external_id = f"sig-chain-{state.replace('_', '-')}"
+            eid = _insert_event(conn, source="slack_alert", external_id=external_id,
+                                 title=f"🚨 sig chain {state}", first_seen=first_seen)
+            conn.execute("UPDATE events SET notified_at=?, last_reminder_at=? WHERE id=?",
+                         (stale_anchor, stale_anchor, eid))
+            conn.execute(
+                "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+                "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (eid, f"slack_alert:{external_id}", "demo-repo", state, 5, first_seen.isoformat(),
+                 stale_anchor, NOW.isoformat(), NOW.isoformat()),
+            )
+            ids[state] = eid
+            messages.append(_slack_msg(f"999.{len(messages):06d}", f"✅ sig chain {state}"))
+        conn.commit()
+
+        triage._watchdog_poll = _fake_wp_module(messages)
+        triage.resolve_recovery_paired(conn, policy, NOW, dry_run=False)
+        triage.resolve_quiet_grouped(conn, policy, NOW)
+
+        conn.execute("UPDATE events SET resolved_at=?", (NOW.isoformat(),))
+        conn.commit()
+        triage.apply_resolutions(conn, NOW)
+
+        leaked = {state: triage._get_item(conn, eid)["state"]
+                   for state, eid in ids.items()
+                   if triage._get_item(conn, eid)["state"] != state}
+        assert not leaked, (
+            f"silence-resolved a state carrying an obligation: {leaked} "
+            f"(each entry is seeded-state -> state after the three silence paths)"
+        )
 
 
 def test_recovery_pairing_skipped_under_dry_run():

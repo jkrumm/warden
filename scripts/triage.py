@@ -42,7 +42,12 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    declared local command — see VERB OUTCOMES below). Only
                    ever touches a row still in state `new`.
   4. Resolve      — an event whose events.resolved_at is now set flips its
-                   triage_items row to `resolved`.
+                   triage_items row to `resolved` — but ONLY a row still in
+                   `new`. events.resolved_at is set by disappearance from
+                   observation, and observation ending never discharges an
+                   obligation (DESIGN.md principle 5; see
+                   _SILENCE_RESOLVE_ELIGIBLE_STATES, which governs this step
+                   and step 4b alike).
   4b. Quiet/paired resolve — the two GROUPED_TRIAGE_SOURCES (slack_alert,
                    hermes_log) never disappearance-resolve via step 4 at all
                    (watchdog-poll.py's own sweep_stale_grouped only clears
@@ -50,7 +55,8 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    a fresh #alerts fetch for a `✅`-prefixed message pairing
                    the same alert text (see that function's own docstring);
                    resolve_quiet_grouped() falls back to a quietResolveHours
-                   silence timer. Neither ever claims "fixed" — see
+                   silence timer. Both are silence paths, so both touch only
+                   `new` rows too. Neither ever claims "fixed" — see
                    QUIET_RESOLVE_NOTE_PREFIX/RECOVERY_PAIRED_NOTE_PREFIX.
   5. Dissolve     — a cluster (see CLUSTERING below) whose folded verdict says
                    its members do not share a root cause splits back into
@@ -305,14 +311,16 @@ STATE_NOTE = "note"
 # human about an item they were told about; a state change on an item they
 # were never told about is not news. `STATE_RESOLVED` sits in this tuple
 # because a CARDED item's resolution is real news (the human saw the problem,
-# now sees it close) — but `resolved` is reachable from EVERY state including
-# `new` (apply_resolutions()/resolve_quiet_grouped()/resolve_recovery_paired()
-# all flip `new` straight to `resolved` on a quiet/disappeared signal that was
-# never escalated), and an item whose whole life was `new -> resolved` was
-# never told about in the first place. Being in CARDED_STATES only makes a row
-# ELIGIBLE for a card — sync_card() below is where "already had one" is
-# actually enforced (via `card_ts`), and that is the one place this rule is
-# checked, rather than every caller having to re-derive it.
+# now sees it close) — but `resolved` is reachable from `new`
+# (apply_resolutions()/resolve_quiet_grouped()/resolve_recovery_paired() all
+# flip `new` straight to `resolved` on a quiet/disappeared signal that was
+# never escalated, and `new` is the ONLY state they may flip — see
+# _SILENCE_RESOLVE_ELIGIBLE_STATES), and an item whose whole life was
+# `new -> resolved` was never told about in the first place. Being in
+# CARDED_STATES only makes a row ELIGIBLE for a card — sync_card() below is
+# where "already had one" is actually enforced (via `card_ts`), and that is the
+# one place this rule is checked, rather than every caller having to
+# re-derive it.
 CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR_OPEN, STATE_RESOLVED,
                   STATE_IMPLEMENTING, STATE_VALIDATING, STATE_MERGE_BLOCKED, STATE_MERGED,
                   STATE_LIVENESS_PENDING)
@@ -996,21 +1004,26 @@ def unsnooze_if_expired(conn: sqlite3.Connection, now: dt.datetime) -> None:
 
 
 def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime) -> None:
-    # STATE_NOTE is excluded alongside IGNORED/SNOOZED: it is terminal by
-    # design (see that state's docstring) and must never flip to RESOLVED,
-    # which IS a carded state — an unstructured-prose row must never get a
-    # card, including a one-time "resolved" one.
+    # `events.resolved_at` is set only by disappearance-from-observation
+    # (watchdog-poll.py's own ingest sweep) or its 7-idle-day housekeeping —
+    # never by a human decision. So this is a SILENCE path, and only `new` is
+    # eligible: see _SILENCE_RESOLVE_ELIGIBLE_STATES. STATE_NOTE, IGNORED and
+    # SNOOZED are covered by the same allowlist rather than by being named
+    # here — a `note` row is terminal by design (see that state's docstring)
+    # and must never flip to RESOLVED, which IS a carded state.
+    placeholders = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
     rows = conn.execute(
-        "SELECT ti.event_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE e.resolved_at IS NOT NULL AND ti.state NOT IN (?, ?, ?, ?)",
-        (STATE_RESOLVED, STATE_IGNORED, STATE_SNOOZED, STATE_NOTE),
+        f"SELECT ti.event_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"WHERE e.resolved_at IS NOT NULL AND ti.state IN ({placeholders})",
+        _SILENCE_RESOLVE_ELIGIBLE_STATES,
     ).fetchall()
     now_iso = _now_iso(now)
     for row in rows:
-        # note=NULL: a genuine event-driven resolve has no need to retain
-        # whatever text a PRIOR investigation phase left in `note` (a
-        # needs_human blocker, an env-check remediation, ...) — and clearing
-        # it here is also what stops a stale QUIET_RESOLVE_NOTE_PREFIX/
+        # note=NULL is safe BECAUSE the row is `new`: a `new` row carries no
+        # obligation and therefore no prior-phase text worth keeping (a
+        # needs_human blocker, an env-check remediation, ...) — those states
+        # are not reachable from here at all any more. What clearing it does
+        # do is stop a stale QUIET_RESOLVE_NOTE_PREFIX/
         # RECOVERY_PAIRED_NOTE_PREFIX note from a much earlier quiet-resolve
         # surviving a reopen -> genuine fix -> resolve cycle and rendering
         # under render_card_blocks()'s STATE_RESOLVED branch as if it were
@@ -1026,14 +1039,25 @@ def _quiet_resolve_hours(policy: dict[str, Any]) -> float:
     return float(policy.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS)
 
 
-# States a grouped item must NOT be in to be eligible for either resolve path
-# below — same terminal exclusions as apply_resolutions(), PLUS `investigating`:
-# an open dispatch is already in flight, so a quiet timer or a recovery
-# message racing dispatch-sweep.py's own fold_dispatch_verdict() would be
-# premature. Let the investigation finish; either resolve path can still
-# close it out on THAT state (verdict/needs_human/pr_open) on a later run.
-_GROUPED_RESOLVE_EXCLUDED_STATES = (STATE_RESOLVED, STATE_IGNORED, STATE_SNOOZED, STATE_NOTE,
-                                     STATE_INVESTIGATING)
+# The only state a SILENCE path may resolve — DESIGN.md § "The quiet rule,
+# corrected" and principle 5, "Observation status and remediation obligation are
+# different facts". All three silence paths (apply_resolutions(),
+# resolve_recovery_paired(), resolve_quiet_grouped()) resolve an item because its
+# signal STOPPED BEING OBSERVED, and observation ending is not a discharge: `new`
+# is the one state carrying no obligation yet, which is exactly why silence may
+# cancel it.
+#
+# The concrete failure this closes, which was live: an intermittent fault alerts,
+# an investigation writes a correct fix, the item reaches `needs_human`, the
+# fault clears on its own, the item goes terminal and the written fix is
+# abandoned. The old exclusion list let a grouped `needs_human` item quiet-resolve
+# after 2h — 90 minutes before DESIGN.md's own 4h SLA for answering one.
+#
+# It is an INCLUSION list of one, and that is the load-bearing part: Wave 2 adds
+# `implementing`, `validating`, `deploying` and `verifying` to the chain. An
+# exclusion list silently ADMITS every state added after it was written; an
+# inclusion list silently EXCLUDES them. This must fail closed.
+_SILENCE_RESOLVE_ELIGIBLE_STATES = (STATE_NEW,)
 
 
 def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -1065,16 +1089,22 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
     Reading live #alerts instead of `events` is what makes this possible at
     all — and it stays cheap because it is ONE fetch per triage run
     (poll_slack_messages's own single call), shared across every open
-    slack_alert candidate via one dict, not one call per item."""
+    slack_alert candidate via one dict, not one call per item.
+
+    A recovery message is still only an OBSERVATION that the alert cleared, so
+    like every other silence path this one only ever touches a row still in
+    `new` (see _SILENCE_RESOLVE_ELIGIBLE_STATES). A human's pending decision
+    about a written fix, an open dispatch, an in-flight merge — none of those
+    are discharged by the thing that raised them going away."""
     if dry_run:
         # Mirrors escalate_cluster()/run_verbs(): --dry-run makes NO outbound
         # call, Slack reads included, so a preview against a throwaway DB
         # copy never depends on live credentials or network.
-        placeholders = ",".join("?" * len(_GROUPED_RESOLVE_EXCLUDED_STATES))
+        placeholders = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
         candidates = conn.execute(
             f"SELECT ti.event_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-            f"WHERE e.source='slack_alert' AND e.resolved_at IS NULL AND ti.state NOT IN ({placeholders})",
-            _GROUPED_RESOLVE_EXCLUDED_STATES,
+            f"WHERE e.source='slack_alert' AND e.resolved_at IS NULL AND ti.state IN ({placeholders})",
+            _SILENCE_RESOLVE_ELIGIBLE_STATES,
         ).fetchall()
         if candidates:
             print(f"[dry-run] would check {len(candidates)} open slack_alert item(s) against live "
@@ -1102,11 +1132,11 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
         if prev is None or ts > prev[0]:
             latest_by_key[key] = (ts, text)
 
-    placeholders = ",".join("?" * len(_GROUPED_RESOLVE_EXCLUDED_STATES))
+    placeholders = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
     rows = conn.execute(
         f"SELECT ti.event_id, e.external_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        f"WHERE e.source='slack_alert' AND e.resolved_at IS NULL AND ti.state NOT IN ({placeholders})",
-        _GROUPED_RESOLVE_EXCLUDED_STATES,
+        f"WHERE e.source='slack_alert' AND e.resolved_at IS NULL AND ti.state IN ({placeholders})",
+        _SILENCE_RESOLVE_ELIGIBLE_STATES,
     ).fetchall()
     now_iso = _now_iso(now)
     for row in rows:
@@ -1145,6 +1175,14 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     fresh occurrence (see upsert_grouped()) — so a value that has stopped
     changing already IS the quiet duration.
 
+    Only a row still in `new` is eligible (see
+    _SILENCE_RESOLVE_ELIGIBLE_STATES). `investigating` is excluded here not as
+    a special case about racing dispatch-sweep.py's fold_dispatch_verdict(),
+    but as one instance of the general rule: every state past `new` carries an
+    obligation, and a quiet timer is an observation about the signal, never a
+    discharge of that obligation. It exits through its own transition or its
+    deadline, not through silence.
+
     Deliberately never claims a fix: render_card_blocks() only ever shows
     this as "signal quiet since <time>" (QUIET_RESOLVE_NOTE_PREFIX) — a
     service that is fully down also stops emitting, so silence alone is
@@ -1154,13 +1192,13 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     respects `dry_run` (see run()'s own sync_card() call)."""
     quiet_hours = _quiet_resolve_hours(policy)
     placeholders_sources = ",".join("?" * len(GROUPED_TRIAGE_SOURCES))
-    placeholders_states = ",".join("?" * len(_GROUPED_RESOLVE_EXCLUDED_STATES))
+    placeholders_states = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
     rows = conn.execute(
         f"SELECT ti.event_id, e.last_reminder_at, e.notified_at, e.first_seen "
         f"FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         f"WHERE e.source IN ({placeholders_sources}) AND e.resolved_at IS NULL "
-        f"AND ti.state NOT IN ({placeholders_states})",
-        (*GROUPED_TRIAGE_SOURCES, *_GROUPED_RESOLVE_EXCLUDED_STATES),
+        f"AND ti.state IN ({placeholders_states})",
+        (*GROUPED_TRIAGE_SOURCES, *_SILENCE_RESOLVE_ELIGIBLE_STATES),
     ).fetchall()
     now_iso = _now_iso(now)
     for row in rows:
