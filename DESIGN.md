@@ -56,7 +56,7 @@ out of the gateway's scheduler once.
 | Metric | Today | Target |
 |-|-|-|
 | Verdicts reaching a **recorded** disposition | 1 / 11 | 11 / 11 — `implement`, `dismissed` with a reason, or `needs_human`. Silence is never an outcome. |
-| Closes that are verified fixes vs. silence | 2 / 28 | verified is the majority of closes **for mapped signatures** |
+| Closes that are verified fixes vs. silence | 0 / 28 | verified is the majority of closes **for mapped signatures** |
 | Median `needs_human` → human decision | no answer path exists | < 4h |
 | Verified unattended fixes per week | 0 | ≥ 2, sustained over a month |
 | Minutes with no poller running | unmeasured | 0, and alarmed |
@@ -64,6 +64,24 @@ out of the gateway's scheduler once.
 
 The last row is not decoration. Without it the fourth row is trivially gameable —
 see *Self-concealing change* below.
+
+**Row 2 was `2 / 28` in v2 and is corrected to `0 / 28` here (2026-09-09, Wave 2),
+because v2 contradicted itself.** The 2 were items 931/932, closed by
+`resolve_recovery_paired()` on an observed ✅ — the same two counted in § *Why this
+exists*, and the same two `REVIEW.md` § *Facts corrected* names. But § *What must
+not be lost* item 4 says of that path, in as many words, that it **never claims a
+fix**: a service that is fully down also stops emitting, and a recovery message
+cannot tell "we fixed it" from "it came back on its own" any better than silence
+can. Counting an alert clearing as a verified fix is precisely the Goodhart
+failure `REVIEW.md` **C3** exists to prevent, so item 4 wins and the row moves.
+
+Concretely: `fixed` requires a **positive liveness probe**
+(`maybe_check_liveness()`, the one producer), recovery-pairing and the quiet timer
+both produce `quiet`, and **zero rows have ever carried a liveness confirmation**.
+So this number reads 0 today and **cannot move until at least one repo has a
+deploy target and a liveness probe and the whole chain completes** — Wave 3+. That
+is a real constraint on the headline metric and it is stated here rather than
+discovered from a dashboard reading zero.
 
 ---
 
