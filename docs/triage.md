@@ -1,6 +1,6 @@
 # Alert triage — the act-loop over watchdog.db
 
-`scripts/triage.py` (its own LaunchAgent, `com.jkrumm.hermes-triage`, every 10 min —
+`scripts/triage.py` (its own LaunchAgent, `com.jkrumm.warden-loop`, every 10 min —
 see *Why a LaunchAgent, not `hermes cron`* below) closes the loop
 `scripts/watchdog-poll.py` opened but never acted on: deduplicated `events`
 rows become one durable, updated-in-place Slack card per problem, with a real
@@ -755,8 +755,8 @@ because the only delivery path a gateway-scheduled job has is the same Slack
 connection that row says is broken.
 
 `triage.py` is instead installed by `make setup` as its own LaunchAgent
-(`com.jkrumm.hermes-triage`, `launchd/com.jkrumm.hermes-triage.plist.template`,
-`StartInterval 600`) invoking `~/.hermes/hermes-agent/venv/bin/python3
+(`com.jkrumm.warden-loop`, `launchd/com.jkrumm.warden-loop.plist.template`,
+`StartInterval 600`) invoking this repo's own `.venv/bin/python3
 scripts/triage.py --run` directly — no gateway process in the loop at all.
 This is safe specifically because Slack delivery here was already independent
 of the gateway: `post_blocks`/`update_blocks` call `chat.postMessage`/
@@ -903,7 +903,7 @@ LLM turn is gone.
 ## Tests
 
 `tests/test_triage.py`, run with
-`~/.hermes/hermes-agent/venv/bin/python3 tests/test_triage.py` (this repo's
+`.venv/bin/python3 tests/test_triage.py` (this repo's
 `venv` has no pytest — see that file's own docstring; every `test_*` function
 is still plain-`assert`, argument-free, so it is valid standalone pytest input
 too, and the test file's `main()` runner would be redundant if pytest is ever

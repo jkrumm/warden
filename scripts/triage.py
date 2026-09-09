@@ -187,7 +187,9 @@ throwaway copy of watchdog.db print a meaningful "what would be carded and
 dispatched" preview instead of nothing at all.
 
 Source of truth: ~/SourceRoot/warden/scripts/triage.py
-~/.hermes/scripts/ is itself a symlink to this directory (see make setup).
+~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
+directory — this code left that repo on 2026-09-09 and is reached by its
+own path now.
 """
 
 from __future__ import annotations

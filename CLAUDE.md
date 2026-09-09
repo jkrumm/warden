@@ -46,7 +46,7 @@ make unload    # stop the agents
 
 **Never start a second loop.** Two loops against one ledger double every card and
 every dispatch. Before loading an agent, check nothing else is already running the
-same script — during the extraction that means `com.jkrumm.hermes-triage` in
+same script — during the extraction that means `com.jkrumm.warden-loop` in
 particular.
 
 ## Python

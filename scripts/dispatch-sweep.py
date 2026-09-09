@@ -62,7 +62,9 @@ stamps `reported_at` so it is never polled again. A successful poll resets
 the counter, so three misses spread across a flapping sideclaw do not count.
 
 Source of truth: ~/SourceRoot/warden/scripts/dispatch-sweep.py
-~/.hermes/scripts/ is itself a symlink to this directory (see make setup).
+~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
+directory — this code left that repo on 2026-09-09 and is reached by its
+own path now.
 """
 
 from __future__ import annotations

@@ -53,12 +53,10 @@ WARDEN_HOME = (
 # works today.
 DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db"
 
-# Scope note: this default does not move the live ledger. Nothing in this
-# slice points warden.db at ~/.hermes/watchdog.db, and nothing here copies or
-# creates ~/.warden/warden.db in production — the three scripts that use this
-# module keep resolving their own DB_PATH through their existing `--db` /
-# HERMES_CC_DB overrides, which for now still means ~/.hermes/watchdog.db.
-# The cutover to this default is a separate, later step.
+# This IS the live ledger, since the cutover on 2026-09-09. Four LaunchAgents
+# and hermes-cc.sh all resolve here. ~/.hermes/watchdog.db is still on disk,
+# frozen at its pre-cutover state and written by nothing, kept as the rollback —
+# so if you are reading this to work out which database is real, it is this one.
 
 SCHEMA_VERSION = 1
 
@@ -82,7 +80,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 # column, before any table-level constraint — which is why `dispatch_id`
 # below sits before `UNIQUE(source, external_id)` rather than after it).
 # Column lists, index definitions and column order were read directly off
-# the live ~/.hermes/watchdog.db via a read-only connection — not
+# the then-live ~/.hermes/watchdog.db via a read-only connection — not
 # reconstructed from memory of the four DDL blocks — so this is a faithful
 # copy, not a redesign.
 BASE_SCHEMA = """

@@ -1027,7 +1027,7 @@ which. **Do not start Wave 1.**
 | 0.4b | Cut over: unload `com.jkrumm.hermes-triage`, delete the two `cron/jobs.json` entries, delete the originals and the two orphan wrappers, load warden's agents. Folded into 0.6 — one short reversible flip, so there is never an interval with two loops or none. | warden + hermes-agent | 1, 5 | not started |
 | 0.5 | Ledger: WAL + `busy_timeout`, one migrator + `schema_version`. Code + tests only; the path move and the heartbeat snapshot go with the cutover. | warden | **4** (partly — see §19) | **done** — `de5d80d` |
 | 0.6 | The cutover. | warden + hermes-agent | **1, 5** | **DONE & LIVE** — §23 |
-| 0.7 | hermes-agent cleanup: `dispatch-repos.json` ceilings for `sideclaw`/`warden` (§6), `HERMES_PLISTS`, `docs/symlinks-and-agents.md`, `dotfiles/docs/architecture.md:171`. | hermes-agent + dotfiles | 3 (defence in depth) | not started |
+| 0.7 | hermes-agent + dotfiles cleanup, the policy agreement check, the doc redirect. | hermes-agent + dotfiles | 3 (defence in depth) | **done** — `22eb31c`, `f90cf5a`, `c661a89`, dotfiles `d6d6559`/`8ce1476` |
 
 **Ordering.** 0.1 and 0.2 are in a different repo and touch nothing warden owns —
 they run first and independently, and 0.1 is the item most likely to get skipped,
@@ -1587,6 +1587,9 @@ docstrings that have been wrong since slice 0.4a.
 
 ### Where this leaves the stop condition's "one writer"
 
+> **CORRECTED 2026-09-09 by the wave-boundary audit — see §24. The paragraph below
+> was wrong about `one migrator`, which is worse than the gap it was busy conceding.**
+
 Honestly: **not met, and it cannot be in Wave 0.** WAL, one migrator and
 `schema_version` are done. But "one writer *process*" requires the intent queue
 that DESIGN.md § Migration puts in **Wave 1**, and the approval plugin's direct
@@ -1801,13 +1804,13 @@ bootstrap` it, and re-create the two cron jobs from `jobs.json.bak`.
 |-|-|-|
 | 1 | Back up the un-gitted state | three files in `~/.warden-cutover-backup/` |
 | 2 | `launchctl bootout com.jkrumm.hermes-triage` | no longer in `launchctl list` |
-| 3 | `hermes cron delete 4b1faabda97d` / `4dd759917dd1` | *"Removed job: Watchdog"*, *"Removed job: Dispatch sweep"*; 4 jobs remain |
+| 3 | `hermes cron delete 4b1faabda97d` / `4dd759917dd1` | *"Removed job: Watchdog"*, *"Removed job: Dispatch sweep"*; **5** jobs remain (7 − 2; an earlier draft said 4) |
 | 4 | `VACUUM INTO ~/.warden/warden.db` off a **read-only** handle | 956/9/22/5/49 rows, every column set and all six indexes identical, `schema_version` 1, `journal_mode` wal |
 | 5 | Repoint every reader/writer | all five warden scripts, `hermes-cc.sh`, the approval plugin, `briefing-context.py` |
 | 6 | Exercise by hand before trusting a timer | loop `--dry-run` (18 open items, zero Slack), loop `--run` rc=0, poller `--post --dry-run` zero calls, sweeper rc=0 |
 | 7 | `make agents` | four loaded, **all four exit status 0**, empty logs |
 | 8 | Confirm the *agents* (not my manual runs) are writing | `triage_last_run` 19s old, `slack_alert_ts` advanced by the poller |
-| 9 | Delete the originals + the two orphan wrappers | hermes-agent's nine suites all still pass |
+| 9 | Delete the originals + the two orphan wrappers | hermes-agent's **ten** suites all still pass |
 
 ### What moved, and the two things that were not just path edits
 
@@ -1877,3 +1880,108 @@ An assert-only process that fires before the migrator on a **fresh** ledger erro
 once and self-heals (§19). It did not happen here — the ledger was migrated
 explicitly at step 4, before any agent was loaded — but it is the shape to expect
 on a rebuild.
+
+---
+
+## 24. Wave-boundary audit — what it caught, including one thing this file got wrong
+
+A **fresh** reviewer with none of this session's context audited all three repos
+and the running system against `DESIGN.md` and `FLOWS.md`. Its verdict: **Wave 0
+is not done**, on one item — and the important part was not that the item failed
+but that **§19 asserted it was finished.**
+
+### CRITICAL — `hermes-cc.sh` was still a second, unversioned migrator
+
+Verified first-hand rather than taken from the report:
+
+```
+$ grep -n 'DB_PATH=' scripts/hermes-cc.sh
+111:DB_PATH="${HERMES_CC_DB:-$HOME/.warden/warden.db}"     <- the NEW ledger
+$ sed -n '829,834p' scripts/hermes-cc.sh
+  conn = sqlite3.connect(os.environ['DB_PATH'])
+  conn.executescript(os.environ['DB_SCHEMA'])              <- full CREATE block
+$ grep -n 'ALTER TABLE' scripts/hermes-cc.sh | wc -l
+7
+$ grep -c 'schema_version' scripts/hermes-cc.sh
+0
+$ grep -c 'db_py ' scripts/hermes-cc.sh
+11
+```
+
+Eleven call sites, every one re-running the whole DDL against the live ledger,
+with no knowledge of `schema_version` and no `assert_schema_version()`. **This is
+verbatim DESIGN.md C4** — *"two processes independently `ALTER TABLE` the same
+tables with no version table"* — and slice 0.5 consolidated three of the four
+copies while §19 claimed all of them.
+
+It is benign only because the two schemas happen to agree. It stops being benign
+the first time `SCHEMA_VERSION` becomes 2, and it silently voids the fail-loudly
+property the poller and sweeper were given in the same slice.
+
+**The concession §19 *did* make — that "one writer" is not met — the auditor
+judged honest** (six writers named, the reason given, carried into the deferred
+list). What was not honest was bundling "one migrator" into the done column in
+the same paragraph. **Corrected in place above, and being fixed:**
+`scripts/ledger.py` gained a CLI (`--migrate` / `--check` / `--version`,
+warden `fe95e81`) so a shell script can prepare and assert a ledger without
+carrying its own schema, and `hermes-cc.sh` is being converted from migrating to
+asserting.
+
+### MAJOR — a heartbeat semantics change nobody wrote down
+
+`watchdog-poll.py`'s `--post` path returns 1 on a **failed Slack post**, before
+the UptimeKuma ping. Under the old wrapper the gateway did delivery and rc was
+unaffected by it, so `UPTIME_PUSH_WATCHDOG` answered *"did the poller run"*. It now
+also answers *"did Slack accept the message"* — **a Slack outage will red the
+"Watchdog last successful run" monitor even though ingest ran perfectly.**
+
+Test 10 pins it deliberately, so it is a decision, not an accident. **Decision,
+recorded now because it was not before: keep it.** A poll whose digest reached
+nobody is not a successful poll — the operator learns nothing from it, which is
+the same blindness by a different route. But the monitor's *name* now understates
+what it covers, and if Slack outages turn out to be the common case this should
+flip. The quiet-poll half is correct and confirmed: an empty digest still pings.
+
+### The other findings, and their disposition
+
+| Finding | Disposition |
+|-|-|
+| 75 KB of stale hermes-agent docs, incl. `docs/triage.md` byte-identical to warden's | fixed, `c661a89` — `docs/triage.md` and `cron/watchdog.md` deleted, `docs/watchdog.md` cut to the 9 lines still true there. `make status`: `✓ cron registry (5 jobs match)` |
+| `ledger.py`'s scope note still said the cutover was "a separate, later step" — in the one file a stranger opens to learn which database is live | fixed |
+| Three docstrings claiming `~/.hermes/scripts` symlinks to *this* directory | fixed — it symlinks to `hermes-agent/scripts` and always will |
+| `warden/docs/triage.md` and `CLAUDE.md` still named `com.jkrumm.hermes-triage` and the hermes venv — copied verbatim in `040e3eb`, never adapted | fixed |
+| `dotfiles/scripts/log-rotate.sh` said `hermes-triage` "runs today" | fixed, dotfiles `8ce1476` |
+| §23 said "4 jobs remain" (5) and "nine suites" (10) | corrected in place |
+| §15 called the sweeper's delivery "still gateway-coupled", contradicting `dispatch-sweep.py:99` | **§15 was wrong.** Verified in the CLI itself: `hermes_cli/send_cmd.py:258` — *"no agent loop, no running gateway required for bot-token"*. `hermes send` loads the gateway's **config** for credentials and posts through the platform adapter directly. It matters, because flow 5 is the case where the gateway is down |
+
+### Confirmed under attack — recorded because these are the load-bearing claims
+
+- **All nine of DESIGN.md § "What must not be lost" survive**, located line by line in the moved files. The auditor could not fault one. The dry-run contract is *better* tested than before (`--dry-run` beats `--post`, zero Slack **and** zero heartbeat). The `needs_human`-quiet-resolves bug DESIGN.md schedules for Wave 1 is correctly **still there** — not opportunistically fixed.
+- **The old ledger is untouched, cryptographically:**
+  `MD5(~/.hermes/watchdog.db) == MD5(~/.warden-cutover-backup/watchdog.db.pre-cutover)` = `f24b06d8ad5eae08bbc901df95bfb5b6`.
+- **No split brain** — no writer in any of the three repos still resolves to the old path.
+- **The boundary refuses under attack**: trailing slash, `.` segment, `../` traversal, case-flip, pinned-repo-via-traversal, a subdirectory, and the root itself — all 400 at submit, no job row. `__proto__`/`constructor`/`toString`/`hasOwnProperty` are correctly *admitted* to `DEFAULT_RULE` and then die on `Directory not found`.
+- **No test deleted, skipped or weakened.** `test_triage.py` 2002 lines before and after, one line changed. The two changed assertions across the wave both moved in the **stricter** direction.
+- **restic coverage discharged**: `homelab/docker-compose.yml:247` mounts the whole `/mnt/hdd/backups` read-only, and `restic-excludes.txt` excludes `*-shm`/`*-journal` but **not** `*.db`. DESIGN.md's *"verify the paths before assuming coverage"* is answered — the doc should be updated to say so.
+
+### Two residual security gaps, by construction, worth DESIGN.md's attention
+
+Neither is an implementation defect; both are properties of the design as built,
+and DESIGN.md § Security model currently reads as if the pinned entries are
+absolute.
+
+1. **The policy keys on the directory basename, not on git identity.** A clone or
+   worktree of `warden` under a different name, directly under a dispatch root,
+   gets `DEFAULT_RULE` = `implement` — defeating a PINNED entry.
+2. **`~/IuRoot` is a dispatch root with zero rules.** Every work repo under it is
+   reachable at `implement`. That is pre-existing interactive capability, not
+   something this wave introduced, and `check-dispatch-policy.py` prints it as a
+   note rather than hiding it.
+
+### Still open, declared
+
+- `op://hermes/uptime-kuma/warden-backup-push-url` **does not exist**, so the
+  backup runs unmonitored. Human-essential case 2 (§15).
+- `com.jkrumm.warden-backup` has never fired via launchd — `StartCalendarInterval`
+  03:10, and both existing snapshots were made by hand. First natural firing is
+  the real test.
