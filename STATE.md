@@ -340,12 +340,18 @@ confirmation of DESIGN.md C5's "no auth" claim on the job API.
 
 Numbered so a later session can cite them.
 
-- **Q1. Where does warden's ledger live?** `~/.warden/warden.db` is the clean
-  answer and it silently leaves the backup path (§2). `~/.hermes/watchdog.db`
-  in place keeps backup coverage but keeps the coupling DESIGN.md § The ledger
-  says must end (*"the Slack approval plugin must stop writing this file
-  directly, or the coupling silently returns"*). **Not blocking** — decide it as
-  the first Wave 0 slice and record the decision here.
+- **Q1. Where does warden's ledger live? — DECIDED 2026-09-09: `~/.warden/warden.db`.**
+  The objection was that it leaves the backup path (§2). It does not, because the
+  restic container mounts the **whole** `/mnt/hdd/backups` directory, not the
+  `hermes/` subdirectory:
+  `- /mnt/hdd/backups:/sources/hermes-backup:ro` (homelab `docker-compose.yml:247`,
+  re-verified against the live file). So a new `warden/` sibling of `hermes/` is
+  covered by B2 the moment it exists, with **zero homelab-side change**. Only the
+  mini→homelab leg is new, and that is `scripts/warden-backup.sh` (slice 0.3),
+  scheduled 03:10 — after `hermes-backup` at 03:00, before restic at 03:30.
+  This keeps the clean separation *and* the coverage, so the coupling DESIGN.md
+  § The ledger says must end (*"the Slack approval plugin must stop writing this
+  file directly"*) can actually end.
 - **Q2. Does `watchdog-poll.py` move at all in Wave 0?** Its `stray_skill` source
   walks `~/.hermes/skills/` and is documented as *the primary defence* for
   agent-created skills — a hermes concern, not a warden one, riding in the same
@@ -1014,9 +1020,9 @@ which. **Do not start Wave 1.**
 
 | # | Slice | Repo | Stop-condition item | Status |
 |-|-|-|-|-|
-| 0.1 | Repo policy module in sideclaw: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | sideclaw | **3 — sideclaw enforces the allowlist** | not started |
+| 0.1 | Repo policy module in sideclaw: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | sideclaw | **3 — sideclaw enforces the allowlist** | **in progress** (delegated) |
 | 0.2 | Typed `outcome` enum on the dispatch verdict + a schema version, following the `review.ts:127` precedent. Publish the schema as a consumable artifact. | sideclaw | (Wave 0 scope per DESIGN.md § Migration; not in the five-item stop list, but stated work) | not started |
-| 0.3 | warden repo skeleton: venv (`cryptography` only), Makefile, `launchd/*.template`, hand-rolled test runner, log-rotate registration. | warden | 1, 5 | not started |
+| 0.3 | warden repo skeleton: venv (`cryptography` only), Makefile, `launchd/*.template`, hand-rolled test runner, log-rotate registration. | warden | 1, 5 | **done** — `89b0c12`, see §15 |
 | 0.4 | Move `triage.py`, `dispatch-sweep.py`, `watchdog-poll.py`, `watchdog-summary.py`, `triage-policy.json`, `docs/triage.md`, and the 68 tests. Sever the `agents-overview.py` seam (§12). Make the `TRIAGE_REPO_DIR` policy-commit failure **loud** (risk #6). | warden | 1, 2 | not started |
 | 0.5 | Ledger: WAL + `busy_timeout`, one migrator + `schema_version`, one writer, `VACUUM INTO` backup on the heartbeat landing on a restic-covered path (§2). Stop-copy-verify if the file moves (Q1). | warden | **4** | not started |
 | 0.6 | LaunchAgents for the loop, the poller and the sweeper. Delete the two cron jobs from `cron/jobs.json`. Delete `watchdog-slack.py` + `dispatch-sweep-cron.py` **after** porting the UptimeKuma heartbeat (§5, carry-over #1). | warden + hermes-agent | **1, 5** | not started |
@@ -1051,3 +1057,97 @@ wire it into `runDispatch` before `existsSync(cwd)` and into the submit path.
 Verify with `bun test`, `bun run typecheck`, `bun run lint`, then re-run the live
 probe from §11 and paste the refusal. Deploy with `make reload`, never `bun run dev`.
 
+
+---
+
+## 15. Slice 0.3 — warden skeleton (DONE, `89b0c12`)
+
+### What exists now
+
+| Path | What |
+|-|-|
+| `Makefile` | `setup` · `venv` · `test` · `status` · `agents` · `unload` · `render-plists` |
+| `requirements.txt` | one pinned entry: `cryptography==50.0.0` |
+| `README.md` | the four docs and how to run it |
+| `launchd/com.jkrumm.warden-loop.plist.template` | `triage.py --run`, `StartInterval 600`, `RunAtLoad` |
+| `launchd/com.jkrumm.warden-sweep.plist.template` | `dispatch-sweep.py`, `StartInterval 300` |
+| `launchd/com.jkrumm.warden-backup.plist.template` | `warden-backup.sh`, `StartCalendarInterval` 03:10 |
+| `scripts/warden-backup.sh` | `VACUUM INTO` snapshot + rotate 7 + rsync → homelab |
+| `.venv/` | Python 3.11.15, gitignored |
+
+### Verification
+
+```
+$ make venv
+  creating /Users/jkrumm/SourceRoot/warden/.venv from Python 3.11.15
+  ✓ venv (Python 3.11.15)
+
+$ .venv/bin/python3 -c "import cryptography, sys; print(cryptography.__version__); print(sys.version)"
+50.0.0
+3.11.15 (main, Apr  7 2026, 20:41:15) [Clang 22.1.1 ]
+
+$ make test
+  no tests found
+make: *** [test] Error 1        # correct — zero tests must never report success
+
+$ zsh -n scripts/warden-backup.sh   # exit 0
+$ plutil -lint launchd/*.template   # all three OK after __HOME__ substitution
+$ git check-ignore -v .venv
+.gitignore:5:.venv/	.venv
+```
+
+### Decisions made in this slice
+
+**Interpreter pinned to `python3.11` (3.11.15).** It is uv-managed at
+`~/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none`, shimmed at
+`~/.local/bin/python3.11`. The default `python3` on this box is **3.14.7**.
+Moving 3400 lines of `triage.py` to a new repo *and* a new interpreter in one
+change mixes two failure sources; `make venv` fails loudly if `python3.11` is
+absent rather than falling back. The upgrade is its own verifiable step, later.
+
+**Script filenames do not change in Wave 0.** `triage.py`, `watchdog-poll.py`,
+`dispatch-sweep.py` keep their names. Renaming during a lift-and-shift breaks the
+68 tests' `spec_from_file_location` loader paths and hides the real diff behind
+churn. (`watchdog.db` → `warden.db` *is* a rename, because DESIGN.md names it and
+because the file moves anyway.)
+
+**`make test` exists here, where hermes-agent has no test target.** Every suite is
+run and its last line reported; a non-zero exit prints the full output. Zero tests
+found is a failure, not a pass.
+
+### Deliberately deferred within this slice
+
+**`launchd/com.jkrumm.warden-poll.plist.template` is NOT written yet**, and this is
+the one real piece of work hiding inside "promote the two cron jobs":
+
+> Under the gateway cron runner with `no_agent: true`, `watchdog-poll.py --slack-body`
+> printed the Slack message to **stdout** and *the gateway* delivered it to
+> `slack:C0ASRULFTSS`. A LaunchAgent has no such consumer — stdout goes to a log
+> file. So the poller must post to Slack **itself**, the way `triage.py` already
+> does (plain `chat.postMessage` with a token from `resolve_slack_token()`), before
+> its plist can exist. That is slice 0.6, and the template lands with the code
+> change rather than ahead of it. `make render-plists` prints
+> `✗ com.jkrumm.warden-poll [no template]` in the meantime — visibly absent, not
+> silently broken.
+
+**`dispatch-sweep.py` needs no such change for scheduling** — it posts each verdict
+into its own origin thread directly and keeps stdout empty on purpose (that is what
+`dispatch-sweep-cron.py`'s docstring means by *"anything on stdout would be a SECOND
+message"*). Its template is written.
+
+> **But its delivery is still gateway-coupled**, and this is worth stating plainly
+> because it is easy to read the LaunchAgent promotion as more than it is:
+> `dispatch-sweep.py:93` shells out to `~/.local/bin/hermes send`. After slice 0.6
+> the sweeper's **scheduling** no longer depends on the gateway; its **delivery**
+> still does. That is extraction risk #4 (§12), it is not in Wave 0's stop
+> condition, and it is recorded here so it is not mistaken for finished.
+
+### Needs a human (not blocking)
+
+`scripts/warden-backup.sh` pings an UptimeKuma push monitor on a clean run, resolving
+`op://hermes/uptime-kuma/warden-backup-push-url` (overridable via
+`WARDEN_BACKUP_PUSH_REF`). **That monitor and that 1Password item do not exist yet** —
+creating them needs a browser and a biometric `op`, DESIGN.md human-essential case 2.
+Until then the script resolves nothing and skips the ping, exactly as
+`hermes-backup.sh` does on a resolution failure: the backup still runs and still
+exits with rsync's code. The heartbeat is additive, so nothing is blocked.
