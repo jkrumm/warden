@@ -1346,3 +1346,127 @@ boundary quietly allows something the control plane thinks it forbids."*
 agreement check** — fetch the projection, diff it against `dispatch-repos.json`,
 fail `make status` on disagreement. Without it the second copy is a liability
 rather than defence in depth.
+
+---
+
+## 18. Slice 0.1 — review pass 1, and what it changed
+
+`/review` on the uncommitted sideclaw diff. Outcome **`needs-human`**, and partly
+for a reason that has nothing to do with the code: **2 of 8 reviewers failed to
+start** — `typescript` and `security`, both *"Session exited with code 1"*, neither
+having examined the diff. A security change reviewed by everything except the
+security angle is not a reviewed security change. A second pass with explicit
+angles was run.
+
+### The blocking finding was wrong, and the correct version of it was fixed anyway
+
+The reviewer claimed — and said it had *"verified empirically"*, with the
+cross-family adversary reviewer concurring — that
+`basename(realpathSync(cwd))` **does not** normalize case on APFS, so
+`~/SourceRoot/Dotfiles-Private` at `tier: implement` would miss the lowercase rule
+key and fall through to the permissive `DEFAULT_RULE`, defeating the module at
+both enforcement points and on the pinned entries too.
+
+Measured directly, twice, on both an APFS user volume and `/private/tmp`:
+
+```
+disk RealName   query exact   -> RealName
+disk RealName   query lower   -> RealName      <- on-disk spelling, not the caller's
+disk RealName   query upper   -> RealName
+disk lowername  query mixed   -> lowername
+```
+
+`realpathSync` returns the **on-disk** name. And every ruled repo is lowercase on
+disk — checked one by one, `dotfiles-private`, `homelab-private`, `dotfiles`,
+`brain`, `hermes-agent`, `sideclaw`, `warden`, all `MATCH`. **There was no live
+bypass.** (An earlier note in §17 read this as "bun canonicalizes, Python does
+not"; the sharper statement is that *both* return the on-disk name here — the
+Python reading came from a path whose disk name already was lowercase, which
+proves nothing either way.)
+
+**The fragility underneath it is real, though, and is now fixed.** The table is
+keyed lowercase while the lookup key comes from disk. Those agree today by
+coincidence of naming, not by construction. If a repo's directory ever gains a
+capital, it silently stops matching its own rule and falls through to
+`DEFAULT_RULE` — `implement`, and `sensitive: false`, in a repo that is on the
+list precisely because neither is safe. `lookupRule()` now lowercases both sides:
+free on a case-insensitive volume, where two repos differing only in case cannot
+coexist, and on a case-sensitive one it applies the stricter rule to both, which
+is the direction to err.
+
+### Two more fail-open paths, both real, both fixed
+
+**Prototype-shaped lookups.** `policy.rules[repo] ?? DEFAULT_RULE` with `repo`
+derived from an unauthenticated, HTTP-submitted `cwd`. Bracket access on
+`constructor` / `toString` / `__proto__` returns an inherited `Object.prototype`
+value rather than `undefined`, so `??` never fires, `rule.ceiling` reads
+`undefined`, and `tierRank(undefined)` is 99 — making `tierRank(tier) > 99`
+**false**, i.e. *admitted*, with `sensitive` falsy. Not reachable today only
+because `DEFAULT_RULE` is already permissive, which is exactly why it would have
+survived until `DEFAULT_RULE` was tightened. Now `Object.hasOwn`, and the two env
+appliers use it instead of `in` (which walks the prototype chain) and normalize
+before writing.
+
+**`canonical()`'s catch.** I introduced this helper, and it degraded to
+`resolve(p)` — the literal, unresolved string — when a path *existed* but
+`realpathSync` threw (ELOOP, EACCES on an intermediate component, a TOCTOU race).
+An unresolvable symlink whose raw text happens to sit under a root would be
+admitted on the string while the kernel follows it elsewhere at execution time.
+It now returns `null` and `resolveDispatchTarget` refuses; a root that will not
+resolve is dropped rather than compared literally.
+
+### Accepted, lower severity
+
+- **`DispatchTier` was declared twice** — once as a union in the policy module,
+  once as `z.infer` in `dispatch.ts`. `tierRank`'s fail-closed `?? 99` would have
+  masked any drift by refusing the new tier everywhere instead of failing at
+  compile time. Now declared once, in the policy module, with `DISPATCH_INPUT`'s
+  zod enum built from that array and the type re-exported.
+- **API contract.** `DISPATCH_INPUT.cwd`'s description and the MCP tool
+  description both still described the old contract. Both now state the
+  root/ceiling constraint, the `dispatch refused: …` shape, and point at
+  `GET /api/dispatch-policy`.
+
+### Declined, with reasons
+
+- **Split `runDispatch`** (280 lines, cyclomatic 37, flagged CRITICAL by fallow).
+  Real, and out of scope: refactoring the function this change is *gating* mixes a
+  behaviour change with a structural one in a security-relevant path. Recorded as
+  Wave 3+ work.
+- **Drop the unused `DISPATCH_OUTPUT` export.** Unrelated to this change, and
+  DESIGN.md wants the verdict schema published as a consumable artifact in slice
+  0.2 — that export is likely to gain a consumer imminently. Leave it.
+
+### Tests added for exactly the paths the review named
+
+`tests/dispatch-policy.test.ts` grew from 35 to 46 cases: case-flipped `cwd`; a
+repo directory carrying capitals against a lowercase key (the fragility above);
+`constructor` / `toString` / `hasOwnProperty` as repo names; `__proto__` as an
+override name; mixed-case override names against both a normal and a pinned repo;
+both route-level refusals **asserting no job row is created**; the non-string-`cwd`
+fallthrough; and a `GET /api/dispatch-policy` shape test.
+
+One of those tests found a real problem in itself: the fallthrough case
+legitimately *does* create a job row, the job store is one sqlite file shared
+across the whole `bun test` run, and several suites assert on an empty store —
+it broke `execute-drain-abandon.test.ts`. Confirmed against a stashed tree
+(clean: 488 pass / 0 fail) rather than guessed at, and fixed with the same
+`__resetForTests()` cleanup contract that suite already uses.
+
+### Validation after the fixes
+
+```
+$ bun test
+ 534 pass
+ 0 fail
+ 1213 expect() calls
+Ran 534 tests across 19 files. [16.65s]
+
+$ bun run typecheck    # tsc --noEmit, no output
+$ bun run lint         # Found 13 warnings and 0 errors   (the pre-existing baseline)
+$ bun run format:check # All matched files use the correct format.
+```
+
+Two transient self-inflicted breakages were caught and fixed on the way: an
+unescaped backtick that terminated the MCP tool's template literal, and a
+`raw` shadow in `applySensitiveOverrides` that pushed lint from 13 to 14.
