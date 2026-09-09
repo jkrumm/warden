@@ -60,6 +60,14 @@ TRUSTED_GH_LOGIN = GH_OWNER
 CH_ALERTS = "C0AS1LAUQ3C"
 CH_UPDATES = "C0ARZJD824W"
 
+# Where the composed NEW/REMINDERS/RESOLVED digest itself is delivered — not one
+# of the two channels polled above. Matches the retiring gateway cron job's
+# `"deliver": "slack:C0ASRULFTSS"` (hermes-agent cron/jobs.json, job
+# 4b1faabda97d, "Watchdog"); this constant is what replaces that gateway-side
+# delivery target now that the poller posts for itself instead of relying on
+# the gateway to deliver its stdout.
+WATCHDOG_CHANNEL = os.environ.get("WATCHDOG_SLACK_CHANNEL", "C0ASRULFTSS")
+
 UK_DOWN_GATE_MIN = 30
 DOCKER_UNHEALTHY_GATE_MIN = 30
 GITHUB_STALE_DAYS = 3
@@ -169,6 +177,10 @@ _CACHE_REFS: dict[str, str] = {
     "GITHUB_TOKEN": "op://hermes/github/token",
     "HOMELAB_API_KEY": "op://common/api/SECRET",
     "UPTIME_PUSH_WATCHDOG": "op://hermes/uptime-kuma/watchdog-push-url",
+    # Same ref triage.py's resolve_slack_token() uses (_SLACK_TOKEN_REF) — kept
+    # in sync by hand, the same way that file's own Slack helpers are hand-
+    # mirrored rather than imported (see its "Reused, not reimplemented" note).
+    "SLACK_BOT_TOKEN": "op://hermes/slack/bot-token",
 }
 
 
@@ -252,6 +264,42 @@ def http_get(url: str, headers: dict[str, str] | None = None, timeout: int = 15)
             return json.loads(resp.read().decode())
     except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError) as e:
         return {"_error": str(e)}
+
+
+# --- Slack delivery --------------------------------------------------------
+#
+# A plain HTTP client, mirroring triage.py's _slack_call()/post_blocks() shape
+# exactly — never the gateway's live slack_bolt connection. That is the
+# property that lets this poller deliver its own digest once it runs as its
+# own LaunchAgent instead of as a gateway cron job whose stdout the gateway
+# posts on its behalf.
+SLACK_POST_URL = "https://slack.com/api/chat.postMessage"
+
+
+def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, str | None]:
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, OSError):
+        return False, None
+    ok = bool(data.get("ok"))
+    if not ok:
+        print(f"watchdog: slack call failed: {data.get('error', 'unknown')}", file=sys.stderr)
+    return ok, data.get("ts")
+
+
+def post_text(channel: str, text: str, token: str) -> tuple[bool, str | None]:
+    return _slack_call(
+        SLACK_POST_URL,
+        {"channel": channel, "text": text, "unfurl_links": False},
+        token,
+    )
 
 
 def db_connect() -> sqlite3.Connection:
@@ -1280,9 +1328,33 @@ def slack_poll_failure(conn: sqlite3.Connection) -> str | None:
     return "watchdog: Slack polling is blind: " + ", ".join(blind)
 
 
+def _push_uptime_heartbeat() -> None:
+    """Self-health heartbeat, inherited from hermes-agent's watchdog-slack.py
+    wrapper (the cron entry-point this replaces) — ping the UptimeKuma push
+    monitor, best-effort, exceptions swallowed. Callers fire this only on a
+    clean run (rc == 0), so a crash, hang, or non-zero exit trips the
+    "Watchdog last successful run" Kuma alert. This is the only thing that
+    notices the ingest poller itself has died.
+    """
+    push_url = resolve_secret("UPTIME_PUSH_WATCHDOG")
+    if not push_url:
+        return
+    # uptime.jkrumm.com sits behind Cloudflare, which 403s the default
+    # Python-urllib User-Agent — send a curl-like UA so the heartbeat lands.
+    req = urllib.request.Request(push_url, headers={"User-Agent": "curl/8.7.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = set(argv if argv is not None else sys.argv[1:])
-    emit_slack_body = "--slack-body" in args
+    post = "--post" in args
+    # --post implies --slack-body: it composes the same digest, it just
+    # delivers it itself instead of printing it for a caller to deliver.
+    emit_slack_body = "--slack-body" in args or post
     dry_run = "--dry-run" in args
 
     env = load_env()
@@ -1332,9 +1404,34 @@ def main(argv: list[str] | None = None) -> int:
     if emit_slack_body:
         body = compose_slack_body(all_new, all_rem, all_res,
                                   quiet=quiet, vacation=vacation, now=now)
+        rc = 1 if slack_blind else 0
+
+        if post:
+            # --dry-run beats --post, always: compose as usual, make zero
+            # Slack calls (and no heartbeat — that is a network call too),
+            # print what would have been sent, and stop.
+            if dry_run:
+                print(f"[dry-run] would post {len(body)} chars to {WATCHDOG_CHANNEL}", file=sys.stderr)
+                return rc
+            if not body:
+                # Quiet hours, vacation, or nothing to report — compose_slack_body()
+                # already made that call; posting nothing is not an error.
+                return rc
+            token = resolve_secret("SLACK_BOT_TOKEN")
+            if not token:
+                print("watchdog: no Slack token, cannot post digest", file=sys.stderr)
+                return 1
+            ok, _ = post_text(WATCHDOG_CHANNEL, body, token)
+            if not ok:
+                print("watchdog: slack post failed, digest not delivered", file=sys.stderr)
+                return 1
+            if rc == 0:
+                _push_uptime_heartbeat()
+            return rc
+
         if body:
             print(body)
-        return 1 if slack_blind else 0
+        return rc
 
     print(f"QUIET_HOURS={'true' if quiet else 'false'}")
     print(f"VACATION={'true' if vacation else 'false'}")
