@@ -34,6 +34,7 @@ handled first and separately from every later version.
 import datetime as dt
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 # Same env-var-first, documented-default-second shape triage.py already uses
@@ -456,3 +457,47 @@ def snapshot(conn: sqlite3.Connection, dest: Path | str) -> Path:
     dest_path = Path(dest).expanduser()
     conn.execute("VACUUM INTO ?", (str(dest_path),))
     return dest_path
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+#
+# So a process that is NOT warden can prepare or check a ledger without carrying
+# its own copy of the schema. That is not a convenience: `hermes-cc.sh` owns two
+# of the five tables and still writes them, and the only alternative to this door
+# is the one that was there before — a second, unversioned migrator running
+# `executescript` on every connect, which is the exact defect this module exists
+# to remove. A shell script cannot import a Python module; it can run one.
+#
+#   python3 ledger.py --migrate <path>   create or adopt, then stamp. The loop's job;
+#                                        also what a test fixture needs.
+#   python3 ledger.py --check <path>     assert the version and print it. Exit 1 on
+#                                        mismatch, so a caller can fail closed.
+#   python3 ledger.py --version          print SCHEMA_VERSION and exit.
+
+def _main(argv: list[str]) -> int:
+    if "--version" in argv:
+        print(SCHEMA_VERSION)
+        return 0
+    for flag in ("--migrate", "--check"):
+        if flag in argv:
+            i = argv.index(flag)
+            if i + 1 >= len(argv):
+                print(f"ledger: {flag} needs a path", file=sys.stderr)
+                return 2
+            path = Path(argv[i + 1]).expanduser()
+            try:
+                conn = connect(path, migrate=(flag == "--migrate"))
+            except Exception as err:  # noqa: BLE001 — the message IS the output
+                print(f"ledger: {err}", file=sys.stderr)
+                return 1
+            version = _current_version(conn)
+            conn.close()
+            print(version)
+            return 0
+    print(__doc__ or "", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _sys.exit(_main(_sys.argv[1:]))
