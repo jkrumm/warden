@@ -3307,3 +3307,133 @@ secret problem above — that is the real blocker, and it is an estate-level
 question, not a warden one.
 
 **Wave 1 is closed.**
+
+---
+
+## 37. Wave 2 — reconnaissance against the running system (2026-09-09, ~18:40Z)
+
+Read-only. No edits, no restarts, no writable handle on the live ledger.
+
+### The system is healthy, and every Wave 1 claim re-verified
+
+```
+$ make status
+  venv                     Python 3.11.15
+  agents:
+    ✓ com.jkrumm.warden-loop  [pid -, last exit 0]      runs = 41
+    ✓ com.jkrumm.warden-poll  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-sweep  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-backup  [pid -, last exit 0]
+  policy                   ✓ both copies agree on all 30 repos
+  ledger                   988K
+
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   12/12 passed
+  test_triage.py                   96/96 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ grep -c 'UPDATE triage_items SET state=' scripts/triage.py
+1
+```
+
+| Check | Result |
+|-|-|
+| `schema_version` | **2** |
+| Non-terminal rows with NULL `state_deadline` | **0** |
+| `triage_last_run` heartbeat | `2026-09-09T18:35:01Z`, 3.9 min old against a 600s interval |
+| State census | `resolved` 30 · `note` 8 · `ignored` 7 · `needs_human` 4 · `new` 3 |
+| The four `uk:*` rows | all four `needs_human`, all four `state_deadline = 2026-09-16T17:34:38Z` |
+| Ledger mode | 600, WAL, `-wal` present and drained |
+| `pgrep -f triage.py` | nothing — no second loop |
+
+`~/Library/Logs/warden-{poll,sweep}.err` are **0 bytes**. `warden-loop.err` is 29 KB
+and **entirely stale**: it opens with the `sqlite3.OperationalError: database is
+locked` traceback from `ingest()` that §31 root-caused and `261e827` fixed, and it
+ends with the Wave 1 `state_deadline` backfill FINDINGs stamped `17:34Z`. Nothing
+in it postdates the backfill. Not a live fault.
+
+### Finding 1 — the reopen churn is 23 of the 30 `resolved` rows, measured
+
+Running Wave 2's target predicate against the live ledger read-only:
+
+```sql
+SELECT COUNT(*) FROM triage_items ti JOIN events e ON e.id = ti.event_id
+ WHERE ti.state IN ('resolved','dismissed') AND e.resolved_at IS NULL;
+-- 23   (slack_alert 17, hermes_log 6)
+```
+
+**23 rows are reopened and re-quiet-resolved on every single pass**, every ten
+minutes, 41 runs so far. `docs/triage.md` described the mechanism; this is the
+count. The remaining 7 (`uk` 5, plus 2) have `events.resolved_at` set and are
+stable.
+
+### Finding 2 — the churn has already destroyed the distinction Wave 2 exists to record
+
+This is new, and it changes what the state-split migration can honestly do.
+
+```sql
+SELECT COUNT(*) FROM triage_items WHERE note LIKE '%recover%';   -- 0
+```
+
+`DESIGN.md` § Why this exists and `REVIEW.md` § Facts corrected both name items
+**931 and 932** as the two closes that were *verified recoveries* —
+`resolve_recovery_paired()` firing after `jkrumm/vps#8` merged, the only
+positive-signal closes the system has ever produced. Both rows today read:
+
+```
+931  resolved  "signal quiet since 2026-09-07 16:04 UTC — no new occurrence for 2h…"
+932  resolved  "signal quiet since 2026-09-07 16:04 UTC — no new occurrence for 2h…"
+```
+
+`RECOVERY_PAIRED_NOTE_PREFIX` ("recovery message observed: ") appears on **zero**
+rows in the database. The reopen churn overwrote it: `reopen_if_needed()` flips the
+row to `new` leaving `note` alone, and `resolve_quiet_grouped()` then writes its own
+note over the top. Every pass. The card never changed because the *replacement* note
+is byte-identical each time — `card_hash` hid the overwrite exactly as it hides the
+churn.
+
+Two consequences:
+
+- The note field is **not** a usable provenance source for the `fixed`/`quiet`
+  split on the two rows that matter most. Their evidence is in `dispatches`
+  (both carry `dispatch_job 74f2e233…`), in `DESIGN.md`, and in `vps#8` — not in
+  the ledger.
+- It is a second, independent argument for DESIGN.md's ordering. The churn does not
+  merely re-render a card; **it rewrites the item's own history**, and the state
+  split is precisely an attempt to record history in that row.
+
+### Finding 3 — the occurrence signal is in two clocks, not one
+
+Relevant to the fix, and easy to get wrong. `docs/triage.md` says to reopen on
+"the grouped payload's `ts_last` moving". `ts_last` is a **Slack `ts` float-string**
+(`"1788850795.862159"`), while `last_reminder_at` / `notified_at` / `first_seen` are
+**ISO-8601**. A single `MAX()`/`>` over the two is a lexical comparison between
+`"1788…"` and `"2026…"` and is wrong in a way that reads as correct.
+
+They also move on different events. `upsert_grouped()` re-stamps
+`last_reminder_at`/`notified_at` **only when it emits** (cooldown-gated); on a
+suppressed occurrence it writes `payload_json.ts_last` and nothing else. So neither
+field alone is the occurrence signal — and `resolve_quiet_grouped()`'s idle anchor,
+which uses only the ISO trio, is blind to a cooldown-suppressed recurrence. That is
+a separate defect from the churn; recorded here, not fixed here.
+
+For a **state** source there is no `ts_last` at all, and the reopen signal is
+`watchdog-poll.py:878` resetting `resolved_at=NULL, first_seen=now,
+notified_at=NULL, last_reminder_at=NULL` — which does move the ISO trio.
+
+### Finding 4 — `ingest()` runs before `reopen_if_needed()`, and rewrites `updated_at`
+
+`run()` order is `drain_intents → ingest → reopen_if_needed → …`, so the reopen step
+already sees this pass's refreshed `triage_items.last_seen`. Useful. But `ingest()`
+also writes `updated_at = now` on every open row every pass, so **`updated_at` is
+not the time the item last changed state** and cannot be used as the "resolved at"
+anchor a new-occurrence comparison needs. The comparison needs its own stored mark.
+
+### Next action
+
+Slice 2.1 — the reopen condition, per DESIGN.md's ordering. Design settled by the
+findings above; written up with the slice.
