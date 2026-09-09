@@ -3871,3 +3871,106 @@ status` is the only caller and is not once Argo polls it.
 
 The Wave 2 roll-up against the stop condition, then a fresh reviewer with no
 context from this session.
+
+---
+
+## 41. Wave 2 — final state, against the stop condition
+
+Item by item, with the evidence. Wave 1 nearly shipped without this section and
+its reviewer correctly called that its most consequential defect.
+
+| # | Condition | Status | Evidence |
+|-|-|-|-|
+| 1 | A grouped item no longer reopens every pass, proven by running the loop twice and observing no churn | **MET** | `b13705b`. Two `run()` passes on a `VACUUM INTO` copy of the live ledger: **46 → 0** transitions per pass, census identical. Two consecutive live ticks (18:55 → 19:05Z) changed **0** rows' state/mark/note. §38. |
+| 2 | `resolved` split into `fixed`/`quiet`/`closed`, the live ledger's 30 rows migrated, each landing in a defensible bucket | **MET** | `d601047`, schema 4. Live: 0 rows in `resolved`, 29 `quiet`. All 30 → `quiet`, defended in `_MIGRATION_4`'s comment and §39: every one is a silence close by note or by cleared note, `RECOVERY_PAIRED_NOTE_PREFIX` on zero rows. |
+| 3 | `/metrics` serves the six funnel numbers from a read-only handle | **MET** | `639e9e5`. Live payload in §40. `ledger.connect(readonly=True)` + an explicit per-request `assert_schema_version()`; mismatch → 503. Two of the six serve `null` **with a reason** rather than a fabricated 0 — see below, this is deliberate and is not a partial. |
+| 4 | `make test` green with a count you can account for | **MET** | Accounted below. |
+
+### Item 4 — the count, accounted for
+
+| Suite | Count | Delta this wave |
+|-|-|-|
+| `test_triage.py` | **107** | 96 + 6 (slice 2.1, the occurrence mark) + 5 (slice 2.2, the split) |
+| `test_ledger.py` | **16** | 12 + 2 (migration 3) + 2 (migration 4) |
+| `test_api.py` | **18** | new file, slice 2.3 |
+| `test_intents.py` | 19 | unchanged |
+| `test_watchdog_locking.py` | 3 | unchanged |
+| `test_dispatch_sweep.py`, `test_watchdog_delivery.py`, `test_watchdog_slack_blindness.py` | "all cases as expected" | unchanged |
+| hermes-agent `test_hermes_cc.py` / `test_dispatch_approval.py` | 165 cases / 83 checks | unchanged, re-run green after both pin bumps |
+
+Fourteen mutations across the three slices, each broken → red **by name** →
+restored → green. The full table is in §38, §39 and §40.
+
+### Item 3 — why two `null`s are the condition being MET, not missed
+
+`DESIGN.md` asks for six numbers. Two of them describe things the ledger cannot
+currently know, and both reasons are structural, not effort:
+
+- **"unattended"** needs an approval-to-item link. `dispatch_approvals` has no
+  `event_id`; 0 of 5 rows carry `--auto-from-item`. That link is the operation id
+  `DESIGN.md` § Crash recovery specifies, which is Wave 3.
+- **reverts** needs `warden revert`, which `DESIGN.md` § Abort and revert also
+  places in Wave 3.
+
+Serving `0` for either would be a fabricated measurement in the exact funnel this
+design says must not be gameable (`REVIEW.md` C3). Both serve `null` with a
+machine-readable reason and their raw ingredients alongside. Building the
+missing primitives to make them non-null would be starting Wave 3.
+
+### What the numbers actually say, now that they can be read
+
+```
+verdicts reaching a recorded disposition   5 / 17   (10 went to `quiet` — silence)
+closes that are verified fixes vs silence  0 / 10
+```
+
+`DESIGN.md` § What "done" means targets 11/11 and "verified is the majority".
+Neither number could be computed before this wave. Both are now on an endpoint,
+and both are bad — which is the point of measuring them.
+
+### Inherited known-open items, dispositioned
+
+The handover named four. Two are closed, two are not, deliberately.
+
+| # | Item | Disposition |
+|-|-|-|
+| 1 | `sync_card()`'s never-carded guard covered only `resolved`, so a `dismissed` row lacking `card_ts` would post a first card | **CLOSED** (§39). `_NEVER_CARDED_FIRST_STATES = (fixed, quiet, closed, dismissed)`, with a test per state. |
+| 2 | A forged spool file blocks a real approval click and Slack renders "already decided" instead of "superseded" | **NOT DONE.** It lives in `hermes-agent/plugins/dispatch-approval`, not warden, and it is a label on a correct denial — the deny itself is right. Named here so it is not lost; it belongs with the next hermes-agent plugin change, not bolted onto a warden wave. |
+| 3 | `needs_human`'s "reminder at 1d" | **STILL DELIBERATELY UNBUILT.** A reminder is a notification, not a deadline. Unchanged from §35. |
+| 4 | `DESIGN.md` § 365's Argo Postgres read-cache justification does not survive its own objection | **UNTOUCHED, correctly** — the handover puts it in Wave 4. |
+
+### New known-open, created or found by this wave
+
+1. **`hermes_log` has no `ts_last`.** A cooldown-suppressed occurrence on that
+   source moves nothing in `_occurrence_mark`, so such a row does not reopen
+   until the 24h cooldown emits. Not a regression (§38 shows why) and written
+   into `docs/triage.md` beside the self-tuning quiet window, which is where it
+   belongs.
+2. **The self-tuning quiet window is now UNBLOCKED** and still open. It was
+   blocked only on the reopen churn being invisible; there is no churn left to
+   uncover. `docs/triage.md` § brain-sync.
+3. **`ledger._verify_columns()` still checks only the original five tables**, so
+   `item_transitions`' shape is created by the migration but not asserted by the
+   adoption path. Found by the slice-2.2 worker. Harmless today; worth folding
+   into whichever migration next needs that guarantee.
+4. **`/metrics` metric 3 loads all of `item_transitions` into memory** to pair
+   entries with exits. Correct and trivial at present volume; it is an O(n) read
+   that will want a windowed query long before it is a problem.
+
+### Two process facts this wave established, for the next handover
+
+- **There is no staging window in this repo.** The LaunchAgents execute
+  `scripts/*.py` from the working tree and `~/.hermes/scripts` symlinks into
+  `hermes-agent`, so an uncommitted edit is in production the moment it is saved.
+  Slice 2.1 learned this by having the live ledger migrate itself three minutes
+  after the edit landed (§38); slices 2.2 and 2.3 ran `make unload` first, or
+  confined edits to files no agent runs.
+- **`ledger.connect(path, readonly=True)` does not assert the schema version.**
+  Its readonly branch opens `mode=ro` and returns. Any read-only consumer must
+  call `assert_schema_version()` itself. `api.py` does, per request.
+
+### Wave 2 is closed to the stop condition. Not started, on purpose
+
+Wave 3 is abort, revert, the per-repo in-flight lock, and crash reconciliation
+with `unknown` — plus the operation id that makes `/metrics`' "unattended"
+number derivable. **Do not roll into it from here.**
