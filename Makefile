@@ -143,12 +143,27 @@ status:
 	@printf '  %-24s ' "venv"; \
 	[ -x "$(PY)" ] && "$(PY)" -V || echo "MISSING — run 'make venv'"
 	@echo "  agents:"
+	@# launchctl list prints PID, LAST EXIT STATUS, LABEL. Being loaded is not the
+	@# same fact as having worked: on 2026-09-09 the loop died on `database is
+	@# locked` and this target printed ✓ over an exit status of 1 for ten minutes.
+	@# A control plane whose job is noticing that something stopped must not have a
+	@# status surface that hides its own stopping — see DESIGN.md's "deferral must
+	@# be visible". So: ✓ only when loaded AND the last exit was 0 (or it has not
+	@# run yet, which launchctl prints as `-`); otherwise ✗, the code, and the
+	@# exact log to read next.
 	@for name in $(WARDEN_PLISTS); do \
 		line=$$(launchctl list 2>/dev/null | grep -E "[[:space:]]$$name$$" || true); \
-		if [ -n "$$line" ]; then \
-			echo "    ✓ $$name  [$$line]"; \
-		else \
+		if [ -z "$$line" ]; then \
 			echo "    ✗ $$name  [not loaded]"; \
+			continue; \
+		fi; \
+		pid=$$(echo "$$line" | awk '{print $$1}'); \
+		rc=$$(echo "$$line" | awk '{print $$2}'); \
+		short=$$(echo "$$name" | sed 's/^com\.jkrumm\.warden-//'); \
+		if [ "$$rc" = "0" ] || [ "$$rc" = "-" ]; then \
+			echo "    ✓ $$name  [pid $$pid, last exit $$rc]"; \
+		else \
+			echo "    ✗ $$name  [pid $$pid, LAST EXIT $$rc] — read $(HOME)/Library/Logs/warden-$$short.err"; \
 		fi; \
 	done
 	@printf '  %-24s ' "policy"; \
