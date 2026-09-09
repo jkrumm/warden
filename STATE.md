@@ -2682,3 +2682,152 @@ $ make test
 Still to observe: the next real `com.jkrumm.warden-poll` run (1800s interval)
 exiting 0 with the loop unaffected. Check `make status` and
 `cursors.hermes_errors_log_offset`.
+
+---
+
+## 32. Wave 1, item 2b + 2d — the plugin repoint, and the loop as backstop drainer (DONE)
+
+### 2b — `hermes-agent` `3c5d516`
+
+`plugins/dispatch-approval/__init__.py` no longer opens the ledger for writing.
+Both of its connections are now `mode=ro`, verified by grep:
+
+```
+$ grep -n 'sqlite3.connect' plugins/dispatch-approval/__init__.py
+263:    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+393:    conn = sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True)
+```
+
+The second one is `_load_invocation()`, which was opening a WRITABLE handle to
+run `SELECT`s — not the slice's target, but "read-only means read-only" is a
+rule in warden's CLAUDE.md and this was a standing violation of it.
+
+`_record_decision()` now: read the row read-only → `_sign()` (unchanged) →
+spool an `approval_decision` intent on **stdin** → drain synchronously → re-read
+the row and decide from **the row**.
+
+Three decisions in that flow worth keeping:
+
+1. **The drain's exit code is deliberately NOT the success signal.**
+   `intents.py --drain` exits 1 when *any* file in the spool was rejected,
+   including one another surface wrote that has nothing to do with this click.
+   It is logged; the row is the truth. There is a test for exactly this.
+2. **A write that did not land raises, it does not return `None`.** `None`
+   already means "no longer on file", which the click handler renders as
+   ":grey_question: This approval request is no longer on file" — a lie about a
+   row sitting there undecided. The handler already catches exceptions and
+   renders ":warning: Could not record the decision", which is true.
+3. **The race branch compares signatures.** `after["signature"] != sig` means
+   someone else's click won; report their decision, as the old `rowcount == 0`
+   branch did. Ed25519 here is deterministic, so two identical clicks by the
+   same user mint the same signature and land in the "we won" branch — correct
+   either way, and noted in the code so nobody "fixes" it.
+
+**The authority model did not move**, and that was the point: RAM-only key,
+minted at startup, signing a real Slack interaction payload, and
+`require_signed_approval()` still the one and only verifier. Only the writer
+moved.
+
+```
+tests/test_dispatch_approval.py   83 checks, 0 failure(s)   (was 51, +32)
+tests/test_hermes_cc.py           all 165 cases as expected  (unchanged)
+```
+
+Mutation check, run here and not taken from the worker's report — stub the drain
+out and the click stops working:
+
+```
+69 checks, 2 failure(s)
+  test_decision_lands_through_the_real_queue        RuntimeError: … did not reach the ledger
+  test_unrelated_rejection_does_not_fail_the_click  RuntimeError: … did not reach the ledger
+```
+
+### 2d — the loop drains too, and this was a real gap
+
+Reading 2b's diff surfaced something the brief had not asked for: **nothing else
+drained the spool.** The plugin drains synchronously, and that is the only drain
+there was. If that drain failed — a locked ledger, a timeout, a version mismatch
+— the intent stayed in `~/.warden/intents` and *nothing would ever pick it up*.
+An intent nobody drains is a silent discard, which is the failure this whole
+control plane exists to remove, reintroduced by the mechanism meant to remove it.
+
+`triage.py` gains `drain_intents()` as **step 0 of `run()`**, before `ingest()`.
+DESIGN.md § The ledger says intents go through the loop's queue; this is the
+half of that sentence 2a and 2b had not built.
+
+**`--dry-run` does NOT drain**, and this is a deliberate departure from this
+file's usual "local bookkeeping runs for real under dry-run" rule
+(`apply_resolutions`, `classify`). A dry-run is pointed at a COPY of the ledger,
+but there is only ONE `~/.warden/intents`. Draining would permanently consume
+intents the live loop still needs and apply them to a database nobody reads.
+Eating the live system's queue is worse than either thing the dry-run contract
+forbids.
+
+`tests/test_triage.py` **73 → 75**:
+- `test_the_loop_is_the_backstop_drainer` — spools through the REAL `intents`
+  module (the same call the plugin makes, not a hand-written file) and asserts
+  `run()` applies it and removes the file.
+- `test_dry_run_never_consumes_the_live_spool`.
+
+`_triage_env()` now also points `triage._intents.INTENTS_DIR` at its throwaway
+directory and restores it. That is not incidental: it is **not** in the `saved`
+dict (the spool lives on `triage._intents`, so the `setattr(triage, …)` loop
+cannot restore it), and without it any test in the file could consume an intent
+out of the live spool. Confirmed after the run: `~/.warden/` still contains only
+`backups/` and `warden.db`.
+
+Mutation check — delete the `drain_intents()` call from `run()`:
+
+```
+74/75 passed
+  test_the_loop_is_the_backstop_drainer: the loop did not drain the intent:
+    {'decision': None, 'decided_by': None, 'signature': None}
+```
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   11/11 passed
+  test_triage.py                   75/75 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+```
+
+### Be precise about what "one writer" now means
+
+The stop condition says the ledger has ONE WRITER. State it exactly, because the
+claim is easy to overstate:
+
+- The approval plugin **no longer writes it at all** — both handles are `mode=ro`.
+  That was the named goal and it is met.
+- The code that performs that write is **warden's own** `scripts/intents.py`,
+  reached as a short-lived subprocess. So it is one writer *implementation*, not
+  literally one OS process: the plugin's drain and the loop's drain are two
+  processes running the same warden code against the same guarded UPDATE.
+- `hermes-cc.sh` still writes `dispatches` and `dispatch_approvals` directly.
+  That is the documented, deliberate exception (`fe95e81`, "a door for the one
+  writer that is not warden") and was explicitly out of scope for this wave.
+
+So: six writers → **two** (warden, and `hermes-cc.sh`), with the "control plane
+inside the thing it supervises" coupling gone. Anything stronger than that is
+not yet true.
+
+### Not done yet — the gateway is still running the old plugin
+
+The gateway (pid 65056) loaded `dispatch-approval` at start and has not been
+restarted, so the OLD code is live until it is. No approvals are stranded by a
+restart: all five rows in `dispatch_approvals` are decided and long expired
+(newest expiry 2026-09-08), so no in-flight signature depends on the current
+RAM key.
+
+### Next action
+
+Restart the gateway, confirm the plugin reloaded and republished its public key,
+then Wave 1 item 3 — `state_deadline` and a named poller on every non-terminal
+state. Item 3 also carries the `_run_migrations()` adoption bug found in §26:
+case 2 stamps version 1 and `return`s without entering the migration loop, so the
+first time `SCHEMA_VERSION` becomes 2, adopting a pre-versioned ledger stamps it
+1, skips migration 2, and then fails `_verify_columns()`. That path is the
+rollback (`~/.warden-cutover-backup/`), so it fails exactly when it is needed.

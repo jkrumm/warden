@@ -41,6 +41,13 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    EITHER `repo`, escalate to an episode, OR `verb`, run a
                    declared local command — see VERB OUTCOMES below). Only
                    ever touches a row still in state `new`.
+  0. Drain        — apply anything a surface spooled into ~/.warden/intents
+                   since the last pass (see drain_intents() and
+                   scripts/intents.py). The loop is the BACKSTOP drainer, not
+                   the only one: the Slack approval plugin drains synchronously
+                   because a click must land before `hermes-cc.sh --confirm`
+                   runs. This is what stops an intent nobody else drained from
+                   sitting in the spool forever.
   4. Resolve      — an event whose events.resolved_at is now set flips its
                    triage_items row to `resolved` — but ONLY a row still in
                    `new`. events.resolved_at is set by disappearance from
@@ -617,6 +624,46 @@ _ledger_spec = importlib.util.spec_from_file_location("ledger", _LEDGER_PATH)
 assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
 _ledger = importlib.util.module_from_spec(_ledger_spec)
 _ledger_spec.loader.exec_module(_ledger)
+
+# scripts/intents.py — same by-path load, same reason. The loop is the backstop
+# drainer: a surface that spools an intent may be unable to drain it (Argo has
+# no ledger access at all by design), and the one that CAN — the Slack approval
+# plugin, which drains synchronously because a click must take effect before
+# `hermes-cc.sh --confirm` runs — can still fail at it. Without a drain here an
+# intent nobody drained sits in the spool forever, which is precisely the silent
+# discard this control plane exists to remove. DESIGN.md § The ledger: "intents
+# go through the loop's queue."
+_INTENTS_PATH = Path(__file__).resolve().parent / "intents.py"
+_intents_spec = importlib.util.spec_from_file_location("intents", _INTENTS_PATH)
+assert _intents_spec and _intents_spec.loader, "Failed to load scripts/intents.py"
+_intents = importlib.util.module_from_spec(_intents_spec)
+_intents_spec.loader.exec_module(_intents)
+
+
+def drain_intents(conn: sqlite3.Connection, *, dry_run: bool) -> None:
+    """Step 0 — apply anything a surface spooled since the last pass.
+
+    Runs FIRST, before ingest(), so a decision recorded between two passes is
+    already on the row by the time anything in this file reads state.
+
+    Under --dry-run this reports and does nothing, which is a DEPARTURE from
+    this file's usual "local bookkeeping runs for real" rule (apply_resolutions,
+    classify). The reason is that the spool is not part of the database: a
+    dry-run is pointed at a COPY of the ledger, but there is only one
+    ~/.warden/intents, so draining here would consume — permanently — intents
+    the live loop still needs, and apply them to a database nobody reads. The
+    dry-run contract is "never touches Slack, never shells out"; eating the
+    live system's queue is worse than either.
+    """
+    if dry_run:
+        pending = sorted(_intents.INTENTS_DIR.glob("*.json")) if _intents.INTENTS_DIR.exists() else []
+        if pending:
+            print(f"[dry-run] would drain {len(pending)} spooled intent(s) (skipped under --dry-run)")
+        return
+    result = _intents.drain(conn)
+    if result["applied"] or result["rejected"]:
+        print(f"triage: drained {result['applied']} intent(s), "
+              f"rejected {result['rejected']}", file=sys.stderr)
 
 
 def db_connect() -> sqlite3.Connection:
@@ -3195,6 +3242,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     now = dt.datetime.now(dt.timezone.utc)
     policy = load_policy()
 
+    drain_intents(conn, dry_run=dry_run)
     ingest(conn, now)
     reopen_if_needed(conn, now)
     unsnooze_if_expired(conn, now)

@@ -115,7 +115,14 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         "_resolve_openai_base_url": triage._resolve_openai_base_url,
         "_resolve_openai_api_key": triage._resolve_openai_api_key,
     }
+    # NOT part of `saved` above: the spool lives on triage._intents, not on
+    # triage, so the setattr loop in the finally cannot restore it. Pointed at
+    # the throwaway dir unconditionally, for every test in this file, so no
+    # test can ever consume or delete an intent out of the live
+    # ~/.warden/intents.
+    saved_intents_dir = triage._intents.INTENTS_DIR
     try:
+        triage._intents.INTENTS_DIR = tmp_dir / "intents"
         triage.DB_PATH = tmp_dir / "watchdog.db"
         triage.POLICY_PATH = tmp_dir / "triage-policy.json"
         triage.DISPATCH_REPOS_JSON = tmp_dir / "dispatch-repos.json"
@@ -156,6 +163,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
     finally:
         for k, v in saved.items():
             setattr(triage, k, v)
+        triage._intents.INTENTS_DIR = saved_intents_dir
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -1497,6 +1505,71 @@ def test_no_chain_state_is_silence_resolvable():
             f"silence-resolved a state carrying an obligation: {leaked} "
             f"(each entry is seeded-state -> state after the three silence paths)"
         )
+
+
+def _spool_approval(nonce: str, decision: str = "approve") -> None:
+    """Spool one approval_decision intent through the REAL intents module —
+    the same call the Slack plugin makes. Not a hand-written file: the point is
+    that whatever the plugin can spool, the loop can drain."""
+    triage._intents.record({
+        "v": 1, "kind": "approval_decision",
+        "created_at": NOW.isoformat(), "source": "test",
+        "nonce": nonce, "decision": decision, "decided_by": "U123",
+        "signature": "ab" * 64,
+    })
+
+
+def _pending_approval(conn, nonce: str) -> None:
+    conn.execute(
+        "INSERT INTO dispatch_approvals(nonce, verb, repo, tier, payload_hash, created_at, expires_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (nonce, "dispatch", "demo-repo", "1", "hash-" + nonce, OLD.isoformat(), NOW.isoformat()),
+    )
+    conn.commit()
+
+
+def test_the_loop_is_the_backstop_drainer():
+    """A surface can spool an intent it cannot itself drain — Argo has no
+    ledger access at all by design, and the Slack plugin, which does drain
+    synchronously, can fail at it. Without a drain in the loop that intent sits
+    in the spool forever, which is exactly the silent discard this control
+    plane exists to remove. DESIGN.md § The ledger says intents go through the
+    loop's queue."""
+    with _triage_env() as (conn, _ctx):
+        _pending_approval(conn, "n-backstop")
+        _spool_approval("n-backstop")
+        assert len(list(triage._intents.INTENTS_DIR.glob("*.json"))) == 1
+
+        triage.run(conn, dry_run=False)
+
+        row = conn.execute(
+            "SELECT decision, decided_by, signature FROM dispatch_approvals WHERE nonce=?",
+            ("n-backstop",),
+        ).fetchone()
+        assert row["decision"] == "approve", f"the loop did not drain the intent: {dict(row)}"
+        assert row["decided_by"] == "U123"
+        assert list(triage._intents.INTENTS_DIR.glob("*.json")) == [], "a drained intent must be gone"
+
+
+def test_dry_run_never_consumes_the_live_spool():
+    """The one place this file's "local bookkeeping runs for real under
+    --dry-run" rule does NOT apply, and deliberately. A dry-run is pointed at a
+    COPY of the ledger, but there is only ONE ~/.warden/intents — so draining
+    would permanently eat intents the live loop still needs and apply them to a
+    database nobody reads. Eating the live system's queue is worse than either
+    thing the dry-run contract forbids."""
+    with _triage_env() as (conn, ctx):
+        _pending_approval(conn, "n-dryrun")
+        _spool_approval("n-dryrun")
+
+        triage.run(conn, dry_run=True)
+
+        assert len(list(triage._intents.INTENTS_DIR.glob("*.json"))) == 1, (
+            "--dry-run consumed a spooled intent; the spool is shared with the live loop")
+        row = conn.execute(
+            "SELECT decision FROM dispatch_approvals WHERE nonce=?", ("n-dryrun",)).fetchone()
+        assert row["decision"] is None, "--dry-run applied an intent to the ledger"
+        assert ctx.total_calls() == 0
 
 
 def test_recovery_pairing_skipped_under_dry_run():
