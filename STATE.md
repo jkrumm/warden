@@ -2379,7 +2379,12 @@ Recorded here so it stays settled.
   of fixing it, preserving exactly what DESIGN.md wants gone.
 - **Volume does not motivate it.** 980K, 959 events over 38 days, three agents on
   600s/1800s/300s. SQLite in WAL is already over-provisioned for this.
-- **It inverts warden's founding property.** This repo is separate from
+- **It inverts warden's founding property, and "the mini being down takes
+  warden down anyway" is the argument FOR co-locating, not against.** One failure
+  domain is the goal. A ledger on the VPS does not remove the mini from the
+  critical path — the loop still runs there — it ADDS a second way to be down
+  (VPS down, or tailnet down, with the mini perfectly healthy). Two failure
+  domains where there was one. This repo is separate from
   `hermes-agent` because the loop that notices Hermes is broken must not run
   inside Hermes. DESIGN.md's system table pins warden's failure domain to "mini,
   own LaunchAgents" and Argo's to "**VPS — separate domain**"; FLOWS.md says it
@@ -2387,10 +2392,16 @@ Recorded here so it stays settled.
   ledger over the tailnet means a VPS or network outage stops the control plane
   from recording that there is an outage. That is the 2026-09-07 gateway-crash
   failure with a longer wire.
-- **Postgres is already in this architecture, deliberately demoted.** DESIGN.md
-  line 365: Argo caches `GET` responses in Postgres "purely so the page renders
-  when the mini is unreachable … **An HTTP cache, not a mirror.**" Promoting that
-  cache to the source of truth is the thing it was written not to be.
+- ~~**Postgres is already in this architecture, deliberately demoted.**~~
+  **WITHDRAWN, 2026-09-09, and correctly.** This cited DESIGN.md line 365 — Argo
+  caching `GET` responses in Postgres "purely so the page renders when the mini
+  is unreachable" — as evidence the split was considered. The objection: *if the
+  mini is down, warden is down, so the board renders a frozen snapshot of work
+  that is not progressing anyway.* That is right. Uptime Kuma already reports the
+  mini being down, faster and louder; the only residual value is forensic, and
+  the ledger answers that when it comes back. **DESIGN.md's stated justification
+  for the Argo cache does not survive the objection** — see §29. The decision
+  below does not rest on this bullet.
 - **It puts a client library in the process that decides whether to touch
   production.** The loop is pure stdlib plus `cryptography`, on purpose.
 - **The advanced patterns buy nothing at this shape.** SQLite has transactions.
@@ -2413,3 +2424,33 @@ drains synchronously — because `execute_approved()` re-runs `hermes-cc.sh
 --confirm` in a subprocess IMMEDIATELY after the click, so a 600s loop drain
 would break the flow outright. `require_signed_approval()` is not touched.
 Fold in the `busy_timeout` raise and a bounded retry around the pass (§26).
+
+---
+
+## 29. Design finding — the Argo Postgres cache is justified by an argument that does not hold
+
+Not an implementation defect and **not for this wave** (Argo is Wave 3). Recorded
+so it is decided deliberately rather than inherited.
+
+`DESIGN.md` line 365 justifies Argo caching `GET` responses in Postgres "purely
+so the page renders when the mini is unreachable, stamped with fetch time."
+
+**If the mini is unreachable, warden is not running.** The loop, the pollers and
+the sweeper are all LaunchAgents on the mini. So the page renders a frozen
+snapshot of work that has stopped progressing — it cannot be acted on, and
+nothing it shows will change until the mini returns. Uptime Kuma already reports
+the mini being down, sooner and more loudly than a stale board does. The residual
+value is forensic ("what was in flight when it died"), and the ledger answers
+that directly once the mini is back.
+
+Options for Wave 3, none of them decided here:
+
+1. **Drop the cache.** Argo fetches live and shows a plain "mini unreachable"
+   state. Least machinery, and honest about what it knows.
+2. **Keep it, justified differently** — e.g. page-load latency across the tailnet,
+   or surviving a warden restart rather than a mini outage. If it is kept, the
+   justification in DESIGN.md must be replaced, because the current one is the
+   one that fails.
+
+What must NOT happen is the cache quietly becoming a mirror. That is the same
+line §28 declines for a different reason, and it is still the line.
