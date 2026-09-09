@@ -127,6 +127,16 @@ unload:
 # status
 # ---------------------------------------------------------------------------
 
+# The two copies of the dispatch policy — sideclaw's, which is the boundary, and
+# hermes-agent's, which is defence in depth — are meant to agree, and nothing
+# else notices when they stop. Drift here does not read as an error; it reads as
+# working, right up until the boundary admits something the control plane
+# believes it forbids.
+.PHONY: check-policy
+check-policy:
+	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
+	@"$(PY)" "$(WARDEN_REPO)/scripts/check-dispatch-policy.py"
+
 .PHONY: status
 status:
 	@echo "warden"
@@ -141,6 +151,12 @@ status:
 			echo "    ✗ $$name  [not loaded]"; \
 		fi; \
 	done
+	@printf '  %-24s ' "policy"; \
+	if out=$$("$(PY)" "$(WARDEN_REPO)/scripts/check-dispatch-policy.py" 2>&1); then \
+		echo "$$out" | grep -E '^(✓|✗)' | head -1 | sed 's/^ *//'; \
+	else \
+		echo "DISAGREES with sideclaw — run 'make check-policy'"; \
+	fi
 	@printf '  %-24s ' "ledger"; \
 	if [ -f "$(WARDEN_HOME)/warden.db" ]; then \
 		ls -lh "$(WARDEN_HOME)/warden.db" | awk '{print $$5, $$6, $$7, $$8}'; \
