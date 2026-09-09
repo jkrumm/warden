@@ -282,7 +282,7 @@ causes a 100% approve rate as often as good scoping does.
 |-|-|-|-|
 | **warden** | ingest, dedupe, decide, drive the lifecycle, ask a human | **yes — the ledger** | mini, own LaunchAgents |
 | **sideclaw** | execute one bounded episode; **enforce the repo allowlist and tier ceiling** | job store, disposable | mini, own daemon |
-| **signer** | mint a signed decision; reachable only by Slack Socket Mode and a TTY-gated CLI | signing key, RAM-only | gateway process |
+| **signer** | mint a signed decision; reachable **only by Slack Socket Mode** (the TTY-gated CLI is withdrawn — § The decision primitive) | signing key, RAM-only | gateway process |
 | **hermes** | conversational agent; Slack surface; also a signal source | its own, unrelated | mini, gateway |
 | **Argo** | operator console; records intents | display cache only | **VPS — separate domain** |
 
@@ -333,15 +333,39 @@ Split it:
 
 ```
 POST /items/:id/intent   -> records an unsigned request. Any surface. Not authority.
-sign(intent) -> Decision -> only Slack Socket Mode or a TTY-gated CLI.
+sign(intent) -> Decision -> Slack Socket Mode only.
                             Binds payload_hash over the exact brief bytes.
 ```
 
-Argo shows the queue and records intents. It cannot approve. Confirmation happens
-in Slack or at a TTY — the `human-queue` shape, which already requires a typed
-`yes` on a real terminal. Keep `require_signed_approval()` exactly as it is: it
-trusts only the row's signature and never the caller, which is why it survives
-this change untouched.
+Argo shows the queue and records intents. It cannot approve. Keep
+`require_signed_approval()` exactly as it is: it trusts only the row's signature
+and never the caller, which is why it survives this change untouched.
+
+**The TTY-gated CLI was specified here and is withdrawn (2026-09-09, Wave 1).**
+It was unimplementable as written, and the reason is worth keeping because it
+constrains every future "let a human decide from somewhere else" idea:
+
+- The signing key is RAM-only in the gateway (see § Systems). A separate CLI
+  process cannot reach it, so with the gateway *stopped* — the only scenario the
+  TTY path existed for, FLOWS.md flow 5 — **no signature can exist at all.**
+- Having the CLI ask the running gateway to sign reintroduces the signing oracle
+  REVIEW.md **C1** rejected.
+- A second key needs a human-only secret on the mini, and **this estate cannot
+  hold one.** `dotfiles-private/headless.refs` is explicit: the seed refuses
+  `op://Private/*` unconditionally, and everything in the mini's offline cache
+  resolves headless — so anything an operator could store, an episode can read.
+  A passphrase kept only in a human's head would work cryptographically and fail
+  operationally: used perhaps twice a year, with no recovery path once the pubkey
+  is published.
+
+**What flow 5 actually does instead:** restart the gateway
+(`launchctl kickstart -k gui/$UID/ai.hermes.gateway` — measured at ~8s on
+2026-09-09, and the plugin republishes its public key on boot), then approve in
+Slack. FLOWS.md already concedes the human is at a machine in that flow; if they
+are at a machine, they can restart a LaunchAgent. If the gateway cannot be
+restarted at all, approvals are unavailable and **warden fails closed** — nothing
+merges without one. That is the correct degradation, and it needs no second
+signer to achieve.
 
 `--auto-from-item` stays as-is, including its own honest header: it is *"a
 precondition the caller cannot fabricate cheaply,"* not a cryptographic proof —
@@ -565,7 +589,7 @@ verifier needs `cryptography` from a venv that does not exist yet;
 | Wave | What |
 |-|-|
 | **0** | Extract. Re-assert the repo allowlist **inside sideclaw**. Typed `outcome` enum + versioned verdict schema. WAL, one writer, one migrator, `schema_version`, backup. Promote the two cron jobs to LaunchAgents; delete the orphan wrappers. |
-| **1** | Intent/signature split. Slack repointed. CLI decide path. Deadlines and `state_deadline` on every chain state. Fix the quiet rule. |
+| **1** | Intent/signature split. Slack repointed. ~~CLI decide path~~ (withdrawn — see § The decision primitive). Deadlines and `state_deadline` on every chain state. Fix the quiet rule. |
 | **2** | Honest states + `dismissed` (cheap — the enum value already exists unconsumed). `/metrics`. Fix the reopen condition before any re-render work. |
 | **3** | Abort, revert, per-repo lock, crash reconciliation with `unknown`. Prove one complete path survives a kill at every boundary. |
 | **4** | Argo console. |

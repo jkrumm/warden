@@ -3232,3 +3232,78 @@ than "already decided" when the signature does not verify.
 
 **Do not start Wave 2.** Resolve item 5 first — it is the last Wave 1 item, and
 it is one design decision plus roughly a day of work, not a wave.
+
+---
+
+## 36. Wave 1, item 5 — RESOLVED BY WITHDRAWAL, and why that is the right answer
+
+Item 5 ("the CLI decide path works at a TTY with the gateway stopped") is
+**closed by deleting the requirement**, not by building a signer. Decision taken
+2026-09-09 with the operator's delegation ("do whatever is stable and will not be
+the next issue I'm complaining about"). Recorded here in full because a future
+session will want to rebuild it.
+
+### It was unimplementable as specified
+
+Confirmed independently by the wave-boundary reviewer. The signing key is RAM-only
+in the gateway (`DESIGN.md` § Systems), and `require_signed_approval()` reads
+exactly one public key from one file (`hermes-cc.sh:1131`). **With the gateway
+stopped — the only scenario the TTY path existed for — no signature can exist at
+all.**
+
+### The three ways out, and why each fails
+
+1. **CLI asks the running gateway to sign.** Reintroduces the signing oracle
+   `REVIEW.md` **C1** already rejected, and still does nothing when the gateway is
+   the thing that is down.
+2. **A second key file on disk.** An episode runs as `jkrumm` with unrestricted
+   Bash and reads files. warden's own CLAUDE.md: *"a bearer token on this host is
+   not an authorization boundary against an episode."* A key file is weaker than
+   a token.
+3. **A passphrase-derived key (my own initial recommendation).** Cryptographically
+   fine, operationally a footgun, and the deciding fact came from this estate's
+   secrets model rather than from cryptography:
+
+   `dotfiles-private/headless.refs` — *"`op://Private/...` is refused by the seed
+   unconditionally (fail-safe) — Private is the human-only vault and can never
+   enter the headless cache"*, while everything that IS in the mini's cache
+   resolves **headless**. So on this machine, anything an operator can store an
+   episode can read, and a human-only secret cannot be stored at all. The
+   passphrase would have to live only in a human's head, be used perhaps twice a
+   year, and have **no recovery path** once the pubkey is published. Forgetting it
+   permanently removes the emergency approval surface — the opposite of what it
+   was for.
+
+### What flow 5 actually does now
+
+**Restart the gateway, then approve in Slack.**
+`launchctl kickstart -k gui/$UID/ai.hermes.gateway` — measured at ~8s on
+2026-09-09 (new pid, `~/.hermes/dispatch-approval.pub` rotated at 15:59,
+Slack app re-initialised, no errors). FLOWS.md flow 5 already concedes that
+reviving a wedged gateway *needs a human at a machine*; a human at a machine can
+restart a LaunchAgent. **The TTY signer solved a problem the restart already
+solves, in the one flow it existed for.**
+
+If the gateway cannot be restarted at all, no approval can be minted and **warden
+fails closed**: it keeps ingesting, triaging and carding, and nothing merges.
+That is the right way to be broken.
+
+### FLOWS.md was wrong in a second way, now corrected
+
+*"You approve in Argo, or at a TTY."* **Both halves were false.** Argo records
+intents and cannot approve — FLOWS.md's own surface table says so two sections
+later, and that table also said "confirmation in Slack or TTY". Three statements
+in two documents, all asserting a capability that never existed. Fixed in this
+commit: `DESIGN.md` § The decision primitive (the withdrawal and its reasoning),
+`DESIGN.md` § Systems (the signer row), `DESIGN.md` § Migration (the Wave 1 row),
+`FLOWS.md` flow 5, `FLOWS.md` surface table.
+
+### Be exact about what this means for the stop condition
+
+Item 5 is **withdrawn, not met**. Four of five were built; the fifth was removed
+as unimplementable-and-unnecessary, with the design amended so the next reader
+does not rebuild it. Anyone who wants it back must first solve the human-only
+secret problem above — that is the real blocker, and it is an estate-level
+question, not a warden one.
+
+**Wave 1 is closed.**

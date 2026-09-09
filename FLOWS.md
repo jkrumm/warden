@@ -161,12 +161,27 @@ live app.
 Argo existing.**
 
 **Decision needed: yes, case 2** — reviving a wedged gateway needs a human at a
-machine. But the decision surface must not be the thing that is down. You approve
-in Argo, or at a TTY.
+machine.
 
-**Friction, named honestly:** if both the gateway and Argo are unreachable, the
-answer is a terminal. That is correct — three surfaces is enough, a fourth is
-theatre.
+**Corrected 2026-09-09 (Wave 1).** This paragraph used to say *"You approve in
+Argo, or at a TTY."* Both halves were false. Argo **records intents and cannot
+approve** — this document's own surface table says so two sections down. And the
+TTY path was unimplementable: the signing key is RAM-only in the gateway, so with
+the gateway stopped no signature can exist, and this estate cannot hold a
+human-only secret to build a second signer with (`dotfiles-private/headless.refs`
+refuses `op://Private/*` unconditionally, and the mini's cache resolves headless
+— an episode reads whatever an operator stores). See DESIGN.md § The decision
+primitive for the full withdrawal.
+
+**What you actually do:** restart the gateway —
+`launchctl kickstart -k gui/$UID/ai.hermes.gateway`, ~8s measured, the plugin
+republishes its public key on boot — then approve in Slack as normal. You are
+already at a machine in this flow; that is what "case 2" means.
+
+**Friction, named honestly:** if the gateway cannot be restarted at all, no
+approval can be minted and **warden fails closed** — it keeps triaging and
+carding, and nothing merges. That is the right way to be broken, and it is why
+this is a degradation rather than an outage.
 
 ---
 
@@ -203,7 +218,7 @@ alternative is 40 merges.
 | **Role** | trigger, notification, one-tap decision | the console |
 | **Shows** | one card per problem, updated in place | board, item timeline, approvals, system state, cost |
 | **Survives a mini outage** | no (Socket Mode) | **yes** (VPS) |
-| **Can approve** | yes — Slack payloads mint signatures | records intent; confirmation in Slack or TTY |
+| **Can approve** | yes — Slack payloads mint signatures | no — records intent; confirmation in Slack |
 | **Steering** | reply to the card thread | comment on the item |
 
 **Steering is not the same as approving**, and both are needed. Approving answers
