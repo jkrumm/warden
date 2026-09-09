@@ -1695,3 +1695,46 @@ and against the real repos, through the pure resolver rather than by dispatching
 
 `GET /api/dispatch-policy` renders the effective table, roots
 `[~/SourceRoot, ~/IuRoot]`, `overrides: []`.
+
+---
+
+## 21. Slice 0.7 (first half) — the defence-in-depth copy, in hermes-agent
+
+hermes-agent `22eb31c`. `config/dispatch-repos.json` now has
+`tiers.investigate: ["dotfiles", "brain", "hermes-agent", "sideclaw", "warden"]`.
+
+Both new names went into `tiers.investigate` and **not** into `deny`, for two
+reasons: investigating them is legitimate and often the point — only the write
+tiers are the problem — and a name appearing in both `deny` and `tiers` is a
+**contradiction this resolver refuses to run on**, not a precedence question
+(§6). Thirty lines of rationale went into the file's `_comment`, which is where
+this repo keeps its reasoning.
+
+```
+$ ~/.hermes/hermes-agent/venv/bin/python3 scripts/validate-dispatch-policy.py config/dispatch-repos.json
+28 repos dispatchable — 5 investigate, 0 author, 23 implement; 2 denied     (was 3 investigate)
+
+$ ~/.hermes/hermes-agent/venv/bin/python3 tests/test_hermes_cc.py
+all 163 cases as expected
+```
+
+`json.dump` reflowed three arrays the file deliberately kept on one line; the
+formatting was restored so the diff is additive apart from the one intended line.
+Committed by path — `cron/usage_audit.jsonl` in that tree is a live gateway
+artifact, not part of this change.
+
+### Still owed by 0.7
+
+- **The agreement check.** Two copies of this policy now exist by design
+  (DESIGN.md § Security model asks for exactly that), and nothing yet compares
+  them. `GET /api/dispatch-policy` exists so they can be. Until something diffs
+  the projection against `dispatch-repos.json` and fails loudly, the second copy
+  is a liability rather than defence in depth — drift here presents as *"the
+  boundary quietly allows what the control plane forbids."*
+  **Careful, and this is the trap:** warden's side is Python, and
+  `os.path.realpath` does **not** correct case the way Bun's `realpathSync` does.
+  A naive `basename()` comparison there reintroduces the fail-open the sideclaw
+  side just closed (§17, §20).
+- `dotfiles/docs/architecture.md:171`, which describes `com.jkrumm.hermes-triage`
+  and why it is a LaunchAgent — rewrite at the cutover, when it stops being true.
+- `hermes-agent`'s `HERMES_PLISTS` and `docs/symlinks-and-agents.md` — same.
