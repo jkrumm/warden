@@ -74,6 +74,13 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
   6b. Verbs       — every `new`+`verb`-mapped+eligible item runs its
                    allowlisted local command once (see VERB OUTCOMES) — never
                    an episode, never clustered with repo-mapped items.
+  6c. Deadlines   — every non-terminal state names its poller and how long a
+                   row may sit in it (STATE_DEADLINES); sweep_deadlines() is
+                   what happens when the poller did not deliver. Runs after
+                   every poller (so an item that can still advance does) and
+                   before the card (so the expiry is visible in the same pass).
+                   An expiry is never silent: it writes the reason into `note`
+                   and prints it.
   7. Card         — one Slack card per cluster (or per verb outcome), posted
                    once state leaves `new` (an unescalated item, mapped or
                    not, is carried silently — see CARDED STATES below) and
@@ -221,7 +228,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 HERMES_HOME = Path.home() / ".hermes"
 # The ledger. `~/.warden/warden.db` since the extraction — the same file
@@ -307,6 +314,21 @@ STATE_LIVENESS_PENDING = "liveness_pending"  # deployed; waiting on a positive l
 # row surfaces once, under its own heading, in the daily digest — see
 # maybe_post_daily_digest() — then is never touched again.
 STATE_NOTE = "note"
+# Terminal, and the only state a DEADLINE is allowed to expire an item into
+# (see STATE_DEADLINES below). Always carries its reason in `note` —
+# _set_state() raises rather than let a reasonless dismissal exist, because
+# the reason is the whole content of the state: "nobody answered in 7 days"
+# and "the merge stayed blocked for 7 days" are different facts and the row
+# is the only place either survives.
+#
+# Deliberately neither of the two terminal states it superficially resembles.
+# NOT `resolved`: nothing was fixed, and `resolved` is the number DESIGN.md
+# optimizes for — a metric that improves the more questions go unanswered is
+# precisely the failure this loop exists to remove. NOT `ignored`: that is a
+# human calling a signature benign, and an expiry is the absence of a human
+# rather than a judgement by one. Conflating either would corrupt the only
+# two numbers this system reports.
+STATE_DISMISSED = "dismissed"
 
 # A card exists only for a row that has actually left `new` — see the module
 # docstring's CARDED STATES paragraph. `snoozed` and `note` are deliberately
@@ -328,9 +350,15 @@ STATE_NOTE = "note"
 # where "already had one" is actually enforced (via `card_ts`), and that is the
 # one place this rule is checked, rather than every caller having to
 # re-derive it.
+# STATE_DISMISSED is in this tuple for the same reason STATE_RESOLVED is: an
+# item that HAD a card and then ran out of time is real news to the human who
+# was asked and did not answer — silently dropping it is what a deadline must
+# never look like. Every state that can expire to `dismissed` (needs_human,
+# merge_blocked, pr_open) is itself carded, so in practice this only ever
+# updates a card that already exists.
 CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR_OPEN, STATE_RESOLVED,
                   STATE_IMPLEMENTING, STATE_VALIDATING, STATE_MERGE_BLOCKED, STATE_MERGED,
-                  STATE_LIVENESS_PENDING)
+                  STATE_LIVENESS_PENDING, STATE_DISMISSED)
 
 # `triage_items.note` prefixes for the grouped-source resolve paths (see
 # resolve_quiet_grouped()/resolve_recovery_paired()) plus the liveness path
@@ -361,7 +389,102 @@ STATE_EMOJI = {
     STATE_MERGE_BLOCKED: ":no_entry:",
     STATE_MERGED: ":rocket:",
     STATE_LIVENESS_PENDING: ":hourglass_flowing_sand:",
+    STATE_DISMISSED: ":wastebasket:",
 }
+
+# Terminal means: no poller, no deadline, no exit. Named once, as a constant,
+# so STATE_DEADLINES below can be checked against it by a test rather than by
+# a reader — DESIGN.md principle 6 is "checked against the diagram, not
+# assumed", and a hand-maintained second list of terminal states is exactly
+# how the two drift apart.
+TERMINAL_STATES = (STATE_RESOLVED, STATE_IGNORED, STATE_NOTE, STATE_DISMISSED)
+
+
+class _DeadlineRule(NamedTuple):
+    """What advances a state, how long a row may sit in it, and where it goes
+    when nothing advanced it in time.
+
+    `poller` names the function or the human — principle 6 asks every
+    non-terminal state to name the thing that polls it, and a name in a table
+    the code reads is a claim a test can check, where a name in a comment is
+    not. `hours` is None for a state bounded by something other than a clock.
+    `deadline_column` names WHICH column carries the moment, because two
+    states own their own and sweep_deadlines() must not touch a window it
+    does not own."""
+
+    poller: str
+    hours: float | None
+    on_expiry: str | None
+    reason: str | None
+    deadline_column: str | None
+
+
+# The generic column, owned by _set_state() (writes it) and sweep_deadlines()
+# (acts on it). `liveness_pending` and `snoozed` name their own instead.
+# Underscore-private, and that is load-bearing: it is not a state, and
+# test_every_non_terminal_state_names_a_poller_and_a_deadline enumerates every
+# public STATE_* string in this module to find the states it must check.
+_STATE_DEADLINE_COLUMN = "state_deadline"
+
+# THE table. Every non-terminal state appears here exactly once; a state that
+# does not is a state an item can sit in forever, which is the failure
+# DESIGN.md § Deadlines was written about
+# (test_every_non_terminal_state_names_a_poller_and_a_deadline enforces it).
+# The numbers are DESIGN.md's own table, not re-derived here.
+#
+# Three entries deviate from that table, deliberately, because a reader will
+# check:
+#
+#   * `verdict` is not in DESIGN.md's table at all, and it is non-terminal.
+#     maybe_auto_implement() only advances it when the repo has auto-implement
+#     enabled AND the verdict reads nextAction=implement at confidence=high;
+#     every other verdict sits in `verdict` with nothing scheduled to touch it
+#     again. 24h -> needs_human. An ADDITION to the design's table, not a
+#     contradiction of it.
+#   * `merged` expires to `resolved`, where DESIGN.md says `closed`. `closed`
+#     is part of the Wave 2 `resolved` split (fixed/quiet/closed) and does not
+#     exist yet; this line becomes `closed` the day that lands.
+#   * `needs_human`'s "reminder at 1d" is NOT built here. A reminder is a
+#     notification feature, not a deadline — it changes nothing about when the
+#     row may stop existing. Scoped out on purpose, not missed.
+STATE_DEADLINES: dict[str, _DeadlineRule] = {
+    # Bounded by silence, not by a clock: the three silence paths resolve a
+    # `new` row after `quietResolveHours` (see _SILENCE_RESOLVE_ELIGIBLE_STATES,
+    # which is an inclusion list of exactly this one state). A clock here would
+    # be a second, competing bound on the one state that already has one.
+    STATE_NEW: _DeadlineRule("resolve_quiet_grouped / apply_resolutions", None, None, None, None),
+    STATE_INVESTIGATING: _DeadlineRule("dispatch-sweep.py", 2, STATE_NEEDS_HUMAN, None,
+                                        _STATE_DEADLINE_COLUMN),
+    STATE_VERDICT: _DeadlineRule("maybe_auto_implement", 24, STATE_NEEDS_HUMAN, None,
+                                  _STATE_DEADLINE_COLUMN),
+    STATE_IMPLEMENTING: _DeadlineRule("poll_implement_jobs", 2, STATE_MERGE_BLOCKED, None,
+                                       _STATE_DEADLINE_COLUMN),
+    STATE_VALIDATING: _DeadlineRule("poll_validation_jobs", 1, STATE_MERGE_BLOCKED, None,
+                                     _STATE_DEADLINE_COLUMN),
+    STATE_MERGE_BLOCKED: _DeadlineRule("operator", 168, STATE_DISMISSED, "unresolved",
+                                        _STATE_DEADLINE_COLUMN),
+    # Nothing polls a `merged` row — the deploy path already declined it (see
+    # poll_validation_jobs()), so the clock IS its only exit, and this sweeper
+    # is therefore honestly named as the poller rather than left blank.
+    STATE_MERGED: _DeadlineRule("sweep_deadlines", 1, STATE_RESOLVED, None, _STATE_DEADLINE_COLUMN),
+    STATE_NEEDS_HUMAN: _DeadlineRule("operator", 168, STATE_DISMISSED, "expired",
+                                      _STATE_DEADLINE_COLUMN),
+    STATE_PR_OPEN: _DeadlineRule("operator", 336, STATE_DISMISSED, "expired", _STATE_DEADLINE_COLUMN),
+    # Owns `liveness_deadline` (schema version 1, the deploy path's own probe
+    # window) — maybe_check_liveness() both sets and acts on it, including the
+    # reopen-to-`new` that a generic expiry could never express. The generic
+    # sweeper skips it on this column name alone.
+    STATE_LIVENESS_PENDING: _DeadlineRule("maybe_check_liveness", None, None, None, "liveness_deadline"),
+    # Owns `snoozed_until`: a human chose that moment, and unsnooze_if_expired()
+    # is the poller that honours it.
+    STATE_SNOOZED: _DeadlineRule("unsnooze_if_expired", None, None, None, "snoozed_until"),
+}
+
+# Written into `note` by sweep_deadlines() and by nothing else. A human
+# reading a card must be able to tell "the clock ran out" from "something
+# decided this" without knowing the state machine, so the note says so in
+# words, first.
+DEADLINE_EXPIRED_NOTE_PREFIX = "deadline expired: "
 
 DEFAULT_CARD_CHANNEL = "C0BVDE5R562"  # #agents — see config/triage-policy.json
 DEFAULT_MIN_OCCURRENCES = 3
@@ -982,6 +1105,99 @@ def _get_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
 
 
+# --- the one state transition ------------------------------------------------
+
+# Every column a state transition in this file is allowed to write alongside
+# `state`. A closed allowlist, for the same reason the verb/evidence/liveness/
+# repo lists are closed: these names are interpolated into SQL, and the rule
+# that a policy file (or any caller) may name and parameterise but never
+# express holds here too. `state`, `state_deadline` and `updated_at` are not in
+# it — those three are the helper's own, written on every transition, never by
+# a caller.
+_SET_STATE_COLUMNS = (
+    "note", "dispatch_job", "card_channel", "card_ts", "card_hash", "artifact_url",
+    "pr_url", "implement_job", "validation_job", "liveness_deadline", "deploy_expect_json",
+    "snoozed_until",
+)
+
+
+class _Coalesce(NamedTuple):
+    """`_set_state(..., artifact_url=_Coalesce(url))` writes
+    `artifact_url=COALESCE(?, artifact_url)` — keep the existing value when the
+    new one is NULL. One call site needs it (fold_dispatch_verdict(), where a
+    verdict with no artifact must not erase the pull request an earlier fold
+    recorded), and it is a sentinel rather than a second helper so that site
+    does not have to be the one raw UPDATE left in the file."""
+
+    value: Any
+
+
+def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datetime, *,
+                expect_state: str | None = None, expect_null: tuple[str, ...] = (),
+                **columns: Any) -> int:
+    """The ONLY place this file writes triage_items.state. Returns rowcount.
+
+    It exists because `state` and `state_deadline` are one fact written in two
+    columns: the deadline is a property OF the state (scripts/ledger.py's
+    migration 2 says the same from the schema side), so a transition that
+    writes one without the other produces a row that either sits forever with
+    no clock or carries the previous state's clock. Twenty-six call sites each
+    remembering to compute a deadline is twenty-six chances to forget one;
+    computing it HERE, from STATE_DEADLINES, is the entire reason for the
+    helper. test_no_raw_state_transition_remains is what keeps it the only one.
+
+    The deadline is NULL — deliberately, not by omission — for a terminal
+    state, for `new` (bounded by silence, see _SILENCE_RESOLVE_ELIGIBLE_STATES)
+    and for the two states carrying their own column. Everything else gets
+    `now + hours`.
+
+    Raises on a state STATE_DEADLINES has never heard of and that is not
+    terminal: a state added later must fail loudly at its first transition
+    rather than quietly acquire "no deadline, forever". Raises on a `dismissed`
+    with no reason, because a dismissal without one is indistinguishable from
+    a bug (see STATE_DISMISSED).
+
+    `expect_state`/`expect_null` turn the UPDATE into a compare-and-swap —
+    maybe_auto_implement() claims an item that way, and the returned rowcount
+    is how it learns whether it won."""
+    rule = STATE_DEADLINES.get(state)
+    if rule is None and state not in TERMINAL_STATES:
+        raise ValueError(
+            f"{state!r} is in neither STATE_DEADLINES nor TERMINAL_STATES. A non-terminal state "
+            f"with no deadline rule is an item that sits in it forever with nothing polling it out "
+            f"— add it to STATE_DEADLINES (poller, hours, on_expiry) or to TERMINAL_STATES.")
+    if state == STATE_DISMISSED and not str(columns.get("note") or "").strip():
+        raise ValueError(
+            "a `dismissed` transition must carry its reason in note= — the reason IS the state's "
+            "content, and a reasonless dismissal cannot be told apart from a bug (see STATE_DISMISSED)")
+    unknown = tuple(c for c in (*columns, *expect_null) if c not in _SET_STATE_COLUMNS)
+    if unknown:
+        raise ValueError(f"{unknown} not in _SET_STATE_COLUMNS — column names reach SQL here, so the "
+                         f"list is closed on purpose")
+
+    deadline = None
+    if rule is not None and rule.hours is not None and rule.deadline_column == _STATE_DEADLINE_COLUMN:
+        deadline = (now + dt.timedelta(hours=rule.hours)).isoformat()
+
+    sql = "UPDATE triage_items SET state=?, state_deadline=?, updated_at=?"
+    params: list[Any] = [state, deadline, _now_iso(now)]
+    for col, value in columns.items():
+        if isinstance(value, _Coalesce):
+            sql += f", {col}=COALESCE(?, {col})"
+            params.append(value.value)
+        else:
+            sql += f", {col}=?"
+            params.append(value)
+    sql += " WHERE event_id=?"
+    params.append(event_id)
+    if expect_state is not None:
+        sql += " AND state=?"
+        params.append(expect_state)
+    for col in expect_null:
+        sql += f" AND {col} IS NULL"
+    return conn.execute(sql, params).rowcount
+
+
 # --- 1. ingest -------------------------------------------------------------
 
 def ingest(conn: sqlite3.Connection, now: dt.datetime) -> None:
@@ -1031,22 +1247,25 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime) -> None:
         "WHERE ti.state=? AND e.resolved_at IS NULL",
         (STATE_RESOLVED,),
     ).fetchall()
-    now_iso = _now_iso(now)
     for row in rows:
-        conn.execute(
-            "UPDATE triage_items SET state=?, updated_at=? WHERE event_id=?",
-            (STATE_NEW, now_iso, row["event_id"]),
-        )
+        _set_state(conn, row["event_id"], STATE_NEW, now)
     conn.commit()
 
 
 def unsnooze_if_expired(conn: sqlite3.Connection, now: dt.datetime) -> None:
+    # Row at a time rather than one set-based UPDATE, so this goes through
+    # _set_state() like every other transition in the file: `snoozed` carries
+    # its deadline in its own column (STATE_DEADLINES), and clearing that
+    # column in the same write that changes the state is exactly what the
+    # helper exists to keep together.
     now_iso = _now_iso(now)
-    conn.execute(
-        "UPDATE triage_items SET state=?, snoozed_until=NULL, updated_at=? "
+    rows = conn.execute(
+        "SELECT event_id FROM triage_items "
         "WHERE state=? AND snoozed_until IS NOT NULL AND snoozed_until<=?",
-        (STATE_NEW, now_iso, STATE_SNOOZED, now_iso),
-    )
+        (STATE_SNOOZED, now_iso),
+    ).fetchall()
+    for row in rows:
+        _set_state(conn, row["event_id"], STATE_NEW, now, snoozed_until=None)
     conn.commit()
 
 
@@ -1064,7 +1283,6 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime) -> None:
         f"WHERE e.resolved_at IS NOT NULL AND ti.state IN ({placeholders})",
         _SILENCE_RESOLVE_ELIGIBLE_STATES,
     ).fetchall()
-    now_iso = _now_iso(now)
     for row in rows:
         # note=NULL is safe BECAUSE the row is `new`: a `new` row carries no
         # obligation and therefore no prior-phase text worth keeping (a
@@ -1075,10 +1293,7 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime) -> None:
         # surviving a reopen -> genuine fix -> resolve cycle and rendering
         # under render_card_blocks()'s STATE_RESOLVED branch as if it were
         # still current.
-        conn.execute(
-            "UPDATE triage_items SET state=?, note=NULL, updated_at=? WHERE event_id=?",
-            (STATE_RESOLVED, now_iso, row["event_id"]),
-        )
+        _set_state(conn, row["event_id"], STATE_RESOLVED, now, note=None)
     conn.commit()
 
 
@@ -1185,7 +1400,6 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
         f"WHERE e.source='slack_alert' AND e.resolved_at IS NULL AND ti.state IN ({placeholders})",
         _SILENCE_RESOLVE_ELIGIBLE_STATES,
     ).fetchall()
-    now_iso = _now_iso(now)
     for row in rows:
         match = latest_by_key.get(row["external_id"])
         if match is None:
@@ -1194,10 +1408,7 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
         if not text.lstrip().startswith("✅"):
             continue
         note = f"{RECOVERY_PAIRED_NOTE_PREFIX}{text.strip()[:200]}"
-        conn.execute(
-            "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-            (STATE_RESOLVED, note, now_iso, row["event_id"]),
-        )
+        _set_state(conn, row["event_id"], STATE_RESOLVED, now, note=note)
     conn.commit()
 
 
@@ -1247,7 +1458,6 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
         f"AND ti.state IN ({placeholders_states})",
         (*GROUPED_TRIAGE_SOURCES, *_SILENCE_RESOLVE_ELIGIBLE_STATES),
     ).fetchall()
-    now_iso = _now_iso(now)
     for row in rows:
         anchor_raw = row["last_reminder_at"] or row["notified_at"] or row["first_seen"]
         quiet_since = _parse_ts(anchor_raw)
@@ -1258,10 +1468,7 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
         note = (f"{QUIET_RESOLVE_NOTE_PREFIX}{_fmt_ts(anchor_raw)} — no new occurrence for "
                 f"{quiet_hours:g}h. This closes the item on silence alone; it is NOT a confirmed "
                 f"fix, and the signature reopens automatically the moment it recurs.")
-        conn.execute(
-            "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-            (STATE_RESOLVED, note, now_iso, row["event_id"]),
-        )
+        _set_state(conn, row["event_id"], STATE_RESOLVED, now, note=note)
     conn.commit()
 
 
@@ -1288,18 +1495,12 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
         targets = _match_targets(event_row)
 
         if _fnmatch_any(targets, policy["ignore"]):
-            conn.execute(
-                "UPDATE triage_items SET state=?, updated_at=? WHERE event_id=?",
-                (STATE_IGNORED, now_iso, row["event_id"]),
-            )
+            _set_state(conn, row["event_id"], STATE_IGNORED, now)
             continue
 
         if policy["ignoreUnstructuredSlackProse"] and event_row["source"] == "slack_alert" \
                 and not _looks_like_bot_alert(event_row["title"]):
-            conn.execute(
-                "UPDATE triage_items SET state=?, updated_at=? WHERE event_id=?",
-                (STATE_NOTE, now_iso, row["event_id"]),
-            )
+            _set_state(conn, row["event_id"], STATE_NOTE, now)
             continue
 
         if row["repo"] is None and row["verb"] is None:
@@ -1791,12 +1992,8 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
     if result is None:
         return None
     job_id = result["jobId"]
-    now_iso = _now_iso(now)
     for m in members:
-        conn.execute(
-            "UPDATE triage_items SET state=?, dispatch_job=?, updated_at=? WHERE event_id=?",
-            (STATE_INVESTIGATING, job_id, now_iso, m["event_id"]),
-        )
+        _set_state(conn, m["event_id"], STATE_INVESTIGATING, now, dispatch_job=job_id)
     dispatch_row = conn.execute("SELECT id FROM dispatches WHERE job_id=?", (job_id,)).fetchone()
     if dispatch_row is not None:
         for m in members:
@@ -1964,11 +2161,7 @@ def run_verbs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime
             continue
         output = _run_verb(argv, timeout=VERB_TIMEOUT)
         note = _render_env_check_note(output) if verb == "env-check" else json.dumps(output)[:SECTION_TEXT_MAX]
-        now_iso = _now_iso(now)
-        conn.execute(
-            "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-            (STATE_NEEDS_HUMAN, note, now_iso, item["event_id"]),
-        )
+        _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
         conn.commit()
         fresh_item = _get_item(conn, item["event_id"])
         event_row = _get_event(conn, item["event_id"])
@@ -2013,13 +2206,9 @@ def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now:
                     f"Each will be re-evaluated individually."}},
             ]
             update_blocks(card_channel, card_ts, blocks, "Cluster split — re-evaluating individually", token)
-    now_iso = _now_iso(now)
     for m in members:
-        conn.execute(
-            "UPDATE triage_items SET state=?, card_channel=NULL, card_ts=NULL, "
-            "card_hash=NULL, updated_at=? WHERE event_id=?",
-            (STATE_NEW, now_iso, m["event_id"]),
-        )
+        _set_state(conn, m["event_id"], STATE_NEW, now,
+                   card_channel=None, card_ts=None, card_hash=None)
     conn.commit()
 
 
@@ -2130,6 +2319,14 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
         # fires for a genuine state-source (uk/docker/op_refs) recovery,
         # which needs no caveat.
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"↳ _{_escape(primary['note'])}_"}]})
+    elif state == STATE_DISMISSED:
+        # The reason is the whole point of the state (see STATE_DISMISSED), and
+        # the human reading this card is the one who was asked and did not
+        # answer — so the card must say what expired rather than just going
+        # quiet. _set_state() guarantees the note exists; the fallback is for a
+        # row edited by hand outside this file.
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+            f"↳ _{_escape(primary['note'] or 'dismissed, no reason recorded')}_"[:SECTION_TEXT_MAX]}]})
     elif state == STATE_IMPLEMENTING and primary["implement_job"]:
         blocks.append({
             "type": "context",
@@ -2271,13 +2468,9 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         print(f"[dry-run] would fold dispatch {job_id} onto {len(members)} triage item(s): state={new_state}")
         return
 
-    now_iso = _now_iso(now)
     for m in members:
-        conn.execute(
-            "UPDATE triage_items SET state=?, artifact_url=COALESCE(?, artifact_url), note=?, updated_at=? "
-            "WHERE event_id=?",
-            (new_state, d["artifact_url"], blocker or None, now_iso, m["event_id"]),
-        )
+        _set_state(conn, m["event_id"], new_state, now,
+                   artifact_url=_Coalesce(d["artifact_url"]), note=blocker or None)
     conn.commit()
 
     fresh_members = [r for r in (_get_item(conn, m["event_id"]) for m in members) if r is not None]
@@ -2397,12 +2590,8 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # conditional UPDATE is the claim: `AND state=?` makes it a compare-and-set,
         # so a concurrent run that already claimed this item changes 0 rows and this
         # one skips instead of racing it.
-        now_iso = _now_iso(now)
-        claimed = conn.execute(
-            "UPDATE triage_items SET state=?, updated_at=? WHERE event_id=? AND state=? "
-            "AND implement_job IS NULL",
-            (STATE_IMPLEMENTING, now_iso, item["event_id"], STATE_VERDICT),
-        ).rowcount
+        claimed = _set_state(conn, item["event_id"], STATE_IMPLEMENTING, now,
+                             expect_state=STATE_VERDICT, expect_null=("implement_job",))
         conn.commit()
         if not claimed:
             continue
@@ -2410,10 +2599,8 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if job_id is None:
             # Dispatch refused or failed, so nothing is running — hand the claim back
             # rather than stranding the item in `implementing` with no job to poll.
-            conn.execute(
-                "UPDATE triage_items SET state=?, updated_at=? WHERE event_id=? AND state=?",
-                (STATE_VERDICT, _now_iso(now), item["event_id"], STATE_IMPLEMENTING),
-            )
+            _set_state(conn, item["event_id"], STATE_VERDICT, now,
+                       expect_state=STATE_IMPLEMENTING)
             conn.commit()
             continue
         conn.execute(
@@ -2517,33 +2704,31 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
     for item in items:
         resp = _hermes_cc_status(item["implement_job"])
         if resp is None:
+            # sideclaw no longer knows this job: it prunes terminal jobs at 24h
+            # OR at 200 terminal rows, a cap shared with every interactive
+            # /check, so 200 can arrive in an afternoon. Nothing here can move
+            # the item — which is why `implementing` has a 2h deadline in
+            # STATE_DEADLINES that fires long before either bound and takes it
+            # to `merge_blocked`. No miss counter, no extra column: the clock
+            # already covers the case (see sweep_deadlines()).
             continue
         status = resp.get("status")
         if status not in ("done", "failed", "interrupted", "lost"):
             continue
-        now_iso = _now_iso(now)
         artifact_url = resp.get("artifactUrl")
         if status != "done" or not artifact_url:
             reason = resp.get("error") or ((resp.get("verdict") or {}).get("summary")) or "no further detail"
             note = f"implement episode {item['implement_job']} finished '{status}' with no pull request: {reason}"
-            conn.execute(
-                "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-                (STATE_MERGE_BLOCKED, note, now_iso, item["event_id"]),
-            )
+            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=note)
         else:
             val_job = _run_hermes_cc_validation(conn, repo=item["repo"], event_id=item["event_id"],
                                                  implement_job=item["implement_job"], pr_url=artifact_url)
             if val_job is None:
-                conn.execute(
-                    "UPDATE triage_items SET state=?, note=?, pr_url=?, updated_at=? WHERE event_id=?",
-                    (STATE_MERGE_BLOCKED, "could not open the step-7 validation episode", artifact_url,
-                     now_iso, item["event_id"]),
-                )
+                _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
+                           note="could not open the step-7 validation episode", pr_url=artifact_url)
             else:
-                conn.execute(
-                    "UPDATE triage_items SET state=?, validation_job=?, pr_url=?, updated_at=? WHERE event_id=?",
-                    (STATE_VALIDATING, val_job, artifact_url, now_iso, item["event_id"]),
-                )
+                _set_state(conn, item["event_id"], STATE_VALIDATING, now,
+                           validation_job=val_job, pr_url=artifact_url)
         conn.commit()
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
         if fresh_item is not None and fresh_event is not None:
@@ -2565,6 +2750,10 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     for item in items:
         resp = _hermes_cc_status(item["validation_job"])
         if resp is None:
+            # Same pruned-job case as poll_implement_jobs() above, same answer:
+            # `validating` carries a 1h deadline in STATE_DEADLINES, so an item
+            # whose validation job sideclaw has forgotten exits to
+            # `merge_blocked` on the clock instead of being polled forever.
             continue
         status = resp.get("status")
         if status not in ("done", "failed", "interrupted", "lost"):
@@ -2577,47 +2766,32 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
                      (outcome, item["implement_job"]))
         conn.commit()
-        now_iso = _now_iso(now)
         if outcome != "confirmed":
             note = (f"step-7 validation ({outcome}): "
                     f"{verdict.get('summary') or resp.get('error') or 'no further detail'}")
-            conn.execute(
-                "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-                (STATE_MERGE_BLOCKED, note, now_iso, item["event_id"]),
-            )
+            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=note)
             conn.commit()
         else:
             merge_result = _run_hermes_cc_merge(item["implement_job"])
             if merge_result is None:
-                conn.execute(
-                    "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-                    (STATE_MERGE_BLOCKED, "validation confirmed but the merge call itself failed to run",
-                     now_iso, item["event_id"]),
-                )
+                _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
+                           note="validation confirmed but the merge call itself failed to run")
                 conn.commit()
             elif merge_result.get("ok") and merge_result.get("merged"):
                 deploy = merge_result.get("deploy") or {}
                 if deploy.get("attempted") and deploy.get("ok"):
                     deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-                    conn.execute(
-                        "UPDATE triage_items SET state=?, liveness_deadline=?, deploy_expect_json=?, "
-                        "note=NULL, updated_at=? WHERE event_id=?",
-                        (STATE_LIVENESS_PENDING, deadline, json.dumps(deploy.get("expectedAlerts") or []),
-                         now_iso, item["event_id"]),
-                    )
+                    _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+                               liveness_deadline=deadline,
+                               deploy_expect_json=json.dumps(deploy.get("expectedAlerts") or []),
+                               note=None)
                 else:
                     reason = deploy.get("reason") or "merged; no deploy configured for this repo"
-                    conn.execute(
-                        "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-                        (STATE_MERGED, reason, now_iso, item["event_id"]),
-                    )
+                    _set_state(conn, item["event_id"], STATE_MERGED, now, note=reason)
                 conn.commit()
             else:
                 note = f"merge refused: {merge_result.get('error') or 'unknown reason'}"
-                conn.execute(
-                    "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-                    (STATE_MERGE_BLOCKED, note, now_iso, item["event_id"]),
-                )
+                _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=note)
                 conn.commit()
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
         if fresh_item is not None and fresh_event is not None:
@@ -2659,10 +2833,7 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 print(f"[dry-run] would resolve {item['signature']} on confirmed liveness: {detail}")
                 continue
             note = f"{LIVENESS_CONFIRMED_NOTE_PREFIX}{detail}"
-            conn.execute(
-                "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-                (STATE_RESOLVED, note, now_iso, item["event_id"]),
-            )
+            _set_state(conn, item["event_id"], STATE_RESOLVED, now, note=note)
             conn.commit()
             fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
             if fresh_item is not None and fresh_event is not None:
@@ -2693,11 +2864,112 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 ]
                 update_blocks(item["card_channel"], item["card_ts"], blocks,
                               "Reopened — liveness never confirmed", token)
-        conn.execute(
-            "UPDATE triage_items SET state=?, note=?, updated_at=? WHERE event_id=?",
-            (STATE_NEW, history, now_iso, item["event_id"]),
-        )
+        _set_state(conn, item["event_id"], STATE_NEW, now, note=history)
         conn.commit()
+
+
+# --- the clock ----------------------------------------------------------------
+
+def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
+    """The only thing that acts on `state_deadline`. Every non-terminal state
+    names a poller and a deadline (STATE_DEADLINES); this is what happens when
+    the poller did not deliver in time.
+
+    Runs LAST of the pollers and BEFORE the card sync, and both halves of that
+    matter. A poller that can still advance an item this pass must get its
+    chance before the clock takes it away — an item that reached its 2h mark
+    thirty seconds before its episode finished should finish, not expire. And
+    an expiry the human never sees is the same as no expiry at all, so the
+    state change has to land before sync_card() renders this pass's cards.
+
+    Local bookkeeping with no outbound call, so it runs FOR REAL under
+    --dry-run, exactly like apply_resolutions()/classify()/
+    resolve_quiet_grouped() — the dry-run contract is "never touches Slack,
+    never shells out, everything else real". It prints every expiry it applies
+    either way, because a deadline that fires silently is indistinguishable
+    from a loop that is not firing them at all.
+
+    A NON-TERMINAL row with a NULL `state_deadline` is reported to stderr and
+    left alone. It is a finding, not permission to sit forever — but it is not
+    backfilled either: `updated_at` is the only anchor available and ingest()
+    rewrites it every pass for every open event, so a deadline derived from it
+    would move further away on every run and never fire, while looking
+    authoritative. The rows that predate schema version 2 are the reason this
+    prints rather than guesses."""
+    now_iso = _now_iso(now)
+    # The string comparison is a prefilter over the state_deadline index (the
+    # same shape unsnooze_if_expired() uses on snoozed_until); _parse_ts()
+    # below makes the actual decision, so a differently-formatted timestamp
+    # can never expire an item on a lexical accident.
+    rows = conn.execute(
+        "SELECT event_id, signature, state, state_deadline FROM triage_items "
+        "WHERE state_deadline IS NOT NULL AND state_deadline<=? ORDER BY event_id",
+        (now_iso,),
+    ).fetchall()
+    for row in rows:
+        rule = STATE_DEADLINES.get(row["state"])
+        if rule is None or rule.on_expiry is None:
+            continue
+        if rule.deadline_column != _STATE_DEADLINE_COLUMN:
+            # `liveness_pending` and `snoozed` own their own window and their
+            # own poller. A stale value in this column on one of them is not
+            # this sweeper's to act on.
+            continue
+        deadline = _parse_ts(row["state_deadline"])
+        if deadline is None or now < deadline:
+            continue
+        note = (f"{DEADLINE_EXPIRED_NOTE_PREFIX}sat in `{row['state']}` for its full "
+                f"{rule.hours:g}h without {rule.poller} advancing it (deadline "
+                f"{_fmt_ts(row['state_deadline'])}). Moved to `{rule.on_expiry}` by the clock, "
+                f"not by a decision")
+        if rule.reason:
+            note += f" — reason `{rule.reason}`"
+        note += "."
+        _set_state(conn, row["event_id"], rule.on_expiry, now, note=note)
+        print(f"triage: deadline expired for {row['signature']} (event {row['event_id']}): "
+              f"{row['state']} -> {rule.on_expiry} after {rule.hours:g}h with no advance "
+              f"from {rule.poller}")
+    conn.commit()
+
+    expected = [s for s, r in STATE_DEADLINES.items() if r.deadline_column == _STATE_DEADLINE_COLUMN]
+    placeholders = ",".join("?" * len(expected))
+    for row in conn.execute(
+        f"SELECT event_id, signature, state FROM triage_items "
+        f"WHERE state_deadline IS NULL AND state IN ({placeholders}) ORDER BY event_id",
+        expected,
+    ).fetchall():
+        # Stamp it from NOW, and say so. Two anchors were possible and only one
+        # is safe: `updated_at` is rewritten by ingest() on every recurrence, so
+        # a deadline derived from it would move further away every pass and
+        # never fire — which is the bug this whole slice closes, rebuilt. `now`
+        # cannot do that. It is deliberately CONSERVATIVE: a row that has
+        # already sat in `needs_human` for six days gets a fresh 168h rather
+        # than expiring immediately, and erring toward not-discarding is the
+        # same call item 1 made.
+        #
+        # Leaving these as a report only was the first version of this, and it
+        # was wrong in the one case that matters: the rows carrying a NULL
+        # deadline on the live ledger are all `needs_human`, and the only thing
+        # that transitions a `needs_human` row is a human — so "it gets a real
+        # one when it next transitions" means "never", for exactly the
+        # population that must not sit forever. It would have printed the same
+        # four lines every 600s and bounded nothing.
+        #
+        # Still printed as a FINDING, once, at stamp time: a NULL deadline on a
+        # non-terminal row can only be a pre-column legacy row or a bug in a
+        # transition site, and silently fixing the second is how it stays a bug.
+        rule = STATE_DEADLINES[row["state"]]
+        stamped = now + dt.timedelta(hours=rule.hours)
+        conn.execute(
+            "UPDATE triage_items SET state_deadline=? WHERE event_id=? AND state_deadline IS NULL",
+            (_now_iso(stamped), row["event_id"]),
+        )
+        print(f"triage: FINDING — {row['signature']} (event {row['event_id']}) was in non-terminal "
+              f"state {row['state']!r} with a NULL state_deadline, so nothing would ever have timed "
+              f"it out. Stamped {rule.hours:g}h from now ({_fmt_ts(_now_iso(stamped))}), not from "
+              f"updated_at, which ingest() rewrites every pass. If this row is not a pre-column "
+              f"legacy row, a transition site is failing to write a deadline.", file=sys.stderr)
+    conn.commit()
 
 
 # --- propose_mappings() — step 8, the one LLM call in this file --------------
@@ -3267,6 +3539,12 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     poll_validation_jobs(conn, policy, now, dry_run=dry_run)
     maybe_check_liveness(conn, policy, now, dry_run=dry_run)
 
+    # After every poller above, before the cards below — see sweep_deadlines()'s
+    # own docstring: a poller that can still advance an item this pass gets its
+    # chance before the clock takes it away, and an expiry has to be on the card
+    # in the same pass it happens.
+    sweep_deadlines(conn, now, dry_run=dry_run)
+
     for _key, members in _cluster_groups(conn).items():
         members = sorted(members, key=lambda r: r["event_id"])
         event_rows = [_get_event(conn, m["event_id"]) for m in members]
@@ -3334,6 +3612,14 @@ def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: boo
 
 # --- CLI verbs: --snooze / --ignore / --reopen / --list ------------------------
 
+def _items_for_signature(conn: sqlite3.Connection, signature: str) -> list[sqlite3.Row]:
+    """The three CLI verbs address a SIGNATURE, not an event, so they resolve
+    it to rows first and transition each through _set_state() — same reason
+    unsnooze_if_expired() stopped being one set-based UPDATE: the deadline is
+    written with the state, by one function, or it drifts."""
+    return conn.execute("SELECT event_id FROM triage_items WHERE signature=?", (signature,)).fetchall()
+
+
 def _arg_value(argv: list[str], flag: str) -> str | None:
     if flag not in argv:
         return None
@@ -3353,12 +3639,11 @@ def cmd_snooze(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
         print(f"triage: --hours must be a number, got {hours_s!r}", file=sys.stderr)
         return 2
     until = (now + dt.timedelta(hours=hours)).isoformat()
-    cur = conn.execute(
-        "UPDATE triage_items SET state=?, snoozed_until=?, updated_at=? WHERE signature=?",
-        (STATE_SNOOZED, until, _now_iso(now), signature),
-    )
+    rows = _items_for_signature(conn, signature)
+    for row in rows:
+        _set_state(conn, row["event_id"], STATE_SNOOZED, now, snoozed_until=until)
     conn.commit()
-    if cur.rowcount == 0:
+    if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
         return 1
     print(f"snoozed {signature} until {until}")
@@ -3370,12 +3655,11 @@ def cmd_ignore(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
     if not signature:
         print("triage: --ignore needs a signature", file=sys.stderr)
         return 2
-    cur = conn.execute(
-        "UPDATE triage_items SET state=?, snoozed_until=NULL, updated_at=? WHERE signature=?",
-        (STATE_IGNORED, _now_iso(now), signature),
-    )
+    rows = _items_for_signature(conn, signature)
+    for row in rows:
+        _set_state(conn, row["event_id"], STATE_IGNORED, now, snoozed_until=None)
     conn.commit()
-    if cur.rowcount == 0:
+    if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
         return 1
     print(f"ignored {signature}")
@@ -3387,12 +3671,11 @@ def cmd_reopen(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
     if not signature:
         print("triage: --reopen needs a signature", file=sys.stderr)
         return 2
-    cur = conn.execute(
-        "UPDATE triage_items SET state=?, snoozed_until=NULL, updated_at=? WHERE signature=?",
-        (STATE_NEW, _now_iso(now), signature),
-    )
+    rows = _items_for_signature(conn, signature)
+    for row in rows:
+        _set_state(conn, row["event_id"], STATE_NEW, now, snoozed_until=None)
     conn.commit()
-    if cur.rowcount == 0:
+    if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
         return 1
     print(f"reopened {signature}")

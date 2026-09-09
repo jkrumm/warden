@@ -2955,3 +2955,126 @@ network rather than a stub.
 `sideclaw/server/jobs/store.ts:41-42`, a cap shared with every interactive
 `/check`). Both need a decision recorded first: three of the nine expiry actions
 in DESIGN.md's table target `dismissed`, and that state does not exist yet.
+
+---
+
+## 34. Wave 1, item 3b/3c — deadlines and named pollers (DONE)
+
+DESIGN.md principle 6 — "Every non-terminal state names the thing that polls it
+and its deadline. **Checked against the diagram, not assumed**" — is now checked
+by a test rather than by reading.
+
+### What was built
+
+- **`STATE_DISMISSED`**, terminal, reason always required (enforced in the
+  helper, not by convention). Built because three of the nine expiry actions in
+  DESIGN.md's table target it. Scoped to that: this is NOT the Wave 2 `resolved`
+  → `fixed`/`quiet`/`closed` split.
+- **`STATE_DEADLINES`** — one closed table mapping every non-terminal state to
+  its poller, its hours, and its expiry action. The poller is a *string in the
+  table*, so principle 6 is satisfied in code rather than in a comment.
+- **`_set_state()`** — all **26** transition sites now route through one helper
+  that writes state, `updated_at` and `state_deadline` as one fact.
+  `grep -c 'UPDATE triage_items SET state=' scripts/triage.py` → **1**.
+- **`sweep_deadlines()`** in `run()`, after the chain pollers (a poller that can
+  still advance an item gets its chance before the clock takes it) and before
+  `sync_card()` (so the expiry shows on the card the same pass).
+
+### Three documented deviations from DESIGN.md's table
+
+- **`verdict` is not in that table and is non-terminal.** `maybe_auto_implement`
+  only advances it when the repo has auto-implement enabled, so otherwise it
+  sits forever. 24h → `needs_human`. An addition to the design's table, not a
+  contradiction of it.
+- **`merged` expires to `resolved`, where DESIGN.md says `closed`.** `closed` is
+  Wave 2. Noted in the code as the line that changes then.
+- **`needs_human`'s "reminder at 1d" is not built.** A reminder is a
+  notification feature; the 7d expiry is the deadline. Scoped out deliberately,
+  recorded here so it reads as scoped-out rather than missed.
+
+`liveness_pending` and `snoozed` keep their own columns (`liveness_deadline`,
+`snoozed_until`) and are named in the table pointing at them, so the audit passes
+without two mechanisms that could disagree.
+
+### 3c — the sideclaw pruning gap closes with no new column
+
+`poll_implement_jobs`/`poll_validation_jobs` both did `if resp is None: continue`,
+so an item whose sideclaw job was pruned was polled forever with nothing moving
+it. sideclaw prunes terminal jobs at 24h **or** 200 rows
+(`sideclaw/server/jobs/store.ts:41-42`, re-verified — a cap shared with every
+interactive `/check`, so 200 can arrive in an afternoon). The 2h/1h deadlines
+fire long before either bound, so a pruned job's item exits to `merge_blocked` on
+the clock. **No miss counter, no new column.**
+`test_a_pruned_sideclaw_job_does_not_strand_an_item` proves it: the item does not
+move inside its deadline and does reach `merge_blocked` past it.
+
+### The correction I made to the delivered work
+
+The first version **reported** a NULL `state_deadline` on a non-terminal row and
+deliberately did not backfill it, because `updated_at` is rewritten by `ingest()`
+on every recurrence and a deadline derived from it would move further away every
+pass. That reasoning is right, and the conclusion was wrong in the only case that
+occurs: **every NULL-deadline row on the live ledger is `needs_human`, and the
+only thing that transitions a `needs_human` row is a human.** So "it gets a
+deadline when it next transitions" meant "never", for precisely the population
+that must not sit forever — four lines of FINDING every 600s, bounding nothing.
+
+Now it stamps from **`now`**, which cannot drift the way `updated_at` can, and is
+deliberately conservative (a row six days into `needs_human` gets a fresh 168h
+rather than expiring at once — erring toward not-discarding, the same call item 1
+made). It still prints a FINDING, once, at stamp time: a NULL deadline is either
+a pre-column legacy row or a bug in a transition site, and silently fixing the
+second is how it stays a bug.
+
+### Evidence
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   12/12 passed
+  test_triage.py                   92/92 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+```
+
+**75 → 92 (+17).** The regression gate is now **92/92**; CLAUDE.md still says
+68/68 and wants updating.
+
+Mutation checks, run here:
+
+| Mutation | Result |
+|-|-|
+| drop `needs_human` from `STATE_DEADLINES` | 84/91 — the principle-6 test names it: *"a state with no named poller and no deadline is a state an item sits in forever"* |
+| `sweep_deadlines()` → no-op | 81/91 — all eight expiry edges, plus the pruned-job and NULL-deadline tests |
+
+Against a VACUUM INTO copy of the **live** ledger, two consecutive dry-runs:
+
+```
+pass 1:  4 FINDING lines   (events 543/875/930/943, all needs_human, all pre-column)
+pass 2:  0 FINDING lines
+after:   state_deadline = 2026-09-16T17:28:30Z on all four — 168h out, stamped once
+         states unchanged: nothing was expired, only bounded
+```
+
+The four items that item 1 stopped being silently discarded are now also the four
+items that can no longer sit unbounded. Those are the same four rows, and that is
+the whole wave in one line.
+
+### Files
+
+`scripts/triage.py`, `tests/test_triage.py`, `docs/triage.md` (loop step 6c,
+`dismissed` in Carded states, the deadline edges in the diagram, a new Deadlines
+section).
+
+### Noticed, not fixed
+
+- `dismissed` is terminal and `reopen_if_needed()` only reopens `resolved`, so a
+  dismissed signature that recurs stays invisible — the same as `ignored`/`note`,
+  and arguably correct, but it is a real edge and Wave 2's state-machine work
+  should decide it deliberately.
+- `sync_card()`'s never-carded guard covers only `STATE_RESOLVED`, so a
+  `dismissed` row that somehow lacked `card_ts` would post a first card.
+- `docs/triage.md` §Tests still counts "30 cases"; `CLAUDE.md` still pins the
+  gate at 68/68. Both stale.

@@ -109,6 +109,11 @@ edges* and *Clustering* below.
    not one dispatch per item. See *Clustering*.
 6b. **Verbs** — every eligible `new`+`verb`-mapped item runs its allowlisted
    local command once. See *Verb outcomes*.
+6c. **Deadlines** — every non-terminal state names its poller and how long a
+   row may sit in it (`STATE_DEADLINES`); `sweep_deadlines()` is what happens
+   when that poller did not deliver. See *Deadlines* below. Runs after every
+   poller (an item that can still advance gets its chance first) and before
+   the card (an expiry the human never sees is the same as no expiry).
 7. **Card** — one Slack card per cluster (`_cluster_groups()`, keyed by
    `dispatch_job`, a verb outcome is its own singleton "cluster"), posted
    once state leaves `new` (see *Carded states* below) and updated in place
@@ -337,9 +342,12 @@ prefixes, specifically so an ordinary event-driven resolve (which clears
 ## Carded states
 
 A card exists ONLY once a cluster has left `new` — state in `investigating`,
-`verdict`, `needs_human`, `pr_open`, `resolved`, or one of the auto-implement
-chain's own states (`implementing`, `validating`, `merge_blocked`, `merged`,
-`liveness_pending` — see *Closing the loop* below). An item that is mapped
+`verdict`, `needs_human`, `pr_open`, `resolved`, `dismissed`, or one of the
+auto-implement chain's own states (`implementing`, `validating`,
+`merge_blocked`, `merged`, `liveness_pending` — see *Closing the loop* below).
+`dismissed` is carded for the same reason `resolved` is: an item that HAD a
+card and then ran out of time is real news to the human who was asked and did
+not answer. An item that is mapped
 but hasn't yet crossed `minOccurrences`/`minOpenMinutes` — or is simply
 unmapped — is carried silently; it appears only in the daily digest (if
 unmapped) or not at all (if mapped but not yet eligible). `ignored` and
@@ -379,6 +387,11 @@ new ──(escalate, clustered by repo)──> investigating ──(sweeper fold
  ├──(--snooze)──> snoozed ──(snoozed_until passes)──> new
  └──(event resolves)──> resolved ──(event reopens)──> new
 
+investigating ──(2h)──> needs_human      merge_blocked ──(7d)──> dismissed
+verdict ──────(24h)──> needs_human      needs_human ──(7d)──> dismissed
+implementing ─(2h)──> merge_blocked     pr_open ─────(14d)──> dismissed
+validating ───(1h)──> merge_blocked     merged ──────(1h)──> resolved
+
 implementing ──(implement episode done, PR opened)──> validating (step 7, a DIFFERENT model)
              └──(implement failed / no PR)──────────> merge_blocked
 
@@ -394,6 +407,65 @@ moment the underlying event's `resolved_at` is set (see step 4). Once resolved, 
 rendered content stops changing, so the card-hash short-circuit (below)
 means it is genuinely never touched again — "stop touching it" falls out of
 the state machine, it isn't a separate rule.
+
+## Deadlines
+
+DESIGN.md principle 6: every non-terminal state names the thing that polls it
+and its deadline, *checked against the diagram, not assumed*.
+`STATE_DEADLINES` in `scripts/triage.py` is that table — poller, hours,
+on-expiry state, reason — and
+`test_every_non_terminal_state_names_a_poller_and_a_deadline` enumerates the
+module's own `STATE_*` constants against it, so a state added without a
+deadline fails at the moment it is added rather than months later as one row
+nobody looked at again.
+
+| State | Poller | Deadline | On expiry |
+|-|-|-|-|
+| `new` | `resolve_quiet_grouped` / `apply_resolutions` | — | bounded by `quietResolveHours`, not by a clock |
+| `investigating` | `dispatch-sweep.py` | 2h | `needs_human` |
+| `verdict` | `maybe_auto_implement` | 24h | `needs_human` |
+| `implementing` | `poll_implement_jobs` | 2h | `merge_blocked` |
+| `validating` | `poll_validation_jobs` | 1h | `merge_blocked` |
+| `merge_blocked` | operator | 7d | `dismissed`, reason `unresolved` |
+| `merged` | the clock itself | 1h | `resolved` |
+| `needs_human` | operator | 7d | `dismissed`, reason `expired` |
+| `pr_open` | operator | 14d | `dismissed`, reason `expired` |
+| `liveness_pending` | `maybe_check_liveness` | own column `liveness_deadline` | reopens to `new` with history |
+| `snoozed` | `unsnooze_if_expired` | own column `snoozed_until` | `new` |
+
+Three deviations from DESIGN.md's own table, all deliberate. `verdict` is not
+in it at all and is non-terminal — `maybe_auto_implement()` only advances a
+verdict that reads `nextAction=implement` at `confidence=high`, so every other
+one sits there with nothing scheduled to touch it. `merged` expires to
+`resolved` where the design says `closed`, because `closed` is part of the
+Wave 2 `resolved` split and does not exist yet. And `needs_human`'s "reminder
+at 1d" is NOT built: a reminder is a notification, not a deadline.
+
+`dismissed` is terminal and always carries its reason in `note` —
+`_set_state()` raises rather than let a reasonless dismissal exist. It is
+deliberately neither `resolved` (nothing was fixed, and `resolved` is the
+number this system reports — a metric that improves the more questions go
+unanswered is the exact failure the loop exists to remove) nor `ignored` (that
+is a human calling a signature benign; an expiry is the *absence* of a human).
+
+Two mechanical properties hold this together. **Every transition goes through
+`_set_state()`**, which writes `state`, `state_deadline` and `updated_at` in
+one statement — state and deadline are one fact, and a call site that could
+forget the deadline is a row that sits with no clock or with the previous
+state's clock (`test_no_raw_state_transition_remains` keeps it the only such
+statement in the file). And **a non-terminal row with a NULL `state_deadline`
+is reported to stderr, never backfilled**: `updated_at` is the only anchor
+available and `ingest()` rewrites it every pass for every open event, so a
+deadline derived from it would move further away every run and never fire. The
+rows that predate schema version 2 print on every pass until they next
+transition.
+
+This also closes the pruned-job gap: `sideclaw` prunes terminal jobs at 24h
+*or* 200 terminal rows (a cap shared with every interactive `/check`), after
+which `poll_implement_jobs()`/`poll_validation_jobs()` poll a job that no
+longer exists and nothing moves the item. The 2h/1h deadlines fire long before
+either bound, so no miss counter and no extra column are needed — the item
+exits to `merge_blocked` on the clock.
 
 ## Clustering
 

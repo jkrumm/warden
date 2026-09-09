@@ -30,6 +30,7 @@ import contextlib
 import datetime as dt
 import time
 import importlib.util
+import io
 import json
 import shutil
 import sqlite3
@@ -2236,6 +2237,337 @@ def test_heartbeat_skipped_under_dry_run():
             "SELECT COUNT(*) AS n FROM cursors WHERE key=?",
             (triage.HEARTBEAT_CURSOR_KEY,),
         ).fetchone()["n"] == 0, "--dry-run did not complete a real pass"
+
+
+# --- deadlines (slice 3b) -----------------------------------------------------
+
+def _seed_expiring_item(conn, *, external_id: str, state: str, state_deadline: str | None,
+                         **columns) -> int:
+    """One triage_items row parked in `state` with an exact `state_deadline`.
+
+    Written directly rather than through triage._set_state() on purpose: these
+    cases are about what the SWEEPER does with a given deadline, so the test
+    has to own that value instead of inheriting whatever the helper would
+    compute for the state."""
+    eid = _insert_event(conn, source="slack_alert", external_id=external_id,
+                         title=f"Expiring {external_id}", first_seen=OLD)
+    cols = {
+        "event_id": eid, "signature": f"slack_alert:{external_id}", "repo": "demo-repo",
+        "state": state, "occurrences": 3, "first_seen": OLD.isoformat(),
+        "last_seen": OLD.isoformat(), "created_at": OLD.isoformat(),
+        "updated_at": OLD.isoformat(), "state_deadline": state_deadline,
+    }
+    cols.update(columns)
+    conn.execute(
+        f"INSERT INTO triage_items({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+        tuple(cols.values()),
+    )
+    conn.commit()
+    return eid
+
+
+def _expire(conn, state: str, external_id: str, **columns):
+    """Seed `state` with a deadline an hour in the past, sweep, return the row."""
+    eid = _seed_expiring_item(conn, external_id=external_id, state=state,
+                               state_deadline=(NOW - dt.timedelta(hours=1)).isoformat(),
+                               **columns)
+    triage.sweep_deadlines(conn, NOW, dry_run=False)
+    return triage._get_item(conn, eid)
+
+
+def test_every_non_terminal_state_names_a_poller_and_a_deadline():
+    """DESIGN.md principle 6, executable: "every non-terminal state names the
+    thing that polls it and its deadline — checked against the diagram, not
+    assumed". Enumerates the module's own STATE_* constants rather than a list
+    written here, so a state added to triage.py and forgotten in
+    STATE_DEADLINES fails HERE, at the moment it is added, instead of showing
+    up months later as one row nobody ever looked at again."""
+    states = {v for k, v in vars(triage).items()
+              if k.startswith("STATE_") and isinstance(v, str)}
+    assert triage.STATE_DISMISSED in states, "sanity: the enumeration must see every state constant"
+    non_terminal = states - set(triage.TERMINAL_STATES)
+    assert len(non_terminal) >= 9, f"expected the full chain, saw {sorted(non_terminal)}"
+
+    for state in sorted(non_terminal):
+        rule = triage.STATE_DEADLINES.get(state)
+        assert rule is not None, (
+            f"non-terminal state {state!r} is in neither STATE_DEADLINES nor TERMINAL_STATES. "
+            f"A state with no named poller and no deadline is a state an item sits in forever "
+            f"with nothing polling it out — that is the failure DESIGN.md § Deadlines exists to "
+            f"close, and it is how a written fix gets abandoned.")
+        assert rule.poller and rule.poller.strip(), (
+            f"{state!r} has a deadline rule with no poller. Naming the thing that advances a "
+            f"state is half of principle 6: a deadline with no poller says when to give up "
+            f"without saying what was supposed to happen instead.")
+
+    for state in triage.TERMINAL_STATES:
+        assert state not in triage.STATE_DEADLINES, (
+            f"terminal state {state!r} must not carry a deadline — terminal means no poller, no "
+            f"clock, no exit.")
+
+
+def test_no_raw_state_transition_remains():
+    """Every transition goes through _set_state(), and this is what keeps it
+    true. A raw `UPDATE triage_items SET state=` writes no `state_deadline`,
+    so the row it produces either sits with no clock at all or keeps the
+    PREVIOUS state's clock — both invisible until the item has been stuck for
+    days."""
+    source = (REPO_ROOT / "scripts" / "triage.py").read_text()
+    marker = "UPDATE triage_items SET state="
+    start = source.index("def _set_state(")
+    end = source.index("\ndef ", start)
+    inside = source[start:end].count(marker)
+    outside = source.count(marker) - inside
+    assert inside == 1, f"_set_state() should hold exactly one such statement, found {inside}"
+    assert outside == 0, (
+        f"{outside} raw state transition(s) outside _set_state(). Each one silently writes no "
+        f"deadline, which is how an item comes to sit in a non-terminal state forever.")
+
+
+def test_investigating_expires_to_needs_human():
+    with _triage_env() as (conn, _ctx):
+        item = _expire(conn, triage.STATE_INVESTIGATING, "sig-dl-inv", dispatch_job="job-dl-inv")
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert item["note"].startswith(triage.DEADLINE_EXPIRED_NOTE_PREFIX), item["note"]
+        assert "dispatch-sweep.py" in item["note"], item["note"]
+
+
+def test_verdict_expires_to_needs_human():
+    """Not in DESIGN.md's table, and deliberately added: maybe_auto_implement()
+    only advances a verdict that reads nextAction=implement at confidence=high,
+    so every other verdict has nothing scheduled to touch it ever again."""
+    with _triage_env() as (conn, _ctx):
+        item = _expire(conn, triage.STATE_VERDICT, "sig-dl-verdict")
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "maybe_auto_implement" in item["note"], item["note"]
+
+
+def test_implementing_expires_to_merge_blocked():
+    with _triage_env() as (conn, _ctx):
+        item = _expire(conn, triage.STATE_IMPLEMENTING, "sig-dl-impl", implement_job="impl-dl")
+        assert item["state"] == triage.STATE_MERGE_BLOCKED, item["state"]
+        assert "poll_implement_jobs" in item["note"], item["note"]
+
+
+def test_validating_expires_to_merge_blocked():
+    with _triage_env() as (conn, _ctx):
+        item = _expire(conn, triage.STATE_VALIDATING, "sig-dl-val", validation_job="val-dl")
+        assert item["state"] == triage.STATE_MERGE_BLOCKED, item["state"]
+        assert "poll_validation_jobs" in item["note"], item["note"]
+
+
+def test_merge_blocked_expires_to_dismissed_unresolved():
+    with _triage_env() as (conn, _ctx):
+        item = _expire(conn, triage.STATE_MERGE_BLOCKED, "sig-dl-blocked")
+        assert item["state"] == triage.STATE_DISMISSED, item["state"]
+        assert "unresolved" in item["note"], item["note"]
+        assert item["state_deadline"] is None, "a terminal state carries no deadline"
+
+
+def test_needs_human_expires_to_dismissed_expired():
+    """7 days, and the reason says `expired` rather than `resolved` — nobody
+    answered, which is not the same fact as nothing being wrong."""
+    with _triage_env() as (conn, _ctx):
+        item = _expire(conn, triage.STATE_NEEDS_HUMAN, "sig-dl-human")
+        assert item["state"] == triage.STATE_DISMISSED, item["state"]
+        assert "expired" in item["note"], item["note"]
+        assert "168h" in item["note"], item["note"]
+
+
+def test_pr_open_expires_to_dismissed_expired():
+    with _triage_env() as (conn, _ctx):
+        item = _expire(conn, triage.STATE_PR_OPEN, "sig-dl-pr")
+        assert item["state"] == triage.STATE_DISMISSED, item["state"]
+        assert "expired" in item["note"], item["note"]
+        assert "336h" in item["note"], item["note"]
+
+
+def test_merged_expires_to_resolved():
+    """DESIGN.md says `closed` here; `closed` is part of the Wave 2 `resolved`
+    split and does not exist yet, so this lands in `resolved` until it does."""
+    with _triage_env() as (conn, _ctx):
+        item = _expire(conn, triage.STATE_MERGED, "sig-dl-merged",
+                        pr_url="https://github.com/jkrumm/demo-repo/pull/42")
+        assert item["state"] == triage.STATE_RESOLVED, item["state"]
+        assert item["note"].startswith(triage.DEADLINE_EXPIRED_NOTE_PREFIX), item["note"]
+
+
+def test_a_pruned_sideclaw_job_does_not_strand_an_item():
+    """sideclaw prunes terminal jobs at 24h OR at 200 terminal rows — a cap
+    shared with every interactive /check, so 200 can arrive in an afternoon.
+    Once pruned, _hermes_cc_status() returns None and poll_implement_jobs()
+    can never move the item again. No miss counter and no extra column: the
+    2h deadline fires long before either prune bound, so the item exits to
+    `merge_blocked` on the clock. Asserts BOTH halves — it does not move while
+    inside the window, and it does move once past it."""
+    with _triage_env() as (conn, _ctx):
+        deadline = NOW + dt.timedelta(hours=2)
+        eid = _seed_expiring_item(conn, external_id="sig-pruned", state=triage.STATE_IMPLEMENTING,
+                                   state_deadline=deadline.isoformat(), implement_job="impl-pruned")
+        polled: list[str] = []
+
+        def _pruned_status(job_id):
+            polled.append(job_id)
+            return None
+
+        triage._hermes_cc_status = _pruned_status
+
+        for _pass in range(2):
+            triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            triage.sweep_deadlines(conn, NOW, dry_run=False)
+        assert polled == ["impl-pruned", "impl-pruned"], polled
+        inside = triage._get_item(conn, eid)
+        assert inside["state"] == triage.STATE_IMPLEMENTING, (
+            "inside its window the item must keep waiting for the poller")
+
+        later = deadline + dt.timedelta(minutes=1)
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, later, dry_run=False)
+        triage.sweep_deadlines(conn, later, dry_run=False)
+        after = triage._get_item(conn, eid)
+        assert after["state"] == triage.STATE_MERGE_BLOCKED, (
+            f"a pruned job must not strand the item, got {after['state']}")
+        assert "poll_implement_jobs" in after["note"], after["note"]
+
+
+def test_dismissed_requires_a_reason():
+    """The reason IS the state's content — "nobody answered in 7 days" and
+    "the merge stayed blocked" are different facts, and this row is the only
+    place either survives."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_expiring_item(conn, external_id="sig-dismiss-noreason",
+                                   state=triage.STATE_NEEDS_HUMAN, state_deadline=None)
+        for bad in (None, "", "   "):
+            try:
+                triage._set_state(conn, eid, triage.STATE_DISMISSED, NOW, note=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"a dismissal with note={bad!r} must raise")
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_HUMAN
+
+        triage._set_state(conn, eid, triage.STATE_DISMISSED, NOW, note="expired, nobody answered")
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_DISMISSED
+
+
+def test_unknown_state_cannot_transition_without_a_deadline_rule():
+    """A state added later must fail loudly at its first transition rather than
+    quietly acquiring "no deadline, forever"."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_expiring_item(conn, external_id="sig-unknown-state",
+                                   state=triage.STATE_NEW, state_deadline=None)
+        try:
+            triage._set_state(conn, eid, "deploying", NOW)
+        except ValueError as e:
+            assert "STATE_DEADLINES" in str(e), str(e)
+        else:
+            raise AssertionError("a state in neither STATE_DEADLINES nor TERMINAL_STATES must raise")
+
+
+def test_liveness_pending_and_snoozed_are_not_touched_by_the_generic_sweeper():
+    """Both own their own column — `liveness_deadline` and `snoozed_until` —
+    and their own poller, which does something no generic expiry could express
+    (maybe_check_liveness() REOPENS to `new` with history; unsnooze_if_expired()
+    returns a human's own decision). A stale value in the generic column must
+    not let this sweeper act for them."""
+    with _triage_env() as (conn, _ctx):
+        stale = (NOW - dt.timedelta(hours=5)).isoformat()
+        live_eid = _seed_expiring_item(
+            conn, external_id="sig-live-untouched", state=triage.STATE_LIVENESS_PENDING,
+            state_deadline=stale, liveness_deadline=(NOW + dt.timedelta(hours=2)).isoformat())
+        snoozed_eid = _seed_expiring_item(
+            conn, external_id="sig-snoozed-untouched", state=triage.STATE_SNOOZED,
+            state_deadline=stale, snoozed_until=(NOW + dt.timedelta(hours=8)).isoformat())
+
+        triage.sweep_deadlines(conn, NOW, dry_run=False)
+
+        live = triage._get_item(conn, live_eid)
+        assert live["state"] == triage.STATE_LIVENESS_PENDING, live["state"]
+        assert live["state_deadline"] == stale, "the sweeper must not rewrite a column it does not own"
+        snoozed = triage._get_item(conn, snoozed_eid)
+        assert snoozed["state"] == triage.STATE_SNOOZED, snoozed["state"]
+        assert snoozed["snoozed_until"] is not None
+
+
+def test_a_non_terminal_row_with_no_deadline_is_stamped_from_now_and_reported():
+    """The rows that predate the column get a deadline anchored at NOW, and a
+    FINDING line saying so.
+
+    Two anchors were possible and only one is safe. `updated_at` is rewritten
+    by ingest() on every recurrence, so a deadline derived from it would move
+    further away every pass and never fire — the very bug this slice closes,
+    rebuilt. `now` cannot do that.
+
+    Reporting WITHOUT stamping was the first version of this and it was wrong
+    in the one case that matters: every NULL-deadline row on the live ledger is
+    `needs_human`, and only a human transitions a `needs_human` row — so "it
+    gets a deadline when it next transitions" means "never", for exactly the
+    population that must not sit forever. It printed four lines every 600s and
+    bounded nothing.
+
+    It stays a FINDING because a NULL deadline is either a pre-column legacy
+    row or a bug in a transition site, and silently fixing the second is how it
+    stays a bug."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_expiring_item(conn, external_id="sig-no-deadline",
+                                   state=triage.STATE_NEEDS_HUMAN, state_deadline=None)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            triage.sweep_deadlines(conn, NOW, dry_run=False)
+        out = err.getvalue()
+        assert str(eid) in out and triage.STATE_NEEDS_HUMAN in out, out
+        assert "FINDING" in out, out
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, "stamping a deadline is not acting on one"
+        got = triage._parse_ts(item["state_deadline"])
+        assert got == NOW + dt.timedelta(hours=168), (
+            f"a legacy row must be bounded from now, not left NULL: {got}")
+
+        # ...and the stamp is idempotent: a second pass must not push it out.
+        with contextlib.redirect_stderr(io.StringIO()):
+            triage.sweep_deadlines(conn, NOW + dt.timedelta(hours=1), dry_run=False)
+        assert triage._parse_ts(triage._get_item(conn, eid)["state_deadline"]) == got, (
+            "a deadline that moves every pass is the bug this slice exists to close")
+
+
+def test_a_stamped_legacy_row_then_actually_expires():
+    """End to end on the population that motivated the stamp: a pre-column
+    `needs_human` row is bounded on one pass and dismissed on a later one, so
+    it can no longer sit forever."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_expiring_item(conn, external_id="sig-legacy-expires",
+                                   state=triage.STATE_NEEDS_HUMAN, state_deadline=None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            triage.sweep_deadlines(conn, NOW, dry_run=False)
+            triage.sweep_deadlines(conn, NOW + dt.timedelta(hours=169), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_DISMISSED, item["state"]
+        assert item["note"].startswith(triage.DEADLINE_EXPIRED_NOTE_PREFIX), item["note"]
+
+
+def test_a_transition_writes_the_deadline_its_state_declares():
+    """The whole reason _set_state() exists: state and deadline are one fact.
+    Also covers the three NULL cases — terminal, `new`, and a state that owns
+    its own column."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_expiring_item(conn, external_id="sig-deadline-write",
+                                   state=triage.STATE_NEW, state_deadline=None)
+
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job="job-x")
+        got = triage._parse_ts(triage._get_item(conn, eid)["state_deadline"])
+        assert got == NOW + dt.timedelta(hours=2), got
+
+        triage._set_state(conn, eid, triage.STATE_LIVENESS_PENDING, NOW,
+                          liveness_deadline=(NOW + dt.timedelta(hours=2)).isoformat())
+        assert triage._get_item(conn, eid)["state_deadline"] is None, (
+            "liveness_pending carries its window in liveness_deadline, not here")
+
+        triage._set_state(conn, eid, triage.STATE_NEW, NOW)
+        assert triage._get_item(conn, eid)["state_deadline"] is None, (
+            "`new` is bounded by silence-resolve, not by a clock")
+
+        triage._set_state(conn, eid, triage.STATE_RESOLVED, NOW, note=None)
+        assert triage._get_item(conn, eid)["state_deadline"] is None, "terminal states carry no clock"
 
 
 # --- runner ------------------------------------------------------------------
