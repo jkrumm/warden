@@ -2052,11 +2052,21 @@ re-create the two cron jobs from `jobs.json.bak`, and set `HERMES_CC_DB` back.
 
 ### The first things a Wave 1 session should know
 
-1. **`op://hermes/uptime-kuma/warden-backup-push-url` does not exist**, so the
-   backup runs unmonitored. Needs a browser and a biometric `op` — DESIGN.md
-   human-essential case 2. Everything else about the backup is verified.
-2. **`com.jkrumm.warden-backup` has never fired via launchd.** Both snapshots were
-   made by hand; `StartCalendarInterval` 03:10 is untested in anger.
+1. ~~backup unmonitored~~ **RESOLVED, and it never needed a human.**
+   `homelab/uptime-kuma/sync.py:129` says the quiet part out loud — *"The push
+   token is retrievable too … so create-and-wire needs no browser."* So:
+   `Warden Backup - Push` added to homelab's declarative monitor config
+   (`99e16c3`), created by `make uk-sync`, token read back through the API, and
+   **verified end to end — a real backup run produced `status: UP, msg: OK` on
+   monitor 234.** The URL could not go into 1Password from the mini (`op` is not
+   interactively signed in; seeding is biometric), so it lives in a mode-600 file
+   at `~/.config/uptime-kuma/warden-backup-push-url` — the same shape homelab
+   already uses for `garmin-relogin-push-url`. `op://` stays **first** in the
+   lookup, so this converges on the convention the moment that ref exists and the
+   file can be deleted then.
+2. **`com.jkrumm.warden-backup` has never fired via launchd.** Every snapshot so
+   far was made by hand; `StartCalendarInterval` 03:10 is untested in anger. The
+   monitor is now what will say so — a missed 03:10 reds it within 25h.
 3. **Two design-level gaps** the audit surfaced, neither an implementation defect,
    both worth a line in DESIGN.md § Security model — which currently reads as if
    the pinned entries are absolute: the policy keys on **directory basename**, so
