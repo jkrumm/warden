@@ -7,7 +7,7 @@ This file records *what is*, not *what should be*.
 | | |
 |-|-|
 | Last updated | 2026-09-09 |
-| Current wave | **0 — cut over and live; docs pass + wave review outstanding** |
+| Current wave | **0 — COMPLETE except one declared item (see §25). Do not start Wave 1 without reading it.** |
 | Repo state | `master`. The loop, poller, sweeper and backup run here on four LaunchAgents. |
 | Next action | see § Next action (bottom) |
 
@@ -1025,7 +1025,7 @@ which. **Do not start Wave 1.**
 | 0.3 | warden repo skeleton: venv (`cryptography` only), Makefile, `launchd/*.template`, hand-rolled test runner, log-rotate registration. | warden | 1, 5 | **done** — `89b0c12`, see §15 |
 | 0.4a | **Copy** the loop, the poller, the sweeper, the summary reader, the four suites and the two docs into warden. Sever the `agents-overview.py` seam. Repoint `hermes-ops.sh`. No behaviour change anywhere. | warden | 1, 2 | **done** — `040e3eb`, see §16 |
 | 0.4b | Cut over: unload `com.jkrumm.hermes-triage`, delete the two `cron/jobs.json` entries, delete the originals and the two orphan wrappers, load warden's agents. Folded into 0.6 — one short reversible flip, so there is never an interval with two loops or none. | warden + hermes-agent | 1, 5 | not started |
-| 0.5 | Ledger: WAL + `busy_timeout`, one migrator + `schema_version`. Code + tests only; the path move and the heartbeat snapshot go with the cutover. | warden | **4** (partly — see §19) | **done** — `de5d80d` |
+| 0.5 | Ledger: WAL + `busy_timeout`, one migrator + `schema_version`. | warden + hermes-agent | **4** | **done** — `de5d80d`, completed by hermes-agent `15e50a9` (§25) |
 | 0.6 | The cutover. | warden + hermes-agent | **1, 5** | **DONE & LIVE** — §23 |
 | 0.7 | hermes-agent + dotfiles cleanup, the policy agreement check, the doc redirect. | hermes-agent + dotfiles | 3 (defence in depth) | **done** — `22eb31c`, `f90cf5a`, `c661a89`, dotfiles `d6d6559`/`8ce1476` |
 
@@ -1985,3 +1985,87 @@ absolute.
 - `com.jkrumm.warden-backup` has never fired via launchd — `StartCalendarInterval`
   03:10, and both existing snapshots were made by hand. First natural firing is
   the real test.
+
+---
+
+## 25. Wave 0 — final state, against the stop condition
+
+| # | Stop condition | Verdict | Evidence |
+|-|-|-|-|
+| 1 | The repo runs its own loop on its own LaunchAgent | **DONE** | `com.jkrumm.warden-loop`, `StartInterval 600`. All four warden agents last-exit **0**. `triage_last_run` written by the agent, not by hand. `com.jkrumm.hermes-triage` gone from `launchctl list` and from `~/Library/LaunchAgents/` |
+| 2 | The tests pass | **DONE** | warden `test_triage.py` **68/68** (the baseline), `test_ledger.py` **11/11**, three more suites green. hermes-agent **165** + **51** + eight more. sideclaw **555 pass / 0 fail**. **No test deleted, skipped or weakened** — audited independently; both changed assertions moved *stricter* |
+| 3 | sideclaw enforces the allowlist | **DONE** | Live, both directions. Refuses traversal, `.` segments, trailing slashes, case-flips, pinned-repo-via-`../`, a subdirectory and the root itself — all 400 at submit, no job row. Still admits `vps@implement`, `hermes-agent@investigate` |
+| 4 | Ledger: WAL + one writer + one migrator + a backup | **PARTIAL — one item, declared** | WAL ✓ · `schema_version` ✓ · **one migrator ✓ (as of `15e50a9`)** · backup ✓ end to end · **one writer ✗** |
+| 5 | Two cron jobs → LaunchAgents, orphan wrappers deleted | **DONE** | `jobs.json` 7 → 5, missing exactly `4b1faabda97d` and `4dd759917dd1`. `watchdog-slack.py` and `dispatch-sweep-cron.py` deleted, heartbeat ported first |
+
+### One migrator — closed, and this is what closed it
+
+hermes-cc.sh no longer creates or alters anything. It asserts, and refuses loudly:
+
+```
+$ grep -n 'ALTER TABLE\|executescript\|CREATE TABLE' scripts/hermes-cc.sh
+767:# the tables join without conversion. The schema itself (CREATE TABLE, CREATE   <- prose
+```
+
+Every remaining hit across all three repos is a comment describing what used to be
+there. The only executable DDL is in `warden/scripts/ledger.py`.
+
+Proven to refuse, not just to pass:
+
+```
+unmigrated db (no schema_version)  -> exit 2
+schema_version = 99                -> exit 2
+the live ledger                    -> exit 0     ("no dispatches", budget line)
+--json on refusal                  -> {"ok": false, "exitCode": 2, ...}   shape preserved
+```
+
+The message names the path, both versions, and who is allowed to migrate —
+deliberately the same shape as `ledger.py`'s own assertion, because they are the
+same system.
+
+### One writer — NOT met, and it cannot be in this wave
+
+Six writers remain on `warden.db`: the loop, the poller, the sweeper,
+`hermes-cc.sh` (two separate connections), and
+`plugins/dispatch-approval/__init__.py:259`.
+
+Consolidating them needs the **intent queue** and the **approval-plugin repoint**,
+and DESIGN.md § Migration puts both in **Wave 1** — the plugin's direct write is
+named in § The ledger as a post-extraction step, and the intent/signature split is
+Wave 1's first line. Doing it here would mean building Wave 1 to close a Wave 0
+checkbox.
+
+What Wave 0 delivers instead is **one writer *module*** — a single place owning
+the schema, the pragmas and the transaction discipline — plus WAL, which removes
+the reader-blocks-writer failure that made six writers acute rather than merely
+untidy. **The gap is named, not narrowed.**
+
+### Where the rollback is
+
+`~/.warden-cutover-backup/` — `jobs.json.bak` (the cron registry is **not** in git,
+so `hermes cron delete` is otherwise unrecoverable), `watchdog.db.pre-cutover`, and
+`com.jkrumm.hermes-triage.plist`. `~/.hermes/watchdog.db` is still on disk and
+byte-identical to that backup by MD5.
+
+To roll back: `make unload` here, restore the plist, `launchctl bootstrap` it,
+re-create the two cron jobs from `jobs.json.bak`, and set `HERMES_CC_DB` back.
+
+### The first things a Wave 1 session should know
+
+1. **`op://hermes/uptime-kuma/warden-backup-push-url` does not exist**, so the
+   backup runs unmonitored. Needs a browser and a biometric `op` — DESIGN.md
+   human-essential case 2. Everything else about the backup is verified.
+2. **`com.jkrumm.warden-backup` has never fired via launchd.** Both snapshots were
+   made by hand; `StartCalendarInterval` 03:10 is untested in anger.
+3. **Two design-level gaps** the audit surfaced, neither an implementation defect,
+   both worth a line in DESIGN.md § Security model — which currently reads as if
+   the pinned entries are absolute: the policy keys on **directory basename**, so
+   a clone of `warden` under another name defeats its PINNED entry; and
+   **`~/IuRoot` is a dispatch root with zero rules.**
+4. **The poller's heartbeat now also fails on a failed Slack post** (§24). Kept
+   deliberately; the monitor's name understates its scope.
+5. **`propose_mappings()` was inert** for the whole extraction and is live again
+   now the policy file is inside this repo (§16). **Re-verify it rather than
+   assuming it survived** — it has not run successfully since before the move.
+
+**Do not start Wave 1 without reading §24 and this section.**
