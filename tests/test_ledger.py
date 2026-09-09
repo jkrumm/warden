@@ -163,6 +163,7 @@ def test_fresh_migrate_creates_all_tables_and_indexes():
         "idx_dispatches_created",
         "idx_approvals_hash",
         "idx_triage_state",
+        "idx_triage_state_deadline",   # version 2
     }
     assert indexes == expected, f"got {indexes}"
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
@@ -236,11 +237,23 @@ def test_migrate_adopts_pre_versioned_database():
     assert pre_has_schema_version is None, "fixture must start without schema_version"
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+    # SCHEMA_VERSION, not 1. Adoption establishes that the file is at version
+    # 1's SHAPE; it does not establish that it is at the current version, so it
+    # stamps 1 and then falls through the migration loop like any other
+    # database. Asserting `== 1` here is what hid that bug while SCHEMA_VERSION
+    # happened to be 1.
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
 
     post_cols = {t: _table_columns(conn, t) for t in ledger._ADOPTABLE_TABLES}
     post_counts = _row_counts(conn, ledger._ADOPTABLE_TABLES)
-    assert post_cols == pre_cols, f"columns changed: {post_cols} != {pre_cols}"
+    # Every column the fixture had is still there, and the only additions are
+    # the ones the migrations past version 1 declare. Nothing is dropped or
+    # renamed: adopting a live database stays additive.
+    for table, cols in pre_cols.items():
+        assert cols <= post_cols[table], f"{table} lost columns: {cols - post_cols[table]}"
+    assert post_cols["triage_items"] - pre_cols["triage_items"] == {"state_deadline"}, (
+        f"unexpected column change on triage_items: "
+        f"{post_cols['triage_items'] - pre_cols['triage_items']}")
     assert post_counts == pre_counts, f"rows lost: {post_counts} != {pre_counts}"
 
     # Functionally equivalent to a from-scratch database: same column sets
@@ -249,6 +262,42 @@ def test_migrate_adopts_pre_versioned_database():
     fresh = ledger.connect(_tmp_path(), migrate=True)
     fresh_cols = {t: _table_columns(fresh, t) for t in ledger._ADOPTABLE_TABLES}
     assert fresh_cols == post_cols, f"adopted schema diverges from a fresh one: {post_cols} != {fresh_cols}"
+    fresh.close()
+    conn.close()
+
+
+def test_adopting_a_pre_versioned_ledger_runs_every_later_migration():
+    """The bug this pins, found 2026-09-09 while reading ahead for Wave 1 item 3.
+
+    `_run_migrations()`'s adoption branch used to stamp version 1 and `return`,
+    skipping the migration loop entirely. That was invisible for exactly as long
+    as SCHEMA_VERSION stayed 1. The moment it became 2, adopting a pre-versioned
+    ledger would stamp it 1, skip migration 2, and then fail `_verify_columns()`
+    on the column migration 2 would have added.
+
+    The only thing that adopts a pre-versioned ledger is the ROLLBACK —
+    ~/.warden-cutover-backup/ holds exactly such a file — so this would have
+    failed at the one moment it was needed.
+
+    The strongest assertion here is the last one: an adopted database and a
+    freshly created one must end up with the SAME schema. That is the property
+    the `return` broke."""
+    path = _tmp_path()
+    _build_old_style_db(path)
+
+    conn = ledger.connect(path, migrate=True)
+    version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == ledger.SCHEMA_VERSION, (
+        f"adoption stopped at version {version} instead of running on to "
+        f"{ledger.SCHEMA_VERSION} — every migration after the adopted one was skipped")
+
+    cols = _table_columns(conn, "triage_items")
+    assert "state_deadline" in cols, "migration 2 did not run against the adopted ledger"
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    for table in ledger._ADOPTABLE_TABLES:
+        assert _table_columns(fresh, table) == _table_columns(conn, table), (
+            f"{table}: an adopted ledger and a fresh one must have the same schema")
     fresh.close()
     conn.close()
 
@@ -264,7 +313,7 @@ def test_migrate_is_idempotent():
     conn.close()
 
     conn2 = ledger.connect(path, migrate=True)
-    assert conn2.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+    assert conn2.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
     assert conn2.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1, "must stay a single row"
     second_counts = _row_counts(conn2, ledger._ADOPTABLE_TABLES)
     second_cols = {t: _table_columns(conn2, t) for t in ledger._ADOPTABLE_TABLES}

@@ -58,7 +58,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # frozen at its pre-cutover state and written by nothing, kept as the rollback —
 # so if you are reading this to work out which database is real, it is this one.
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -183,8 +183,32 @@ CREATE INDEX IF NOT EXISTS idx_triage_state ON triage_items(state);
 # Target version -> its DDL. Adding version 2 is appending one entry here —
 # `migrate()` below already walks every version strictly greater than the
 # database's current one, in order, so nothing else changes.
+# Version 2 — `state_deadline`, one column, so that every non-terminal state can
+# name the moment it stops being allowed to sit there. DESIGN.md § Deadlines:
+# "Every non-terminal state gets a `state_deadline` and a named poller."
+#
+# ONE column, not one per state, and not a second table: the deadline is a
+# property OF the row's current state, so it is rewritten by the same UPDATE that
+# writes the state and is meaningless without it. A separate table would let the
+# two disagree, and "the deadline says investigating, the row says merged" is a
+# question nothing could answer.
+#
+# NULL means "no deadline applies" — a terminal state, or `new`, which is bounded
+# by silence-resolve rather than by a clock (see triage.py's
+# _SILENCE_RESOLVE_ELIGIBLE_STATES). It is NOT "the deadline was forgotten": the
+# sweeper treats NULL on a non-terminal state as a finding, not as permission.
+#
+# `liveness_deadline` (version 1) is deliberately left alone rather than folded
+# into this column. It is the deploy path's own probe window and predates this;
+# merging them would be a data migration on a live ledger to save one column.
+_MIGRATION_2 = """
+ALTER TABLE triage_items ADD COLUMN state_deadline TEXT;
+CREATE INDEX IF NOT EXISTS idx_triage_state_deadline ON triage_items(state_deadline);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
+    2: _MIGRATION_2,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live
@@ -281,8 +305,17 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # Adopting the live, pre-versioned ledger — see this function's own
         # docstring, case 2. Stamp only; BASE_SCHEMA never runs.
         conn.executescript(f"BEGIN;\n{_stamp_version_sql(1, _now_iso())}COMMIT;\n")
-        _verify_columns(conn)
-        return
+        # ...and then FALL THROUGH to the migration loop below rather than
+        # returning. Adoption establishes that this file is at version 1's
+        # shape; it does not establish that it is at SCHEMA_VERSION. This
+        # `return` used to be unconditional, and was harmless for exactly as
+        # long as SCHEMA_VERSION stayed 1 — the moment it became 2, adopting a
+        # pre-versioned ledger would stamp it 1, skip migration 2, and then fail
+        # `_verify_columns()` on a column the migration it skipped would have
+        # added. The path that does that is the ROLLBACK
+        # (~/.warden-cutover-backup/ holds a pre-versioned ledger), so it would
+        # have failed at exactly the moment it was needed.
+        current = 1
 
     for version in range(current + 1, SCHEMA_VERSION + 1):
         ddl = MIGRATIONS[version]
@@ -298,13 +331,22 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
 
 
 def _expected_columns() -> dict[str, set[str]]:
-    """What BASE_SCHEMA says each table has, derived by running BASE_SCHEMA
-    itself against an in-memory database rather than by keeping a second
-    hand-written list beside it. A hand-written list is a copy, and a copy of
-    a schema is a thing that drifts from the schema."""
+    """What the schema AT `SCHEMA_VERSION` says each table has, derived by
+    replaying BASE_SCHEMA and then every migration up to it against an
+    in-memory database, rather than by keeping a second hand-written list
+    beside it. A hand-written list is a copy, and a copy of a schema is a
+    thing that drifts from the schema."""
     mem = sqlite3.connect(":memory:")
     try:
-        mem.executescript(BASE_SCHEMA)
+        # BASE_SCHEMA is version 1's shape, so replaying it alone would describe
+        # a schema this module stopped having the moment MIGRATIONS gained a
+        # second entry — and `_verify_columns()` would then silently stop
+        # checking every column added after version 1. Replay the migrations in
+        # order instead, which is the same "derive it, never copy it" property
+        # one version further on.
+        for version in sorted(MIGRATIONS):
+            if version <= SCHEMA_VERSION:
+                mem.executescript(MIGRATIONS[version])
         return {
             t: {r[1] for r in mem.execute(f"PRAGMA table_info('{t}')")}
             for t in _ADOPTABLE_TABLES

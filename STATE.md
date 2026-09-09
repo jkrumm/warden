@@ -2831,3 +2831,127 @@ case 2 stamps version 1 and `return`s without entering the migration loop, so th
 first time `SCHEMA_VERSION` becomes 2, adopting a pre-versioned ledger stamps it
 1, skips migration 2, and then fails `_verify_columns()`. That path is the
 rollback (`~/.warden-cutover-backup/`), so it fails exactly when it is needed.
+
+---
+
+## 33. Wave 1, item 3a — `state_deadline`, and the migrator bug it exposed (DONE & LIVE)
+
+Schema only. The deadline *logic* is 3b; this is the column and the migrator
+that carries it.
+
+### Migration 2
+
+`ALTER TABLE triage_items ADD COLUMN state_deadline TEXT` plus an index.
+`SCHEMA_VERSION` 1 → 2, and `WARDEN_SCHEMA_VERSION` in `hermes-cc.sh` 1 → 2 in
+the same breath (`hermes-agent` `dbfa679`) — they are pinned to each other and a
+mismatch is a loud exit, which is exactly what it did before the ledger moved:
+
+```
+$ .venv/bin/python3 scripts/ledger.py --check ~/.warden/warden.db
+ledger: warden ledger at ~/.warden/warden.db is at schema_version=1, this
+process expects SCHEMA_VERSION=2. Only the loop (triage.py, via
+`connect(migrate=True)`) is allowed to migrate this file …
+exit=1
+```
+
+One column, not one per state and not a second table: the deadline is a property
+OF the row's current state, written by the same UPDATE that writes the state and
+meaningless without it. A separate table could disagree with the row, and "the
+deadline says investigating, the row says merged" is a question nothing could
+answer. `liveness_deadline` (version 1) is deliberately left alone — it is the
+deploy path's own probe window, and merging them would be a data migration on a
+live ledger to save one column.
+
+### The bug this exposed, which would have fired on the rollback
+
+`_run_migrations()`'s adoption branch — case 2, "this is the live pre-versioned
+ledger" — stamped version 1 and **`return`ed**, never entering the migration
+loop. That was invisible for exactly as long as `SCHEMA_VERSION` stayed 1.
+
+The moment it became 2, adopting a pre-versioned ledger would stamp it 1, skip
+migration 2, and then fail `_verify_columns()` on the column migration 2 would
+have added. **The only thing that adopts a pre-versioned ledger is the
+rollback** — `~/.warden-cutover-backup/` holds exactly such a file — so it would
+have failed at the one moment it was needed.
+
+Fixed: adoption stamps 1 and then falls through to the loop. Adoption
+establishes that the file is at version 1's *shape*; it does not establish that
+it is at `SCHEMA_VERSION`.
+
+### A second, quieter one in the same function's orbit
+
+`_expected_columns()` derived the expected schema by replaying **`BASE_SCHEMA`
+alone** — version 1's shape. At `SCHEMA_VERSION` 2 that means `_verify_columns()`
+would silently stop checking every column added after version 1: the guard that
+exists to catch a structurally incomplete database would itself have gone blind
+to exactly the columns most likely to be missing. Now it replays BASE_SCHEMA and
+every migration in order — the same "derive it, never copy it" property, one
+version further on.
+
+### Evidence
+
+`tests/test_ledger.py` **11 → 12**. Three existing tests asserted `version == 1`
+after adoption, i.e. they encoded the bug; corrected to `== ledger.SCHEMA_VERSION`
+with the reason written in. The new test,
+`test_adopting_a_pre_versioned_ledger_runs_every_later_migration`, pins it, and
+its strongest assertion is that **an adopted database and a freshly created one
+end up with the same schema** — the property the `return` broke.
+
+Mutation check — put the unconditional `return` back:
+
+```
+7/12 passed
+  test_adopting_a_pre_versioned_ledger_runs_every_later_migration:
+    adoption stopped at version 1 instead of running on to 2 — every migration
+    after the adopted one was skipped
+  test_adoption_refuses_a_structurally_incomplete_database
+  test_adoption_tolerates_an_unexpected_extra_column
+  test_migrate_adopts_pre_versioned_database
+  test_migrate_is_idempotent
+```
+
+All suites, both repos:
+
+```
+warden        test_dispatch_sweep all cases · test_intents 19/19 · test_ledger 12/12
+              test_triage 75/75 · test_watchdog_delivery all cases
+              test_watchdog_locking 3/3 · test_watchdog_slack_blindness all cases
+hermes-agent  test_hermes_cc all 165 cases · test_dispatch_approval 83 checks
+```
+
+### The live migration
+
+Snapshot first: `~/.warden/backups/pre-schema-v2-20260909T140408Z.db` (VACUUM
+INTO from a read-only handle).
+
+Then **the loop migrated it, not me** — `launchctl kickstart` on
+`com.jkrumm.warden-loop` after confirming no `triage.py` was already running, so
+"only the loop migrates, at boot" held and no second loop existed:
+
+```
+schema_version:        [(2, '2026-09-09T14:04:23.234003+00:00')]
+state_deadline:        present on triage_items
+rows:                  triage_items 52 · events 959   (nothing lost)
+ledger.py --check:     exit 0
+triage_last_run:       2026-09-09T14:04:23Z
+make status:           all four agents ✓, last exit 0
+```
+
+`~/Library/Logs/warden-loop.err` is unchanged at 581 bytes, mtime 13:05Z — the
+old crash, not a new one.
+
+**And the 2c fix is confirmed live**, which §31 could only predict: the ingest
+poller ran at **14:06:18Z**, after the per-source commit points landed, exit 0
+with an empty `.err`. That is the first real pass in which its probes — `ssh`,
+`gh`, two Slack fetches — ran outside a write transaction, against the live
+network rather than a stub.
+
+### Next action
+
+3b — set `state_deadline` on every transition into a non-terminal state, and a
+`sweep_deadlines()` step that acts on expiry per DESIGN.md § Deadlines. 3c — make
+`poll_implement_jobs`/`poll_validation_jobs` survive sideclaw pruning its job
+(`PRUNE_TTL_MS` 24h **or** `MAX_TERMINAL_ROWS` 200, confirmed at
+`sideclaw/server/jobs/store.ts:41-42`, a cap shared with every interactive
+`/check`). Both need a decision recorded first: three of the nine expiry actions
+in DESIGN.md's table target `dismissed`, and that state does not exist yet.
