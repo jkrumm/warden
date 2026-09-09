@@ -1020,7 +1020,7 @@ which. **Do not start Wave 1.**
 
 | # | Slice | Repo | Stop-condition item | Status |
 |-|-|-|-|-|
-| 0.1 | Repo policy module in sideclaw: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | sideclaw | **3 — sideclaw enforces the allowlist** | **code done, under review** — see §17 |
+| 0.1 | Repo policy module in sideclaw: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | sideclaw | **3 — sideclaw enforces the allowlist** | **DONE & LIVE** — sideclaw `2d225d4`, verified §20 |
 | 0.2 | Typed `outcome` enum on the dispatch verdict + a schema version, following the `review.ts:127` precedent. Publish the schema as a consumable artifact. | sideclaw | (Wave 0 scope per DESIGN.md § Migration; not in the five-item stop list, but stated work) | not started |
 | 0.3 | warden repo skeleton: venv (`cryptography` only), Makefile, `launchd/*.template`, hand-rolled test runner, log-rotate registration. | warden | 1, 5 | **done** — `89b0c12`, see §15 |
 | 0.4a | **Copy** the loop, the poller, the sweeper, the summary reader, the four suites and the two docs into warden. Sever the `agents-overview.py` seam. Repoint `hermes-ops.sh`. No behaviour change anywhere. | warden | 1, 2 | **done** — `040e3eb`, see §16 |
@@ -1596,3 +1596,102 @@ post-extraction step. Six writers remain: the loop, the poller, the sweeper,
 *module*** — a single place that owns the schema, the pragmas and the transaction
 discipline — plus WAL, which removes the reader-blocks-writer failure that made
 multiple writers acute. The gap is named rather than narrowed.
+
+---
+
+## 20. Slice 0.1 — review pass 2, and the live acceptance test
+
+**Stop-condition item 3 — "sideclaw enforces the allowlist" — is DONE and verified
+against the running daemon.** sideclaw commit `2d225d4`, deployed with `make reload`.
+
+### Review pass 2 (security and typescript angles ran this time)
+
+Outcome `needs-human` again, on **one blocking finding, and it was real**:
+
+> `rules[repo] = {...}` on a plain object literal. A repo key of literally
+> `__proto__` — and env values are lowercased first, so `__proto__` qualifies —
+> does not create an own property. It runs the **inherited setter and reassigns
+> the object's prototype**, so the entry silently vanishes while being reported
+> `applied: true`. Contained today only because `lookupRule` reads through
+> `Object.hasOwn`; it stops being contained the moment anything reads
+> `rules[repo]` directly. Flagged independently by five reviewers plus the
+> adversary.
+
+This is the **write-side twin of the read-side guard added after pass 1** — the
+same class of bug, on the other side of the same table, and pass 1 closed one half
+of it. The table is now built with `Object.create(null)`.
+
+Also applied from pass 2:
+
+| Finding | Fix |
+|-|-|
+| The route hardcoded `"investigate"` as the tier default instead of reading the schema's — two "belt and suspenders" checks that could disagree about which tier a tier-omitting call gets are a gap, not redundancy | `DEFAULT_DISPATCH_TIER` exported once; the zod `.default()` and the route both read it |
+| `SIDECLAW_DISPATCH_SENSITIVE` marked a repo sensitive without touching its ceiling, so an operator who forgot to also narrow it got a submission admitted by the ceiling-only route check, a job row and a queue slot spent, and the refusal only later inside `runDispatch` | marking sensitive now **clamps the ceiling to `investigate`** — the meaning it already has everywhere else in the estate |
+| `.env.example` claimed "NEVER WIDENS" for all three vars, but `SIDECLAW_DISPATCH_ROOTS` **replaces** the roots rather than narrowing them | wording corrected in `.env.example` and `CLAUDE.md`; the two per-repo overrides narrow, ROOTS is called out as the one that needs thought |
+| `canonical()`'s catch documented ELOOP/EACCES, but `existsSync` swallows those the same way, so in practice only a TOCTOU race reaches it | comment narrowed to say what is actually true |
+
+One pre-existing test had to change: it asserted that adding `sensitive` left the
+ceiling at `implement`. The clamp makes that **stricter**, so the expectation was
+updated with the reason written into the test. Nothing was weakened.
+
+Still declined, unchanged: splitting `runDispatch` (280 lines, CRAP 41.6 — real,
+but restructuring the function this change *gates*, in the same pass, on a
+security path, is how a refactor hides a behaviour change) and removing the unused
+`DISPATCH_OUTPUT` export (slice 0.2 gives it a consumer).
+
+### Final validation
+
+```
+$ bun test
+ 543 pass
+ 0 fail
+ 1244 expect() calls
+Ran 543 tests across 19 files. [15.41s]
+
+$ bun run typecheck    # tsc --noEmit, no output
+$ bun run lint         # Found 13 warnings and 0 errors   (the pre-existing baseline)
+$ bun run format:check # All matched files use the correct format.
+```
+
+Tests went 35 → 46 → **57** across the two review passes.
+
+### The live acceptance test
+
+`make reload`, then the same unauthenticated `POST /api/jobs` that was accepted
+and executed before this change (§11). **Every refusal is a 400, by policy, at
+submit — no job row created:**
+
+```
+cwd                                        tier         result
+/Users/jkrumm/SourceRoot/homelab-private   implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'homelab-private'
+/Users/jkrumm/SourceRoot/dotfiles-private  author       400  tier 'author' exceeds the ceiling 'investigate' for repo 'dotfiles-private'
+/Users/jkrumm/SourceRoot/sideclaw          implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'sideclaw'
+/Users/jkrumm/SourceRoot/warden            implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'warden'
+/tmp                                       investigate  400  cwd is not a repo directly under a dispatch root: /tmp
+/Users/jkrumm/SourceRoot/Homelab-Private   implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'homelab-private'
+```
+
+The last row is the case-flipped spelling landing on the lowercase rule.
+
+**The negative control matters as much** — a boundary that refuses everything is
+not a boundary. Admission was proven without starting a real episode, using paths
+under a root that do not exist, so the policy passes and the handler's own
+`existsSync` is what stops it:
+
+```
+/Users/jkrumm/SourceRoot/vps-probe-does-not-exist           implement    ADMITTED -> failed | Directory not found
+/Users/jkrumm/SourceRoot/hermes-agent-probe-does-not-exist  investigate  ADMITTED -> failed | Directory not found
+/Users/jkrumm/IuRoot/some-work-repo-probe                   implement    ADMITTED -> failed | Directory not found
+```
+
+and against the real repos, through the pure resolver rather than by dispatching:
+
+```
+/Users/jkrumm/SourceRoot/vps               implement    ALLOWED  sensitive=false
+/Users/jkrumm/SourceRoot/hermes-agent      investigate  ALLOWED  sensitive=false
+/Users/jkrumm/SourceRoot/brain             investigate  ALLOWED  sensitive=false
+/Users/jkrumm/SourceRoot/homelab-private   investigate  ALLOWED  sensitive=true
+```
+
+`GET /api/dispatch-policy` renders the effective table, roots
+`[~/SourceRoot, ~/IuRoot]`, `overrides: []`.
