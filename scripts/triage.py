@@ -186,7 +186,7 @@ it runs for real even under --dry-run: that is what lets a dry run against a
 throwaway copy of watchdog.db print a meaningful "what would be carded and
 dispatched" preview instead of nothing at all.
 
-Source of truth: ~/SourceRoot/hermes-agent/scripts/triage.py
+Source of truth: ~/SourceRoot/warden/scripts/triage.py
 ~/.hermes/scripts/ is itself a symlink to this directory (see make setup).
 """
 
@@ -576,114 +576,29 @@ _OPENAI_API_KEY_REF = "op://common/anthropic/API_KEY"
 
 TRIAGE_REPO_DIR = Path(__file__).resolve().parent.parent
 
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    external_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    url TEXT,
-    payload_json TEXT,
-    first_seen TEXT NOT NULL,
-    notified_at TEXT,
-    last_reminder_at TEXT,
-    reminder_count INTEGER NOT NULL DEFAULT 0,
-    resolved_at TEXT,
-    UNIQUE(source, external_id)
-);
-CREATE INDEX IF NOT EXISTS idx_events_open ON events(source) WHERE resolved_at IS NULL;
-
-CREATE TABLE IF NOT EXISTS dispatches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id TEXT NOT NULL UNIQUE,
-    tier TEXT NOT NULL,
-    repo TEXT NOT NULL,
-    brief TEXT NOT NULL,
-    why TEXT,
-    origin_channel TEXT,
-    origin_thread_ts TEXT,
-    origin_event_id INTEGER,
-    status TEXT NOT NULL,
-    verdict_json TEXT,
-    artifact_url TEXT,
-    created_at TEXT NOT NULL,
-    finished_at TEXT,
-    reported_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS cursors (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS triage_items (
-  event_id      INTEGER PRIMARY KEY REFERENCES events(id),
-  signature     TEXT NOT NULL,
-  repo          TEXT,
-  verb          TEXT,
-  state         TEXT NOT NULL,
-  card_channel  TEXT,
-  card_ts       TEXT,
-  card_hash     TEXT,
-  dispatch_job  TEXT,
-  artifact_url  TEXT,
-  occurrences   INTEGER NOT NULL DEFAULT 0,
-  first_seen    TEXT,
-  last_seen     TEXT,
-  snoozed_until TEXT,
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL,
-  note          TEXT,
-  -- The auto-implement chain (steps 6-10) — see maybe_auto_implement() and
-  -- its own siblings' docstrings for what writes/reads each column.
-  implement_job      TEXT,  -- job id of the auto-dispatched `implement` episode
-  validation_job     TEXT,  -- job id of the step-7 (different-model) review episode
-  pr_url             TEXT,  -- the implement episode's own pull request, once opened
-  deploy_expect_json TEXT,  -- expected alert def(s) captured at deploy time (hermes-cc.sh)
-  liveness_deadline  TEXT,  -- maybe_check_liveness()'s reopen-if-not-confirmed-by window
-  -- propose_mappings()'s own cooldown marker: the last time this signature's
-  -- item was told `unsure` by the model, so it isn't re-billed daily — see
-  -- PROPOSE_UNSURE_COOLDOWN_DAYS.
-  propose_unsure_at  TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_triage_state ON triage_items(state);
-"""
+# scripts/ledger.py — loaded by path, the same mechanism used elsewhere in
+# this file (see the watchdog-poll.py borrow below) because the sibling
+# filenames here are not importable. ledger.py now owns the schema and the
+# migrations that used to live inline as this file's own SCHEMA constant
+# plus a hand-rolled ALTER TABLE block — see its module docstring for why
+# four independent copies of that block was the actual defect.
+_LEDGER_PATH = Path(__file__).resolve().parent / "ledger.py"
+_ledger_spec = importlib.util.spec_from_file_location("ledger", _LEDGER_PATH)
+assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
+_ledger = importlib.util.module_from_spec(_ledger_spec)
+_ledger_spec.loader.exec_module(_ledger)
 
 
 def db_connect() -> sqlite3.Connection:
-    """Same idiom as watchdog-poll.py/dispatch-sweep.py: sqlite3.connect +
-    Row factory + an idempotent executescript, so this script works even on a
-    fresh mini where neither of those has run yet. `events.dispatch_id` is
-    copied from watchdog-poll.py's own additive migration — `CREATE TABLE IF
-    NOT EXISTS` never adds a column to an already-existing table."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
-    if "dispatch_id" not in cols:
-        conn.execute("ALTER TABLE events ADD COLUMN dispatch_id INTEGER")
-        conn.commit()
-    ti_cols = {r["name"] for r in conn.execute("PRAGMA table_info(triage_items)").fetchall()}
-    if "verb" not in ti_cols:
-        conn.execute("ALTER TABLE triage_items ADD COLUMN verb TEXT")
-        conn.commit()
-    for col in ("implement_job", "validation_job", "pr_url", "deploy_expect_json", "liveness_deadline",
-                "propose_unsure_at"):
-        if col not in ti_cols:
-            conn.execute(f"ALTER TABLE triage_items ADD COLUMN {col} TEXT")
-            conn.commit()
-    # Shared with hermes-cc.sh's own additive migration on this same table
-    # (its db_py() adds them too) — added here as well so this file never
-    # depends on hermes-cc.sh having run first against a given DB file.
-    d_cols = {r["name"] for r in conn.execute("PRAGMA table_info(dispatches)").fetchall()}
-    for col in ("validation_job_id", "validation_status"):
-        if col not in d_cols:
-            conn.execute(f"ALTER TABLE dispatches ADD COLUMN {col} TEXT")
-            conn.commit()
-    return conn
+    """triage.py is the LaunchAgent that runs the loop every 10 minutes —
+    the one process DESIGN.md's § The ledger names as running at boot — so
+    it is the only caller in warden allowed to pass migrate=True. Every
+    other reader/writer of this database (watchdog-poll.py,
+    dispatch-sweep.py) calls ledger.connect() without it and asserts the
+    version instead, so a process that starts before the loop has ever
+    touched a fresh ledger fails loudly rather than inventing its own
+    tables."""
+    return _ledger.connect(DB_PATH, migrate=True)
 
 
 def _apply_db_override(argv: list[str]) -> None:

@@ -61,7 +61,7 @@ one-line notice into the origin thread (or the undeliverable sentinel), and
 stamps `reported_at` so it is never polled again. A successful poll resets
 the counter, so three misses spread across a flapping sideclaw do not count.
 
-Source of truth: ~/SourceRoot/hermes-agent/scripts/dispatch-sweep.py
+Source of truth: ~/SourceRoot/warden/scripts/dispatch-sweep.py
 ~/.hermes/scripts/ is itself a symlink to this directory (see make setup).
 """
 
@@ -152,52 +152,23 @@ assert _triage_spec and _triage_spec.loader, "Failed to load scripts/triage.py"
 _triage = importlib.util.module_from_spec(_triage_spec)
 _triage_spec.loader.exec_module(_triage)
 
-DB_SCHEMA = """
-CREATE TABLE IF NOT EXISTS dispatches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id TEXT NOT NULL UNIQUE,
-    tier TEXT NOT NULL,
-    repo TEXT NOT NULL,
-    brief TEXT NOT NULL,
-    why TEXT,
-    origin_channel TEXT,
-    origin_thread_ts TEXT,
-    origin_event_id INTEGER,
-    status TEXT NOT NULL,
-    verdict_json TEXT,
-    artifact_url TEXT,
-    created_at TEXT NOT NULL,
-    finished_at TEXT,
-    reported_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_dispatches_open ON dispatches(status) WHERE reported_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_dispatches_created ON dispatches(created_at);
-"""
+# scripts/ledger.py — same by-path loading mechanism as the triage.py load
+# just above. ledger.py is now the sole owner of the schema and migrations
+# that used to live inline here as DB_SCHEMA plus an ALTER TABLE block.
+_LEDGER_PATH = Path(__file__).resolve().parent / "ledger.py"
+_ledger_spec = importlib.util.spec_from_file_location("ledger", _LEDGER_PATH)
+assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
+_ledger = importlib.util.module_from_spec(_ledger_spec)
+_ledger_spec.loader.exec_module(_ledger)
 
 
 def db_connect() -> sqlite3.Connection:
-    """Same idiom as watchdog-poll.py: sqlite3.connect + Row factory + an
-    idempotent executescript. The DDL is copied verbatim from
-    scripts/hermes-cc.sh (the table's owner) so this sweeper works even on a
-    fresh mini where hermes-cc.sh has never run yet.
-
-    `merged_at` is deliberately outside DB_SCHEMA, same as hermes-cc.sh's own
-    `db_py()`: `CREATE TABLE IF NOT EXISTS` is a no-op against a table that
-    already exists on this machine, so a column added only to the CREATE
-    statement would never appear on a live DB. Additive ALTER TABLE, run
-    every connect, mirrors hermes-cc.sh's migration exactly."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(DB_SCHEMA)
-    existing_columns = {r[1] for r in conn.execute("PRAGMA table_info(dispatches)")}
-    if "merged_at" not in existing_columns:
-        conn.execute("ALTER TABLE dispatches ADD COLUMN merged_at TEXT")
-        conn.commit()
-    if "poll_misses" not in existing_columns:
-        conn.execute("ALTER TABLE dispatches ADD COLUMN poll_misses INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
-    return conn
+    """Assert-only: dispatch-sweep.py is not the migrator (DESIGN.md § The
+    ledger — migrations run only by the loop, triage.py, at boot). If this
+    runs before the loop has ever touched a fresh ledger, ledger.connect()
+    raises a clear schema-version error rather than this file inventing its
+    own `dispatches` table the way it used to."""
+    return _ledger.connect(DB_PATH)
 
 
 def _apply_db_override(argv: list[str]) -> None:

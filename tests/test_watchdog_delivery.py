@@ -44,6 +44,10 @@ def check(name: str, got, want) -> None:
 def fresh_db() -> sqlite3.Connection:
     tmp = Path(tempfile.mkdtemp(prefix="wd-test-")) / "watchdog.db"
     wp.DB_PATH = tmp
+    # watchdog-poll.py is assert-only (it is not the migrator — see
+    # ledger.py); stand in for the loop's own boot-time migrate() so
+    # wp.db_connect() below has a schema to assert against.
+    wp._ledger.connect(tmp, migrate=True).close()
     return wp.db_connect()
 
 

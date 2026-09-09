@@ -9,13 +9,14 @@ later from silent heartbeats), and stray agent-created skills under
 2026-08-02 skill-sprawl cleanup). Reconciles against ~/.hermes/watchdog.db
 (SQLite). Emits NEW=, REMINDERS=, RESOLVED= blocks for the LLM cron prompt.
 
-Source of truth: ~/SourceRoot/hermes-agent/scripts/watchdog-poll.py
+Source of truth: ~/SourceRoot/warden/scripts/watchdog-poll.py
 ~/.hermes/scripts/ is itself a symlink to this directory (see make setup).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import importlib.util
 import json
 import os
 import re
@@ -30,6 +31,17 @@ from zoneinfo import ZoneInfo
 
 HERMES_HOME = Path.home() / ".hermes"
 DB_PATH = HERMES_HOME / "watchdog.db"
+
+# scripts/ledger.py — loaded by path, the same mechanism triage.py already
+# uses for its own sibling loads (the filenames here are not importable).
+# ledger.py is now the sole owner of the schema and the migrations that used
+# to live inline as this file's own SCHEMA constant plus an ALTER TABLE
+# block.
+_LEDGER_PATH = Path(__file__).resolve().parent / "ledger.py"
+_ledger_spec = importlib.util.spec_from_file_location("ledger", _LEDGER_PATH)
+assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
+_ledger = importlib.util.module_from_spec(_ledger_spec)
+_ledger_spec.loader.exec_module(_ledger)
 STATE_PATH = HERMES_HOME / "scripts" / "briefing-state.json"
 JOBS_PATH = HERMES_HOME / "cron" / "jobs.json"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
@@ -242,56 +254,13 @@ def http_get(url: str, headers: dict[str, str] | None = None, timeout: int = 15)
         return {"_error": str(e)}
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    external_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    url TEXT,
-    payload_json TEXT,
-    first_seen TEXT NOT NULL,
-    notified_at TEXT,
-    last_reminder_at TEXT,
-    reminder_count INTEGER NOT NULL DEFAULT 0,
-    resolved_at TEXT,
-    UNIQUE(source, external_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_open ON events(source) WHERE resolved_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_events_resolved_at ON events(resolved_at);
-
-CREATE TABLE IF NOT EXISTS cursors (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-"""
-
-
 def db_connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    _ensure_events_dispatch_id_column(conn)
-    return conn
-
-
-def _ensure_events_dispatch_id_column(conn: sqlite3.Connection) -> None:
-    """Additive migration for the dispatch-bridge watchdog projection (Phase 3,
-    docs/dispatch-bridge.md): `events.dispatch_id` is the reverse pointer to a
-    `dispatches` row (which itself points back via `origin_event_id`), letting
-    reconcile() ask "does this event already have an investigation in flight"
-    before it re-reminds. `CREATE TABLE IF NOT EXISTS` never adds a column to
-    an already-existing table, so this checks PRAGMA table_info and
-    ALTER TABLE-adds it exactly once — matching this file's existing
-    idempotent-DDL convention rather than introducing a migrations framework.
-    """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
-    if "dispatch_id" not in cols:
-        conn.execute("ALTER TABLE events ADD COLUMN dispatch_id INTEGER")
-        conn.commit()
+    """Assert-only: watchdog-poll.py is not the migrator (DESIGN.md § The
+    ledger — migrations run only by the loop, triage.py, at boot). If this
+    runs before the loop has ever touched a fresh ledger, ledger.connect()
+    raises a clear schema-version error rather than this file inventing its
+    own tables the way it used to."""
+    return _ledger.connect(DB_PATH)
 
 
 def _dispatch_status(conn: sqlite3.Connection, dispatch_id: int | None) -> sqlite3.Row | None:

@@ -371,7 +371,10 @@ def main() -> int:
     sent: list[tuple[str, str]] = []
     try:
         dispatch_sweep.DB_PATH = tmpdb
-        conn = dispatch_sweep.db_connect()
+        # dispatch-sweep.py is assert-only (it is not the migrator — see
+        # ledger.py); this fixture stands in for the loop's own boot-time
+        # migrate() so db_connect() below has a schema to assert against.
+        conn = dispatch_sweep._ledger.connect(tmpdb, migrate=True)
         conn.execute(
             "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_channel,origin_thread_ts) "
             "VALUES('lost-job-1','investigate','example','b','queued','2026-09-07T00:00:00+00:00','C0123','1.2')")
