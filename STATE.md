@@ -999,7 +999,7 @@ ever UPDATE a row it already INSERTed."*
 | 3 | `triage.py:394` puts `hermes-ops.sh` (**staying**, 62 KB) in warden's closed `VERB_ALLOWLIST` — a live cross-repo argv for `env-check` | `triage.py:394-397` |
 | 4 | `dispatch-sweep.py:93` and the plugin `:80` both shell to `~/.local/bin/hermes send`; warden's Slack path is otherwise pure `urllib` (`triage.py:757-792`) | the one non-`urllib` delivery path |
 | 5 | Four processes race unversioned DDL on a non-WAL file | §12 DDL table |
-| 6 | **`triage.py:3043-3070` `git commit`s `config/triage-policy.json`** inside `TRIAGE_REPO_DIR` (`:575`). After extraction that root changes and the `_policy_git_rel_path()` guard (`:3018-3021`) returns `None`, **skipping the commit silently** rather than failing loudly | a silent-failure trap; must be made loud in Wave 0 |
+| 6 | ~~silently skips~~ **CORRECTED — see §16.** `triage.py` does `git commit` `config/triage-policy.json` inside `TRIAGE_REPO_DIR` (`:575`), and after extraction the `_policy_git_rel_path()` guard does return `None` — but the **call site already printed** a `triage: ...` stderr line, so it was never silent. The real consequence is worse and different: `_write_policy_additions()` is never reached on that path, so proposals are **neither written nor committed** | recon error, corrected in §16 |
 | 7 | `hermes-cc.sh:171` reads `~/.claude/pr-required-repos.json` — a **dotfiles-owned** file — as the merge gate's source of truth | cross-repo config dep |
 
 ---
@@ -1020,10 +1020,11 @@ which. **Do not start Wave 1.**
 
 | # | Slice | Repo | Stop-condition item | Status |
 |-|-|-|-|-|
-| 0.1 | Repo policy module in sideclaw: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | sideclaw | **3 — sideclaw enforces the allowlist** | **in progress** (delegated) |
+| 0.1 | Repo policy module in sideclaw: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | sideclaw | **3 — sideclaw enforces the allowlist** | **code done, under review** — see §17 |
 | 0.2 | Typed `outcome` enum on the dispatch verdict + a schema version, following the `review.ts:127` precedent. Publish the schema as a consumable artifact. | sideclaw | (Wave 0 scope per DESIGN.md § Migration; not in the five-item stop list, but stated work) | not started |
 | 0.3 | warden repo skeleton: venv (`cryptography` only), Makefile, `launchd/*.template`, hand-rolled test runner, log-rotate registration. | warden | 1, 5 | **done** — `89b0c12`, see §15 |
-| 0.4 | Move `triage.py`, `dispatch-sweep.py`, `watchdog-poll.py`, `watchdog-summary.py`, `triage-policy.json`, `docs/triage.md`, and the 68 tests. Sever the `agents-overview.py` seam (§12). Make the `TRIAGE_REPO_DIR` policy-commit failure **loud** (risk #6). | warden | 1, 2 | not started |
+| 0.4a | **Copy** the loop, the poller, the sweeper, the summary reader, the four suites and the two docs into warden. Sever the `agents-overview.py` seam. Repoint `hermes-ops.sh`. No behaviour change anywhere. | warden | 1, 2 | **done** — `040e3eb`, see §16 |
+| 0.4b | Cut over: unload `com.jkrumm.hermes-triage`, delete the two `cron/jobs.json` entries, delete the originals and the two orphan wrappers, load warden's agents. Folded into 0.6 — one short reversible flip, so there is never an interval with two loops or none. | warden + hermes-agent | 1, 5 | not started |
 | 0.5 | Ledger: WAL + `busy_timeout`, one migrator + `schema_version`, one writer, `VACUUM INTO` backup on the heartbeat landing on a restic-covered path (§2). Stop-copy-verify if the file moves (Q1). | warden | **4** | not started |
 | 0.6 | LaunchAgents for the loop, the poller and the sweeper. Delete the two cron jobs from `cron/jobs.json`. Delete `watchdog-slack.py` + `dispatch-sweep-cron.py` **after** porting the UptimeKuma heartbeat (§5, carry-over #1). | warden + hermes-agent | **1, 5** | not started |
 | 0.7 | hermes-agent cleanup: `dispatch-repos.json` ceilings for `sideclaw`/`warden` (§6), `HERMES_PLISTS`, `docs/symlinks-and-agents.md`, `dotfiles/docs/architecture.md:171`. | hermes-agent + dotfiles | 3 (defence in depth) | not started |
@@ -1151,3 +1152,76 @@ creating them needs a browser and a biometric `op`, DESIGN.md human-essential ca
 Until then the script resolves nothing and skips the ping, exactly as
 `hermes-backup.sh` does on a resolution failure: the backup still runs and still
 exits with rsync's code. The heartbeat is additive, so nothing is blocked.
+
+---
+
+## 16. Slice 0.4a — the copy (DONE, `040e3eb`)
+
+**Nothing running changed.** hermes-agent is untouched, warden's agents are
+unloaded, the ledger is still `~/.hermes/watchdog.db`, and the config is still
+`~/.hermes/config/triage-policy.json`. This slice only makes the code run in its
+new home.
+
+### Evidence
+
+```
+$ cd ~/SourceRoot/warden && make test
+  test_dispatch_sweep.py           all cases as expected
+  test_triage.py                   68/68 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ cd ~/SourceRoot/hermes-agent && git status --short -- scripts/ tests/ docs/ config/
+  (no output)
+$ ~/.hermes/hermes-agent/venv/bin/python3 tests/test_triage.py
+68/68 passed
+
+$ for f in watchdog-poll.py dispatch-sweep.py watchdog-summary.py; do
+    diff -q ~/SourceRoot/hermes-agent/scripts/$f ~/SourceRoot/warden/scripts/$f; done
+  (no output — byte-identical)
+```
+
+`triage.py` differs in exactly three hunks, read line by line by the orchestrator,
+not taken on the worker's word:
+
+| Where | Change |
+|-|-|
+| `:389-397` | `_HERMES_OPS_BIN` was `Path(__file__).parent / "hermes-ops.sh"`. `hermes-ops.sh` stayed in hermes-agent, so it now takes `WARDEN_HERMES_OPS_BIN` else `HERMES_HOME/"scripts"/"hermes-ops.sh"` — the same env-then-default shape `HERMES_CC_BIN` already uses, and via `~/.hermes/scripts` (the symlink) like every other constant in the file. |
+| `:702-742` | The `importlib` load of `agents-overview.py` deleted; its hand-mirrored fallback promoted to the sole `resolve_slack_token()`. Behaviour byte-identical: `SLACK_BOT_TOKEN` wins, else `secrets-run read op://hermes/slack/bot-token` with the Homebrew-prepended PATH and a 15s timeout, `""` on any failure. The `watchdog-poll.py` borrow below it is untouched — that sibling moved too. |
+| `:3119-3124` | The `_policy_git_rel_path() is None` message now names both `POLICY_PATH` and `TRIAGE_REPO_DIR` and says "not written, not committed". |
+
+Plus one test edit: `tests/test_triage.py:453` now reads `triage.POLICY_PATH`
+instead of composing `REPO_ROOT / "config" / "triage-policy.json"`, because the
+config did **not** move. `_triage_env()`'s `finally` restores `POLICY_PATH`, so
+this is order-independent. **No test was deleted, skipped or weakened.**
+
+### Correction to §12, extraction risk #6
+
+STATE.md said the policy-commit guard *"returns `None` (skipping the commit
+silently) rather than failing loudly."* **The silent part is wrong.** The call
+site already printed a `triage: propose_mappings — …` line to stderr before this
+change; the recon read the function and not its caller. What the edit did was
+widen that existing message, not add a missing one.
+
+The real consequence is different, and worse:
+
+> When `_policy_git_rel_path()` returns `None`, `_write_policy_additions()` is
+> **never reached** — the function returns first. So proposals are neither
+> written nor committed, not "written but uncommitted". And in warden that branch
+> is **permanently true**, because `TRIAGE_REPO_DIR` is now `~/SourceRoot/warden`
+> while `POLICY_PATH` still resolves into `hermes-agent`. `propose_mappings()`'s
+> self-extending signature map is therefore **inert until `triage-policy.json`
+> moves**, which happens at the cutover. That is expected for this slice and is
+> not a regression, but it is a live capability that is currently off, so it must
+> be re-verified after the cutover rather than assumed to have survived it.
+
+The control flow was deliberately **not** reordered to make the write happen
+before the commit check — that would be a behaviour change smuggled into a move.
+
+### Still not moved, deliberately
+
+`config/triage-policy.json`, the ledger, `hermes-cc.sh`, `hermes-ops.sh`,
+`agents-overview.py`, `validate-dispatch-policy.py`, `watchdog-slack.py`,
+`dispatch-sweep-cron.py`, `plugins/dispatch-approval/`. Each has its own reason
+in §12; none of them belongs in a slice whose whole property is that nothing
+running changed.
