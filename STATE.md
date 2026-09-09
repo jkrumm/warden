@@ -2418,8 +2418,10 @@ starts writing. Neither is on the Wave 1–3 path.
 
 Wave 1 item 2 — the intent/signature split, which is also what closes "one
 writer". Design already settled from reading (record it before building):
-spool at `~/.warden/intents/`, `ledger.py --record-intent` / `--drain-intents`
-as the door (same precedent as `fe95e81`), the plugin signs then spools then
+spool at `~/.warden/intents/`, a door on its own module (see §30 — it became
+`scripts/intents.py`, not `ledger.py`, so the file whose own docstring calls
+`_run_migrations()` "the single most dangerous function in this repo" does not
+also grow business logic), the plugin signs then spools then
 drains synchronously — because `execute_approved()` re-runs `hermes-cc.sh
 --confirm` in a subprocess IMMEDIATELY after the click, so a 600s loop drain
 would break the flow outright. `require_signed_approval()` is not touched.
@@ -2454,3 +2456,125 @@ Options for Wave 3, none of them decided here:
 
 What must NOT happen is the cache quietly becoming a mirror. That is the same
 line §28 declines for a different reason, and it is still the line.
+
+---
+
+## 30. Wave 1, item 2a — the intent queue (DONE, nothing repointed yet)
+
+`scripts/intents.py` + `tests/test_intents.py`. New files only; no existing
+script changed, no schema change, no LaunchAgent touched. **This slice builds the
+queue. It does not yet move any writer onto it** — that is 2b.
+
+### The shape, and the two decisions inside it
+
+A spool directory plus a single drain. `record()` writes one JSON file and
+**opens no database at all**, which is the entire point: a process that records
+an intent is not a ledger writer. `drain(conn)` is the only thing that turns a
+file into a row, and it does not open the database either — the caller passes a
+connection, so a drain can never become a seventh way to open the ledger with its
+own pragmas.
+
+**Decision 1: `scripts/intents.py`, not `ledger.py --record-intent`.** §28's next
+action said the latter. Changed on writing the brief: `ledger.py` owns the
+schema, the connection and the migrator, and its own docstring calls
+`_run_migrations()` "the single most dangerous function in this repo". Growing
+business logic into that file is how it stops being reviewable. `intents.py`
+imports it and owns the spool.
+
+**Decision 2: no signature verification in the drain, deliberately.** This was
+the one real design question in the slice. `require_signed_approval()`
+(`hermes-cc.sh:1113`) already verifies, and a second verifier is a copied
+contract — the exact defect this repo refuses for sideclaw's verdict schema. So
+the drain validates SHAPE and writes the row; the signature is checked where it
+always was, at spend time.
+
+The threat model that follows, written into the module docstring so it is not
+re-derived later: **a forged spool file cannot mint a signature, so it cannot
+cause an approval.** The worst a writer of that directory achieves is
+`decision='deny'` on a pending approval — a denial of service, not an
+escalation, and an episode on this host can already do worse. What makes the
+forged-`deny` bounded rather than free is the `AND decision IS NULL` guard.
+
+**`expires_at` and `payload_hash` are refused outright from a spool file** and
+read from the existing row instead. They are what bind an approval to a deadline
+and to specific bytes; a file that could set them could widen its own approval.
+That refusal is the security-relevant line in the module and has its own named
+error and its own test.
+
+### Evidence
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   11/11 passed
+  test_triage.py                   73/73 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ grep -n 'sqlite3.connect' scripts/intents.py
+(none — every connection comes from ledger.connect)
+```
+
+**17 tests came from the brief; I added two**, both for guardrails that were
+asserted in comments and never actually run — the class of defect Wave 0 kept
+shipping:
+
+- `test_cli_drain_refuses_a_ledger_at_the_wrong_schema_version` — `--drain`
+  passes `migrate=False`, so it asserts. Stamping a throwaway ledger one version
+  forward makes it exit 1 naming `schema_version`. The refusal branch never runs
+  in normal operation, which is precisely why it needed running.
+- `test_a_half_written_file_is_invisible_to_the_drain` — `record()` publishes by
+  renaming a `.tmp` written in the same directory; the drain's `*.json` glob is
+  what makes a crash mid-write invisible. Worth noting: **pathlib's `glob("*")`
+  does match dotfiles** (unlike a shell glob), so the protection is the `.json`
+  suffix, not the leading dot.
+
+**Mutation checks, run here rather than taken from the worker's report:**
+
+| Mutation | Result |
+|-|-|
+| drop `AND decision IS NULL` | 17/19 — a replayed `deny` overwrites a human's `approve`; ordering becomes last-write-wins |
+| widen the glob to `*` | 18/19 — the half-written `.tmp` gets drained into `rejected/` |
+
+**End-to-end through the CLI, against a VACUUM INTO snapshot of the live
+ledger** (not a synthetic schema), with a pending approval shaped as
+`record_approval_request()` writes one:
+
+```
+$ ... | intents.py --record        -> .../intents/20260909T134137357947-ea24e6f8.json   rc=0
+                                      -rw------- , directory drwx------
+$ intents.py --drain <snapshot>    -> applied=1 rejected=0   rc=0
+row: decision='approve' decided_by='U_JKRUMM' decided_at=<now>
+     payload_hash='deadbeefcafe' expires_at=<unchanged> spent_at=None
+spool after drain: empty
+```
+
+`payload_hash` and `expires_at` came from the row and are untouched; `spent_at`
+stays NULL, so the approval is still good for exactly one spend and
+`require_signed_approval()` is still the thing that spends it.
+
+### Behaviours a later reader will be tempted to "fix"
+
+- **`rowcount == 0` on the UPDATE is SUCCESS.** Unknown nonce, or already
+  decided; both are ordinary idempotency. Turning either into a rejection fills
+  `rejected/` with files whose only defect is that the world moved on.
+- **Unlink happens AFTER the commit.** A crash in between means the file drains
+  again next pass, and the guard makes that a no-op. The safe order is "apply
+  twice", never "lose one".
+- **`--drain` exits 1 if any file was rejected**, even though the drain itself
+  succeeded — because 2b has the plugin draining synchronously right after a
+  click, and "your intent did not land" must be in the exit status.
+
+### Next action
+
+**2b — repoint the approval plugin.** `hermes-agent/plugins/dispatch-approval/__init__.py:229`
+`_record_decision()` stops opening sqlite: sign (unchanged, RAM key), then
+`intents.py --record`, then `intents.py --drain`, then read the row back
+**read-only**. The drain must be synchronous, not left to the loop: the plugin's
+`execute_approved()` re-runs `hermes-cc.sh --confirm` in a subprocess
+IMMEDIATELY after the click, so a 600s drain would break the flow outright. That
+is the constraint that decided the whole shape.
+
+Then **2c** — `busy_timeout` off 5s and a bounded retry around the pass (§26
+finding 1).
