@@ -81,7 +81,16 @@ from pathlib import Path
 from typing import Any
 
 HERMES_HOME = Path.home() / ".hermes"
-DB_PATH = HERMES_HOME / "watchdog.db"
+# The ledger. `~/.warden/warden.db` since the extraction — the same file
+# scripts/ledger.py resolves, and the same two env vars, so a `--db` override, a
+# test fixture and the module default cannot disagree about which database this
+# is. It moved out of ~/.hermes because the control plane cannot keep living
+# inside the thing it supervises; ~/.hermes/watchdog.db is left in place,
+# untouched, as the rollback.
+WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
+               if os.environ.get("WARDEN_HOME") else Path.home() / ".warden")
+DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
+           if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
 # Same override hermes-cc.sh honors (HERMES_CC_SIDECLAW_BASE / it reads the same
 # dispatches table) — localhost, unauthenticated, reachable only from this machine.

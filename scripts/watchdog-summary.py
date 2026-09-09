@@ -10,11 +10,21 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
-DB_PATH = Path.home() / ".hermes" / "watchdog.db"
+# The ledger. `~/.warden/warden.db` since the extraction — the same file
+# scripts/ledger.py resolves, and the same two env vars, so a `--db` override, a
+# test fixture and the module default cannot disagree about which database this
+# is. It moved out of ~/.hermes because the control plane cannot keep living
+# inside the thing it supervises; ~/.hermes/watchdog.db is left in place,
+# untouched, as the rollback.
+WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
+               if os.environ.get("WARDEN_HOME") else Path.home() / ".warden")
+DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
+           if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
 # "Overnight" for the morning briefing: a dispatch that finished within this
 # many hours of the poll is still worth mentioning; older ones have already

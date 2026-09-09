@@ -209,7 +209,16 @@ from pathlib import Path
 from typing import Any
 
 HERMES_HOME = Path.home() / ".hermes"
-DB_PATH = HERMES_HOME / "watchdog.db"
+# The ledger. `~/.warden/warden.db` since the extraction — the same file
+# scripts/ledger.py resolves, and the same two env vars, so a `--db` override, a
+# test fixture and the module default cannot disagree about which database this
+# is. It moved out of ~/.hermes because the control plane cannot keep living
+# inside the thing it supervises; ~/.hermes/watchdog.db is left in place,
+# untouched, as the rollback.
+WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
+               if os.environ.get("WARDEN_HOME") else Path.home() / ".warden")
+DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
+           if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
 _env_cc_bin = os.environ.get("HERMES_CC_BIN")
 HERMES_CC_BIN = Path(_env_cc_bin).expanduser() if _env_cc_bin else (HERMES_HOME / "scripts" / "hermes-cc.sh")
@@ -221,8 +230,20 @@ DISPATCH_REPOS_JSON = (
     Path(_env_repos_json).expanduser() if _env_repos_json else (HERMES_HOME / "config" / "dispatch-repos.json")
 )
 
-_env_policy = os.environ.get("HERMES_TRIAGE_POLICY")
-POLICY_PATH = Path(_env_policy).expanduser() if _env_policy else (HERMES_HOME / "config" / "triage-policy.json")
+# This repo's own config/, not ~/.hermes/config/, since the extraction. That is
+# not cosmetic: propose_mappings() writes this file and then `git commit`s it
+# inside TRIAGE_REPO_DIR, and while the file lived outside this checkout that
+# whole path returned early — the signature map could not extend itself at all.
+# hermes-cc.sh still reads the same file for the merge/deploy half of it, via its
+# own HERMES_CC_TRIAGE_POLICY_JSON default pointing here. One file, two readers,
+# as it always was.
+# This repo's root: the `git -C` target for propose_mappings()'s policy
+# auto-commit, and the anchor POLICY_PATH resolves against. Defined here,
+# above its first use, rather than twice in one file.
+TRIAGE_REPO_DIR = Path(__file__).resolve().parent.parent
+_env_policy = os.environ.get("WARDEN_TRIAGE_POLICY") or os.environ.get("HERMES_TRIAGE_POLICY")
+POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
+               else TRIAGE_REPO_DIR / "config" / "triage-policy.json")
 
 # Sources watchdog-poll.py already dedups that this loop acts on. github_*,
 # hermes_cron, stray_skill are deliberately excluded — they are either
@@ -574,7 +595,6 @@ PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "gpt-5.6-luna")
 # Mirrors .env.tpl's own OPENAI_API_KEY ref exactly — never a plaintext key.
 _OPENAI_API_KEY_REF = "op://common/anthropic/API_KEY"
 
-TRIAGE_REPO_DIR = Path(__file__).resolve().parent.parent
 
 # scripts/ledger.py — loaded by path, the same mechanism used elsewhere in
 # this file (see the watchdog-poll.py borrow below) because the sibling

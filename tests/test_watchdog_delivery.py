@@ -236,7 +236,12 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     rc = wp.main(["--post"])
     check("rc == 0", rc, 0)
     check("zero Slack calls", len(ctx.posts), 0)
-    check("zero heartbeat calls", ctx.heartbeats["n"], 0)
+    # NOT zero. The monitor this feeds answers "is the poller still running", not
+    # "did it have news", and a quiet half hour is the normal case. Skipping the
+    # ping here pages on every silent poll and trains the alert to be ignored —
+    # which is how eleven days of blindness go unnoticed. The retiring wrapper
+    # pinged on rc == 0 regardless of whether a body was printed.
+    check("heartbeat STILL fires on a quiet poll", ctx.heartbeats["n"], 1)
 
 print("\n8. --post --dry-run makes zero Slack calls and zero heartbeat calls")
 with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:

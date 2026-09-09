@@ -30,7 +30,16 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 HERMES_HOME = Path.home() / ".hermes"
-DB_PATH = HERMES_HOME / "watchdog.db"
+# The ledger. `~/.warden/warden.db` since the extraction — the same file
+# scripts/ledger.py resolves, and the same two env vars, so a `--db` override, a
+# test fixture and the module default cannot disagree about which database this
+# is. It moved out of ~/.hermes because the control plane cannot keep living
+# inside the thing it supervises; ~/.hermes/watchdog.db is left in place,
+# untouched, as the rollback.
+WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
+               if os.environ.get("WARDEN_HOME") else Path.home() / ".warden")
+DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
+           if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
 # scripts/ledger.py — loaded by path, the same mechanism triage.py already
 # uses for its own sibling loads (the filenames here are not importable).
@@ -1413,18 +1422,24 @@ def main(argv: list[str] | None = None) -> int:
             if dry_run:
                 print(f"[dry-run] would post {len(body)} chars to {WATCHDOG_CHANNEL}", file=sys.stderr)
                 return rc
-            if not body:
-                # Quiet hours, vacation, or nothing to report — compose_slack_body()
-                # already made that call; posting nothing is not an error.
-                return rc
-            token = resolve_secret("SLACK_BOT_TOKEN")
-            if not token:
-                print("watchdog: no Slack token, cannot post digest", file=sys.stderr)
-                return 1
-            ok, _ = post_text(WATCHDOG_CHANNEL, body, token)
-            if not ok:
-                print("watchdog: slack post failed, digest not delivered", file=sys.stderr)
-                return 1
+            # An empty body is the NORMAL case — quiet hours, vacation, or simply
+            # nothing new — and compose_slack_body() already made that call, so
+            # posting nothing is not an error. Note what this branch must NOT do:
+            # skip the heartbeat. The monitor this feeds answers "is the poller
+            # still running", not "did the poller have news"; treating a quiet poll
+            # as a missed heartbeat would page on every silent half hour and train
+            # the alert to be ignored — which is how an eleven-day blindness goes
+            # unnoticed in the first place. The retiring wrapper pinged on rc == 0
+            # regardless of whether a body was printed, and that is the behaviour.
+            if body:
+                token = resolve_secret("SLACK_BOT_TOKEN")
+                if not token:
+                    print("watchdog: no Slack token, cannot post digest", file=sys.stderr)
+                    return 1
+                ok, _ = post_text(WATCHDOG_CHANNEL, body, token)
+                if not ok:
+                    print("watchdog: slack post failed, digest not delivered", file=sys.stderr)
+                    return 1
             if rc == 0:
                 _push_uptime_heartbeat()
             return rc
