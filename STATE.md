@@ -1225,3 +1225,124 @@ before the commit check — that would be a behaviour change smuggled into a mov
 `dispatch-sweep-cron.py`, `plugins/dispatch-approval/`. Each has its own reason
 in §12; none of them belongs in a slice whose whole property is that nothing
 running changed.
+
+---
+
+## 17. Slice 0.1 — sideclaw repo policy (code complete, `sideclaw` working tree)
+
+Not yet committed or deployed — a `/review` is running, and `make reload` refuses
+while a job is in flight.
+
+### What landed
+
+| File | What |
+|-|-|
+| `server/lib/dispatch-policy.ts` (new) | `PINNED_RULES` (un-overridable), `DEFAULT_RULES` (mirrors `dispatch-repos.json`), `buildDispatchPolicy(env)`, `resolveDispatchTarget()`, `dispatchPolicy()`, `logDispatchPolicy()` |
+| `server/routes/dispatch-policy.ts` (new) | `GET /api/dispatch-policy` — read-only projection |
+| `tests/dispatch-policy.test.ts` (new) | 35 tests |
+| `server/jobs/handlers/dispatch.ts` | gate after `parseParams`, before the fs checks; `effectiveSensitive` now feeds `assertSensitiveTierAllowed`, **both** `assertNoGithubForSensitive` sites and **both** `applySensitiveScan` sites |
+| `server/routes/jobs.ts` | same check at submit — a refusal never creates a job row |
+| `server/index.ts` | `logDispatchPolicy(logger)`, `.use(dispatchPolicyRoutes)` |
+| `.env.example`, `CLAUDE.md` | the three env vars, the never-widen rule, and the corrected `sensitive` paragraph |
+| `tests/setup.ts`, `tests/git-fixture.ts` | fixture repos moved under a seeded `SIDECLAW_DISPATCH_ROOTS` — **outside the original brief**, see below |
+
+### The policy
+
+```
+roots    WORKSPACE_ROOTS = [~/SourceRoot, ~/IuRoot]   (env SIDECLAW_DISPATCH_ROOTS)
+cwd      must be a DIRECT child of a root — not the root, not a nested subdir
+default  { ceiling: implement, sensitive: false }
+
+PINNED (env can never raise, remove or touch):
+  sideclaw          investigate
+  warden            investigate
+
+DEFAULT (env may only narrow):
+  dotfiles-private  investigate  sensitive
+  homelab-private   investigate  sensitive
+  dotfiles          investigate
+  brain             investigate
+  hermes-agent      investigate
+```
+
+`sensitive` is now **derived** from the policy and ORed with the caller's flag: a
+caller may opt a policy-neutral repo *into* the scan, and can no longer opt a
+policy-marked one *out* of it by omitting the field. That is the bypass §11 named.
+
+### Validation (run by the orchestrator, not taken on the worker's word)
+
+```
+$ bun test
+ 523 pass
+ 0 fail
+ 1172 expect() calls
+Ran 523 tests across 19 files. [15.43s]
+
+$ bun run typecheck    # tsc --noEmit, no output
+$ bun run lint         # Found 13 warnings and 0 errors  (all 13 pre-existing,
+                       #  in excalidraw-hydrate.ts and session-runner.ts)
+$ bun run format:check # All matched files use the correct format.
+```
+
+Every hunk of the diff was read directly. The worker also found and fixed two
+`assertNoGithubForSensitive` call sites the brief did not name — correct, and
+checked.
+
+### One defect found in review and fixed by the orchestrator
+
+`resolveDispatchTarget` canonicalized the **cwd** with `realpathSync` but only
+`resolve()`d the **roots**. That asymmetry is a whole-surface outage waiting for a
+symlinked root — and it had already bitten once, which is exactly why
+`tests/setup.ts` has to `realpathSync` its temp root (macOS `$TMPDIR` resolves
+through `/var → /private/var`). Every dispatch would be refused, fail-closed, with
+a message pointing at the repo instead of at the config. Factored both sides
+through one `canonical()` helper. Re-ran the four checks above; unchanged.
+
+### The two out-of-brief test files — judged legitimate
+
+`dispatch-policy.ts` builds its `POLICY` singleton at module load from the real
+`process.env`, so fixture repos under `$TMPDIR` sat outside every root and were
+refused before `runDispatch` reached the code two pre-existing
+`dispatch-prompt.test.ts` cases were exercising. The fix seeds
+`SIDECLAW_DISPATCH_ROOTS` in the preload and creates the fixture `repo` as a
+direct child of it. **That is the fixture becoming more realistic, not a test
+weakened to fit the code** — a real dispatch target has always been a repo under
+a workspace root, and the fixture was only getting away with `$TMPDIR` because
+nothing checked. `origin`/`worktrees`/`salvage` stay under the fixture's own root.
+Flagged to the reviewer explicitly.
+
+### Case sensitivity — checked, and it produced a finding for later
+
+APFS is case-insensitive, `DEFAULT_RULES` keys are lowercase, and
+`~/SourceRoot/Homelab-Private` **resolves to the same directory** as the denied
+`homelab-private`. Whether that is a bypass depends entirely on whether the
+runtime's `realpath` corrects case. Measured, both runtimes, same path:
+
+```
+python3  os.path.realpath  -> /Users/jkrumm/SourceRoot/Homelab-Private   (case NOT corrected)
+bun      realpathSync      -> /Users/jkrumm/SourceRoot/homelab-private   (case corrected)
+```
+
+**sideclaw is safe**: it uses Bun's `realpathSync`, which returns the on-disk
+name, so the mixed-case spelling lands on the `homelab-private` rule. A test for
+this is owed and is added after the review lands.
+
+> **But warden's defence-in-depth copy will be Python, and Python's
+> `os.path.realpath` does not correct case.** A naive `basename()` check there is
+> a live bypass of its own deny list. Whatever warden implements must compare
+> case-insensitively, or resolve the on-disk name some other way. Recorded here
+> because it is exactly the kind of thing that gets re-derived wrongly.
+
+### Drift, and what closes it
+
+There are now **two** copies of this policy — `dispatch-repos.json` in
+hermes-agent and `DEFAULT_RULES` in sideclaw. DESIGN.md § Security model asks for
+precisely that ("warden's copy is defence in depth; sideclaw's is the boundary"),
+so the duplication is intended, not an accident. But it is the same drift shape
+DESIGN.md warns about for the verdict schema, and drift here presents as *"the
+boundary quietly allows something the control plane thinks it forbids."*
+
+`GET /api/dispatch-policy` exists so the two can be compared. **Slice 0.7 owes an
+agreement check** — fetch the projection, diff it against `dispatch-repos.json`,
+fail `make status` on disagreement. Without it the second copy is a liability
+rather than defence in depth.
