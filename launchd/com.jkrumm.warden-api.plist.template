@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jkrumm.warden-api</string>
+  <!-- The read-only HTTP API. GET /metrics (the six funnel numbers, JSON) and
+       GET /health (schema version, per-poller heartbeat age, one `ok` boolean) —
+       see docs/api.md and scripts/api.py's own module docstring for the full
+       contract, including why `/metrics` is JSON and not Prometheus text, and
+       why a schema-version mismatch is a 503 rather than a 200 built on a
+       connection this process could not trust.
+
+       DIFFERENT SHAPE from the other four agents in this repo: this is a
+       long-running server, not a periodic job — `scripts/api.py --serve` calls
+       `ThreadingHTTPServer.serve_forever()` and never returns on its own. So
+       `KeepAlive` is `true` (relaunch on any exit, clean or not) and there is
+       deliberately NO `StartInterval` — launchd would spawn a SECOND server on
+       top of the first one still running, and both would try to bind
+       127.0.0.1:7734.
+
+       `ThrottleInterval` (10s) is what stops a crash loop from spinning: if the
+       process dies immediately after every relaunch (a stuck bind, a missing
+       venv, a syntax error introduced mid-edit), launchd still waits at least
+       this long between attempts instead of pegging a core forever. Every other
+       agent in this repo doesn't need it — `StartInterval` already spaces their
+       relaunches by design; only a `KeepAlive` job with no interval of its own
+       can crash-loop at all.
+
+       Binds 127.0.0.1:7734 only — see scripts/api.py's own docstring for why a
+       bearer token would be theatre on a host where an episode already runs
+       unrestricted Bash, and why no Caddy/tailnet door is added in this wave
+       (that is Wave 4, alongside Argo, the only intended remote consumer). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/SourceRoot/warden/.venv/bin/python3</string>
+    <string>__HOME__/SourceRoot/warden/scripts/api.py</string>
+    <string>--serve</string>
+  </array>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <!-- ~/Library/Logs, never /tmp: launchd opens stdio once at spawn and macOS sweeps
+       untouched /tmp files after 3+ days, leaving the process writing into an
+       unlinked inode nothing reports. Declared in dotfiles/scripts/log-rotate.sh. -->
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/warden-api.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/warden-api.err</string>
+</dict>
+</plist>

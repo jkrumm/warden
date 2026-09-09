@@ -3725,3 +3725,149 @@ additive migration; this one did not repeat it.
 
 Reload the agents and let the loop migrate the live ledger to 4, then slice 2.3 —
 `/metrics`.
+
+---
+
+## 40. Wave 2, item 3 — `/metrics` (DONE & LIVE, no schema change)
+
+A fifth LaunchAgent, `com.jkrumm.warden-api`, serving `GET /metrics` and
+`GET /health` on `127.0.0.1:7734`. `scripts/api.py`, 473 lines, stdlib only.
+
+**Only those two endpoints.** `/board`, `/items/:id`, `POST /items/:id/intent`
+and `POST /items/:id/note` are `DESIGN.md`'s full § HTTP API contract and are
+Wave 4, with Argo — their only consumer. Unconsumed surface has nothing to prove
+it correct.
+
+### The design decisions worth keeping
+
+- **One fresh read-only connection per request**, not a handle held for the
+  process's life. A WAL reader pinned at startup keeps serving the snapshot it
+  opened with, and a schema assertion made once at boot says nothing about the
+  ledger after the loop migrated it. A failed assertion is a **503 with the
+  mismatch in the body** — never a 200 built on a connection the process could
+  not trust.
+- **`ledger.connect(readonly=True)` does NOT assert the schema version.** My
+  brief claimed it did; the worker checked and it was false — the readonly branch
+  opens `mode=ro` and returns. `api.py` calls `assert_schema_version()` itself,
+  per request. Worth recording as a fact about `ledger.py`, not just about this
+  slice.
+- **Loopback bind, no auth, and that is not laziness.** Per `DESIGN.md` §
+  Security model an episode on this host runs unrestricted `Bash`; a bearer
+  token would be theatre, because whatever can read the token can also query the
+  socket. The boundary is the bind plus the read-only handle. **No Caddy/tailnet
+  door this wave** — that belongs with Argo, the only intended remote consumer.
+- **JSON, not Prometheus text**, despite the path name. The named consumer is
+  Argo and the six numbers are a funnel snapshot, not a time series.
+
+### The honesty rules, which are the actual product here
+
+Every metric is `{"value": …, "unavailable": …}`. `value` is `null` **only**
+paired with a non-empty reason, and **never a fabricated `0`**. Two of the six
+come back `null` today, both for reasons that are facts about the ledger:
+
+| Metric | Why `null` |
+|-|-|
+| verified **unattended** fixes/week | `dispatch_approvals` has no `event_id` and no item link of any kind — 5 rows, 1 with `argv_json`, **0** carrying `--auto-from-item`. An approval cannot be attributed to the item it fixed. That link is the operation id from `DESIGN.md` § Crash recovery, i.e. Wave 3. The raw `fixed`-transition count and `approvals_spent_in_window` are served alongside, explicitly labelled as not attendance-filtered. |
+| reverts | No revert primitive exists (`warden revert`, Wave 3). A `0` here would read as "measured, none happened". |
+
+And a top-level **`history_since`** = `MIN(item_transitions.at)`. The table was
+created empty and records nothing retroactively, so any window starting before
+that timestamp is empty *by construction*, not a measured zero. Without this
+field `/metrics` would confidently report "0 fixes this week" for a week the
+table did not exist in.
+
+### Poller heartbeats — the one thing that had to touch two live scripts
+
+Metric 5 was unmeasurable: only the loop wrote a heartbeat. `watchdog-poll.py`
+and `dispatch-sweep.py` now each write one unconditional `cursors` row per
+**completed** pass (`watchdog_poll_last_run`, `dispatch_sweep_last_run`),
+mirroring `triage.py`'s `record_heartbeat()` and skipped under `--dry-run` for
+the same reason. The sweep's is stamped at the *end* of the pass, not the start —
+the cursor answers "when did this last COMPLETE", which is the question a
+staleness threshold asks.
+
+Thresholds are `3 ×` each agent's own `StartInterval`, named as constants with
+the plist they came from in the comment: loop 600s → 30 min, poll 1800s → 90 min,
+sweep 300s → 15 min.
+
+### Verified, not claimed — against the live system
+
+```
+$ make status
+    ✓ com.jkrumm.warden-loop  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-poll  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-sweep  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-backup  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-api  [pid 27968, last exit 0]
+  api (/health)            ✓ reachable, ok
+  policy                   ✓ both copies agree on all 30 repos
+
+$ make test
+  test_api.py                      18/18 passed
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   16/16 passed
+  test_triage.py                   107/107 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ curl -s 127.0.0.1:7734/nope     -> 404
+$ curl -s -XPOST 127.0.0.1:7734/metrics -> 405
+$ curl -s 127.0.0.1:7734/health   -> ok:true, schema_version 4 == expected 4,
+                                     all three pollers under threshold
+```
+
+**The real `/metrics` payload, live:**
+
+```
+verdicts -> recorded disposition   5/17 = 0.294   states {needs_human: 6, quiet: 10}
+verified fixes vs silence          0.0            fixed 0 · quiet 10 · closed 0 · dismissed 0
+median needs_human -> decision     null           no pairs in window yet
+verified UNATTENDED fixes/week     null           fixes_in_window 0, approvals_spent 1
+poller ages (max)                  0.29 min       loop / watchdog_poll / dispatch_sweep all live
+reopen_after_fixed                 0              history_since 2026-09-09T19:43:30Z
+reverts                            null           no primitive
+```
+
+**The two numbers this whole project exists to move are now readable, and they
+are bad, which is the point.** Ten of the seventeen verdicts with a recorded
+disposition went to `quiet` — silence, which `DESIGN.md` says is never an
+outcome. Zero verified fixes against ten silence closes. Before this wave neither
+number could be computed at all.
+
+### The chain ran end to end while this was being verified
+
+`item_transitions` recorded it, unprompted, which is the best evidence the
+history table works:
+
+```
+261  quiet         -> new            19:43:30Z
+260  new           -> investigating  19:43:30Z
+261  new           -> investigating  19:43:30Z
+260  investigating -> needs_human    19:48:30Z  "Not fixable from this repo. On the mini, check the slack_sdk…"
+261  investigating -> needs_human    19:48:30Z  "Not fixable from this repo. On the mini, check the slack_sdk…"
+```
+
+A recurring `hermes_log` signal reopened, clustered, dispatched a real
+`investigate` episode against `hermes-agent`, and folded a verdict to
+`needs_human` with concrete remediation — in five minutes, unattended. Note the
+honest attribution: event 261 would also have reopened under the *old* predicate
+(its quiet anchor was fresh, so `resolve_quiet_grouped()` would not have
+re-closed it that pass), so this is not a fix-attributable escalation. What is
+new is that **the ledger can now say it happened.**
+
+### Out-of-scope edit made deliberately
+
+`dotfiles/scripts/log-rotate.sh` gained `warden-api.{log,err}`. The plist
+template's comment claims rotation is "declared in" that file, and the file
+enumerates warden's logs by name rather than globbing — so without the entry the
+comment was false and the log would grow forever. It is also the only warden log
+that grows **per request** rather than per scheduled pass
+(`BaseHTTPRequestHandler` logs every GET), which is negligible while `make
+status` is the only caller and is not once Argo polls it.
+
+### Next action
+
+The Wave 2 roll-up against the stop condition, then a fresh reviewer with no
+context from this session.

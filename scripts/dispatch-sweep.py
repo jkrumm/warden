@@ -699,6 +699,28 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
         )
 
 
+# --- Heartbeat ------------------------------------------------------------------
+#
+# Mirrors triage.py's record_heartbeat() and watchdog-poll.py's own copy: an
+# unconditional row per COMPLETED pass, because every other write in this file
+# only happens when a dispatch's status actually changed — a sweep that finds
+# nothing with `reported_at IS NULL` leaves no trace at all otherwise, making
+# "the sweep ran and had nothing to do" indistinguishable from "the sweep did
+# not run." /metrics' per-poller age (scripts/api.py) reads this cursor to
+# answer that question for this sweeper by name.
+HEARTBEAT_CURSOR_KEY = "dispatch_sweep_last_run"
+
+
+def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *, considered: int, errors: int) -> None:
+    value = json.dumps({"considered": considered, "errors": errors}, sort_keys=True)
+    conn.execute(
+        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (HEARTBEAT_CURSOR_KEY, value, now.isoformat()),
+    )
+    conn.commit()
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     dry_run = "--dry-run" in argv
@@ -710,6 +732,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _apply_db_override(argv)
 
+    errors = 0
     conn = db_connect()
     try:
         rows = conn.execute(
@@ -719,11 +742,18 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 process_dispatch(conn, row, dry_run=dry_run)
             except Exception as e:  # one bad row must never stop the others
+                errors += 1
                 print(
                     f"dispatch-sweep: row job_id={row['job_id']!r} (repo {row['repo']!r}) "
                     f"raised: {e} — skipping, next sweep retries",
                     file=sys.stderr,
                 )
+        if not dry_run:
+            # Stamped at the END of the pass, not the start — the cursor's
+            # updated_at is read by /metrics as "when did this sweeper last
+            # COMPLETE", which is the question a staleness threshold asks.
+            record_heartbeat(conn, dt.datetime.now(dt.timezone.utc),
+                             considered=len(rows), errors=errors)
     finally:
         conn.close()
     return 0

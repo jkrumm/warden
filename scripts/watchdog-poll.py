@@ -1399,6 +1399,34 @@ def _push_uptime_heartbeat() -> None:
         pass
 
 
+# --- Heartbeat ----------------------------------------------------------------
+#
+# Mirrors triage.py's record_heartbeat() exactly — same key shape, same
+# "unconditional row per COMPLETED pass, skipped under --dry-run" contract, for
+# the same reason: every other write in this file only happens when something
+# CHANGED, so an idle pass (nothing new, nothing to remind, nothing resolved)
+# leaves no trace at all, and "the poller ran and found nothing" becomes
+# indistinguishable from "the poller did not run." This is what /metrics'
+# per-poller age (warden/scripts/api.py) reads to answer that question for
+# this poller specifically, by name, rather than only "something is blind."
+HEARTBEAT_CURSOR_KEY = "watchdog_poll_last_run"
+
+
+def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *,
+                     new_count: int, reminder_count: int, resolved_count: int,
+                     slack_blind: bool) -> None:
+    value = json.dumps({
+        "new": new_count, "reminders": reminder_count, "resolved": resolved_count,
+        "slack_blind": slack_blind,
+    }, sort_keys=True)
+    conn.execute(
+        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (HEARTBEAT_CURSOR_KEY, value, now.isoformat()),
+    )
+    conn.commit()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = set(argv if argv is not None else sys.argv[1:])
     post = "--post" in args
@@ -1445,6 +1473,8 @@ def main(argv: list[str] | None = None) -> int:
         all_new, all_rem, all_res = _run_poll(conn, now, env, deliver=deliver)
         conn.commit()
         slack_blind = slack_poll_failure(conn)
+        record_heartbeat(conn, now, new_count=len(all_new), reminder_count=len(all_rem),
+                         resolved_count=len(all_res), slack_blind=bool(slack_blind))
         conn.close()
 
     # stderr, never stdout: under no_agent the stdout of --slack-body IS the Slack message.

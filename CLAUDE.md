@@ -16,7 +16,7 @@ warden is a deterministic control plane over one SQLite ledger. **No LLM call
 decides a state transition** — the dispatched episodes each run one, the loop
 never does. Pollers feed it, sideclaw executes for it, Slack and Argo render it.
 
-Four LaunchAgents, never `hermes cron` jobs, and that is the whole reason this
+Five LaunchAgents, never `hermes cron` jobs, and that is the whole reason this
 repo is separate from `hermes-agent`: a gateway cron job runs *inside* the
 `ai.hermes.gateway` process, so the loop whose job is noticing Hermes is broken
 cannot run when Hermes is down. That was measured, not theorized — the gateway
@@ -29,6 +29,14 @@ against a ledger that had stopped receiving signals.
 | `com.jkrumm.warden-poll` | ingest | 1800s |
 | `com.jkrumm.warden-sweep` | `scripts/dispatch-sweep.py` | 300s |
 | `com.jkrumm.warden-backup` | `scripts/warden-backup.sh` | daily 03:10 |
+| `com.jkrumm.warden-api` | `scripts/api.py --serve` (GET /metrics, /health) | long-running, `KeepAlive` |
+
+`warden-api` is the odd shape: a long-running server, not a periodic job — see
+its own plist template for why that changes `KeepAlive`/`StartInterval` and adds
+a `ThrottleInterval`. It binds `127.0.0.1:7734` only, loopback and no auth — see
+`docs/api.md` for the endpoints, the six funnel numbers' exact definitions, the
+honesty rules (`null` + reason, never a fabricated `0`), and what is deliberately
+not built yet.
 
 Slack delivery from the loop is a **plain HTTP client** (`chat.postMessage` /
 `chat.update` with a token from `resolve_slack_token()`), never the gateway's live

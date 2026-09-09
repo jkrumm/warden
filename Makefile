@@ -1,9 +1,12 @@
 # warden — the control plane. See DESIGN.md for what it is, STATE.md for where it is.
 #
-# Everything here assumes the mini. warden's loop, its pollers and its backup are
-# LaunchAgents, never `hermes cron` jobs: the loop that notices Hermes is broken
-# cannot depend on Hermes being up to run it. That argument is DESIGN.md's reason
-# for the whole repo, and it is why these four plists exist.
+# Everything here assumes the mini. warden's loop, its pollers, its backup and its
+# read-only HTTP API are LaunchAgents, never `hermes cron` jobs: the loop that
+# notices Hermes is broken cannot depend on Hermes being up to run it. That
+# argument is DESIGN.md's reason for the whole repo, and it is why these five
+# plists exist. com.jkrumm.warden-api is the odd one out shape-wise — a
+# long-running server (KeepAlive, no StartInterval) rather than a periodic job —
+# see its own template for why.
 
 WARDEN_REPO := $(shell pwd)
 WARDEN_HOME := $(HOME)/.warden
@@ -17,7 +20,8 @@ PY          := $(VENV)/bin/python3
 BASE_PY     := python3.11
 
 WARDEN_PLISTS := com.jkrumm.warden-loop com.jkrumm.warden-poll \
-                 com.jkrumm.warden-sweep com.jkrumm.warden-backup
+                 com.jkrumm.warden-sweep com.jkrumm.warden-backup \
+                 com.jkrumm.warden-api
 
 .DEFAULT_GOAL := help
 
@@ -166,6 +170,21 @@ status:
 			echo "    ✗ $$name  [pid $$pid, LAST EXIT $$rc] — read $(HOME)/Library/Logs/warden-$$short.err"; \
 		fi; \
 	done
+	@# com.jkrumm.warden-api is a KeepAlive server, not a periodic job — the loop
+	@# above already reads it correctly (a live PID with last exit 0 is ✓, a
+	@# crash-loop shows no PID with a non-zero exit and is ✗, exactly like every
+	@# other agent here), but "loaded" is not "answering." This is the one check
+	@# that actually asks the process something, over the loopback bind itself.
+	@printf '  %-24s ' "api (/health)"; \
+	if out=$$(curl -fsS --max-time 2 http://127.0.0.1:7734/health 2>/dev/null); then \
+		if echo "$$out" | grep -q '"ok": true'; then \
+			echo "✓ reachable, ok"; \
+		else \
+			echo "✗ reachable but degraded — $$out"; \
+		fi; \
+	else \
+		echo "✗ unreachable (is com.jkrumm.warden-api loaded?)"; \
+	fi
 	@printf '  %-24s ' "policy"; \
 	if out=$$("$(PY)" "$(WARDEN_REPO)/scripts/check-dispatch-policy.py" 2>&1); then \
 		echo "$$out" | grep -E '^(✓|✗)' | head -1 | sed 's/^ *//'; \
