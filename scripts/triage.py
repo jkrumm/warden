@@ -3797,7 +3797,8 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     maybe_post_daily_digest(conn, policy, unmapped, now, dry_run=dry_run, auto_mapped=auto_mapped)
 
-    record_heartbeat(conn, now, dry_run=dry_run)
+    # No timestamp argument, deliberately — see record_heartbeat().
+    record_heartbeat(conn, dry_run=dry_run)
     return 0
 
 
@@ -3806,7 +3807,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 HEARTBEAT_CURSOR_KEY = "triage_last_run"
 
 
-def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
+def record_heartbeat(conn: sqlite3.Connection, *, dry_run: bool) -> None:
     """Write one `cursors` row per completed pass, unconditionally.
 
     Every other write in this file is conditional on something having CHANGED,
@@ -3842,7 +3843,17 @@ def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: boo
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (HEARTBEAT_CURSOR_KEY, value, _now_iso(now)),
+        # Stamped HERE, from a clock read at write time — the function takes no
+        # timestamp at all, and that is the point. `updated_at` answers "when
+        # did this pass COMPLETE" (api.py reads it as exactly that, against a
+        # 3x-StartInterval staleness threshold), while every caller has a `now`
+        # in hand that is the pass's START. Three scripts each remembering to
+        # pass a fresh clock instead of the one already in scope is three
+        # chances to stamp the loop as fresh at the moment it began; two of the
+        # three got it wrong until 2026-09-09. Removing the parameter makes the
+        # mistake unexpressible rather than merely tested — the same argument
+        # _set_state() makes for owning `state_deadline`.
+        (HEARTBEAT_CURSOR_KEY, value, _now_iso(dt.datetime.now(dt.timezone.utc))),
     )
     conn.commit()
 

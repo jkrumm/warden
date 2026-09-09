@@ -711,12 +711,14 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
 HEARTBEAT_CURSOR_KEY = "dispatch_sweep_last_run"
 
 
-def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *, considered: int, errors: int) -> None:
+def record_heartbeat(conn: sqlite3.Connection, *, considered: int, errors: int) -> None:
+    # No timestamp argument — see triage.py's record_heartbeat() for why the
+    # write clock is read here rather than accepted from a caller.
     value = json.dumps({"considered": considered, "errors": errors}, sort_keys=True)
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (HEARTBEAT_CURSOR_KEY, value, now.isoformat()),
+        (HEARTBEAT_CURSOR_KEY, value, dt.datetime.now(dt.timezone.utc).isoformat()),
     )
     conn.commit()
 
@@ -749,11 +751,7 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
         if not dry_run:
-            # Stamped at the END of the pass, not the start — the cursor's
-            # updated_at is read by /metrics as "when did this sweeper last
-            # COMPLETE", which is the question a staleness threshold asks.
-            record_heartbeat(conn, dt.datetime.now(dt.timezone.utc),
-                             considered=len(rows), errors=errors)
+            record_heartbeat(conn, considered=len(rows), errors=errors)
     finally:
         conn.close()
     return 0

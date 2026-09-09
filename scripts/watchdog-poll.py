@@ -1412,9 +1412,12 @@ def _push_uptime_heartbeat() -> None:
 HEARTBEAT_CURSOR_KEY = "watchdog_poll_last_run"
 
 
-def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *,
+def record_heartbeat(conn: sqlite3.Connection, *,
                      new_count: int, reminder_count: int, resolved_count: int,
                      slack_blind: bool) -> None:
+    # No timestamp argument — see triage.py's record_heartbeat() for why the
+    # write clock is read here rather than accepted from a caller holding the
+    # pass's START time.
     value = json.dumps({
         "new": new_count, "reminders": reminder_count, "resolved": resolved_count,
         "slack_blind": slack_blind,
@@ -1422,7 +1425,7 @@ def record_heartbeat(conn: sqlite3.Connection, now: dt.datetime, *,
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (HEARTBEAT_CURSOR_KEY, value, now.isoformat()),
+        (HEARTBEAT_CURSOR_KEY, value, dt.datetime.now(dt.timezone.utc).isoformat()),
     )
     conn.commit()
 
@@ -1473,7 +1476,7 @@ def main(argv: list[str] | None = None) -> int:
         all_new, all_rem, all_res = _run_poll(conn, now, env, deliver=deliver)
         conn.commit()
         slack_blind = slack_poll_failure(conn)
-        record_heartbeat(conn, now, new_count=len(all_new), reminder_count=len(all_rem),
+        record_heartbeat(conn, new_count=len(all_new), reminder_count=len(all_rem),
                          resolved_count=len(all_res), slack_blind=bool(slack_blind))
         conn.close()
 

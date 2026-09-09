@@ -73,12 +73,28 @@ consumer (Argo, a human reading the JSON) tell the two apart.
 
 | # | Key | Definition | Windowed |
 |-|-|-|-|
-| 1 | `verdicts_recorded_disposition` | numerator/denominator/`states` breakdown for investigate-tier dispatches with a recorded verdict, reaching a state DESIGN.md counts as a recorded disposition (the implement chain, `needs_human`, or `dismissed`). `quiet` does **not** count — DESIGN.md principle 5, silence is never an outcome. | all-time |
+| 1 | `verdicts_recorded_disposition` | numerator/denominator (both **dispatch counts**) plus an `item_states` breakdown for investigate-tier dispatches with a recorded verdict AND `origin_event_id IS NOT NULL` (loop-originated — see below), reaching a state DESIGN.md counts as a recorded disposition (the implement chain, `needs_human`, or `dismissed`). `quiet` does **not** count — DESIGN.md principle 5, silence is never an outcome. `item_states` counts `triage_items` rows, **not** dispatches, so its total may legitimately exceed the denominator — one clustered dispatch joins several items (see `item_states_note`). Verdict-carrying investigate dispatches with `origin_event_id IS NULL` are interactive Slack dispatches a human asked `hermes-cc` to run directly; they never entered warden's funnel as an item and never will, so they're excluded from the ratio and reported separately as `excluded_interactive` (with `excluded_interactive_note`) rather than silently dropped. | all-time |
 | 2 | `verified_fixes_vs_silence` | `fixed`/`quiet`/`closed`/`dismissed` counts and `fixed / (fixed + quiet)`, restricted to mapped signatures (`triage_items.repo IS NOT NULL`). | all-time |
 | 3 | `median_needs_human_to_decision_hours` | median hours between a transition into `needs_human` and the item's next transition, **excluding** pairs whose exit is `dismissed` (that is the 7-day expiry clock, not a human deciding — REVIEW.md's C3 Goodhart concern). | windowed on entry |
 | 4 | `verified_unattended_fixes_per_week` | always `null` — the "unattended" qualifier needs an operation id linking an approval to the item it fixed (DESIGN.md § Crash recovery), which does not exist before Wave 3. Serves `fixes_in_window` (raw `fixed` transition count, explicitly **not** attendance-filtered) and `approvals_spent_in_window` as the closest available context. | windowed |
 | 5 | `poller_ages` | per-poller age in minutes plus the worst case across all three, named individually. | current (not windowed) |
 | 6 | `reverts_and_reopens` | `reopen_after_fixed` (real count, transitions with `from_state='fixed'`) and `reverts` (always `null` — no revert primitive exists before `warden revert`, DESIGN.md § Abort and revert, Wave 3). | windowed |
+
+**Leaf-level history guard.** Metrics 3, 4 (`fixes_in_window`) and 6
+(`reopen_after_fixed`) are all computed from `item_transitions`, which was
+created empty by schema migration 4. Each checks `history_since` against its
+own window start *at the leaf*, not just at the top level: an empty table, or
+a window whose start predates `history_since`, returns `null` with a reason
+naming which case applied — never a fabricated `0`. This means all three
+currently read `null` and will keep doing so until the window no longer
+predates `history_since` (7 days after the earliest row lands).
+
+**`item_transitions` is history after the first state, not from creation.**
+`ingest()` inserts a brand-new `triage_items` row directly with `state='new'`
+rather than going through `_set_state()` (there is no prior state to
+transition from), so an item's entry into `new` is never itself recorded as a
+row here — the table's first entry for an item is always its departure from
+`new` (or later).
 
 ## Why these six and not more
 

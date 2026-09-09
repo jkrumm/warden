@@ -2206,7 +2206,7 @@ def test_heartbeat_written_on_every_pass_including_an_idle_one():
             "SELECT COUNT(*) AS n FROM triage_items"
         ).fetchone()["n"] == 0, "this case is about an EMPTY, fully idle pass"
 
-        triage.record_heartbeat(conn, NOW, dry_run=False)
+        triage.record_heartbeat(conn, dry_run=False)
 
         row = conn.execute(
             "SELECT value, updated_at FROM cursors WHERE key=?",
@@ -2233,7 +2233,7 @@ def test_heartbeat_census_counts_states_and_open_clusters():
         )
         conn.commit()
 
-        triage.record_heartbeat(conn, NOW, dry_run=False)
+        triage.record_heartbeat(conn, dry_run=False)
 
         value = json.loads(conn.execute(
             "SELECT value FROM cursors WHERE key=?",
@@ -2243,9 +2243,52 @@ def test_heartbeat_census_counts_states_and_open_clusters():
         assert value["open_clusters"] == 1, "cluster membership is by dispatch_job, not row count"
 
 
+def test_heartbeat_is_stamped_when_the_pass_ENDS_not_when_it_began():
+    """`updated_at` on this cursor answers "when did this pass COMPLETE" —
+    api.py reads it as exactly that, against a 3x-StartInterval staleness
+    threshold — while run()'s `now` is the pass's START. Passing that `now`
+    down stamped the loop as fresh at the moment it began; on a slow pass the
+    heartbeat lies in the one direction that matters, claiming liveness it
+    does not have.
+
+    record_heartbeat() therefore takes NO timestamp and reads the clock at the
+    write itself, which makes the mistake unexpressible rather than merely
+    tested. This case is the second half of that: it proves the invariant
+    end to end through run(), so reintroducing a caller-supplied timestamp
+    and threading the pass's `now` back into it turns this red.
+
+    The delay is injected into ingest(), the first step of the pass, so the
+    gap being measured is genuinely "start to finish" and not scheduler noise.
+    """
+    with _triage_env() as (conn, _ctx):
+        pass_now: list[dt.datetime] = []
+        real_ingest = triage.ingest
+
+        def slow_ingest(c: Any, now: dt.datetime) -> None:
+            pass_now.append(now)
+            time.sleep(0.05)
+            return real_ingest(c, now)
+
+        triage.ingest = slow_ingest
+        try:
+            triage.run(conn, dry_run=False)
+        finally:
+            triage.ingest = real_ingest
+
+        assert pass_now, "ingest() must have run — otherwise this proves nothing"
+        stamped = dt.datetime.fromisoformat(conn.execute(
+            "SELECT updated_at FROM cursors WHERE key=?",
+            (triage.HEARTBEAT_CURSOR_KEY,),
+        ).fetchone()["updated_at"])
+        gap = (stamped - pass_now[0]).total_seconds()
+        assert gap >= 0.05, (
+            f"heartbeat stamped {gap:.4f}s after the pass began, but the pass was made to take "
+            f"at least 0.05s — updated_at is the pass's START time, not its completion")
+
+
 def test_heartbeat_skipped_under_dry_run():
     with _triage_env() as (conn, _ctx):
-        triage.record_heartbeat(conn, NOW, dry_run=True)
+        triage.record_heartbeat(conn, dry_run=True)
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM cursors WHERE key=?",
             (triage.HEARTBEAT_CURSOR_KEY,),

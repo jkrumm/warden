@@ -137,36 +137,70 @@ def _poller_age_minutes(conn: sqlite3.Connection, now: dt.datetime, key: str) ->
 # blur that distinction.
 
 def _metric_verdicts_recorded_disposition(conn: sqlite3.Connection) -> dict[str, Any]:
-    """# 1 — verdicts -> recorded disposition. All-time."""
+    """# 1 — verdicts -> recorded disposition. All-time.
+
+    Denominator is investigate dispatches with a verdict AND
+    `origin_event_id IS NOT NULL` — that column is exactly "the loop
+    originated this", not "a triage_item happens to link to it" (the latter
+    would circularly exclude the very no-item failures this metric exists to
+    count). The other verdict-carrying investigate dispatches
+    (`origin_event_id IS NULL`, `origin_channel`/`origin_thread_ts` set
+    instead) are interactive Slack dispatches a human asked `hermes-cc` to
+    run: they were never items in warden's funnel and no item will ever point
+    at them, so they are reported separately as `excluded_interactive` rather
+    than silently dropped or miscounted into the denominator.
+
+    `item_states`' total is deliberately allowed to exceed the denominator: a
+    clustered dispatch joins several `triage_items` rows, so counting items
+    (not dispatches) in the breakdown while dispatches (not items) are the
+    numerator/denominator was the exact confusion that made a live 5/17
+    ratio read next to a 16-item breakdown as if it were about the same 17."""
     denominator = conn.execute(
-        "SELECT COUNT(*) AS n FROM dispatches WHERE tier='investigate' AND verdict_json IS NOT NULL"
+        "SELECT COUNT(*) AS n FROM dispatches "
+        "WHERE tier='investigate' AND verdict_json IS NOT NULL AND origin_event_id IS NOT NULL"
     ).fetchone()["n"]
+    excluded_interactive = conn.execute(
+        "SELECT COUNT(*) AS n FROM dispatches "
+        "WHERE tier='investigate' AND verdict_json IS NOT NULL AND origin_event_id IS NULL"
+    ).fetchone()["n"]
+    excluded_interactive_note = (
+        "verdict-carrying investigate dispatches with no origin_event_id — a human asked hermes-cc "
+        "to investigate interactively; these never entered warden's funnel as an item and never will, "
+        "so they are excluded from numerator and denominator rather than silently miscounted"
+    )
+    item_states_note = "counts triage_items, not dispatches — one clustered dispatch contributes several, so this total may exceed denominator"
     if denominator == 0:
         return {
             "value": None,
-            "unavailable": "no investigate dispatches with a recorded verdict yet",
-            "numerator": 0, "denominator": 0, "states": {},
+            "unavailable": "no loop-originated investigate dispatches with a recorded verdict yet",
+            "numerator": 0, "denominator": 0,
+            "item_states": {}, "item_states_note": item_states_note,
+            "excluded_interactive": excluded_interactive, "excluded_interactive_note": excluded_interactive_note,
             "windowed": False,
         }
     placeholders = ",".join("?" for _ in DISPOSITION_STATES)
     numerator = conn.execute(
         f"SELECT COUNT(DISTINCT d.id) AS n FROM dispatches d "
         f"JOIN triage_items ti ON ti.dispatch_job = d.job_id "
-        f"WHERE d.tier='investigate' AND d.verdict_json IS NOT NULL AND ti.state IN ({placeholders})",
+        f"WHERE d.tier='investigate' AND d.verdict_json IS NOT NULL AND d.origin_event_id IS NOT NULL "
+        f"AND ti.state IN ({placeholders})",
         DISPOSITION_STATES,
     ).fetchone()["n"]
-    states = {
+    item_states = {
         row["state"]: row["n"]
         for row in conn.execute(
             "SELECT ti.state AS state, COUNT(*) AS n FROM dispatches d "
             "JOIN triage_items ti ON ti.dispatch_job = d.job_id "
-            "WHERE d.tier='investigate' AND d.verdict_json IS NOT NULL GROUP BY ti.state"
+            "WHERE d.tier='investigate' AND d.verdict_json IS NOT NULL AND d.origin_event_id IS NOT NULL "
+            "GROUP BY ti.state"
         )
     }
     return {
         "value": numerator / denominator,
         "unavailable": None,
-        "numerator": numerator, "denominator": denominator, "states": states,
+        "numerator": numerator, "denominator": denominator,
+        "item_states": item_states, "item_states_note": item_states_note,
+        "excluded_interactive": excluded_interactive, "excluded_interactive_note": excluded_interactive_note,
         "windowed": False,
     }
 
@@ -193,7 +227,31 @@ def _metric_verified_fixes_vs_silence(conn: sqlite3.Connection) -> dict[str, Any
     }
 
 
-def _metric_median_needs_human_to_decision(conn: sqlite3.Connection, now: dt.datetime) -> dict[str, Any]:
+def _history_guard_reason(history_since: str | None, window_start: dt.datetime) -> str | None:
+    """Leaf-level guard shared by every metric computed from `item_transitions`.
+
+    The table was created EMPTY by migration 4 and records nothing
+    retroactively (ledger.py's `_MIGRATION_4` docstring), so a window whose
+    start is before the earliest recorded row — or a still-empty table — is
+    empty BY CONSTRUCTION, not a measured zero. The top-level `history_since`
+    field alone doesn't prevent a leaf from fabricating a `0` here: a consumer
+    has to remember to cross-reference it, which is advisory, not enforced.
+    This makes the check load-bearing at the leaf itself. Returns the reason
+    string when the guard applies (caller must report `null`, never `0`), or
+    None when the window is safely inside recorded history."""
+    if history_since is None:
+        return "item_transitions has no rows yet (table created empty by schema migration 4) — not a measured zero"
+    if window_start < dt.datetime.fromisoformat(history_since):
+        return (
+            f"window start predates history_since ({history_since}) — item_transitions records "
+            "nothing before that point, so this window is empty by construction, not a measured zero"
+        )
+    return None
+
+
+def _metric_median_needs_human_to_decision(
+    conn: sqlite3.Connection, now: dt.datetime, history_since: str | None,
+) -> dict[str, Any]:
     """# 3 — median needs_human -> human decision, in hours. Windowed on entry.
 
     Pairs each transition INTO needs_human with the very next transition for
@@ -205,6 +263,16 @@ def _metric_median_needs_human_to_decision(conn: sqlite3.Connection, now: dt.dat
     counting it would make the metric improve the longer a human ignores the
     card — the Goodhart failure REVIEW.md's C3 already named.
     """
+    window_start = now - dt.timedelta(days=WINDOW_DAYS)
+    guard_reason = _history_guard_reason(history_since, window_start)
+    if guard_reason:
+        return {
+            "value": None,
+            "unavailable": guard_reason,
+            "pairs": 0, "excluded_dismissed_pairs": 0,
+            "windowed": True, "window_days": WINDOW_DAYS,
+        }
+
     rows = conn.execute(
         "SELECT event_id, from_state, to_state, at FROM item_transitions ORDER BY event_id, id"
     ).fetchall()
@@ -212,7 +280,6 @@ def _metric_median_needs_human_to_decision(conn: sqlite3.Connection, now: dt.dat
     for row in rows:
         by_event.setdefault(row["event_id"], []).append(row)
 
-    window_start = now - dt.timedelta(days=WINDOW_DAYS)
     deltas_hours: list[float] = []
     excluded_dismissed = 0
     for transitions in by_event.values():
@@ -246,7 +313,9 @@ def _metric_median_needs_human_to_decision(conn: sqlite3.Connection, now: dt.dat
     }
 
 
-def _metric_verified_unattended_fixes_per_week(conn: sqlite3.Connection, now: dt.datetime) -> dict[str, Any]:
+def _metric_verified_unattended_fixes_per_week(
+    conn: sqlite3.Connection, now: dt.datetime, history_since: str | None,
+) -> dict[str, Any]:
     """# 4 — verified UNATTENDED fixes per week. The qualifier itself is not
     derivable: `dispatch_approvals` carries no `event_id` and no item link of
     any kind (verified on the live ledger 2026-09-09: 5 rows, 1 with
@@ -256,13 +325,23 @@ def _metric_verified_unattended_fixes_per_week(conn: sqlite3.Connection, now: dt
     Serves the raw ingredients instead of a fabricated number: the plain
     `fixed` transition count in the window (not attendance-filtered — labelled
     as such), and `dispatch_approvals.spent_at` in the window as the closest
-    available context.
+    available context. `fixes_in_window` itself is `item_transitions`-derived
+    and so goes through the same leaf-level history guard as metrics 3 and 6
+    (see `_history_guard_reason`) — `approvals_spent_in_window` reads
+    `dispatch_approvals`, an unrelated table, and needs no guard.
     """
-    window_start_iso = (now - dt.timedelta(days=WINDOW_DAYS)).isoformat()
-    fixes = conn.execute(
-        "SELECT COUNT(*) AS n FROM item_transitions WHERE to_state='fixed' AND at >= ?",
-        (window_start_iso,),
-    ).fetchone()["n"]
+    window_start = now - dt.timedelta(days=WINDOW_DAYS)
+    window_start_iso = window_start.isoformat()
+    guard_reason = _history_guard_reason(history_since, window_start)
+    if guard_reason:
+        fixes: int | None = None
+        fixes_note = guard_reason
+    else:
+        fixes = conn.execute(
+            "SELECT COUNT(*) AS n FROM item_transitions WHERE to_state='fixed' AND at >= ?",
+            (window_start_iso,),
+        ).fetchone()["n"]
+        fixes_note = "raw `fixed` transition count — NOT filtered for attendance"
     approvals = conn.execute(
         "SELECT COUNT(*) AS n FROM dispatch_approvals WHERE spent_at IS NOT NULL AND spent_at >= ?",
         (window_start_iso,),
@@ -275,7 +354,7 @@ def _metric_verified_unattended_fixes_per_week(conn: sqlite3.Connection, now: dt
             "and 0/5 rows carry --auto-from-item"
         ),
         "fixes_in_window": fixes,
-        "fixes_in_window_note": "raw `fixed` transition count — NOT filtered for attendance",
+        "fixes_in_window_note": fixes_note,
         "approvals_spent_in_window": approvals,
         "windowed": True, "window_days": WINDOW_DAYS,
     }
@@ -308,19 +387,30 @@ def _metric_poller_ages(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
     }
 
 
-def _metric_reverts_and_reopens(conn: sqlite3.Connection, now: dt.datetime) -> dict[str, Any]:
+def _metric_reverts_and_reopens(
+    conn: sqlite3.Connection, now: dt.datetime, history_since: str | None,
+) -> dict[str, Any]:
     """# 6 — reverts and reopen-after-fixed. `reverts` has no primitive yet
     (DESIGN.md § Abort and revert: `warden revert` is Wave 3) so it is served
     `null` with a reason, never `0` — a `0` here would read as "measured, zero
-    reverts happened" instead of "not tracked at all"."""
-    window_start_iso = (now - dt.timedelta(days=WINDOW_DAYS)).isoformat()
-    reopen = conn.execute(
-        "SELECT COUNT(*) AS n FROM item_transitions WHERE from_state='fixed' AND at >= ?",
-        (window_start_iso,),
-    ).fetchone()["n"]
+    reverts happened" instead of "not tracked at all". `reopen_after_fixed` is
+    `item_transitions`-derived and goes through the same leaf-level history
+    guard as metrics 3 and 4 (see `_history_guard_reason`) for the same
+    reason: an empty or young table must never present a fabricated `0`."""
+    window_start = now - dt.timedelta(days=WINDOW_DAYS)
+    guard_reason = _history_guard_reason(history_since, window_start)
+    if guard_reason:
+        reopen_value: int | None = None
+        reopen_reason = guard_reason
+    else:
+        reopen_value = conn.execute(
+            "SELECT COUNT(*) AS n FROM item_transitions WHERE from_state='fixed' AND at >= ?",
+            (window_start.isoformat(),),
+        ).fetchone()["n"]
+        reopen_reason = None
     return {
         "reopen_after_fixed": {
-            "value": reopen, "unavailable": None,
+            "value": reopen_value, "unavailable": reopen_reason,
             "windowed": True, "window_days": WINDOW_DAYS,
         },
         "reverts": {
@@ -331,12 +421,20 @@ def _metric_reverts_and_reopens(conn: sqlite3.Connection, now: dt.datetime) -> d
     }
 
 
+def _item_transitions_history_since(conn: sqlite3.Connection) -> str | None:
+    """MIN(at) across `item_transitions`, or None when the table is empty —
+    the one query `metrics_payload()`'s top-level `history_since` field and
+    every leaf-level history guard (`_history_guard_reason`) share, so there
+    is exactly one definition of "how far back does our history go"."""
+    return conn.execute("SELECT MIN(at) AS min_at FROM item_transitions").fetchone()["min_at"]
+
+
 def metrics_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     """The whole `/metrics` body. A thin function so the HTTP handler below is
     the deep-module shape this repo's code-style rules ask for: the handler
     is a shell, this is what a test actually drives."""
     now = dt.datetime.now(dt.timezone.utc)
-    history_since = conn.execute("SELECT MIN(at) AS min_at FROM item_transitions").fetchone()["min_at"]
+    history_since = _item_transitions_history_since(conn)
     return {
         "generated_at": now.isoformat(),
         "window_days": WINDOW_DAYS,
@@ -344,14 +442,16 @@ def metrics_payload(conn: sqlite3.Connection) -> dict[str, Any]:
         # retroactively (ledger.py's _MIGRATION_4 docstring). Any window whose
         # start predates this timestamp is empty BY CONSTRUCTION — a consumer
         # must be able to tell that apart from a measured zero, which is the
-        # whole reason this field exists.
+        # whole reason this field exists. Metrics 3/4/6 additionally enforce
+        # this at the LEAF (`_history_guard_reason`) rather than relying on a
+        # consumer to cross-reference this field themselves.
         "history_since": history_since,
         "verdicts_recorded_disposition": _metric_verdicts_recorded_disposition(conn),
         "verified_fixes_vs_silence": _metric_verified_fixes_vs_silence(conn),
-        "median_needs_human_to_decision_hours": _metric_median_needs_human_to_decision(conn, now),
-        "verified_unattended_fixes_per_week": _metric_verified_unattended_fixes_per_week(conn, now),
+        "median_needs_human_to_decision_hours": _metric_median_needs_human_to_decision(conn, now, history_since),
+        "verified_unattended_fixes_per_week": _metric_verified_unattended_fixes_per_week(conn, now, history_since),
         "poller_ages": _metric_poller_ages(conn, now),
-        "reverts_and_reopens": _metric_reverts_and_reopens(conn, now),
+        "reverts_and_reopens": _metric_reverts_and_reopens(conn, now, history_since),
     }
 
 

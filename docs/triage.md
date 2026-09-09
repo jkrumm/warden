@@ -1201,6 +1201,34 @@ because it looks like an accident and is not, and because it belongs with the
 self-tuning quiet window below: that is where "the signal is still firing but
 suppressed" is the actual subject.
 
+**A second asymmetry the mark inherits, also measured 2026-09-09 and also
+deliberately not fixed here.** For a **state** source (`uk`, `docker_*`,
+`github_pr`, `github_issue`, `hermes_cron`, `op_refs_*`, `stray_skill` —
+anything NOT in `GROUPED_SOURCES`) whose event's `resolved_at` stays
+continuously NULL — the monitor never clears, it just keeps firing — while the
+item itself has already gone terminal (`dismissed` after the 7-day
+`needs_human` fuse, or `closed`), the only writer in `watchdog-poll.py` that
+moves any of `_occurrence_mark()`'s five slots is `reconcile()`'s reminder
+bump at line 928 (`last_reminder_at`, `reminder_count`), gated by
+`REM_HOURS[source]`. Everything else a recurrence writes —
+`title`/`url`/`payload_json` at line 887 — is deliberately outside the mark
+(see the grouped-source paragraph above for why: those columns are cosmetic,
+not occurrence signal). So reopen latency for such a row is bounded by the
+source's own reminder cadence: **6h** for `uk`/`docker_*`/`op_refs_*`/
+`hermes_cron`, **72h** for `github_pr`, **168h** (a full week) for
+`github_issue` and `stray_skill`. Live, 13 of 32 stamped marks carry an empty
+`ts_last` slot: 7 `hermes_log` (the asymmetry above) and **6 `uk`** — the
+`hermes_log` paragraph alone does not account for the other half.
+
+Both facts, honestly. Under the OLD `resolved_at IS NULL` predicate, a row
+like this reopened on the very next pass — which sounds better and is not: it
+meant `dismissed` was **effectively unreachable** for a state source with a
+continuously-open event, because the 7-day fuse could fire and the very next
+10-minute pass would reopen the item before anything downstream ever saw it
+sit dismissed. The new bound trades that for a real latency — up to a week, on
+two low-volume sources — in exchange for a `dismissed` state that actually
+retires something.
+
 ### brain-sync is never investigated
 
 27 `Brain Sync - Push` DOWN messages in a week, the third-largest alert source,
