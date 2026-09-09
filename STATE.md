@@ -2578,3 +2578,107 @@ is the constraint that decided the whole shape.
 
 Then **2c** — `busy_timeout` off 5s and a bounded retry around the pass (§26
 finding 1).
+
+---
+
+## 31. Wave 1, item 2c — the `database is locked` crash, root cause (DONE)
+
+§26 finding 1 was going to be "raise `busy_timeout` and add a retry". It is not
+that. Looking for *which* writer held the lock for more than five seconds found
+the answer, and it is a much better fix.
+
+### The cause
+
+`scripts/watchdog-poll.py`'s `_run_poll()` had **no commit of its own**.
+`main()` committed once, after the whole poll returned — the only two
+`conn.commit()` calls in the entire file were both in `main()`.
+
+Python's sqlite3 opens a DEFERRED write transaction on the first INSERT or
+UPDATE and holds it until commit. `_run_poll()` interleaves probes and writes:
+
+```
+poll_uk()          HTTP        reconcile()   <- first write: transaction OPENS
+poll_docker()      ssh x2      reconcile()
+poll_op_refs()     ssh xN      reconcile()
+poll_github()      gh subprocess, timeout=30
+poll_hermes_cron() ...
+poll_slack_messages() HTTP x2
+                                             <- main() finally commits
+```
+
+So from `reconcile()`'s first write until `main()`'s commit, **the ingest poller
+held the ledger's write lock across every remaining probe** — two `ssh` round
+trips, one per op-refs host, a `gh` call with a 30s timeout, and two Slack
+fetches. Minutes, on a bad day. `ledger.py` sets `busy_timeout=5000`. The
+act-loop, ticking every 600s into a lock held that long, had no chance:
+
+```
+sqlite3.OperationalError: database is locked
+  scripts/triage.py:959 in ingest
+```
+
+The loop whose entire job is noticing that things have stopped was stopped by
+the ingest poller.
+
+### The fix
+
+Commit after each source, so the network I/O happens outside any transaction.
+Seven commit points, one invariant, stated in `_run_poll()`'s docstring: **no
+network call may happen inside an open write transaction.**
+
+The trade, stated because it is one: a crash mid-poll now leaves earlier sources
+committed rather than rolling the whole pass back. That is the right way round —
+every `reconcile()` re-derives its rows from `observed` on the next pass, so a
+partial poll is self-healing, while a deadlocked act-loop is not.
+
+### `busy_timeout` deliberately stays at 5s
+
+The obvious move is 5s → 30s. Declined. A 5s timeout that fails loudly is a
+better detector than a 30s one that masks a regression, and `make status` now
+surfaces the failed exit (§26). Fix the cause; keep the alarm sensitive.
+
+### Evidence
+
+`tests/test_watchdog_locking.py`, new, 3 cases. It stubs every probe and records
+`conn.in_transaction` at the moment each is entered.
+
+**The test caught a real hole in my own first fix.** I put the Slack loop's
+commit at the tail of the body; both `continue` statements in that loop jump
+straight to the next iteration and skip it — and they are exactly the paths that
+have just written a fail-streak cursor:
+
+```
+AssertionError: these probes were called while holding the ledger's write lock:
+['poll_slack_messages']
+```
+
+Moved to immediately before the probe, which is `continue`-proof. This is the
+whole argument for writing the property test rather than reading the diff: the
+diff looked right.
+
+`test_the_guard_is_not_vacuous` exists because the invariant test is meaningless
+if nothing wrote — no writes means no transaction means nothing to hold, and it
+would have gone green against the very bug it exists to catch. So `uk` and
+`hermes_log` return real rows, and the test asserts rows landed and ≥8 probes ran.
+
+**Mutation check** — delete the first commit point (after `uk`):
+
+```
+AssertionError: these probes were called while holding the ledger's write lock:
+['poll_docker']
+```
+
+```
+$ make test
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   11/11 passed
+  test_triage.py                   73/73 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+```
+
+Still to observe: the next real `com.jkrumm.warden-poll` run (1800s interval)
+exiting 0 with the loop unaffected. Check `make status` and
+`cursors.hermes_errors_log_offset`.

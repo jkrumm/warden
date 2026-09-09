@@ -1254,6 +1254,32 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
     are inserted, refreshed and resolved — but nothing is stamped as notified, so
     the backlog fires on the first delivering poll instead of being consumed by a
     message that was never sent. See reconcile() for the failure this closes.
+
+    THE INVARIANT, and it is load-bearing: **no network call may happen inside
+    an open write transaction.** Every `conn.commit()` below is a commit point
+    placed immediately after a source's writes and immediately before the next
+    source's probe — not tidiness, and not durability.
+
+    Python's sqlite3 opens a DEFERRED write transaction on the first INSERT or
+    UPDATE and holds it until commit. This function used to have none of its
+    own: `main()` committed once, at the very end. So from `reconcile()`'s first
+    write until that commit, this poller held the ledger's write lock across
+    every probe still to come — two `ssh` round trips for docker, one per
+    op-refs host, a `gh` subprocess with a 30s timeout, and two Slack HTTP
+    fetches. Minutes, on a bad day.
+
+    On 2026-09-09 at 13:05Z the act-loop died with `sqlite3.OperationalError:
+    database is locked` on the first INSERT of its own pass. `ledger.py` sets
+    `busy_timeout=5000`; against a lock held for the length of a `gh` call it
+    never stood a chance. The loop is the process whose job is noticing that
+    things have stopped, and the ingest poller stopped it.
+
+    Committing per source shrinks the window from "the whole poll" to "one
+    source's rows". The trade, stated because it IS a trade: a crash mid-poll
+    now leaves earlier sources committed instead of rolling the whole pass
+    back. That is the right way round — every `reconcile()` re-derives its
+    rows from `observed` on the next pass, so a partial poll is self-healing,
+    while a deadlocked act-loop is not.
     """
     now_iso = now.isoformat()
     all_new: list[dict] = []
@@ -1262,12 +1288,14 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
 
     n, r, res = reconcile(conn, "uk", poll_uk(env), now, UK_DOWN_GATE_MIN, REM_HOURS["uk"], deliver=deliver)
     all_new += n; all_rem += r; all_res += res
+    conn.commit()
 
     for host in ("homelab", "vps"):
         src = f"docker_{host}"
         n, r, res = reconcile(conn, src, poll_docker(env, host), now,
                               DOCKER_UNHEALTHY_GATE_MIN, REM_HOURS[src], deliver=deliver)
         all_new += n; all_rem += r; all_res += res
+        conn.commit()
 
     for host, remote_cmd in OP_REF_HOSTS.items():
         src = f"op_refs_{host}"
@@ -1282,29 +1310,39 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
             continue
         n, r, res = reconcile(conn, src, observed, now, 0, REM_HOURS[src], deliver=deliver)
         all_new += n; all_rem += r; all_res += res
+        conn.commit()
 
     gh = poll_github(env)
     for kind in ("github_pr", "github_issue"):
         n, r, res = reconcile(conn, kind, gh[kind], now, 0, REM_HOURS[kind], deliver=deliver)
         all_new += n; all_rem += r; all_res += res
+        conn.commit()
 
     n, r, res = reconcile(conn, "hermes_cron", poll_hermes_cron(), now, 0, REM_HOURS["hermes_cron"], deliver=deliver)
     all_new += n; all_rem += r; all_res += res
+    conn.commit()
 
     n, r, res = reconcile(conn, "stray_skill", poll_stray_skills(), now, 0, REM_HOURS["stray_skill"], deliver=deliver)
     all_new += n; all_rem += r; all_res += res
+    conn.commit()
 
     log_groups = poll_hermes_logs(conn, now, now_iso)
     if log_groups:
         all_new += upsert_grouped(conn, "hermes_log", log_groups, now,
                                   flap_threshold=1, cooldown_hours=REM_HOURS["hermes_log"],
                                   deliver=deliver)
+    conn.commit()
 
     for cur_key, ch_id, src, skip_uk in [
         ("slack_alert_ts", CH_ALERTS, "slack_alert", True),
         ("slack_update_ts", CH_UPDATES, "slack_update", False),
     ]:
         since = cursor_get(conn, cur_key)
+        # Immediately before the probe, NOT at the tail of this body: both
+        # `continue`s below jump straight to the next iteration, so a commit
+        # placed at the end is skipped by exactly the paths that just wrote a
+        # fail-streak cursor. tests/test_watchdog_locking.py caught this.
+        conn.commit()
         msgs, latest, ok = poll_slack_messages(env, ch_id, since, skip_uk_push=skip_uk)
         streak_key = f"{src}_fail_streak"
         if ok:
@@ -1321,6 +1359,7 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
             all_new += upsert_grouped(conn, src, groups, now, deliver=deliver)
         if latest and latest != since:
             cursor_set(conn, cur_key, latest, now_iso)
+        conn.commit()
 
     sweep_stale_grouped(conn, now)
 
