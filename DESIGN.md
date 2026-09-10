@@ -5,7 +5,7 @@ estate that holds that state.** Everything else feeds it (pollers), executes for
 it (sideclaw), or renders it (Argo, Slack).
 
 STATUS: design v2. **Wave 0 is built and live** — the loop, the pollers and the
-ledger run here on four LaunchAgents, and sideclaw enforces the repo allowlist.
+ledger run here on five LaunchAgents, and sideclaw enforces the repo allowlist.
 `STATE.md` is where the implementation actually is and is the file to read first;
 this one is what it is measured against. v1 was reviewed by three agents and one
 out-of-family model; four criticals came back and are folded in here. `REVIEW.md`

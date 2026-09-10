@@ -13,7 +13,7 @@ estate that holds that state.** Everything else feeds it (pollers), executes for
 
 ## Running it
 
-warden is four LaunchAgents on the mini, never `hermes cron` jobs. The reason is the
+warden is five LaunchAgents on the mini, never `hermes cron` jobs. The reason is the
 whole reason this repo is separate: the loop that notices Hermes is broken cannot
 depend on Hermes being up to run it, and its Slack delivery is a plain HTTP client
 rather than the gateway's live connection.

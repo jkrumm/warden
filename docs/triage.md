@@ -1283,7 +1283,7 @@ carries a pending change, and `--dry-run` making zero model calls.
 is the running tally *as each group of cases landed*, not the count today —
 they are kept because each paragraph describes what its own group covers. The
 number that governs is the one in `CLAUDE.md`: the regression gate, at
-**107/107**, and any other number is a finding rather than a count to edit.
+**148/148**, and any other number is a finding rather than a count to edit.
 The 32 cases past 64 are Wave 1's: the quiet rule (silence-resolve restricted
 to `new`), the intent queue's loop drain, and the deadline table. The 6 past
 96 are the `occurrence_mark` reopen fix (§ Known: grouped reopen churn). The 5

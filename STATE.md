@@ -6,9 +6,9 @@ This file records *what is*, not *what should be*.
 
 | | |
 |-|-|
-| Last updated | 2026-09-09 |
+| Last updated | 2026-09-10 |
 | Current wave | **0 — COMPLETE except one declared item (see §25). Do not start Wave 1 without reading it.** |
-| Repo state | `master`. The loop, poller, sweeper and backup run here on four LaunchAgents. |
+| Repo state | `master`. The loop, poller, sweeper, backup and read-only API run here on five LaunchAgents. |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -5549,3 +5549,147 @@ Item 2 (`warden abort` — needs a real `POST /api/jobs/:id/cancel` in sideclaw,
 which does not exist — `warden revert`, the per-repo in-flight lock), then item 3:
 drive a dependency upgrade through the whole chain and kill the process at every
 boundary. The `autoMergePaths` decision for argo gates item 3 and is the operator's.
+
+---
+
+## 52. Wave 4 (estate chain) — reconnaissance against the running system (2026-09-10, ~17:30Z)
+
+This is step 4.1 of `~/SourceRoot/dotfiles/docs/waves/PLAN.md` Wave 4 — a different
+chain from warden's own Waves 0–3 above. Findings only; every number below was
+measured on the mini before any edit in this wave. The design authority for what
+follows is `brain/Inbox/Warden Wave 4 — Shape.md`; where it or the audit was wrong,
+that is recorded here.
+
+### Warden
+
+```
+make status   five agents ✓ (loop, poll, sweep, backup, api pid 89295), last exit 0
+              api /health ✓ ok, schema 5 = expected 5, all three pollers fresh
+              policy ✓ both copies agree on all 30 repos
+make test     test_api 26/26 · test_dispatch_sweep ok · test_intents 19/19 ·
+              test_ledger 19/19 · test_triage 148/148 · watchdog_delivery ok ·
+              watchdog_locking 3/3 · watchdog_slack_blindness ok
+/metrics      verdicts_recorded_disposition 0.7 (7/10) · verified_fixes_vs_silence
+              0.0 (0 fixed / 9 quiet / 3 closed) · everything windowed is null with
+              a reason (history_since 2026-09-09T19:43Z)
+```
+
+Tree clean at `d3f5f2b`. `CLAUDE.md` and `docs/triage.md` still name the
+`test_triage.py` gate as **107/107**; it has been 148/148 since Wave 3 — corrected in
+this wave's docs commit, the number is a finding to report and 148 is the reported
+number.
+
+`warden-loop.err` tail: the four `needs_human` items with NULL `state_deadline`
+(uk:204/220/229/193) were stamped 168h on 2026-09-10 17:34Z by the loop's own
+backfill; the last line before that is `propose_mappings — model call failed: HTTP
+Error 403` — from the IU cost-cap window, see below.
+
+### The IU key, measured
+
+`curl $ANTHROPIC_BASE_URL/v1/messages` with `model: glm-5.3-flash` → **HTTP 200**,
+`"text":"OK"`. The last `403 access_denied` in `~/Library/Logs/sideclaw.jsonl` is
+`2026-09-10T13:36:55Z` (a `review` adversary angle). The cap is gone; nothing in
+this wave is blocked on it. Finding 2 is closed by the provider, not by us.
+
+### sideclaw's cheap lane — the audit's diagnosis was wrong in the way that matters
+
+`GET /api/routing`: `check`/`overview`/`review_router` = `glm-5.3-flash` on `iu`,
+fallback `claude-haiku-4-5` on `max`, no `.env` overrides. `GET /api/jobs?limit=30`:
+the newest `overview` jobs failed, the newest `check` failed, one `review` done.
+
+Reproduced sideclaw's exact worker argv by hand (`-p … --output-format stream-json
+--verbose --setting-sources project --settings '{"disableAllHooks":true}'
+--strict-mcp-config --max-turns … --model glm-5.3-flash`, IU env, the four
+`ANTHROPIC_DEFAULT_*_MODEL` pins) on Claude Code **2.1.267**:
+
+```
+exit=0   result subtype=success  result="OK"
+stderr:  ⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set …
+         [claude-code:unrecognized_model] {"model":"glm-5.3-flash","query_source":"generate_session_title"}
+```
+
+**Both stderr lines are warnings.** They print on every IU run, including the ones
+that exit 0 — `[claude-code:unrecognized_model]` is 2.1.266+'s client-side model
+catalog noting it cannot describe a gateway id (the long form says: *"isn't
+described by this version's model catalog; … map it with behavesAs on a
+modelPicker row … CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 restores the
+previous wait-for-the-API behavior"*). It costs nothing here: sideclaw already sets
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` from its own gateway table, so the 200k assumption
+the warning describes never applies. The audit's "two distinct shapes"
+(`unrecognized_model` vs `connectors are disabled`) are one shape: the same stderr
+prefix, captured whole or truncated. Neither ever made a job fail.
+
+What did fail, by job:
+
+| Job | Route | What actually happened |
+|-|-|-|
+| `e8902111`, `8152bad3` (09-09), `9c5a7339` (today 17:37Z) | overview, glm/iu | **Timed out at 120 000 ms**, exit 143 after SIGTERM, then `backend.fallback reason=iu-unavailable` → haiku on max. 09-09 the fallback finished in 62 s. Today the fallback **also** hit 120 s (`session.timeout_unclassified`, turns=3) — a 242 s `job.fail` on both lanes. |
+| `440837aa`, `50559f44` (today 12:23Z), `13ed9bc9` (check, 12:17Z) | glm/iu | Exit 1 in ~2.7 s, **inside the 403 window**. The gateway's refusal reaches Claude Code as an API error (result envelope `is_error: true, api_error_status: 403`, plus one synthetic assistant turn carrying Claude Code's own error text) — not stderr, which is why the only stderr on record is the warning. `planNextAttempt` did not fall back: at attempt 1 on `iu` the `iuDown` branch needs `noCredentials || timedOutStuck || attempt >= 2`, 403 is not in the retryable status set, and the synthetic turn made `noOutputYet` false. |
+
+So finding 1's "the fallback never fires" is true only for the refusal shape; the
+timeout shape has been falling back correctly since 09-09. The fix is two-sided and
+lands in this wave (step 4.2): classify a gateway refusal (`api_error_status ≥ 400`
+on the envelope, or the `access_denied|cost-service-denial|403` text on a zero-output
+exit) as "IU never answered" so the max fallback fires at attempt 1; and give
+`overview` a cap both lanes can meet.
+
+`overview` measured by hand on the current 16 KB / 9-agent prompt: glm/iu **139 s**
+once (`num_turns=4`, one legitimate `StructuredOutput` retry on a 123-char
+`standing` > 120), **nothing in 82 s** the next time; haiku/max 58–60 s; haiku/iu
+119.9 s. Model-side latency, not a loop — `check` on the same glm/iu transport
+finished in 64 s (`57e2a7ed`, `make test` + `make check-policy`, passed). The 2 min
+cap was undersized for glm's success case and did not cover haiku's tail either.
+
+`GET /api/jobs/health` before the change: `ok: true`, `backendFallbacks.count: 0`
+(process-local, last hour only) — three days of a route that never succeeded on its
+primary were invisible, exactly finding 22.
+
+`modelpick` (`cap --list`, suite "final" 2026-08-31): unattended worker =
+`glm-5.3-flash`, "cheapest perfect score at $0.035 … 38m 24s wall, which is what the
+price buys". The route stays; the timeout moves.
+
+### The Hermes gateway
+
+`ai.hermes.gateway` pid 94884, up. `gateway.error.log`: `slack_bolt.AsyncApp: Failed
+to connect (error: Session is closed); Retrying…` **every 10 s, 360/hour, all day**
+(32 682 lines since 2026-09-07). Yet `gateway.log` shows a Slack response delivered
+at 18:26:30 local and `Socket Mode unhealthy (transport disconnected); reconnecting`
+at 19:27:41 — one live Socket Mode client and one dead one retrying forever. UptimeKuma
+`Hermes - HTTP` is down (uptime1d 0). Finding 3 is live: `dispatch-sweep.py`'s
+`send_message()` and the plugin's `_send_to_origin` still shell out to `hermes send`
+(step 4.4 removes that dependency). `dispatches.reported_at` today: 25 timestamps, 2
+`undeliverable:no-origin-channel` strings in the timestamp column.
+
+### Argo
+
+`https://argo.jkrumm.com/agents` → 200 (the SPA shell); `/api/agents/overview` → 401
+without a token. Not probed further — Wave 7 owns the Argo surface.
+
+### The notifier (STATE §49, finding 6), re-measured
+
+`events` with `source='uk'` carry `payload.type`; the three forever-reminders are all
+`type: "group"` (ev710 "Services" reminder_count 8, ev269 "Local" 7, ev285 "VPS" 8;
+16 group events in history). `triage_items` is keyed by `event_id`. The reminder
+branch (`watchdog-poll.py:894-930`) still has exactly one mute. Step 4.5's disposal
+of the three: skip `type == "group"` at the poller — a group parent's children alert
+on their own, a parent has `repo IS NULL` and can never be escalated. That is the
+operator call §49 deferred; it is taken here under the chain's authorization and is
+reversible (one `continue`).
+
+### What the shape note got wrong
+
+- "The 403 … resolved externally" — confirmed, but the note's timeline had the cheap
+  lane dead *because of* `unrecognized_model`; it never was (above).
+- `hermes-cc.sh` "2 679 lines" — current file is the same order; the relevant fact
+  for step 4.3 is that it has **zero self-location logic** (no `$0`, `BASH_SOURCE`,
+  `source`): every path is `$HOME`-anchored and env-overridable, so a two-line
+  `exec` shim is behaviourally exact. Two hermes-agent tests read the script's
+  *text* (`test_hermes_cc.py:2524`, `test_dispatch_approval.py:213`) and would pass
+  vacuously or crash against a shim — the suites move with the file.
+- `hermes-agent/config/dispatch-repos.json` is not an inventory: `root`,
+  `defaultTier`, `deny`, `sensitive`, `tiers.investigate`. `make check-policy`
+  compares *that* file against sideclaw, not `triage-policy.json` — so "deleted"
+  means moved into `warden/config/`, or the check loses its subject.
+- The Hermes-side guards (`tirith-hermes-guards.patch`, `test_raw_agent_guard.py`)
+  key on the literal path `~/.hermes/scripts/hermes-cc.sh`. The Hermes door keeps
+  calling the shim path; only warden's loop and the plugin repoint to warden.
