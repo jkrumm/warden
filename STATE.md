@@ -5409,3 +5409,143 @@ Item 1b's warden half, in flight: the `deployOnMerge` policy key, the third merg
 case into `liveness_pending`, an `argo-commit-live` liveness gatherer, and the
 Actions run id folded into the merge operation's receipt as the deploy receipt the
 ssh path structurally cannot provide.
+
+---
+
+## 51. Wave 3, item 1b — merge-is-deploy (DONE & LIVE, no schema change)
+
+§47 found that `DESIGN.md`'s *"merge **is** deploy"* had no code path: a RollHook
+repo merges, lands in `merged`, expires to `closed` at 1h, and never reaches a
+probe — so `fixed` was unreachable for every repo except `vps`. This closes that,
+with the GitHub Actions run as the deploy receipt the ssh path structurally cannot
+provide.
+
+### What changed
+
+| File | Change |
+|-|-|
+| `scripts/triage.py` | `_gather_argo_commit_live()` + `ARGO_HEALTH_URL`, registered as `argo-commit-live`; `_FULL_SHA_RE`; `_run_gh_run_list()`; a third merge case in `poll_validation_jobs()`; `reconcile_operations()` asks for the real run status and converges the item |
+| `config/triage-policy.json` | `argo` in `repos` — `deployOnMerge` + `liveness`, **no `autoMergePaths`**; the new key documented in `_readme` |
+| `tests/test_triage.py` | 131 → **148** |
+| `DESIGN.md`, `docs/triage.md` | the mechanism, the policy key, the gatherer |
+
+No schema change — `deploy_expect_json` and `liveness_deadline` already exist and
+the new payload reuses the list-of-dicts shape `maybe_check_liveness()` already
+deserializes.
+
+**The merge gate stays shut.** argo has no `autoMergePaths`, so
+`merge_gate_check()` refuses every merge with `NOPATHS`. The mechanism, the
+receipt and the probe are all built and tested while warden cannot merge anything
+in argo. Opening it is a separate operator decision and is called out in the
+policy file itself so nobody "completes" the entry.
+
+### The probe is an exact sha match, and that is the whole point
+
+A restart-time probe (research-gateway's `lastRestartAt`, argo's container
+`startedAt`) proves *a* restart, not *this* commit. `fixed` is the one state in
+this system that claims a change actually worked, and `REVIEW.md` C3 is about
+exactly how that claim gets gamed. So `ok` is true only on an exact match;
+`"unknown"` (argo's own out-of-CI placeholder), a differing sha, a missing field,
+a non-200 and unparseable JSON all read as a genuine mismatch, never as "not sure".
+
+**Run against the live service, not a stub:**
+
+```
+URL: https://argo.jkrumm.com/api/health
+match  -> (True,  'commit cf003491b462 live')
+wrong  -> (False, "live commit 'cf003491b462' != expected 'aaaaaaaaaaaa'")
+empty  -> (False, 'no expected commit was captured at merge time')
+nosha  -> (False, 'expected deploy record carried no commit sha')
+```
+
+The URL lives in the gatherer, not the policy file — `LIVENESS_ALLOWLIST` names a
+behaviour and the behaviour owns its endpoint, exactly as `hyperdx-alert-state`
+owns `HYPERDX_BASE`. A config-driven URL would let a policy edit alone decide what
+this loop asks an arbitrary host to confirm, which is what the closed-allowlist
+principle exists to prevent.
+
+### A second mutation SURVIVED, same lesson as §48, one branch deeper
+
+The worker's own table was clean. My independent battery replaced the sha guard
+`isinstance(merge_sha, str) and _FULL_SHA_RE.match(merge_sha)` with a bare
+`merge_sha is not None` — and the suite stayed green at 148/148.
+
+The test covering that guard passed `mergeCommit: None`, **the one value both
+spellings reject.** `_FULL_SHA_RE` exists for the present-but-malformed values, and
+none of them was tested. The test now runs eight cases — `None`, `""`, `"abc"`, 39
+hex, 41 hex, uppercase, `"unknown"`, and 40 non-hex chars — and the mutation now
+fails by name on the empty string, which would otherwise have entered
+`liveness_pending` with nothing a probe could ever match.
+
+Same shape as §48's survived mutation and §42 defect 3 before it: **a test that
+exercises one branch of a compound condition looks like coverage and is not.**
+Three waves, three instances, each found only by mutation.
+
+### One defect fixed on the worker's diff, flagged in its own report
+
+A `deployOnMerge` merge reconciled **via GitHub** after a crash landed in
+`STATE_MERGED` with the note *"no deploy configured for this repo"* — false for
+this repo class — and never resumed toward a probe.
+
+The reasoning that fixes it: **a `deployOnMerge` deploy is driven by GitHub
+Actions off the push, not by the subprocess warden lost.** A crash in warden says
+nothing about whether the deploy ran, and the probe can still answer. So
+reconciliation now converges on exactly where the live path puts it —
+`liveness_pending` on `[{"commit": sha}]`, with a fresh window measured from now
+(the probe is idempotent; the deadline bounds how long we wait for it, it is not a
+claim about when the deploy happened). Two tests pin both sides of that branch.
+
+That convergence is worth stating as a principle: **a reconciled operation must
+land its item where the uncrashed path would have.** §48 got this right for the
+ssh case and wrong for this one, because this repo class did not exist yet.
+
+### Verified
+
+```
+$ make test
+  test_api.py 26/26 · test_ledger.py 19/19 · test_intents.py 19/19
+  test_triage.py 148/148 · three "all cases as expected" suites · test_watchdog_locking.py 3/3
+$ grep -c 'UPDATE triage_items SET state=' scripts/triage.py    1
+$ make check-policy    ✓ both copies agree on all 30 repos
+$ config/triage-policy.json — JSON valid
+```
+
+131 + 15 (worker) + 2 (convergence) = 148; the eight-case guard test replaced a
+one-case one rather than adding to the count.
+
+Six mutations, each red **by name**, restored, file verified byte-identical:
+reconciled `deployOnMerge` no longer converging; the gatherer returning true on any
+200; the gatherer accepting `"unknown"`; `deployOnMerge` merges going to `merged`;
+the sha guard weakened to `is not None` (the survivor, now caught); and the Actions
+run identity dropped from the receipt.
+
+### Also corrected: a factual error in my own brief
+
+The brief claimed the positive-path test would be *"the first test in the repo's
+history that produces a `fixed` row"*. False — `test_liveness_confirmed_resolves_the_item`
+already asserted `STATE_FIXED`. The worker checked, wrote the test anyway on honest
+framing (it exercises the real `argo-commit-live` gatherer end to end rather than a
+swapped-in stub, which *is* new), and flagged the discrepancy rather than adopting
+the claim. That is the reasoned-brief contract working in the direction it is meant
+to.
+
+### Live
+
+The five agents ran throughout — this slice is additive (a new policy key, a new
+allowlist entry, a new branch), so no `make unload` was needed. Checked after the
+edits landed: all five ✓ last exit 0, `/health` ok at schema 5, all three pollers
+fresh, census unchanged, `warden-loop.err` mtime still 2026-09-09 22:39Z.
+
+### What is now true that was not
+
+`fixed` is reachable. The chain has a repo where merge is deploy, a receipt with an
+id that outlives the process, and a probe that proves a specific commit is serving.
+**Nothing has run it yet** — the merge gate is deliberately shut, so no item can
+reach `implementing` in argo. That is the stop-condition exercise, and it is next.
+
+### Next action
+
+Item 2 (`warden abort` — needs a real `POST /api/jobs/:id/cancel` in sideclaw,
+which does not exist — `warden revert`, the per-repo in-flight lock), then item 3:
+drive a dependency upgrade through the whole chain and kill the process at every
+boundary. The `autoMergePaths` decision for argo gates item 3 and is the operator's.

@@ -824,11 +824,69 @@ def _gather_hyperdx_alert_state(expected: list[dict[str, Any]]) -> tuple[bool, s
     return True, f"{len(expected)} alert definition(s) verified live"
 
 
+ARGO_HEALTH_URL = os.environ.get("TRIAGE_ARGO_HEALTH_URL", "https://argo.jkrumm.com/api/health")
+
+
+def _gather_argo_commit_live(expected: list[dict[str, Any]]) -> tuple[bool, str]:
+    """The deployOnMerge liveness probe for `argo` (item 1b, STATE.md §47/§48).
+    Re-reads argo's own `GET /api/health` — tailnet-reachable, no auth, no
+    secret, verified directly against a real merge (jkrumm/argo#16, 56s
+    merge-to-served) — and asserts its `commit` field matches the merge
+    commit sha captured at merge time (poll_validation_jobs()'s deployOnMerge
+    branch, carried on triage_items.deploy_expect_json as the SAME
+    list-of-dicts shape `_gather_hyperdx_alert_state()` above already uses —
+    `[{"commit": sha}]` — see maybe_check_liveness()'s own docstring for why
+    that shape is fixed, not reinvented per gatherer).
+
+    `ok` is a genuine exact-sha-match POSITIVE confirmation, never inferred
+    from the service merely being reachable or having recently restarted. A
+    restart-time-only probe cannot distinguish a landed deploy from a
+    container that bounced for an unrelated reason — STATE.md §47's own
+    research-gateway/meteo reconnaissance hit exactly this ambiguity, which
+    is why it stopped short of using `lastRestartAt` here. `fixed` is the
+    one state in this file that claims a change actually worked
+    (LIVENESS_CONFIRMED_NOTE_PREFIX is "the one genuine 'this is actually
+    fixed' claim in the file" — see its own comment), and REVIEW.md C3 is
+    about exactly how that claim gets gamed by a weaker probe. `"unknown"`
+    (argo's own placeholder for a build outside CI), a missing `commit`
+    field, a differing sha, a non-200, and unparseable JSON all fall through
+    to the same `!= want` comparison below and read as a genuine mismatch,
+    never as "not sure".
+
+    THE URL LIVES HERE, NOT IN THE POLICY FILE. DESIGN.md principle 4 (the
+    four closed allowlists — see this repo's own CLAUDE.md): a policy file
+    may name and parameterise a behaviour, never express one.
+    LIVENESS_ALLOWLIST names a KEY ("argo-commit-live"); this function owns
+    argo's endpoint the same way _gather_hyperdx_alert_state() above owns
+    HYPERDX_BASE — one gatherer per repo is the correct shape here, not a
+    generic URL-fetcher driven by config. This will read as duplication next
+    to that gatherer; it is not — a config-driven URL would let a policy
+    edit alone decide what this loop asks an arbitrary host to confirm,
+    which is exactly what the closed-allowlist principle exists to prevent."""
+    if not expected:
+        return False, "no expected commit was captured at merge time"
+    want = expected[0].get("commit")
+    if not want:
+        return False, "expected deploy record carried no commit sha"
+    req = urllib.request.Request(ARGO_HEALTH_URL)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, OSError) as e:
+        return False, f"argo health fetch failed: {e}"
+    live = data.get("commit") if isinstance(data, dict) else None
+    if not isinstance(live, str) or live != want:
+        return False, f"live commit {str(live)[:12]!r} != expected {str(want)[:12]!r}"
+    return True, f"commit {want[:12]} live"
+
+
 # Same closed-set principle as VERB_ALLOWLIST/EVIDENCE_ALLOWLIST above: a
 # repo's `config/triage-policy.json` entry names a `liveness` KEY, never a
-# probe. Seeded with exactly one, matching the one seeded `deploy` key.
+# probe. Seeded with the original `deploy` key plus `argo-commit-live` (item
+# 1b) for the merge-is-deploy path.
 LIVENESS_ALLOWLIST = {
     "hyperdx-alert-state": _gather_hyperdx_alert_state,
+    "argo-commit-live": _gather_argo_commit_live,
 }
 
 # --- propose_mappings() — the one LLM call in this file (see module docstring
@@ -3016,6 +3074,14 @@ def _hermes_cc_status(job_id: str) -> dict[str, Any] | None:
 # instruction not to write a second parser for the same URL.
 _PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)$")
 
+# A full git commit sha, lowercase hex, exactly 40 chars — what hermes-cc.sh's
+# own `merge_sha` and `gh`'s `mergeCommit.oid` both produce (STATE.md §47's
+# jkrumm/argo#16 verification). Used by the deployOnMerge branches below (item
+# 1b) to refuse a probe with nothing real to compare against, rather than
+# entering `liveness_pending` on a short/garbled/empty value that could never
+# match a live commit and would just sit until liveness_deadline and reopen.
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
 
 def _parse_pr_url(url: str | None) -> tuple[str, str, int] | None:
     """(owner, repo, pr_number) parsed from a GitHub pull request URL, or
@@ -3059,6 +3125,41 @@ def _run_gh_pr_view(owner: str, repo: str, pr: int) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         print(f"triage: gh pr view returned non-JSON for {owner}/{repo}#{pr}: {r.stdout[:300]}", file=sys.stderr)
         return None
+
+
+def _run_gh_run_list(owner: str, repo: str, sha: str) -> list[dict[str, Any]] | None:
+    """`gh run list --repo <owner>/<repo> --commit <sha> --json databaseId,name,status,conclusion,createdAt`
+    — read-only, used only by the deployOnMerge path (item 1b, STATE.md §47)
+    to attach the GitHub Actions run as the merge's deploy RECEIPT. This is
+    the thing DESIGN.md § Crash recovery asks for and the ssh deploy path
+    structurally cannot provide: `ssh <host> make <target>` returns only an
+    exit code to the (now dead) process that ran it, while an Actions run has
+    an id and is queryable after the fact, by anyone, at any later time.
+
+    Same single-bounded-poll, never-raises shape as _run_gh_pr_view()/
+    _hermes_cc_status(): `None` means the read itself failed (network,
+    non-zero exit, unparseable stdout) — never guessed at. An EMPTY list is a
+    different, legitimate answer: the workflow is queued by the push and can
+    take a moment to appear, so "no run visible yet" is normal right after a
+    merge and must not be conflated with "the read failed". Callers record
+    whichever of the two they got; neither retries in a loop."""
+    argv = [str(GH_BIN), "run", "list", "--repo", f"{owner}/{repo}", "--commit", sha,
+            "--json", "databaseId,name,status,conclusion,createdAt"]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"triage: gh run list failed for {owner}/{repo}@{sha}: {e}", file=sys.stderr)
+        return None
+    if r.returncode != 0:
+        print(f"triage: gh run list exited {r.returncode} for {owner}/{repo}@{sha}: "
+              f"{r.stderr.strip()[:300]}", file=sys.stderr)
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        print(f"triage: gh run list returned non-JSON for {owner}/{repo}@{sha}: {r.stdout[:300]}", file=sys.stderr)
+        return None
+    return data if isinstance(data, list) else None
 
 
 def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -3144,12 +3245,24 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                     merge_commit = gh_resp.get("mergeCommit")
                     sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else merge_commit
                     outcome = "done"
-                    # The deploy half has no remote answer — `ssh <host> make
-                    # <target>` returns only an exit code to the (now dead)
-                    # process that ran it. Recorded honestly as "unknown"
-                    # rather than guessed, per DESIGN.md § Crash recovery.
+                    repo_policy = (policy.get("repos") or {}).get(row["repo"] or "") or {}
+                    if repo_policy.get("deployOnMerge") and isinstance(sha, str) and _FULL_SHA_RE.match(sha):
+                        # Unlike the ssh path, this repo's deploy DOES have a
+                        # remote receipt to ask for — the Actions run against
+                        # this exact sha. Read what is there; a run that has
+                        # not appeared yet (_run_gh_run_list returns []) is
+                        # recorded as such, not retried in a loop.
+                        runs = _run_gh_run_list(owner, repo_name, sha)
+                        deploy_value: Any = runs if runs is not None else "unknown"
+                    else:
+                        # The ssh deploy half has no remote answer — `ssh
+                        # <host> make <target>` returns only an exit code to
+                        # the (now dead) process that ran it. Recorded
+                        # honestly as "unknown" rather than guessed, per
+                        # DESIGN.md § Crash recovery.
+                        deploy_value = "unknown"
                     new_receipt = {
-                        "pullRequest": pr, "mergeCommit": sha, "reconciled": True, "deploy": "unknown",
+                        "pullRequest": pr, "mergeCommit": sha, "reconciled": True, "deploy": deploy_value,
                     }
                 else:
                     outcome = "failed"
@@ -3198,7 +3311,29 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
         sha = (new_receipt or {}).get("mergeCommit")
         repo_entry = (policy.get("repos") or {}).get(row["repo"] or "") or {}
-        if repo_entry.get("autoDeploy"):
+        if repo_entry.get("deployOnMerge") and isinstance(sha, str) and _FULL_SHA_RE.match(sha):
+            # RECONCILIATION CONVERGES ON THE LIVE PATH, and that is the whole
+            # point of this branch. A deployOnMerge repo's deploy is driven by
+            # GitHub Actions off the push, NOT by the subprocess warden lost —
+            # so a crash here says nothing about whether the deploy ran, and
+            # the probe can still answer. Sending this item to `merged` (as
+            # the `else` below would) or to `needs_human` (as `autoDeploy`
+            # does) would strand a deploy that very likely succeeded, with a
+            # note saying "no deploy configured for this repo" that is simply
+            # false for this repo class.
+            #
+            # So it lands exactly where poll_validation_jobs() would have put
+            # it: `liveness_pending` on the same `[{"commit": sha}]` shape,
+            # with a fresh window measured from NOW rather than from the lost
+            # merge — the probe is idempotent and the deadline is a bound on
+            # how long we wait for it, not a claim about when the deploy
+            # happened.
+            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
+            _set_state(conn, row["event_id"], STATE_LIVENESS_PENDING, now,
+                       liveness_deadline=deadline,
+                       deploy_expect_json=json.dumps([{"commit": sha}]),
+                       note=None)
+        elif repo_entry.get("autoDeploy"):
             # Merged, and the deploy rode along inside the same lost
             # subprocess. `ssh <host> make <target>` leaves no remote handle
             # to ask (STATE.md §46), so whether production changed is
@@ -3612,28 +3747,63 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                     conn.commit()
             elif merge_call.result.get("ok") and merge_call.result.get("merged"):
                 deploy = merge_call.result.get("deploy") or {}
+                merge_sha = merge_call.result.get("mergeCommit")
+                repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
                 # mergeCommit is the one genuine remote receipt this system
                 # already obtains (hermes-cc.sh's own merge_sha) and used to
                 # throw away — STATE.md §46's write-ordering map names this
-                # exactly. Persisted here, plus the whole deploy object
-                # (output capped — see _DEPLOY_OUTPUT_RECEIPT_CAP_CHARS).
-                receipt = json.dumps({
-                    "pullRequest": merge_call.result.get("pullRequest"),
-                    "mergeCommit": merge_call.result.get("mergeCommit"),
-                    "branch": merge_call.result.get("branch"),
-                    "mergeMethod": merge_call.result.get("mergeMethod"),
-                    "deploy": {
-                        **deploy,
-                        "output": _cap_evidence(deploy.get("output") or "", _DEPLOY_OUTPUT_RECEIPT_CAP_CHARS),
-                    },
-                })
-                complete_operation(conn, op_id, outcome="done", receipt=receipt)
+                # exactly. Persisted here, plus a `deploy` object — either the
+                # ssh-deploy half hermes-cc.sh already ran (output capped, see
+                # _DEPLOY_OUTPUT_RECEIPT_CAP_CHARS), or, for a deployOnMerge
+                # repo, the Actions run identity below.
+                receipt_deploy: dict[str, Any] = {
+                    **deploy,
+                    "output": _cap_evidence(deploy.get("output") or "", _DEPLOY_OUTPUT_RECEIPT_CAP_CHARS),
+                }
+                deadline: str | None = None
+                expect_json: str | None = None
                 if deploy.get("attempted") and deploy.get("ok"):
                     deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
+                    expect_json = json.dumps(deploy.get("expectedAlerts") or [])
+                elif repo_entry.get("deployOnMerge") and isinstance(merge_sha, str) and _FULL_SHA_RE.match(merge_sha):
+                    # item 1b (STATE.md §47/§48): this repo's CI/CD IS the
+                    # deploy (GitHub Actions -> RollHook, DESIGN.md § Deploy)
+                    # — there is no ssh half to have set `deploy.attempted`,
+                    # so this branch only runs once the ssh-deploy case above
+                    # has already said no (hermes-cc.sh's own
+                    # run_deploy_if_enabled() returns attempted:false for a
+                    # repo with no `autoDeploy` key, which a deployOnMerge
+                    # repo deliberately never declares — see the policy
+                    # entry's own comment). The Actions run is the deploy
+                    # RECEIPT the ssh path can never supply (STATE.md §47);
+                    # owner/repo parsed from the PR url the same way
+                    # reconcile_operations() already does, never a second URL
+                    # parser (_parse_pr_url()).
+                    parsed = _parse_pr_url(item["pr_url"])
+                    runs = _run_gh_run_list(parsed[0], parsed[1], merge_sha) if parsed else None
+                    receipt_deploy = {"mechanism": "deploy-on-merge", "commit": merge_sha,
+                                       "runs": runs if runs is not None else "unknown"}
+                    deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
+                    expect_json = json.dumps([{"commit": merge_sha}])
+                receipt = json.dumps({
+                    "pullRequest": merge_call.result.get("pullRequest"),
+                    "mergeCommit": merge_sha,
+                    "branch": merge_call.result.get("branch"),
+                    "mergeMethod": merge_call.result.get("mergeMethod"),
+                    "deploy": receipt_deploy,
+                })
+                complete_operation(conn, op_id, outcome="done", receipt=receipt)
+                if deadline is not None:
                     _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
-                               liveness_deadline=deadline,
-                               deploy_expect_json=json.dumps(deploy.get("expectedAlerts") or []),
-                               note=None)
+                               liveness_deadline=deadline, deploy_expect_json=expect_json, note=None)
+                elif repo_entry.get("deployOnMerge"):
+                    # deployOnMerge is set but the merge carried no usable
+                    # sha — a probe with nothing real to compare against
+                    # would sit until liveness_deadline and then reopen the
+                    # item to `new`, a worse outcome than an honest `merged`.
+                    reason = (f"deployOnMerge is set for this repo but the merge result carried no "
+                              f"usable mergeCommit ({merge_sha!r})")
+                    _set_state(conn, item["event_id"], STATE_MERGED, now, note=reason)
                 else:
                     reason = deploy.get("reason") or "merged; no deploy configured for this repo"
                     _set_state(conn, item["event_id"], STATE_MERGED, now, note=reason)

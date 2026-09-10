@@ -1092,17 +1092,53 @@ contents API, never the local checkout) and records
 item — what step 10 verifies against. State: `merged` (no deploy) |
 `liveness_pending` (deploy attempted and succeeded).
 
+**Step 8b — merge-is-deploy (`deployOnMerge`, item 1b).** A third outcome of
+the same `poll_validation_jobs()` merge branch, checked only once the
+`deploy.attempted && deploy.ok` case above has already said no (a
+`deployOnMerge` repo never declares `autoDeploy`, so the two never actually
+compete): if the repo's `config/triage-policy.json` entry sets
+`"deployOnMerge": true` and the merge result carried a usable 40-char-hex
+`mergeCommit`, the item goes straight to `liveness_pending` on that sha —
+`deploy_expect_json` becomes `[{"commit": "<sha>"}]`, the same
+list-of-dicts shape step 9's alert-expectation payload already uses, just
+with one key instead of three. There is no ssh half here for `deploy` to be
+`attempted`/`ok` about — this repo's own CI/CD (GitHub Actions → RollHook)
+*is* the deploy, which `DESIGN.md` § Deploy already claimed and had no code
+path for until this slice (see STATE.md §47's reconnaissance). The receipt
+`ssh <host> make <target>` structurally cannot provide — an exit code to a
+process that is dead the moment it returns — a GitHub Actions run CAN: it has
+an id, queryable after the fact by anyone. `gh run list --commit <sha>` is
+folded into the merge operation's own `receipt_json` under `deploy`
+(`{"mechanism": "deploy-on-merge", "commit": <sha>, "runs": [...] |
+"unknown"}` — `"unknown"` only when the read itself failed, an empty list
+when the workflow genuinely has not appeared yet; neither is fabricated, and
+neither is retried in a loop). A merge result with no usable sha falls
+through to plain `merged` with a reason instead — entering
+`liveness_pending` with nothing to compare against would just sit until
+`liveness_deadline` and reopen the item, worse than an honest `merged`.
+State: `validating` → `liveness_pending` (deployOnMerge, usable sha) |
+`merged` (deployOnMerge, no usable sha).
+
 **Step 10 — `maybe_check_liveness()`.** The item must not close because the
 alert went quiet — a fully-down service is also quiet, the same principle
 `resolve_quiet_grouped()`/`resolve_recovery_paired()` already apply above.
 Runs the repo's declared `liveness` key (`config/triage-policy.json`, same
-closed-allowlist shape) against `deploy_expect_json`; seeded with exactly
-one, `hyperdx-alert-state`, which re-reads every expected alert's LIVE
+closed-allowlist shape) against `deploy_expect_json`; seeded with two:
+`hyperdx-alert-state`, which re-reads every expected alert's LIVE
 `threshold`/`thresholdType` from `GET
 https://hyperdx.jkrumm.com/api/api/v2/alerts` (the SAME REST endpoint
 `vps/scripts/hyperdx-sync.sh`'s own `export`/`apply` already use — read from
 that script, never a fabricated endpoint) and asserts it matches what the
-merged diff set. Only a genuine POSITIVE match resolves the item
+merged diff set; and `argo-commit-live` (item 1b), which re-reads argo's own
+`GET https://argo.jkrumm.com/api/health` and asserts its `commit` field
+matches the merge sha EXACTLY — never inferred from the service merely being
+reachable, since a restart-time-only probe cannot distinguish a landed
+deploy from a container that bounced for an unrelated reason (the exact
+ambiguity STATE.md §47's own research-gateway/meteo reconnaissance hit, and
+part of why `argo` is the deployOnMerge repo seeded here rather than one of
+those two). Both gatherer functions own their own endpoint directly, never a
+config-driven URL — a policy file may name and parameterise a behaviour,
+never express one (`DESIGN.md` principle 4). Only a genuine POSITIVE match resolves the item
 (`LIVENESS_CONFIRMED_NOTE_PREFIX`, the one prefix in this file that actually
 claims "fixed" — every other resolve note deliberately doesn't). Past
 `liveness_deadline` (`LIVENESS_WINDOW_HOURS`, default 2h) with no positive
@@ -1125,6 +1161,10 @@ before this file existed at all.
       "deploy": "hyperdx-apply",
       "autoDeploy": false,
       "liveness": "hyperdx-alert-state"
+    },
+    "argo": {
+      "deployOnMerge": true,
+      "liveness": "argo-commit-live"
     }
   }
 }
@@ -1132,8 +1172,9 @@ before this file existed at all.
 
 `autoMergePaths`/`noCiRequired`/`deploy`/`autoDeploy` are read by
 `hermes-cc.sh`'s `cmd_merge` (via `HERMES_CC_TRIAGE_POLICY_JSON`, defaulting
-to this same file); `liveness` is read here, by `maybe_check_liveness()`.
-Every changed path in a PR must match `autoMergePaths` or the merge refuses
+to this same file); `liveness` and `deployOnMerge` are read here, by
+`maybe_check_liveness()` and `poll_validation_jobs()` respectively. Every
+changed path in a PR must match `autoMergePaths` or the merge refuses
 outright — a repo absent from `repos`, or with no `autoMergePaths`, refuses
 too; there is no implicit allow. `noCiRequired` is the explicit
 acknowledgement that a repo has zero PR-time required checks, so their
@@ -1142,6 +1183,13 @@ being silently read as "CI passed" (measured wrong — `clean` is vacuously
 true whenever nothing ran, which is `vps`'s and `research-gateway`'s exact
 shape: no `.github/workflows` at all). A repo with zero check-runs and no
 `noCiRequired` entry FAILS the gate now, on purpose.
+
+`argo`'s entry above is seeded with **deliberately no `autoMergePaths`** —
+`merge_gate_check()` still refuses every merge for this repo outright
+(`NOPATHS`, there is no implicit allow), so `deployOnMerge` builds the
+merge-is-deploy MECHANISM (item 1b) with the merge gate closed. Opening it is
+a separate operator decision; the live policy file says so next to the entry
+so nobody "completes" it by adding a scope later without meaning to.
 
 ## Silencing `#alerts`
 

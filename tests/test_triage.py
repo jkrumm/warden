@@ -2109,6 +2109,224 @@ def test_confirmed_merge_with_successful_deploy_enters_liveness_pending():
         assert json.loads(item["deploy_expect_json"]) == expected
 
 
+# --- deployOnMerge (item 1b, STATE.md §47/§48) — merge-is-deploy as a first-
+# class path, the GitHub Actions run as its receipt --------------------------
+
+def test_confirmed_merge_in_deploy_on_merge_repo_enters_liveness_pending_on_the_merge_sha():
+    """A merge in a deployOnMerge repo must go straight to `liveness_pending`
+    on the merge commit sha, never to `merged` — the only path that existed
+    before this slice (STATE.md §47's central finding)."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-dom-enter", confidence="high",
+                                  investigate_job="investigate-dom-enter", repo="argo")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-dom-enter", "validation-job-dom-enter",
+             "https://github.com/jkrumm/argo/pull/20", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-dom-enter", repo="argo")
+
+        triage._hermes_cc_status = lambda job_id: {
+            "ok": True, "status": "done",
+            "verdict": {"summary": "correct. " + triage.VALIDATION_CONFIRM_MARKER},
+        }
+        sha = "1" + "a" * 39
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult({
+            "ok": True, "merged": True, "pullRequest": 20, "mergeCommit": sha,
+            "branch": "dispatch/argo", "mergeMethod": "rebase",
+            "deploy": {"attempted": False, "reason": "autoDeploy is false for argo"},
+        }, None)
+        triage._run_gh_run_list = lambda owner, repo, commit_sha: []
+
+        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
+        triage.poll_validation_jobs(conn, policy, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_LIVENESS_PENDING, item["state"]
+        assert item["liveness_deadline"] is not None
+        assert json.loads(item["deploy_expect_json"]) == [{"commit": sha}]
+
+
+def test_confirmed_merge_without_deploy_on_merge_still_lands_merged():
+    """Regression: a repo whose policy entry does NOT set deployOnMerge keeps
+    the pre-existing behaviour exactly — `merged`, never `liveness_pending` —
+    even with other per-repo keys present (e.g. `liveness` alone)."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-no-dom", confidence="high",
+                                  investigate_job="investigate-no-dom", repo="argo")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-no-dom", "validation-job-no-dom",
+             "https://github.com/jkrumm/argo/pull/21", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-no-dom", repo="argo")
+
+        triage._hermes_cc_status = lambda job_id: {
+            "ok": True, "status": "done",
+            "verdict": {"summary": "correct. " + triage.VALIDATION_CONFIRM_MARKER},
+        }
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult({
+            "ok": True, "merged": True, "pullRequest": 21, "mergeCommit": "2" + "b" * 39,
+            "branch": "dispatch/argo", "mergeMethod": "rebase",
+            "deploy": {"attempted": False},
+        }, None)
+        run_calls: list[int] = []
+        triage._run_gh_run_list = lambda owner, repo, commit_sha: (run_calls.append(1), [])[1]
+
+        policy = dict(DEFAULT_POLICY, repos={"argo": {"liveness": "argo-commit-live"}})  # no deployOnMerge
+        triage.poll_validation_jobs(conn, policy, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGED, item["state"]
+        assert "no deploy configured" in item["note"], item["note"]
+        assert run_calls == [], "gh run list must never be called for a repo without deployOnMerge"
+
+
+def test_confirmed_merge_in_deploy_on_merge_repo_with_no_usable_sha_falls_through_to_merged():
+    """item 1b's stated guard: a merge result carrying no usable 40-hex sha
+    must NOT enter `liveness_pending` — a probe with nothing to compare
+    against would sit until liveness_deadline and reopen the item, which is
+    worse than an honest `merged`.
+
+    Every case below, not just `None`. A mutation replacing
+    `_FULL_SHA_RE.match(merge_sha)` with a bare `merge_sha is not None`
+    SURVIVED when this test only exercised `None` — which is the one value
+    both spellings reject. The guard exists for the PRESENT-BUT-MALFORMED
+    values, so those are what it has to be tested against."""
+    cases = [
+        (None, "no sha at all"),
+        ("", "empty string"),
+        ("abc", "far too short"),
+        ("a" * 39, "39 hex — one short, the classic off-by-one"),
+        ("a" * 41, "41 hex — one long"),
+        ("A" * 40, "uppercase: GitHub and gh both emit lowercase, so this is not a sha we produced"),
+        ("unknown", "argo's own placeholder leaking into a merge result"),
+        ("z" * 40, "right length, not hex"),
+    ]
+    for i, (bad_sha, why) in enumerate(cases):
+        with _triage_env() as (conn, _ctx):
+            eid = _seed_verdict_item(conn, external_id=f"sig-dom-no-sha-{i}", confidence="high",
+                                      investigate_job=f"investigate-dom-no-sha-{i}", repo="argo")
+            conn.execute(
+                "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+                (triage.STATE_VALIDATING, f"implement-job-dom-no-sha-{i}", f"validation-job-dom-no-sha-{i}",
+                 "https://github.com/jkrumm/argo/pull/22", eid),
+            )
+            conn.commit()
+            _seed_implement_dispatch(conn, f"implement-job-dom-no-sha-{i}", repo="argo")
+
+            triage._hermes_cc_status = lambda job_id: {
+                "ok": True, "status": "done",
+                "verdict": {"summary": "correct. " + triage.VALIDATION_CONFIRM_MARKER},
+            }
+            triage._run_hermes_cc_merge = lambda job_id, _s=bad_sha: triage._MergeCallResult({
+                "ok": True, "merged": True, "pullRequest": 22, "mergeCommit": _s,
+                "branch": "dispatch/argo", "mergeMethod": "rebase",
+                "deploy": {"attempted": False, "reason": "autoDeploy is false for argo"},
+            }, None)
+            triage._run_gh_run_list = lambda owner, repo, commit_sha: []
+
+            policy = dict(DEFAULT_POLICY,
+                           repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
+            triage.poll_validation_jobs(conn, policy, NOW, dry_run=False)
+
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_MERGED, (
+                f"{why} ({bad_sha!r}) must fall through to `merged`, not enter liveness_pending "
+                f"with nothing a probe could ever match — got {item['state']!r}")
+            assert item["deploy_expect_json"] is None, (
+                f"{why}: nothing should have been written for a probe to read")
+            assert "no usable mergeCommit" in (item["note"] or ""), (
+                f"{why}: the note must say WHY it stopped at `merged` — got {item['note']!r}")
+
+
+def test_deploy_on_merge_merge_receipt_carries_the_actions_run_identity_when_visible():
+    """The Actions run is the deploy receipt the ssh path structurally cannot
+    provide (STATE.md §47) — it must land in the merge operation's own
+    receipt_json, replacing the (empty, no-ssh-deploy) `deploy` key."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-dom-receipt", confidence="high",
+                                  investigate_job="investigate-dom-receipt", repo="argo")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-dom-receipt", "validation-job-dom-receipt",
+             "https://github.com/jkrumm/argo/pull/16", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-dom-receipt", repo="argo")
+
+        triage._hermes_cc_status = lambda job_id: {
+            "ok": True, "status": "done",
+            "verdict": {"summary": "correct. " + triage.VALIDATION_CONFIRM_MARKER},
+        }
+        sha = "d" * 40
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult({
+            "ok": True, "merged": True, "pullRequest": 16, "mergeCommit": sha,
+            "branch": "dispatch/argo", "mergeMethod": "rebase",
+            "deploy": {"attempted": False, "reason": "autoDeploy is false for argo"},
+        }, None)
+        run_calls: list[tuple[str, str, str]] = []
+
+        def _fake_run_list(owner, repo, commit_sha):
+            run_calls.append((owner, repo, commit_sha))
+            return [{"databaseId": 34502657131, "name": "Deploy", "status": "completed",
+                     "conclusion": "success", "createdAt": "2026-09-10T16:31:50Z"}]
+
+        triage._run_gh_run_list = _fake_run_list
+
+        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
+        triage.poll_validation_jobs(conn, policy, NOW, dry_run=False)
+
+        assert run_calls == [("jkrumm", "argo", sha)]
+        op = conn.execute("SELECT receipt_json FROM operations WHERE event_id=? AND kind='merge'",
+                          (eid,)).fetchone()
+        receipt = json.loads(op["receipt_json"])
+        assert receipt["mergeCommit"] == sha
+        assert receipt["deploy"]["mechanism"] == "deploy-on-merge"
+        assert receipt["deploy"]["runs"][0]["databaseId"] == 34502657131
+
+
+def test_deploy_on_merge_merge_receipt_does_not_fabricate_a_run_when_none_is_visible():
+    """The workflow a push triggers is not guaranteed to be visible the
+    instant `gh run list` is asked (STATE.md §47: "normal, do not retry in a
+    loop, do not block") — but a read that FAILED must never be recorded as
+    if it succeeded with nothing found. `runs: "unknown"` distinguishes the
+    two; an empty list would not."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-dom-no-run", confidence="high",
+                                  investigate_job="investigate-dom-no-run", repo="argo")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-dom-no-run", "validation-job-dom-no-run",
+             "https://github.com/jkrumm/argo/pull/23", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-dom-no-run", repo="argo")
+
+        triage._hermes_cc_status = lambda job_id: {
+            "ok": True, "status": "done",
+            "verdict": {"summary": "correct. " + triage.VALIDATION_CONFIRM_MARKER},
+        }
+        sha = "3" + "c" * 39
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult({
+            "ok": True, "merged": True, "pullRequest": 23, "mergeCommit": sha,
+            "branch": "dispatch/argo", "mergeMethod": "rebase",
+            "deploy": {"attempted": False, "reason": "autoDeploy is false for argo"},
+        }, None)
+        triage._run_gh_run_list = lambda owner, repo, commit_sha: None  # gh could not be read
+
+        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
+        triage.poll_validation_jobs(conn, policy, NOW, dry_run=False)
+
+        op = conn.execute("SELECT receipt_json FROM operations WHERE event_id=? AND kind='merge'",
+                          (eid,)).fetchone()
+        receipt = json.loads(op["receipt_json"])
+        assert receipt["deploy"]["runs"] == "unknown", (
+            "a gh run list that could not be read must be recorded honestly, never fabricated")
+
+
 def test_liveness_confirmed_resolves_the_item():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-live-ok")
@@ -2183,6 +2401,144 @@ def test_liveness_still_inside_window_neither_resolves_nor_reopens():
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_LIVENESS_PENDING, "still inside the window — neither outcome yet"
         assert ctx.total_calls() == 0
+
+
+# --- _gather_argo_commit_live() — the deployOnMerge liveness probe itself
+# (item 1b), the real production gatherer with only urlopen stubbed --------
+
+class _FakeHealthResp:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def _stub_argo_health(body_obj: Any = None, *, raise_exc: Exception | None = None):
+    """Same pattern test_propose_mappings_unparseable_response_is_non_fatal
+    already uses for triage.urllib.request.urlopen — this is the second
+    caller, not a new one."""
+    def _fake_urlopen(_req, timeout=None):
+        if raise_exc is not None:
+            raise raise_exc
+        return _FakeHealthResp(json.dumps(body_obj).encode())
+    return _fake_urlopen
+
+
+def test_argo_commit_live_matches_exact_sha():
+    sha = "a" * 40
+    saved = triage.urllib.request.urlopen
+    triage.urllib.request.urlopen = _stub_argo_health({"status": "ok", "commit": sha})
+    try:
+        ok, detail = triage._gather_argo_commit_live([{"commit": sha}])
+    finally:
+        triage.urllib.request.urlopen = saved
+    assert ok is True
+    assert sha[:12] in detail
+
+
+def test_argo_commit_live_rejects_unknown_placeholder():
+    """argo's own `"unknown"` (a build made outside CI) must read as a
+    genuine mismatch, never as "not sure" — reachability alone is not proof."""
+    saved = triage.urllib.request.urlopen
+    triage.urllib.request.urlopen = _stub_argo_health({"status": "ok", "commit": "unknown"})
+    try:
+        ok, detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
+    finally:
+        triage.urllib.request.urlopen = saved
+    assert ok is False
+    assert "unknown" in detail
+
+
+def test_argo_commit_live_rejects_differing_sha():
+    saved = triage.urllib.request.urlopen
+    triage.urllib.request.urlopen = _stub_argo_health({"status": "ok", "commit": "b" * 40})
+    try:
+        ok, detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
+    finally:
+        triage.urllib.request.urlopen = saved
+    assert ok is False
+    assert "a" * 12 in detail and "b" * 12 in detail, (
+        f"the failure detail must name BOTH values compared, got {detail!r}")
+
+
+def test_argo_commit_live_rejects_missing_commit_field():
+    saved = triage.urllib.request.urlopen
+    triage.urllib.request.urlopen = _stub_argo_health({"status": "ok"})
+    try:
+        ok, _detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
+    finally:
+        triage.urllib.request.urlopen = saved
+    assert ok is False
+
+
+def test_argo_commit_live_rejects_non_200():
+    saved = triage.urllib.request.urlopen
+    triage.urllib.request.urlopen = _stub_argo_health(
+        raise_exc=triage.urllib.error.HTTPError("https://argo.jkrumm.com/api/health", 503,
+                                                  "unavailable", {}, None))
+    try:
+        ok, detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
+    finally:
+        triage.urllib.request.urlopen = saved
+    assert ok is False
+    assert "fetch failed" in detail
+
+
+def test_argo_commit_live_rejects_unparseable_json():
+    def _fake_urlopen(_req, timeout=None):
+        return _FakeHealthResp(b"not json at all {{{")
+    saved = triage.urllib.request.urlopen
+    triage.urllib.request.urlopen = _fake_urlopen
+    try:
+        ok, detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
+    finally:
+        triage.urllib.request.urlopen = saved
+    assert ok is False
+    assert "fetch failed" in detail
+
+
+def test_argo_commit_live_with_no_expected_commit_captured_is_false_not_an_error():
+    ok, _detail = triage._gather_argo_commit_live([])
+    assert ok is False
+
+
+def test_deploy_on_merge_liveness_confirmed_produces_a_fixed_row():
+    """The full positive path through the REAL production gatherer (urlopen
+    stubbed, no network) rather than a fake swapped into LIVENESS_ALLOWLIST —
+    liveness_pending + a matching probe -> STATE_FIXED carrying
+    LIVENESS_CONFIRMED_NOTE_PREFIX, the one genuine "this is actually fixed"
+    claim in the file."""
+    with _triage_env() as (conn, ctx):
+        sha = "c" * 40
+        eid = _seed_verdict_item(conn, external_id="sig-argo-live", repo="argo")
+        deadline = (NOW + dt.timedelta(hours=1)).isoformat()
+        conn.execute(
+            "UPDATE triage_items SET state=?, pr_url=?, liveness_deadline=?, deploy_expect_json=?, "
+            "card_channel=?, card_ts=? WHERE event_id=?",
+            (triage.STATE_LIVENESS_PENDING, "https://github.com/jkrumm/argo/pull/16", deadline,
+             json.dumps([{"commit": sha}]), "C0TESTCHAN01", "1000.000099", eid),
+        )
+        conn.commit()
+
+        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
+        saved_urlopen = triage.urllib.request.urlopen
+        triage.urllib.request.urlopen = _stub_argo_health({"status": "ok", "commit": sha})
+        try:
+            triage.maybe_check_liveness(conn, policy, NOW, dry_run=False)
+        finally:
+            triage.urllib.request.urlopen = saved_urlopen
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FIXED
+        assert item["note"].startswith(triage.LIVENESS_CONFIRMED_NOTE_PREFIX)
+        assert len(ctx.updated) == 1 and len(ctx.posted) == 0
 
 
 # --- propose_mappings() — the one LLM call in this file ---------------------
@@ -3686,6 +4042,145 @@ def test_reconcile_merged_operation_with_autodeploy_goes_to_needs_human():
             f"merged with an unverifiable deploy must reach a human, not expire to `closed` — "
             f"got {item['state']!r}")
         assert "cafef00d" in (item["note"] or ""), item["note"]
+
+
+def test_reconcile_deploy_on_merge_records_the_actions_run_status_when_readable():
+    """item 3/8: reconcile_operations() already takes `policy`, so a
+    deployOnMerge repo's reconciled merge can do better than the ssh path's
+    blanket "unknown" — it asks `gh run list` for the merge sha directly."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-dom", confidence="high",
+                                  investigate_job="investigate-reconcile-dom", repo="argo")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-reconcile-dom",
+             "https://github.com/jkrumm/argo/pull/16", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-reconcile-dom", repo="argo")
+        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
+                     ("https://github.com/jkrumm/argo/pull/16", "implement-job-reconcile-dom"))
+        conn.commit()
+
+        op_id = triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
+                                         authorized_by="auto-from-item")
+        sha = "e" * 40
+        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "MERGED", "mergeCommit": {"oid": sha}}
+        run_calls: list[tuple[str, str, str]] = []
+
+        def _fake_run_list(owner, repo, commit_sha):
+            run_calls.append((owner, repo, commit_sha))
+            return [{"databaseId": 1, "status": "completed", "conclusion": "success"}]
+
+        triage._run_gh_run_list = _fake_run_list
+
+        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
+        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
+
+        assert run_calls == [("jkrumm", "argo", sha)]
+        op = conn.execute("SELECT receipt_json FROM operations WHERE op_id=?", (op_id,)).fetchone()
+        receipt = json.loads(op["receipt_json"])
+        assert receipt["deploy"] == [{"databaseId": 1, "status": "completed", "conclusion": "success"}]
+
+
+def test_reconcile_deploy_on_merge_converges_on_liveness_pending_not_merged():
+    """Resolving the OPERATION is not enough; the ITEM has to land where the
+    live path would have put it.
+
+    A deployOnMerge repo's deploy is driven by GitHub Actions off the push,
+    NOT by the subprocess warden lost — so a crash mid-merge says nothing
+    about whether the deploy ran, and the probe can still answer. Sending the
+    item to `merged` would strand a deploy that very likely succeeded under a
+    note reading "no deploy configured for this repo", which is false for this
+    repo class; sending it to `needs_human` (the `autoDeploy` answer) would
+    ask a person to verify something a probe verifies better. It has to
+    converge on `liveness_pending`, carrying the same `[{"commit": sha}]`
+    shape poll_validation_jobs() writes."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-converge", confidence="high",
+                                  investigate_job="investigate-reconcile-converge", repo="argo")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-converge",
+             "https://github.com/jkrumm/argo/pull/16", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-converge", repo="argo")
+        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
+                     ("https://github.com/jkrumm/argo/pull/16", "implement-job-converge"))
+        conn.commit()
+        triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
+                                 authorized_by="auto-from-item")
+        sha = "c" * 40
+        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "MERGED", "mergeCommit": {"oid": sha}}
+        triage._run_gh_run_list = lambda owner, repo, commit_sha: []
+
+        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
+        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_LIVENESS_PENDING, (
+            f"a reconciled deployOnMerge merge must converge on the live path's own destination, "
+            f"not be stranded in `merged` — got {item['state']!r}")
+        assert json.loads(item["deploy_expect_json"]) == [{"commit": sha}], item["deploy_expect_json"]
+        assert item["liveness_deadline"] is not None, "the probe needs a window to run in"
+
+
+def test_reconcile_merge_without_deploy_on_merge_still_lands_in_merged():
+    """The other side of the same branch, so nobody widens it: a repo with
+    neither `deployOnMerge` nor `autoDeploy` has genuinely nothing left to
+    happen after the merge, and `merged` (which expires to `closed` at 1h) is
+    the honest destination."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-plain", confidence="high",
+                                  investigate_job="investigate-reconcile-plain", repo="vps")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-plain", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-plain", repo="vps")
+        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
+                     ("https://github.com/jkrumm/vps/pull/8", "implement-job-plain"))
+        conn.commit()
+        triage.record_operation(conn, event_id=eid, kind="merge", repo="vps",
+                                 authorized_by="auto-from-item")
+        triage._run_gh_pr_view = lambda owner, repo, pr: {
+            "state": "MERGED", "mergeCommit": {"oid": "d" * 40}}
+
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGED, item["state"]
+
+
+def test_reconcile_deploy_on_merge_records_unknown_when_the_run_cannot_be_read():
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-dom-unknown", confidence="high",
+                                  investigate_job="investigate-reconcile-dom-unknown", repo="argo")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-reconcile-dom-unknown",
+             "https://github.com/jkrumm/argo/pull/17", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-reconcile-dom-unknown", repo="argo")
+        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
+                     ("https://github.com/jkrumm/argo/pull/17", "implement-job-reconcile-dom-unknown"))
+        conn.commit()
+
+        op_id = triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
+                                         authorized_by="auto-from-item")
+        sha = "f" * 40
+        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "MERGED", "mergeCommit": {"oid": sha}}
+        triage._run_gh_run_list = lambda owner, repo, commit_sha: None  # gh unreachable
+
+        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
+        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
+
+        op = conn.execute("SELECT receipt_json FROM operations WHERE op_id=?", (op_id,)).fetchone()
+        receipt = json.loads(op["receipt_json"])
+        assert receipt["deploy"] == "unknown", "a gh run list that could not be read must not be guessed at"
 
 
 def test_merge_remote_error_is_left_for_reconcile_not_read_as_merge_blocked():

@@ -447,6 +447,28 @@ has no CI and self-documents "CI-less for now," so it belongs with
 `vps/observability/`, `homelab` and `homelab-private` in the group that needs a
 deploy key.
 
+**As of item 1b (STATE.md §47/§48), "merge is deploy" has a mechanism, not just
+a claim.** Reconnaissance (§47) found no code path into it at all — a merge in a
+repo with no `deploy` key landed in `merged` and expired to `closed` after 1h,
+never `liveness_pending`, never a probe, never `fixed`. A `deployOnMerge: true`
+policy entry now makes a confirmed merge in that repo enter `liveness_pending`
+directly, on the merge commit sha, the same as the ssh-deploy path's
+`deploy.attempted && deploy.ok` branch — just reached a different way, since
+there is no ssh call whose `attempted`/`ok` this repo's CI/CD could ever set.
+
+The receipt is the part the ssh path structurally cannot provide. `ssh <host>
+make <target>` returns only an exit code to the (now dead) process that ran it —
+nothing queryable survives a crash mid-deploy. A GitHub Actions run has an id and
+is queryable after the fact, by anyone, at any later time, so `gh run list
+--commit <sha>` is folded into the merge operation's own `receipt_json` (never
+fabricated when the run has not appeared yet or `gh` cannot be read — recorded as
+`"unknown"`, the same honesty discipline `reconcile_operations()` already uses
+for the ssh half). `argo` is seeded first, with a real liveness gatherer
+(`argo-commit-live`, comparing `GET /api/health`'s `commit` field against the
+merge sha exactly — reachability alone is never proof) and **deliberately no
+`autoMergePaths`**, so the merge gate stays closed and nothing actually merges
+into it yet; this slice only builds the mechanism.
+
 ### Budgets — absent from v1 entirely
 
 Autonomy without a rate limit is the blast-radius answer. Existing ceilings must
