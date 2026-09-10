@@ -4675,3 +4675,225 @@ of 5 rows carry `--auto-from-item`), so it is schema 5 and it bumps
 `WARDEN_SCHEMA_VERSION` in `hermes-agent/scripts/hermes-cc.sh` in the same breath.
 It is what makes `/metrics`' *verified unattended fixes per week* stop returning
 `null`.
+
+---
+
+## 46. Wave 3, item 1 — reconnaissance, and three facts that change what item 1 is
+
+Before designing the operation id, both sides of the boundary were mapped by two
+fresh subagents with no context from this session, and **every load-bearing claim
+they returned was re-verified here** against the code, the live ledger and
+GitHub. Three of those claims contradict documents this project treats as
+authoritative. All three hold. A fourth was flattened by the report and is
+corrected below.
+
+### Correction 1 — `--auto-from-item` can never produce an approval row. It is an invariant, not a sample.
+
+`/metrics` metric 4 serves `null` with this reason:
+
+> *"the 'unattended' qualifier cannot be derived without an operation id linking
+> an approval to an item — `dispatch_approvals` has no `event_id` and 0/5 rows
+> carry `--auto-from-item`"*
+
+The "0/5" reads as a measurement that more data could change. It cannot. Verified
+in `hermes-agent/scripts/hermes-cc.sh`:
+
+```sh
+:617   awaiting_confirm() { tier_is_gated && [ "$CONFIRM" != 1 ] && [ -z "$AUTO_FROM_ITEM" ]; }
+:1369  if awaiting_confirm; then PLANNED=1; fi
+:1374  if [ "$PLANNED" = 1 ] && [ "$DRY_RUN" != 1 ]; then
+:1375    mint_approval "dispatch" "$name" "$TIER" "$BRIEF" "$WHY" "$CONTEXT"
+:1397  if [ -n "$AUTO_FROM_ITEM" ]; then APPROVED_BY="triage:item-…"
+:1400  else require_signed_approval "dispatch" …
+```
+
+`grep -n 'mint_approval' scripts/hermes-cc.sh` returns the definition and **one**
+call site. `AUTO_FROM_ITEM` set ⇒ `awaiting_confirm` false ⇒ `PLANNED` stays 0 ⇒
+`mint_approval` is never reached ⇒ no row exists. The two doors are mutually
+exclusive by construction.
+
+**Consequence for the design, and it is the whole shape of item 1:** adding an
+`event_id` to `dispatch_approvals` would link nothing on the unattended path,
+because *the unattended path leaves no approval row at all*. The attribution has
+to live somewhere **both** doors pass through. The only such place today is the
+`dispatches` row — which already carries `origin_event_id`, the item link the
+metric wants, and which is written on both paths.
+
+### Correction 2 — `REVIEW.md`'s `merged_at` finding is a misreading
+
+`REVIEW.md` § *Facts corrected* closes with:
+
+> *"`dispatches.merged_at` for the one successful implement is **NULL** — the
+> ledger failed to record its own merge."*
+
+The NULL is real (dispatch 16, job `4f39ca44…`, `vps#8`). The conclusion is not.
+**The merge never went through warden**, so there was nothing to record:
+
+```
+$ gh pr view 8 --repo jkrumm/vps --json state,mergedAt,mergeCommit,mergedBy
+  state      MERGED
+  mergedAt   2026-09-08T16:42:20Z
+  mergeCommit 9289436afde30f1ad4c0a6d82b5556ca9df9876f
+  mergedBy   jkrumm  (is_bot: false)
+
+dispatch 16 finished_at        2026-09-08T14:20:40Z   ->  merged 2h22m later, by hand
+dispatch 16 validation_status  NULL
+```
+
+`cmd_merge` refuses anything whose `validation_status` is not the literal
+`confirmed` (`hermes-cc.sh:2019-2020`, `NOVALIDATION`), so it was structurally
+incapable of merging that PR. The operator merged it in the GitHub UI. **There is
+no lost write here and no crash to reconcile** — `REVIEW.md` inferred a ledger
+failure from a NULL that only ever meant "warden was not involved".
+
+`REVIEW.md` is not rewritten; this is the correction, recorded where corrections
+live.
+
+### Correction 3 — the warden-driven auto-implement chain has never executed
+
+```
+triage_items with implement_job      0
+triage_items with pr_url             0
+triage_items with validation_job     0
+triage_items with liveness_deadline  0
+dispatches with validation_status    0
+item_transitions into implementing / validating / merged / merge_blocked /
+                     liveness_pending / fixed / pr_open        0
+```
+
+`maybe_auto_implement → poll_implement_jobs → poll_validation_jobs → merge →
+maybe_check_liveness` has run **zero** times in production. This is the strongest
+argument yet for the ordering `DESIGN.md` § Migration already chose: Wave 3 is
+where the chain is proven, and everything built for it until now is untested by
+anything except its unit tests.
+
+### Refinement — `cmd_merge` itself is NOT unexercised, and the report said it was
+
+The subagent concluded the merge path had never run. That is true of the *chain*
+and false of the *verb*. Checked directly:
+
+```
+dispatches with merged_at: 4   — all `implement`, all repo `dispatch-scratch`,
+                                 2026-08-02 → 2026-08-03, all origin_event_id NULL,
+                                 all validation_status NULL
+```
+
+Four real `cmd_merge` runs, interactive, in a scratch repo, before the validation
+gate existed. So the merge verb has receipts of having worked; what has never run
+is **warden driving it**. Worth the distinction, because it means
+`dispatch-scratch` is a proven surface for exercising the chain without touching
+anything that matters.
+
+### The write-ordering map — where a crash loses or duplicates an operation
+
+This is what item 1 exists to fix, and it is worth having in one table.
+
+| Step | Ledger write | External call | Order | Crash consequence |
+|-|-|-|-|-|
+| `hermes-cc dispatch` (gated) | `UPDATE dispatch_approvals SET spent_at` + COMMIT | `POST /api/jobs` | **write BEFORE** | approval burned, nothing dispatched — `DESIGN.md:492`'s *"approved fix, no action completed"*, verbatim |
+| same | `INSERT INTO dispatches` | (same call) | **write AFTER** | an episode runs that warden has no record of: never swept, never reported, never budget-counted |
+| `maybe_auto_implement` | `_set_state(implementing, expect_state=verdict, expect_null=implement_job)` | `dispatch --auto-from-item` | **write BEFORE** ✅ | but `implement_job` is written *after*, so a crash in between leaves an item `implementing` that `poll_implement_jobs` never selects (`implement_job IS NOT NULL`) — rescued only by the 2h deadline |
+| same | rollback to `verdict` on a `None` return | | | **the duplication bug**: `_run_hermes_cc_auto_implement` returns `None` on `TimeoutExpired` *and* on non-JSON stdout, both reachable **after** sideclaw accepted the job. Next tick auto-implements again — two branches, two draft PRs |
+| `poll_validation_jobs` | `UPDATE dispatches SET validation_status` | `merge --confirm` | **write BEFORE** | the only write-first in the chain, and the one that did not need to be |
+| `cmd_merge` | `UPDATE dispatches SET merged_at` | `PUT /pulls/:pr/merge` | **write AFTER** | crash between them → retry sees `merged_at` NULL, GitHub says `merged: true`, `policy_err` fires, warden records **`merge_blocked` for a PR that is merged and deployed**. `DESIGN.md:500`'s *"silently read as failure"*, exactly |
+| `run_deploy_if_enabled` | *nothing* | `ssh vps make hyperdx-apply` | **no write at all** | `ok`, `exitCode` and `output` are dropped; only `expectedAlerts` is persisted. "Did the deploy run?" is unanswerable except by probing HyperDX hours later — which cannot tell *"never ran"* from *"ran and the fix was wrong"* |
+
+Two adjacent verbs in one script chose opposite orderings and neither comment
+acknowledges the other. `spent_at`-before loses operations; `merged_at`-after
+duplicates then misreports them. **Whatever single rule item 1 picks will have to
+move one of them.**
+
+`merge_sha` is already obtained (`hermes-cc.sh:2092`) and thrown away — it reaches
+stdout as `mergeCommit` and never the ledger. `dispatches` has no column for a
+merge SHA and none for a PR number. That is the one genuine remote receipt the
+system already holds.
+
+### Existing idempotency, in full — there is no operation id anywhere
+
+No operation id, no request id, no attempt counter, no `unknown` state, no
+remote-receipt reconciliation, in either repo. What exists is all local
+compare-and-set that never consults an external system: `AND decision IS NULL`
+(`intents.py`), unlink-after-commit in the drain, `AND spent_at IS NULL` +
+`rowcount == 1`, the supersede-delete on mint, `_set_state(expect_state=…,
+expect_null=…)`, and `merged_at IS NOT NULL → refuse` — the only "did this already
+happen" check against an external operation, and it reads local state, never
+GitHub.
+
+`poll_misses` is not an attempt counter: `dispatch-sweep.py` increments it **only**
+on a sideclaw 404, resets it to 0 on any successful poll, and gives up at 3 into
+status `lost`. It answers "has sideclaw forgotten this job", which is a
+bookkeeping debt, not an operation one.
+
+`dispatch-sweep.py:25-43` is the one place in the system where write/call ordering
+was reasoned about and written down — an explicit **at-least-once** contract,
+status committed before delivery, `reported_at` stamped only after exit 0. It is a
+good template and it is also the easy case: a duplicate Slack message is
+cosmetic, and it gives no guidance for a duplicate merge.
+
+### The structural constraint on binding an approval to an operation id
+
+`require_signed_approval()` **recomputes** `payload_hash` from the arguments in
+hand (`hermes-cc.sh:1116-1117`) and looks the row up *by that hash*. It never
+reads `payload_hash` off a row to choose one. The signature covers `payload_hash`
+(`canonical_message()` = `v1|nonce|payload_hash|decision|decided_by|expires_at`),
+so anything inside the hash is transitively bound — but **an operation id folded
+into the hash must be independently reproducible at verify time from the same
+inputs the caller supplies.** A random id minted at plan time and stored only in a
+new column would not be recomputable and the lookup would break. It has to ride in
+argv, and therefore into `argv_json`, and therefore be replayed verbatim by
+`_load_invocation()`.
+
+Also closed against extension: `intents.py`'s `_KIND_FIELDS["approval_decision"]`
+is a closed allowlist that `validate()` raises on, and `_NEVER_FROM_FILE =
+("expires_at", "payload_hash")` refuses exactly the binding fields from a spool
+file. An operation id has the same character and wants the same treatment — it
+must come from the row, never from the intent.
+
+### Facts about sideclaw that bear on reconciliation
+
+Verified against `~/SourceRoot/sideclaw` by the second subagent; the `DESIGN.md`
+claims they check are quoted in §*Talking to sideclaw* of `CLAUDE.md`.
+
+- **No cancel endpoint exists in any form.** Only `POST /api/shutdown`, which is
+  process-wide and SIGTERMs every worker. `warden abort` (item 2) therefore needs
+  a real sideclaw change, as `DESIGN.md` says.
+- **A pruned job id returns `404 "job not found"` — byte-identical to a job id
+  that never existed.** Pruning is 24h **or** 200 terminal rows shared across all
+  six tools, and `prune()` runs after *every* job finish, not on a timer. The
+  reconciliation problem is confirmed at the wire level.
+- **`GET /api/jobs/:id` returns a view that drops `params`.** Warden cannot
+  recover a job's repo, tier or brief from sideclaw after the fact — it must have
+  recorded them before submitting. An independent argument for
+  operation-id-before-dispatch.
+- **A drain-killed job is deliberately left at `running`** and reconciled only at
+  sideclaw's next boot. If that boot never happens, `GET /api/jobs/:id` reports
+  `running` forever, so a reconciler treating `running` as "still alive" waits
+  indefinitely.
+- `DISPATCH_SCHEMA_VERSION = 1`, carried as a required `schemaVersion` literal on
+  every verdict *and* served at `GET /api/dispatch-schema` — two independent
+  mismatch channels. Warden's loud-refusal rule is implementable from the job
+  result alone.
+- **`warden` and `sideclaw` are hard-pinned to tier `investigate`**, merged last
+  in `buildDispatchPolicy` so environment variables cannot raise them. `DESIGN.md`
+  § Security model's rule holds in the executor, verified rather than assumed.
+- **One `DESIGN.md` claim is optimistic.** *"Salvage bundles are referenced only
+  inside an error string"* is true of the synchronous-throw path. After a real
+  SIGKILL the job's error is the fixed string `'HTTP server restarted while job
+  was running'` and the bundle path appears **only in a pino warn log**
+  (`dispatch.worktree_salvaged`), reachable by grepping `~/Library/Logs/sideclaw.*`.
+  The bundle is derivable from the branch name, which is derivable from the job
+  id; bundles self-prune at 14 days / 100 files.
+
+### Next action
+
+Item 1's design follows from correction 1: the unit is the **operation**, not the
+approval, and it hangs off `dispatches` (which both doors write) rather than
+`dispatch_approvals` (which only the human door writes). That is schema 5.
+
+One question genuinely branches the rest of Wave 3 and is being asked rather than
+assumed, per the handover: **which repo the complete path is proven against.**
+`dispatch-scratch` has four real `cmd_merge` receipts and no deploy target, so it
+proves everything up to `merged → closed`; `vps/observability/**` is the only
+seeded deploy target and the only way `fixed` can ever be produced, and it is
+`FLOWS.md` flow 1's case-4 monitoring-config trap in production. `DESIGN.md` §
+What "done" means already states metric 2 cannot move without the second.
