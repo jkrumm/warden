@@ -5229,3 +5229,84 @@ pipeline working, not a side effect of this slice.
 Item 1b — merge-is-deploy, with the GitHub Actions run id as the deploy receipt
 (§47). It is the only place in this estate where a real deploy receipt exists, and
 without it no repo can reach `fixed`, so it blocks the stop-condition exercise.
+
+---
+
+## 49. FINDING — the notifier does not read the ledger
+
+Raised by the operator, 2026-09-10: *"we keep on getting Slack alerts … seemingly
+many watchdogs open etc."* Investigated read-only. **Warden is not
+malfunctioning. It is telling the truth on a cadence that has nothing to do with
+what it knows.**
+
+### What the reminder digest actually is
+
+`watchdog-poll.py:1216` renders it (`_render_section("Reminders", ":bell:", …)`),
+driven by `reconcile()`'s reminder branch at `:906-930`, anchored on
+`events.last_reminder_at || notified_at` against `REM_HOURS` — 6h for `uk`, 24h
+for `hermes_log`, 168h for `stray_skill`.
+
+```
+$ grep -n 'triage_items' scripts/watchdog-poll.py
+(nothing)
+```
+
+**The reminder path never reads `triage_items`.** It has exactly one mute
+(`:918-921`): an event whose `dispatch_id` points at a dispatch with
+`reported_at IS NULL` — i.e. an investigation currently in flight. There is no
+mute for an item that is `ignored`, `note`, `needs_human`, unmapped, or parked
+behind a deadline. The notification layer and the state machine are decoupled.
+
+That contradicts `DESIGN.md` principle 1 in spirit — *"Slack cards and Argo pages
+are projections … the ledger re-renders the surface"* — for this one surface.
+The card path obeys it; the reminder digest renders straight off `events`.
+
+### The seven lines, split
+
+| Population | Rows | Verdict |
+|-|-|-|
+| **Structurally unactionable** | ev269 `Local` (#6), ev285 `VPS` (#7), ev710 `Services` (#7) | `repo IS NULL`, state `new`. `escalate()` requires `repo IS NOT NULL`, so these can never be investigated, never resolve, and remind **every 6h forever**. |
+| **The system working** | ev930 Hermes-HTTP (#8), ev943 Research-Gateway-HTTP (#7), ev261 slack_bolt (#6), ev875 Meteo-Watchdog (#5) | All `needs_human`, all carrying a real verdict — the text in the operator's Slack paste **is** the verdict warden wrote. Four genuine outstanding decisions with 7-day deadlines. |
+| **No triage row at all** | ev849, ev887 `stray_skill`, ev68 `hermes_cron` | `DESIGN.md` § Open questions 3 named ev849 already: *"no `triage_items` row exists for it at all."* Still true. |
+
+So **3 of 7 lines are noise by construction** and 4 are "you have decisions
+pending" at the wrong cadence.
+
+The three were identified in `DESIGN.md` § Open questions (resolved-since-v1
+paragraph) **by name**: `uk:95` / `uk:179` / `uk:186` are UptimeKuma **group**
+monitors matching `homelab/uptime-kuma/monitors.yaml` group names verbatim —
+*"mappable without guessing"*. The fix was written down and never applied.
+
+### The trap in the obvious fix
+
+Adding an `ignore` or a mapping rule to `config/triage-policy.json` **would not
+silence them**, and that is worth knowing before someone tries it: the reminder
+is emitted by `watchdog-poll.py` before and independently of triage
+classification. Routing an item to `ignored`/`note` changes the *card* and the
+*digest*, not the *reminder*. Mapping them to a repo would silence them only as a
+side effect — by making them escalate, which spends investigate episodes on group
+parents whose children already alert separately.
+
+### The two real fixes, neither done here
+
+1. **Teach the reminder path the ledger.** Skip an event whose item is
+   `ignored`/`note`, and give `needs_human` its own cadence (§41 known-open 3
+   scoped "reminder at 1d" out of warden on the grounds that *"a reminder is a
+   notification, not a deadline"* — correct about the deadline, and it left the
+   notification unowned, which is this). This is the structural fix and it is the
+   one that makes the digest trustworthy.
+2. **Dispose of the three group monitors** — an `ignore` entry at the poller, or a
+   decision that a group parent is worth its own item. An operator call, not a
+   code call: it is about what the operator wants to be told.
+
+### Why this matters beyond the noise
+
+`DESIGN.md`'s opening measurement is *"a correct verdict has nowhere to go"*. This
+is the mirror image: four correct verdicts have somewhere to go, they are sitting
+there correctly, and the surface reports them identically to three rows that can
+never move. **A digest where actionable and unactionable look the same is how an
+operator stops reading the digest** — which is the failure mode that produced the
+eleven-day blindness this project exists to prevent.
+
+Recorded, not fixed. It is not Wave 3 scope as written, and it is a stronger
+candidate for the next slice than anything remaining in items 2 and 3.
