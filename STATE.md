@@ -7,7 +7,7 @@ This file records *what is*, not *what should be*.
 | | |
 |-|-|
 | Last updated | 2026-09-10 |
-| Current wave | **0 — COMPLETE except one declared item (see §25). Do not start Wave 1 without reading it.** |
+| Current wave | warden Waves 0–3 complete (§§25, 35, 41, 51). **Estate chain Wave 4 done (§§52–53); Wave 5 is next** — `~/SourceRoot/dotfiles/docs/waves/PLAN.md` is the authority on order and status from here. |
 | Repo state | `master`. The loop, poller, sweeper, backup and read-only API run here on five LaunchAgents. |
 | Next action | see § Next action (bottom) |
 
@@ -5693,3 +5693,153 @@ reversible (one `continue`).
 - The Hermes-side guards (`tirith-hermes-guards.patch`, `test_raw_agent_guard.py`)
   key on the literal path `~/.hermes/scripts/hermes-cc.sh`. The Hermes door keeps
   calling the shim path; only warden's loop and the plugin repoint to warden.
+
+---
+
+## 53. Wave 4 (estate chain) — steps 4.2–4.5, DONE & LIVE (2026-09-10, 17:30Z → 18:40Z)
+
+One Fable orchestrator, four Sonnet implementers, one Sonnet verifier, two
+sideclaw reviews. Every claim below was executed, not diffed. Commits: warden
+`8ca494c` (recon), `e29434a` (4.3), `968f4ac` (4.5), `c1ebe58` (4.4); hermes-agent
+`3ecbdef` (shim), `0429201` (plugin delivery); sideclaw `df89ac5` (4.2); dotfiles
+`dd306eb`, `3bf4b30`. Nothing pushed — the chain runs in this checkout.
+
+### 4.2 — the cheap lane lives again
+
+Root cause was §52's, not the audit's: a 403 refusal in a result envelope plus a
+120 s cap. Landed in sideclaw `server/mcp/session-runner.ts`: `api_error_status`
+captured off the result event and carried on `SessionResult`; a status in
+`{400, 401, 403, 404}` (or `access_denied|cost-service-denial|403` text on a
+zero-output exit) is "IU never answered" and forces the Max fallback at attempt 1;
+429/5xx keep the one same-backend retry. Per-route consecutive-failure streaks
+(bounded map, 64 keys) and a `warnings[]` line for degraded routes or last-hour
+fallbacks on `GET /api/jobs/health`, `ok` untouched. `overview`'s per-attempt
+cap 2 → 3 min. `devhost-health-check.sh` returns WARN (rc 2) on `warnings`.
+
+The first sideclaw review caught a real bug in the first cut: the two benign
+banner lines (`unrecognized_model`, `connectors are disabled`) were in the
+classifier, which would have made *every* zero-output IU transport failure skip
+the same-backend retry. Removed; a test now pins that a banner-only failure
+retries. Declined from that review: a `session-health.ts` extraction, an env
+override for the streak limit, a `runSessionAttempt` refactor, pre-existing
+fallow dead-code items.
+
+Live, on the reloaded server:
+
+| Proof | Job | Result |
+|-|-|-|
+| `check` on the cheap route | `57e2a7ed` | `done`, glm-5.3-flash/iu, 64 s, `make test` + `make check-policy` passed |
+| `overview` on the cheap route | `50db0e38` | `done`, glm-5.3-flash/iu, 166 s (under the new 180 s cap; would have died at 120) |
+| Forced route failure (`model: glm-5.3-flash-nonexistent`) | `8cfeaca4`, `b743f0a4` | `backend.fallback reason=iu-unavailable` **1.2 s** after submit, job `done` on haiku/max; `/api/jobs/health` `warnings: ["1 backend fallback(s) in the last hour: iu-unavailable×1"]`; `check_sideclaw_jobs` → `sideclaw jobs WARN: …` rc=2 |
+
+Not done, deliberately: mapping `glm-5.3-flash` in Claude Code's model catalog
+(`modelPicker`/`behavesAs`) to silence the banner — it is cosmetic, the context
+window is already pinned by env, and the research-gateway job on the 2.1.266
+catalog behaviour came back with zero citations (32 pages fetched, nothing
+extracted — a research-gateway defect worth its own look).
+
+### 4.3 — `hermes-cc.sh` moved wholesale
+
+`warden/scripts/hermes-cc.sh` is the file; diff against hermes-agent's HEAD is
+comments plus one default (`REPOS_JSON` → `warden/config/dispatch-repos.json`,
+moved with it). `hermes-agent/scripts/hermes-cc.sh` is a five-line exec shim
+(`HERMES_CC_BIN` override) — kept because the Hermes-side guards allow that path
+by literal, and the `claude-dispatch` skill keeps invoking it. `triage.py` resolves
+the binary and the policy relative to itself; the plugin's `_DEFAULT_CC_SCRIPT`
+points at warden directly. `validate-dispatch-policy.py` moved too (it checks
+shapes `check-dispatch-policy.py` does not). Both test suites moved and run under
+`make test` on this venv: `test_hermes_cc.py all 165 cases as expected`,
+`test_dispatch_approval.py 85 checks` (83 + two for 4.4). New
+`test_hermes_cc_schema_pin_matches_ledger` regexes the bash default and asserts it
+equals `ledger.SCHEMA_VERSION` — the pin is intra-repo now and a bump in one place
+fails `make test` until the other follows (it fired once during 4.4, as designed).
+
+Live: the loop ticked at 18:03Z and 18:13Z on the moved `triage.py` with no error;
+`hermes-cc.log` shows the shim path answering `status`; one `investigate` opened
+through `~/.hermes/scripts/hermes-cc.sh` → shim → warden's script → sideclaw
+(`c7737ef5`, 25 s, `nextAction: none`), recorded in `dispatches`. **The Hermes
+recursion guard refused the first attempt** (`CLAUDECODE` is set in this
+orchestrator's environment — "a dispatched episode may never dispatch"); the
+probe was re-run with that one variable unset, which is what a human at a
+terminal is. The guard is correct and untouched. The "from Slack through Hermes"
+half of the acceptance needs a human typing in Slack and is not done unattended
+— see Left behind.
+
+Not done: `bare python3` (Homebrew 3.14) is still the script's interpreter and
+`APPROVAL_PY` still points at the gateway venv — zero-change means zero-change;
+Wave 5 replaces the file.
+
+### 4.4 — verdict delivery off the gateway binary, schema 6
+
+`scripts/slack_client.py` holds `resolve_slack_token()` (moved out of
+`triage.py`, alias kept) and `slack_post_message()` — stdlib, never raises.
+`dispatch-sweep.py` posts through it; `hermes send`, the temp file and the
+`hermes` binary lookup are gone. The plugin's `_send_to_origin` is a hand copy
+under `asyncio.to_thread`. `dispatches.delivery_status` (`delivered`,
+`undeliverable:<reason>`, `failed:<reason>`, NULL = not attempted) is written at
+every `reported_at` write point, including `hermes-cc.sh`'s in-turn `--wait` path
+and its abandon — the worker flagged that gap, the orchestrator closed it (and
+broke the script twice doing so: an apostrophe and then a quoted SQL literal
+inside `db_py`'s single-quoted heredoc; the 165 suite caught both, the literals are
+bound parameters now).
+
+Migration 5 → 6 on the live ledger happened at the loop's 18:13:09Z tick, from the
+working tree, before the commit — the designed path, and a reminder that the
+LaunchAgents run whatever is on disk. The sweep refused once on the version check
+(`.err`, 18:12Z) and resumed at 18:17Z; the API (long-running, version loaded at
+boot) refused until `launchctl kickstart -k` at 18:29Z. Backfill: 25 rows
+`delivered`, 2 `undeliverable:no-origin-channel`, zero strings left in
+`reported_at`.
+
+Live: the probe episode's verdict was posted to `C0BVDE5R562` by the sweep at
+18:34:06Z over HTTP, row `delivery_status = delivered`, `dispatch_sweep_last_run
+{"considered": 1, "errors": 0}` — while the gateway's Socket Mode client was still
+logging `Session is closed` every 10 s.
+
+### 4.5 — the notifier reads the ledger
+
+`watchdog-poll.py`'s reminder branch looks up `triage_items` by `event_id`:
+terminal states (`ignored`/`note` included) are skipped without bumping the
+anchor; `needs_human` reminds on its own 24 h cadence with the item's `note`
+folded into the line; no row / no table → exactly the old behaviour. `poll_uk()`
+drops `type == "group"` monitors. State names live in `ledger.py` too, with a test
+that pins them to `triage.py`'s. 9 new tests. Proven first against a `.backup` copy
+of the live ledger (`--dry-run --slack-body`: the three group rows move to
+"Resolved", nothing else changes), then live: the poller's first run on the new
+code at **18:14:11Z resolved ev710 "Services", ev269 "Local", ev285 "VPS"**
+(`watchdog_poll_last_run {"resolved": 3, "reminders": 0}`) — 23 reminders' worth
+of noise, gone with one `continue`.
+
+Known gap (worker's finding): `hermes_log` events ride `upsert_grouped()`, not
+`reconcile()`'s reminder branch, so ev261 (one of §49's four `needs_human`
+decisions) is not on the 24 h cadence. Also declined from the review: flipping the
+constant duplication so `triage.py` imports from `ledger.py` — `triage.py` defines
+its states at line 338 and loads `ledger` at line 956, so the flip is a module
+reorder, not an alias; a log line on group-monitor auto-resolve (it already
+happened, once, and is recorded here).
+
+### Reviews, and what they were told
+
+Sideclaw review on sideclaw (needs-human → fixed, above). Sideclaw review on
+warden `e29434a..968f4ac` (needs-human): its adversary angle called `cmd_merge`'s
+`--confirm` gate a bypass of signed approval — that is hermes-cc.sh's pre-existing
+contract (`merge_gate_check` + budgets + `pr-required-repos.json`, the signed
+decision covers the Slack `implement` door), unchanged by a zero-change move, and
+Wave 5.2 is where the gates are ported and the signed spend moves into the loop;
+not relitigated here. Its senior-dev angle saw 4.4's in-flight cross-repo edit
+(the moved plugin suite green only against hermes-agent's working tree) — true for
+twenty minutes, false once `0429201` and `c1ebe58` landed together.
+
+### What is now true that was not
+
+The cheap lane classifies a refusal and falls back in a second; a route that
+keeps failing shows up as a WARN on the devhost heartbeat. The actuator client,
+its policy and its tests live in the repo whose ledger they write. A verdict
+reaches Slack without the gateway. The digest tells actionable from settled.
+
+### Next action
+
+Wave 5 (`dotfiles/docs/waves/PLAN.md`): the clients in Python, the lifecycle
+gates, the CLI, real cancel, and the stop-condition exercise on argo's canary
+scope. The human-in-Slack half of 4.3's acceptance rides along: the first time
+the owner types a dispatch into Slack after this, the shim path is what answers.
