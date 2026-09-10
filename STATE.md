@@ -5310,3 +5310,102 @@ eleven-day blindness this project exists to prevent.
 
 Recorded, not fixed. It is not Wave 3 scope as written, and it is a stronger
 candidate for the next slice than anything remaining in items 2 and 3.
+
+---
+
+## 50. The complete path, walked by hand before automating it
+
+`STATE.md` §47 established that merge-is-deploy has no code path and that no image
+reveals which commit it is running. Operator decision: **argo, plus a `GIT_SHA`
+surface** — the only one of the three RollHook repos with PR-time CI, so the merge
+gate sees real check runs and `noCiRequired: true` (the vacuously-clean inversion
+`hermes-cc.sh` exists to refuse) is never needed.
+
+### The argo change
+
+`jkrumm/argo` PR **#16**, merged 2026-09-10. `GIT_SHA=${{ github.sha }}` as a
+`build_args` on the api image; `ARG`/`ENV` in the Dockerfile's **runner** stage (an
+ARG only exists in the stage that declares it); `/health` returns
+`{status, commit}`, read once at module load. Defaults to `"unknown"` so a local
+build stays schema-valid. Verified before opening: lint 0/0 on the changed file,
+format clean, typecheck clean, 578 api tests pass, and no existing test asserts the
+`/health` shape.
+
+### The whole chain, measured
+
+```
+16:30:0xZ  PR #16 opened
+16:31:12Z  CI `check` pass          (argo is the only one of the three with PR-time CI)
+16:31:43Z  rebase merge             cf003491b46234983dd789a977e2fba6b7bcdd32
+           Actions "Deploy" run 34502657131 on that sha
+16:32:39Z  GET https://argo.jkrumm.com/api/health
+           {"status":"ok","commit":"cf003491b46234983dd789a977e2fba6b7bcdd32"}
+```
+
+**56 seconds from merge to the deployed commit serving.** Before the merge the same
+endpoint returned a bare `{"status":"ok"}` — the baseline was captured first, so the
+field appearing is evidence rather than assumption.
+
+### Four facts this established that were previously assumptions
+
+1. **argo is rebase-only** (`allow_squash_merge:false`, `allow_merge_commit:false`).
+   `hermes-cc.sh`'s `pick_merge_method()` probes the repo and falls back
+   squash → rebase → merge, so it already handles this. Found by having `gh pr merge
+   --squash` refused, not by reading.
+2. **`gh pr view --json mergeCommit` returns the rebased head**, byte-identical to
+   `git rev-parse origin/master`. So `reconcile_operations()`'s existing SHA source
+   is correct on a rebase-only repo — and it is the *same value* that becomes
+   `GIT_SHA` in the image. **That equality is the whole basis of the probe** and it
+   was worth checking rather than assuming.
+3. **The deploy latency is ~56s**, inside §47's measured 67-145s range for argo's
+   last five runs. `LIVENESS_WINDOW_HOURS` has enormous headroom.
+4. **CodeRabbit does not review this repo** — *"fewer than 10 stars"* — so its
+   green check is a **skip, not a review**. A CI status that reads `pass` for
+   "declined to look" is the same vacuously-clean shape the merge gate refuses
+   elsewhere; worth knowing before anyone treats a CodeRabbit tick as evidence.
+
+### The safety staging that lets this be built with the gate shut
+
+Adding argo to `config/triage-policy.json`'s `repos` with `deployOnMerge` and
+`liveness` but **no `autoMergePaths`** leaves warden unable to merge anything there:
+`merge_gate_check()` prints `NOPATHS` and `cmd_merge` refuses with *"nothing merges
+without an explicit declared scope"*. So the mechanism, the probe and the receipt
+can all be built and tested while the merge gate stays closed. **Opening it is a
+separate operator decision** — and a real one, because the driving change is a
+dependency upgrade, so `autoMergePaths` would grant warden auto-merge over
+`package.json`/`bun.lock` changes it wrote itself.
+
+### Also done: the first production use of `cmd_close`
+
+The IU endpoint's rolling-30-day 403 turned out to be the provider's own
+usage-tracking fault, resolved externally and confirmed by the operator — never our
+consumption. Three items (ev968/969/970) were parked in `needs_human` for it.
+Closed by hand with a reason rather than left to the 7-day clock, which would have
+recorded them as `dismissed`/`expired` — an outage that was resolved is not an
+expiry.
+
+```
+ev968/969/970   needs_human -> closed   16:28:47Z
+metric1         6/9 = 0.667  ->  7/10 = 0.700
+metric2         `closed: 3` enters the funnel for the first time
+```
+
+`cmd_close` had never fired in production before. It works, and the three
+`needs_human → closed` pairs it produced (~10.2h each) are the first data
+`/metrics` metric 3 has ever had.
+
+**Metric 3 still reads `null` anyway, and that is worth a note.** Its leaf history
+guard suppresses the whole window because the 7-day start predates `history_since`
+(2026-09-09T19:43Z) — correct for a *count* over a window the table did not exist
+for, but this metric is a **median of durations**, and a median of the pairs that do
+exist is a valid statistic on a smaller sample, not an understatement. The guard
+applies count semantics to a median. It self-resolves on 2026-09-16, so it is
+recorded rather than changed — §42 defect 2 added those leaf guards deliberately and
+re-litigating one needs better evidence than six days of impatience.
+
+### Next action
+
+Item 1b's warden half, in flight: the `deployOnMerge` policy key, the third merge
+case into `liveness_pending`, an `argo-commit-live` liveness gatherer, and the
+Actions run id folded into the merge operation's receipt as the deploy receipt the
+ssh path structurally cannot provide.
