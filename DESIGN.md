@@ -188,7 +188,9 @@ new -> investigating -> verdict -+-> implementing -> validating -+-> merged -> d
                                  +-> needs_human                 
                                  +-> dismissed (reason required)
                                  +-> pr_open
-                                 +-> new           (UNRELATED SIGNATURES, cluster dissolve)
+                                 +-> split         (UNRELATED SIGNATURES, cluster dissolve)
+split -> investigating   (individual re-evaluation, singleton)
+split -> needs_human     (deadline, verdict carried in `note`)
 new -> ignored | note | snoozed -> new
 terminal: fixed | quiet | closed | dismissed | ignored | note
 ```
@@ -242,6 +244,7 @@ pruned is stuck forever with nothing polling it out.
 | `verifying` | liveness | 2h | `new`, reopened with history |
 | `needs_human` | operator | 7d, reminder at 1d | `dismissed`, reason `expired` |
 | `pr_open` | PR poll | 14d | `dismissed` |
+| `split` | escalate | 24h | `needs_human`, verdict carried in `note` |
 
 ---
 

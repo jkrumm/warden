@@ -90,10 +90,16 @@ WINDOW_DAYS = 7
 # "What done means" table counts as a RECORDED disposition for a verdict.
 # `quiet` is deliberately absent: DESIGN.md's own principle 5, "silence is
 # never an outcome" — a signal going quiet cancels the need to START work, it
-# never discharges an obligation a verdict already created. Mirrors
+# never discharges an obligation a verdict already created. `split` is
+# absent for the same reason it sits outside `quiet`'s company, not inside
+# it: a split item's verdict has NOT reached a disposition yet — it is
+# mid-funnel, carrying an unre-evaluated verdict while it waits to be
+# escalated again on its own (triage.py's STATE_SPLIT) — so it belongs with
+# `new`/`investigating`/`verdict`, outside this list, until IT reaches one of
+# the states actually named here. Mirrors
 # triage.py's STATE_* constants by literal value rather than by import: this
 # module stays a read-only, dependency-free reader of the ledger, and copying
-# eight string literals that change on the same rare cadence as the lifecycle
+# ten string literals that change on the same rare cadence as the lifecycle
 # diagram itself (DESIGN.md § Lifecycle) is a smaller risk than pulling in the
 # whole 3400-line act-loop module just to read its constants.
 DISPOSITION_STATES = (

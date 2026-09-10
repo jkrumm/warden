@@ -250,6 +250,43 @@ def _setup_discoverable_repos(ctx, names: list[str], *, deny: list[str] | None =
     return root_dir
 
 
+def _insert_dispatch_row(conn: sqlite3.Connection, job_id: str, created_at: dt.datetime, *,
+                          repo: str = "demo-repo") -> None:
+    """A bare `dispatches` row with nothing but the columns `_cooldown_ok()`
+    reads (job_id, created_at) — for tests that need a `split`/carried
+    `dispatch_job` to resolve against a real cooldown anchor without running
+    a whole escalate_cluster() cycle to produce one."""
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,why,origin_channel,origin_thread_ts,"
+        "origin_event_id,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (job_id, "investigate", repo, "brief", None, None, None, None, "done", created_at.isoformat()),
+    )
+    conn.commit()
+
+
+def _seed_split_item(conn: sqlite3.Connection, *, external_id: str, repo: str = "demo-repo",
+                      dispatch_job: str | None = None, occurrences: int = 5,
+                      first_seen: dt.datetime | None = None) -> int:
+    """One triage_items row DIRECTLY inserted already in `split` — the shape
+    a real dissolve produces (state=split, repo retained, dispatch_job
+    retained as the cooldown anchor) — without needing the whole
+    escalate -> fold-verdict -> dissolve cycle
+    (test_cluster_dissolves_on_unrelated_verdict already covers that path in
+    full; these are escalate()-focused tests that only need the resulting
+    shape)."""
+    first_seen = first_seen or OLD
+    eid = _insert_event(conn, source="slack_alert", external_id=external_id,
+                         title=f"Split {external_id}", first_seen=first_seen)
+    conn.execute(
+        "INSERT INTO triage_items(event_id, signature, repo, state, dispatch_job, occurrences, "
+        "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (eid, f"slack_alert:{external_id}", repo, triage.STATE_SPLIT, dispatch_job, occurrences,
+         first_seen.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+    )
+    conn.commit()
+    return eid
+
+
 # --- tests -----------------------------------------------------------------
 
 def test_repeated_signature_one_card_one_investigation():
@@ -614,19 +651,242 @@ def test_cluster_dissolves_on_unrelated_verdict():
         triage.fold_dispatch_verdict(conn, origin_event_id=e1, job_id=job_id, now=NOW, dry_run=False)
         assert triage._get_item(conn, e1)["state"] == triage.STATE_VERDICT
 
-        # A direct call, not triage.run(): run() would immediately re-cluster
-        # the freshly-dissolved (now cooldown-unprotected-by-state-but-
-        # dispatch_job-anchored) pair back together via escalate() in the
-        # same pass — see _dissolve_cluster()'s own docstring. Dissolution
-        # itself is what this test asserts, not the following escalation.
+        # A direct call, not triage.run(): run() would immediately try to
+        # re-escalate the freshly-dissolved (now cooldown-unprotected-by-
+        # state-but-dispatch_job-anchored) pair via escalate() in the same
+        # pass — each as its own SINGLETON now, never re-fused (see
+        # escalate()'s own comment). Dissolution itself is what this test
+        # asserts, not the following escalation.
         triage.maybe_dissolve_clusters(conn, NOW, dry_run=False)
         for eid in (e1, e2):
             item = triage._get_item(conn, eid)
-            assert item["state"] == triage.STATE_NEW, f"member {eid} should have been dissolved back to new"
+            assert item["state"] == triage.STATE_SPLIT, f"member {eid} should have been dissolved to split"
             # dispatch_job is deliberately RETAINED as a cooldown anchor —
             # see _dissolve_cluster()'s docstring — not cleared.
             assert item["dispatch_job"] == job_id
             assert item["card_ts"] is None
+            assert item["note"].startswith(triage.SPLIT_VERDICT_NOTE_PREFIX), item["note"]
+            assert "UNRELATED SIGNATURES — two separate causes." in item["note"], item["note"]
+
+
+def test_dissolve_cluster_dry_run_performs_state_change_without_slack_call():
+    """DRY-RUN CONTRACT paragraph, taken literally: "dissolve bookkeeping ...
+    runs for real even under --dry-run" — only the Slack update is skipped.
+    Before this fix `_dissolve_cluster()` returned before doing ANYTHING
+    under --dry-run, which meant the one pre-production surface this repo has
+    (a two-pass run() against a VACUUM INTO copy with --dry-run set — STATE.md
+    §38/§39) could not exercise the dissolve edge at all."""
+    with _triage_env() as (conn, ctx):
+        e1 = _insert_event(conn, source="slack_alert", external_id="sig-dryrun-split-a", title="A",
+                            first_seen=OLD)
+        e2 = _insert_event(conn, source="slack_alert", external_id="sig-dryrun-split-b", title="B",
+                            first_seen=OLD)
+        calls: list[dict[str, Any]] = []
+        triage._run_hermes_cc_dispatch = _fake_dispatcher(conn, calls)
+        triage.run(conn, dry_run=False)
+        job_id = triage._get_item(conn, e1)["dispatch_job"]
+        assert job_id is not None
+        assert triage._get_item(conn, e1)["card_ts"] is not None, "the cluster must have a real card first"
+
+        conn.execute(
+            "UPDATE dispatches SET status=?, verdict_json=? WHERE job_id=?",
+            ("done", json.dumps({"summary": "UNRELATED SIGNATURES — dry-run split.",
+                                  "confidence": "high", "nextAction": "none"}), job_id),
+        )
+        conn.commit()
+        triage.fold_dispatch_verdict(conn, origin_event_id=e1, job_id=job_id, now=NOW, dry_run=False)
+
+        calls_before = ctx.total_calls()
+        triage.maybe_dissolve_clusters(conn, NOW, dry_run=True)
+        assert ctx.total_calls() == calls_before, "--dry-run must never call Slack"
+
+        for eid in (e1, e2):
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_SPLIT, (
+                f"dissolve bookkeeping must run for real under --dry-run, got {item['state']}"
+            )
+            assert item["card_ts"] is None
+            assert item["note"].startswith(triage.SPLIT_VERDICT_NOTE_PREFIX), item["note"]
+
+
+def test_split_state_survives_apply_resolutions_state_43_regression():
+    """STATE.md §43, reproduced then closed: two dissolved cluster members
+    carrying a correct, real verdict were sent to `new`, missed
+    re-escalation inside cooldownHours, and were silently quiet-resolved by
+    apply_resolutions() before anyone ever saw the verdict — which survived
+    only in dispatches.verdict_json, which nothing reads. If this test goes
+    red, that defect is back."""
+    with _triage_env() as (conn, ctx):
+        e1 = _insert_event(conn, source="slack_alert", external_id="sig-43-a", title="A", first_seen=OLD)
+        e2 = _insert_event(conn, source="slack_alert", external_id="sig-43-b", title="B", first_seen=OLD)
+        calls: list[dict[str, Any]] = []
+        triage._run_hermes_cc_dispatch = _fake_dispatcher(conn, calls)
+        triage.run(conn, dry_run=False)
+        job_id = triage._get_item(conn, e1)["dispatch_job"]
+
+        conn.execute(
+            "UPDATE dispatches SET status=?, verdict_json=? WHERE job_id=?",
+            ("done", json.dumps({"summary": "UNRELATED SIGNATURES — an active watchdog race.",
+                                  "confidence": "high", "nextAction": "none"}), job_id),
+        )
+        conn.commit()
+        triage.fold_dispatch_verdict(conn, origin_event_id=e1, job_id=job_id, now=NOW, dry_run=False)
+        triage.maybe_dissolve_clusters(conn, NOW, dry_run=False)
+        for eid in (e1, e2):
+            assert triage._get_item(conn, eid)["state"] == triage.STATE_SPLIT
+
+        # The exact §43 mechanism: the underlying signal disappears
+        # (events.resolved_at set — disappearance from observation, never a
+        # human decision) while the item is still inside cooldownHours of its
+        # dissolved dispatch.
+        conn.execute("UPDATE events SET resolved_at=? WHERE id IN (?, ?)", (NOW.isoformat(), e1, e2))
+        conn.commit()
+        triage.apply_resolutions(conn, NOW)
+
+        for eid in (e1, e2):
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_SPLIT, (
+                f"a split row's verdict must survive silence — got {item['state']} (this is the exact "
+                f"STATE.md §43 defect: the verdict reached nobody)"
+            )
+            assert item["note"] is not None and item["note"].startswith(triage.SPLIT_VERDICT_NOTE_PREFIX), (
+                "the dissolve verdict must still be readable on the row after a silence pass"
+            )
+
+
+def test_escalate_singleton_splits_never_group():
+    """A `split` item escalates alone — never grouped with another `split`
+    item, even in the same repo (see escalate()'s own comment: grouping it
+    would re-fuse the very cluster _dissolve_cluster() just took apart, which
+    its own Slack notice promises will not happen)."""
+    with _triage_env() as (conn, ctx):
+        _insert_dispatch_row(conn, "job-old-cluster", VERY_OLD)
+        e1 = _seed_split_item(conn, external_id="sig-solo-a", dispatch_job="job-old-cluster")
+        e2 = _seed_split_item(conn, external_id="sig-solo-b", dispatch_job="job-old-cluster")
+        calls: list[dict[str, Any]] = []
+        triage._run_hermes_cc_dispatch = _fake_dispatcher(conn, calls)
+        triage.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert len(calls) == 1, (
+            f"one dispatch per repo per run must hold across two split items too, got {len(calls)}"
+        )
+        dispatched = [eid for eid in (e1, e2)
+                      if triage._get_item(conn, eid)["state"] == triage.STATE_INVESTIGATING]
+        waiting = [eid for eid in (e1, e2) if triage._get_item(conn, eid)["state"] == triage.STATE_SPLIT]
+        assert len(dispatched) == 1 and len(waiting) == 1, f"{dispatched=} {waiting=}"
+        # The dispatch's own primary event_id is the proof of singleton-ness —
+        # NOT "the other signature's text is absent from the brief": the
+        # waiting item legitimately still appears there as sibling CONTEXT
+        # (_sibling_open_items(), unrelated to cluster membership), same as
+        # any other open item in the repo would.
+        assert calls[0]["event_id"] == dispatched[0], (
+            f"expected the dispatch's primary member to be the escalated split item, "
+            f"got event_id={calls[0]['event_id']!r}"
+        )
+
+
+def test_escalate_prefers_split_over_new_in_same_repo_and_defers_new():
+    """"split candidates are considered before new clusters" — and the
+    existing "one dispatch per repo per run" property holds across both
+    kinds: a repo with an eligible split item spends this run's slot on it,
+    and its new items wait for the next run, reported rather than dropped
+    (DESIGN.md § What must not be lost item 7, "overflow waits, never
+    drops")."""
+    with _triage_env() as (conn, ctx):
+        _insert_dispatch_row(conn, "job-old-cluster", VERY_OLD)
+        split_eid = _seed_split_item(conn, external_id="sig-priority-split", dispatch_job="job-old-cluster")
+        new_eid = _insert_event(conn, source="slack_alert", external_id="sig-priority-new",
+                                 title="A new one", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+            "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (new_eid, "slack_alert:sig-priority-new", "demo-repo", triage.STATE_NEW, 5,
+             OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        triage._run_hermes_cc_dispatch = _fake_dispatcher(conn, calls)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            triage.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert len(calls) == 1, f"one dispatch per repo per run, got {len(calls)}"
+        # calls[0]["event_id"] is the proof the SPLIT item won the slot — not
+        # "the new item's text is absent from the brief": it legitimately
+        # still appears there as sibling CONTEXT (_sibling_open_items()),
+        # same as any other open item in the repo would.
+        assert calls[0]["event_id"] == split_eid, (
+            f"expected the split item to win this run's slot, got event_id={calls[0]['event_id']!r}"
+        )
+        assert triage._get_item(conn, split_eid)["state"] == triage.STATE_INVESTIGATING
+        assert triage._get_item(conn, new_eid)["state"] == triage.STATE_NEW, (
+            "the new item must wait for the next run, not be dropped"
+        )
+        assert "wait for next run" in err.getvalue(), (
+            f"a deferral that only reaches nothing is indistinguishable from a broken loop: "
+            f"{err.getvalue()}"
+        )
+
+
+def test_a_capped_attempt_does_not_claim_to_have_deferred_anyone():
+    """An attempt stopped by MAX_OPEN_INVESTIGATIONS took nobody's slot, so it
+    must not print "wait for next run" — that line describes a dispatch that
+    did not happen, and a deferral message naming the wrong cause is worse
+    than the silence DESIGN.md § Budgets objects to. The cluster-cap overflow
+    print sat after both cap `continue`s before `split` existed; carrying the
+    deferral lines onto the attempt keeps that ordering now that there are two
+    kinds of attempt."""
+    saved_cap = triage.MAX_OPEN_INVESTIGATIONS
+    try:
+        with _triage_env() as (conn, ctx):
+            _insert_dispatch_row(conn, "job-old-capped", VERY_OLD)
+            split_eid = _seed_split_item(conn, external_id="sig-capped-split",
+                                          dispatch_job="job-old-capped")
+            new_eid = _insert_event(conn, source="slack_alert", external_id="sig-capped-new",
+                                     title="Held behind the cap", first_seen=OLD)
+            conn.execute(
+                "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+                "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (new_eid, "slack_alert:sig-capped-new", "demo-repo", triage.STATE_NEW, 5,
+                 OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+            )
+            conn.commit()
+            calls: list[dict[str, Any]] = []
+            triage._run_hermes_cc_dispatch = _fake_dispatcher(conn, calls)
+            triage.MAX_OPEN_INVESTIGATIONS = 0
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                triage.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+            assert len(calls) == 0, f"MAX_OPEN_INVESTIGATIONS=0 must dispatch nothing, got {len(calls)}"
+            assert "at MAX_OPEN_INVESTIGATIONS" in err.getvalue(), (
+                f"the cap itself must still be visible: {err.getvalue()}")
+            assert "wait for next run" not in err.getvalue(), (
+                f"nothing was dispatched, so nothing was deferred BY a dispatch — the cap message is "
+                f"the whole story here: {err.getvalue()}")
+            assert triage._get_item(conn, split_eid)["state"] == triage.STATE_SPLIT
+            assert triage._get_item(conn, new_eid)["state"] == triage.STATE_NEW
+    finally:
+        # Restored by hand: _triage_env()'s own save/restore captures this
+        # global on ENTRY, and the cap tests in this file set it before
+        # entering, so relying on it would leak this 0 into later tests.
+        triage.MAX_OPEN_INVESTIGATIONS = saved_cap
+
+
+def test_cooldown_holds_back_split_member_inside_cooldown_hours():
+    """The STATE.md §43 mechanism itself, now harmless: a split member's
+    retained dispatch_job still anchors a real cooldownHours wait, so it does
+    not instantly re-escalate in the very same run — it simply no longer
+    loses its verdict while it waits (see the §43 regression test above)."""
+    with _triage_env() as (conn, ctx):
+        recent = NOW - dt.timedelta(hours=1)
+        _insert_dispatch_row(conn, "job-recent", recent)
+        eid = _seed_split_item(conn, external_id="sig-cooldown-split", dispatch_job="job-recent")
+        calls: list[dict[str, Any]] = []
+        triage._run_hermes_cc_dispatch = _fake_dispatcher(conn, calls)
+        triage.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert calls == [], "inside cooldownHours, a split item must not re-escalate"
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_SPLIT
 
 
 def test_dispatch_brief_on_stdin_and_capped():
@@ -681,12 +941,13 @@ def test_resolution_updates_card_once_then_stops():
 
     The item is escalated first (that is what puts a real card on it), then
     returned to `new` before the resolve — the shape production reaches via
-    `snoozed -> new` (unsnooze_if_expired()), a cluster dissolve
-    (_dissolve_cluster()) and a liveness-window reopen, all of which keep the
-    card. It has to be `new` because a silence resolve may touch nothing else
-    (_SILENCE_RESOLVE_ELIGIBLE_STATES); apply_resolutions() runs before
-    escalate() in run(), so the row resolves on that pass rather than being
-    re-dispatched."""
+    `snoozed -> new` (unsnooze_if_expired()) and a liveness-window reopen,
+    both of which keep the card (a cluster dissolve no longer produces this
+    shape: _dissolve_cluster() now moves a member to `split`, not `new` —
+    see STATE_SPLIT). It has to be `new` because a silence resolve may touch
+    nothing else (_SILENCE_RESOLVE_ELIGIBLE_STATES); apply_resolutions() runs
+    before escalate() in run(), so the row resolves on that pass rather than
+    being re-dispatched."""
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-resolve", title="Resolve me", first_seen=OLD)
         calls: list[dict[str, Any]] = []
@@ -1480,7 +1741,8 @@ def test_no_chain_state_is_silence_resolvable():
     `resolved_at` stamped. None of them may move."""
     chain_states = (triage.STATE_INVESTIGATING, triage.STATE_VERDICT, triage.STATE_NEEDS_HUMAN,
                      triage.STATE_PR_OPEN, triage.STATE_IMPLEMENTING, triage.STATE_VALIDATING,
-                     triage.STATE_MERGE_BLOCKED, triage.STATE_MERGED, triage.STATE_LIVENESS_PENDING)
+                     triage.STATE_MERGE_BLOCKED, triage.STATE_MERGED, triage.STATE_LIVENESS_PENDING,
+                     triage.STATE_SPLIT)
     policy = dict(DEFAULT_POLICY, quietResolveHours=1)
     with _triage_env(policy=policy) as (conn, _ctx):
         stale_anchor = (NOW - dt.timedelta(hours=3)).isoformat()
@@ -2436,6 +2698,39 @@ def test_pr_open_expires_to_dismissed_expired():
         assert item["state"] == triage.STATE_DISMISSED, item["state"]
         assert "expired" in item["note"], item["note"]
         assert "336h" in item["note"], item["note"]
+
+
+def test_split_expires_to_needs_human_preserving_verdict_note():
+    """The 24h split -> needs_human deadline (STATE_DEADLINES[STATE_SPLIT])
+    must not cost the row the one thing that makes carding it again worth
+    doing: the dissolve verdict written under SPLIT_VERDICT_NOTE_PREFIX. See
+    sweep_deadlines()'s own "NARROW exception" docstring paragraph."""
+    with _triage_env() as (conn, _ctx):
+        verdict_note = f"{triage.SPLIT_VERDICT_NOTE_PREFIX}root cause in scripts/foo.py, two lines"
+        item = _expire(conn, triage.STATE_SPLIT, "sig-dl-split", note=verdict_note)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert item["note"].startswith(triage.DEADLINE_EXPIRED_NOTE_PREFIX), item["note"]
+        assert "unre-evaluated" in item["note"], item["note"]
+        assert verdict_note in item["note"], (
+            f"the dissolve verdict must survive the expiry, appended rather than lost: {item['note']}"
+        )
+
+
+def test_sweep_deadlines_replaces_note_on_non_split_expiry():
+    """The narrow-scope guard, the other direction: a NON-split state's prior
+    note is HISTORICAL (an old written fix, a stale remediation), not a
+    pending obligation being handed to the deadline for the first time, and
+    sweep_deadlines() must still replace it outright — generalising the
+    split-note preservation to every expiry path is explicitly out of scope
+    (see that function's own docstring), and this is the guard against
+    someone "finishing the job" later."""
+    with _triage_env() as (conn, _ctx):
+        old_note = "an old, unrelated written fix that predates this expiry"
+        item = _expire(conn, triage.STATE_VERDICT, "sig-dl-verdict-old-note", note=old_note)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert old_note not in item["note"], (
+            f"a non-split state's prior note must be REPLACED, not preserved: {item['note']}"
+        )
 
 
 def test_merged_expires_to_closed():

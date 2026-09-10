@@ -102,11 +102,16 @@ edges* and *Clustering* below.
    timer. See *Evidence commands and grouped-source resolution* below.
 5. **Dissolve** — a cluster whose folded verdict says its members don't
    share a root cause (`DISSOLVE_MARKER`, see *Clustering*) splits: every
-   member resets to `new` and re-escalates independently later.
+   member moves to `split` — carrying that verdict in `note` — and waits to
+   be re-evaluated on its own. See *The `split` state* below.
 6. **Escalate** — every eligible `new`+`repo`-mapped item, GROUPED BY REPO,
    becomes at most ONE sideclaw dispatch per repo per run (a cluster, capped
    at `MAX_CLUSTER_SIGNATURES` = 5 members; the rest wait for a later run) —
-   not one dispatch per item. See *Clustering*.
+   not one dispatch per item. A `split` item is ALSO a candidate, considered
+   BEFORE `new` clusters, but escalates as a SINGLETON, never grouped — and
+   still counts against that repo's one-dispatch-per-run slot, so a repo with
+   an eligible `split` item defers its `new` items to the next run. See
+   *Clustering* and *The `split` state*.
 6b. **Verbs** — every eligible `new`+`verb`-mapped item runs its allowlisted
    local command once. See *Verb outcomes*.
 6c. **Deadlines** — every non-terminal state names its poller and how long a
@@ -400,7 +405,8 @@ was asked and did not answer. An item that is mapped
 but hasn't yet crossed `minOccurrences`/`minOpenMinutes` — or is simply
 unmapped — is carried silently; it appears only in the daily digest (if
 unmapped) or not at all (if mapped but not yet eligible). `ignored` and
-`STATE_NOTE` are excluded too — see *Notes vs ignored*. This is deliberate:
+`STATE_NOTE` are excluded too — see *Notes vs ignored*. `split` is excluded
+for its own, different reason — see *The `split` state*. This is deliberate:
 an empty or partial policy must never turn into dozens of cards of noise on
 day one, which is exactly what carding every non-`ignored` row (regardless of
 state) used to do.
@@ -426,7 +432,7 @@ state change on an item they were never told about is not news.**
 ## State machine
 
 ```
-new ──(escalate, clustered by repo)──> investigating ──(sweeper folds verdict)──┬──> verdict ──(DISSOLVE_MARKER)──> new (cluster splits)
+new ──(escalate, clustered by repo)──> investigating ──(sweeper folds verdict)──┬──> verdict ──(DISSOLVE_MARKER)──> split (cluster splits)
  │                                                                                │        │
  │                                                                                │        └──(nextAction=implement, confidence=high)──> implementing (step 6)
  │                                                                                ├──> needs_human
@@ -436,6 +442,9 @@ new ──(escalate, clustered by repo)──> investigating ──(sweeper fold
  ├──(ignoreUnstructuredSlackProse)──> note  (terminal, never carded, but IN the daily digest)
  ├──(--snooze)──> snoozed ──(snoozed_until passes)──> new
  └──(event resolves / quiet timer / recovery ✅)──> quiet ──(event reopens)──> new
+
+split ──(escalate, SINGLETON — never grouped)──> investigating  (re-evaluated on its own)
+split ──(24h, no escalate slot won)──> needs_human  (verdict from `note` carried into the expiry note)
 
 investigating ──(2h)──> needs_human      merge_blocked ──(7d)──> dismissed
 verdict ──────(24h)──> needs_human      needs_human ──(7d)──> dismissed
@@ -484,15 +493,20 @@ nobody looked at again.
 | `pr_open` | operator | 14d | `dismissed`, reason `expired` |
 | `liveness_pending` | `maybe_check_liveness` | own column `liveness_deadline` | reopens to `new` with history, or `fixed` on a positive match |
 | `snoozed` | `unsnooze_if_expired` | own column `snoozed_until` | `new` |
+| `split` | `escalate` | 24h | `needs_human`, reason `unre-evaluated`, verdict carried in `note` |
 
-Two deviations from DESIGN.md's own table remain, both deliberate. `verdict`
+Three deviations from DESIGN.md's own table remain, all deliberate. `verdict`
 is not in it at all and is non-terminal — `maybe_auto_implement()` only
 advances a verdict that reads `nextAction=implement` at `confidence=high`, so
-every other one sits there with nothing scheduled to touch it. `needs_human`'s
-"reminder at 1d" is NOT built: a reminder is a notification, not a deadline.
-(A third deviation — `merged` expiring to `resolved` instead of `closed` —
-was here until the `resolved` split landed; `merged` now expires to `closed`,
-matching DESIGN.md's own table exactly.)
+every other one sits there with nothing scheduled to touch it. `split` is the
+same kind of addition, for the same reason — nothing scheduled to touch it
+unless `escalate()` finds it a free per-repo slot this run — at the same 24h,
+matching `verdict`'s own rule, well clear of `cooldownHours` so `escalate()`
+gets several real chances first. `needs_human`'s "reminder at 1d" is NOT
+built: a reminder is a notification, not a deadline. (A fourth deviation —
+`merged` expiring to `resolved` instead of `closed` — was here until the
+`resolved` split landed; `merged` now expires to `closed`, matching
+DESIGN.md's own table exactly.)
 
 `dismissed` is terminal and always carries its reason in `note` —
 `_set_state()` raises rather than let a reasonless dismissal exist. It is
@@ -543,17 +557,61 @@ phrase `UNRELATED SIGNATURES` in its summary/verdict/recommendation. The very
 next run's `maybe_dissolve_clusters()` does a plain, case-sensitive substring
 check for that phrase on a `verdict`-state cluster (`needs_human`/`pr_open`
 clusters found something actionable, so dissolving doesn't apply there) and,
-on a match, resets every member to `new` via `_dissolve_cluster()` — which
+on a match, moves every member to `split` via `_dissolve_cluster()` — which
 posts one final "Cluster split" message on the shared card and clears its
 `card_channel`/`card_ts`/`card_hash`, but DELIBERATELY LEAVES `dispatch_job`
-set on the now-`new` rows, purely as a cooldown anchor (`_cooldown_ok()` still
-finds the dissolved dispatch's `created_at`). Without that, the SAME run's
-`escalate()` call would see both members freshly eligible with zero cooldown
-and instantly re-fuse them into an identical cluster — dissolve would be a
-no-op in practice. Accepted tradeoff: a dissolved pair could re-cluster again
-after `cooldownHours` if both are still open; a hard permanent split would
-need a negative-relationship table this schema doesn't have, and the split
-verdict stays visible in `dispatches.verdict_json` regardless.
+set on the now-`split` rows, purely as a cooldown anchor (`_cooldown_ok()`
+still finds the dissolved dispatch's `created_at`). Without that, the SAME
+run's `escalate()` call would see both members freshly eligible with zero
+cooldown and instantly re-fuse them into an identical cluster — dissolve
+would be a no-op in practice. Accepted tradeoff: a dissolved pair could
+re-cluster again after `cooldownHours` if both are still open; a hard
+permanent split would need a negative-relationship table this schema doesn't
+have.
+
+## The `split` state
+
+Before Wave 3, a dissolved member reset all the way to `new`. Live on
+2026-09-09 21:09-21:39Z (STATE.md §43): two members carrying a real, correct
+verdict about an active `hermes-agent` watchdog race were dissolved to `new`,
+missed re-escalation inside `cooldownHours` (correctly — that's the cooldown
+anchor working as designed), and were silently quiet-resolved by
+`apply_resolutions()` before anyone ever saw the verdict — which survived
+only in `dispatches.verdict_json`, which nothing reads. `new` is the one
+state a silence path may discharge (`_SILENCE_RESOLVE_ELIGIBLE_STATES`,
+deliberately an inclusion list of exactly that one state) precisely because a
+`new` row carries no obligation yet — and a dissolved member does.
+
+`split` is that obligation's home: a cluster member whose shared
+investigation returned `UNRELATED SIGNATURES`. It carries the dissolve
+verdict in `note` (`SPLIT_VERDICT_NOTE_PREFIX`, capped the same way a
+dispatch brief is), so the verdict survives on the row itself rather than
+only inside an unread `dispatches.verdict_json`.
+
+It is deliberately **not carded** — `_cluster_groups()` groups CARDED rows by
+`dispatch_job`, and a dissolved member still shares its (retained)
+`dispatch_job` with its former cluster-mates, so carding `split` would
+re-render, as one cluster card, the very cluster the dissolve just took
+apart. Its own dissolve-notice update on the shared card IS its visible
+history until it reaches `needs_human` (which IS carded).
+
+`escalate()` is what advances it — as a **singleton**, never grouped with
+another `split` item or with `new` items (grouping it would re-fuse the
+cluster the dissolve just split, which its own Slack notice promises won't
+happen: "Each will be re-evaluated individually"). Every eligible `split`
+candidate across EVERY repo is attempted before any `new` cluster in any
+repo — the ordering is global, not per-repo, so the shared
+`MAX_OPEN_INVESTIGATIONS`/`DAILY_INVESTIGATE_BUDGET` ceilings go to obligated
+items first. A `split` item still counts against its repo's
+one-dispatch-per-run slot: a repo with an eligible `split` item
+spends this run's slot on it, and its `new` items wait for the next run
+(printed, never silently dropped). `STATE_DEADLINES` bounds it at 24h,
+expiring to `needs_human` — the honest expiry for an unactioned verdict,
+which is also what makes it visible on a card again. `sweep_deadlines()`
+appends its generic expiry note to the split verdict rather than replacing
+it, the one narrow exception to "the expiry note replaces whatever was
+there" — every other state's prior note is history, this one is a still-live
+obligation.
 
 ## Escalation — the two edges
 

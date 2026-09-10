@@ -4445,3 +4445,233 @@ needs a poller and a deadline like every other non-terminal state
 (`STATE_DEADLINES` is one closed table), a `WARDEN_SCHEMA_VERSION` bump in
 `hermes-agent/scripts/hermes-cc.sh` in the same breath, and `make unload` first —
 this is not an additive change.
+
+---
+
+## 45. Wave 3, item 0 — the `split` state (DONE & LIVE, no schema change)
+
+`STATE.md` §43 measured it in production: `_dissolve_cluster()` sent a split
+cluster's members back to `new`, and `new` is the one state a silence path may
+discharge — so a substantive, correct verdict was closed as `quiet` before anyone
+saw it. The fix is a distinct state, per the handover: a dissolved member **has
+been evaluated**, carries a verdict, and is not silence-eligible until it has been
+re-evaluated individually.
+
+### What changed
+
+| File | Change |
+|-|-|
+| `scripts/triage.py` | `STATE_SPLIT = "split"`; `SPLIT_VERDICT_NOTE_PREFIX`; `STATE_DEADLINES` + `STATE_EMOJI` entries; `_dissolve_cluster()` targets `split`, carries the verdict in `note`, and no longer skips its bookkeeping under `--dry-run`; `maybe_dissolve_clusters()` passes the verdict text down; `escalate()` treats `split` rows as singleton candidates ahead of `new` clusters; `sweep_deadlines()` preserves a split verdict note on expiry |
+| `scripts/api.py` | comment only — why `split` is not a recorded disposition |
+| `tests/test_triage.py` | 108 → **116** (7 + 1, accounted below) |
+| `DESIGN.md`, `docs/triage.md` | lifecycle diagram, deadline table, and a new § *The `split` state* |
+
+`_SILENCE_RESOLVE_ELIGIBLE_STATES` is **unchanged** at `(STATE_NEW,)`. That is the
+point: it is an inclusion list precisely so a state added later is excluded
+fail-closed, and `split` is protected by that property rather than by an edit to
+it.
+
+### There is no schema 5, and the handover expected one
+
+The Wave 3 handover says of this item *"it is schema 5"*. It is not, and the
+reason is evidence rather than preference — a version bump here would be ritual
+and would force a coordinated `WARDEN_SCHEMA_VERSION` edit in `hermes-cc.sh` for
+no contract change:
+
+| Claim | Checked |
+|-|-|
+| No new column is needed | `dispatch_job` is already the cooldown anchor and `note` already exists |
+| `triage_items.state` has no `CHECK` constraint | `SELECT sql FROM sqlite_master WHERE name='triage_items'` — plain `TEXT NOT NULL` |
+| `dispatch-sweep.py` never reads `triage_items` | `grep -n "triage_items" scripts/dispatch-sweep.py` → nothing |
+| `hermes-cc.sh`'s `--auto-from-item` refuses a `split` item | it gates `if row["state"] != "verdict"` and returns `STATE <state>` → `policy_err` |
+| `api.py`'s `DISPOSITION_STATES` excludes it fail-closed | it is an inclusion list, same shape and same argument as `_SILENCE_RESOLVE_ELIGIBLE_STATES` |
+
+Confirmed by running the cross-repo suites unchanged: `test_hermes_cc.py` **165
+cases as expected** (including its `WARDEN_SCHEMA_VERSION assertion 2/2`),
+`test_dispatch_approval.py` **83 checks, 0 failures**.
+
+### Second finding — `_dissolve_cluster()` was violating the dry-run contract
+
+Found while building the verification harness, and it is the reason the harness
+did not work on the first attempt. The module docstring's DRY-RUN CONTRACT
+paragraph says, in as many words:
+
+> *"Every other step (ingest, reopen/unsnooze, classify, resolve, **dissolve
+> bookkeeping**) ... runs for real even under --dry-run"*
+
+It did not. `_dissolve_cluster()` opened with `if dry_run: print(...); return`,
+placed **before** both the Slack call and the `_set_state()` loop, so a dry run
+made no state change at all. Measured, against a `VACUUM INTO` copy of the live
+ledger with the pair rewound to `verdict`:
+
+```
+BEFORE (HEAD, unmodified)
+  pass 1  -> state stays 'verdict'   [dry-run] would dissolve cluster 09bf0c14…
+  pass 2  -> state stays 'verdict'
+```
+
+`DESIGN.md` § What must not be lost item 8 calls the dry-run contract *"the only
+pre-production surface that exists"*. It was silently not covering the one edge
+this slice changes. The guard now suppresses only the Slack `update_blocks()`
+call. A dissolve moves a row between two **working** states, which is the same
+class of move `classify()` / `apply_resolutions()` / `resolve_quiet_grouped()`
+already perform for real under dry-run; it is not the **terminal**,
+non-re-derivable move `sweep_deadlines()` carves its exception for.
+
+### Verified, not claimed — the live-shaped proof
+
+Two `VACUUM INTO` copies of the live ledger (taken 08:26Z, schema 4, 57 items, 24
+transitions). Events 2 and 815 — §43's actual victims — rewound to `verdict`
+sharing dispatch `09bf0c14…`, whose `verdict_json` still carries
+`UNRELATED SIGNATURES`. Then the real `scripts/triage.py --dry-run` entry point,
+`WARDEN_HOME` redirected, twice: once to dissolve, then with both events marked
+resolved to see whether silence discharges them.
+
+```
+BEFORE — HEAD state machine (dissolve -> new)
+  rewound (2, 815) to `verdict`
+  pass 1  -> {"2": "new",   "815": "new"}      transitions 24 -> 26
+  both events marked resolved (the monitors recovered)
+  pass 2  -> {"2": "quiet", "815": "quiet"}    transitions 26 -> 28
+  RESULT: DISCHARGED BY SILENCE
+
+AFTER — the split state
+  pass 1  -> {"2": "split", "815": "split"}    transitions 24 -> 26
+            ev2  : state='split' dispatch_job=SET note=set: cluster split — the investigation's verdict…
+            ev815: state='split' dispatch_job=SET note=set: cluster split — the investigation's verdict…
+  both events marked resolved (the monitors recovered)
+  pass 2  -> {"2": "split", "815": "split"}    transitions 26 (no change)
+  RESULT: SURVIVED silence
+```
+
+The BEFORE run required patching a **throwaway** `git archive HEAD` export to move
+the dry-run guard — the finding above is what made HEAD's own behaviour
+unmeasurable. Said here because "we measured the old behaviour" is otherwise a
+claim about a run that could not have happened.
+
+**Churn regression, the Wave 2 property, re-run on both:** two passes on an
+untouched copy produce `0` and `0` new transitions with an identical census,
+before and after. The new state does not reintroduce what §38 removed.
+
+### Test count, accounted for
+
+```
+$ make test
+  test_api.py                      23/23 passed
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   16/16 passed
+  test_triage.py                   116/116 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ grep -c 'UPDATE triage_items SET state=' scripts/triage.py
+1
+$ make check-policy   ->   ✓ both copies agree on all 30 repos
+```
+
+`test_triage.py` **108 + 7 + 1 = 116**. The seven: dissolve targets `split`;
+dry-run performs the state change with no Slack call; the §43 regression through
+`apply_resolutions()`; singleton escalation; split-over-new priority with its
+deferral reported; cooldown still holding a split member back; the 24h expiry
+preserving the verdict note; and the non-split expiry still replacing its note.
+The one is `test_a_capped_attempt_does_not_claim_to_have_deferred_anyone` — see
+below.
+
+### Mutation-tested, independently of the worker's own table
+
+Nine mutations, each broken → red **by name** → restored → `116/116` green, with
+the file verified byte-identical after each restore.
+
+| Mutation | Caught by |
+|-|-|
+| `_dissolve_cluster()` back to `STATE_NEW` | `test_cluster_dissolves_on_unrelated_verdict`, `test_dissolve_cluster_dry_run_performs_state_change_without_slack_call`, `test_split_state_survives_apply_resolutions_state_43_regression` |
+| `STATE_SPLIT` admitted to `_SILENCE_RESOLVE_ELIGIBLE_STATES` | `test_no_chain_state_is_silence_resolvable`, `test_silence_resolve_eligible_states_is_new_only`, `test_split_state_survives_apply_resolutions_state_43_regression` |
+| `escalate()` groups split members instead of singletons | `test_escalate_singleton_splits_never_group`, `test_escalate_prefers_split_over_new_in_same_repo_and_defers_new`, `test_a_capped_attempt_does_not_claim_to_have_deferred_anyone` |
+| `sweep_deadlines()` drops the split-note preservation | `test_split_expires_to_needs_human_preserving_verdict_note` |
+| `_dissolve_cluster()` clears `dispatch_job` | `test_cluster_dissolves_on_unrelated_verdict` |
+| dry-run early `return` restored before the `_set_state()` loop | `test_dissolve_cluster_dry_run_performs_state_change_without_slack_call` |
+| `split` removed from `STATE_DEADLINES` | `test_every_non_terminal_state_names_a_poller_and_a_deadline` + 4 more (the `_set_state()` raise fires first) |
+| deferral lines deleted entirely | `test_escalate_prefers_split_over_new_in_same_repo_and_defers_new` |
+| deferral lines **hoisted ahead of the cap checks** | `test_a_capped_attempt_does_not_claim_to_have_deferred_anyone` |
+
+The last two are a pair on purpose: the first proves the deferral is *visible*,
+the second proves it is *true*. Only the second catches the regression below.
+
+### Three corrections made to the worker's diff after reading it
+
+A worker's report is a claim; the diff is the proof. Reading it line by line found:
+
+1. **A log-honesty regression.** The worker moved the overflow/deferral prints
+   ahead of the two cap checks, so a repo deferred by `MAX_OPEN_INVESTIGATIONS`
+   would still print *"N more wait for next run"* — describing a dispatch that
+   never happened. The pre-`split` code printed the cluster-cap overflow **after**
+   both `continue`s. Restored by carrying the deferral lines on the attempt tuple,
+   plus the ninth mutation and the 116th test. `DESIGN.md` § Budgets asks for
+   deferral to be visible; a deferral message naming the wrong cause is worse than
+   the silence it objects to.
+2. **`docs/triage.md` understated the priority rule.** The implementation orders
+   **globally** — every eligible `split` across every repo is attempted before any
+   `new` cluster in any repo, so the shared `MAX_OPEN_INVESTIGATIONS` /
+   `DAILY_INVESTIGATE_BUDGET` ceilings go to obligated items first. That is the
+   right call and the worker named it as an assumption; the doc said "in the same
+   repo". Corrected to state the global ordering.
+3. **`scripts/api.py`** described `DISPOSITION_STATES` as *"eight string
+   literals"*. It has ten. Pre-existing drift, fixed because the file is in this
+   diff.
+
+### Live
+
+Agents were unloaded for the whole slice (`make unload` at 08:25:58Z, `make
+agents` at 09:01:36Z) — §38's lesson, applied rather than relearned. The loop
+started on load; `pgrep -f triage.py` was checked before anything else so no
+second loop could exist.
+
+```
+first live pass on the new code, 09:01:42Z
+  census      {'ignored': 7, 'needs_human': 9, 'new': 3, 'note': 8, 'quiet': 30}
+  transitions 24  (unchanged)
+  schema      4
+  warden-loop.err  mtime unchanged (2026-09-09 22:39Z) — no new line
+  all five agents ✓ last exit 0 · api /health ok · policy ✓ 30 repos
+```
+
+Inert on the current ledger, which is correct: no row is in `verdict`, so nothing
+dissolves, and the three `new` rows are the unmapped `uk` group monitors that
+never escalate. The first real exercise will be the next genuine
+`UNRELATED SIGNATURES` verdict.
+
+### Observations, recorded not fixed
+
+1. **The split note is capped at `MAX_BRIEF_CHARS` (8000)** while its only
+   consumer, a Block Kit section, truncates at `SECTION_TEXT_MAX` (3000). Not a
+   defect — it is stored honestly and displayed truncated — but it is up to 8 KB
+   per split row in `triage_items.note` *and* in `item_transitions.note`, which
+   §41's known-open 6 (metric 3 loading all of `item_transitions` into memory)
+   will eventually care about.
+2. **`_triage_env()`'s save/restore captures `MAX_OPEN_INVESTIGATIONS` /
+   `DAILY_INVESTIGATE_BUDGET` on ENTRY**, and this file's cap tests set them
+   *before* entering, so a mutated value can leak into alphabetically-later tests
+   in the same process. Found by the worker. The suite passes because no later
+   test depends on the default; `test_a_capped_attempt_does_not_claim_to_have_
+   deferred_anyone` restores by hand rather than rely on it. A latent
+   test-isolation gap, not a production one.
+3. **`docs/triage.md` § Tests narrates stale case counts** ("30 cases", "42 cases
+   total") that predate the 108 baseline. Pre-existing drift; a rewrite of that
+   narrative is its own task.
+4. **A dissolved pair can still re-cluster after `cooldownHours`** if both
+   re-escalate in different runs and later co-occur — `_dissolve_cluster()`'s
+   original accepted tradeoff, unchanged. Singleton escalation removes the
+   same-run re-fusion that persisting in `split` would otherwise have made the
+   likely outcome; a permanent split still needs a negative-relationship table
+   this schema does not have.
+
+### Next action
+
+Wave 3 item 1 — the operation id, and crash reconciliation with `unknown`. That
+one **does** need a schema change (`dispatch_approvals` has no `event_id`, and 0
+of 5 rows carry `--auto-from-item`), so it is schema 5 and it bumps
+`WARDEN_SCHEMA_VERSION` in `hermes-agent/scripts/hermes-cc.sh` in the same breath.
+It is what makes `/metrics`' *verified unattended fixes per week* stop returning
+`null`.

@@ -67,11 +67,14 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    `new` rows too. Neither ever claims "fixed" — see
                    QUIET_RESOLVE_NOTE_PREFIX/RECOVERY_PAIRED_NOTE_PREFIX.
   5. Dissolve     — a cluster (see CLUSTERING below) whose folded verdict says
-                   its members do not share a root cause splits back into
-                   individually-eligible `new` items.
+                   its members do not share a root cause splits into `split`
+                   items — carrying that verdict in `note` — each waiting to
+                   be re-evaluated individually (see STATE_SPLIT).
   6. Escalate     — every `new`+`repo`-mapped+eligible item, GROUPED BY REPO,
                    becomes at most one sideclaw `investigate` dispatch per
-                   repo per run (a cluster), not one per item.
+                   repo per run (a cluster), not one per item; a `split` item
+                   escalates too, but always as a SINGLETON, ahead of that
+                   repo's `new` clusters — see escalate()'s own comment.
   6b. Verbs       — every `new`+`verb`-mapped+eligible item runs its
                    allowlisted local command once (see VERB OUTCOMES) — never
                    an episode, never clustered with repo-mapped items.
@@ -156,11 +159,12 @@ per brief; the rest wait for the next run), rather than one dispatch per item.
 Cluster membership is DERIVED, never stored as its own column: every CARDED
 triage_items row sharing a non-NULL `dispatch_job` value IS one cluster — a
 dedicated `cluster_id` column would just duplicate that fact under a different
-name. `_dissolve_cluster()` resets a split cluster's members to state `new`
-(which drops them out of every cluster grouping — see CARDED STATES below),
-but deliberately leaves `dispatch_job` itself set on those rows purely as a
-cooldown anchor, not a live cluster pointer — see that function's own
-docstring for why clearing it outright would let the escalate() call in the
+name. `_dissolve_cluster()` moves a split cluster's members to state `split`
+(which drops them out of every cluster grouping — see CARDED STATES below —
+while keeping the verdict that produced the split readable on each row, see
+STATE_SPLIT), but deliberately leaves `dispatch_job` itself set on those rows
+purely as a cooldown anchor, not a live cluster pointer — see that function's
+own docstring for why clearing it outright would let the escalate() call in the
 very same run instantly re-fuse the pair it just split. The clustering is a
 HYPOTHESIS from deterministic co-occurrence, never an assertion: the brief
 tells the episode so explicitly and asks it to confirm or split it (see
@@ -289,6 +293,34 @@ GROUPED_TRIAGE_SOURCES = ("slack_alert", "hermes_log")
 STATE_NEW = "new"
 STATE_INVESTIGATING = "investigating"
 STATE_VERDICT = "verdict"
+# A cluster member whose SHARED investigation returned DISSOLVE_MARKER
+# ("UNRELATED SIGNATURES" — see _dissolve_cluster()): it HAS been evaluated,
+# it CARRIES that verdict, and it is waiting to be re-evaluated on its own.
+# Reached only from `verdict`, via maybe_dissolve_clusters(), which is why it
+# sits here rather than next to STATE_NEW.
+#
+# Deliberately NOT `new`. `new` is the one state a silence path may discharge
+# (_SILENCE_RESOLVE_ELIGIBLE_STATES is an inclusion list of exactly that one
+# state) precisely because a `new` row carries no obligation yet — and a
+# dissolved member does. Measured live, 2026-09-09 21:09-21:39Z (STATE.md
+# §43): two members carrying a real, correct verdict about an active
+# hermes-agent watchdog race were dissolved to `new`, missed re-escalation
+# inside cooldownHours (correctly — see _dissolve_cluster()'s docstring for
+# why `dispatch_job` stays the cooldown anchor), and were silently
+# quiet-resolved by apply_resolutions() before anyone ever saw the verdict.
+# The verdict survived only in dispatches.verdict_json, which nothing reads.
+# That is the defect this state exists to close, and it closes it by putting
+# the row somewhere silence structurally cannot reach.
+#
+# Deliberately NOT in CARDED_STATES — see that tuple's own comment for why: a
+# dissolved member still shares its (deliberately-retained) `dispatch_job`
+# with its former cluster-mates, and _cluster_groups() groups CARDED rows by
+# that column, so carding `split` would re-render, as one cluster card, the
+# very cluster this state exists to take apart.
+#
+# escalate() is what advances it — as a SINGLETON, never grouped, see that
+# function's own comment — and STATE_DEADLINES is what bounds it.
+STATE_SPLIT = "split"
 STATE_NEEDS_HUMAN = "needs_human"
 STATE_PR_OPEN = "pr_open"
 # Wave 2's `resolved` split — three honest terminal outcomes instead of one
@@ -383,6 +415,17 @@ STATE_DISMISSED = "dismissed"
 # like. Every state that can expire to `dismissed` (needs_human,
 # merge_blocked, pr_open) is itself carded, so in practice this only ever
 # updates a card that already exists.
+# STATE_SPLIT is deliberately ABSENT, and it looks like an omission rather
+# than a decision, so: `_cluster_groups()` groups CARDED rows BY
+# `dispatch_job`, and a dissolved member still shares its former cluster's
+# `dispatch_job` (kept on purpose, as the cooldown anchor — see
+# _dissolve_cluster()). Carding `split` would therefore re-render, as one
+# cluster card, the very cluster the dissolve just took apart — the row
+# would look carded-and-grouped exactly like the `investigating` cluster it
+# used to be. Its own dissolve-notice update (posted by _dissolve_cluster()
+# itself, directly) IS its card history; nothing further renders for it
+# until it reaches `needs_human` on expiry (see STATE_DEADLINES), which IS
+# carded.
 CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR_OPEN,
                   STATE_FIXED, STATE_QUIET, STATE_CLOSED,
                   STATE_IMPLEMENTING, STATE_VALIDATING, STATE_MERGE_BLOCKED, STATE_MERGED,
@@ -404,6 +447,17 @@ CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR
 QUIET_RESOLVE_NOTE_PREFIX = "signal quiet since "
 RECOVERY_PAIRED_NOTE_PREFIX = "recovery message observed: "
 LIVENESS_CONFIRMED_NOTE_PREFIX = "liveness confirmed: "
+# _dissolve_cluster()'s own note prefix — the dissolve verdict's text
+# (summary + verdict + recommendation, the same text_blob DISSOLVE_MARKER is
+# matched against), so a `split` row's obligation is readable on its own row,
+# not only inside dispatches.verdict_json where STATE.md §43 found nobody
+# ever reads it. Safe to write here where a note was not safe on `new`
+# (apply_resolutions() clears note=NULL, but a `split` row is never a
+# candidate for that function — see _SILENCE_RESOLVE_ELIGIBLE_STATES): this
+# is the ledger RECORDING the obligation (DESIGN.md principle 1), not
+# forgetting it. sweep_deadlines() preserves it, rather than overwriting it,
+# on the one expiry path that can reach a `split` row — see that function.
+SPLIT_VERDICT_NOTE_PREFIX = "cluster split — the investigation's verdict, pending individual re-evaluation: "
 
 STATE_EMOJI = {
     STATE_NEW: ":large_blue_circle:",
@@ -423,6 +477,11 @@ STATE_EMOJI = {
     STATE_MERGED: ":rocket:",
     STATE_LIVENESS_PENDING: ":hourglass_flowing_sand:",
     STATE_DISMISSED: ":wastebasket:",
+    # Unreachable on a rendered card today — `split` is deliberately absent
+    # from CARDED_STATES (see that state's own comment) — but STATE_EMOJI is
+    # a total map over the vocabulary, and a gap here would silently render
+    # `:question:` the day this state is ever carded.
+    STATE_SPLIT: ":scissors:",
 }
 
 # Terminal means: no poller, no deadline, no exit. Named once, as a constant,
@@ -477,6 +536,20 @@ _STATE_DEADLINE_COLUMN = "state_deadline"
 #   * `needs_human`'s "reminder at 1d" is NOT built here. A reminder is a
 #     notification feature, not a deadline — it changes nothing about when the
 #     row may stop existing. Scoped out on purpose, not missed.
+#   * `split` is the same third addition as `verdict` above, for the same
+#     reason: post-verdict, nothing scheduled to touch it unless a specific
+#     condition is met (here: escalate() finding it a free per-repo slot —
+#     see that function). Poller is named as "escalate" — the real function
+#     that advances it, per principle 6 — not a comment. 24h, matching
+#     `verdict`'s own rule: `split` is the same KIND of state, and the
+#     deadline has to clear DEFAULT_COOLDOWN_HOURS=6 by a wide margin so
+#     escalate() gets several real chances (several 10-minute passes across
+#     multiple cooldown windows) before the clock takes over — this is the
+#     backstop for "the repo is denied/unmapped, or budgets stayed
+#     saturated", not the normal path. Expires to `needs_human`, not
+#     `dismissed`: the row holds an unactioned verdict, so the honest expiry
+#     is to put it in front of a human — which also makes it visible again,
+#     since `needs_human` IS carded (see CARDED_STATES).
 STATE_DEADLINES: dict[str, _DeadlineRule] = {
     # Bounded by silence, not by a clock: the three silence paths resolve a
     # `new` row after `quietResolveHours` (see _SILENCE_RESOLVE_ELIGIBLE_STATES,
@@ -487,6 +560,7 @@ STATE_DEADLINES: dict[str, _DeadlineRule] = {
                                         _STATE_DEADLINE_COLUMN),
     STATE_VERDICT: _DeadlineRule("maybe_auto_implement", 24, STATE_NEEDS_HUMAN, None,
                                   _STATE_DEADLINE_COLUMN),
+    STATE_SPLIT: _DeadlineRule("escalate", 24, STATE_NEEDS_HUMAN, "unre-evaluated", _STATE_DEADLINE_COLUMN),
     STATE_IMPLEMENTING: _DeadlineRule("poll_implement_jobs", 2, STATE_MERGE_BLOCKED, None,
                                        _STATE_DEADLINE_COLUMN),
     STATE_VALIDATING: _DeadlineRule("poll_validation_jobs", 1, STATE_MERGE_BLOCKED, None,
@@ -2221,17 +2295,38 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
 def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
     """Groups every eligible `new`+mapped item BY REPO and opens at most one
     sideclaw dispatch per repo per run (a cluster — see module docstring),
-    capped at MAX_CLUSTER_SIGNATURES members per brief. Concurrency and daily
-    budget are checked once per run, decremented as clusters are opened, so
-    later repos in the same run correctly see an exhausted cap."""
+    capped at MAX_CLUSTER_SIGNATURES members per brief. A `split` item (see
+    STATE_SPLIT) is ALSO an escalation candidate, gated by the exact same
+    checks (snoozed_until, denied repo, _is_escalation_eligible(),
+    _cooldown_ok()) — but it escalates as a SINGLETON, never grouped with
+    another `split` item or with `new` items: grouping it would re-fuse the
+    very cluster _dissolve_cluster() just took apart, which its own Slack
+    notice promises will not happen ("Each will be re-evaluated
+    individually").
+
+    `split` candidates are considered BEFORE `new` clusters — an item
+    carrying an obligation and a deadline outranks work that has not
+    started — and the "at most one dispatch per repo per run" property holds
+    across both kinds: if a repo has an eligible `split` item, THAT repo's
+    slot for this run is spent on it, and every `new` item (and any
+    additional `split` item) in that same repo waits for a later run,
+    reported exactly like the existing cluster-cap overflow is — a
+    deferral that only reaches a `.err` file is indistinguishable from a
+    broken loop.
+
+    Concurrency and daily budget are checked once per run, decremented as
+    clusters are opened, so later repos (and later, `new`, attempts) in the
+    same run correctly see an exhausted cap."""
     denied = _denied_repos()
     open_investigations = _count_open_investigation_clusters(conn)
     budget_used_today = _investigate_dispatches_today(conn, now)
 
     candidates = conn.execute(
-        "SELECT * FROM triage_items WHERE state=? AND repo IS NOT NULL ORDER BY event_id", (STATE_NEW,)
+        "SELECT * FROM triage_items WHERE state IN (?, ?) AND repo IS NOT NULL ORDER BY event_id",
+        (STATE_NEW, STATE_SPLIT),
     ).fetchall()
-    by_repo: dict[str, list[sqlite3.Row]] = {}
+    split_by_repo: dict[str, list[sqlite3.Row]] = {}
+    new_by_repo: dict[str, list[sqlite3.Row]] = {}
     for item in candidates:
         if item["snoozed_until"]:
             continue
@@ -2246,9 +2341,53 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
             print(f"triage: {item['signature']} recurred inside cooldownHours, not re-escalating yet",
                   file=sys.stderr)
             continue
-        by_repo.setdefault(repo, []).append(item)
+        bucket = split_by_repo if item["state"] == STATE_SPLIT else new_by_repo
+        bucket.setdefault(repo, []).append(item)
 
-    for repo, members in by_repo.items():
+    # One ordered list of (repo, members, deferrals) attempts — `split`
+    # singletons first (see this function's own docstring), each repo
+    # appearing at most once. `claimed_repos` is what makes "one dispatch per
+    # repo per run" hold ACROSS the two kinds, not just within `new_by_repo`
+    # as it used to.
+    #
+    # `deferrals` are the lines saying who this attempt pushed to a later run,
+    # and they are CARRIED rather than printed here on purpose: an attempt
+    # that never gets past the two caps below did not take anyone's slot, and
+    # announcing "N more wait for next run" for a cluster that was itself
+    # deferred describes a dispatch that did not happen. That is the shape the
+    # cluster-cap message had before `split` existed — the overflow print sat
+    # after both `continue`s — and it is preserved rather than reinvented.
+    attempts: list[tuple[str, list[sqlite3.Row], list[str]]] = []
+    claimed_repos: set[str] = set()
+    for repo, items in split_by_repo.items():
+        primary, overflow = items[0], items[1:]
+        deferrals = []
+        if overflow:
+            deferrals.append(
+                f"triage: {len(overflow)} more split item(s) in {repo} wait for next run "
+                f"(a split item escalates as a singleton, never grouped): "
+                f"{[m['signature'] for m in overflow]}")
+        held_new = new_by_repo.get(repo) or []
+        if held_new:
+            deferrals.append(
+                f"triage: {repo}'s slot this run went to a split item — {len(held_new)} new item(s) "
+                f"wait for next run: {[m['signature'] for m in held_new]}")
+        attempts.append((repo, [primary], deferrals))
+        claimed_repos.add(repo)
+
+    for repo, members in new_by_repo.items():
+        if repo in claimed_repos:
+            continue
+        group = members[:MAX_CLUSTER_SIGNATURES]
+        overflow = members[MAX_CLUSTER_SIGNATURES:]
+        deferrals = []
+        if overflow:
+            deferrals.append(
+                f"triage: {len(overflow)} more eligible {repo} items wait for next run "
+                f"(cluster cap {MAX_CLUSTER_SIGNATURES}/brief): {[m['signature'] for m in overflow]}")
+        attempts.append((repo, group, deferrals))
+
+    for repo, members, deferrals in attempts:
         if open_investigations >= MAX_OPEN_INVESTIGATIONS:
             print(f"triage: at MAX_OPEN_INVESTIGATIONS={MAX_OPEN_INVESTIGATIONS}, deferring cluster in "
                   f"{repo} ({[m['signature'] for m in members]})", file=sys.stderr)
@@ -2257,13 +2396,9 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
             print(f"triage: at DAILY_INVESTIGATE_BUDGET={DAILY_INVESTIGATE_BUDGET}, deferring cluster "
                   f"in {repo}", file=sys.stderr)
             continue
-        group = members[:MAX_CLUSTER_SIGNATURES]
-        overflow = members[MAX_CLUSTER_SIGNATURES:]
-        if overflow:
-            print(f"triage: {len(overflow)} more eligible {repo} items wait for next run "
-                  f"(cluster cap {MAX_CLUSTER_SIGNATURES}/brief): {[m['signature'] for m in overflow]}",
-                  file=sys.stderr)
-        job_id = escalate_cluster(conn, repo, group, now, policy, dry_run=dry_run)
+        for line in deferrals:
+            print(line, file=sys.stderr)
+        job_id = escalate_cluster(conn, repo, members, now, policy, dry_run=dry_run)
         # escalate_cluster() always returns None under --dry-run (it never
         # calls hermes-cc.sh) — `or dry_run` keeps the two caps' PREVIEW
         # meaningful across multiple repos in one dry-run pass (a later repo
@@ -2369,11 +2504,12 @@ def run_verbs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime
 # --- dissolve — a cluster the episode itself says is unrelated ----------------
 
 def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now: dt.datetime,
-                       *, dry_run: bool) -> None:
-    """Reset every member to `new` so each re-escalates individually.
+                       verdict_text: str, *, dry_run: bool) -> None:
+    """Move every member to `split` so each is re-evaluated individually.
     `dispatch_job` is deliberately LEFT SET (only card_channel/card_ts/
-    card_hash are cleared) — a `new` row is never grouped by
-    `_cluster_groups()` (which only looks at CARDED_STATES), so the cluster
+    card_hash are cleared) — a `split` row is never grouped by
+    `_cluster_groups()` (which only looks at CARDED_STATES, and `split` is
+    deliberately not in it — see that tuple's own comment), so the cluster
     is functionally gone for card/escalation purposes, but keeping the
     pointer means `_cooldown_ok()` still finds the dissolved dispatch's
     created_at and enforces a real cooldownHours wait. Without this, the very
@@ -2383,29 +2519,47 @@ def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now:
     a no-op in practice. The tradeoff: a dissolved pair COULD re-cluster again
     after cooldownHours if both are still open — accepted, since a hard
     permanent split needs a negative-relationship table this schema doesn't
-    have, and the split verdict stays visible in dispatches.verdict_json for
-    whoever reads the history."""
+    have.
+
+    `verdict_text` (the SAME `summary`/`verdict`/`recommendation` text_blob
+    maybe_dissolve_clusters() already built to check DISSOLVE_MARKER against —
+    passed down rather than re-read from `dispatches` here, which would be a
+    second source of truth for the same string) is written into every
+    member's `note` under SPLIT_VERDICT_NOTE_PREFIX. This is the actual fix
+    for STATE.md §43: the split verdict used to survive only in
+    `dispatches.verdict_json`, which nothing reads — now it survives on the
+    row itself, in the one state silence can never touch.
+
+    Runs its bookkeeping for real even under `dry_run` — only the Slack
+    `update_blocks()` call is skipped, per the module's own DRY-RUN CONTRACT
+    ("dissolve bookkeeping ... runs for real even under --dry-run"). A
+    dissolve moves a row between two WORKING states (verdict -> split), the
+    same class of move classify()/apply_resolutions()/resolve_quiet_grouped()
+    already perform for real under --dry-run; it is not the TERMINAL,
+    non-re-derivable move sweep_deadlines() carves an exception for."""
     sigs = [m["signature"] for m in members]
     job_id = members[0]["dispatch_job"]
-    if dry_run:
-        print(f"[dry-run] would dissolve cluster {job_id}: {sigs}")
-        return
     card_channel = members[0]["card_channel"]
     card_ts = members[0]["card_ts"]
+    print(f"{'[dry-run] would dissolve' if dry_run else 'triage: dissolving'} cluster {job_id}: {sigs}")
     if card_channel and card_ts:
-        token = resolve_slack_token()
-        if token:
-            sig_list = ", ".join(f"`{s}`" for s in sigs)
-            blocks = [
-                {"type": "header", "text": {"type": "plain_text", "text": ":arrows_counterclockwise: Cluster split"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text":
-                    f"The investigation found these did not share a root cause: {sig_list}. "
-                    f"Each will be re-evaluated individually."}},
-            ]
-            update_blocks(card_channel, card_ts, blocks, "Cluster split — re-evaluating individually", token)
+        if dry_run:
+            print(f"[dry-run] would post cluster-split update to {card_channel}/{card_ts}")
+        else:
+            token = resolve_slack_token()
+            if token:
+                sig_list = ", ".join(f"`{s}`" for s in sigs)
+                blocks = [
+                    {"type": "header", "text": {"type": "plain_text", "text": ":arrows_counterclockwise: Cluster split"}},
+                    {"type": "section", "text": {"type": "mrkdwn", "text":
+                        f"The investigation found these did not share a root cause: {sig_list}. "
+                        f"Each will be re-evaluated individually."}},
+                ]
+                update_blocks(card_channel, card_ts, blocks, "Cluster split — re-evaluating individually", token)
+    note = f"{SPLIT_VERDICT_NOTE_PREFIX}{_cap_brief(verdict_text)}" if verdict_text.strip() else None
     for m in members:
-        _set_state(conn, m["event_id"], STATE_NEW, now,
-                   card_channel=None, card_ts=None, card_hash=None)
+        _set_state(conn, m["event_id"], STATE_SPLIT, now,
+                   card_channel=None, card_ts=None, card_hash=None, note=note)
     conn.commit()
 
 
@@ -2413,9 +2567,11 @@ def maybe_dissolve_clusters(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
     """A cluster (>1 member sharing one dispatch_job) that landed in plain
     `verdict` (not needs_human/pr_open — those found something actionable,
     splitting doesn't apply) whose folded verdict text contains
-    DISSOLVE_MARKER gets unwound: every member goes back to `new`, its
-    dispatch_job/card pointers cleared, so each re-escalates independently on
-    a later run. Runs once per pass, before escalate() — "the cluster is
+    DISSOLVE_MARKER gets unwound: every member moves to `split`, its
+    dispatch_job/card pointers cleared (dispatch_job itself retained — see
+    _dissolve_cluster()), carrying the verdict that produced the split in its
+    own `note` so each is re-evaluated independently on a later run without
+    losing it. Runs once per pass, before escalate() — "the cluster is
     dissolved on the next run" per the design this implements."""
     rows = conn.execute(
         "SELECT dispatch_job, count(*) c FROM triage_items WHERE dispatch_job IS NOT NULL AND state=? "
@@ -2434,7 +2590,7 @@ def maybe_dissolve_clusters(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
         members = conn.execute(
             "SELECT * FROM triage_items WHERE dispatch_job=? ORDER BY event_id", (job_id,)
         ).fetchall()
-        _dissolve_cluster(conn, list(members), now, dry_run=dry_run)
+        _dissolve_cluster(conn, list(members), now, text_blob, dry_run=dry_run)
 
 
 # --- card rendering ------------------------------------------------------------
@@ -3123,14 +3279,27 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
     `needs_human`, and only a human transitions one, so "it gets a deadline
     when it next transitions" meant never. It stays a FINDING because a NULL
     deadline is either a pre-column legacy row or a bug in a transition site,
-    and silently fixing the second is how it stays a bug."""
+    and silently fixing the second is how it stays a bug.
+
+    NARROW exception to "write a fresh generic note": a `split` row's `note`
+    carries the dissolve verdict under SPLIT_VERDICT_NOTE_PREFIX (see
+    _dissolve_cluster()) — the one unactioned obligation this sweeper can
+    expire. Overwriting it at the exact moment the row finally becomes
+    visible again (split -> needs_human, which IS carded) would lose the
+    verdict a second time, on top of the loss STATE.md §43 already recorded
+    once. So THIS ONE CASE appends the expiry note to the existing one
+    instead of replacing it. Deliberately NOT generalised to every state's
+    prior note — the other five expiry paths' prior notes are HISTORICAL
+    (an old written fix, a stale env-check remediation), not a pending
+    obligation being handed to the deadline for the first time, and
+    preserving them too is a different, unasked-for change."""
     now_iso = _now_iso(now)
     # The string comparison is a prefilter over the state_deadline index (the
     # same shape unsnooze_if_expired() uses on snoozed_until); _parse_ts()
     # below makes the actual decision, so a differently-formatted timestamp
     # can never expire an item on a lexical accident.
     rows = conn.execute(
-        "SELECT event_id, signature, state, state_deadline FROM triage_items "
+        "SELECT event_id, signature, state, state_deadline, note FROM triage_items "
         "WHERE state_deadline IS NOT NULL AND state_deadline<=? ORDER BY event_id",
         (now_iso,),
     ).fetchall()
@@ -3153,6 +3322,12 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
         if rule.reason:
             note += f" — reason `{rule.reason}`"
         note += "."
+        prior_note = row["note"] or ""
+        if row["state"] == STATE_SPLIT and prior_note.startswith(SPLIT_VERDICT_NOTE_PREFIX):
+            # See this function's own docstring, "NARROW exception" paragraph
+            # — this is the one prior note that is itself an unactioned
+            # obligation, not history, so it is appended rather than lost.
+            note = f"{note}\n\n{prior_note}"
         if dry_run:
             print(f"[dry-run] would expire {row['signature']} (event {row['event_id']}): "
                   f"{row['state']} -> {rule.on_expiry} after {rule.hours:g}h with no advance "
