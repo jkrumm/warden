@@ -4897,3 +4897,131 @@ proves everything up to `merged → closed`; `vps/observability/**` is the only
 seeded deploy target and the only way `fixed` can ever be produced, and it is
 `FLOWS.md` flow 1's case-4 monitoring-config trap in production. `DESIGN.md` §
 What "done" means already states metric 2 cannot move without the second.
+
+---
+
+## 47. The deploy surface — "merge is deploy" is a design claim with no code behind it
+
+Reconnaissance for the stop-condition exercise. **Operator decision, 2026-09-10:
+the driving change is a minor dependency upgrade**, not a monitoring-threshold
+fix — a real change with a real diff and real CI, but nothing about it is
+self-concealing, so it sidesteps `REVIEW.md` C3 / human-essential case 4 entirely.
+That decision needs a repo where merge *is* deploy. Mapped, then verified here.
+
+### The blocker, verified against the code rather than the doc
+
+`DESIGN.md` § Deploy says:
+
+> *"Prefer not needing this at all: `meteo`, `research-gateway` and `argo` deploy
+> via GitHub Actions → RollHook, so merge **is** deploy."*
+
+Directionally true and **operationally unreachable**. There is no code path into
+`liveness_pending` for a repo with no deploy key:
+
+```python
+# triage.py, poll_validation_jobs()
+elif merge_result.get("ok") and merge_result.get("merged"):
+    deploy = merge_result.get("deploy") or {}
+    if deploy.get("attempted") and deploy.get("ok"):
+        ... STATE_LIVENESS_PENDING
+    else:
+        ... STATE_MERGED, note="merged; no deploy configured for this repo"
+```
+
+```sh
+# hermes-cc.sh, run_deploy_if_enabled()
+if not entry.get("autoDeploy"):
+    printf '{"attempted": false, "reason": "autoDeploy is false for %s"}' "$repo"
+```
+
+So a RollHook repo merges, lands in `merged`, and expires to `closed` after 1h —
+**never `liveness_pending`, never a probe, never `fixed`.** The design treats
+merge-is-deploy as the *easy* case that needs nothing built; the code has no
+representation for it at all. `DESIGN.md` § What "done" means already says metric
+2 cannot move until a repo has a deploy target and a liveness probe. This is the
+specific reason.
+
+Supporting facts, all verified here:
+
+```
+LIVENESS_ALLOWLIST                 exactly one key: "hyperdx-alert-state"
+config/triage-policy.json `repos`  exactly one repo: vps (observability/** only)
+```
+
+`merge_gate_check()` prints `NOPATHS` and refuses outright for a repo with no
+`autoMergePaths` — there is no implicit allow, which is correct and means adding
+a repo is a deliberate config act.
+
+### This belongs in item 1, and it improves item 1
+
+`DESIGN.md` § Crash recovery asks for *"remote receipts where available (PR merge
+sha, **deploy run id**)"*. The ssh path can never supply the second: `ssh <host>
+make <target>` returns an exit code and nothing addressable, which is why §46's
+ordering table records the deploy as having **no receipt that can exist**.
+
+A GitHub Actions run **does** have an id, and it is queryable after the fact. So
+the merge-is-deploy path is not a detour around the receipt problem — it is the
+only place in this estate where a real deploy receipt is obtainable. Building it
+strengthens item 1 rather than competing with it.
+
+### The candidates, measured
+
+| | `meteo` | `research-gateway` | `argo` |
+|-|-|-|-|
+| Actions → RollHook on master | yes, **paths-filtered** (JS only) | yes | yes (api + dashboard) |
+| Deploy duration, last 5 runs | 60-80s | 55-85s | 67-145s |
+| **PR-time CI** | **none** (push-to-master only) | **none** | **yes** — `check.yml` on `pull_request` |
+| Health endpoint | `/health`, static nginx `"ok"` | `/health` + `lastRestartAt` | `/api/health` |
+| Reachable from the mini | **public** (Cloudflare tunnel) | tailnet, **200** | tailnet, **200** |
+| Reveals a commit SHA | no | no | no (`version` is a hardcoded `"1.0.0"`) |
+| Installable minor/patch upgrade today | **`vite` 8.2.1→8.2.2**, exercised by the real build + two bundle-size gates | **none** — every candidate inside the 3-day `minimumReleaseAge` cooldown | `concurrently`, `lefthook` — dev-only, **CI never invokes them** |
+
+**Nothing bakes a commit SHA into any image.** `rollhook-action`'s inputs are
+`url`/`image_name`/`image_tag`/`dockerfile`/`context`/`build_args`/`timeout` — no
+automatic revision label. So today the strongest available liveness evidence is
+*"a restart landed after the merge"* (`research-gateway`'s `lastRestartAt`, or
+argo's bearer-gated `GET /api/docker/vps/containers` `startedAt`, which covers all
+three VPS containers without touching any of them), **not** *"this commit is
+live"*. `lastRestartAt` = 2026-09-08T08:31:57Z matches research-gateway's last
+deploy run (08:31:09Z → 08:32:10Z) exactly, which is what makes it usable at all.
+
+A restart-time probe is a genuine positive signal and it is weaker than what
+`fixed` deserves. Adding `GIT_SHA=${{ github.sha }}` as a `build_args` plus an
+endpoint that echoes it is a small change in the target repo and would make the
+probe prove the deploy *landed* rather than that the service *bounced*.
+
+### Two more contradictions found, recorded not fixed
+
+1. **`config/triage-policy.json`'s `_readme` is stale about argo.** It says *"argo
+   is compose-managed manually inside `vps` — nothing in argo's own repo redeploys
+   it"*, and routes `docker_*:*:argo*` alerts to `vps` on that basis. But
+   `argo/.github/workflows/deploy.yml` is committed and active, and
+   `vps/apps/argo/compose.yml` carries `rollhook.allowed_repos=jkrumm/argo` on both
+   containers. **Argo does redeploy from its own repo on every master push.**
+   Either the rationale is stale or the routing rule points at the wrong repo —
+   resolve before argo is added to `repos`.
+2. **`DESIGN.md` overstates meteo.** Only the *edge* (web/nginx) deploys via
+   Actions → RollHook. Meteo's Python half (`uv.lock`, store/blend/tileserver)
+   runs on this mini under launchd with no deploy workflow, so a `uv.lock` bump
+   would merge and deploy nothing. Half the repo is not merge-is-deploy.
+
+### The `noCiRequired` trap this walks into
+
+`meteo` and `research-gateway` have **no `pull_request` trigger**, so a PR head
+commit gets zero check runs and both would need `noCiRequired: true`. That is
+exactly the *"vacuously clean"* inversion `hermes-cc.sh`'s own merge gate comments
+say it exists to refuse — "no checks" and "all checks passed" must not be the same
+answer. Only `argo` has genuine PR-time CI.
+
+That pushes toward `argo` on safety and toward `meteo` on the quality of the
+change being tested (`vite` 8.2.1→8.2.2 goes through the actual production build
+and two bundle-size gates; argo's two installable bumps are dev tools its CI never
+invokes, so a green PR would prove almost nothing). **Not decided here** — it is
+downstream of the merge-is-deploy mechanism existing at all, and that is the next
+build after item 1a.
+
+### Next action
+
+Finish item 1a (the operations ledger, in flight). Then merge-is-deploy as item
+1b, with the Actions run id as its receipt — which is the deploy receipt `DESIGN.md`
+§ Crash recovery asks for and the ssh path structurally cannot provide.
