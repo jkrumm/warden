@@ -4258,3 +4258,190 @@ All nine `needs_human` rows are carded and carry 7-day deadlines
 - **The IU endpoint hit its rolling-30-day cost limit**, which is what broke the
   morning briefing and `propose_mappings`. Operational, external, and outside
   anything warden can act on.
+
+---
+
+## 44. Wave 3 — reconnaissance against the running system (2026-09-10, ~08:19Z)
+
+Read-only. No edits, no restarts, no writable handle on the live ledger. Every
+number below was produced by a command in this section, not read out of §43.
+
+### The five agents, the suites, the two endpoints
+
+```
+$ make status
+  venv                     Python 3.11.15
+  agents:
+    ✓ com.jkrumm.warden-loop  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-poll  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-sweep  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-backup  [pid -, last exit 0]
+    ✓ com.jkrumm.warden-api  [pid 10635, last exit 0]
+  api (/health)            ✓ reachable, ok
+  policy                   ✓ both copies agree on all 30 repos
+  ledger                   1.0M Sep 10 10:14
+
+$ make test                                      # exit 0
+  test_api.py                      23/23 passed
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   16/16 passed
+  test_triage.py                   108/108 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ make check-policy
+  dispatch policy — 30 repos under /Users/jkrumm/SourceRoot
+  ✓ both copies agree on all 30 repos
+  notes: sideclaw also admits roots hermes-cc.sh never uses: ['/Users/jkrumm/IuRoot']
+
+$ grep -c 'UPDATE triage_items SET state=' scripts/triage.py
+1
+$ pgrep -f triage.py
+(none — no second loop)
+$ git status --porcelain
+(clean, at 12d8020)
+```
+
+Every count matches the handover's pinned table exactly. `test_triage.py` is
+**108/108**, the regression gate.
+
+`/health` — `ok: true`, `schema_version` 4 == expected 4, all three named pollers
+under threshold (loop 8.3/30 min, watchdog_poll 17.3/90, dispatch_sweep 4.0/15).
+
+`/metrics`, live at 08:18:52Z:
+
+```
+metric1  verdicts -> recorded disposition   6/9 = 0.667   excluded_interactive 10
+                                            item_states {needs_human: 9, quiet: 11}
+metric2  verified fixes vs silence          0.0   fixed 0 · quiet 11 · closed 0 · dismissed 0
+metric3  median needs_human -> decision     null  window predates history_since
+metric4  verified UNATTENDED fixes/week     null  no operation id; approvals_spent_in_window 1
+metric5  poller ages (max)                  17.28 min (watchdog_poll, threshold 90)
+metric6  reopen_after_fixed null (history guard) · reverts null (no primitive)
+```
+
+Four of six `null`, each with a reason naming a fact about the ledger rather than
+a fabricated `0`. Three of those four clear on their own on 2026-09-16 when the
+7-day window stops predating `history_since`; the other two (metric 4's
+`unattended` qualifier, metric 6's `reverts`) are Wave 3 items 1 and 2.
+
+### The ledger, verified against my own read-only queries
+
+`sqlite3.connect("file:…?mode=ro", uri=True)` throughout.
+
+| Check | Result |
+|-|-|
+| `schema_version` | **4**, `applied_at` 2026-09-09T19:43:30.582326Z |
+| `journal_mode` / `quick_check` | `wal` / `ok` |
+| File mode | `-rw-------` (600), 1,077,248 bytes |
+| Rows still in `resolved` | **0** |
+| Census | `quiet` 30 · `needs_human` 9 · `note` 8 · `ignored` 7 · `new` 3 = 57 |
+| Non-terminal rows with a NULL `state_deadline` | **3, all `new`, and that is correct** — see below |
+| `needs_human` rows with a deadline and a card | **9 / 9 / 9** |
+| Schema pins | `ledger.py SCHEMA_VERSION = 4` == `hermes-cc.sh WARDEN_SCHEMA_VERSION="${…:-4}"` |
+
+**The three NULL deadlines are by design, not the Wave 1 defect returning.**
+`STATE_DEADLINES[STATE_NEW]` is `_DeadlineRule("resolve_quiet_grouped /
+apply_resolutions", None, None, None, None)` — `new` is bounded by silence, not by
+a clock, and a `deadline_column` of `None` is what says so. The three rows are
+`uk` group monitors (`Local`, `VPS`, `Services`) with `repo = NULL`: the unmapped
+parents from `DESIGN.md` § Open questions 3. Unmapped means they never escalate,
+which is why they have sat in `new` since Wave 0 without a card.
+
+### Transitions against loop passes — the churn has not come back
+
+The handover's sharpest recon question. Counted, not assumed:
+
+```
+item_transitions rows                     24
+first / last                              2026-09-09T19:43:30Z / 2026-09-10T06:14:49Z
+elapsed                                   12h 27m  ->  ~75 loop passes at 600s
+transitions per pass                      0.32
+```
+
+Under the pre-Wave-2 predicate the same span would have produced ~75 × 45 ≈ 3,400.
+By edge:
+
+```
+new -> investigating   7      quiet -> new      4      verdict -> new          2
+investigating -> needs_human 5  new -> quiet    4      investigating -> verdict 2
+```
+
+Every one accounted for by §40 (ids 1-5), §43 incident A (ids 19-24) and §43's
+dissolve incident (ids 7-16). Ids 17/18 are `ev310` reopening at 00:09:48Z and
+re-quieting at 00:39:50Z — a real `quiet -> new -> quiet` on a recurrence that
+went silent again inside 30 minutes, the intended behaviour of the one state
+silence may discharge.
+
+### The logs — checked by mtime and content, not by size
+
+```
+warden-{poll,sweep,backup}.err   0 bytes
+warden-api.err                   1107 bytes, ALL of it BaseHTTPRequestHandler
+                                 access logging (200s, one 405 on POST /metrics)
+warden-loop.err                  30051 bytes, mtime 2026-09-09T22:39Z local 00:39
+```
+
+`warden-loop.err` has not been written to in 9.6 hours despite ~57 loop passes
+since. Its newest lines are the two benign `uk:175/uk:185 recurred inside
+cooldownHours` notices and `propose_mappings — model call failed: HTTP Error 403:
+Forbidden`. **That 403 is not a live fault and will not retry until tonight**:
+`propose_mappings()` is on a 24h budget whose cursor
+(`triage_propose_mappings_last_run`) is stamped *before* the call precisely so a
+failure counts against the day's attempt rather than hammering the endpoint every
+ten minutes. Cursor reads `2026-09-09T22:39:42Z`; next attempt ~22:39Z tonight.
+The cause is §43's external one — the IU endpoint's rolling-30-day cost limit.
+
+### Backup — the nightly run happened, and the bytes left the box
+
+```
+$ cat ~/Library/Logs/warden-backup.log
+snapshot /Users/jkrumm/.warden/backups/warden-20260910T011000Z.db (1.0M)
+$ ssh homelab 'ls -la /mnt/hdd/backups/warden/'
+-rw------- 1 jkrumm jkrumm 1064960 Sep 10 01:09 warden.db
+```
+
+`warden-backup.err` 0 bytes at 03:10 local. Still **no restore path** — unchanged
+and still tracked.
+
+### The item-0 defect is still sitting in the ledger, exactly as §43 described it
+
+Re-derived independently rather than taken from §43:
+
+```sql
+SELECT event_id FROM item_transitions WHERE from_state='verdict';   -- 2, 815
+```
+
+```
+ev2   (uk:175)  state=quiet  note=NULL  card_ts=NULL  dispatch_job=09bf0c14…
+ev815 (uk:185)  state=quiet  note=NULL  card_ts=NULL  dispatch_job=09bf0c14…
+dispatches.verdict_json → "These two alerts do NOT share a root cause — UNRELATED SIGNATU…"
+```
+
+Two items, one substantive verdict, `note` and `card_ts` both NULL on both rows.
+The verdict exists only in `dispatches.verdict_json`, which nothing reads. This is
+Wave 3 item 0 and it goes first.
+
+### Known-open items re-checked against the code, not the doc
+
+| # | Claim | Verified |
+|-|-|-|
+| 4 | `hermes_log` has no `ts_last` | still true — `poll_hermes_logs()` payload is `{"first_line": …}` |
+| 5 | `ledger._verify_columns()` checks only the original five tables | **confirmed** — `_ADOPTABLE_TABLES = ("events","cursors","dispatches","dispatch_approvals","triage_items")`; `item_transitions` is created by `_MIGRATION_4` and asserted by nothing |
+| 6 | `/metrics` metric 3 loads all of `item_transitions` | still true, and 24 rows makes it a non-issue today |
+
+### Nothing new was found that §43 did not already name
+
+Which is itself the finding: eleven hours of production plus a full independent
+re-derivation surfaced no defect the boundary review and the first-night check had
+missed. The recon disagrees with `STATE.md` nowhere.
+
+### Next action
+
+Wave 3 item 0 — a distinct state for a dissolved cluster member, schema 5. It
+needs a poller and a deadline like every other non-terminal state
+(`STATE_DEADLINES` is one closed table), a `WARDEN_SCHEMA_VERSION` bump in
+`hermes-agent/scripts/hermes-cc.sh` in the same breath, and `make unload` first —
+this is not an additive change.
