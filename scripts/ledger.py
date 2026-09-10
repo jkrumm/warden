@@ -37,9 +37,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-# Same env-var-first, documented-default-second shape triage.py already uses
-# for HERMES_CC_BIN — an operator or a test overrides one variable and every
-# reader of this module (this file, and anything that imports it) agrees
+# Same env-var-first, documented-default-second shape every CLI binary path in
+# this repo already uses — an operator or a test overrides one variable and
+# every reader of this module (this file, and anything that imports it) agrees
 # without a second constant to keep in sync.
 WARDEN_HOME = (
     Path(os.environ["WARDEN_HOME"]).expanduser() if os.environ.get("WARDEN_HOME") else Path.home() / ".warden"
@@ -54,11 +54,11 @@ WARDEN_HOME = (
 DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db"
 
 # This IS the live ledger, since the cutover on 2026-09-09. Four LaunchAgents
-# and hermes-cc.sh all resolve here. ~/.hermes/watchdog.db is still on disk,
+# and the warden CLI all resolve here. ~/.hermes/watchdog.db is still on disk,
 # frozen at its pre-cutover state and written by nothing, kept as the rollback —
 # so if you are reading this to work out which database is real, it is this one.
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 """
 
 # Version 1 — every CREATE TABLE and CREATE INDEX currently spread across
-# hermes-cc.sh, triage.py, watchdog-poll.py and dispatch-sweep.py, with the
+# the CLI, triage.py, watchdog-poll.py and dispatch-sweep.py, with the
 # columns that today only exist because of a runtime `ALTER TABLE` declared
 # inline, in the exact column order and position SQLite's own ALTER TABLE
 # ADD COLUMN produces (new column text is spliced in after the last existing
@@ -278,12 +278,12 @@ CREATE INDEX IF NOT EXISTS idx_item_transitions_event ON item_transitions(event_
 # PLANNED=1, and `awaiting_confirm()` is false whenever AUTO_FROM_ITEM is set —
 # the two doors are mutually exclusive by construction), so attribution has to
 # live somewhere BOTH doors write, and this repo writes this table itself, on
-# both doors, rather than depending on hermes-cc.sh to own a third table.
+# both doors, rather than depending on the CLI to own a third table.
 #
 # `outcome IS NULL` means "in flight" — an operation this process recorded as
 # STARTED but has not yet recorded the result of, whether because it crashed
-# before it could, or because the external call it covers (`hermes-cc.sh
-# dispatch --tier implement`, `merge --confirm`) returned ambiguously (a
+# before it could, or because the external call it covers (`warden dispatch
+# --tier implement`, `warden merge --confirm`) returned ambiguously (a
 # subprocess timeout, unparseable stdout) and the call site deliberately left
 # it open for triage.py's reconcile_operations() to resolve on the very next
 # pass, before anything else acts on the item (see that file's module
@@ -366,6 +366,55 @@ UPDATE dispatches
    AND delivery_status IS NULL;
 """
 
+# Version 7 — Wave 5.2 (the policy/dispatch/approval port). Four columns, two
+# tables, for two unrelated reasons that happen to land in the same migration:
+#
+#   dispatch_approvals.key_id        the signer.key_id() of the public key that
+#     was live at MINT time, so `execute_approved()` (scripts/lifecycle/
+#     approvals.py) can tell a genuinely forged/tampered row ("invalid") from
+#     one signed correctly under a gateway key that has since rotated
+#     ("superseded") — the two read identically from `verify()` alone (both are
+#     "does not verify against the CURRENT key"), and only one of them means
+#     the approval was ever real. NULL for every pre-Wave-5.2 row: the bash
+#     mint_approval() never recorded a key id, so those rows fall back to the
+#     "invalid" branch rather than "superseded" — a harmless conservatism,
+#     since nothing minted before this migration is still a live approval by
+#     the time it ships.
+#
+#   dispatch_approvals.params_json   the CLOSED parameter dict the spend
+#     replays: why, model, origin_channel, origin_thread_ts, origin_event_id.
+#     `argv_json` (version 1) stays exactly what it always was — the bash
+#     invocation's own argv, kept as an audit copy of the command line that
+#     was approved. It is not what execute_approved() reads to reopen the
+#     episode, because there is no argv to replay anymore: `params_json` is
+#     the structured, closed equivalent for the Python spend path.
+#
+#   dispatch_approvals.spent_job_id  the sideclaw job id the spend actually
+#     opened, once it opens one. Distinct from `spent_at` (version 1): a row
+#     can be spent (its single use consumed, `spent_at` set) without ever
+#     reaching a job id, if `open_episode()`'s submit itself failed after the
+#     spend committed — see approvals.py's `execute_approved()` for why the
+#     spend and the operations-row commit happen in one transaction BEFORE the
+#     submit is attempted, not after.
+#
+#   dispatch_approvals.spend_error   why the LAST spend attempt did not open a
+#     job, for an approval that is not yet (or never) spent. A budget refusal
+#     at spend time leaves the approval retryable until `expires_at` — see
+#     execute_approved()'s docstring — and this column is what a human or the
+#     next sweep pass reads to know why, instead of a silent "still pending".
+#
+#   triage_items.revert_pr           `warden revert <item>` (Wave 5.3, not yet
+#     built) records the revert PR's URL here. Added now, alongside the other
+#     lifecycle columns, so a single migration covers both of Wave 5's halves
+#     rather than forcing a Wave-5.3-only schema bump for one column.
+_MIGRATION_7 = """
+ALTER TABLE dispatch_approvals ADD COLUMN key_id TEXT;
+ALTER TABLE dispatch_approvals ADD COLUMN params_json TEXT;
+ALTER TABLE dispatch_approvals ADD COLUMN spent_job_id TEXT;
+ALTER TABLE dispatch_approvals ADD COLUMN spend_error TEXT;
+ALTER TABLE triage_items ADD COLUMN revert_pr INTEGER;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -373,6 +422,7 @@ MIGRATIONS: dict[int, str] = {
     4: _MIGRATION_4,
     5: _MIGRATION_5,
     6: _MIGRATION_6,
+    7: _MIGRATION_7,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live
@@ -411,7 +461,13 @@ STATE_CLOSED = "closed"
 STATE_IGNORED = "ignored"
 STATE_NOTE = "note"
 STATE_DISMISSED = "dismissed"
-TERMINAL_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_IGNORED, STATE_NOTE, STATE_DISMISSED)
+# `reverted` (Wave 5.3, `warden revert`) — a merged/liveness_pending/fixed item
+# whose PR was reverted by a later, named PR. Terminal like the six above: a
+# revert closes the item's story, it does not reopen it.
+STATE_REVERTED = "reverted"
+TERMINAL_STATES = (
+    STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_IGNORED, STATE_NOTE, STATE_DISMISSED, STATE_REVERTED,
+)
 
 
 def _now_iso() -> str:
@@ -698,7 +754,7 @@ def snapshot(conn: sqlite3.Connection, dest: Path | str) -> Path:
 # ── CLI ────────────────────────────────────────────────────────────────────────
 #
 # So a process that is NOT warden can prepare or check a ledger without carrying
-# its own copy of the schema. That is not a convenience: `hermes-cc.sh` owns two
+# its own copy of the schema. That is not a convenience: the CLI owns two
 # of the five tables and still writes them, and the only alternative to this door
 # is the one that was there before — a second, unversioned migrator running
 # `executescript` on every connect, which is the exact defect this module exists

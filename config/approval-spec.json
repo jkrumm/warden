@@ -1,0 +1,74 @@
+{
+  "version": "v1",
+  "payloadHash": {
+    "algorithm": "sha256",
+    "fields": ["verb", "repo", "tier", "body", "why", "context"],
+    "encoding": "utf-8",
+    "terminator": "\\u0000",
+    "note": "each field is followed by one NUL byte, including the last; hex digest lowercase"
+  },
+  "signedMessage": {
+    "format": "v1|{nonce}|{payload_hash}|{decision}|{decided_by}|{expires_at}",
+    "encoding": "utf-8",
+    "signature": "ed25519 raw, hex",
+    "publicKey": "raw 32 bytes, lowercase hex, published at $HERMES_HOME/dispatch-approval.pub"
+  },
+  "keyId": {
+    "algorithm": "sha256(raw public key bytes) hex, first 16 chars"
+  },
+  "vectors": {
+    "payloadHash": [
+      {
+        "verb": "dispatch",
+        "repo": "gamma",
+        "tier": "implement",
+        "body": "Fix the flaky assertion in the retry test.",
+        "why": "test",
+        "context": "benign context: the failing assertion is at line 42",
+        "expected": "36208747bf43ad8b894de77927fa09a86904f49b04016416311180c8a406eb92"
+      },
+      {
+        "verb": "dispatch",
+        "repo": "alpha",
+        "tier": "implement",
+        "body": "multi\nline\nbrief",
+        "why": "",
+        "context": "",
+        "expected": "db09f09b0cb93b8fbeb3bef47f66539ab71ff79de2d431f3a2efb6e77225464d"
+      },
+      {
+        "verb": "dispatch",
+        "repo": "alpha",
+        "tier": "implement",
+        "body": "ünïcödé ✓",
+        "why": "warum",
+        "context": "",
+        "expected": "955d8c194d7f7fc8f26bca3902d9deedc772f8056d91e45deca0b27181a57bc5"
+      }
+    ],
+    "signedMessage": [
+      {
+        "nonce": "00112233445566778899aabbccddeeff",
+        "payload_hash": "36208747bf43ad8b894de77927fa09a86904f49b04016416311180c8a406eb92",
+        "decision": "approve",
+        "decided_by": "U0JOHANNES",
+        "expires_at": "2026-09-10T12:00:00+00:00",
+        "expectedHex": "76317c30303131323233333434353536363737383839396161626263636464656566667c333632303837343762663433616438623839346465373739323766613039613836393034663439623034303136343136333131313830633861343036656239327c617070726f76657c55304a4f48414e4e45537c323032362d30392d31305431323a30303a30302b30303a3030"
+      },
+      {
+        "nonce": "ffeeddccbbaa99887766554433221100",
+        "payload_hash": "36208747bf43ad8b894de77927fa09a86904f49b04016416311180c8a406eb92",
+        "decision": "deny",
+        "decided_by": "",
+        "expires_at": "2026-09-10T12:00:00+00:00",
+        "expectedHex": "76317c66666565646463636262616139393838373736363535343433333232313130307c333632303837343762663433616438623839346465373739323766613039613836393034663439623034303136343136333131313830633861343036656239327c64656e797c7c323032362d30392d31305431323a30303a30302b30303a3030"
+      }
+    ],
+    "keyId": [
+      {
+        "publicKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "expected": "630dcd2966c43366"
+      }
+    ]
+  }
+}
