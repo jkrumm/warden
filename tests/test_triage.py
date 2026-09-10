@@ -1918,7 +1918,7 @@ def test_auto_implement_fires_only_at_high_confidence():
 
         def _fake_auto_implement(*, repo, event_id):
             calls.append((repo, event_id))
-            return "implement-job-001"
+            return triage._AutoImplementResult("implement-job-001", None)
 
         triage._run_hermes_cc_auto_implement = _fake_auto_implement
         triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -1948,17 +1948,17 @@ def test_auto_implement_claims_the_item_before_dispatching():
 
         def _observing_dispatch(*, repo, event_id):
             observed.append(triage._get_item(conn, event_id)["state"])
-            return "implement-job-claim"
+            return triage._AutoImplementResult("implement-job-claim", None)
 
         triage._run_hermes_cc_auto_implement = _observing_dispatch
         triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert observed == [triage.STATE_IMPLEMENTING], (
             f"item must already be claimed while the dispatch runs, saw {observed}")
 
-        # A refused dispatch hands the claim back.
+        # A refused (definitely-failed, not merely ambiguous) dispatch hands the claim back.
         eid2 = _seed_verdict_item(conn, external_id="sig-claim-fail", confidence="high",
                                   investigate_job="investigate-claim-fail")
-        triage._run_hermes_cc_auto_implement = lambda *, repo, event_id: None
+        triage._run_hermes_cc_auto_implement = lambda *, repo, event_id: triage._AutoImplementResult(None, "failed")
         triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         back = triage._get_item(conn, eid2)
         assert back["state"] == triage.STATE_VERDICT, back["state"]
@@ -2033,7 +2033,8 @@ def test_disagreeing_validation_blocks_the_merge():
             "verdict": {"summary": "the diff does not match the PR body. " + triage.VALIDATION_DISAGREE_MARKER},
         }
         merge_calls = []
-        triage._run_hermes_cc_merge = lambda job_id: merge_calls.append(job_id) or None
+        triage._run_hermes_cc_merge = lambda job_id: (
+            merge_calls.append(job_id), triage._MergeCallResult(None, "failed"))[1]
 
         triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -2061,10 +2062,11 @@ def test_confirmed_validation_merges_and_a_failed_deploy_check_still_lands_merge
             "ok": True, "status": "done",
             "verdict": {"summary": "looks right. " + triage.VALIDATION_CONFIRM_MARKER},
         }
-        triage._run_hermes_cc_merge = lambda job_id: {
-            "ok": True, "merged": True,
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult({
+            "ok": True, "merged": True, "pullRequest": 11, "mergeCommit": "deadbeef",
+            "branch": "dispatch/demo", "mergeMethod": "squash",
             "deploy": {"attempted": False, "reason": "autoDeploy is false for demo-repo"},
-        }
+        }, None)
 
         triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -2092,10 +2094,12 @@ def test_confirmed_merge_with_successful_deploy_enters_liveness_pending():
             "verdict": {"summary": "correct. " + triage.VALIDATION_CONFIRM_MARKER},
         }
         expected = [{"path": "observability/alerts/x.json", "name": "X", "threshold": 5, "thresholdType": "above"}]
-        triage._run_hermes_cc_merge = lambda job_id: {
-            "ok": True, "merged": True,
-            "deploy": {"attempted": True, "ok": True, "key": "hyperdx-apply", "expectedAlerts": expected},
-        }
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult({
+            "ok": True, "merged": True, "pullRequest": 12, "mergeCommit": "cafef00d",
+            "branch": "dispatch/vps", "mergeMethod": "squash",
+            "deploy": {"attempted": True, "ok": True, "key": "hyperdx-apply", "expectedAlerts": expected,
+                       "output": "applied ok"},
+        }, None)
 
         triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -3322,6 +3326,559 @@ def test_sync_card_never_posts_a_first_card_for_any_never_carded_terminal_state(
             event = triage._get_event(conn, eid)
             triage.sync_card(conn, [item], [event], DEFAULT_POLICY, dry_run=False)
         assert ctx.total_calls() == 0, "a never-carded state must never post a first card"
+
+
+# =============================================================================
+# operations — the crash-recovery unit (schema 5, DESIGN.md § Crash recovery).
+# record_operation()/complete_operation() are the two writers; reconcile_operations()
+# is the sole resolver of a row an external call left ambiguous, and it runs
+# FIRST in run(), before anything that could retry. See STATE.md §46's
+# write-ordering map for the two bugs this section pins down: the `merged_at`
+# read-as-failure bug (poll_validation_jobs' merge branch) and the
+# maybe_auto_implement() duplication bug (a timeout wrongly read as a refusal).
+# =============================================================================
+
+def test_record_operation_commits_before_returning():
+    """The durability contract IS the commit: the row must be visible from a
+    SEPARATE connection before complete_operation() is ever called. A test
+    that only re-reads through the SAME connection proves nothing — an
+    uncommitted write is already visible to its own connection regardless."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-op-commit", title="x", first_seen=OLD)
+        op_id = triage.record_operation(conn, event_id=eid, kind="implement", repo="demo-repo",
+                                         authorized_by="auto-from-item")
+
+        other = triage._ledger.connect(triage.DB_PATH, readonly=True)
+        try:
+            row = other.execute("SELECT op_id, outcome, kind, repo, authorized_by FROM operations "
+                                "WHERE op_id=?", (op_id,)).fetchone()
+            assert row is not None, "record_operation() must commit before returning"
+            assert row["outcome"] is None
+            assert row["kind"] == "implement"
+            assert row["repo"] == "demo-repo"
+            assert row["authorized_by"] == "auto-from-item"
+        finally:
+            other.close()
+
+
+def test_record_operation_and_complete_operation_reject_unknown_kind_or_outcome():
+    """kind and outcome both reach SQL — closed allowlists, same reasoning as
+    _SET_STATE_COLUMNS: a typo must fail loudly here, never write a row
+    reconcile_operations() would never recognize."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-op-closed", title="x", first_seen=OLD)
+        try:
+            triage.record_operation(conn, event_id=eid, kind="investigate", repo="demo-repo",
+                                     authorized_by="auto-from-item")
+            raise AssertionError("expected ValueError for an unlisted kind")
+        except ValueError as e:
+            assert "investigate" in str(e)
+
+        op_id = triage.record_operation(conn, event_id=eid, kind="implement", repo="demo-repo",
+                                         authorized_by="auto-from-item")
+        try:
+            triage.complete_operation(conn, op_id, outcome="succeeded")
+            raise AssertionError("expected ValueError for an unlisted outcome")
+        except ValueError as e:
+            assert "succeeded" in str(e)
+
+
+def test_auto_implement_timeout_leaves_operation_open_and_does_not_roll_back():
+    """The duplication bug STATE.md §46 names: a bare `None` return used to
+    conflate 'sideclaw was never called' with 'sideclaw may have already
+    accepted the job', and BOTH rolled the item's claim back to `verdict` —
+    which re-implemented next tick against a job that could already be
+    running (two branches, two draft PRs). A timeout must leave the item
+    claimed (`implementing`, no implement_job to poll yet) and its
+    `implement` operation OPEN (outcome NULL) for reconcile_operations() to
+    resolve on the very next pass — never rolled back here."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-impl-timeout", confidence="high",
+                                  investigate_job="investigate-timeout")
+        triage._run_hermes_cc_auto_implement = lambda *, repo, event_id: triage._AutoImplementResult(None, "unknown")
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_IMPLEMENTING, (
+            f"a timeout must NOT roll back to verdict (the duplication bug) — got {item['state']}")
+        assert item["implement_job"] is None
+
+        op = conn.execute(
+            "SELECT outcome FROM operations WHERE event_id=? AND kind='implement'", (eid,)
+        ).fetchone()
+        assert op is not None, "record_operation() must have written a row before the call"
+        assert op["outcome"] is None, "an ambiguous return must leave the operation open for reconciliation"
+
+
+class _FakeCompleted:
+    """Minimal stand-in for subprocess.CompletedProcess — the two producer
+    tests below need to drive the real helper bodies, which only ever read
+    `returncode`, `stdout` and `stderr`."""
+
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _with_fake_subprocess_run(fake):
+    """Swap triage's `subprocess.run` for `fake`, returning a restore
+    callable. Patched on the module object triage itself imported, so the
+    helper under test resolves it exactly as it does in production."""
+    original = triage.subprocess.run
+    triage.subprocess.run = fake
+    return lambda: setattr(triage.subprocess, "run", original)
+
+
+def test_auto_implement_helper_maps_each_failure_mode_to_the_right_outcome():
+    """The PRODUCER half, and it is here because a mutation proved the two
+    caller-side tests above cannot see it: they stub
+    `_run_hermes_cc_auto_implement` wholesale and inject an outcome, so
+    flipping the helper's own TimeoutExpired branch from "unknown" to
+    "failed" left the entire suite green. That is exactly the Wave 2 defect-3
+    shape (STATE.md §42) — a guarantee whose test could not observe the call
+    site it claimed to guard.
+
+    The mapping under test is the whole point of _AutoImplementResult: a
+    timeout is NOT a refusal. TimeoutExpired and unparseable stdout are both
+    reachable AFTER sideclaw accepted the job, so both must be `unknown`;
+    only a subprocess that never ran (OSError) or a definite non-zero/not-ok
+    answer is `failed`."""
+    def raise_timeout(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="hermes-cc.sh", timeout=1)
+
+    def raise_oserror(*a, **k):
+        raise OSError("not executable")
+
+    cases = [
+        (raise_timeout, None, "unknown", "a timeout may follow an accepted submission"),
+        (raise_oserror, None, "failed", "the subprocess never ran, so sideclaw was never called"),
+        (lambda *a, **k: _FakeCompleted(0, "not json at all"), None, "unknown",
+         "unparseable stdout cannot distinguish crashed-before from crashed-after"),
+        (lambda *a, **k: _FakeCompleted(4, "", "policy refused"), None, "failed",
+         "a non-zero exit is a definite answer"),
+        (lambda *a, **k: _FakeCompleted(0, json.dumps({"ok": False, "error": "nope"})), None, "failed",
+         "hermes-cc.sh completed and plainly said no"),
+        (lambda *a, **k: _FakeCompleted(0, json.dumps({"ok": True, "jobId": "job-xyz"})), "job-xyz", None,
+         "a complete success carries the job id and no outcome"),
+    ]
+    for fake, want_job, want_outcome, why in cases:
+        restore = _with_fake_subprocess_run(fake)
+        try:
+            got = triage._run_hermes_cc_auto_implement(repo="demo-repo", event_id=1)
+        finally:
+            restore()
+        assert got.job_id == want_job, f"{why}: job_id {got.job_id!r} != {want_job!r}"
+        assert got.outcome == want_outcome, f"{why}: outcome {got.outcome!r} != {want_outcome!r}"
+
+
+def test_merge_helper_maps_each_failure_mode_to_the_right_outcome():
+    """Same producer-level coverage for `_run_hermes_cc_merge`, for the same
+    reason. A timeout here is the sharpest case in the whole file: `merge
+    --confirm` covers GraphQL ready-for-review, `PUT /pulls/:pr/merge`, a
+    branch delete and an `ssh <host> make <target>` deploy behind ONE
+    subprocess boundary, so a timeout can land after the PR is already merged
+    AND deployed."""
+    def raise_timeout(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="hermes-cc.sh", timeout=1)
+
+    def raise_oserror(*a, **k):
+        raise OSError("not executable")
+
+    restore = _with_fake_subprocess_run(raise_timeout)
+    try:
+        got = triage._run_hermes_cc_merge("job-1")
+    finally:
+        restore()
+    assert got.result is None and got.outcome == "unknown", (
+        f"a merge timeout may mean the PR is already merged — got {got}")
+
+    restore = _with_fake_subprocess_run(raise_oserror)
+    try:
+        got = triage._run_hermes_cc_merge("job-1")
+    finally:
+        restore()
+    assert got.result is None and got.outcome == "failed", (
+        f"the subprocess never ran, so nothing was merged — got {got}")
+
+    restore = _with_fake_subprocess_run(lambda *a, **k: _FakeCompleted(0, "}{ not json"))
+    try:
+        got = triage._run_hermes_cc_merge("job-1")
+    finally:
+        restore()
+    assert got.result is None and got.outcome == "unknown", (
+        f"unparseable stdout is an ambiguity, not a refusal — got {got}")
+
+    restore = _with_fake_subprocess_run(
+        lambda *a, **k: _FakeCompleted(0, json.dumps({"ok": True, "merged": True, "mergeCommit": "abc"})))
+    try:
+        got = triage._run_hermes_cc_merge("job-1")
+    finally:
+        restore()
+    assert got.outcome is None and got.result is not None and got.result["mergeCommit"] == "abc", got
+
+
+def test_auto_implement_oserror_rolls_back_and_marks_the_operation_failed():
+    """The one case that IS safe to roll back: the subprocess never ran at
+    all (OSError), so sideclaw was never called — a genuine, resolved
+    failure, not an ambiguity."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-impl-oserror", confidence="high",
+                                  investigate_job="investigate-oserror")
+        triage._run_hermes_cc_auto_implement = lambda *, repo, event_id: triage._AutoImplementResult(None, "failed")
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERDICT, "a definite failure must hand the claim back"
+        assert item["implement_job"] is None
+
+        op = conn.execute(
+            "SELECT outcome FROM operations WHERE event_id=? AND kind='implement'", (eid,)
+        ).fetchone()
+        assert op is not None
+        assert op["outcome"] == "failed"
+
+
+def test_reconcile_implement_sideclaw_404_becomes_unknown_not_failed_and_needs_human():
+    """A pruned sideclaw job returns 404, byte-identical to a job id that
+    never existed (STATE.md §46) — absence proves nothing, so an in-flight
+    implement operation reconcile_operations() cannot confirm must land on
+    `unknown`, never `failed`, and the item must move to needs_human rather
+    than being silently written off."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-impl-404", confidence="high",
+                                  investigate_job="investigate-reconcile-impl-404")
+        conn.execute("UPDATE triage_items SET state=? WHERE event_id=?", (triage.STATE_IMPLEMENTING, eid))
+        conn.commit()
+        op_id = triage.record_operation(conn, event_id=eid, kind="implement", repo="demo-repo",
+                                         authorized_by="auto-from-item")
+        # Simulates a crash AFTER a job id was learned but BEFORE this process
+        # recorded the outcome — the row reconcile_operations() has to ask
+        # sideclaw about.
+        conn.execute("UPDATE operations SET receipt_json=? WHERE op_id=?",
+                     (json.dumps({"jobId": "implement-job-orphan"}), op_id))
+        conn.commit()
+
+        triage._hermes_cc_status = lambda job_id: None  # sideclaw: 404 / unreachable
+
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        op = conn.execute("SELECT outcome, reconciled_at FROM operations WHERE op_id=?", (op_id,)).fetchone()
+        assert op["outcome"] == "unknown", op["outcome"]
+        assert op["reconciled_at"] is not None, "every row reconcile_operations() touches must be stamped"
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+
+
+def test_reconcile_merge_github_reports_merged_becomes_done_with_merge_commit_not_merge_blocked():
+    """The exact bug STATE.md §46 names: `dispatches.merged_at` written AFTER
+    `PUT /pulls/:pr/merge`, so a crash in between used to leave the retry
+    reading `merged_at` NULL while GitHub says `merged: true` — and
+    `policy_err` fired, recording `merge_blocked` for a PR that was actually
+    merged and deployed. reconcile_operations() must ask GitHub directly and
+    land on `done`, carrying the merge sha — never `failed`/`merge_blocked`."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-merge", confidence="high",
+                                  investigate_job="investigate-reconcile-merge", repo="vps")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-reconcile", "https://github.com/jkrumm/vps/pull/8", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-reconcile", repo="vps")
+        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
+                     ("https://github.com/jkrumm/vps/pull/8", "implement-job-reconcile"))
+        conn.commit()
+
+        op_id = triage.record_operation(conn, event_id=eid, kind="merge", repo="vps",
+                                         authorized_by="auto-from-item")
+
+        triage._run_gh_pr_view = lambda owner, repo, pr: {
+            "state": "MERGED", "mergedAt": "2026-09-08T16:42:20Z",
+            "mergeCommit": {"oid": "9289436afde30f1ad4c0a6d82b5556ca9df9876f"},
+        }
+
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        op = conn.execute("SELECT outcome, receipt_json, reconciled_at FROM operations WHERE op_id=?",
+                          (op_id,)).fetchone()
+        assert op["outcome"] == "done", op["outcome"]
+        assert op["reconciled_at"] is not None
+        receipt = json.loads(op["receipt_json"])
+        assert receipt["mergeCommit"] == "9289436afde30f1ad4c0a6d82b5556ca9df9876f"
+        assert receipt["pullRequest"] == 8
+        assert receipt["deploy"] == "unknown", "the deploy half has no remote answer — must be honest, not guessed"
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] != triage.STATE_MERGE_BLOCKED, (
+            "a PR GitHub reports merged must never be recorded merge_blocked")
+        # And it must not be left in `validating` either — see
+        # test_reconcile_merged_operation_advances_the_item below for why
+        # "not merge_blocked" is too weak an assertion on its own.
+        assert item["state"] == triage.STATE_MERGED, item["state"]
+
+
+def test_reconcile_merged_operation_advances_the_item_instead_of_leaving_it_to_expire():
+    """Resolving the OPERATION is not enough — the ITEM has to move too.
+
+    A `merge` operation left open by a timeout and then reconciled to `done`
+    used to leave its item sitting in `validating`, whose STATE_DEADLINES
+    rule expires it to `merge_blocked` after 1h. The operations table would
+    read "merged, here is the sha" while the item read "blocked": STATE.md
+    §46's merged-but-recorded-as-failure bug wearing a different hat, one
+    layer further in. With no deploy configured for the repo, `merged` is
+    where the live path puts it, so that is where reconciliation puts it."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-advance", confidence="high",
+                                  investigate_job="investigate-reconcile-advance", repo="vps")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-advance", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-advance", repo="vps")
+        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
+                     ("https://github.com/jkrumm/vps/pull/8", "implement-job-advance"))
+        conn.commit()
+        triage.record_operation(conn, event_id=eid, kind="merge", repo="vps",
+                                 authorized_by="auto-from-item")
+        triage._run_gh_pr_view = lambda owner, repo, pr: {
+            "state": "MERGED", "mergeCommit": {"oid": "deadbeef"}}
+
+        # No `repos` entry at all -> no autoDeploy -> nothing else was
+        # supposed to happen after the merge.
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGED, (
+            f"a reconciled merge must advance the item, not leave it in `validating` to expire "
+            f"into merge_blocked — got {item['state']!r}")
+        assert "deadbeef" in (item["note"] or ""), item["note"]
+
+
+def test_reconcile_merged_operation_with_autodeploy_goes_to_needs_human():
+    """Same reconciliation, but the repo auto-deploys. The deploy rode along
+    inside the same lost subprocess and `ssh <host> make <target>` leaves no
+    remote handle to ask, so whether production changed is genuinely
+    unknown. `merged` would quietly expire to `closed` after 1h, claiming a
+    clean landing nobody verified — so this one goes to a human instead."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-deploy", confidence="high",
+                                  investigate_job="investigate-reconcile-deploy", repo="vps")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-deploy", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-deploy", repo="vps")
+        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
+                     ("https://github.com/jkrumm/vps/pull/8", "implement-job-deploy"))
+        conn.commit()
+        triage.record_operation(conn, event_id=eid, kind="merge", repo="vps",
+                                 authorized_by="auto-from-item")
+        triage._run_gh_pr_view = lambda owner, repo, pr: {
+            "state": "MERGED", "mergeCommit": {"oid": "cafef00d"}}
+
+        policy = dict(DEFAULT_POLICY, repos={"vps": {"autoDeploy": True, "deploy": "hyperdx-apply"}})
+        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, (
+            f"merged with an unverifiable deploy must reach a human, not expire to `closed` — "
+            f"got {item['state']!r}")
+        assert "cafef00d" in (item["note"] or ""), item["note"]
+
+
+def test_merge_remote_error_is_left_for_reconcile_not_read_as_merge_blocked():
+    """hermes-cc.sh's `_err` taxonomy: exit 3 is `remote_err`, reached only
+    once it is ALREADY talking to something — so it is reachable after
+    `PUT /pulls/:pr/merge` has been sent, and even after it succeeded (a lost
+    response, or a timeout in the branch-delete or ssh deploy that follows).
+    Reading a parsed `{"ok": false, "exitCode": 3}` as `merge_blocked` is
+    DESIGN.md § Crash recovery's "silently read as failure" arriving through
+    an error object instead of a dead process. Exit 2/4/64 are decided BEFORE
+    anything is attempted and stay definite refusals."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-merge-remote", confidence="high",
+                                  investigate_job="investigate-merge-remote", repo="vps")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-remote", "validation-job-remote", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-remote", repo="vps")
+
+        triage._hermes_cc_status = lambda job_id: {
+            "status": "done",
+            "verdict": {"summary": triage.VALIDATION_CONFIRM_MARKER, "verdict": "", "recommendation": ""},
+        }
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult(
+            {"verb": "merge", "ok": False, "exitCode": 3,
+             "error": "sideclaw accepted the job but returned no id"}, None)
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VALIDATING, (
+            f"a REMOTE error may mean the merge already landed — the item must stay put for "
+            f"reconcile_operations() to ask GitHub, not be declared blocked. Got {item['state']!r}")
+        op = conn.execute("SELECT outcome FROM operations WHERE event_id=? AND kind='merge'",
+                          (eid,)).fetchone()
+        assert op is not None and op["outcome"] is None, (
+            "the operation must stay OPEN so reconcile_operations() resolves it against GitHub")
+
+
+def test_merge_policy_refusal_is_still_read_as_merge_blocked():
+    """The other side of the exit-code split, so nobody widens it later: a
+    POLICY refusal (exit 4) is a definite answer decided before anything was
+    attempted. It must still block, or every real refusal would leak into
+    `needs_human` via an unresolvable operation."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-merge-policy", confidence="high",
+                                  investigate_job="investigate-merge-policy", repo="vps")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-policy", "validation-job-policy", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-policy", repo="vps")
+
+        triage._hermes_cc_status = lambda job_id: {
+            "status": "done",
+            "verdict": {"summary": triage.VALIDATION_CONFIRM_MARKER, "verdict": "", "recommendation": ""},
+        }
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult(
+            {"verb": "merge", "ok": False, "exitCode": 4,
+             "error": "no autoMergePaths declared for vps"}, None)
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGE_BLOCKED, item["state"]
+        op = conn.execute("SELECT outcome FROM operations WHERE event_id=? AND kind='merge'",
+                          (eid,)).fetchone()
+        assert op["outcome"] == "failed", op["outcome"]
+
+
+def test_reconcile_operations_runs_before_anything_that_could_retry():
+    """reconcile_operations() must be the FIRST thing run() does — an item
+    sitting under an in-flight operation must never be visible to a poller
+    that could act on it (and retry the same external call) before the
+    operation is reconciled. Asserted directly against run()'s own body via
+    source order, and behaviourally: a dangling `implement` operation with a
+    STATE_VERDICT-eligible sibling item must not cause maybe_auto_implement()
+    to fire a SECOND dispatch for the item the operation already covers —
+    the item stays `implementing` throughout the whole pass, never bounces
+    back to `verdict` and out again in the same run."""
+    import inspect
+    # Comment lines are stripped first — the step's own explanatory comment
+    # mentions drain_intents() by name before the call it precedes, which
+    # would otherwise make a naive substring search find the wrong occurrence.
+    code_lines = [ln for ln in inspect.getsource(triage.run).splitlines() if not ln.strip().startswith("#")]
+    code = "\n".join(code_lines)
+    assert code.index("reconcile_operations(") < code.index("drain_intents("), (
+        "reconcile_operations() must be called before drain_intents() in run()")
+
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reconcile-order", confidence="high",
+                                  investigate_job="investigate-reconcile-order")
+        conn.execute("UPDATE triage_items SET state=? WHERE event_id=?", (triage.STATE_IMPLEMENTING, eid))
+        conn.commit()
+        triage.record_operation(conn, event_id=eid, kind="implement", repo="demo-repo",
+                                 authorized_by="auto-from-item")
+
+        implement_calls: list[int] = []
+        triage._run_hermes_cc_auto_implement = lambda *, repo, event_id: (
+            implement_calls.append(event_id) or triage._AutoImplementResult("should-not-happen", None))
+        triage._hermes_cc_status = lambda job_id: None  # 404 — resolves to `unknown`
+
+        triage.run(conn, dry_run=False)
+
+        assert implement_calls == [], (
+            "maybe_auto_implement() must never fire while this item's operation is unreconciled")
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, (
+            "reconcile_operations() must have already moved the item out of implementing this same pass")
+
+
+def test_successful_merge_stores_pull_request_merge_commit_and_deploy_in_receipt():
+    """`mergeCommit` is the one genuine remote receipt this system already
+    obtains (hermes-cc.sh's own merge_sha) and used to throw away entirely —
+    STATE.md §46's write-ordering map names this exactly. A successful merge
+    must persist pullRequest/mergeCommit/branch/mergeMethod and the whole
+    (capped) deploy object into the operation's receipt."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-op-receipt", confidence="high",
+                                  investigate_job="investigate-op-receipt")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-receipt", "validation-job-receipt",
+             "https://github.com/jkrumm/demo-repo/pull/42", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-receipt")
+
+        triage._hermes_cc_status = lambda job_id: {
+            "ok": True, "status": "done",
+            "verdict": {"summary": "correct. " + triage.VALIDATION_CONFIRM_MARKER},
+        }
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult({
+            "ok": True, "merged": True, "pullRequest": 42, "mergeCommit": "deadbeefcafe",
+            "branch": "dispatch/demo-repo/fix", "mergeMethod": "squash",
+            "deploy": {"attempted": True, "ok": True, "key": "hyperdx-apply", "expectedAlerts": [],
+                       "output": "x" * 5000},
+        }, None)
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        op = conn.execute(
+            "SELECT outcome, receipt_json FROM operations WHERE event_id=? AND kind='merge'", (eid,)
+        ).fetchone()
+        assert op is not None
+        assert op["outcome"] == "done"
+        receipt = json.loads(op["receipt_json"])
+        assert receipt["pullRequest"] == 42
+        assert receipt["mergeCommit"] == "deadbeefcafe"
+        assert receipt["branch"] == "dispatch/demo-repo/fix"
+        assert receipt["mergeMethod"] == "squash"
+        assert receipt["deploy"]["key"] == "hyperdx-apply"
+        assert len(receipt["deploy"]["output"]) <= triage._DEPLOY_OUTPUT_RECEIPT_CAP_CHARS, (
+            "deploy.output must be capped before it reaches the receipt")
+
+
+def test_merge_timeout_leaves_operation_open_and_does_not_mark_merge_blocked():
+    """The read-as-failure bug, at the call site rather than through
+    reconciliation: a timeout AFTER `hermes-cc.sh merge --confirm` may mean
+    the PR (and its deploy) already landed. poll_validation_jobs() must
+    leave the operation open (outcome NULL) and must NOT set
+    STATE_MERGE_BLOCKED — reconcile_operations() resolves it on the next
+    pass by asking GitHub directly."""
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-merge-timeout", confidence="high",
+                                  investigate_job="investigate-merge-timeout")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-timeout", "validation-job-timeout",
+             "https://github.com/jkrumm/demo-repo/pull/43", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-timeout")
+
+        triage._hermes_cc_status = lambda job_id: {
+            "ok": True, "status": "done",
+            "verdict": {"summary": "correct. " + triage.VALIDATION_CONFIRM_MARKER},
+        }
+        triage._run_hermes_cc_merge = lambda job_id: triage._MergeCallResult(None, "unknown")
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] != triage.STATE_MERGE_BLOCKED, (
+            "a merge timeout must never be read as a refusal (DESIGN.md § Crash recovery)")
+        op = conn.execute(
+            "SELECT outcome FROM operations WHERE event_id=? AND kind='merge'", (eid,)
+        ).fetchone()
+        assert op is not None
+        assert op["outcome"] is None, "an ambiguous merge return must stay open for reconciliation"
 
 
 # --- runner ------------------------------------------------------------------

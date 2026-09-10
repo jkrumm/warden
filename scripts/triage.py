@@ -42,6 +42,23 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    EITHER `repo`, escalate to an episode, OR `verb`, run a
                    declared local command — see VERB OUTCOMES below). Only
                    ever touches a row still in state `new`.
+  -1. Reconcile   — runs FIRST, before even Drain, over `operations` rows
+                   with `outcome IS NULL` — an operation this process
+                   recorded as STARTED (before the external call it covers:
+                   `hermes-cc.sh dispatch --tier implement` or
+                   `merge --confirm`) but never recorded the result of,
+                   whether from a genuine crash or from a call site that
+                   deliberately left it open on an ambiguous return (a
+                   subprocess timeout, unparseable stdout — see
+                   maybe_auto_implement()/poll_validation_jobs()). Asks the
+                   external system (sideclaw, GitHub) what actually
+                   happened; an operation that still cannot be resolved
+                   moves its item to `needs_human` rather than being
+                   retried (see reconcile_operations()). DESIGN.md §
+                   Crash recovery: "unknown is an explicit outcome,
+                   reconciled before any retry — never silently read as
+                   failure." Must run before anything else in THE LOOP
+                   could act on the item underneath an in-flight operation.
   0. Drain        — apply anything a surface spooled into ~/.warden/intents
                    since the last pass (see drain_intents() and
                    scripts/intents.py). The loop is the BACKSTOP drainer, not
@@ -203,13 +220,25 @@ tracking is needed) and the card's note IS the whole verdict — the dangling
 item name plus the exact remediation, so no further investigation is needed.
 
 DRY-RUN CONTRACT. `--dry-run` never touches Slack (no chat.postMessage/
-chat.update) and never shells out to hermes-cc.sh — those two are the only
-externally-visible actions this script can take. Every other step (ingest,
-reopen/unsnooze, classify, resolve, dissolve bookkeeping) is local
+chat.update), never shells out to hermes-cc.sh, and never shells out to `gh`
+— those three are the only externally-visible actions this script can take.
+(`gh` is the newest of them and the only READ-ONLY one: reconcile_operations()
+uses `gh pr view` to ask GitHub whether a merge it lost the answer to
+actually landed. It is still a shell-out to a remote system, so it is named
+here rather than quietly exempted for being harmless.) Every other step
+(ingest, reopen/unsnooze, classify, resolve, dissolve bookkeeping) is local
 bookkeeping against triage_items alone, idempotent and side-effect-free, so
 it runs for real even under --dry-run: that is what lets a dry run against a
 throwaway copy of watchdog.db print a meaningful "what would be carded and
 dispatched" preview instead of nothing at all.
+
+Three steps are carve-outs that do NOT run under --dry-run, each for its own
+stated reason: drain_intents() (the spool is not part of the database),
+sweep_deadlines() (it can move an item TERMINALLY, and a preview must not be
+able to end an item), and reconcile_operations() (both of its branches
+shell out — see the paragraph above; a preview that cannot ask sideclaw or
+GitHub what happened has nothing to reconcile with, and guessing is the one
+thing that function exists not to do).
 
 Source of truth: ~/SourceRoot/warden/scripts/triage.py
 ~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
@@ -232,6 +261,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -249,6 +279,15 @@ DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
 
 _env_cc_bin = os.environ.get("HERMES_CC_BIN")
 HERMES_CC_BIN = Path(_env_cc_bin).expanduser() if _env_cc_bin else (HERMES_HOME / "scripts" / "hermes-cc.sh")
+
+# Same env-var-first, documented-absolute-default-second shape as HERMES_CC_BIN
+# above, and for the same reason: reconcile_operations() shells out to `gh`
+# under a LaunchAgent, and launchd hands a job a minimal PATH with no
+# guarantee `gh` is on it — a bare `gh` would work fine in an interactive
+# shell and fail silently under the agent, which is exactly the class of
+# defect this project keeps finding (see docs/triage.md and STATE.md).
+_env_gh_bin = os.environ.get("GH_BIN")
+GH_BIN = Path(_env_gh_bin).expanduser() if _env_gh_bin else Path("/opt/homebrew/bin/gh")
 
 # Same env var name hermes-cc.sh itself honors for this file (HERMES_CC_REPOS_JSON)
 # — one override reaches both the real dispatch and this script's own pre-check.
@@ -2862,6 +2901,98 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 # inherent to what "investigate"/"implement" mean, not something this loop
 # does itself.
 
+# --- operations: the crash-recovery unit (schema 5, DESIGN.md § Crash
+# recovery) --------------------------------------------------------------
+#
+# ONLY the two mutating verbs in this chain get an operation: `implement`
+# (opens a branch + draft PR) and `merge` (merges, deletes the branch,
+# deploys). `investigate`/validation-`investigate` episodes are deliberately
+# excluded — they run read-only, in their own worktree, mutate nothing
+# outside sideclaw, and dispatch-sweep.py's own poll_misses/`lost` path
+# already covers a forgotten job. Recording one for a read-only tier would
+# be bookkeeping with nothing to reconcile against.
+#
+# `merge` is recorded as ONE operation, not two, even though
+# `hermes-cc.sh merge --confirm` is a compound external call — GraphQL
+# ready-for-review, `PUT /merge`, a branch delete, then `ssh <host> make
+# <target>` — behind ONE subprocess boundary. There is no way to write a row
+# between the merge and the deploy without a change in hermes-agent, which is
+# out of scope here; the one operation's receipt carries both results
+# instead (see poll_validation_jobs() below).
+_OPERATION_KINDS = ("implement", "merge")
+_OPERATION_OUTCOMES = ("done", "failed", "unknown")
+
+
+def record_operation(conn: sqlite3.Connection, *, event_id: int, kind: str, repo: str,
+                      authorized_by: str, note: str | None = None) -> str:
+    """Mint and durably record an operation BEFORE the external call it
+    covers is made. This is the unit DESIGN.md § Crash recovery asks for:
+    "an operation id recorded before dispatch; the approval binds to it."
+
+    `conn.commit()`s before returning, and that commit IS the entire
+    contract: the row must be on disk before the caller goes on to shell out
+    to hermes-cc.sh, because a crash inside that external call is exactly
+    the case this table exists to survive. If this function returned
+    without committing, a crash between the INSERT and the external call
+    would lose the operation id along with the process, and
+    reconcile_operations() would have nothing to reconcile against — the row
+    simply would not exist.
+
+    `op_id` is a fresh `uuid.uuid4()`, chosen once and never recomputed. It
+    does NOT need to be reproducible from the request's own arguments — the
+    reproducibility constraint STATE.md §46 describes (an operation id
+    folded into `payload_hash` so `require_signed_approval()` can recompute
+    it at verify time) applies only to binding an id to a SIGNED approval,
+    which is a later slice (3.1b), not this one. Nothing recorded by this
+    file's own callers is signed today: `authorized_by` is always the
+    literal `"auto-from-item"` on this chain (maybe_auto_implement() dispatches
+    via `--auto-from-item`, and `merge --confirm` is ungated by owner
+    decision, hermes-cc.sh:2029-2035) — see api.py's `"signed:"` prefix for
+    the value a future signed-approval caller would pass instead.
+
+    `kind` reaches SQL and is checked against the closed `_OPERATION_KINDS`
+    allowlist for the same reason `_SET_STATE_COLUMNS` is closed: a caller
+    that passes a typo'd kind must fail loudly here, not silently write a row
+    reconcile_operations() will never recognize."""
+    if kind not in _OPERATION_KINDS:
+        raise ValueError(f"{kind!r} not in _OPERATION_KINDS={_OPERATION_KINDS} — kind reaches SQL, closed on purpose")
+    op_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO operations(op_id, event_id, kind, repo, authorized_by, started_at, note) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (op_id, event_id, kind, repo, authorized_by, dt.datetime.now(dt.timezone.utc).isoformat(), note),
+    )
+    conn.commit()
+    return op_id
+
+
+def complete_operation(conn: sqlite3.Connection, op_id: str, *, outcome: str,
+                        receipt: str | None = None, note: str | None = None) -> None:
+    """Called AFTER the external call record_operation() preceded returns —
+    never before, and never for an ambiguous return (a subprocess timeout,
+    unparseable stdout): those call sites deliberately leave the row's
+    `outcome` NULL rather than guess, and reconcile_operations() — which
+    runs first on every later pass, before anything could retry — is the
+    only thing that ever resolves one of those. See that function's own
+    docstring.
+
+    `outcome` is checked against the closed `_OPERATION_OUTCOMES` allowlist,
+    same reasoning as `kind` above. `receipt` is caller-supplied JSON text
+    (already `json.dumps()`'d) rather than a dict, so this function never
+    has an opinion about a receipt's shape — implement's and merge's
+    receipts are structurally different (a bare job id vs. pull request +
+    merge sha + deploy result) and this is the one write path both share."""
+    if outcome not in _OPERATION_OUTCOMES:
+        raise ValueError(
+            f"{outcome!r} not in _OPERATION_OUTCOMES={_OPERATION_OUTCOMES} — outcome reaches SQL, closed on purpose")
+    conn.execute(
+        "UPDATE operations SET outcome=?, outcome_at=?, receipt_json=COALESCE(?, receipt_json), "
+        "note=COALESCE(?, note) WHERE op_id=?",
+        (outcome, dt.datetime.now(dt.timezone.utc).isoformat(), receipt, note, op_id),
+    )
+    conn.commit()
+
+
 def _hermes_cc_status(job_id: str) -> dict[str, Any] | None:
     """`hermes-cc.sh status <job-id> --json` — a single poll, never --wait
     (an implement episode can run 30 minutes; this loop is a 10-minute cron
@@ -2880,7 +3011,240 @@ def _hermes_cc_status(job_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _run_hermes_cc_auto_implement(*, repo: str, event_id: int) -> str | None:
+# Same shape as hermes-cc.sh's own `url_re` inside cmd_merge (hermes-cc.sh
+# ~line 1927) — reused rather than reinvented, per STATE.md §46's explicit
+# instruction not to write a second parser for the same URL.
+_PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)$")
+
+
+def _parse_pr_url(url: str | None) -> tuple[str, str, int] | None:
+    """(owner, repo, pr_number) parsed from a GitHub pull request URL, or
+    None for anything that isn't one — including a NULL/empty artifact_url,
+    which a dispatch that never reached `implement` completion legitimately
+    has."""
+    if not url:
+        return None
+    m = _PR_URL_RE.match(url)
+    if not m:
+        return None
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def _run_gh_pr_view(owner: str, repo: str, pr: int) -> dict[str, Any] | None:
+    """`gh pr view <n> --repo <owner>/<repo> --json state,mergedAt,mergeCommit`
+    — read-only, used only by reconcile_operations() to ask GitHub whether a
+    `merge` operation this process never recorded the outcome of actually
+    landed. `gh` holds its own credential; this file never reads a GitHub
+    token, the same discipline hermes-cc.sh's own `gh_token()` uses. Same
+    single-bounded-poll, never-raises shape as _hermes_cc_status(): None on
+    anything that could not even be read.
+
+    `mergeCommit` in `gh`'s own JSON output is a nested `{"oid": "<sha>"}`
+    object, not a plain string (verified directly against this host's `gh
+    2.100.0` on a real merged PR, jkrumm/vps#8 — STATE.md §46's own example);
+    the caller unwraps it, this function returns the raw object verbatim."""
+    argv = [str(GH_BIN), "pr", "view", str(pr), "--repo", f"{owner}/{repo}",
+            "--json", "state,mergedAt,mergeCommit"]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"triage: gh pr view failed for {owner}/{repo}#{pr}: {e}", file=sys.stderr)
+        return None
+    if r.returncode != 0:
+        print(f"triage: gh pr view exited {r.returncode} for {owner}/{repo}#{pr}: "
+              f"{r.stderr.strip()[:300]}", file=sys.stderr)
+        return None
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        print(f"triage: gh pr view returned non-JSON for {owner}/{repo}#{pr}: {r.stdout[:300]}", file=sys.stderr)
+        return None
+
+
+def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                          *, dry_run: bool) -> None:
+    """Step -1 (see the module docstring) — runs FIRST in run(), before even
+    drain_intents(). Every `operations` row with `outcome IS NULL` is an
+    operation this process recorded as STARTED (record_operation(), before
+    the external call it covers) but never recorded the result of — either a
+    genuine process crash, or a call site (maybe_auto_implement(),
+    poll_validation_jobs()) that deliberately left it open on an ambiguous
+    return (a subprocess timeout, unparseable stdout) rather than guess. Both
+    look identical from here, and both get the SAME treatment: ask the
+    external system what actually happened, using only what the row itself
+    already carries — never the item's own current state, which is exactly
+    what might be stale.
+
+    `outcome`, once resolved, is always one of `_OPERATION_OUTCOMES`. An
+    operation that resolves to `unknown` moves its item to STATE_NEEDS_HUMAN
+    rather than being left for something else to retry: "we do not know
+    whether the world changed" is precisely the case DESIGN.md § Crash
+    recovery routes to a human, and `needs_human` is carded, so the operator
+    sees it. It must never silently become `failed` — that would retry a
+    possibly-already-running implement episode or re-attempt a merge that
+    may already have landed, which is the whole defect this slice exists to
+    close."""
+    if dry_run:
+        # Both branches below shell out (hermes-cc.sh status, `gh pr view`) —
+        # the dry-run contract is "never shells out", the same reason
+        # poll_implement_jobs()/poll_validation_jobs() return outright below.
+        return
+    rows = conn.execute("SELECT * FROM operations WHERE outcome IS NULL ORDER BY op_id").fetchall()
+    for row in rows:
+        receipt = _safe_json(row["receipt_json"])
+        new_receipt: dict[str, Any] | None = None
+        note: str | None = None
+
+        if row["kind"] == "implement":
+            job_id = receipt.get("jobId")
+            if not job_id:
+                # No job id was ever recorded — this process crashed (or the
+                # call site left the row open on a timeout/non-JSON stdout)
+                # before it even learned whether sideclaw accepted the
+                # submission. There is nothing left here to ask.
+                outcome = "unknown"
+                note = "no sideclaw job id was ever recorded for this implement dispatch"
+            else:
+                resp = _hermes_cc_status(job_id)
+                if resp is None:
+                    # A pruned job returns 404, byte-identical to a job id
+                    # that never existed (STATE.md §46, verified against
+                    # sideclaw directly) — absence proves nothing, so this is
+                    # unknown, never failed.
+                    outcome = "unknown"
+                    note = f"sideclaw has no record of job {job_id} (pruned, unreachable, or never accepted)"
+                else:
+                    status = resp.get("status")
+                    if status == "done":
+                        outcome, new_receipt = "done", {**receipt, "status": status}
+                    elif status in ("failed", "interrupted", "lost"):
+                        outcome, new_receipt = "failed", {**receipt, "status": status}
+                    else:
+                        # queued/running — genuinely still in flight, not yet
+                        # resolvable either way; try again next pass.
+                        outcome = "unknown"
+                        note = f"sideclaw reports job {job_id} still {status!r}"
+        elif row["kind"] == "merge":
+            d = conn.execute(
+                "SELECT artifact_url FROM dispatches WHERE job_id = "
+                "(SELECT implement_job FROM triage_items WHERE event_id=?)",
+                (row["event_id"],),
+            ).fetchone()
+            parsed = _parse_pr_url(d["artifact_url"] if d else None)
+            if parsed is None:
+                outcome = "unknown"
+                note = "could not derive a pull request from this item's implement dispatch artifact_url"
+            else:
+                owner, repo_name, pr = parsed
+                gh_resp = _run_gh_pr_view(owner, repo_name, pr)
+                if gh_resp is None:
+                    outcome = "unknown"
+                    note = f"gh pr view could not be read for {owner}/{repo_name}#{pr}"
+                elif gh_resp.get("state") == "MERGED":
+                    merge_commit = gh_resp.get("mergeCommit")
+                    sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else merge_commit
+                    outcome = "done"
+                    # The deploy half has no remote answer — `ssh <host> make
+                    # <target>` returns only an exit code to the (now dead)
+                    # process that ran it. Recorded honestly as "unknown"
+                    # rather than guessed, per DESIGN.md § Crash recovery.
+                    new_receipt = {
+                        "pullRequest": pr, "mergeCommit": sha, "reconciled": True, "deploy": "unknown",
+                    }
+                else:
+                    outcome = "failed"
+                    new_receipt = {"pullRequest": pr, "state": gh_resp.get("state"), "reconciled": True}
+        else:
+            outcome = "unknown"
+            note = f"reconcile_operations: unrecognized operation kind {row['kind']!r}"
+
+        complete_operation(conn, row["op_id"], outcome=outcome,
+                            receipt=json.dumps(new_receipt) if new_receipt is not None else None, note=note)
+        conn.execute("UPDATE operations SET reconciled_at=? WHERE op_id=?", (_now_iso(now), row["op_id"]))
+        conn.commit()
+
+        if row["event_id"] is None:
+            continue
+
+        if outcome == "unknown":
+            _set_state(conn, row["event_id"], STATE_NEEDS_HUMAN, now,
+                       note=f"operation {row['op_id']} ({row['kind']}) could not be reconciled: {note}")
+            conn.commit()
+            continue
+
+        # A RESOLVED operation still has to move the item, and forgetting that
+        # reproduces the very defect this slice closes. Concretely: a `merge`
+        # operation left open by a timeout, then reconciled to `done` because
+        # GitHub says MERGED, leaves the item sitting in `validating` — whose
+        # STATE_DEADLINES rule expires it to `merge_blocked` after 1h. The
+        # operations table would correctly read "merged, here is the sha"
+        # while the item read "blocked", which is STATE.md §46's
+        # merged-but-recorded-as-failure bug wearing a different hat.
+        #
+        # Only `merge` needs this. An `implement` operation cannot reach
+        # `done` here in practice: the only way its receipt carries a jobId is
+        # complete_operation() having already been called with one, in the
+        # same call+commit that sets the outcome, so an orphaned implement
+        # always lands in the no-jobId branch above and resolves `unknown`.
+        if row["kind"] != "merge":
+            continue
+        if outcome == "failed":
+            # GitHub is authoritative and says it did not merge. Same
+            # destination the live path uses for a definite refusal.
+            detail = note or f"see operation {row['op_id']}"
+            _set_state(conn, row["event_id"], STATE_MERGE_BLOCKED, now,
+                       note=f"reconciled from GitHub: the pull request is not merged ({detail})")
+            conn.commit()
+            continue
+        sha = (new_receipt or {}).get("mergeCommit")
+        repo_entry = (policy.get("repos") or {}).get(row["repo"] or "") or {}
+        if repo_entry.get("autoDeploy"):
+            # Merged, and the deploy rode along inside the same lost
+            # subprocess. `ssh <host> make <target>` leaves no remote handle
+            # to ask (STATE.md §46), so whether production changed is
+            # genuinely unknown — and `merged` would quietly expire to
+            # `closed`, claiming a clean landing nobody verified.
+            _set_state(conn, row["event_id"], STATE_NEEDS_HUMAN, now,
+                       note=(f"reconciled from GitHub: merged as {sha}, but this repo auto-deploys and the "
+                             f"deploy ran inside the same lost call — whether it completed cannot be "
+                             f"determined remotely. Verify the deployment before acting on this item."))
+        else:
+            # No deploy was configured, so nothing else was supposed to
+            # happen — this is exactly where the live path puts a merge with
+            # no deploy target, and `merged`'s own 1h rule takes it to
+            # `closed` from here.
+            _set_state(conn, row["event_id"], STATE_MERGED, now,
+                       note=f"reconciled from GitHub: merged as {sha}; no deploy configured for this repo")
+        conn.commit()
+
+
+class _AutoImplementResult(NamedTuple):
+    """Return shape for _run_hermes_cc_auto_implement(), replacing a bare
+    `str | None`. A bare None used to conflate every failure mode into one
+    value, and the caller (maybe_auto_implement()) always rolled its claim
+    back on it — which is safe ONLY for the one case where the subprocess
+    never ran at all. `subprocess.TimeoutExpired` and a non-JSON stdout are
+    both reachable AFTER sideclaw has already accepted the job (STATE.md §46's
+    write-ordering map): a timeout can fire while hermes-cc.sh is sitting
+    inside its own bounded curl to sideclaw, well after the POST that matters
+    has already been sent, and a non-JSON stdout can follow a submission that
+    hermes-cc.sh itself started emitting a response for. Rolling either of
+    those back re-opens the item to a SECOND implement dispatch next tick —
+    two branches, two draft PRs, the exact bug STATE.md §46 names. The rule:
+    a timeout is not a refusal.
+
+    `job_id` is set only on a genuine, complete success (hermes-cc.sh
+    returned `{"ok": true, "jobId": ...}`). `outcome` is one of
+    `_OPERATION_OUTCOMES` whenever `job_id` is None — "failed" only for the
+    subprocess never having run at all (OSError) or hermes-cc.sh completing
+    and plainly saying no (non-zero exit, or a parsed `{"ok": false, ...}`);
+    "unknown" for TimeoutExpired and for stdout that never parsed as JSON —
+    never read when `job_id` is set."""
+    job_id: str | None
+    outcome: str | None
+
+
+def _run_hermes_cc_auto_implement(*, repo: str, event_id: int) -> _AutoImplementResult:
     """Step 6 — `dispatch <repo> --tier implement --auto-from-item <event_id>`.
     hermes-cc.sh re-checks every precondition itself from watchdog.db (see
     its own require_auto_from_item()); this function only decides WHICH item
@@ -2888,7 +3252,14 @@ def _run_hermes_cc_auto_implement(*, repo: str, event_id: int) -> str | None:
     deliberately terse — the analysis already happened in the linked
     investigate episode, which the implement episode can and should re-read
     itself inside the repo (CLAUDE.md, the actual code) rather than trusting
-    a second-hand summary here."""
+    a second-hand summary here.
+
+    See _AutoImplementResult above for why this returns a NamedTuple instead
+    of a bare `str | None`, and specifically why OSError (process never ran)
+    and TimeoutExpired (process may have already reached sideclaw) are no
+    longer caught by the same `except` clause — they used to be, both being
+    `subprocess.SubprocessError` subclasses, which is exactly how the two got
+    conflated in the first place."""
     brief = (
         "A prior read-only investigation of this repo (dispatched by the alert triage loop) "
         "already concluded, at high confidence, that the fix should be implemented — re-read "
@@ -2903,23 +3274,32 @@ def _run_hermes_cc_auto_implement(*, repo: str, event_id: int) -> str | None:
             "--json"]
     try:
         r = subprocess.run(argv, input=brief, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        # hermes-cc.sh may already have POSTed to sideclaw and be waiting on
+        # the response when the outer timeout fires — see _AutoImplementResult.
+        print(f"triage: hermes-cc.sh auto-implement timed out for {repo}: {e}", file=sys.stderr)
+        return _AutoImplementResult(None, "unknown")
     except (OSError, subprocess.SubprocessError) as e:
+        # The subprocess never ran at all (e.g. HERMES_CC_BIN not executable)
+        # — sideclaw was never called, so this is a genuine, safe-to-retry failure.
         print(f"triage: hermes-cc.sh auto-implement failed to run for {repo}: {e}", file=sys.stderr)
-        return None
+        return _AutoImplementResult(None, "failed")
     if r.returncode != 0:
         print(f"triage: hermes-cc.sh auto-implement exited {r.returncode} for {repo}: "
               f"{r.stderr.strip()[:500]}", file=sys.stderr)
-        return None
+        return _AutoImplementResult(None, "failed")
     try:
         obj = json.loads(r.stdout)
     except json.JSONDecodeError:
+        # hermes-cc.sh completed but stdout never parsed — cannot tell "crashed
+        # before submitting" from "crashed after sideclaw accepted the job".
         print(f"triage: hermes-cc.sh auto-implement returned non-JSON for {repo}: {r.stdout[:300]}",
               file=sys.stderr)
-        return None
+        return _AutoImplementResult(None, "unknown")
     if not obj.get("ok") or not obj.get("jobId"):
         print(f"triage: hermes-cc.sh auto-implement not ok for {repo}: {obj}", file=sys.stderr)
-        return None
-    return obj["jobId"]
+        return _AutoImplementResult(None, "failed")
+    return _AutoImplementResult(obj["jobId"], None)
 
 
 def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -2964,17 +3344,36 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         conn.commit()
         if not claimed:
             continue
-        job_id = _run_hermes_cc_auto_implement(repo=item["repo"], event_id=item["event_id"])
-        if job_id is None:
-            # Dispatch refused or failed, so nothing is running — hand the claim back
-            # rather than stranding the item in `implementing` with no job to poll.
+        # Recorded and committed BEFORE the external call — see
+        # record_operation()'s own docstring for why the commit is the whole
+        # contract. This is the "operation id recorded before dispatch"
+        # DESIGN.md § Crash recovery asks for.
+        op_id = record_operation(conn, event_id=item["event_id"], kind="implement",
+                                  repo=item["repo"], authorized_by="auto-from-item")
+        result = _run_hermes_cc_auto_implement(repo=item["repo"], event_id=item["event_id"])
+        if result.job_id is None:
+            if result.outcome == "unknown":
+                # A timeout or unparseable stdout — sideclaw MAY have accepted
+                # the job. Do NOT roll back: that would re-implement next tick
+                # against a job that could already be running (the exact
+                # duplication bug this slice exists to fix). Leave both the
+                # item in `implementing` (no implement_job to poll yet) and
+                # the operation's outcome NULL — reconcile_operations() runs
+                # first on the very next pass and resolves it before
+                # anything here gets a chance to retry.
+                continue
+            # "failed" — the subprocess never ran, or hermes-cc.sh completed and
+            # plainly refused. Sideclaw was never called either way, so it is
+            # safe to hand the claim back rather than stranding the item.
+            complete_operation(conn, op_id, outcome="failed")
             _set_state(conn, item["event_id"], STATE_VERDICT, now,
                        expect_state=STATE_IMPLEMENTING)
             conn.commit()
             continue
+        complete_operation(conn, op_id, outcome="done", receipt=json.dumps({"jobId": result.job_id}))
         conn.execute(
             "UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
-            (job_id, _now_iso(now), item["event_id"]),
+            (result.job_id, _now_iso(now), item["event_id"]),
         )
         conn.commit()
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
@@ -3035,7 +3434,50 @@ def _run_hermes_cc_validation(conn: sqlite3.Connection, *, repo: str, event_id: 
     return job_id
 
 
-def _run_hermes_cc_merge(job_id: str) -> dict[str, Any] | None:
+# hermes-cc.sh `merge --confirm` covers GraphQL ready-for-review, `PUT
+# /pulls/:pr/merge`, a branch delete AND an `ssh <host> make <target>` deploy
+# behind ONE subprocess boundary (STATE.md §46's write-ordering map) — capped
+# here, in Python, before `deploy.output` ever reaches a receipt JSON blob,
+# same "cap at the point the text is assembled" reasoning MAX_BRIEF_CHARS
+# already documents for the brief itself.
+_DEPLOY_OUTPUT_RECEIPT_CAP_CHARS = 2000
+
+# hermes-cc.sh's own exit taxonomy (`_err`, hermes-cc.sh:355-368): 2
+# precondition, 3 remote, 4 policy, 64 usage — and its `--json` error object
+# carries the code back as `exitCode`, so this is read, never guessed from a
+# message string.
+#
+# Only 3 can fire AFTER an external mutation has already been attempted:
+# `remote_err` is reached once hermes-cc.sh is already talking to something,
+# and it covers both a transport failure and the literal
+# `remote_err "sideclaw accepted the job but returned no id"` — a case where
+# the job IS running. 2, 4 and 64 are all decided BEFORE anything is
+# attempted (a missing tool, a policy gate, a bad flag), so they are definite
+# refusals and stay safe to roll back.
+_HERMES_CC_EX_REMOTE = 3
+
+
+class _MergeCallResult(NamedTuple):
+    """Return shape for _run_hermes_cc_merge() — same reasoning as
+    _AutoImplementResult above: a bare `dict | None` conflated "the merge
+    call never ran" with "it may already have landed (and deployed)".
+    `hermes-cc.sh merge --confirm` covers GraphQL ready-for-review, `PUT
+    /pulls/:pr/merge`, a branch delete and an `ssh <host> make <target>`
+    deploy behind ONE subprocess boundary — a timeout after ANY of those
+    steps means the PR may already be merged, so treating that the same as a
+    refusal is DESIGN.md § Crash recovery's "silently read as failure",
+    verbatim (STATE.md §46's `cmd_merge` write-ordering row is exactly this).
+
+    `result` is the parsed `merge --json` object on a genuine completion —
+    whether the merge itself succeeded or hermes-cc.sh's own gate refused it,
+    either way it returned a definite, parseable answer. `outcome` is set
+    only when `result` is None: "failed" for a subprocess that never ran at
+    all (OSError), "unknown" for a timeout or unparseable stdout."""
+    result: dict[str, Any] | None
+    outcome: str | None
+
+
+def _run_hermes_cc_merge(job_id: str) -> _MergeCallResult:
     """Step 8 — `merge <job-id> --confirm`. `merge`'s own `--confirm` is an
     ungated, instruction-level flag (unlike `dispatch --tier implement`,
     which needs the signed-approval OR --auto-from-item gate) — owner
@@ -3043,19 +3485,25 @@ def _run_hermes_cc_merge(job_id: str) -> dict[str, Any] | None:
     the approval, landing it is finishing the thing already said yes to.
     Every real bound (declared path scope, CI reality, this exact
     validation) is enforced INSIDE cmd_merge, re-checked against the
-    current head — this call is not itself a trust boundary."""
+    current head — this call is not itself a trust boundary.
+
+    See _MergeCallResult above for why this returns a NamedTuple: a timeout
+    here must never be read the same as a definite refusal."""
     argv = [str(HERMES_CC_BIN), "merge", job_id, "--why",
             "triage auto-merge: step-7 validation confirmed", "--confirm", "--json"]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        print(f"triage: hermes-cc.sh merge timed out for {job_id}: {e}", file=sys.stderr)
+        return _MergeCallResult(None, "unknown")
     except (OSError, subprocess.SubprocessError) as e:
         print(f"triage: hermes-cc.sh merge failed to run for {job_id}: {e}", file=sys.stderr)
-        return None
+        return _MergeCallResult(None, "failed")
     try:
-        return json.loads(r.stdout)
+        return _MergeCallResult(json.loads(r.stdout), None)
     except json.JSONDecodeError:
         print(f"triage: hermes-cc.sh merge returned non-JSON for {job_id}: {r.stdout[:300]}", file=sys.stderr)
-        return None
+        return _MergeCallResult(None, "unknown")
 
 
 def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -3141,13 +3589,45 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=note)
             conn.commit()
         else:
-            merge_result = _run_hermes_cc_merge(item["implement_job"])
-            if merge_result is None:
-                _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                           note="validation confirmed but the merge call itself failed to run")
-                conn.commit()
-            elif merge_result.get("ok") and merge_result.get("merged"):
-                deploy = merge_result.get("deploy") or {}
+            # Recorded and committed BEFORE the external call — same
+            # contract as maybe_auto_implement()'s implement operation.
+            op_id = record_operation(conn, event_id=item["event_id"], kind="merge",
+                                      repo=item["repo"], authorized_by="auto-from-item")
+            merge_call = _run_hermes_cc_merge(item["implement_job"])
+            if merge_call.result is None:
+                if merge_call.outcome == "unknown":
+                    # The merge (and its bundled deploy) may already have
+                    # happened — see _MergeCallResult's own docstring. Leave
+                    # the operation open (outcome still NULL) and the item in
+                    # `validating`: reconcile_operations() asks GitHub
+                    # directly on the very next pass, BEFORE this function
+                    # gets another chance to re-attempt the merge. Setting
+                    # STATE_MERGE_BLOCKED here would be exactly DESIGN.md §
+                    # Crash recovery's "silently read as failure".
+                    conn.commit()
+                else:
+                    complete_operation(conn, op_id, outcome="failed")
+                    _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
+                               note="validation confirmed but the merge call itself failed to run")
+                    conn.commit()
+            elif merge_call.result.get("ok") and merge_call.result.get("merged"):
+                deploy = merge_call.result.get("deploy") or {}
+                # mergeCommit is the one genuine remote receipt this system
+                # already obtains (hermes-cc.sh's own merge_sha) and used to
+                # throw away — STATE.md §46's write-ordering map names this
+                # exactly. Persisted here, plus the whole deploy object
+                # (output capped — see _DEPLOY_OUTPUT_RECEIPT_CAP_CHARS).
+                receipt = json.dumps({
+                    "pullRequest": merge_call.result.get("pullRequest"),
+                    "mergeCommit": merge_call.result.get("mergeCommit"),
+                    "branch": merge_call.result.get("branch"),
+                    "mergeMethod": merge_call.result.get("mergeMethod"),
+                    "deploy": {
+                        **deploy,
+                        "output": _cap_evidence(deploy.get("output") or "", _DEPLOY_OUTPUT_RECEIPT_CAP_CHARS),
+                    },
+                })
+                complete_operation(conn, op_id, outcome="done", receipt=receipt)
                 if deploy.get("attempted") and deploy.get("ok"):
                     deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
                     _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
@@ -3158,8 +3638,29 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                     reason = deploy.get("reason") or "merged; no deploy configured for this repo"
                     _set_state(conn, item["event_id"], STATE_MERGED, now, note=reason)
                 conn.commit()
+            elif merge_call.result.get("exitCode") == _HERMES_CC_EX_REMOTE:
+                # A REMOTE failure, not a refusal. hermes-cc.sh reaches
+                # `remote_err` only once it is already talking to something —
+                # so this is reachable AFTER `PUT /pulls/:pr/merge` has been
+                # sent and even after it succeeded (a lost response, a
+                # timeout inside the branch-delete or the ssh deploy that
+                # follows it). Reading it as `merge_blocked` is DESIGN.md §
+                # Crash recovery's "silently read as failure" arriving through
+                # a parsed error object instead of a lost process. Leave the
+                # operation open and the item in `validating`;
+                # reconcile_operations() asks GitHub — which is authoritative
+                # about whether the PR merged — before this function can run
+                # again. See _HERMES_CC_EX_REMOTE for why 2/4/64 are not here.
+                print(f"triage: merge for {item['signature']} returned a REMOTE error "
+                      f"({merge_call.result.get('error')}) — left unresolved for reconcile_operations()",
+                      file=sys.stderr)
+                conn.commit()
             else:
-                note = f"merge refused: {merge_result.get('error') or 'unknown reason'}"
+                # hermes-cc.sh completed and gave a definite refusal (its own
+                # gate, or a GitHub 409/405) — a real answer, not an ambiguity.
+                complete_operation(conn, op_id, outcome="failed",
+                                   receipt=json.dumps({"error": merge_call.result.get("error")}))
+                note = f"merge refused: {merge_call.result.get('error') or 'unknown reason'}"
                 _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=note)
                 conn.commit()
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
@@ -3925,6 +4426,15 @@ def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], un
 def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     now = dt.datetime.now(dt.timezone.utc)
     policy = load_policy()
+
+    # Step -1 — MUST run before anything else in this pass, including
+    # drain_intents(): an item sitting under an in-flight operation (a
+    # process that crashed, or an ambiguous hermes-cc.sh return the call
+    # site deliberately left unresolved) must be reconciled before any
+    # poller gets a chance to retry the same external call. See
+    # reconcile_operations()'s own docstring and the module docstring's
+    # step -1.
+    reconcile_operations(conn, policy, now, dry_run=dry_run)
 
     drain_intents(conn, dry_run=dry_run)
     ingest(conn, now)

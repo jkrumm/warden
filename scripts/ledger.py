@@ -58,7 +58,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # frozen at its pre-cutover state and written by nothing, kept as the rollback —
 # so if you are reading this to work out which database is real, it is this one.
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -269,11 +269,57 @@ CREATE TABLE item_transitions (
 CREATE INDEX IF NOT EXISTS idx_item_transitions_event ON item_transitions(event_id, id);
 """
 
+# Version 5 — `operations`, the crash-recovery unit DESIGN.md § Crash recovery
+# calls for: "an operation id recorded before dispatch... unknown is an
+# explicit outcome, reconciled before any retry — never silently read as
+# failure." STATE.md §46 Correction 1 is why this hangs off its OWN table
+# rather than `dispatch_approvals`: the unattended door (--auto-from-item) can
+# never produce an approval row (`mint_approval` has one call site, behind
+# PLANNED=1, and `awaiting_confirm()` is false whenever AUTO_FROM_ITEM is set —
+# the two doors are mutually exclusive by construction), so attribution has to
+# live somewhere BOTH doors write, and this repo writes this table itself, on
+# both doors, rather than depending on hermes-cc.sh to own a third table.
+#
+# `outcome IS NULL` means "in flight" — an operation this process recorded as
+# STARTED but has not yet recorded the result of, whether because it crashed
+# before it could, or because the external call it covers (`hermes-cc.sh
+# dispatch --tier implement`, `merge --confirm`) returned ambiguously (a
+# subprocess timeout, unparseable stdout) and the call site deliberately left
+# it open for triage.py's reconcile_operations() to resolve on the very next
+# pass, before anything else acts on the item (see that file's module
+# docstring, step 0). The partial index below is what makes that scan cheap —
+# the whole point of recording the id BEFORE the external call is that this
+# table is checked on every single pass, not just after a genuine crash.
+#
+# No data migration, same as item_transitions in migration 4: the table
+# starts empty and records nothing retroactively. A /metrics window
+# predating it is empty BY CONSTRUCTION, not zero — see this module's own
+# migration 4 comment and api.py's _history_guard_reason() for the pattern
+# this repeats.
+_MIGRATION_5 = """
+CREATE TABLE operations (
+  op_id          TEXT PRIMARY KEY,
+  event_id       INTEGER REFERENCES events(id),
+  kind           TEXT NOT NULL,
+  repo           TEXT NOT NULL,
+  authorized_by  TEXT NOT NULL,
+  started_at     TEXT NOT NULL,
+  outcome        TEXT,
+  outcome_at     TEXT,
+  receipt_json   TEXT,
+  reconciled_at  TEXT,
+  note           TEXT
+);
+CREATE INDEX IF NOT EXISTS operations_open  ON operations(outcome) WHERE outcome IS NULL;
+CREATE INDEX IF NOT EXISTS operations_event ON operations(event_id);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
     4: _MIGRATION_4,
+    5: _MIGRATION_5,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live
@@ -281,6 +327,21 @@ MIGRATIONS: dict[int, str] = {
 # adoption check in migrate() — never by connect()/assert_schema_version(),
 # which only ever look at schema_version itself.
 _ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "dispatch_approvals", "triage_items")
+
+# Every table this schema declares AT SCHEMA_VERSION, used only by
+# _expected_columns()/_verify_columns() — deliberately a DIFFERENT set from
+# _ADOPTABLE_TABLES above, and the two must stay separate. _ADOPTABLE_TABLES
+# answers "is this the live pre-versioned ledger" (table presence only, at the
+# instant BEFORE the migration loop runs — an adopted ledger legitimately has
+# neither item_transitions nor operations yet, since both are created by
+# migrations 4 and 5, which adoption falls through into immediately after).
+# _VERSIONED_TABLES answers a different question — "does a database stamped
+# at SCHEMA_VERSION actually have the columns that version declares" — and has
+# to include every table ever added by a migration, or a later migration's
+# table silently stops being checked. This closes STATE.md §41 known-open item
+# 5: item_transitions' shape was created by migration 4 but never asserted by
+# _verify_columns(), because it only ever walked _ADOPTABLE_TABLES.
+_VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
 
 
 def _now_iso() -> str:
@@ -414,7 +475,7 @@ def _expected_columns() -> dict[str, set[str]]:
                 mem.executescript(MIGRATIONS[version])
         return {
             t: {r[1] for r in mem.execute(f"PRAGMA table_info('{t}')")}
-            for t in _ADOPTABLE_TABLES
+            for t in _VERSIONED_TABLES
         }
     finally:
         mem.close()

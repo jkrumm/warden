@@ -967,6 +967,64 @@ ever registered by hand). `dispatch-sweep.py`'s own cron loader
 sideclaw and folds a verdict onto a card `triage.py` already wrote, so it has
 no chicken-and-egg dependency on the gateway being up.
 
+## Operations — the crash-recovery unit (schema 5)
+
+Steps 6 and 8 below each make one external, non-atomic call — `hermes-cc.sh
+dispatch --tier implement`, and `merge --confirm` — that this ledger cannot
+undo if the process dies mid-call. `operations` (schema 5) is what makes
+restarting mid-chain lossless rather than duplicating or misreporting the
+result, per DESIGN.md § Crash recovery.
+
+**Scope: the mutating chain only.** An `implement` operation covers the call
+that opens a branch and a draft PR; a `merge` operation covers the call that
+merges, deletes the branch and (best-effort) deploys — recorded as ONE
+operation even though `merge --confirm` is itself a compound external call
+(GraphQL ready-for-review, `PUT /pulls/:pr/merge`, a branch delete, then `ssh
+<host> make <target>`) behind a single subprocess boundary; there is no
+write-point between the merge and the deploy without a `hermes-agent`
+change, which is out of scope here. `investigate`/validation episodes never
+get one — they are read-only, run in their own sideclaw worktree, mutate
+nothing outside it, and `dispatch-sweep.py`'s existing `poll_misses`/`lost`
+path already covers a forgotten job.
+
+**The write order, always.** `record_operation()` INSERTs and commits BEFORE
+the external call runs — the commit is the entire contract: the row has to be
+durable before this process goes on to shell out. `complete_operation()`
+writes the outcome AFTER the call returns — but ONLY when the return is
+unambiguous. A subprocess timeout or unparseable stdout can each follow a
+call the external system already accepted (`hermes-cc.sh` may have already
+POSTed to sideclaw, or the merge may have already landed before the timeout
+fired), so the call sites (`maybe_auto_implement()`, `poll_validation_jobs()`)
+deliberately leave the row's `outcome` NULL in that case rather than guess —
+"a timeout is not a refusal."
+
+**`outcome` is one of three values**, a closed allowlist (`_OPERATION_OUTCOMES`
+in triage.py): `done`, `failed`, or `unknown`. `failed` means the call
+definitely never took effect (the subprocess never ran, or the external
+system gave a plain, parseable refusal). `unknown` means this process cannot
+tell — and an item behind an `unknown` operation is never retried: it stays
+in whatever non-`new` state the claim put it in (`implementing`/`validating`,
+never rolled back), which keeps it out of every eligibility query that could
+re-fire the same call.
+
+**`reconcile_operations()` runs FIRST in every pass**, before even
+`drain_intents()` — see `run()`'s own ordering. Every `operations` row with
+`outcome IS NULL` (a genuine crash, or a call site's deliberately-left-open
+ambiguity — both look the same from here) gets asked about directly:
+`_hermes_cc_status(job_id)` for `implement` (a pruned job returns 404,
+byte-identical to a job id that never existed, so absence maps to `unknown`,
+never `failed`); `gh pr view <pr> --repo <owner>/<repo>` for `merge` (the PR
+is parsed from `dispatches.artifact_url` with the same regex `cmd_merge`
+itself uses). A `merge` operation GitHub reports as merged always resolves to
+`done`, carrying `mergeCommit` in its receipt — never `merge_blocked`, which
+is the exact "silently read as failure" bug DESIGN.md names. The deploy half
+has no remote answer (`ssh <host> make <target>` returns only an exit code to
+a process that is gone), so a reconciled merge's receipt honestly records
+`"deploy": "unknown"` rather than guessing. **An operation that reconciliation
+still cannot resolve moves its item to `needs_human`** — "we do not know
+whether the world changed" is exactly the case this system routes to a
+person.
+
 ## Closing the loop — verdict → implement → validate → merge → deploy → verify
 
 The triage loop used to stop at a verdict. Five functions close the rest of

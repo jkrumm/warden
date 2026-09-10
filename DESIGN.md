@@ -493,12 +493,40 @@ recording it: warden either repeats a destructive operation, or refuses because
 the approval is spent — which is "approved fix, no action completed" again.
 
 v1's claim that "restarting warden mid-chain loses nothing" was unsupported.
-Required:
+Schema 5 (`operations`, triage.py's `record_operation()`/`complete_operation()`/
+`reconcile_operations()`) closes this for the mutating chain — `implement` and
+`merge`, the only two verbs that change anything outside sideclaw's own
+worktree. `investigate`/validation episodes are deliberately excluded: they are
+read-only, in their own worktree, and `dispatch-sweep.py`'s existing
+`poll_misses`/`lost` path already covers a forgotten one.
 
-- An **operation id** recorded before dispatch; the approval binds to it.
-- **Remote receipts** where available (PR merge sha, deploy run id).
+- An **operation id** is recorded (and durably committed) BEFORE the external
+  call — `hermes-cc.sh dispatch --tier implement`, or `merge --confirm` — that
+  it covers. STATE.md §46 Correction 1 is why this lives in its own table
+  rather than on `dispatch_approvals`: the unattended door (`--auto-from-item`)
+  structurally never produces an approval row, so attribution has to hang off
+  something both doors write.
+- **Remote receipts** where available: a successful merge persists
+  `pullRequest`, `mergeCommit` and the whole `deploy` result — `mergeCommit`
+  is hermes-cc.sh's own `merge_sha`, computed for years and thrown away until
+  now. The one honest gap: `merge --confirm` covers GraphQL ready-for-review,
+  `PUT /pulls/:pr/merge`, a branch delete AND `ssh <host> make <target>`
+  behind ONE subprocess boundary, so there is no write-point between the
+  merge and the deploy — a reconciled merge's receipt records
+  `"deploy": "unknown"` rather than guessing whether the deploy half also ran.
+  Splitting that into two operations needs a change in `hermes-agent`, not
+  this repo, and is not done here.
 - **`unknown` is an explicit outcome**, reconciled before any retry — never
-  silently read as failure.
+  silently read as failure. Two sources produce it: a genuine process crash
+  (an `operations` row left with `outcome IS NULL`), and a call site that
+  deliberately declines to guess on an ambiguous return (a subprocess
+  timeout, unparseable stdout — both reachable AFTER the external system has
+  already accepted the call). `reconcile_operations()` runs FIRST in every
+  pass, before anything that could retry, and asks the external system
+  directly (sideclaw's `status`, `gh pr view`) rather than trust local state.
+  An operation that still cannot be resolved moves its item to
+  `needs_human` — "we do not know whether the world changed" is exactly the
+  case this system routes to a person, never a machine's second guess.
 
 ---
 

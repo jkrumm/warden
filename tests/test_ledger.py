@@ -154,7 +154,7 @@ def test_fresh_migrate_creates_all_tables_and_indexes():
     conn = ledger.connect(_tmp_path(), migrate=True)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for t in ("events", "cursors", "dispatches", "dispatch_approvals", "triage_items", "schema_version",
-              "item_transitions"):
+              "item_transitions", "operations"):
         assert t in tables, f"missing table {t}"
     indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
     expected = {
@@ -166,6 +166,8 @@ def test_fresh_migrate_creates_all_tables_and_indexes():
         "idx_triage_state",
         "idx_triage_state_deadline",   # version 2
         "idx_item_transitions_event",  # version 4
+        "operations_open",             # version 5
+        "operations_event",            # version 5
     }
     assert indexes == expected, f"got {indexes}"
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
@@ -498,6 +500,84 @@ def test_adoption_tolerates_an_unexpected_extra_column() -> None:
     ledger.migrate(conn)
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
     conn.close()
+
+
+def test_migration_5_creates_operations_table_and_indexes():
+    """See _MIGRATION_5 / triage.py's record_operation()/complete_operation()/
+    reconcile_operations() — the crash-recovery unit DESIGN.md § Crash
+    recovery asks for."""
+    conn = ledger.connect(_tmp_path(), migrate=True)
+    cols = _table_columns(conn, "operations")
+    assert cols == {
+        "op_id", "event_id", "kind", "repo", "authorized_by", "started_at",
+        "outcome", "outcome_at", "receipt_json", "reconciled_at", "note",
+    }, cols
+    indexes = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='operations' AND name NOT LIKE 'sqlite_%'"
+    )}
+    assert indexes == {"operations_open", "operations_event"}, indexes
+    assert conn.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0, (
+        "the table starts empty — migration 5 records nothing retroactively, same as item_transitions")
+    conn.close()
+
+
+def test_v4_database_migrates_to_v5_matching_a_fresh_one():
+    """A real upgrade path, not adoption: a database already stamped at
+    schema_version 4 (item_transitions present, operations not yet) must
+    reach SCHEMA_VERSION 5 with a schema identical to a fresh database's."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    conn.executescript(ledger._MIGRATION_2)
+    conn.executescript(ledger._MIGRATION_3)
+    conn.executescript(ledger._MIGRATION_4)
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (4, 'test')")
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "operations" in tables, "migration 5 did not run against the v4-stamped database"
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    for table in ledger._VERSIONED_TABLES:
+        assert _table_columns(fresh, table) == _table_columns(conn, table), (
+            f"{table}: a v4-upgraded schema diverges from a fresh one")
+    fresh.close()
+    conn.close()
+
+
+def test_verify_columns_catches_missing_operations_column():
+    """Closes STATE.md §41 known-open item 5: item_transitions' (and now
+    operations') shape was created by a migration but never asserted by
+    _verify_columns(), because it only ever walked _ADOPTABLE_TABLES —
+    exactly the five original BASE_SCHEMA tables, never a table a LATER
+    migration added. A database stamped at SCHEMA_VERSION with an
+    `operations` table missing a declared column must be refused, the same
+    way test_adoption_refuses_a_structurally_incomplete_database already
+    proves for `dispatches`."""
+    tmp = Path(tempfile.mkdtemp(prefix="ledger-ops-incomplete-")) / "warden.db"
+    conn = ledger.connect(tmp, migrate=True)
+    conn.close()
+
+    conn = sqlite3.connect(tmp)
+    conn.execute("ALTER TABLE operations DROP COLUMN note")
+    conn.commit()
+    conn.close()
+
+    conn = sqlite3.connect(tmp)
+    try:
+        ledger.migrate(conn)
+    except RuntimeError as err:
+        assert "missing" in str(err), str(err)
+        assert "note" in str(err), str(err)
+        assert "operations" in str(err), str(err)
+    else:
+        raise AssertionError("migrate() accepted an `operations` table missing a declared column")
+    finally:
+        conn.close()
 
 
 def main() -> int:

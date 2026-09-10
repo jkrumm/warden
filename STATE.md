@@ -5025,3 +5025,207 @@ build after item 1a.
 Finish item 1a (the operations ledger, in flight). Then merge-is-deploy as item
 1b, with the Actions run id as its receipt — which is the deploy receipt `DESIGN.md`
 § Crash recovery asks for and the ssh path structurally cannot provide.
+
+---
+
+## 48. Wave 3, item 1a — the operations ledger (DONE & LIVE, schema_version 5)
+
+`DESIGN.md` § *Crash recovery* asked for three things. All three now exist for
+the mutating chain, and the shape follows from §46 correction 1 rather than from
+the handover's framing.
+
+### What changed
+
+| File | Change |
+|-|-|
+| `scripts/ledger.py` | `SCHEMA_VERSION` 4 → **5**; `_MIGRATION_5` creates `operations` + two indexes, no data migration; `_VERSIONED_TABLES` split from `_ADOPTABLE_TABLES` |
+| `scripts/triage.py` | `record_operation()` / `complete_operation()`; `reconcile_operations()` as step −1, first in `run()`; `_AutoImplementResult` / `_MergeCallResult`; `_parse_pr_url()` / `_run_gh_pr_view()` / `GH_BIN`; receipts persisted on merge |
+| `scripts/api.py` | metric 4's derivation, replacing its "cannot be derived" reason |
+| `hermes-agent/scripts/hermes-cc.sh` | `WARDEN_SCHEMA_VERSION` 4 → **5**, one line, nothing else |
+| tests | `test_triage.py` 116 → **131**, `test_api.py` 23 → **26**, `test_ledger.py` 16 → **19** |
+| `DESIGN.md`, `docs/triage.md`, `docs/api.md` | crash recovery described as built; the new loop step; metric 4's derivation |
+
+`operations` is written **before** the external call it covers and committed
+before `record_operation()` returns — that commit is the whole contract. Scope is
+the two mutating verbs only, `implement` and `merge`; `investigate`/validation
+episodes are read-only in their own worktree and `dispatch-sweep.py`'s
+`poll_misses`/`lost` path already covers a forgotten one.
+
+**`merge` is one operation, not two, and that is a stated limitation.**
+`hermes-cc.sh merge --confirm` covers GraphQL ready-for-review, `PUT
+/pulls/:pr/merge`, a branch delete *and* `ssh <host> make <target>` behind one
+subprocess boundary, so there is no write-point between the merge and the deploy.
+A reconciled merge's receipt records `"deploy": "unknown"` rather than guessing.
+Splitting it needs a `hermes-agent` change.
+
+Also closed here: **§41 known-open item 5.** `_verify_columns()` walked only
+`_ADOPTABLE_TABLES`, so `item_transitions` was created by migration 4 and asserted
+by nothing — and `operations` would have inherited the gap. The two lists now
+answer two different questions: `_ADOPTABLE_TABLES` is *"is this the live
+pre-versioned ledger"* (checked before the migration loop, where neither newer
+table legitimately exists yet); `_VERSIONED_TABLES` is *"does a database stamped
+at `SCHEMA_VERSION` have the columns that version declares"*.
+
+### A mutation SURVIVED, and it is the Wave 2 defect-3 pattern repeating
+
+The most important thing in this section. My independent mutation battery flipped
+`_run_hermes_cc_auto_implement()`'s `TimeoutExpired` branch from `"unknown"` to
+`"failed"` — reinstating the duplication bug the whole slice exists to close —
+and **the suite stayed green at 129/129.**
+
+Both of the worker's tests for that behaviour stub the helper wholesale:
+
+```python
+triage._run_hermes_cc_auto_implement = lambda *, repo, event_id: \
+    triage._AutoImplementResult(None, "unknown")
+```
+
+They test the **caller's** handling of an injected outcome and can never observe
+the **producer's** mapping. That is exactly §42 defect 3 — *"a read-only guarantee
+whose test could not observe the call site it claimed to guard"* — arriving again
+in a different function, one wave later, and again only a mutation found it.
+
+Two producer-level tests now drive the real helper bodies with a patched
+`subprocess.run`, covering every branch of both helpers. Re-running the mutation:
+
+```
+== MUTATION: auto-implement TimeoutExpired -> failed
+  test_auto_implement_helper_maps_each_failure_mode_to_the_right_outcome:
+    a timeout may follow an accepted submission: outcome 'failed' != 'unknown'
+== MUTATION: merge TimeoutExpired -> failed
+  test_merge_helper_maps_each_failure_mode_to_the_right_outcome:
+    a merge timeout may mean the PR is already merged — got _MergeCallResult(result=None, outcome='failed')
+```
+
+**`_run_hermes_cc_merge()` was unprotected too** — a second, unmutated instance of
+the same gap, found only because the first one prompted looking.
+
+### Three defects fixed on the worker's diff after reading it
+
+1. **A reconciled merge did not move its item.** Resolving the *operation* to
+   `done` left the item in `validating`, whose 1h rule expires it to
+   `merge_blocked`. The operations table would read *"merged, here is the sha"*
+   while the item read *"blocked"* — §46's merged-but-recorded-as-failure bug one
+   layer further in. A reconciled merge now advances the item: `merged` when the
+   repo has no deploy target (where the live path puts it), **`needs_human` when
+   it auto-deploys**, because the deploy rode along inside the same lost
+   subprocess and `merged` would quietly expire to `closed`, claiming a landing
+   nobody verified. The worker flagged this in its own report rather than hiding
+   it — the brief was reasoned, not ordered.
+2. **A remote error was read as a refusal.** `hermes-cc.sh`'s `_err` taxonomy is
+   2 precondition / 3 remote / 4 policy / 64 usage, returned as `exitCode` in its
+   `--json` error object. Only **3** can fire after an external mutation was
+   attempted: `remote_err` is reached once it is already talking to something, and
+   covers the literal `remote_err "sideclaw accepted the job but returned no id"`.
+   Mapping it to `merge_blocked` is *"silently read as failure"* arriving through
+   a parsed error object instead of a dead process. Exit 3 now leaves the
+   operation open for GitHub to answer; 2/4/64 stay definite refusals, with a test
+   pinning each side so nobody widens it.
+3. **`api.py` repeated §42 defect 1's arithmetic shape.** `fixed_event_ids` was a
+   list *with duplicates* subtracted from a **distinct** set of signed items. An
+   item reaching `fixed` twice in one window (`fixed` → a failed liveness probe
+   reopens it → `fixed`) while carrying a signed approval would have reported an
+   unattended fix that never happened. The mutation shows it exactly:
+   `{'value': 1, 'fixed_in_window': 2, 'unattended_in_window': 1}` for one signed
+   item. Now `SELECT DISTINCT`, with the unit named as the item.
+
+Also corrected: the **DRY-RUN CONTRACT paragraph was stale**. The loop now shells
+out to `gh`, a third externally-visible action, and `reconcile_operations()` is a
+third dry-run carve-out beside `drain_intents()` and `sweep_deadlines()`. Both are
+now named in that paragraph rather than left for a reader to discover.
+
+### Verified, not claimed
+
+```
+$ make test
+  test_api.py                      26/26 passed
+  test_dispatch_sweep.py           all cases as expected
+  test_intents.py                  19/19 passed
+  test_ledger.py                   19/19 passed
+  test_triage.py                   131/131 passed
+  test_watchdog_delivery.py        all cases as expected
+  test_watchdog_locking.py         3/3 passed
+  test_watchdog_slack_blindness.py all cases as expected
+
+$ make check-policy                    ✓ both copies agree on all 30 repos
+$ grep -c 'UPDATE triage_items SET state=' scripts/triage.py     1
+$ hermes-agent tests                   165 cases as expected · 83 checks, 0 failures
+$ SCHEMA_VERSION 5  ==  WARDEN_SCHEMA_VERSION "${…:-5}"
+```
+
+`test_triage.py` **116 + 9 (worker) + 4 (my three fixes) + 2 (the producers) =
+131.** `test_api.py` 23 + 2 + 1 = 26. `test_ledger.py` 16 + 3 = 19.
+
+Eleven mutations, each red **by name**, each restored, the file verified
+byte-identical after every restore:
+
+| Mutation | Caught by |
+|-|-|
+| reconciled merge no longer advances the item | 3 tests, incl. `test_reconcile_merged_operation_advances_the_item_instead_of_leaving_it_to_expire` |
+| `autoDeploy` branch → `merged` instead of `needs_human` | `test_reconcile_merged_operation_with_autodeploy_goes_to_needs_human` |
+| exit-3 REMOTE read as a refusal again | `test_merge_remote_error_is_left_for_reconcile_not_read_as_merge_blocked` |
+| `record_operation()` loses its `commit()` | `test_record_operation_commits_before_returning` |
+| sideclaw 404 → `failed` instead of `unknown` | `test_reconcile_implement_sideclaw_404_becomes_unknown_not_failed_and_needs_human` |
+| GitHub says MERGED → `failed` | 3 tests |
+| `reconcile_operations()` moved after `drain_intents()` | `test_reconcile_operations_runs_before_anything_that_could_retry` |
+| `mergeCommit` dropped from the receipt | `test_successful_merge_stores_pull_request_merge_commit_and_deploy_in_receipt` |
+| **auto-implement `TimeoutExpired` → `failed`** | `test_auto_implement_helper_maps_each_failure_mode_to_the_right_outcome` (**survived before the producer tests existed**) |
+| **merge `TimeoutExpired` → `failed`** | `test_merge_helper_maps_each_failure_mode_to_the_right_outcome` (**also unprotected before**) |
+| `SELECT DISTINCT` dropped from metric 4 | `test_metric4_counts_an_item_once_even_if_it_reaches_fixed_twice` |
+
+### The migration — rehearsed on a copy, then live
+
+Agents unloaded for the whole slice (`make unload` 09:25:45Z, `make agents`
+10:12:32Z), snapshot at `~/.warden/backups/pre-schema-v5-20260910T0920Z.db`.
+
+```
+REHEARSAL  (copy of the live ledger, WARDEN_HOME redirected)
+  two passes: 0 and 0 new transitions, census identical
+  schema_version 5 · operations table + operations_open/operations_event · 0 rows
+  quick_check ok
+
+LIVE  (the loop migrated it at boot, as designed — only the loop migrates)
+  live schema before: 4
+  live schema after:  5 at 2026-09-10T10:12:38.508444+00:00
+  census      {'ignored': 7, 'needs_human': 11, 'new': 3, 'note': 8, 'quiet': 28}
+  transitions 30 (unchanged)  ·  operations 0  ·  quick_check ok
+  all five agents ✓ last exit 0 · /health ok, schema 5 == expected 5
+  warden-loop.err mtime unchanged (2026-09-09 22:39Z) — no new line
+```
+
+`/metrics` metric 4 now returns `null` for the **history-window** reason rather
+than *"the unattended qualifier cannot be derived"* — the derivation exists; the
+number needs a `fixed` transition, which needs the chain to run.
+
+Note the live census moved during the brief window the agents were loaded between
+slices: `quiet` 30 → 28, `needs_human` 9 → 11, transitions 24 → 30. Two items
+recurred, clustered, dispatched and folded to `needs_human` unattended — the
+pipeline working, not a side effect of this slice.
+
+### Known-open, decided deliberately
+
+1. **An `implement` dispatch that exits 3 (REMOTE) is still treated as `failed`
+   and rolled back.** The merge path now distinguishes it because GitHub can be
+   asked; the implement path cannot — `GET /api/jobs/:id` drops `params` (§46), so
+   warden cannot ask sideclaw *"is there a job for this repo"*. Mapping exit 3 to
+   `unknown` there would send an item to `needs_human` on **every transient
+   sideclaw outage** — the common case, currently handled correctly by a rollback
+   and retry — to guard against sideclaw returning 200 with a malformed body,
+   which is essentially never. The honest fix is a distinct exit code in
+   `hermes-cc.sh` separating "could not reach sideclaw" from "sideclaw accepted
+   but I lost the id"; that is a `hermes-agent` change, not this slice.
+2. **A reconciled `done`/`failed` `implement` operation cannot occur in practice**
+   — the only way its receipt carries a `jobId` is `complete_operation()` having
+   been called with one, in the same commit that sets the outcome. The branches
+   are defensive, and the no-jobId path (`unknown` → `needs_human`) is the one
+   that actually fires.
+3. `reconcile_operations()` does not resume the chain past the operation it
+   reconciled — a reconciled merge lands the item correctly, but a future
+   `implement` reconciliation that could resume `implementing` → `validating` is
+   not built.
+
+### Next action
+
+Item 1b — merge-is-deploy, with the GitHub Actions run id as the deploy receipt
+(§47). It is the only place in this estate where a real deploy receipt exists, and
+without it no repo can reach `fixed`, so it blocks the stop-condition exercise.

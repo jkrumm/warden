@@ -76,11 +76,11 @@ consumer (Argo, a human reading the JSON) tell the two apart.
 | 1 | `verdicts_recorded_disposition` | numerator/denominator (both **dispatch counts**) plus an `item_states` breakdown for investigate-tier dispatches with a recorded verdict AND `origin_event_id IS NOT NULL` (loop-originated — see below), reaching a state DESIGN.md counts as a recorded disposition (the implement chain, `needs_human`, or `dismissed`). `quiet` does **not** count — DESIGN.md principle 5, silence is never an outcome. `item_states` counts `triage_items` rows, **not** dispatches, so its total may legitimately exceed the denominator — one clustered dispatch joins several items (see `item_states_note`). Verdict-carrying investigate dispatches with `origin_event_id IS NULL` are interactive Slack dispatches a human asked `hermes-cc` to run directly; they never entered warden's funnel as an item and never will, so they're excluded from the ratio and reported separately as `excluded_interactive` (with `excluded_interactive_note`) rather than silently dropped. | all-time |
 | 2 | `verified_fixes_vs_silence` | `fixed`/`quiet`/`closed`/`dismissed` counts and `fixed / (fixed + quiet)`, restricted to mapped signatures (`triage_items.repo IS NOT NULL`). | all-time |
 | 3 | `median_needs_human_to_decision_hours` | median hours between a transition into `needs_human` and the item's next transition, **excluding** pairs whose exit is `dismissed` (that is the 7-day expiry clock, not a human deciding — REVIEW.md's C3 Goodhart concern). | windowed on entry |
-| 4 | `verified_unattended_fixes_per_week` | always `null` — the "unattended" qualifier needs an operation id linking an approval to the item it fixed (DESIGN.md § Crash recovery), which does not exist before Wave 3. Serves `fixes_in_window` (raw `fixed` transition count, explicitly **not** attendance-filtered) and `approvals_spent_in_window` as the closest available context. | windowed |
+| 4 | `verified_unattended_fixes_per_week` | **derivable as of schema 5** — an item that transitioned to `fixed` in the window counts as unattended unless one of its `operations` rows carries `authorized_by LIKE 'signed:%'` (see DESIGN.md § Crash recovery, STATE.md §46 Correction 1: the unattended door, `--auto-from-item`, structurally never produces a `dispatch_approvals` row, so `operations` — written on both doors — is the only table that can answer this). `fixed_in_window`/`unattended_in_window` are the raw counts; `value` is `unattended_in_window`. Still reads `null` today, for a different and correct reason than before: zero `fixed` transitions have ever occurred in production (STATE.md §46 Correction 3), so either the window predates `history_since` or there is simply nothing to count — the derivation becoming *possible* is what changed; the number moving needs the auto-implement chain to actually run. | windowed |
 | 5 | `poller_ages` | per-poller age in minutes plus the worst case across all three, named individually. | current (not windowed) |
 | 6 | `reverts_and_reopens` | `reopen_after_fixed` (real count, transitions with `from_state='fixed'`) and `reverts` (always `null` — no revert primitive exists before `warden revert`, DESIGN.md § Abort and revert, Wave 3). | windowed |
 
-**Leaf-level history guard.** Metrics 3, 4 (`fixes_in_window`) and 6
+**Leaf-level history guard.** Metrics 3, 4 (`fixed_in_window`) and 6
 (`reopen_after_fixed`) are all computed from `item_transitions`, which was
 created empty by schema migration 4. Each checks `history_since` against its
 own window start *at the leaf*, not just at the top level: an empty table, or
@@ -100,7 +100,9 @@ row here — the table's first entry for an item is always its departure from
 
 DESIGN.md § What "done" means names exactly these six as the metrics that
 matter; this wave implements all six honestly rather than a subset dishonestly.
-Two of them (#4's "unattended" qualifier, #6's `reverts`) cannot be computed
-today without ledger primitives that are explicitly Wave 3 work — they are
-served as `null` with a named reason rather than omitted, so a consumer can
-render "not yet measurable" instead of silently missing a key.
+One of them (#6's `reverts`) still cannot be computed at all — no revert
+primitive exists before `warden revert` (Wave 3). #4's "unattended" qualifier
+*is* now derivable (schema 5's `operations` table) but still reads `null`
+because production has never produced a `fixed` transition to evaluate — both
+are served as `null` with a named reason rather than omitted, so a consumer
+can render "not yet measurable" instead of silently missing a key.

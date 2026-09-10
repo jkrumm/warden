@@ -104,6 +104,14 @@ def _approval(conn, nonce: str, *, spent_at: dt.datetime | None) -> None:
     )
 
 
+def _operation(conn, op_id: str, *, event_id: int, kind: str = "implement", repo: str = "r",
+              authorized_by: str = "auto-from-item", now: dt.datetime) -> None:
+    conn.execute(
+        "INSERT INTO operations (op_id, event_id, kind, repo, authorized_by, started_at) VALUES (?,?,?,?,?,?)",
+        (op_id, event_id, kind, repo, authorized_by, _iso(now)),
+    )
+
+
 def _seed_old_history_anchor(conn, now: dt.datetime) -> None:
     """Push `history_since` safely before any WINDOW_DAYS window, so a test
     exercising a metric's REAL in-window computation isn't itself caught by
@@ -307,48 +315,110 @@ def test_metric3_null_with_history_reason_when_table_is_young():
 
 
 # --- Metric 4: verified unattended fixes per week -------------------------------
+#
+# Schema 5's `operations` table makes the "unattended" qualifier derivable —
+# see STATE.md §46 Correction 1 and api.py's own docstring on this metric.
+# An item counts as unattended if none of the `operations` rows tied to its
+# event_id carries a `signed:` authorized_by. In production today this chain
+# has only ever produced the literal "auto-from-item" (STATE.md §46
+# Correction 1), so these seeds are what the real ledger would actually hold.
 
-def test_metric4_unattended_is_null_with_reason_never_zero():
-    """`value` (the unattended qualifier) is null regardless of history —
-    that's DESIGN.md's Wave-3 gap, not a history question. `fixes_in_window`
-    is item_transitions-derived, so with an old anchor establishing history
-    well before the window, it reports the real count, never a fabricated 0
-    that could be confused with the guard's null."""
+def test_metric4_counts_a_fixed_item_with_no_signed_operation_as_unattended():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)
     _event(conn, 1, now)
     _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=1))
-    _approval(conn, "n1", spent_at=now - dt.timedelta(hours=1))
+    _operation(conn, "op1", event_id=1, authorized_by="auto-from-item", now=now - dt.timedelta(hours=2))
     conn.commit()
 
     history_since = api._item_transitions_history_since(conn)
     m = api._metric_verified_unattended_fixes_per_week(conn, now, history_since)
-    assert m["value"] is None
-    assert m["unavailable"] and len(m["unavailable"]) > 0
-    assert m["fixes_in_window"] == 1, m
-    assert m["approvals_spent_in_window"] == 1, m
+    assert m["value"] == 1, m
+    assert m["unavailable"] is None, m
+    assert m["fixed_in_window"] == 1, m
+    assert m["unattended_in_window"] == 1, m
     conn.close()
 
 
-def test_metric4_fixes_in_window_is_null_not_zero_when_history_is_young():
-    """Same seed as the test above MINUS the old anchor: item_transitions'
-    only row is 1h old, so the 7-day window predates history_since.
-    `fixes_in_window` must be null with a reason, never the fabricated `1`
-    (or `0`) the pre-fix code would have served here."""
+def test_metric4_excludes_a_fixed_item_whose_operation_was_signed():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _seed_old_history_anchor(conn, now)
+    _event(conn, 1, now)
+    _event(conn, 2, now, source="s2")
+    _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=1))
+    _transition(conn, 2, "implementing", "fixed", now - dt.timedelta(hours=1))
+    _operation(conn, "op1", event_id=1, authorized_by="auto-from-item", now=now - dt.timedelta(hours=2))
+    _operation(conn, "op2", event_id=2, authorized_by="signed:deadbeef", now=now - dt.timedelta(hours=2))
+    conn.commit()
+
+    history_since = api._item_transitions_history_since(conn)
+    m = api._metric_verified_unattended_fixes_per_week(conn, now, history_since)
+    assert m["fixed_in_window"] == 2, m
+    assert m["value"] == 1, "the signed-operation item must be excluded from the unattended count"
+    assert m["unattended_in_window"] == 1, m
+    conn.close()
+
+
+def test_metric4_counts_an_item_once_even_if_it_reaches_fixed_twice():
+    """The numerator is a count of ITEMS, and the signed set it is reduced
+    by is a set of ITEMS — so the `fixed` transitions must be DISTINCT on
+    event_id or the two sides count different things. An item can genuinely
+    enter `fixed` more than once in one window (`fixed` -> a failed liveness
+    probe reopens it to `new` -> `fixed` again), and without DISTINCT that
+    item would contribute 2 to the numerator while its signed operation
+    could only ever remove 1. That is the exact shape of the metric-1 defect
+    the Wave 2 boundary review caught (STATE.md §42 defect 1)."""
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _seed_old_history_anchor(conn, now)
+    _event(conn, 1, now)
+    _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=5))
+    _transition(conn, 1, "new", "fixed", now - dt.timedelta(hours=1))
+    _operation(conn, "op1", event_id=1, authorized_by="signed:deadbeef", now=now - dt.timedelta(hours=6))
+    conn.commit()
+
+    history_since = api._item_transitions_history_since(conn)
+    m = api._metric_verified_unattended_fixes_per_week(conn, now, history_since)
+    assert m["fixed_in_window"] == 1, f"one item, twice fixed, counts once: {m}"
+    assert m["value"] == 0, f"its only operation was signed, so nothing is unattended: {m}"
+    conn.close()
+
+
+def test_metric4_null_with_history_reason_when_no_fixed_transitions_at_all():
+    """An old-enough history anchor with zero `fixed` transitions anywhere
+    in the window — a real, honest 'no basis', never a fabricated 0."""
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _seed_old_history_anchor(conn, now)
+    conn.commit()
+
+    history_since = api._item_transitions_history_since(conn)
+    m = api._metric_verified_unattended_fixes_per_week(conn, now, history_since)
+    assert m["value"] is None, m
+    assert m["unavailable"] and len(m["unavailable"]) > 0, m
+    assert m["fixed_in_window"] == 0, m
+    conn.close()
+
+
+def test_metric4_null_not_zero_when_history_is_young():
+    """Same shape as the metric-3 guard test: item_transitions' only row is
+    1h old, so the 7-day window predates history_since — the metric must
+    stay null with a reason, never the fabricated `1` (or `0`) a naive count
+    would serve here."""
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
     _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=1))
-    _approval(conn, "n1", spent_at=now - dt.timedelta(hours=1))
+    _operation(conn, "op1", event_id=1, authorized_by="auto-from-item", now=now - dt.timedelta(hours=2))
     conn.commit()
 
     history_since = api._item_transitions_history_since(conn)
     m = api._metric_verified_unattended_fixes_per_week(conn, now, history_since)
-    assert m["fixes_in_window"] is None, m
-    assert "history_since" in m["fixes_in_window_note"] or "no rows yet" in m["fixes_in_window_note"], m
-    # dispatch_approvals is an unrelated table — no guard, real count still served.
-    assert m["approvals_spent_in_window"] == 1, m
+    assert m["value"] is None, m
+    assert "history_since" in m["unavailable"] or "no rows yet" in m["unavailable"], m
+    assert m["fixed_in_window"] == 0, m
     conn.close()
 
 

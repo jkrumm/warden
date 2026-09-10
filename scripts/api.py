@@ -319,49 +319,91 @@ def _metric_median_needs_human_to_decision(
     }
 
 
+# Mirrored from triage.py by literal value, not by import — same reasoning as
+# DISPOSITION_STATES above: this module stays a read-only, dependency-free
+# reader of the ledger, and copying two string literals that change on the
+# same rare cadence as the schema itself is a smaller risk than importing the
+# whole 4000-line act-loop module just to read two constants. "fixed" is
+# triage.py's own STATE_FIXED; "signed:" is the authorized_by prefix
+# triage.py's record_operation() docstring documents for a spent SIGNED
+# approval (as opposed to the literal "auto-from-item", which is the only
+# value this chain has ever actually produced — see STATE.md §46 Correction 1).
+_FIXED_STATE = "fixed"
+_SIGNED_AUTHORIZED_BY_PREFIX = "signed:"
+
+
 def _metric_verified_unattended_fixes_per_week(
     conn: sqlite3.Connection, now: dt.datetime, history_since: str | None,
 ) -> dict[str, Any]:
-    """# 4 — verified UNATTENDED fixes per week. The qualifier itself is not
-    derivable: `dispatch_approvals` carries no `event_id` and no item link of
-    any kind (verified on the live ledger 2026-09-09: 5 rows, 1 with
-    `argv_json`, ZERO containing `--auto-from-item`), so an approval can never
-    be attributed to the item it eventually fixed. That link is the operation
-    id DESIGN.md's Crash recovery section calls for — Wave 3, not this wave.
-    Serves the raw ingredients instead of a fabricated number: the plain
-    `fixed` transition count in the window (not attendance-filtered — labelled
-    as such), and `dispatch_approvals.spent_at` in the window as the closest
-    available context. `fixes_in_window` itself is `item_transitions`-derived
-    and so goes through the same leaf-level history guard as metrics 3 and 6
-    (see `_history_guard_reason`) — `approvals_spent_in_window` reads
-    `dispatch_approvals`, an unrelated table, and needs no guard.
+    """# 4 — verified UNATTENDED fixes per week. The qualifier IS now
+    derivable (schema 5, `operations` — see STATE.md §46 Correction 1 and
+    DESIGN.md § Crash recovery): an item is unattended if none of the
+    `operations` rows tied to its event_id carries a `signed:` authorization.
+    `operations` is written on BOTH the auto-from-item and the (not yet
+    reachable) signed-approval door — unlike `dispatch_approvals`, which the
+    unattended door structurally NEVER writes (`mint_approval` has one call
+    site, behind PLANNED=1, and `awaiting_confirm()` is false whenever
+    AUTO_FROM_ITEM is set — the two doors are mutually exclusive by
+    construction, verified against hermes-cc.sh directly). This is the first
+    table in the ledger where "was a human's signed approval involved in
+    landing this fix" is a real question to ask.
+
+    Still returns `null` today — but for a DIFFERENT and correct reason than
+    before: STATE.md §46 Correction 3 measured zero `item_transitions` into
+    `fixed` in production (the chain has never run), so either the window
+    predates `history_since` entirely, or it does not and there are simply
+    zero `fixed` transitions to evaluate — both are "no basis", never a
+    fabricated 0. The derivation becoming POSSIBLE is this slice's
+    deliverable; the number moving needs the chain to actually run, which is
+    a later slice.
     """
     window_start = now - dt.timedelta(days=WINDOW_DAYS)
     window_start_iso = window_start.isoformat()
     guard_reason = _history_guard_reason(history_since, window_start)
     if guard_reason:
-        fixes: int | None = None
-        fixes_note = guard_reason
-    else:
-        fixes = conn.execute(
-            "SELECT COUNT(*) AS n FROM item_transitions WHERE to_state='fixed' AND at >= ?",
-            (window_start_iso,),
-        ).fetchone()["n"]
-        fixes_note = "raw `fixed` transition count — NOT filtered for attendance"
-    approvals = conn.execute(
-        "SELECT COUNT(*) AS n FROM dispatch_approvals WHERE spent_at IS NOT NULL AND spent_at >= ?",
-        (window_start_iso,),
-    ).fetchone()["n"]
+        return {
+            "value": None,
+            "unavailable": guard_reason,
+            "fixed_in_window": 0,
+            "unattended_in_window": 0,
+            "windowed": True, "window_days": WINDOW_DAYS,
+        }
+    # DISTINCT, and the unit is the ITEM, not the transition. An item can
+    # enter `fixed` more than once in one window (fixed -> reopened by a
+    # failed liveness probe -> fixed again), and `operations` is keyed by
+    # event_id, so a per-transition numerator subtracted from a per-item
+    # signed set is a count of one thing minus a count of another. That is
+    # precisely the shape of the metric-1 defect the Wave 2 boundary review
+    # caught (STATE.md §42 defect 1) — dispatch counts divided while broken
+    # down by item counts — and it is not being repeated here.
+    fixed_event_ids = [
+        row["event_id"] for row in conn.execute(
+            "SELECT DISTINCT event_id FROM item_transitions WHERE to_state=? AND at >= ?",
+            (_FIXED_STATE, window_start_iso),
+        )
+    ]
+    if not fixed_event_ids:
+        return {
+            "value": None,
+            "unavailable": "no `fixed` transitions in window",
+            "fixed_in_window": 0,
+            "unattended_in_window": 0,
+            "windowed": True, "window_days": WINDOW_DAYS,
+        }
+    placeholders = ",".join("?" for _ in fixed_event_ids)
+    signed_event_ids = {
+        row["event_id"] for row in conn.execute(
+            f"SELECT DISTINCT event_id FROM operations WHERE event_id IN ({placeholders}) "
+            f"AND authorized_by LIKE ?",
+            (*fixed_event_ids, f"{_SIGNED_AUTHORIZED_BY_PREFIX}%"),
+        )
+    }
+    unattended = len(fixed_event_ids) - len(signed_event_ids)
     return {
-        "value": None,
-        "unavailable": (
-            "the 'unattended' qualifier cannot be derived without an operation id linking an approval "
-            "to an item (DESIGN.md § Crash recovery, Wave 3) — dispatch_approvals has no event_id "
-            "and 0/5 rows carry --auto-from-item"
-        ),
-        "fixes_in_window": fixes,
-        "fixes_in_window_note": fixes_note,
-        "approvals_spent_in_window": approvals,
+        "value": unattended,
+        "unavailable": None,
+        "fixed_in_window": len(fixed_event_ids),
+        "unattended_in_window": unattended,
         "windowed": True, "window_days": WINDOW_DAYS,
     }
 
