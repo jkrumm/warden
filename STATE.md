@@ -4115,3 +4115,146 @@ it — 107/108, red by name, restored), and the F1 denominator drop.
 crash reconciliation with `unknown` — plus the operation id that makes
 `/metrics`' "unattended" number derivable and the deploy target that lets metric 2
 ever be non-zero. Do not roll into it from here.
+
+---
+
+## 43. First night in production (2026-09-09 21:00Z → 2026-09-10 08:10Z)
+
+Wave 2 closed at 21:00Z. Eleven hours of real traffic later, checked against the
+running system. **The wave holds. It also caught a real defect, which is the
+point of having built the instrument.**
+
+### The churn fix, measured against production rather than a snapshot
+
+```
+loop passes in the window (600s interval, ~11.2h):   ~67
+item_transitions recorded in the window:              18
+```
+
+Eighteen. Every one of them a real state change (they are enumerated below).
+Under the pre-Wave-2 predicate the same window would have produced roughly
+**67 × 46 ≈ 3,100** transitions, all of them noise, each one overwriting a note.
+That is the fix, measured on the live system rather than a copy.
+
+All five agents ✓ with last exit 0. `warden-{poll,sweep}.err` 0 bytes,
+`warden-backup.err` 0 bytes at 03:10 (the nightly `VACUUM INTO` ran).
+`warden-loop.err` grew by 346 bytes — three benign lines
+(`uk:175/uk:185 recurred inside cooldownHours, not re-escalating yet`) and
+`propose_mappings — model call failed: HTTP Error 403`, which is the same
+incident described below, handled and logged rather than crashed.
+`make test` green: `test_triage.py` 108/108, `test_api.py` 23/23,
+`test_ledger.py` 16/16. `make check-policy` ✓ 30 repos.
+
+### The chain ran twice, unattended, on two real incidents
+
+**Incident A — the 403 cost limit (06:10Z).** The IU LLM gateway returned
+`access_denied: rolling-30-day-cost-service-denial-limit` during the 07:01 local
+`Morning briefing` cron. It surfaced at three layers of one call stack and
+arrived as three `hermes_log` signatures plus a `hermes_cron` row:
+
+```
+06:10:15  ev968/969/970  new -> investigating     (one cluster, one episode)
+06:14:49  ev968/969/970  investigating -> needs_human
+          note: "Check the IU endpoint's cost/billing dashboard …"
+```
+
+Dispatch 26's verdict: *"One root cause, not three… it's an error body from the
+external IU endpoint itself."* Correct, clustered correctly, carded, and now
+sitting in `needs_human` with a 2026-09-17 deadline. **Four and a half minutes
+from signal to a recorded, actionable disposition, with no human in it.** That is
+the pipeline this project was built for, working.
+
+**Incident B — the one that got lost. See below.**
+
+### FINDING — the cluster-dissolve edge launders a verdict into a state where silence may discharge it
+
+The sharpest thing this night produced, and it belongs to Wave 3.
+
+```
+21:09:33  ev2 (uk:175) + ev815 (uk:185)   quiet -> new        (both recurred)
+21:09:33                                  new -> investigating (clustered, dispatch 25)
+21:14:32                                  investigating -> verdict
+21:19:37                                  verdict -> new       <- CLUSTER DISSOLVE
+21:29:39  events' resolved_at set          (both monitors recovered)
+21:39:39                                  new -> quiet         <- apply_resolutions
+```
+
+Dispatch 25's verdict was **substantive and correct**:
+
+> *"These two alerts do NOT share a root cause — UNRELATED SIGNATURES. uk:175
+> ("Hermes Agent" push) is caused by a real, currently-active bug: Hermes's own
+> Socket Mode watchdog in `plugins/platforms/slack/adapter.py`
+> (`_restart_socket_mode`/`_stop_socket_mode_handler`) races with slack_sdk's
+> `SocketModeClient.connect()`, whose `while True` retry loop "never checks
+> `closed`" (adapter.py's own comment) — so when the watchdog closes the old
+> aiohttp session to restart, the still-running orphaned old task keeps hitting
+> the closed session forever…"*
+
+Where that verdict is now: `dispatches.verdict_json`. **Nowhere else.** Both items
+are `quiet`, `note` is `NULL` (`apply_resolutions()` clears it), and
+`card_ts` is `NULL` — `_dissolve_cluster()` clears the card pointers, so
+`sync_card()`'s never-carded guard correctly declined to post a final card for a
+terminal item nobody was told about. The last thing the channel saw was
+*"Cluster split — re-evaluating individually"*, which was not true: neither was
+re-evaluated.
+
+**Why it happened, mechanically.** Three correct behaviours compose into the
+founding defect:
+
+1. `_dissolve_cluster()` sends every member back to **`new`** (DESIGN.md's own
+   lifecycle: `verdict -> new (UNRELATED SIGNATURES, cluster dissolve)`),
+   deliberately keeping `dispatch_job` as a cooldown anchor — must-not-be-lost
+   item 2, and its docstring is explicit that without it the same `run()` would
+   instantly re-fuse the pair.
+2. `escalate()` then declines: `uk:175 recurred inside cooldownHours, not
+   re-escalating yet` — the very anchor that makes (1) work.
+3. The monitors recovered inside that cooldown window, so `apply_resolutions()`
+   closed both as `quiet`. Which is correct: **`new` is the one state silence is
+   allowed to discharge.**
+
+`_SILENCE_RESOLVE_ELIGIBLE_STATES = (STATE_NEW,)` is not wrong. **The dissolve
+edge launders an item that carries an obligation into the one state that carries
+none.** Wave 1 closed the direct path (`needs_human` can no longer be
+silence-resolved) and this is the same failure arriving through the side door —
+DESIGN.md's opening sentence, *"A correct verdict has nowhere to go,"* reproduced
+in production eleven hours after the wave that was supposed to be measuring it.
+
+`_dissolve_cluster()`'s docstring already concedes half of this: *"the split
+verdict stays visible in `dispatches.verdict_json` for whoever reads the
+history."* Nobody reads `dispatches.verdict_json`. That is what the ledger is for.
+
+**The instrument scored it correctly, which is the one piece of good news.**
+`/metrics` metric 1 reads **6/9** this morning, not 7/9: dispatch 26 (→
+`needs_human`) counts, dispatch 25 (→ `quiet`) does not, because `quiet` is not a
+recorded disposition. The number this project exists to move detected its own
+worst case on day one without being told to.
+
+**Do not fix this with a patch.** Carrying the verdict text into each member's
+`note` does not survive — `apply_resolutions()` clears `note` precisely because a
+`new` row is supposed to carry no obligation. The honest fix is that a dissolved
+member is **not `new`**: it is a distinct state that has been evaluated, carries a
+verdict, and is not silence-eligible until it has been re-evaluated
+individually. That is a state-machine change and it belongs with Wave 3's
+obligation/reconciliation work, next to `unknown`.
+
+### Live numbers this morning
+
+```
+census        quiet 30 · needs_human 9 · note 8 · ignored 7 · new 3
+metric1       6/9 = 0.667   excluded_interactive 10   item_states {needs_human: 9, quiet: 11}
+metric2       0.0           fixed 0 · quiet 11 · closed 0 · dismissed 0
+metric3/4/6   null          window still predates history_since (2026-09-09T19:43:30Z) until 09-16
+metric5       11.2 min max  watchdog_poll, threshold 90 — all three pollers live
+```
+
+All nine `needs_human` rows are carded and carry 7-day deadlines
+(4× `2026-09-16T17:34`, 2× `2026-09-16T19:48`, 3× `2026-09-17T06:14`).
+
+### Two things for a human, not for warden
+
+- **`hermes-agent` has a real active bug** — the Socket Mode watchdog /
+  `slack_sdk` `SocketModeClient.connect()` race quoted above. Warden diagnosed it
+  correctly and it is a genuine hermes-agent fix, sitting unclaimed.
+- **The IU endpoint hit its rolling-30-day cost limit**, which is what broke the
+  morning briefing and `propose_mappings`. Operational, external, and outside
+  anything warden can act on.
