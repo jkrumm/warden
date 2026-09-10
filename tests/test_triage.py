@@ -4223,6 +4223,8 @@ def test_reconcile_merged_operation_advances_the_item_instead_of_leaving_it_to_e
             f"a reconciled merge must advance the item, not leave it in `validating` to expire "
             f"into merge_blocked — got {item['state']!r}")
         assert "deadbeef" in (item["note"] or ""), item["note"]
+        merged_at = conn.execute("SELECT merged_at FROM dispatches WHERE job_id='implement-job-advance'").fetchone()[0]
+        assert merged_at, "a reconciled merge must stamp dispatches.merged_at — the merge budget reads it"
 
 
 def test_reconcile_merged_operation_with_autodeploy_goes_to_needs_human():
@@ -4697,6 +4699,76 @@ def test_validating_item_already_merged_lands_from_the_receipt_without_a_second_
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_LIVENESS_PENDING, item["state"]
         assert json.loads(item["deploy_expect_json"]) == [{"commit": merge_sha}]
+
+
+def _seed_validating_with_open_merge_op(conn, *, external_id, job, pr_url):
+    eid = _seed_verdict_item(conn, external_id=external_id, confidence="high",
+                              investigate_job=f"investigate-{external_id}", repo="vps")
+    conn.execute("UPDATE triage_items SET state=?, implement_job=? WHERE event_id=?",
+                 (triage.STATE_VALIDATING, job, eid))
+    conn.commit()
+    _seed_implement_dispatch(conn, job, repo="vps")
+    conn.execute("UPDATE dispatches SET artifact_url=?, validation_status='confirmed' WHERE job_id=?", (pr_url, job))
+    conn.commit()
+    op_id = triage.record_operation(conn, event_id=eid, kind="merge", repo="vps", authorized_by="auto-from-item")
+    return eid, op_id
+
+
+def test_reconcile_open_untouched_pr_returns_the_item_to_validating_for_a_retry():
+    """WARDEN_KILL_AT=after-merge-op, observed live in the Wave 5 canary
+    exercise: the merge operation was recorded and the process died before
+    ready-for-review or the PUT. GitHub says OPEN. That is a crash before any
+    mutation, not a refusal — the confirmed validation still stands and the
+    merge is safe to retry, so the item must NOT read `merge_blocked`."""
+    with _triage_env() as (conn, _ctx):
+        eid, op_id = _seed_validating_with_open_merge_op(
+            conn, external_id="sig-open-untouched", job="implement-job-open",
+            pr_url="https://github.com/jkrumm/vps/pull/21")
+        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "OPEN", "mergeCommit": None}
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        op = conn.execute("SELECT outcome, receipt_json FROM operations WHERE op_id=?", (op_id,)).fetchone()
+        assert op["outcome"] == "failed" and json.loads(op["receipt_json"]).get("untouched") is True, dict(op)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VALIDATING, item["state"]
+        assert "untouched" in (item["note"] or "") and "retrying" in item["note"], item["note"]
+
+
+def test_reconcile_closed_pr_still_lands_merge_blocked():
+    """A CLOSED pull request is a definite refusal — the untouched rule must
+    apply to OPEN only."""
+    with _triage_env() as (conn, _ctx):
+        eid, op_id = _seed_validating_with_open_merge_op(
+            conn, external_id="sig-closed-pr", job="implement-job-closed",
+            pr_url="https://github.com/jkrumm/vps/pull/22")
+        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "CLOSED", "mergeCommit": None}
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGE_BLOCKED, item["state"]
+        op = conn.execute("SELECT outcome, receipt_json FROM operations WHERE op_id=?", (op_id,)).fetchone()
+        assert op["outcome"] == "failed" and "untouched" not in (op["receipt_json"] or "")
+
+
+
+
+
+def test_reconcile_open_untouched_pr_retry_is_capped():
+    """A crash that repeats at the same pre-merge point must not retry
+    forever — each `validating` write resets the 1 h deadline, so without a
+    cap the item would spin invisibly. The first untouched failure retries;
+    the second lands `merge_blocked` with the count in the note."""
+    with _triage_env() as (conn, _ctx):
+        eid, op1 = _seed_validating_with_open_merge_op(
+            conn, external_id="sig-open-capped", job="implement-job-capped",
+            pr_url="https://github.com/jkrumm/vps/pull/23")
+        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "OPEN", "mergeCommit": None}
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_VALIDATING
+        # The retry crashed at the same point: a second open merge operation.
+        triage.record_operation(conn, event_id=eid, kind="merge", repo="vps", authorized_by="auto-from-item")
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGE_BLOCKED, item["state"]
+        assert "2 merge attempts" in (item["note"] or ""), item["note"]
 
 
 if __name__ == "__main__":

@@ -152,7 +152,7 @@
     "`vps` is seeded below at the narrowest possible scope (`observability/**` only) — its",
     "own compose files, apps and everything else stay outside every one of these gates.",
     "`argo` is seeded with `deployOnMerge` + `liveness: argo-commit-live` and ONE canary path",
-    "in `autoMergePaths` (`docs/CANARY.md`, a file nothing in argo reads or builds): the",
+    "in `autoMergePaths` (`docs/DEPLOY-VERIFICATION.md`, a file nothing in argo reads or builds): the",
     "owner-authorized scope for the Wave 5 stop-condition exercise (dotfiles",
     "docs/waves/PLAN.md header, 2026-09-10). Every other path in argo stays outside the",
     "gate — merge_gate_check() in scripts/lifecycle/merge.py refuses it OUTOFSCOPE. Widening",
@@ -188,7 +188,7 @@
     },
     "argo": {
       "_note": "autoMergePaths is the CANARY SCOPE ONLY — one file nothing in argo reads or builds, owner-authorized for the Wave 5 stop-condition exercise (2026-09-10, STATE.md §54). merge_gate_check() in scripts/lifecycle/merge.py refuses every other path OUTOFSCOPE. Widening this list is a separate operator decision; do not add paths here to 'complete' this entry.",
-      "autoMergePaths": ["docs/CANARY.md"],
+      "autoMergePaths": ["docs/DEPLOY-VERIFICATION.md"],
       "deployOnMerge": true,
       "liveness": "argo-commit-live"
     }

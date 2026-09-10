@@ -3110,6 +3110,14 @@ def _run_gh_run_list(owner: str, repo: str, sha: str) -> list[dict[str, Any]] | 
     return data if isinstance(data, list) else None
 
 
+# How many times a merge operation may resolve `failed` + `untouched` (the
+# pull request still OPEN after a crash before the PUT) before reconciliation
+# stops handing the item back to `validating` for another attempt. One retry
+# covers the crash the canary exercise reproduced; a second identical outcome
+# is a deterministic failure and lands `merge_blocked` where a human sees it.
+_MERGE_RETRY_CAP = 1
+
+
 def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step -1 (see the module docstring) — runs FIRST in run(), before even
@@ -3230,7 +3238,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                             continue
         elif row["kind"] == "merge":
             d = conn.execute(
-                "SELECT artifact_url FROM dispatches WHERE job_id = "
+                "SELECT job_id, artifact_url FROM dispatches WHERE job_id = "
                 "(SELECT implement_job FROM triage_items WHERE event_id=?)",
                 (row["event_id"],),
             ).fetchone()
@@ -3248,6 +3256,16 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                     merge_commit = gh_resp.get("mergeCommit")
                     sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else merge_commit
                     outcome = "done"
+                    # The live path stamps `dispatches.merged_at` right after
+                    # the PUT; a crash between the two (WARDEN_KILL_AT=
+                    # after-merge-put, observed live in the Wave 5 canary) left
+                    # it NULL — and `merged_at` is what the daily merge budget
+                    # and the "already merged" guard read. Stamp it here so a
+                    # reconciled merge counts like a live one.
+                    conn.execute(
+                        "UPDATE dispatches SET merged_at=? WHERE job_id=? AND merged_at IS NULL",
+                        (_now_iso(now), d["job_id"]),
+                    )
                     repo_policy = (policy.get("repos") or {}).get(row["repo"] or "") or {}
                     if repo_policy.get("deployOnMerge") and isinstance(sha, str) and _FULL_SHA_RE.match(sha):
                         # Unlike the ssh path, this repo's deploy DOES have a
@@ -3270,6 +3288,17 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 else:
                     outcome = "failed"
                     new_receipt = {"pullRequest": pr, "state": gh_resp.get("state"), "reconciled": True}
+                    if gh_resp.get("state") == "OPEN":
+                        # Still open means NOTHING LANDED: a PUT that succeeded
+                        # reads MERGED, so whatever ran before the crash
+                        # (nothing, the idempotent ready-for-review, or a PUT
+                        # GitHub rejected) left the pull request where a retry
+                        # can safely try again — GitHub will not merge the same
+                        # head twice. Observed live in the Wave 5 canary
+                        # exercise (kill `after-merge-op`): without this flag
+                        # the item read `merge_blocked` for a pull request
+                        # nobody had touched. The retry is CAPPED below.
+                        new_receipt["untouched"] = True
         else:
             outcome = "unknown"
             note = f"reconcile_operations: unrecognized operation kind {row['kind']!r}"
@@ -3327,9 +3356,35 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if row["kind"] != "merge":
             continue
         if outcome == "failed":
-            # GitHub is authoritative and says it did not merge. Same
-            # destination the live path uses for a definite refusal.
+            item_row = _get_item(conn, row["event_id"])
+            untouched_attempts = conn.execute(
+                "SELECT COUNT(*) FROM operations WHERE event_id=? AND kind='merge' AND outcome='failed' "
+                "AND receipt_json LIKE '%\"untouched\": true%'",
+                (row["event_id"],),
+            ).fetchone()[0]
+            if ((new_receipt or {}).get("untouched") and item_row is not None
+                    and item_row["state"] == STATE_VALIDATING
+                    and untouched_attempts <= _MERGE_RETRY_CAP):
+                # The pull request is open and untouched: the loop died between
+                # recording the merge operation and mutating anything. A
+                # confirmed validation is still confirmed — leave the item in
+                # `validating` so poll_validation_jobs() retries the merge this
+                # same pass, and say so on the card. `merge_blocked` here would
+                # report a refusal that never happened.
+                _set_state(conn, row["event_id"], STATE_VALIDATING, now,
+                           note="reconciled from GitHub: the pull request is still open and untouched — "
+                                "the loop stopped before the merge; retrying")
+                conn.commit()
+                continue
+            # GitHub is authoritative and says it did not merge (closed, not
+            # open any more, or open but the retry cap is spent — a crash that
+            # repeats at the same point every pass would otherwise retry
+            # forever, each `validating` write resetting its own 1 h deadline).
+            # Same destination the live path uses for a definite refusal.
             detail = note or f"see operation {row['op_id']}"
+            if (new_receipt or {}).get("untouched"):
+                detail = (f"still open after {untouched_attempts} merge attempts that never reached a PUT — "
+                          f"the loop keeps stopping before the merge; not retrying again")
             _set_state(conn, row["event_id"], STATE_MERGE_BLOCKED, now,
                        note=f"reconciled from GitHub: the pull request is not merged ({detail})")
             conn.commit()

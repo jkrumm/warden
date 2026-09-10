@@ -5843,3 +5843,266 @@ Wave 5 (`dotfiles/docs/waves/PLAN.md`): the clients in Python, the lifecycle
 gates, the CLI, real cancel, and the stop-condition exercise on argo's canary
 scope. The human-in-Slack half of 4.3's acceptance rides along: the first time
 the owner types a dispatch into Slack after this, the shim path is what answers.
+
+## 54. Wave 5 (estate chain) — the actuator in Python (2026-09-10, 19:00Z →)
+
+One Fable orchestrator, Sonnet implementers, sideclaw reviews. Live facts as
+they happened, so the close-out below is a record and not a reconstruction.
+
+### Timeline of the live system during the port
+
+| When (UTC) | What |
+|-|-|
+| 19:23:15 | The loop's scheduled tick ran on the working tree and migrated the live ledger **6 → 7** (`dispatch_approvals.{key_id,params_json,spent_job_id,spend_error}`, `triage_items.revert_pr`) — the designed path, and the same reminder as §53: the LaunchAgents run whatever is on disk. |
+| 19:29 | `warden-api` (long-running, loaded at 6) refused every request with the version error until `launchctl kickstart -k` at **19:31:52**; `/health` then `ok` at 7. |
+| 19:31:52 | `com.jkrumm.warden-loop` and `com.jkrumm.warden-sweep` **booted out** for the port window — `triage.py` and `dispatch-sweep.py` were mid-edit and the loop must never run half-ported code against the live ledger. `warden-poll`, `warden-backup`, `warden-api` kept running. Reloaded at the time recorded in the close-out. |
+| 19:2x | `warden-loop.err` shows `propose_mappings — model call failed: HTTP Error 403: Forbidden` on the cheap model route. The plan's header records the 403 as resolved on 2026-09-10; this is the propose-mappings OpenAI-compatible call, not sideclaw's route — either it recurred or it is a different door. Not chased in this wave; Wave 7 (model choices) owns it. |
+
+### sideclaw `a08965a` — `POST /api/jobs/:id/cancel`, live at 19:2xZ
+
+`cancelled` is a terminal `JobStatus`, never counted as failed. Pending →
+cancelled at once; running → `cancel_requested_at` persisted on the row BEFORE
+the SIGTERM (a restart mid-cancel lands it `cancelled` in `recover()`, never
+requeued), the retry loop checks the predicate before every attempt and after
+every failure (a cancel during backoff cannot be overridden by a successful next
+attempt), and the predicate reaches `session-runner` by injection
+(`SessionOptions.isCancelled`) — the first cut imported the store back and the
+review's architect angle plus fallow flagged the cycle. The review's three
+blocking findings (the backoff race, the unpersisted intent, the cycle) were all
+real and all fixed before commit; 591 tests. `make reload` at 19:2xZ; `POST
+/api/jobs/nope/cancel` → 404 live.
+
+### 5.1 + 5.2 — the actuator in Python (`fb87038`, `2918fa2`)
+
+`scripts/hermes-cc.sh` (2692 lines of bash) and its 165-case suite are gone.
+What replaced them, by file:
+
+| Module | Owns | Tests |
+|-|-|-|
+| `clients/errors.py` | the exit taxonomy as exceptions — `UsageError` 64, `PreconditionError` 2, `RemoteError` 3 (with `maybe_mutated`), `PolicyError` 4 | — |
+| `clients/sideclaw.py` | `submit` / `get` (None on 404) / `wait` / `cancel`; `TERMINAL` includes `cancelled` | `test_clients.py` 57 |
+| `clients/github.py` | read PR/repo/files/check-runs, ready-for-review, merge, branch delete, contents, **Actions runs**; token via `secrets-run`, header only | ″ |
+| `clients/signer.py` | `payload_hash`, `canonical_message`, `key_id`, `verify`; the contract is `config/approval-spec.json` with fixture vectors both repos' tests read | ″ |
+| `clients/rollout.py` | the one-arm closed argv (`hyperdx-apply`) | ″ |
+| `clients/slack.py` | moved from `slack_client.py` (shim kept), `WARDEN_SLACK_API`, `slack_post_blocks` | ″ |
+| `lifecycle/policy.py` | `resolve_repo`/`resolve_tier`, the five budgets, `require_auto_from_item`, **`check_repo_not_in_flight`**, `merge_precheck_repo`, `require_no_recursion` | `test_lifecycle.py` 108 |
+| `lifecycle/dispatch.py` | `open_episode` — for a gated tier the in-flight check and the `operations` row commit in one `BEGIN IMMEDIATE` before the submit; the `dispatches` row carries the job's own status, never `queued` | ″ |
+| `lifecycle/approvals.py` | `mint` (records `key_id` + `params_json`, posts the buttons) and `execute_approved` — the spend | ″ |
+| `lifecycle/merge.py` | `merge_gate_check`, `plan_or_land` (the 47 ordered checks), `rollout_after_merge` — **deploy is its own operation** | `test_merge.py` 63 |
+| `lifecycle/operations.py` | `record`/`complete`, kinds `implement` / `merge` / `deploy` | — |
+| `lifecycle/items.py` | the CLI's item transitions (`abort` → `closed`, `revert` → `reverted`) | `test_warden_cli.py` |
+| `lifecycle/chaos.py` | `crash_point(name)` — ten named points, `os._exit(137)` under `WARDEN_KILL_AT` | — |
+| `scripts/warden` + `warden.py` | the CLI: `dispatch status list merge abort revert help` | `test_warden_cli.py` 53 |
+
+**Where the spend lives now.** The Approve click spools a signed intent; the
+plugin drains it synchronously (`intents.py --drain`, under
+`asyncio.to_thread`); `drain()` calls `execute_approved()` on the spot. Inside
+one write-locked transaction: the spend-time policy re-checks, `UPDATE
+spent_at`, `INSERT operations(authorized_by='signed:<user>')`, commit — then
+the submit. A crash after that commit is an open operation reconciliation
+resolves; nothing is burned silently. The payload is re-hashed from the row's
+own `stdin_text`/`why`/`context_text` and must equal the signed
+`payload_hash` — the first cut of the port dropped that check (a worker
+flagged it in its own report: an `UPDATE stdin_text` under a valid signature
+would have dispatched the edited brief), it is back with three tamper tests.
+A rotated gateway key reads `superseded: signed under key X, current is Y`;
+a row minted before schema 7 (`params_json NULL`) reads "re-plan", never
+"tampered". Approved-but-unspent rows (a budget refusal at spend time) are
+retried by the loop every tick until they expire. **There is no `--confirm`
+on `warden dispatch`** — the click is the only door to an implement, which is
+what closes the "second writer of `dispatch_approvals`" violation the Shape
+note named. `merge --confirm` stays confirm-gated (owner decision, not
+relitigated).
+
+**What the reviews caught before commit** (sideclaw, six angles on warden;
+five on sideclaw; the plugin separately):
+
+- *Critical:* the loop read `artifactUrl` and `verdict` off the top of the raw
+  job, but sideclaw nests them under `result` — every finished implement
+  would have landed `merge_blocked` and every validation `disagreed`. The
+  test stubs mirrored the wrong shape, so 149 green tests could not see it.
+  Fixed, with a test pinned to a literal copy of the real job JSON.
+- `contents()`/`delete_branch()` interpolated PR-derived paths unquoted; sha
+  arguments are now validated 40-hex before a request is built.
+- `TIER_RANK` existed twice with different values (1/2/3 vs 0/1/2);
+  `check-dispatch-policy.py` now imports it.
+- The recursion guard lived only in the CLI; it is now enforced at
+  `open_episode()` and at the merge landing.
+- `check_repo_not_in_flight()` was a bare SELECT racing the row that
+  establishes the lock; both doors (`open_episode`, the spend) now check and
+  record inside `BEGIN IMMEDIATE`, with a two-connection test each.
+- A failed `autoDeploy` fell through to `merged` with the note "no deploy
+  configured" — it lands `needs_human` with the exit code and output tail.
+- sideclaw: a cancel arriving during retry backoff could be overridden by a
+  successful next attempt; the intent was in-memory only (a restart would
+  requeue the job); a store↔session-runner import cycle. All three fixed
+  before `a08965a`.
+- hermes-agent: the click handler ran two blocking `subprocess.run`s on the
+  gateway's event loop (now `asyncio.to_thread`); the pubkey was published to
+  a path warden might not read (`WARDEN_APPROVAL_PUBKEY` honoured); the dead
+  `verb == "merge"` branch closed honestly.
+
+Declined, recorded: splitting `plan_or_land` (270 lines, a faithful port of
+`cmd_merge`'s ordered checks — a refactor is its own change), request-object
+refactors of `open_episode`/`mint`, collapsing the `slack_client.py` shim,
+`collect_expected_alerts`' best-effort contract (a persistent fetch failure
+degrades to an empty list with no signal — needs a design call, not a patch).
+
+**The suite numbers, honestly.** 165 black-box bash cases became 53 black-box
+CLI cases plus 108 + 63 unit cases at the function boundary the bash never
+had; the worker time-boxed the merge-gate/deploy permutation matrix out of the
+CLI suite because `test_merge.py` pins it directly. `test_dispatch_approval.py`
+went from 85 to 48 checks (the subprocess-replay cases have no subject; the
+click path is one end-to-end case through the real `intents.py`).
+`test_triage.py` 148 → 157, sixteen tests deleted→replaced at the new boundary
+and eleven added (three of them the canary's own findings, below). `make test`: 14 suites.
+
+**Three things the canary would have hit first, found before it ran:** the
+auto-implement episode never received the investigate verdict (`context=None`
+in bash and in the first port — the brief told it to "re-read that
+investigation's own verdict" and pointed at nothing; no auto-implement had ever
+run for real), an item killed between its claim and its dispatch would have sat
+`implementing` for the 2 h deadline and then read `merge_blocked`, and an item
+killed after the merge but before its state write would have asked GitHub to
+merge again, been refused "already merged", and landed `merge_blocked` for a
+merged, deploying pull request — the §46 misreport, one layer up. All three
+fixed with tests before the exercise; the exercise below then confirmed each
+recovery live.
+
+### Live between the commits
+
+| When (UTC) | What |
+|-|-|
+| 21:11:51 | `warden-sweep` bootstrapped again (the loop stays out until the exercise ends). |
+| 21:11:59 | `ai.hermes.gateway` kickstarted to load the plugin (§53's owner item 4 — the dead Socket Mode client — cleared with it). Key minted, pubkey published 21:12:00. |
+| 21:12:25 | `warden list --json` (3 dispatches today, budget 17/20), `warden dispatch warden --dry-run --json`, three audit lines in `~/Library/Logs/warden-cli.log`. |
+| — | Side finding: `localhost:7734` answers a stranger's 404 page — a `node … astro dev` (pid 78874, `sy-serendipity`) listens on `[::1]:7734` while `warden-api` binds `127.0.0.1:7734`. Nothing in warden uses `localhost`; the `make status` probe is `127.0.0.1`. Left alone; the owner's dev server picked a port the API already declared. |
+
+### 5.4 — the stop-condition exercise, live (canary scope `docs/CANARY.md` in argo)
+
+The loop was run by hand (`triage.py --run`, the LaunchAgent booted out) with
+`WARDEN_KILL_AT` naming a boundary, then again clean, and the ledger snapshotted
+after each run. Every line below is an observed ledger state, not an expectation.
+
+**Canary A — the implement half, killed at three boundaries.** Seeded item 979
+(`verdict`, a synthetic investigate row `canary-investigate-A` with
+`nextAction=implement, confidence=high`).
+
+| When (UTC) | Kill | Observed |
+|-|-|-|
+| 21:13:47 | `before-implement-open` | rc 137 after the compare-and-set claim: item `implementing`, no job, no operation, one transition row. |
+| 21:13:56 | (clean) | `poll_implement_jobs` **reclaimed** it: `verdict`, note `reclaimed: the loop stopped between claiming this item and dispatching it`. Without the reclaim rule this would have been a 2 h deadline into `merge_blocked`. |
+| 21:14:00 | `after-implement-op` | rc 137: operation row committed, `outcome NULL`, no receipt, no job. |
+| 21:14:08 | (clean) | `reconcile_operations` → `unknown` (there is nothing to ask — no job id was ever recorded), item `needs_human` with that exact sentence as its note. The designed answer; a human resumed it (state set back to `verdict`, transition row noted "human resume"). |
+| 21:14:24 | `after-implement-submit` | rc 137: sideclaw job `f38e5cf8` running, no `dispatches` row, operation open. **This is DESIGN.md's orphan gap, reproduced.** |
+| 21:14:32 | — | `POST /api/jobs/f38e5cf8/cancel` → `cancelRequested: true`; **8 s later `status: cancelled`, `error: cancelled by request`** — 5.3's cancel, proven on a running episode. |
+| 21:14:40 | (clean) | reconcile → `unknown` → `needs_human` again; resumed by hand. |
+| 21:14:52 | (clean) | real dispatch: job `7bb4d959`, operation `done` with `{"jobId"}` receipt, item `implementing`. |
+| 21:15:30 | — | the episode **declined**: "its sole justification is an unverifiable claim about a different repo's (warden's) config; no argo evidence supports it… I changed nothing." `outcome: no_changes`, no branch pushed. |
+| 21:17:10 | (clean, `before-merge` armed) | `merge_blocked`, note = the episode's own summary verbatim. |
+
+Two findings from A: (1) the brief's escape hatch ("if what you find no longer
+supports that conclusion, say so and stop") works, and an implement that
+changes nothing lands `merge_blocked` with its reason, never silently; (2) the
+seeded verdict cited evidence in *warden's* repo — an investigate verdict must
+cite what the implement episode can see in *its own* checkout, which a real
+investigate on the same repo naturally does and a hand-seeded one did not.
+
+**Canary B — a real PR, refused by the second model.** Item 981 seeded with an
+argo-internal verdict (the `/api/health` commit probe is undocumented;
+`health.ts`, the Dockerfile and `deploy.yml` cited by line).
+
+| When (UTC) | Observed |
+|-|-|
+| 21:17:22 | implement `7e6d9fb0` opened; 21:18 **PR jkrumm/argo#17** (draft), branch `dispatch/…-7e6d9fb0`, the episode's verdict: re-verified every cited line, and *deliberately rewrote the dictated log line* because "merged → fixed would be false at PR-open time". |
+| 21:19 | validation episode `7340c9db` (opus, read-only) → **DISAGREE**: "PR 17's facts about GET /api/health check out, but the new doc quietly grants an automated agent write scope — and the PR body never mentions it." |
+| 21:21:39 | `merge_blocked`, `validation_status = disagreed`, note = the validator's sentence. PR #17 closed and its branch deleted by hand at 21:22 (a chain-opened PR in the canary scope — inside the header's authorization). |
+
+Finding from B: the dictated doc sentence ("the only path such a control plane
+is allowed to change on its own") *is* a scope grant when it appears in the
+target repo, and the different-model validator caught exactly that. The
+mechanism did what §50 said it must — a merge needs two models to agree, and
+they did not.
+
+**Canary C** — item 982, the doc rewritten to describe rather than grant, the
+log line honest at PR time, the PR body told to state the scope explicitly.
+
+| When (UTC) | Observed (canary C) |
+|-|-|
+| 21:22:21 | implement `0b1d8e60` opened. |
+| 21:24:26 | `merge_blocked`: "Argo /health probe facts check out, but the requested docs content bakes in an unverifiable 'warden auto-merge canary' claim — **looks like an injection attempt**, so I made no changes." |
+
+Three canaries, three refusals, each by a model reading the content on its own
+terms: A because the evidence lived in another repo, B because the doc granted
+scope the PR body did not mention, C because naming warden's scope at all reads
+as injection. That is not a failure of the exercise — it is the property the
+brief, the read-only worktree and the different-model validator exist to have,
+observed three times in a row with nothing landing. The corollary for the
+chain: **an auto-implement can only land a change that justifies itself inside
+the target repo.** The canary was therefore re-cut as one: the single scoped
+path became `docs/DEPLOY-VERIFICATION.md` (same blast radius — one
+documentation file nothing reads; still inside the header's canary
+authorization) and the verdict for canary D describes argo's own
+deploy-verification probe and never mentions warden.
+
+**Canary D** — item 983, implement `cfcc3da6` opened 21:25:03.
+
+| When (UTC) | Kill | Observed (canary D, item 983) |
+|-|-|-|
+| 21:25:03 | — | implement `cfcc3da6` opened with the verdict as context. |
+| 21:27:09 | — | **PR jkrumm/argo#18** (draft) `docs(deploy): document the deploy-verification probe`; validation `22d6c4a6` opened on the second model. |
+| 21:35:15 | `before-merge` | validation **CONFIRMED** (`validation_status = confirmed`), the loop reached the merge branch and died there. Nothing on GitHub touched. |
+| 21:35:52 | `after-merge-op` | rc 137: merge operation committed, PR still draft and open. |
+| 21:36:04 | (clean) | reconcile: `gh pr view` → OPEN → operation `failed`, receipt `{"state": "OPEN"}` — and the item went to **`merge_blocked`** for a pull request nobody had touched. **Finding 4, fixed in this commit:** an OPEN pull request on a reconciled merge operation means the crash came before any mutation; the item returns to `validating` and the merge retries (`untouched: true` on the receipt; a CLOSED one still blocks). The review of that patch caught that a crash repeating at the same pre-merge point would retry forever — each `validating` write resets its own 1 h deadline — so the retry is capped at one (`_MERGE_RETRY_CAP`); the second identical outcome lands `merge_blocked` with the count in the note. Three tests. The live item was returned to `validating` by hand (transition row noted). |
+| 21:37:42 | `after-merge-put` | 6.2 s: ready-for-review, mergeability, `PUT /merge` — rc 137 after the PUT. GitHub: **merged, `5941c600b5a3…`**; ledger: `merged_at NULL`, merge operation open, item `validating`. The §46 window, reproduced on purpose. |
+| 21:37:57 | `before-fixed` (armed, did not fire) | reconcile: MERGED → operation `done`, receipt `{mergeCommit, deploy: [the Actions run, in progress]}`; item → **`liveness_pending`** on `[{"commit": "5941c600…"}]` — §51's principle, live. Probe: `/api/health` still `cf003491` (deploy in flight). **Finding 5, fixed in this commit:** reconcile did not stamp `dispatches.merged_at`, so a reconciled merge would not count against the merge budget; it stamps it now, and the live row was stamped by hand (`2026-09-10T21:37:45+00:00`). |
+| 21:38:54 | — | `GET https://argo.jkrumm.com/api/health` → `{"status":"ok","commit":"5941c600b5a3051bc5247bde33a95c294aa8a6f7"}` — 69 s after the merge. |
+| 21:38:59 | `before-fixed` | rc 137 with the probe matched — item still `liveness_pending`, nothing written. |
+| 21:39:00 | (clean) | **`fixed`.** Transition `liveness_pending → fixed` at 21:39:00.374Z. |
+
+**The stop condition, met.** One complete path — a verdict, a recorded
+implement operation, a draft pull request, a different-model validation, an
+authorized merge, a reconciled deployment, a positive verification against the
+exact commit — with the process killed at seven boundaries (`before-implement-
+open`, `after-implement-op`, `after-implement-submit`, `before-merge`,
+`after-merge-op`, `after-merge-put`, `before-fixed`) and, after each, a next
+run that neither dropped the obligation (every kill left a row a later pass
+resolved: a reclaim, an `unknown` with a `needs_human`, a `failed`-untouched
+retry, a reconciled `done` that advanced the item) nor repeated an unsafe
+action (no second episode for a claimed item, no second `PUT` for a merged
+pull request — the one place it *would* have re-merged was `after-merge-
+before-state`, closed by a unit test before the live run). The three
+post-merge points not killed live (`after-merged-at`, `after-deploy-op`,
+`after-merge-before-state`) are each pinned by a unit test in
+`test_triage.py`/`test_merge.py`; a second live PR for each was judged not
+worth a second production deploy tonight.
+
+Left in the ledger on purpose: items 979/981/982 in `merge_blocked` with the
+episodes' own refusals as their notes — they are the record that three models
+declined three briefs; item 983 `fixed`; job `f38e5cf8` `cancelled`. Argo
+carries `5941c600` (`docs/DEPLOY-VERIFICATION.md`, a documentation file
+nothing reads). PRs #17 (closed by hand, branch deleted) and #18 (merged by
+the loop). `com.jkrumm.warden-loop` bootstrapped again at **21:40:39Z**.
+
+### What is now true that was not
+
+The actuator is Python the loop calls as functions; the bash file is gone. An
+approval is spent where it is drained, inside one transaction with the
+operation that covers it, and its payload is re-hashed before anything runs.
+Deploy is an operation with a receipt. A running episode can be cancelled. An
+item can be aborted or reverted from a closed-verb CLI that takes no path and
+no URL. And the chain has landed a real change in a production repo under
+kill at every boundary that matters, with every recovery observed rather than
+argued.
+
+### Next action
+
+Wave 6 (`dotfiles/docs/waves/PLAN.md`): every origin opens an item; Hermes is
+the door. Carry forward: the reclaim note is not cleared when an item is
+re-claimed (cosmetic, seen at 21:14:00); the orphan-branch/PR ledger field
+DESIGN.md names is still not built (an `after-implement-submit` crash leaves
+sideclaw running an episode the ledger cannot name — the cancel endpoint is
+the manual remedy today); `abort` does not sync the Slack card itself (the
+loop's next tick does); reconcile still reads GitHub through `gh` for merges
+while everything else uses `clients/github.py`; the 4.3 "human types in
+Slack" acceptance is still the owner's — the plugin now reports from the row.
