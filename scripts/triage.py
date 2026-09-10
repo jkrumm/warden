@@ -1029,33 +1029,22 @@ def _apply_db_override(argv: list[str]) -> None:
 
 # --- resolve_slack_token() -----------------------------------------------
 #
-# Used to be loaded by path from agents-overview.py, the same mechanism the
-# cron entry-point wrappers use (the filenames are not importable), with this
-# body as its hand-mirrored fallback so the file stayed independently
-# runnable if the sibling could not be loaded. agents-overview.py stayed
-# behind in hermes-agent when this file moved to warden, so the borrow is
-# gone and the former fallback is now the sole, plain definition.
-_SECRETS_RUN = Path.home() / ".local" / "bin" / "secrets-run"
-_SLACK_TOKEN_REF = "op://hermes/slack/bot-token"
+# Now lives in scripts/slack_client.py, loaded by path — the same mechanism
+# the ledger.py/intents.py loads above use (the sibling filenames here are
+# not importable, and this repo's convention is to load every sibling that
+# way, including the ones that would technically import). `resolve_slack_token`
+# is re-bound as a plain module global immediately below so it stays a thin
+# alias: tests/test_triage.py monkeypatches `triage.resolve_slack_token`
+# directly, and every call site in this file (`resolve_slack_token()`, a bare
+# name) resolves that global at call time regardless of which module
+# originally defined it.
+_SLACK_CLIENT_PATH = Path(__file__).resolve().parent / "slack_client.py"
+_slack_client_spec = importlib.util.spec_from_file_location("slack_client", _SLACK_CLIENT_PATH)
+assert _slack_client_spec and _slack_client_spec.loader, "Failed to load scripts/slack_client.py"
+_slack_client = importlib.util.module_from_spec(_slack_client_spec)
+_slack_client_spec.loader.exec_module(_slack_client)
 
-
-def resolve_slack_token() -> str:
-    """Mirrors agents-overview.py's resolve_slack_token() by hand — verbatim
-    equivalent of that sibling's implementation, now the sole definition
-    since agents-overview.py itself stayed behind in hermes-agent."""
-    val = os.environ.get("SLACK_BOT_TOKEN", "")
-    if val:
-        return val
-    env = os.environ.copy()
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
-    try:
-        r = subprocess.run(
-            [str(_SECRETS_RUN), "read", _SLACK_TOKEN_REF],
-            capture_output=True, text=True, timeout=15, env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
+resolve_slack_token = _slack_client.resolve_slack_token
 
 
 # --- Reused, not reimplemented: normalize_title() -------------------------

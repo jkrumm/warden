@@ -58,7 +58,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # frozen at its pre-cutover state and written by nothing, kept as the rollback —
 # so if you are reading this to work out which database is real, it is this one.
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -314,12 +314,65 @@ CREATE INDEX IF NOT EXISTS operations_open  ON operations(outcome) WHERE outcome
 CREATE INDEX IF NOT EXISTS operations_event ON operations(event_id);
 """
 
+# Version 6 — `dispatches.delivery_status`, so the delivery outcome stops
+# overloading `reported_at` (a TEXT column that is supposed to hold a
+# timestamp) with the string UNDELIVERABLE_SENTINEL
+# ("undeliverable:no-origin-channel") whenever a dispatch has no
+# origin_channel to answer into. This landed alongside dispatch-sweep.py's
+# move off `hermes send` (a Slack Socket Mode subprocess, in a reconnect
+# loop) onto the plain HTTP client scripts/slack_client.py already uses —
+# see that file's module docstring.
+#
+# Values: 'delivered' (the verdict/notice reached Slack), the literal
+# sentinel string above (never deliverable — no thread existed to answer
+# into), or 'failed:<short reason>' (the sweep's last attempt errored;
+# `reported_at` stays NULL and the row is retried next pass, exactly as
+# before this migration — a failed attempt is not a terminal delivery
+# outcome, so it does not get its own reported_at treatment here). NULL
+# means "delivery never attempted yet", true of every row with
+# `reported_at IS NULL` today.
+#
+# Backfill, in two passes so the second cannot re-stamp what the first just
+# wrote:
+#   1. Every row whose `reported_at` IS the sentinel gets `delivery_status`
+#      set to that same string and `reported_at` rewritten to a REAL
+#      timestamp (`finished_at`, or `created_at` if the dispatch never
+#      reached a terminal status) — the sentinel meant "closed, nothing to
+#      deliver," not "no timestamp exists for this row." This is what keeps
+#      these rows out of `idx_dispatches_open` (`WHERE reported_at IS
+#      NULL`) exactly as the sentinel did, now via a real IS NOT NULL
+#      timestamp instead of a string masquerading as one.
+#   2. Every remaining row with a non-NULL `reported_at` (i.e. a real
+#      timestamp already, untouched by pass 1) gets `delivery_status =
+#      'delivered'` — that is what a non-NULL, non-sentinel `reported_at`
+#      has always meant. Guarded by `delivery_status IS NULL` so pass 1's
+#      rows (already stamped, and by now also holding a real `reported_at`)
+#      are not overwritten.
+# Rows with `reported_at IS NULL` (delivery never attempted, or a `failed`
+# row awaiting retry) match neither UPDATE and keep `delivery_status NULL`
+# — correct, since this migration runs once, retroactively, and cannot know
+# a still-open row's eventual outcome.
+_MIGRATION_6 = """
+ALTER TABLE dispatches ADD COLUMN delivery_status TEXT;
+
+UPDATE dispatches
+   SET delivery_status = reported_at,
+       reported_at = COALESCE(finished_at, created_at)
+ WHERE reported_at LIKE 'undeliverable:%';
+
+UPDATE dispatches
+   SET delivery_status = 'delivered'
+ WHERE reported_at IS NOT NULL
+   AND delivery_status IS NULL;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
     4: _MIGRATION_4,
     5: _MIGRATION_5,
+    6: _MIGRATION_6,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live

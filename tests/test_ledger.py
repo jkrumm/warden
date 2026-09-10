@@ -581,6 +581,117 @@ def test_verify_columns_catches_missing_operations_column():
         conn.close()
 
 
+def test_migration_6_adds_delivery_status_column():
+    """See _MIGRATION_6 — dispatches.delivery_status replaces the sentinel
+    string UNDELIVERABLE_SENTINEL that used to live IN `reported_at` (a TEXT
+    column supposed to hold a timestamp, not a status). Landed alongside
+    dispatch-sweep.py's move off `hermes send` onto scripts/slack_client.py's
+    plain HTTP client."""
+    conn = ledger.connect(_tmp_path(), migrate=True)
+    cols = _table_columns(conn, "dispatches")
+    assert "delivery_status" in cols, cols
+    conn.close()
+
+
+def test_migration_6_backfills_delivery_status_from_reported_at():
+    """A v5-stamped database carries the pre-migration overload: the sentinel
+    string 'undeliverable:no-origin-channel' living IN `reported_at`, and a
+    real timestamp meaning delivered. Migration 6 must move both facts into
+    `delivery_status` without losing the "closed, out of the open index"
+    property the sentinel used to buy by sitting directly in `reported_at` —
+    see idx_dispatches_open (`WHERE reported_at IS NULL`)."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    conn.executescript(ledger._MIGRATION_2)
+    conn.executescript(ledger._MIGRATION_3)
+    conn.executescript(ledger._MIGRATION_4)
+    conn.executescript(ledger._MIGRATION_5)
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (5, 'test')")
+
+    # sentinel, with a finished_at to fall back to
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,finished_at,reported_at) "
+        "VALUES('sentinel-with-finished','investigate','r','b','lost','2026-01-01T00:00:00+00:00',"
+        "'2026-01-02T00:00:00+00:00','undeliverable:no-origin-channel')"
+    )
+    # sentinel, no finished_at — falls back to created_at
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,reported_at) "
+        "VALUES('sentinel-no-finished','investigate','r','b','lost','2026-01-03T00:00:00+00:00',"
+        "'undeliverable:no-origin-channel')"
+    )
+    # a real, delivered timestamp
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,reported_at) "
+        "VALUES('delivered-row','investigate','r','b','done','2026-01-04T00:00:00+00:00',"
+        "'2026-01-04T01:00:00+00:00')"
+    )
+    # still open — never attempted
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) "
+        "VALUES('open-row','investigate','r','b','queued','2026-01-05T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    rows = {r["job_id"]: r for r in conn.execute("SELECT * FROM dispatches").fetchall()}
+
+    sentinel_finished = rows["sentinel-with-finished"]
+    assert sentinel_finished["delivery_status"] == "undeliverable:no-origin-channel"
+    assert sentinel_finished["reported_at"] == "2026-01-02T00:00:00+00:00", sentinel_finished["reported_at"]
+
+    sentinel_no_finished = rows["sentinel-no-finished"]
+    assert sentinel_no_finished["delivery_status"] == "undeliverable:no-origin-channel"
+    assert sentinel_no_finished["reported_at"] == "2026-01-03T00:00:00+00:00", sentinel_no_finished["reported_at"]
+
+    delivered = rows["delivered-row"]
+    assert delivered["delivery_status"] == "delivered"
+    assert delivered["reported_at"] == "2026-01-04T01:00:00+00:00"
+
+    open_row = rows["open-row"]
+    assert open_row["delivery_status"] is None
+    assert open_row["reported_at"] is None
+
+    # both sentinel rows now carry a REAL timestamp in reported_at, so they must
+    # be excluded from idx_dispatches_open (WHERE reported_at IS NULL) exactly as
+    # the sentinel string used to exclude them by sitting there directly.
+    open_ids = {r["job_id"] for r in conn.execute(
+        "SELECT job_id FROM dispatches WHERE reported_at IS NULL"
+    ).fetchall()}
+    assert open_ids == {"open-row"}, open_ids
+    conn.close()
+
+
+def test_v5_database_migrates_to_v6_matching_a_fresh_one():
+    """A real upgrade path, not adoption: a database already stamped at
+    schema_version 5 must reach SCHEMA_VERSION 6 with a schema identical to a
+    fresh database's."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    conn.executescript(ledger._MIGRATION_2)
+    conn.executescript(ledger._MIGRATION_3)
+    conn.executescript(ledger._MIGRATION_4)
+    conn.executescript(ledger._MIGRATION_5)
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (5, 'test')")
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    for table in ledger._VERSIONED_TABLES:
+        assert _table_columns(fresh, table) == _table_columns(conn, table), (
+            f"{table}: a v5-upgraded schema diverges from a fresh one")
+    fresh.close()
+    conn.close()
+
+
 def test_hermes_cc_schema_pin_matches_ledger():
     """hermes-cc.sh pins its own copy of the ledger schema version as a bash
     default (`WARDEN_SCHEMA_VERSION="${WARDEN_SCHEMA_VERSION:-N}"`) and refuses to

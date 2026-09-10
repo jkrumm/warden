@@ -118,7 +118,7 @@ DB_PATH="${HERMES_CC_DB:-$HOME/.warden/warden.db}"
 # SCHEMA_VERSION and checked on every DB open — a mismatch is a loud refusal, not
 # a best-effort write, because the alternative is this script silently running an
 # older shape's assumptions against a newer ledger.
-WARDEN_SCHEMA_VERSION="${WARDEN_SCHEMA_VERSION:-5}"
+WARDEN_SCHEMA_VERSION="${WARDEN_SCHEMA_VERSION:-6}"
 AUDIT_LOG="${HERMES_CC_LOG:-$HOME/Library/Logs/hermes-cc.log}"
 # scripts/triage.py's own policy file — shared here for exactly one thing: the
 # `merge` verb's per-repo `autoMergePaths`/`noCiRequired`/`deploy`/`autoDeploy`
@@ -1483,10 +1483,16 @@ result = job.get("result")
 artifact = (result.get("artifactUrl") or None) if isinstance(result, dict) else None
 conn.execute(
     "UPDATE dispatches SET status=?, verdict_json=?, artifact_url=?, finished_at=?, "
-    "reported_at=COALESCE(reported_at, ?) WHERE job_id=?",
+    "reported_at=COALESCE(reported_at, ?), "
+    # schema 6: a verdict handed back in-turn (--wait, or status read by the
+    # caller) is delivered by the caller in its own chat, so the row must say so:
+    # delivery_status IS NULL means "not attempted", and the sweeper would
+    # otherwise be the only writer of that column.
+    "delivery_status=COALESCE(delivery_status, CASE WHEN ? IS NOT NULL THEN ? END) "
+    "WHERE job_id=?",
     (job["status"],
      json.dumps(result) if result is not None else None,
-     artifact, now, reported, os.environ["JOB_ID"]),
+     artifact, now, reported, reported, "delivered", os.environ["JOB_ID"]),
 )
 ' || precond_err "could not update the dispatch record for $1"
 }
@@ -1603,9 +1609,10 @@ cmd_cancel() {
 import datetime as dt
 now = dt.datetime.now(dt.timezone.utc).isoformat()
 cur = conn.execute(
-    "UPDATE dispatches SET status=?, reported_at=?, finished_at=COALESCE(finished_at,?) "
+    "UPDATE dispatches SET status=?, reported_at=?, finished_at=COALESCE(finished_at,?), "
+    "delivery_status=COALESCE(delivery_status, ?) "
     "WHERE job_id=? AND reported_at IS NULL",
-    ("abandoned", now, now, os.environ["JOB_ID"]),
+    ("abandoned", now, now, "undeliverable:abandoned", os.environ["JOB_ID"]),
 )
 print(cur.rowcount)
 ') || precond_err "could not update the dispatch record for $job_id"

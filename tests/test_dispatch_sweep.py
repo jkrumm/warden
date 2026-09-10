@@ -386,7 +386,10 @@ def main() -> int:
             "VALUES('flap-job','investigate','example','b','queued','2026-09-07T00:00:00+00:00','C0123')")
         conn.commit(); conn.close()
 
-        dispatch_sweep.send_message = lambda target, body: sent.append((target, body)) or 0
+        def fake_send(target, body):
+            sent.append((target, body))
+            return 0, "delivered"
+        dispatch_sweep.send_message = fake_send
 
         def row(job_id):
             c = _sqlite3.connect(tmpdb); c.row_factory = _sqlite3.Row
@@ -415,13 +418,16 @@ def main() -> int:
         r1 = row("lost-job-1")
         lost_checks.append(("third miss -> status lost", r1["status"] == "lost"))
         lost_checks.append(("lost row is reported (never polled again)", r1["reported_at"] is not None))
+        lost_checks.append(("lost row's delivery_status is 'delivered'", r1["delivery_status"] == "delivered"))
         lost_checks.append(("exactly one notice, into the origin thread",
                             len([t for t, _ in sent if t == "slack:C0123:1.2"]) == 1))
         lost_checks.append(("notice names the job and says lost",
                             any("Dispatch lost" in b and "lost-job" in b for _, b in sent)))
         r2 = row("lost-job-2")
-        lost_checks.append(("no origin channel -> lost with the undeliverable sentinel",
-                            r2["status"] == "lost" and r2["reported_at"] == dispatch_sweep.UNDELIVERABLE_SENTINEL))
+        lost_checks.append(("no origin channel -> lost, delivery_status carries the sentinel",
+                            r2["status"] == "lost" and r2["delivery_status"] == dispatch_sweep.UNDELIVERABLE_SENTINEL))
+        lost_checks.append(("no origin channel -> reported_at is a REAL timestamp, not the sentinel string",
+                            r2["reported_at"] is not None and r2["reported_at"] != dispatch_sweep.UNDELIVERABLE_SENTINEL))
         rf = row("flap-job")
         lost_checks.append(("a 'running' answer after two misses reset the streak to 0",
                             rf["status"] == "queued" and rf["poll_misses"] == 0))
@@ -439,6 +445,92 @@ def main() -> int:
         check(f"lost jobs: {label}", cond)
     lost_ok = sum(1 for _, cond in lost_checks if cond)
 
+    # --- delivery: send_message() over slack_client, and delivery_status ------
+    #
+    # Exercises process_dispatch()'s normal (non-lost) delivery path with the
+    # HTTP client faked at the level dispatch-sweep.py actually calls it
+    # (`dispatch_sweep._slack_client.slack_post_message` /
+    # `resolve_slack_token`), rather than faking send_message() itself — so
+    # send_message()'s own target-parsing and rc/delivery_status derivation
+    # run for real.
+    delivery_checks: list[tuple[str, bool]] = []
+    tmpdb2 = Path(_tempfile.mkdtemp(prefix="dispatch-sweep-delivery-")) / "watchdog.db"
+    (orig_db2, orig_poll2, orig_token, orig_post) = (
+        dispatch_sweep.DB_PATH, dispatch_sweep.poll_job,
+        dispatch_sweep._slack_client.resolve_slack_token, dispatch_sweep._slack_client.slack_post_message,
+    )
+    post_calls: list[tuple] = []
+    flaky_attempts = {"n": 0}
+    try:
+        dispatch_sweep.DB_PATH = tmpdb2
+        conn = dispatch_sweep._ledger.connect(tmpdb2, migrate=True)
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_channel,origin_thread_ts) "
+            "VALUES('delivered-job','investigate','example','b','queued','2026-09-07T00:00:00+00:00','Cdeliver','9.1')")
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) "
+            "VALUES('no-origin-job','investigate','example','b','queued','2026-09-07T00:00:00+00:00')")
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_channel) "
+            "VALUES('flaky-job','investigate','example','b','queued','2026-09-07T00:00:00+00:00','Cflaky')")
+        conn.commit(); conn.close()
+
+        def row2(job_id):
+            c = _sqlite3.connect(tmpdb2); c.row_factory = _sqlite3.Row
+            r = c.execute("SELECT * FROM dispatches WHERE job_id=?", (job_id,)).fetchone(); c.close()
+            return r
+
+        dispatch_sweep.poll_job = lambda job_id: {
+            "status": "done",
+            "result": {"summary": "ok", "confidence": "high", "nextAction": "none", "evidence": []},
+        }
+        dispatch_sweep._slack_client.resolve_slack_token = lambda: "test-token"
+
+        def fake_post(token, channel, text, thread_ts=None):
+            post_calls.append((channel, text, thread_ts))
+            if channel == "Cflaky":
+                flaky_attempts["n"] += 1
+                if flaky_attempts["n"] == 1:
+                    return {"ok": False, "error": "rate_limited"}
+            return {"ok": True}
+        dispatch_sweep._slack_client.slack_post_message = fake_post
+
+        dispatch_sweep.main([])
+
+        d = row2("delivered-job")
+        delivery_checks.append(("delivered: reported_at stamped", d["reported_at"] is not None))
+        delivery_checks.append(("delivered: delivery_status == 'delivered'", d["delivery_status"] == "delivered"))
+        delivery_checks.append(("delivered: posted to the right channel/thread", any(
+            c == "Cdeliver" and t == "9.1" for c, _, t in post_calls)))
+
+        no = row2("no-origin-job")
+        delivery_checks.append(("no-origin: reported_at is a REAL timestamp, not the sentinel",
+                                 no["reported_at"] is not None and no["reported_at"] != dispatch_sweep.UNDELIVERABLE_SENTINEL))
+        delivery_checks.append(("no-origin: delivery_status carries the sentinel",
+                                 no["delivery_status"] == dispatch_sweep.UNDELIVERABLE_SENTINEL))
+        delivery_checks.append(("no-origin: no HTTP post was attempted for it",
+                                 not any(c is None for c, _, _ in post_calls)))
+
+        f1 = row2("flaky-job")
+        delivery_checks.append(("failed attempt: reported_at stays NULL for retry", f1["reported_at"] is None))
+        delivery_checks.append(("failed attempt: delivery_status records the reason",
+                                 f1["delivery_status"] == "failed:rate_limited"))
+
+        # next sweep retries the still-open row and succeeds this time
+        dispatch_sweep.main([])
+        f2 = row2("flaky-job")
+        delivery_checks.append(("retry succeeds: reported_at now stamped", f2["reported_at"] is not None))
+        delivery_checks.append(("retry succeeds: delivery_status flips to 'delivered'",
+                                 f2["delivery_status"] == "delivered"))
+        delivery_checks.append(("flaky-job was posted to exactly twice", flaky_attempts["n"] == 2))
+    finally:
+        dispatch_sweep.DB_PATH, dispatch_sweep.poll_job = orig_db2, orig_poll2
+        dispatch_sweep._slack_client.resolve_slack_token = orig_token
+        dispatch_sweep._slack_client.slack_post_message = orig_post
+    for label, cond in delivery_checks:
+        check(f"delivery: {label}", cond)
+    delivery_ok = sum(1 for _, cond in delivery_checks if cond)
+
     print(f"unmerged byte-identical      {unmerged_ok}/{unmerged_cases}")
     print(f"merged rendering             {merged_ok}/{len(merged_checks)}")
     print(f"garbage merged_at            {garbage_ok}/{len(garbage_checks)}")
@@ -449,6 +541,7 @@ def main() -> int:
     print(f"is_actionable predicate      {actionable_ok}/{len(actionable_checks)}")
     print(f"nudge body content            {nudge_ok}/{len(nudge_checks)}")
     print(f"lost jobs                     {lost_ok}/{len(lost_checks)}")
+    print(f"delivery                      {delivery_ok}/{len(delivery_checks)}")
 
     if failures:
         print("\nFAILURES:")

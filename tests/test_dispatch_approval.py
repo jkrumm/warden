@@ -442,7 +442,6 @@ def test_approve_replays_stored_brief_and_context(h, approver):
             "HERMES_CC_LOG": str(h.new_log("audit-replay")),
             "HERMES_CC_PR_REQUIRED_JSON": str(h.pr_required_json),
             "HERMES_CC_SCRIPT": str(_cc.CC_SCRIPT),
-            "HERMES_CC_HERMES_BIN": str(h.root / "no-such-hermes"),
             **env,
         })
         text = asyncio.run(plugin.execute_approved(nonce, "dispatch", "gamma", "implement", "U0JOHANNES"))
@@ -544,11 +543,10 @@ def test_approve_executes_stored_invocation(h, approver):
     """An Approve click re-runs the stored invocation with --confirm through the
     real script (so the signature it just wrote is what gets verified, the row is
     spent, and a dispatch row appears), then posts the outcome into the origin
-    thread with `hermes send`. The plugin's subprocess env must shed the Claude
-    Code markers — this suite itself runs inside a session, and the gateway can
-    inherit the same markers."""
+    thread over the plain Slack HTTP client (`plugin._slack_post_message`). The
+    plugin's subprocess env must shed the Claude Code markers — this suite itself
+    runs inside a session, and the gateway can inherit the same markers."""
     import asyncio
-    import stat as _stat
 
     db, env, plan = plan_and_db(
         h, approver, extra={"CC_TEST_CURL_LOG": str(h.new_log("curl-approve"))},
@@ -560,16 +558,14 @@ def test_approve_executes_stored_invocation(h, approver):
     check(row is not None and row["argv_json"] is not None, "plan stored argv_json")
     nonce = approver.decide(db, row["payload_hash"])
 
-    # a stub `hermes` that records the send target + body instead of posting
-    send_log = h.root / "hermes-send.log"
-    stub = h.root / "hermes-stub"
-    stub.write_text(
-        "#!/usr/bin/env python3\nimport sys\n"
-        "a = sys.argv[1:]\n"
-        "to = a[a.index('--to') + 1]; body = open(a[a.index('--file') + 1]).read()\n"
-        f"open({str(send_log)!r}, 'a').write(to + '\\n' + body + '\\n---\\n')\n"
+    # records every (channel, text, thread_ts) the plugin would have posted,
+    # in place of a `hermes` binary stub — the delivery is now a direct
+    # function call the plugin makes, not a subprocess to intercept.
+    posted: list[tuple] = []
+    saved_poster = plugin._slack_post_message
+    plugin._slack_post_message = lambda token, channel, text, thread_ts=None: (
+        posted.append((channel, text, thread_ts)) or {"ok": True}
     )
-    stub.chmod(stub.stat().st_mode | _stat.S_IEXEC)
 
     saved = dict(os.environ)
     try:
@@ -582,7 +578,6 @@ def test_approve_executes_stored_invocation(h, approver):
             "HERMES_CC_LOG": str(h.new_log("audit-approve")),
             "HERMES_CC_PR_REQUIRED_JSON": str(h.pr_required_json),
             "HERMES_CC_SCRIPT": str(_cc.CC_SCRIPT),
-            "HERMES_CC_HERMES_BIN": str(stub),
             # the marker the recursion guard keys on — the plugin must strip it
             "CLAUDECODE": "1",
             **env,
@@ -599,10 +594,9 @@ def test_approve_executes_stored_invocation(h, approver):
     check(spent is not None, "the approval was spent by the re-run")
     check(len(dispatches) == 1 and dispatches[0]["repo"] == "gamma" and dispatches[0]["tier"] == "implement",
           f"one implement dispatch row on gamma: {[dict(d) for d in dispatches]}")
-    sent = send_log.read_text() if send_log.exists() else ""
-    check("slack:" not in sent and "no origin channel" not in sent or True, "send attempted only with an origin")
-    # plan_and_db passes no --origin-channel, so the outcome is logged, not posted
-    check(not send_log.exists(), "no origin channel on the row -> nothing posted")
+    # plan_and_db passes no --origin-channel, so the outcome is logged, not posted —
+    # _slack_post_message must never be called
+    check(not posted, "no origin channel on the row -> nothing posted")
 
     # and a second click on the same (now spent) row: the re-run refuses, nothing new opens
     saved = dict(os.environ)
@@ -614,12 +608,13 @@ def test_approve_executes_stored_invocation(h, approver):
             "HERMES_CC_REPOS_JSON": str(h.repos_json),
             "HERMES_CC_LOG": str(h.new_log("audit-approve2")),
             "HERMES_CC_PR_REQUIRED_JSON": str(h.pr_required_json),
-            "HERMES_CC_SCRIPT": str(_cc.CC_SCRIPT), "HERMES_CC_HERMES_BIN": str(stub),
+            "HERMES_CC_SCRIPT": str(_cc.CC_SCRIPT),
             **env,
         })
         text2 = asyncio.run(plugin.execute_approved(nonce, "dispatch", "gamma", "implement", "U0JOHANNES"))
     finally:
         os.environ.clear(); os.environ.update(saved)
+        plugin._slack_post_message = saved_poster
     check(text2 is not None and "Did not run" in text2, f"a spent approval refuses on re-run: {text2!r}")
     conn = sqlite3.connect(str(db))
     n = conn.execute("SELECT COUNT(*) FROM dispatches").fetchone()[0]; conn.close()
@@ -628,9 +623,10 @@ def test_approve_executes_stored_invocation(h, approver):
 
 def test_execute_with_origin_posts_to_thread(h, approver):
     """With --origin-channel/--origin-thread on the plan, the outcome lands in that
-    thread via `hermes send --to slack:<chan>:<ts>` — the sweeper's own target shape."""
+    thread via `plugin._slack_post_message(token, channel, text, thread_ts)` — the
+    plain Slack HTTP client, same channel/thread shape the sweeper's own delivery
+    (`slack:<chan>:<ts>`, parsed into arguments here instead of a `--to` string)."""
     import asyncio
-    import stat as _stat
 
     db = h.new_db()
     env = {
@@ -647,15 +643,13 @@ def test_execute_with_origin_posts_to_thread(h, approver):
     row = conn.execute("SELECT payload_hash FROM dispatch_approvals").fetchone(); conn.close()
     nonce = approver.decide(db, row["payload_hash"])
 
-    send_log = h.root / "hermes-send-origin.log"
-    stub = h.root / "hermes-stub-origin"
-    stub.write_text(
-        "#!/usr/bin/env python3\nimport sys\n"
-        "a = sys.argv[1:]\n"
-        "to = a[a.index('--to') + 1]; body = open(a[a.index('--file') + 1]).read()\n"
-        f"open({str(send_log)!r}, 'a').write(to + '\\n' + body + '\\n')\n"
+    posted: list[tuple] = []
+    saved_poster, saved_token_fn = plugin._slack_post_message, plugin._resolve_slack_token
+    plugin._slack_post_message = lambda token, channel, text, thread_ts=None: (
+        posted.append((token, channel, text, thread_ts)) or {"ok": True}
     )
-    stub.chmod(stub.stat().st_mode | _stat.S_IEXEC)
+    plugin._resolve_slack_token = lambda: "xoxb-test-token"
+
     saved = dict(os.environ)
     try:
         os.environ.update({
@@ -665,15 +659,21 @@ def test_execute_with_origin_posts_to_thread(h, approver):
             "HERMES_CC_REPOS_JSON": str(h.repos_json),
             "HERMES_CC_LOG": str(h.new_log("audit-origin")),
             "HERMES_CC_PR_REQUIRED_JSON": str(h.pr_required_json),
-            "HERMES_CC_SCRIPT": str(_cc.CC_SCRIPT), "HERMES_CC_HERMES_BIN": str(stub),
+            "HERMES_CC_SCRIPT": str(_cc.CC_SCRIPT),
             **env,
         })
         text = asyncio.run(plugin.execute_approved(nonce, "dispatch", "gamma", "implement", "U0JOHANNES"))
     finally:
         os.environ.clear(); os.environ.update(saved)
-    sent = send_log.read_text() if send_log.exists() else ""
-    check(sent.startswith("slack:C0123456789:1700000000.000100\n"), f"posted into the origin thread: {sent[:80]!r}")
-    check("Episode opened" in sent and "job `" in sent, "the posted body is the outcome")
+        plugin._slack_post_message, plugin._resolve_slack_token = saved_poster, saved_token_fn
+
+    check(len(posted) == 1, f"exactly one post attempt: {posted!r}")
+    if posted:
+        token, channel, body, thread_ts = posted[0]
+        check(token == "xoxb-test-token", "the resolved token is what gets passed through")
+        check(channel == "C0123456789", f"posted to the origin channel: {channel!r}")
+        check(thread_ts == "1700000000.000100", f"posted into the origin thread: {thread_ts!r}")
+        check("Episode opened" in body and "job `" in body, "the posted body is the outcome")
 
 
 # --- the plugin stops writing the ledger (Slice 2b) ---------------------------

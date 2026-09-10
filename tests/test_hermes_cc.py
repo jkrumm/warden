@@ -1364,13 +1364,15 @@ def test_dispatch_record(h: Harness):
         job_id2 = None
     row2 = _fetch_row(db_path2, job_id2) if job_id2 else None
     ok = (proc.returncode == 0 and row2 is not None
-          and row2["status"] == "done" and row2["reported_at"] is not None)
+          and row2["status"] == "done" and row2["reported_at"] is not None
+          and row2["delivery_status"] == "delivered")
     if ok:
         passed += 1
     else:
         failures.append(f"--wait to a terminal job: expected reported_at "
-                         f"stamped, got job_id={job_id2!r} row={row2!r} "
-                         f"rc={proc.returncode}")
+                         f"stamped and delivery_status='delivered' (schema 6: the "
+                         f"in-turn verdict is delivered by the caller's own chat), "
+                         f"got job_id={job_id2!r} row={row2!r} rc={proc.returncode}")
 
     # (c) a bare `status <job-id>` on a terminal job updates status/verdict but
     # leaves reported_at NULL — that debt still belongs to the sweeper.
