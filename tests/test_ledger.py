@@ -14,6 +14,7 @@ Run: .venv/bin/python3 tests/test_ledger.py
 """
 
 import importlib.util
+import re
 import sqlite3
 import sys
 import tempfile
@@ -578,6 +579,24 @@ def test_verify_columns_catches_missing_operations_column():
         raise AssertionError("migrate() accepted an `operations` table missing a declared column")
     finally:
         conn.close()
+
+
+def test_hermes_cc_schema_pin_matches_ledger():
+    """hermes-cc.sh pins its own copy of the ledger schema version as a bash
+    default (`WARDEN_SCHEMA_VERSION="${WARDEN_SCHEMA_VERSION:-N}"`) and refuses to
+    run against anything else — see db_py()'s own comment there. Nothing forces
+    that literal to move in step with ledger.SCHEMA_VERSION when the schema is
+    bumped, other than this test: a bump in one place must fail `make test` until
+    the other follows, in this repo, not two commits and a live incident later."""
+    cc_script = REPO / "scripts" / "hermes-cc.sh"
+    text = cc_script.read_text()
+    m = re.search(r'WARDEN_SCHEMA_VERSION="\$\{WARDEN_SCHEMA_VERSION:-(\d+)\}"', text)
+    assert m is not None, f"could not find the WARDEN_SCHEMA_VERSION default in {cc_script}"
+    pinned = int(m.group(1))
+    assert pinned == ledger.SCHEMA_VERSION, (
+        f"hermes-cc.sh pins WARDEN_SCHEMA_VERSION={pinned}, but ledger.SCHEMA_VERSION="
+        f"{ledger.SCHEMA_VERSION} — bump the other one too"
+    )
 
 
 def main() -> int:

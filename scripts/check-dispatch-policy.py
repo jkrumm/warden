@@ -4,8 +4,9 @@
 There are deliberately two. DESIGN.md § Security model asks for exactly that:
 sideclaw's copy is THE BOUNDARY (`server/lib/dispatch-policy.ts`, projected at
 `GET /api/dispatch-policy`), because `POST /api/jobs` has no auth and any local
-process can reach it; hermes-agent's `config/dispatch-repos.json` is defence in
-depth for the one caller that goes through `hermes-cc.sh`.
+process can reach it; this repo's own `config/dispatch-repos.json` (read by
+hermes-cc.sh, which lives here too) is defence in depth for the one caller that
+goes through it.
 
 Duplication asked for on purpose is still duplication, and this is the same drift
 shape DESIGN.md warns about for the verdict schema. Drift here does not present as
@@ -29,9 +30,10 @@ from pathlib import Path
 from typing import Any
 
 SIDECLAW_URL = os.environ.get("SIDECLAW_URL", "http://127.0.0.1:7705")
+# hermes-cc.sh's own copy of this file moved here with the script (2026-09-10).
 REPOS_JSON = Path(
     os.environ.get("HERMES_CC_REPOS_JSON")
-    or Path.home() / "SourceRoot" / "hermes-agent" / "config" / "dispatch-repos.json"
+    or Path(__file__).resolve().parent.parent / "config" / "dispatch-repos.json"
 ).expanduser()
 
 TIER_RANK = {"investigate": 0, "author": 1, "implement": 2}
@@ -162,7 +164,7 @@ def main(argv: list[str]) -> int:
     if problems:
         print(f"\n✗ {len(problems)} disagreement(s) between the boundary and the control plane:")
         print("\n".join(problems))
-        print("\n  sideclaw (server/lib/dispatch-policy.ts) is the boundary; hermes-agent's")
+        print("\n  sideclaw (server/lib/dispatch-policy.ts) is the boundary; warden's own")
         print("  config/dispatch-repos.json is defence in depth. Fix BOTH — a change to one")
         print("  is a change to the other, and drift here reads as working until it matters.")
     else:

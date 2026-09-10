@@ -278,7 +278,10 @@ DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
            if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
 _env_cc_bin = os.environ.get("HERMES_CC_BIN")
-HERMES_CC_BIN = Path(_env_cc_bin).expanduser() if _env_cc_bin else (HERMES_HOME / "scripts" / "hermes-cc.sh")
+# hermes-cc.sh moved wholesale into this repo (2026-09-10) — resolved relative to
+# this file rather than hardcoded, so a moved checkout is a working directory
+# change, not a grep-and-replace.
+HERMES_CC_BIN = Path(_env_cc_bin).expanduser() if _env_cc_bin else (Path(__file__).resolve().parent / "hermes-cc.sh")
 
 # Same env-var-first, documented-absolute-default-second shape as HERMES_CC_BIN
 # above, and for the same reason: reconcile_operations() shells out to `gh`
@@ -291,9 +294,12 @@ GH_BIN = Path(_env_gh_bin).expanduser() if _env_gh_bin else Path("/opt/homebrew/
 
 # Same env var name hermes-cc.sh itself honors for this file (HERMES_CC_REPOS_JSON)
 # — one override reaches both the real dispatch and this script's own pre-check.
+# Moved into this repo's own config/ with hermes-cc.sh (2026-09-10), resolved
+# relative to this file for the same reason HERMES_CC_BIN above is.
 _env_repos_json = os.environ.get("HERMES_CC_REPOS_JSON")
 DISPATCH_REPOS_JSON = (
-    Path(_env_repos_json).expanduser() if _env_repos_json else (HERMES_HOME / "config" / "dispatch-repos.json")
+    Path(_env_repos_json).expanduser() if _env_repos_json
+    else (Path(__file__).resolve().parent.parent / "config" / "dispatch-repos.json")
 )
 
 # This repo's own config/, not ~/.hermes/config/, since the extraction. That is
