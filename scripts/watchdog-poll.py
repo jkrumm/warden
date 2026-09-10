@@ -116,6 +116,14 @@ REM_HOURS = {
     "stray_skill": 168,
 }
 
+# STATE.md §49 — an event whose triage_items row is STATE_NEEDS_HUMAN carries a
+# real outstanding decision (a verdict with a 7-day deadline), which is a
+# different thing than "still down/unresolved on the source's own cadence".
+# 24h, not the source's REM_HOURS entry — §41 known-open item 3 scoped
+# "reminder at 1d" for exactly this state and left the notification path
+# unowned, which is the gap this closes.
+REM_HOURS_NEEDS_HUMAN = 24
+
 HERMES_LOG_FILES = [
     ("hermes_errors_log_offset", "logs/errors.log"),
     ("hermes_gw_error_log_offset", "logs/gateway.error.log"),
@@ -342,6 +350,26 @@ def _dispatch_status(conn: sqlite3.Connection, dispatch_id: int | None) -> sqlit
         return None
 
 
+def _triage_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+    """Look up one triage_items row for the reminder path's own state check
+    (STATE.md §49 — the reminder branch never read the ledger's own
+    classification of the event it was about to remind on). None whenever
+    there's nothing to project: the triage_items table doesn't exist yet
+    (triage.py may never have run against a fresh ledger), or no row for this
+    event — every caller treats None as "behave exactly as before this lookup
+    existed", the same contract _dispatch_status already uses and for the
+    same reason: this is a 30-min production cron and a regression here is an
+    alerting outage, not a cosmetic miss.
+    """
+    try:
+        return conn.execute(
+            "SELECT state, note FROM triage_items WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
 def _dispatch_summary(status: str | None, verdict_json: str | None) -> str:
     """Render a completed dispatch's outcome for the reminder digest, in place
     of a bare 'reminder #N'. Deterministic, no LLM — verdict_json is sideclaw's
@@ -393,6 +421,15 @@ def poll_uk(env: dict[str, str]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for m in monitors:
         if not isinstance(m, dict):
+            continue
+        # STATE.md §49 / DESIGN.md § Open questions ("Resolved since v1"):
+        # group monitors (uk:95 "VPS", uk:179 "Services", uk:186 "Local") are
+        # group PARENTS whose children alert on their own — repo IS NULL, so
+        # escalate() can never dispatch on them, and they remind every 6h
+        # forever. Drop them at the source rather than teach every downstream
+        # consumer to special-case a monitor that can never resolve into
+        # anything actionable.
+        if m.get("type") == "group":
             continue
         status = m.get("status")
         is_down = (isinstance(status, str) and status.lower() == "down") or status == 0 or status is False
@@ -903,8 +940,26 @@ def reconcile(conn: sqlite3.Connection, source: str, observed: list[dict[str, An
             new_events.append(dict(row))
             cur.execute("UPDATE events SET notified_at=? WHERE id=?", (now.isoformat(), row["id"]))
         elif reminder_h:
+            # Ledger projection (STATE.md §49): the reminder path used to
+            # anchor purely on events/REM_HOURS and never look at the ledger's
+            # own classification of the event. A triage_items row in a
+            # TERMINAL_STATES state (ignored/note included) is a settled
+            # verdict — remind on it is pure noise, and skipping here doesn't
+            # even bump the anchor, so a later reopen (triage.py's own
+            # reopen/unsnooze pass) is re-checked cheaply next poll instead of
+            # going quiet for a full reminder_h window. item is None (no
+            # table, no row) behaves exactly as before this projection
+            # existed. See _triage_item.
+            item = _triage_item(conn, row["id"])
+            if item is not None and item["state"] in _ledger.TERMINAL_STATES:
+                continue
+            effective_reminder_h = reminder_h
+            if item is not None and item["state"] == _ledger.STATE_NEEDS_HUMAN:
+                # A real outstanding decision, not an ongoing outage — its own
+                # cadence, REM_HOURS_NEEDS_HUMAN, regardless of the source's.
+                effective_reminder_h = REM_HOURS_NEEDS_HUMAN
             anchor = row["last_reminder_at"] or row["notified_at"]
-            if (now - dt.datetime.fromisoformat(anchor)).total_seconds() >= reminder_h * 3600:
+            if (now - dt.datetime.fromisoformat(anchor)).total_seconds() >= effective_reminder_h * 3600:
                 # Dispatch-bridge projection (Phase 3): an event with an OPEN
                 # dispatch already has an investigation in flight, so
                 # re-reminding is noise — skip silently (don't bump the
@@ -923,6 +978,12 @@ def reconcile(conn: sqlite3.Connection, source: str, observed: list[dict[str, An
                 d = dict(row)
                 if dispatch is not None:
                     d["dispatch_summary"] = _dispatch_summary(dispatch["status"], dispatch["verdict_json"])
+                elif item is not None and item["state"] == _ledger.STATE_NEEDS_HUMAN and item["note"]:
+                    # No dispatch outcome to show yet — fold in the triage
+                    # verdict itself, the way dispatch_summary is folded in
+                    # above, so the reminder carries the actual pending
+                    # decision instead of a bare "reminder #N".
+                    d["triage_note"] = item["note"]
                 reminder_events.append(d)
                 cur.execute(
                     "UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
@@ -1165,10 +1226,15 @@ def _render_bullet(item: dict[str, Any], kind: str, now: dt.datetime) -> str:
     # kind-specific suffixes
     if kind == "reminder":
         dispatch_summary = item.get("dispatch_summary")
+        triage_note = item.get("triage_note")
         if dispatch_summary:
             # Dispatch-bridge projection: the investigation closed, so report
             # its outcome instead of a bare "reminder #N".
             body += f" — {dispatch_summary}"
+        elif triage_note:
+            # Ledger projection (STATE.md §49): needs_human carries a real
+            # verdict already — report it instead of a bare "reminder #N".
+            body += f" — needs human: {triage_note}"
         else:
             rc = item.get("reminder_count") or 0
             if rc:

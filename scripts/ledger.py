@@ -343,6 +343,23 @@ _ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "dispatch_approvals", "t
 # _verify_columns(), because it only ever walked _ADOPTABLE_TABLES.
 _VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
 
+# triage_items.state vocabulary, mirrored from scripts/triage.py's own
+# STATE_* constants (triage.py:332-427) and its TERMINAL_STATES (triage.py:531).
+# ledger.py is the schema owner, so it is the home for the state names that
+# OTHER files (watchdog-poll.py, which must not import triage.py by path — see
+# that file's reminder branch in reconcile() and STATE.md §49) need without
+# pulling in triage.py itself. triage.py does not import these back yet
+# (STATE.md follow-up); tests/test_watchdog_reminders.py asserts the two
+# tuples stay identical so this copy cannot silently drift from the original.
+STATE_NEEDS_HUMAN = "needs_human"
+STATE_FIXED = "fixed"
+STATE_QUIET = "quiet"
+STATE_CLOSED = "closed"
+STATE_IGNORED = "ignored"
+STATE_NOTE = "note"
+STATE_DISMISSED = "dismissed"
+TERMINAL_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_IGNORED, STATE_NOTE, STATE_DISMISSED)
+
 
 def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
