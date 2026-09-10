@@ -110,7 +110,7 @@ render-plists:
 .PHONY: agents
 agents: render-plists
 	@mkdir -p "$(WARDEN_HOME)"
-	@chmod +x "$(WARDEN_REPO)"/scripts/*.sh 2>/dev/null || true
+	@chmod +x "$(WARDEN_REPO)"/scripts/*.sh "$(WARDEN_REPO)"/scripts/warden 2>/dev/null || true
 	@for name in $(WARDEN_PLISTS); do \
 		dst="$(LA)/$$name.plist"; \
 		[ -f "$$dst" ] || continue; \

@@ -5,7 +5,7 @@ There are deliberately two. DESIGN.md § Security model asks for exactly that:
 sideclaw's copy is THE BOUNDARY (`server/lib/dispatch-policy.ts`, projected at
 `GET /api/dispatch-policy`), because `POST /api/jobs` has no auth and any local
 process can reach it; this repo's own `config/dispatch-repos.json` (read by
-hermes-cc.sh, which lives here too) is defence in depth for the one caller that
+the warden CLI, which lives here too) is defence in depth for the one caller that
 goes through it.
 
 Duplication asked for on purpose is still duplication, and this is the same drift
@@ -29,14 +29,23 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+# scripts/ (this file's own directory) onto sys.path so `lifecycle` is
+# importable as a real package — TIER_RANK used to be redefined here,
+# drifting from lifecycle/policy.py's copy (0/1/2 vs 1/2/3); one definition,
+# imported, so the two can never disagree again.
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from lifecycle.policy import TIER_RANK  # noqa: E402
+
 SIDECLAW_URL = os.environ.get("SIDECLAW_URL", "http://127.0.0.1:7705")
-# hermes-cc.sh's own copy of this file moved here with the script (2026-09-10).
+# The CLI's own copy of this file moved here with the script (2026-09-10).
 REPOS_JSON = Path(
-    os.environ.get("HERMES_CC_REPOS_JSON")
+    os.environ.get("WARDEN_DISPATCH_REPOS")
     or Path(__file__).resolve().parent.parent / "config" / "dispatch-repos.json"
 ).expanduser()
 
-TIER_RANK = {"investigate": 0, "author": 1, "implement": 2}
 REFUSED = "refused"  # denied at every tier — no tier name covers that
 
 
@@ -46,7 +55,7 @@ def _rank(tier: str) -> int:
 
 
 def hermes_ceiling(policy: dict[str, Any], repo: str) -> tuple[str, bool]:
-    """The effective (ceiling, sensitive) `hermes-cc.sh`'s resolver would apply.
+    """The effective (ceiling, sensitive) the warden CLI's resolver would apply.
 
     Mirrors resolve_repo/resolve_tier, including the one carve-out that is easy to
     get wrong: a name in `sensitive` MUST also be in `deny`, and that pair means
@@ -122,7 +131,7 @@ def main(argv: list[str]) -> int:
         agree = not looser
         if stricter and not looser:
             notes.append(
-                f"  {repo}: sideclaw is STRICTER than hermes-cc.sh "
+                f"  {repo}: sideclaw is STRICTER than the warden CLI "
                 f"(boundary={s_ceiling}/sensitive={s_sensitive}, "
                 f"control plane={h_ceiling}/sensitive={h_sensitive}) — safe, but the two "
                 "files disagree and a dispatch the control plane allows will be refused"
@@ -147,14 +156,14 @@ def main(argv: list[str]) -> int:
                          "matching relies on the case-insensitive lookup, keep it")
 
     # Root sets. sideclaw is deliberately WIDER: it also serves interactive
-    # dispatch into ~/IuRoot, which hermes-cc.sh never reaches. That is expected,
+    # dispatch into ~/IuRoot, which the warden CLI never reaches. That is expected,
     # and worth printing rather than silently tolerating.
     extra_roots = [r for r in sc_roots if Path(r).resolve() != root.resolve()]
     if extra_roots:
-        notes.append(f"  sideclaw also admits roots hermes-cc.sh never uses: {extra_roots} "
+        notes.append(f"  sideclaw also admits roots the warden CLI never uses: {extra_roots} "
                      "(expected — interactive dispatch into work repos)")
     if not any(Path(r).resolve() == root.resolve() for r in sc_roots):
-        problems.append(f"  sideclaw does not admit hermes-cc.sh's own root {root} at all")
+        problems.append(f"  sideclaw does not admit the warden CLI's own root {root} at all")
 
     if as_json:
         print(json.dumps({"ok": not problems, "rows": rows, "notes": notes}, indent=2))

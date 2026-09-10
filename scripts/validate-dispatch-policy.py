@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Validate config/dispatch-repos.json and summarise what it permits.
 
-Moved here from hermes-agent with hermes-cc.sh and its policy file (2026-09-10).
+Moved here from hermes-agent with the dispatch CLI and its policy file (2026-09-10).
 This used to be a python one-liner inside a Makefile, which was tolerable when the file
 was a flat repo -> maxTier map and is not now that it is a policy with four interacting
-keys. The checks below are the same ones `hermes-cc.sh` makes at dispatch time, run at
-setup time instead: `hermes-cc.sh` fails CLOSED on a malformed policy, which is correct
+keys. The checks below are the same ones `warden dispatch` makes at dispatch time, run at
+setup time instead: it fails CLOSED on a malformed policy, which is correct
 but surfaces the problem mid-incident on the first dispatch. Catch it while nobody is
 waiting on an answer. Distinct from check-dispatch-policy.py, which compares this file
 against sideclaw's copy rather than validating its own shape.
@@ -60,7 +60,7 @@ def main() -> None:
 
     # A name written into `tiers` is one somebody deliberately ruled on, so its absence
     # from disk is drift worth reporting — unlike a discovered repo, which is absent
-    # simply because it was never cloned. hermes-cc.sh makes the same distinction.
+    # simply because it was never cloned. warden dispatch makes the same distinction.
     missing = sorted(
         n for n in overrides
         if not os.path.exists(os.path.join(root, n, ".git"))

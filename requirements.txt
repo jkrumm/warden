@@ -3,7 +3,7 @@
 # The loop itself is pure stdlib — 3400 lines of triage.py, 1380 of the poller and
 # 751 of the sweeper import nothing outside the standard library, which is why this
 # file has one entry and not a page. That entry exists for the Ed25519 verifier that
-# comes across with hermes-cc.sh's approval half: it checks the signature on a human
+# comes across with the CLI's approval half: it checks the signature on a human
 # decision, and the signing key it verifies against lives only in the gateway's RAM.
 #
 # 50.0.0 is the version the hermes venv already runs the same verifier on.

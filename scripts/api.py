@@ -151,7 +151,7 @@ def _metric_verdicts_recorded_disposition(conn: sqlite3.Connection) -> dict[str,
     would circularly exclude the very no-item failures this metric exists to
     count). The other verdict-carrying investigate dispatches
     (`origin_event_id IS NULL`, `origin_channel`/`origin_thread_ts` set
-    instead) are interactive Slack dispatches a human asked `hermes-cc` to
+    instead) are interactive Slack dispatches a human asked `warden` to
     run: they were never items in warden's funnel and no item will ever point
     at them, so they are reported separately as `excluded_interactive` rather
     than silently dropped or miscounted into the denominator.
@@ -170,7 +170,7 @@ def _metric_verdicts_recorded_disposition(conn: sqlite3.Connection) -> dict[str,
         "WHERE tier='investigate' AND verdict_json IS NOT NULL AND origin_event_id IS NULL"
     ).fetchone()["n"]
     excluded_interactive_note = (
-        "verdict-carrying investigate dispatches with no origin_event_id — a human asked hermes-cc "
+        "verdict-carrying investigate dispatches with no origin_event_id — a human asked warden "
         "to investigate interactively; these never entered warden's funnel as an item and never will, "
         "so they are excluded from numerator and denominator rather than silently miscounted"
     )
@@ -344,7 +344,7 @@ def _metric_verified_unattended_fixes_per_week(
     unattended door structurally NEVER writes (`mint_approval` has one call
     site, behind PLANNED=1, and `awaiting_confirm()` is false whenever
     AUTO_FROM_ITEM is set — the two doors are mutually exclusive by
-    construction, verified against hermes-cc.sh directly). This is the first
+    construction, verified against the CLI directly). This is the first
     table in the ledger where "was a human's signed approval involved in
     landing this fix" is a real question to ask.
 

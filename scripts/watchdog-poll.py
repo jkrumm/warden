@@ -333,7 +333,7 @@ def db_connect() -> sqlite3.Connection:
 def _dispatch_status(conn: sqlite3.Connection, dispatch_id: int | None) -> sqlite3.Row | None:
     """Look up one dispatches row for the watchdog projection. None whenever
     there's nothing to project: no dispatch_id set, the dispatches table
-    doesn't exist yet (hermes-cc.sh / dispatch-sweep.py may never have run on
+    doesn't exist yet (the CLI / dispatch-sweep.py may never have run on
     a fresh mini), or the row is gone. Every caller treats None as "behave
     exactly as before the dispatch bridge existed" — this must never raise,
     since watchdog-poll.py is a 30-min production cron and a regression here

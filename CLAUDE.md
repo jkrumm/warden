@@ -145,8 +145,9 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 
 ## Cross-repo facts
 
-`hermes-cc.sh`, `hermes-ops.sh`, `agents-overview.py` and
-`plugins/dispatch-approval/` live in `hermes-agent` and are reached, not vendored.
+`hermes-ops.sh`, `agents-overview.py`, `plugins/dispatch-approval/` and a
+six-line dispatch-shim script (which `exec`s into this repo's `scripts/warden`)
+live in `hermes-agent` and are reached, not vendored.
 `~/.hermes/{scripts,config}` are **whole-directory symlinks** into that repo, which
 is why the extraction was never a `git mv`. The Ed25519 signing key exists only in
 the gateway's RAM, is minted fresh at every start, and is never serialized — only

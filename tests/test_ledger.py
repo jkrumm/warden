@@ -14,7 +14,6 @@ Run: .venv/bin/python3 tests/test_ledger.py
 """
 
 import importlib.util
-import re
 import sqlite3
 import sys
 import tempfile
@@ -256,7 +255,7 @@ def test_migrate_adopts_pre_versioned_database():
     # renamed: adopting a live database stays additive.
     for table, cols in pre_cols.items():
         assert cols <= post_cols[table], f"{table} lost columns: {cols - post_cols[table]}"
-    assert post_cols["triage_items"] - pre_cols["triage_items"] == {"state_deadline", "occurrence_mark"}, (
+    assert post_cols["triage_items"] - pre_cols["triage_items"] == {"state_deadline", "occurrence_mark", "revert_pr"}, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
     assert post_counts == pre_counts, f"rows lost: {post_counts} != {pre_counts}"
@@ -467,7 +466,7 @@ def test_adoption_refuses_a_structurally_incomplete_database() -> None:
     conn = sqlite3.connect(tmp)
     # Every table present, so `_tables_exist` is satisfied and the adoption
     # path is taken — but `dispatches` is built WITHOUT the columns that
-    # hermes-cc.sh used to add by ALTER TABLE at runtime.
+    # the old bash CLI used to add by ALTER TABLE at runtime.
     conn.executescript(ledger.BASE_SCHEMA)
     conn.execute("ALTER TABLE dispatches DROP COLUMN validation_status")
     conn.commit()
@@ -690,24 +689,6 @@ def test_v5_database_migrates_to_v6_matching_a_fresh_one():
             f"{table}: a v5-upgraded schema diverges from a fresh one")
     fresh.close()
     conn.close()
-
-
-def test_hermes_cc_schema_pin_matches_ledger():
-    """hermes-cc.sh pins its own copy of the ledger schema version as a bash
-    default (`WARDEN_SCHEMA_VERSION="${WARDEN_SCHEMA_VERSION:-N}"`) and refuses to
-    run against anything else — see db_py()'s own comment there. Nothing forces
-    that literal to move in step with ledger.SCHEMA_VERSION when the schema is
-    bumped, other than this test: a bump in one place must fail `make test` until
-    the other follows, in this repo, not two commits and a live incident later."""
-    cc_script = REPO / "scripts" / "hermes-cc.sh"
-    text = cc_script.read_text()
-    m = re.search(r'WARDEN_SCHEMA_VERSION="\$\{WARDEN_SCHEMA_VERSION:-(\d+)\}"', text)
-    assert m is not None, f"could not find the WARDEN_SCHEMA_VERSION default in {cc_script}"
-    pinned = int(m.group(1))
-    assert pinned == ledger.SCHEMA_VERSION, (
-        f"hermes-cc.sh pins WARDEN_SCHEMA_VERSION={pinned}, but ledger.SCHEMA_VERSION="
-        f"{ledger.SCHEMA_VERSION} — bump the other one too"
-    )
 
 
 def main() -> int:

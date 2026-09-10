@@ -360,7 +360,19 @@ def main() -> int:
         check(f"nudge body: {label}", cond)
     nudge_ok = sum(1 for _, cond in nudge_checks if cond)
 
-    # --- lost jobs: three consecutive 404s, one notice, never again ------
+    # --- cancelled jobs: terminal exactly like done/failed/interrupted --
+    check("cancelled is one of sideclaw's own TERMINAL statuses",
+          "cancelled" in dispatch_sweep.TERMINAL_STATUSES)
+    cancelled_body = format_message(
+        repo="example", tier="investigate", job_id=JOB_ID, status="cancelled",
+        result=None, error=None,
+    )
+    check("cancelled rendering says cancelled (aborted)",
+          "cancelled (aborted)" in cancelled_body)
+    check("cancelled rendering carries no merged marker",
+          "merged" not in cancelled_body.lower())
+
+    # --- pruned jobs: three consecutive 404s, one notice, never again ------
     import os as _os
     import sqlite3 as _sqlite3
     import tempfile as _tempfile
@@ -416,16 +428,19 @@ def main() -> int:
         lost_checks.append(("miss 2 recorded, still open, nothing sent", row("lost-job-1")["poll_misses"] == 2 and not sent))
         dispatch_sweep.main([])
         r1 = row("lost-job-1")
-        lost_checks.append(("third miss -> status lost", r1["status"] == "lost"))
-        lost_checks.append(("lost row is reported (never polled again)", r1["reported_at"] is not None))
-        lost_checks.append(("lost row's delivery_status is 'delivered'", r1["delivery_status"] == "delivered"))
+        lost_checks.append(("third miss -> status failed (the pruned status, no local 'lost' left)",
+                            r1["status"] == "failed"))
+        lost_checks.append(("pruned row's verdict_json is cleared — there never was one",
+                            r1["verdict_json"] is None))
+        lost_checks.append(("pruned row is reported (never polled again)", r1["reported_at"] is not None))
+        lost_checks.append(("pruned row's delivery_status is 'delivered'", r1["delivery_status"] == "delivered"))
         lost_checks.append(("exactly one notice, into the origin thread",
                             len([t for t, _ in sent if t == "slack:C0123:1.2"]) == 1))
-        lost_checks.append(("notice names the job and says lost",
-                            any("Dispatch lost" in b and "lost-job" in b for _, b in sent)))
+        lost_checks.append(("notice names the job and says pruned",
+                            any("Dispatch pruned" in b and "lost-job" in b for _, b in sent)))
         r2 = row("lost-job-2")
-        lost_checks.append(("no origin channel -> lost, delivery_status carries the sentinel",
-                            r2["status"] == "lost" and r2["delivery_status"] == dispatch_sweep.UNDELIVERABLE_SENTINEL))
+        lost_checks.append(("no origin channel -> pruned, delivery_status carries the sentinel",
+                            r2["status"] == "failed" and r2["delivery_status"] == dispatch_sweep.UNDELIVERABLE_SENTINEL))
         lost_checks.append(("no origin channel -> reported_at is a REAL timestamp, not the sentinel string",
                             r2["reported_at"] is not None and r2["reported_at"] != dispatch_sweep.UNDELIVERABLE_SENTINEL))
         rf = row("flap-job")
@@ -433,12 +448,12 @@ def main() -> int:
                             rf["status"] == "queued" and rf["poll_misses"] == 0))
         before = len(sent)
         dispatch_sweep.main([])
-        lost_checks.append(("a lost row is never re-polled or re-sent", len(sent) == before))
+        lost_checks.append(("a pruned row is never re-polled or re-sent", len(sent) == before))
         rf = row("flap-job")
         lost_checks.append(("the streak restarts at 1 after the reset, not 3",
                             rf["status"] == "queued" and rf["poll_misses"] == 1))
-        lost_checks.append(("lost_notice carries only bridge-owned fields",
-                            "stub" not in dispatch_sweep.lost_notice(repo="r", tier="t", job_id="j", misses=3)))
+        lost_checks.append(("pruned_notice carries only bridge-owned fields",
+                            "stub" not in dispatch_sweep.pruned_notice(repo="r", tier="t", job_id="j", misses=3)))
     finally:
         dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message = orig_db, orig_poll, orig_send
     for label, cond in lost_checks:
@@ -540,7 +555,7 @@ def main() -> int:
     print(f"failed/interrupted unaffected {terminal_ok}/{len(terminal_checks)}")
     print(f"is_actionable predicate      {actionable_ok}/{len(actionable_checks)}")
     print(f"nudge body content            {nudge_ok}/{len(nudge_checks)}")
-    print(f"lost jobs                     {lost_ok}/{len(lost_checks)}")
+    print(f"pruned jobs                   {lost_ok}/{len(lost_checks)}")
     print(f"delivery                      {delivery_ok}/{len(delivery_checks)}")
 
     if failures:

@@ -73,7 +73,7 @@ def _dispatch(conn, job_id: str, *, tier: str = "investigate", verdict_json: str
              origin_event_id: int | None = 1, now: dt.datetime) -> None:
     """`origin_event_id` defaults to loop-originated (matches DESIGN.md's
     "the loop originated this" reading of the column) — pass None to seed an
-    interactive hermes-cc dispatch, which metric 1 must exclude entirely."""
+    interactive warden dispatch, which metric 1 must exclude entirely."""
     conn.execute(
         "INSERT INTO dispatches (job_id, tier, repo, brief, status, verdict_json, origin_event_id, created_at) "
         "VALUES (?,?,?,?,?,?,?,?)",
@@ -165,7 +165,7 @@ def test_metric1_excludes_interactive_dispatches_and_item_states_can_exceed_deno
     # Loop-originated, single item, `quiet` — not a recorded disposition.
     _dispatch(conn, "j2", verdict_json="{}", origin_event_id=4, now=now)
     _item(conn, 4, state="quiet", dispatch_job="j2", now=now)
-    # Interactive: a human asked hermes-cc directly. No origin_event_id, no item.
+    # Interactive: a human asked warden directly. No origin_event_id, no item.
     _dispatch(conn, "j3", verdict_json="{}", origin_event_id=None, now=now)
     conn.commit()
 

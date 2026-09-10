@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS. DESIGN.md § The ledger requires **one writer process**: "The
 API opens read-only; intents go through the loop's queue." Today six writers
-open `warden.db` — the loop, two pollers, `hermes-cc.sh`'s embedded python, the
+open `warden.db` — the loop, two pollers, the CLI's embedded python, the
 Slack approval plugin, CLI verbs — and every one of them is a process that can
 corrupt, lock or half-migrate the file that decides whether to touch
 production. The way out is not "be careful in six places"; it is a spool
@@ -12,7 +12,7 @@ one process opens the database.
 
 WHAT THIS IS NOT: an authority model. Signing happens only where it already
 happens — in the gateway's RAM behind Slack Socket Mode, or at a TTY — and
-`require_signed_approval()` in `~/.hermes/scripts/hermes-cc.sh` remains the one
+`require_signed_approval()` in `scripts/lifecycle/approvals.py` remains the one
 and only verifier, trusting the row's Ed25519 signature and never the caller.
 **There is deliberately no signature verification in this file.** A second
 verifier is a copied contract, and a copied contract drifts; this repo already
@@ -50,6 +50,17 @@ _ledger_spec = importlib.util.spec_from_file_location("ledger", _LEDGER_PATH)
 assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
 ledger = importlib.util.module_from_spec(_ledger_spec)
 _ledger_spec.loader.exec_module(ledger)
+
+# `lifecycle/` and `clients/` ARE importable packages (unlike the sibling
+# *.py files above) — they just need this file's own directory on sys.path,
+# which is not guaranteed when triage.py loads this module by path via
+# `spec_from_file_location` rather than a normal `import intents`.
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from clients.errors import WardenError  # noqa: E402
+from lifecycle import approvals  # noqa: E402
 
 # INTENTS_DIR is a module-level global re-read by every function below at call
 # time, never captured at import and never baked into a default argument — the
@@ -267,9 +278,44 @@ def _reject(path: Path, err: Exception) -> str:
     return dest.name
 
 
+def _spend_after_decision(conn: sqlite3.Connection, intent: dict[str, Any]) -> dict[str, Any] | None:
+    """Turn a just-applied `approval_decision` into an opened episode.
+
+    Only called for a decision this very pass actually WROTE (rowcount>0 —
+    see the caller): a decision applied by an earlier pass was either already
+    spent, or already left for `pending_approved()`'s retry sweep, and this
+    is not that sweep.
+
+    A `deny` spends nothing — `execute_approved()` would itself return
+    `status="denied"` for it, but there is no reason to touch the ledger a
+    second time to learn that. `PolicyError`/`PreconditionError` (raised only
+    by `execute_approved()`'s own `signer.load_pubkey()` call, before its
+    internal try/except begins) are reported like any other outcome — they
+    still fit the `{"nonce","decision","status","jobId","reason"}` shape. Any
+    OTHER exception is a bug in the spend path, not an approval outcome: it
+    is logged and swallowed so it can never turn an already-landed decision
+    into a rejected intent file — the file is gone, the decision stands,
+    `pending_approved()` retries the spend on the loop's own next pass."""
+    nonce = intent["nonce"]
+    decision = intent["decision"]
+    if decision != "approve":
+        return {"nonce": nonce, "decision": decision, "status": "recorded", "jobId": None, "reason": None}
+    try:
+        result = approvals.execute_approved(conn, nonce)
+    except WardenError as err:
+        return {"nonce": nonce, "decision": decision, "status": "error", "jobId": None, "reason": str(err)}
+    except Exception as err:  # noqa: BLE001 — a spend bug must never abort the drain
+        print(f"intents: spend for nonce {nonce} raised {type(err).__name__}: {err}", file=sys.stderr)
+        return None
+    return {
+        "nonce": nonce, "decision": decision, "status": result.status,
+        "jobId": result.job_id, "reason": result.reason,
+    }
+
+
 def drain(conn: sqlite3.Connection) -> dict[str, Any]:
     """Apply every spooled intent, oldest first, and return
-    `{"applied": int, "rejected": int, "rejected_files": [str, ...]}`.
+    `{"applied": int, "rejected": int, "rejected_files": [str, ...], "results": [dict, ...]}`.
 
     `conn` is an already-open WRITABLE connection and the caller owns it —
     `ledger.connect()` is the only thing in warden that makes one, and this
@@ -281,6 +327,13 @@ def drain(conn: sqlite3.Connection) -> dict[str, Any]:
     and nothing is discarded — a failure lands in `rejected/` with its
     exception text and one line on stderr, because a rejection that reaches
     only a file is invisible (DESIGN.md, "deferral must be visible").
+
+    An `approval_decision` that this pass actually applied (see
+    `_spend_after_decision`) is spent right after its own commit — one JSON
+    line printed to stdout per such intent, `{"nonce","decision","status",
+    "jobId","reason"}` — and collected into `results`. A spend that refuses
+    or fails does NOT reject the intent file: the decision already landed:
+    unspent, it is `pending_approved()`'s job to retry until it expires.
     """
     directory = INTENTS_DIR
     # Path.glob() on a directory that does not exist yields nothing rather
@@ -291,6 +344,7 @@ def drain(conn: sqlite3.Connection) -> dict[str, Any]:
 
     applied = 0
     rejected_files: list[str] = []
+    results: list[dict[str, Any]] = []
 
     for path in files:
         try:
@@ -310,15 +364,22 @@ def drain(conn: sqlite3.Connection) -> dict[str, Any]:
         # nonce is a request about a row that no longer exists, which nothing
         # here can or should resurrect. Turning either into a rejection would
         # fill `rejected/` with files whose only defect is that the world
-        # moved on.
-        _ = rows
+        # moved on. It is also why the spend below only fires when THIS pass
+        # is the one that actually wrote the decision (rows > 0) — replaying
+        # an already-applied file must never spend a second time.
         # Unlink AFTER the commit. If the process dies in between, the file is
         # drained again next pass and the `AND decision IS NULL` guard makes
         # that a no-op — the safe order is "apply twice", never "lose one".
         path.unlink(missing_ok=True)
         applied += 1
 
-    return {"applied": applied, "rejected": len(rejected_files), "rejected_files": rejected_files}
+        if rows > 0 and intent["kind"] == "approval_decision":
+            result = _spend_after_decision(conn, intent)
+            if result is not None:
+                results.append(result)
+                print(json.dumps(result))
+
+    return {"applied": applied, "rejected": len(rejected_files), "rejected_files": rejected_files, "results": results}
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────

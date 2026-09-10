@@ -11,6 +11,7 @@ second application changes nothing).
 Run: .venv/bin/python3 tests/test_intents.py
 """
 
+import datetime as dt
 import importlib.util
 import json
 import os
@@ -21,7 +22,21 @@ import tempfile
 import traceback
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+
+from clients import sideclaw, signer  # noqa: E402
+
+# A throwaway HERMES_HOME so `approvals.pubkey_path()`'s default (used by
+# every test in this file that does NOT explicitly set WARDEN_APPROVAL_PUBKEY)
+# resolves to a file that deterministically does not exist, rather than
+# whatever a real dev machine happens to have at ~/.hermes. Those tests only
+# care that a spend attempt cannot crash the drain — see
+# `_spend_after_decision`'s WardenError branch — not that it succeeds.
+os.environ.setdefault("HERMES_HOME", tempfile.mkdtemp(prefix="intents-hermes-home-"))
 
 _ledger_spec = importlib.util.spec_from_file_location("ledger", REPO / "scripts" / "ledger.py")
 ledger = importlib.util.module_from_spec(_ledger_spec)
@@ -33,9 +48,50 @@ _intents_spec.loader.exec_module(intents)
 
 # A plausible Ed25519 signature: 64 bytes of hex. Nothing in intents.py checks
 # its length or its authenticity — that happens once, at spend time, in
-# require_signed_approval(). This is here only so the SHAPE check has real
-# input.
+# `execute_approved()`. This is here only so the SHAPE check has real input;
+# the dedicated spend tests below sign for real.
 SIG = "ab" * 64
+
+
+class _patch:
+    """Swap one attribute on a module object for the duration of a `with`
+    block — `sideclaw.submit = fake`, restored afterward so tests cannot
+    leak into one another. Same shape as tests/test_lifecycle.py's own."""
+
+    def __init__(self, obj, name: str, value):
+        self.obj, self.name, self.value = obj, name, value
+
+    def __enter__(self):
+        self.original = getattr(self.obj, self.name)
+        setattr(self.obj, self.name, self.value)
+        return self.value
+
+    def __exit__(self, *exc):
+        setattr(self.obj, self.name, self.original)
+
+
+class _env:
+    """Set (or, with `None`, force-unset) environment variables for one
+    `with` block, restoring exactly what was there before."""
+
+    def __init__(self, **kv):
+        self.kv = kv
+
+    def __enter__(self):
+        self.original = {k: os.environ.get(k) for k in self.kv}
+        for k, v in self.kv.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.original.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _tmp_dir(prefix: str) -> Path:
@@ -55,12 +111,55 @@ def _use_spool() -> Path:
     return intents.INTENTS_DIR
 
 
+def _keypair():
+    priv = Ed25519PrivateKey.generate()
+    pub_hex = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
+    ).hex()
+    return priv, pub_hex
+
+
+def _write_pubkey(pub_hex: str) -> Path:
+    p = _tmp_dir("intents-pubkey-") / "dispatch-approval.pub"
+    p.write_text(pub_hex + "\n", encoding="utf-8")
+    return p
+
+
+def _dispatch_root_with_repo(name: str = "warden", tier: str = "implement"):
+    root = _tmp_dir("intents-root-")
+    (root / name / ".git").mkdir(parents=True)
+    policy_path = root / "dispatch-repos.json"
+    policy_path.write_text(
+        json.dumps({"root": str(root), "defaultTier": tier, "deny": [], "sensitive": [], "tiers": {}}),
+        encoding="utf-8",
+    )
+    return root, policy_path
+
+
 def _seed_approval(conn, nonce: str, *, decision=None, decided_by=None) -> None:
     conn.execute(
         "INSERT INTO dispatch_approvals (nonce, verb, repo, tier, payload_hash, created_at, expires_at, "
         "decision, decided_by) VALUES (?,?,?,?,?,?,?,?,?)",
         (nonce, "dispatch", "warden", "0", "hash-" + nonce, "2026-09-09T00:00:00+00:00",
          "2026-09-09T01:00:00+00:00", decision, decided_by),
+    )
+    conn.commit()
+
+
+def _seed_approval_row(conn, nonce, *, verb="dispatch", repo="warden", tier="implement",
+                        payload_hash="hash", expires_at=None, channel=None, key_id=None,
+                        params_json="{}", stdin_text="the approved brief") -> None:
+    """A row shaped for a REAL spend attempt — unexpired, with the columns
+    `execute_approved()` actually reads — as opposed to `_seed_approval()`
+    above, whose fixed past `expires_at` is only ever meant to be seen by
+    `_apply_approval_decision()`'s shape/replay tests, never by a spend."""
+    now = dt.datetime.now(dt.timezone.utc)
+    expires_at = expires_at or (now + dt.timedelta(minutes=30)).isoformat()
+    conn.execute(
+        "INSERT INTO dispatch_approvals(nonce,verb,repo,tier,payload_hash,created_at,expires_at,channel,"
+        "argv_json,stdin_text,key_id,params_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (nonce, verb, repo, tier, payload_hash, now.isoformat(), expires_at, channel, "[]",
+         stdin_text, key_id, params_json),
     )
     conn.commit()
 
@@ -95,6 +194,12 @@ def _expect_value_error(intent: dict, *needles: str) -> None:
 
 
 def test_valid_approval_decision_round_trips():
+    """The decision itself lands even though this row's fixed `expires_at`
+    (`_seed_approval`) is already in the past by the time the test runs, so
+    the spend attempt `drain()` now makes refuses as `expired` — a WardenError
+    the `_spend_after_decision` branch turns into a reported result, never a
+    crash. See `test_drain_spends_an_approved_decision_and_opens_an_episode`
+    below for the round trip that actually spends."""
     spool = _use_spool()
     conn, _ = _fresh_ledger()
     _seed_approval(conn, "n1")
@@ -103,14 +208,89 @@ def test_valid_approval_decision_round_trips():
     assert path.exists() and path.parent == spool
 
     result = intents.drain(conn)
-    assert result == {"applied": 1, "rejected": 0, "rejected_files": []}, result
+    assert result["applied"] == 1 and result["rejected"] == 0, result
+    assert len(result["results"]) == 1, result
+    assert result["results"][0]["nonce"] == "n1" and result["results"][0]["decision"] == "approve"
 
     row = _row(conn, "n1")
     assert row["decision"] == "approve", dict(row)
     assert row["decided_by"] == "U999", dict(row)
     assert row["signature"] == SIG, dict(row)
     assert row["decided_at"], "decided_at must be stamped by the drain"
+    assert row["spent_at"] is None, "an expired row must never be spent"
     assert not path.exists(), "an applied intent must be unlinked"
+    conn.close()
+
+
+def test_drain_spends_an_approved_decision_and_opens_an_episode():
+    """The real round trip: a signed `approve` intent, drained against a row
+    that can actually be spent, opens a sideclaw episode — the point of
+    wiring `execute_approved()` into `drain()` at all."""
+    _use_spool()
+    conn, _ = _fresh_ledger()
+    priv, pub_hex = _keypair()
+    root, policy_path = _dispatch_root_with_repo("warden", "implement")
+    payload_hash = signer.payload_hash("dispatch", "warden", "implement", "the approved brief", "fix it", "")
+    expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)).isoformat()
+    _seed_approval_row(
+        conn, "n-spend", repo="warden", tier="implement", payload_hash=payload_hash,
+        expires_at=expires_at, key_id=signer.key_id(pub_hex), params_json=json.dumps({"why": "fix it"}),
+    )
+    message = signer.canonical_message("n-spend", payload_hash, "approve", "U999", expires_at)
+    intents.record(_approval("n-spend", decided_by="U999", signature=priv.sign(message).hex()))
+
+    captured: dict = {}
+
+    def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return {"id": "job-spend", "status": "running"}
+
+    with _env(WARDEN_APPROVAL_PUBKEY=str(_write_pubkey(pub_hex)), WARDEN_DISPATCH_REPOS=str(policy_path)), \
+         _patch(sideclaw, "submit", fake_submit):
+        result = intents.drain(conn)
+
+    assert result["applied"] == 1 and result["rejected"] == 0, result
+    assert len(result["results"]) == 1, result
+    spend = result["results"][0]
+    assert spend == {"nonce": "n-spend", "decision": "approve", "status": "opened", "jobId": "job-spend",
+                      "reason": None}, spend
+    assert captured["cwd"] == os.path.realpath(root / "warden"), captured
+
+    row = _row(conn, "n-spend")
+    assert row["spent_at"] is not None
+    assert row["spent_job_id"] == "job-spend"
+    conn.close()
+
+
+def test_drain_does_not_spend_a_deny():
+    """A `deny` must never reach sideclaw — the whole reason
+    `_spend_after_decision` branches on `decision` before calling
+    `execute_approved()` at all."""
+    _use_spool()
+    conn, _ = _fresh_ledger()
+    priv, pub_hex = _keypair()
+    payload_hash = "hash-n-deny"
+    expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)).isoformat()
+    _seed_approval_row(conn, "n-deny", payload_hash=payload_hash, expires_at=expires_at, key_id=signer.key_id(pub_hex))
+    message = signer.canonical_message("n-deny", payload_hash, "deny", "U999", expires_at)
+    intents.record(_approval("n-deny", decision="deny", decided_by="U999", signature=priv.sign(message).hex()))
+
+    called: list = []
+
+    def fake_submit(**kwargs):
+        called.append(kwargs)
+        return {"id": "should-never-happen", "status": "running"}
+
+    with _env(WARDEN_APPROVAL_PUBKEY=str(_write_pubkey(pub_hex))), _patch(sideclaw, "submit", fake_submit):
+        result = intents.drain(conn)
+
+    assert result["applied"] == 1, result
+    assert result["results"] == [
+        {"nonce": "n-deny", "decision": "deny", "status": "recorded", "jobId": None, "reason": None}
+    ], result
+    assert not called, "a deny must never spend"
+    row = _row(conn, "n-deny")
+    assert row["decision"] == "deny" and row["spent_at"] is None
     conn.close()
 
 
@@ -211,7 +391,8 @@ def test_unknown_nonce_is_applied_and_unlinked_not_rejected():
     path = intents.record(_approval("nonce-that-never-existed"))
 
     result = intents.drain(conn)
-    assert result == {"applied": 1, "rejected": 0, "rejected_files": []}, result
+    assert result["applied"] == 1 and result["rejected"] == 0 and result["rejected_files"] == [], result
+    assert result["results"] == [], "an unknown nonce writes no decision, so nothing is spent"
     assert not path.exists()
     conn.close()
 
@@ -260,7 +441,8 @@ def test_a_valid_json_file_that_fails_validation_is_rejected():
 def test_drain_on_a_missing_directory_returns_zeros():
     intents.INTENTS_DIR = _tmp_dir("intents-absent-") / "never-created"
     conn, _ = _fresh_ledger()
-    assert intents.drain(conn) == {"applied": 0, "rejected": 0, "rejected_files": []}
+    result = intents.drain(conn)
+    assert result["applied"] == 0 and result["rejected"] == 0 and result["rejected_files"] == [] and result["results"] == []
     assert not intents.INTENTS_DIR.exists(), "drain() must not create the spool directory"
     conn.close()
 
@@ -322,7 +504,7 @@ def test_a_half_written_file_is_invisible_to_the_drain():
     (spool / f".{live.name}.tmp").write_text('{"v": 1, "kind": "approval_dec', encoding="utf-8")
 
     result = intents.drain(conn)
-    assert result == {"applied": 1, "rejected": 0, "rejected_files": []}, result
+    assert result["applied"] == 1 and result["rejected"] == 0 and result["rejected_files"] == [], result
     assert _row(conn, "n-half")["decision"] == "approve"
     assert list(spool.glob("*.tmp")) == [] or all(p.name.startswith(".") for p in spool.iterdir()), (
         "the half-written file must be left alone, not drained and not rejected")
@@ -357,7 +539,12 @@ def test_cli_record_then_drain():
         capture_output=True, text=True, env=env,
     )
     assert drained.returncode == 0, drained.stderr
-    assert drained.stdout.strip() == "applied=1 rejected=0", drained.stdout
+    lines = drained.stdout.strip().splitlines()
+    # The last line is `_main()`'s own summary; anything before it is one
+    # spend-result JSON line per applied approval_decision (here: one, for a
+    # row with no real signer configured, so the spend itself refuses/errors
+    # without ever touching stdout's final line's shape).
+    assert lines[-1] == "applied=1 rejected=0", drained.stdout
     assert not spooled.exists()
 
     check = ledger.connect(db, migrate=False)
@@ -383,19 +570,34 @@ def test_cli_record_then_drain():
 
 # --- runner ------------------------------------------------------------------
 
+# This suite runs INSIDE a Claude Code session; lifecycle.policy's
+# require_no_recursion() (reached via a spent approve draining into
+# open_episode()) refuses unconditionally when any of these are set. Popped
+# for the whole run, restored after.
+_RECURSION_MARKERS = ("CLAUDE_CODE_SESSION", "CLAUDECODE", "CLAUDE_SESSION_ID", "CLAUDE_ENTRYPOINT")
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
     passed = 0
     failures: list[str] = []
-    for name, fn in tests:
-        try:
-            fn()
-            passed += 1
-        except AssertionError as e:
-            failures.append(f"{name}: {e}")
-        except Exception:
-            failures.append(f"{name}: unexpected exception\n{traceback.format_exc()}")
+    saved_recursion_markers = {m: os.environ.pop(m, None) for m in _RECURSION_MARKERS}
+    try:
+        for name, fn in tests:
+            try:
+                fn()
+                passed += 1
+            except AssertionError as e:
+                failures.append(f"{name}: {e}")
+            except Exception:
+                failures.append(f"{name}: unexpected exception\n{traceback.format_exc()}")
+    finally:
+        for m, v in saved_recursion_markers.items():
+            if v is None:
+                os.environ.pop(m, None)
+            else:
+                os.environ[m] = v
 
     print(f"{passed}/{len(tests)} passed")
     if failures:

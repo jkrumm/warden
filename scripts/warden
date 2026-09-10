@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# warden — thin launcher into scripts/warden.py, resolved relative to this
+# file so it works regardless of the caller's cwd (same shape as every other
+# `scripts/*` entry point in this repo).
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$DIR/../.venv/bin/python3" "$DIR/warden.py" "$@"

@@ -75,15 +75,21 @@ dispatch bridge itself owns (job id, repo, tier, artifact URL) and never
 carries episode-authored text — see build_nudge_body()'s docstring for why
 that boundary is a security property, not a style choice.
 
-LOST JOBS. sideclaw prunes a job ~24 h after it finishes. A dispatch whose
+PRUNED JOBS. sideclaw prunes a job ~24 h after it finishes. A dispatch whose
 verdict was never folded in before that (sideclaw restarted mid-run, the
 sweeper was down for a day, the job id was never real) answers 404 forever,
 and "retry next sweep" forever is a debt that can never be paid. So a 404 —
 and ONLY a 404, never a connection failure — increments `poll_misses` on the
-row; the third consecutive one marks the row terminal `lost`, delivers a
-one-line notice into the origin thread (or the undeliverable sentinel), and
-stamps `reported_at` so it is never polled again. A successful poll resets
-the counter, so three misses spread across a flapping sideclaw do not count.
+row; the third consecutive one marks the row terminal `failed` (verdict_json
+left NULL — there never was one), delivers a one-line notice into the origin
+thread (or the undeliverable sentinel), and stamps `reported_at` so it is
+never polled again. A successful poll resets the counter, so three misses
+spread across a flapping sideclaw do not count.
+
+CANCELLED JOBS. `cancelled` (sideclaw's own cancel endpoint) is terminal
+exactly like done/failed/interrupted — folded back into the row, delivered
+with its own short "cancelled (aborted)" message, and folded onto a triage
+card via `fold_dispatch_verdict()` the same as any other terminal status.
 
 Source of truth: ~/SourceRoot/warden/scripts/dispatch-sweep.py
 ~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
@@ -97,13 +103,22 @@ import datetime as dt
 import importlib.util
 import json
 import os
-import sqlite3
 import subprocess
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+# scripts/ (this file's own directory) onto sys.path so `clients` is
+# importable as a real package — the same reason triage.py does this.
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from clients import sideclaw as _sideclaw  # noqa: E402
+from clients.errors import RemoteError  # noqa: E402
 
 HERMES_HOME = Path.home() / ".hermes"
 # The ledger. `~/.warden/warden.db` since the extraction — the same file
@@ -117,18 +132,19 @@ WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
 DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
            if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
-# Same override hermes-cc.sh honors (HERMES_CC_SIDECLAW_BASE / it reads the same
-# dispatches table) — localhost, unauthenticated, reachable only from this machine.
-SIDECLAW_BASE = os.environ.get("HERMES_CC_SIDECLAW_BASE", "http://localhost:7705")
-
-SIDECLAW_POLL_TIMEOUT = 15  # seconds; a bare GET against a localhost job server
-
-TERMINAL_STATUSES = {"done", "failed", "interrupted"}
-# Consecutive sideclaw 404s before a row is declared lost. Three sweeps = 15 min,
-# long enough to ride out a sideclaw restart that briefly answers 404 for
-# everything, short enough that a pruned job does not haunt every sweep for weeks.
+# sideclaw's own terminal statuses (done/failed/interrupted/cancelled) —
+# clients/sideclaw.py's TERMINAL is this sweeper's own vocabulary now, not a
+# copy of it: a job in any of these is done reporting, one way or another.
+TERMINAL_STATUSES = _sideclaw.TERMINAL
+# Consecutive sideclaw 404s before a row is declared pruned. Three sweeps = 15
+# min, long enough to ride out a sideclaw restart that briefly answers 404 for
+# everything, short enough that a pruned job does not haunt every sweep for
+# weeks. There is no local `lost` status any more — a pruned job is recorded
+# as a genuine `status='failed'` with `verdict_json` left NULL (there never
+# was one to record), the same terminal status a real failure gets, just
+# distinguishable by having no verdict at all.
 LOST_AFTER_MISSES = 3
-LOST_STATUS = "lost"
+PRUNED_STATUS = "failed"
 
 # --- Wake-up nudge (argo Slack API) -----------------------------------------
 #
@@ -212,57 +228,42 @@ def db_connect() -> sqlite3.Connection:
 
 
 def _apply_db_override(argv: list[str]) -> None:
-    """--db PATH, or the HERMES_CC_DB env var hermes-cc.sh already honors
-    (same table) — lets a test point this at a throwaway copy of the DB
-    without touching the real ~/.hermes/watchdog.db. Mirrors watchdog-poll.py's
+    """--db PATH — lets a test point this at a throwaway copy of the DB
+    without touching the real ~/.warden/warden.db. Mirrors watchdog-poll.py's
     dry-run DB_PATH swap: reassign the module-level global before db_connect()
-    ever opens it."""
+    ever opens it. The env-var override is WARDEN_DB, already applied once at
+    module load (see DB_PATH above) — this only ever handles the argv form."""
     global DB_PATH
     if "--db" in argv:
         idx = argv.index("--db")
         if idx + 1 < len(argv):
             DB_PATH = Path(argv[idx + 1]).expanduser()
-            return
-    env_override = os.environ.get("HERMES_CC_DB")
-    if env_override:
-        DB_PATH = Path(env_override).expanduser()
-
-
-def http_get(url: str, timeout: int = SIDECLAW_POLL_TIMEOUT) -> Any:
-    """An HTTP error keeps its status (`_status`) so a 404 — the job is gone —
-    is distinguishable from a connection failure, where it is not."""
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        return {"_error": str(e), "_status": e.code}
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, ValueError) as e:
-        return {"_error": str(e)}
 
 
 NOT_FOUND = "not_found"
 
 
 def poll_job(job_id: str) -> dict[str, Any] | str | None:
-    """GET the sideclaw job. The job dict on 200; the sentinel NOT_FOUND on a
-    404 (sideclaw pruned it, or never had it); None on any other transport/
-    parse failure or malformed envelope — never raises, so one unreachable poll
-    can't take the sweep down."""
-    data = http_get(f"{SIDECLAW_BASE}/api/jobs/{job_id}")
-    if isinstance(data, dict) and data.get("_status") == 404:
-        return NOT_FOUND
-    if not isinstance(data, dict) or "_error" in data or not data.get("ok"):
+    """GET the sideclaw job via `clients.sideclaw.get()`. The job dict on a
+    real read; the sentinel NOT_FOUND on a 404 (sideclaw pruned it, or never
+    had it — `sideclaw.get()` already turns that into a bare `None`, which
+    this function re-labels); None on any other transport/parse failure
+    (`RemoteError`) — never raises, so one unreachable poll can't take the
+    sweep down."""
+    try:
+        job = _sideclaw.get(job_id)
+    except RemoteError as e:
+        print(f"dispatch-sweep: could not poll sideclaw for job {job_id}: {e}", file=sys.stderr)
         return None
-    job = data.get("job")
-    return job if isinstance(job, dict) else None
+    return NOT_FOUND if job is None else job
 
 
 def http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str],
                     timeout: int = ARGO_HTTP_TIMEOUT) -> Any:
-    """POST sibling of http_get — same urllib idiom, same never-raise contract:
-    any transport/parse failure folds into a {"_error": ...} dict rather than
-    propagating, so a bad nudge attempt can't take the sweep down."""
+    """The one raw-urllib POST this script makes (the homelab nudge webhook).
+    Never-raise contract: any transport/parse failure folds into a
+    {"_error": ...} dict rather than propagating, so a bad nudge attempt
+    can't take the sweep down."""
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, method="POST",
@@ -460,6 +461,13 @@ def format_message(*, repo: str, tier: str, job_id: str, status: str,
     job_short = job_id[:8]
     merged = bool(merged_at)
 
+    if status == "cancelled":
+        lines = [
+            f":no_entry_sign: Dispatch cancelled (aborted) — {repo}",
+            f"_tier {tier} · job `{job_short}`_",
+        ]
+        return _finalize(lines)
+
     if status in ("failed", "interrupted"):
         lines = [
             f":warning: Dispatch {status} — {repo}",
@@ -540,29 +548,32 @@ def format_message(*, repo: str, tier: str, job_id: str, status: str,
     return _finalize(lines)
 
 
-def lost_notice(*, repo: str, tier: str, job_id: str, misses: int) -> str:
-    """The one line a lost dispatch gets. Bridge-owned fields only."""
+def pruned_notice(*, repo: str, tier: str, job_id: str, misses: int) -> str:
+    """The one line a pruned dispatch gets. Bridge-owned fields only."""
     return (
-        f":ghost: Dispatch lost — {repo}: sideclaw no longer has job `{job_id[:8]}` "
-        f"({misses} consecutive 404s) and no verdict was ever recorded. Not retried. "
-        f"_tier {tier}_"
+        f":ghost: Dispatch pruned — {repo}: sideclaw pruned this job before it reported "
+        f"(`{job_id[:8]}`, {misses} consecutive 404s) and no verdict was ever recorded. "
+        f"Not retried. _tier {tier}_"
     )
 
 
-def _mark_lost(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry_run: bool) -> None:
+def _mark_pruned(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry_run: bool) -> None:
     job_id, repo, tier = row["job_id"], row["repo"], row["tier"]
-    body = lost_notice(repo=repo, tier=tier, job_id=job_id, misses=misses)
+    body = pruned_notice(repo=repo, tier=tier, job_id=job_id, misses=misses)
     origin_channel = row["origin_channel"]
     origin_thread_ts = row["origin_thread_ts"]
     target = (f"slack:{origin_channel}:{origin_thread_ts}" if origin_thread_ts
               else f"slack:{origin_channel}") if origin_channel else None
     if dry_run:
-        print(f"[dry-run] would mark job {job_id} (repo {repo}) lost and send to {target or 'nowhere'}:\n{body}\n")
+        print(f"[dry-run] would mark job {job_id} (repo {repo}) pruned and send to {target or 'nowhere'}:\n{body}\n")
         return
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    # verdict_json is explicitly cleared — there never was one to record, and
+    # this is now a genuine status='failed' row indistinguishable from a real
+    # failure except by having no verdict at all.
     conn.execute(
-        "UPDATE dispatches SET status=?, finished_at=?, poll_misses=? WHERE job_id=?",
-        (LOST_STATUS, now_iso, misses, job_id),
+        "UPDATE dispatches SET status=?, verdict_json=NULL, finished_at=?, poll_misses=? WHERE job_id=?",
+        (PRUNED_STATUS, now_iso, misses, job_id),
     )
     conn.commit()
     stamp: str | None = None
@@ -574,7 +585,7 @@ def _mark_lost(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry_r
             stamp = now_iso
         else:
             print(
-                f"dispatch-sweep: lost notice for job {job_id} (repo {repo}) did not send — "
+                f"dispatch-sweep: pruned notice for job {job_id} (repo {repo}) did not send — "
                 f"reported_at left NULL, next sweep re-sends the notice",
                 file=sys.stderr,
             )
@@ -608,12 +619,19 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
     misses = int(row["poll_misses"] or 0) if "poll_misses" in row.keys() else 0
     if job == NOT_FOUND:
         misses += 1
-        if row["status"] == LOST_STATUS or misses >= LOST_AFTER_MISSES:
-            _mark_lost(conn, row, misses, dry_run=dry_run)
+        # No `row["status"]`-based fallback here any more: the pruned status
+        # IS `'failed'` now (PRUNED_STATUS), the same value a real failure
+        # gets, so branching on it would misfire on a genuinely failed
+        # dispatch that sideclaw later prunes. `poll_misses` alone is the
+        # trigger — and it is durable across passes (a delivery that failed
+        # after marking pruned leaves poll_misses already at/above the
+        # threshold, so the very next pass re-enters this branch regardless).
+        if misses >= LOST_AFTER_MISSES:
+            _mark_pruned(conn, row, misses, dry_run=dry_run)
             return
         print(
             f"dispatch-sweep: sideclaw has no job {job_id} (repo {repo}) — miss {misses}/"
-            f"{LOST_AFTER_MISSES}, marking lost at {LOST_AFTER_MISSES}",
+            f"{LOST_AFTER_MISSES}, marking pruned at {LOST_AFTER_MISSES}",
             file=sys.stderr,
         )
         if not dry_run:

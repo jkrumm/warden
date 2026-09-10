@@ -33,7 +33,7 @@ and the two edges it writes.
 |-|-|-|
 | Signal | One deduplicated alert row, owned by `watchdog-poll.py` | `events` |
 | Item | One triage problem, 1:1 with an `events` row, owned by `triage.py` | `triage_items` |
-| Episode | One sideclaw `investigate` dispatch, owned by `hermes-cc.sh` | `dispatches` |
+| Episode | One sideclaw `investigate` dispatch, owned by `scripts/lifecycle/dispatch.py` | `dispatches` |
 
 `triage_items.event_id` is both the primary key and the stable identity across
 a resolve -> recur cycle: a grouped or state source reuses the *same*
@@ -190,9 +190,9 @@ A policy rule can carry `verb` instead of `repo` — routes to a declared,
 CODE-SIDE ALLOWLISTED local command (`VERB_ALLOWLIST` in `scripts/triage.py`)
 rather than a sideclaw episode. The policy file names a KEY (`"env-check"`),
 never a command — a policy file must never be able to name an arbitrary
-argv, the same closed-verb-set principle `hermes-cc.sh`'s own
-dispatch/status/list/merge/cancel verbs use, applied to a bounded local
-probe instead of an episode.
+argv, the same closed-verb-set principle the `warden` CLI's own
+`dispatch|status|list|merge|abort|revert` verbs use, applied to a bounded
+local probe instead of an episode.
 
 Seeded with exactly one: `env-check` (`hermes-ops.sh env-check --json`, two
 sequential ssh probes of homelab/vps's shared `.env.tpl`), which
@@ -615,34 +615,44 @@ obligation.
 
 ## Escalation — the two edges
 
-`escalate_cluster()` shells out to:
+`escalate_cluster()` calls straight into the Python lifecycle module, no
+subprocess and no argv at all:
 
-```
-scripts/hermes-cc.sh dispatch <repo> --tier investigate --json \
-  --origin-event <primary member's events.id> --origin-channel <card channel>
+```python
+target = _policy.resolve_repo(repo)
+opened = _dispatch.open_episode(
+    conn, target=target, tier="investigate", brief=brief, context=None, why=None, model=None,
+    origin=_dispatch.Origin(channel=channel, thread_ts=None, event_id=primary["event_id"]),
+    authorized_by=None,
+)
 ```
 
-with the brief on stdin (never argv — see `docs/dispatch-bridge.md`'s "brief
-is data, never command" rule; capped in Python at `MAX_BRIEF_CHARS` = 8000
-before it ever reaches the subprocess, matching hermes-cc.sh's own ceiling).
-`--origin-event` takes exactly one `events.id` (one `dispatches` row = one
-episode), so it's the cluster's PRIMARY member; `--origin-thread` is omitted
+The brief is a plain function argument (never argv, never stdin to shell
+out over — see `docs/dispatch-bridge.md`'s "brief is data, never command"
+rule for why that invariant existed in the first place); capped in Python at
+`MAX_BRIEF_CHARS` = 8000 BEFORE this call, by `_build_cluster_brief()`'s own
+`_cap_brief()`, matching `lifecycle/dispatch.py`'s own `normalize_brief()`
+ceiling (triage.py never reaches that function — it always caps first).
+`origin.event_id` takes exactly one `events.id` (one `dispatches` row = one
+episode), so it's the cluster's PRIMARY member; `thread_ts` is omitted
 because the card doesn't exist yet at dispatch time (see *Carded states* —
-`new` never has one). The card is posted immediately AFTER the dispatch
-succeeds (the first time this cluster becomes `investigating`, a CARDED
-state), and `escalate_cluster()` then does one small follow-up
-`UPDATE dispatches SET origin_thread_ts=?` — the same "extra writer touching
-one column it doesn't own" pattern `dispatch-sweep.py` already uses for
-`status`/`verdict_json`/`artifact_url`/`merged_at`/`poll_misses`/
-`reported_at` on this same table — so `dispatch-sweep.py`'s existing
-actionable-dispatch nudge still lands on the card's own thread.
+`new` never has one). Any `WardenError` — a denied/unresolvable repo, a
+remote failure — is caught, logged to stderr, and returns `None`, exactly
+like the old subprocess-refusal path did. The card is posted immediately
+AFTER the dispatch succeeds (the first time this cluster becomes
+`investigating`, a CARDED state), and `escalate_cluster()` then does one
+small follow-up `UPDATE dispatches SET origin_thread_ts=?` — the same "extra
+writer touching one column it doesn't own" pattern `dispatch-sweep.py`
+already uses for `status`/`verdict_json`/`artifact_url`/`merged_at`/
+`poll_misses`/`reported_at` on this same table — so `dispatch-sweep.py`'s
+existing actionable-dispatch nudge still lands on the card's own thread.
 
 Two edges were always NULL before this file:
 
-- `dispatches.origin_event_id` — hermes-cc.sh's `--origin-event` flag already
-  existed and already writes this as part of its own `INSERT`; `escalate_cluster()`
-  just has to pass the flag (for the primary member only — `--origin-event`
-  takes a single id). No second writer races `dispatches` for this column.
+- `dispatches.origin_event_id` — `open_episode()`'s own `INSERT` writes this
+  from `origin.event_id` directly (for the primary member only — one
+  `dispatches` row takes a single origin event). No second writer races
+  `dispatches` for this column.
 - `events.dispatch_id` — nothing wrote this. `escalate_cluster()` looks up the
   freshly-inserted `dispatches.id` by `job_id` and does the
   `UPDATE events SET dispatch_id=?` for EVERY member of the cluster, not just
@@ -718,8 +728,8 @@ hand-fixed once, and never entered the map, so it matched nothing when it
 fired again four months later. `propose_mappings()` (step 8 in the loop
 above) is the ONE LLM call anywhere in `scripts/triage.py` — everywhere else,
 "no LLM call" still means exactly what it always did (the dispatched
-`investigate` episode itself running Claude Code is a property of
-hermes-cc.sh, not of this file).
+`investigate` episode itself running Claude Code is inherent to what
+"investigate" means, not something this loop does itself).
 
 **Cadence and input.** At most once per 24h — a timestamp cursor in the same
 `cursors` table the daily digest already uses (`triage_propose_mappings_last_run`),
@@ -748,11 +758,13 @@ other externally-visible call in this file.
 **Applying a proposal.** `ignore` and `map` are NEVER written to
 `triage_items` directly — they only ever become policy entries, picked up by
 `classify()` on a LATER run, exactly like a hand-written rule would be. A
-`map` proposal's `repo` is re-validated against `_discoverable_repos()` (the
-same discovery `hermes-cc.sh`'s own `resolve_repo()` uses: every non-dotted,
-non-`deny`d entry directly under `root` with a `.git` subdirectory) AND the
-deny list — never trusted from the model's own claim, or from the prompt's
-own repo list, alone. `unsure` writes a cooldown marker
+`map` proposal's `repo` is re-validated against `_discoverable_repos()` (which
+delegates to `lifecycle.policy`'s own `load_dispatch_policy()`/
+`_discoverable()` — the SAME discovery `lifecycle.policy.resolve_repo()`
+uses: every non-dotted, non-`deny`d entry directly under `root` with a
+`.git` subdirectory) AND the deny list — never trusted from the model's own
+claim, or from the prompt's own repo list, alone. `unsure` writes a cooldown
+marker
 (`triage_items.propose_unsure_at`) directly, so the SAME signature is not
 re-billed into the model for `PROPOSE_UNSURE_COOLDOWN_DAYS` (7).
 
@@ -896,11 +908,10 @@ it explains the same contract from inside the file itself.
 | Constant | Default | Env override | Why |
 |-|-|-|-|
 | `MAX_OPEN_INVESTIGATIONS` | 3 | `TRIAGE_MAX_OPEN_INVESTIGATIONS` | Concurrency ceiling on open CLUSTERS (distinct `dispatch_job`s in `investigating`) — sideclaw's own concurrency is shared with every other dispatch source |
-| `DAILY_INVESTIGATE_BUDGET` | 8 | `TRIAGE_DAILY_INVESTIGATE_BUDGET` | Well under hermes-cc.sh's own 20/day so a triage storm can never starve interactive dispatch. Counts clusters, not member items |
+| `DAILY_INVESTIGATE_BUDGET` | 8 | `TRIAGE_DAILY_INVESTIGATE_BUDGET` | Well under `WARDEN_DAILY_BUDGET`'s own 20/day (`lifecycle/policy.py`) so a triage storm can never starve interactive dispatch. Counts clusters, not member items |
 | `MAX_CLUSTER_SIGNATURES` | 5 | — | Signatures riding in one cluster's brief; the rest wait for a later run |
-| `SUBPROCESS_TIMEOUT` | 60s | `TRIAGE_SUBPROCESS_TIMEOUT` | Bounds the hermes-cc.sh subprocess call inside a 10-minute cron |
 | `VERB_TIMEOUT` | 260s | — | `env-check` runs TWO sequential ssh probes, each individually bounded by hermes-ops.sh's own `SSH_TIMEOUT=120` — the outer bound has to clear 240s or it would kill a legitimately slow-but-healthy probe |
-| `MAX_BRIEF_CHARS` | 8000 | — | Mirrors hermes-cc.sh's own `MAX_BRIEF_CHARS`; enforced in Python before the brief reaches a subprocess |
+| `MAX_BRIEF_CHARS` | 8000 | — | Mirrors `lifecycle/dispatch.py`'s own `MAX_BRIEF_CHARS`; enforced in Python (`_cap_brief()`) BEFORE `open_episode()` is ever called, so an oversize brief is capped, never refused |
 | `EVIDENCE_TIMEOUT` | 20s | `TRIAGE_EVIDENCE_TIMEOUT` | Hard wall-clock bound per evidence gatherer (a stuck file read or a slow argo API call must never stall a 10-minute cron) |
 | `EVIDENCE_CAP_CHARS` | 1200 | — | Per-key cap on rendered evidence text, before the whole-block cap below |
 | `EVIDENCE_TOTAL_CAP_CHARS` | 3200 | — | Whole evidence block cap — well under `MAX_BRIEF_CHARS` so a 5-signature cluster (each pulling its own evidence) still leaves room for the rest of the brief |
@@ -911,18 +922,19 @@ NULL AND created_at >= <today, UTC>` — the same marker `escalate_cluster()`
 writes, so no separate accounting column is needed. Both caps are checked
 once per run and decremented as clusters open, so a later repo in the same
 run correctly sees an exhausted cap — including under `--dry-run`, where
-`escalate_cluster()` always returns `None` (it never calls hermes-cc.sh), so
-the caps still advance on the dry-run path specifically so a multi-repo
-preview simulates what a real run would actually allow. A Slack or sideclaw
-failure for one cluster logs to stderr and returns without aborting the rest
-of the run — every DB write in the loop is per-cluster and independently
-committed.
+`escalate_cluster()` always returns `None` (it never calls sideclaw, GitHub
+or Slack — the `clients`/`lifecycle` modules are the boundary, and dry-run
+never crosses it), so the caps still advance on the dry-run path
+specifically so a multi-repo preview simulates what a real run would
+actually allow. A Slack or sideclaw failure for one cluster logs to stderr
+and returns without aborting the rest of the run — every DB write in the
+loop is per-cluster and independently committed.
 
 ## CLI verbs
 
-`--run` (default) · `--dry-run` · `--db <path>` · `--snooze <signature>
---hours N` · `--ignore <signature>` · `--reopen <signature>` ·
-`--close <signature> --reason <text>` · `--list`.
+`triage.py` itself: `--run` (default) · `--dry-run` · `--db <path>` ·
+`--snooze <signature> --hours N` · `--ignore <signature>` · `--reopen
+<signature>` · `--close <signature> --reason <text>` · `--list`.
 `--snooze`/`--ignore`/`--reopen`/`--close` mutate `triage_items` and exit
 immediately — they never call Slack or sideclaw. `--close` transitions to
 `closed` and refuses (non-zero) an empty `--reason` or an unknown signature,
@@ -930,8 +942,24 @@ same as `_set_state()` already refuses a reasonless `dismissed`. `--dry-run` run
 passes for real (ingest/reopen/unsnooze/classify/resolve — all side-effect-free
 against `triage_items` alone) so a preview against a throwaway copy of
 `watchdog.db` is meaningful, but never calls Slack (`post_blocks`/
-`update_blocks`) and never shells out to `hermes-cc.sh` — those are the only
-two externally-visible actions this file can take.
+`update_blocks`), sideclaw or GitHub — those are the only externally-visible
+actions this file can take.
+
+Separately, `scripts/warden` — the general-purpose CLI over the same
+`clients`/`lifecycle` modules this loop calls as functions, for a human or an
+agent driving a dispatch by hand:
+
+| Verb | What |
+|-|-|
+| `dispatch <repo>` | Open a sideclaw episode (`--tier`, `--why`, `--context-file`, `--origin-*`) |
+| `status <job>` | Read one job's current status |
+| `list` | Open/today/all dispatches |
+| `merge <job> --why --confirm` | Land a completed `implement` episode's pull request |
+| `abort <item> --why` | Cancel an in-flight episode for a triage item |
+| `revert <item> --pr N --why` | Record that a later, named PR undid this item's fix (→ `STATE_REVERTED`) |
+
+`--run`/`--dry-run`/`--close`/… stay on `triage.py` — those are the loop's own
+bookkeeping verbs, not dispatch-lifecycle ones, and have no reason to move.
 
 ## Why a LaunchAgent, not `hermes cron`
 
@@ -969,61 +997,95 @@ no chicken-and-egg dependency on the gateway being up.
 
 ## Operations — the crash-recovery unit (schema 5)
 
-Steps 6 and 8 below each make one external, non-atomic call — `hermes-cc.sh
-dispatch --tier implement`, and `merge --confirm` — that this ledger cannot
-undo if the process dies mid-call. `operations` (schema 5) is what makes
-restarting mid-chain lossless rather than duplicating or misreporting the
-result, per DESIGN.md § Crash recovery.
+Steps 6, 8 and the deploy that follows a merge each make one external,
+non-atomic call — `lifecycle/dispatch.py`'s `open_episode(tier="implement")`,
+`lifecycle/merge.py`'s `plan_or_land(confirm=True)`, and its own
+`rollout_after_merge()` — that this ledger cannot undo if the process dies
+mid-call. `operations` (schema 5) is what makes restarting mid-chain lossless
+rather than duplicating or misreporting the result, per DESIGN.md § Crash
+recovery.
 
-**Scope: the mutating chain only.** An `implement` operation covers the call
-that opens a branch and a draft PR; a `merge` operation covers the call that
-merges, deletes the branch and (best-effort) deploys — recorded as ONE
-operation even though `merge --confirm` is itself a compound external call
-(GraphQL ready-for-review, `PUT /pulls/:pr/merge`, a branch delete, then `ssh
-<host> make <target>`) behind a single subprocess boundary; there is no
-write-point between the merge and the deploy without a `hermes-agent`
-change, which is out of scope here. `investigate`/validation episodes never
-get one — they are read-only, run in their own sideclaw worktree, mutate
-nothing outside it, and `dispatch-sweep.py`'s existing `poll_misses`/`lost`
-path already covers a forgotten job.
+**Scope: the mutating chain only, three kinds.** `implement` covers the call
+that opens a branch and a draft PR. `merge` covers ready-for-review + `PUT
+/pulls/:pr/merge` + a branch delete. `deploy` covers the rollout AFTER a
+merge — its own write-point since Wave 5, not folded into `merge` any more:
+the ssh-argv path (`autoDeploy`) and the GitHub-Actions path
+(`deployOnMerge`) are each their own external mutation with their own crash
+window, and now that both run as in-process Python calls (not one bash
+subprocess covering merge+deploy together) there is nothing stopping a write
+between them — so there is one. `investigate`/validation episodes never get
+one — they are read-only, run in their own sideclaw worktree, mutate nothing
+outside it, and `dispatch-sweep.py`'s own pruned-job handling already covers
+a forgotten job.
+
+**`event_id` may be NULL.** Every operation this loop itself opens
+(`maybe_auto_implement()`, `poll_validation_jobs()`) carries the triage
+item's `event_id`. A Slack-door `implement` (`scripts/warden dispatch --tier
+implement`) or a signed-approval spend (`lifecycle/approvals.py`'s
+`execute_approved()`) has no triage item behind it at all — its operation's
+`event_id` is NULL, and `reconcile_operations()` resolves it exactly the
+same way, just skipping every item-state step afterward (there is no item to
+move).
 
 **The write order, always.** `record_operation()` INSERTs and commits BEFORE
 the external call runs — the commit is the entire contract: the row has to be
-durable before this process goes on to shell out. `complete_operation()`
+durable before this process goes on to make the call. `complete_operation()`
 writes the outcome AFTER the call returns — but ONLY when the return is
-unambiguous. A subprocess timeout or unparseable stdout can each follow a
-call the external system already accepted (`hermes-cc.sh` may have already
-POSTed to sideclaw, or the merge may have already landed before the timeout
-fired), so the call sites (`maybe_auto_implement()`, `poll_validation_jobs()`)
+unambiguous. A `RemoteError` can follow a call the external system already
+accepted (sideclaw may have already accepted the submission, or the merge may
+have already landed before the response was lost), so the call sites
 deliberately leave the row's `outcome` NULL in that case rather than guess —
-"a timeout is not a refusal."
+"an ambiguous return is not a refusal." (`open_episode()` and `plan_or_land()`
+each resolve their OWN gated call to `unknown` immediately when they catch
+exactly this ambiguity in-process — that is a different thing from a row left
+NULL by a genuine crash; see `lifecycle/operations.py`'s own docstring.)
 
-**`outcome` is one of three values**, a closed allowlist (`_OPERATION_OUTCOMES`
-in triage.py): `done`, `failed`, or `unknown`. `failed` means the call
-definitely never took effect (the subprocess never ran, or the external
-system gave a plain, parseable refusal). `unknown` means this process cannot
-tell — and an item behind an `unknown` operation is never retried: it stays
-in whatever non-`new` state the claim put it in (`implementing`/`validating`,
-never rolled back), which keeps it out of every eligibility query that could
-re-fire the same call.
+**`outcome` is one of three values**, a closed allowlist (`operations.OUTCOMES`,
+aliased in triage.py as `_OPERATION_OUTCOMES`): `done`, `failed`, or
+`unknown`. `failed` means the call definitely never took effect (the request
+never reached anything, or the external system gave a plain, parseable
+refusal). `unknown` means this process cannot tell — and an item behind an
+`unknown` operation is never retried: it stays in whatever non-`new` state
+the claim put it in (`implementing`/`validating`, never rolled back), which
+keeps it out of every eligibility query that could re-fire the same call.
 
 **`reconcile_operations()` runs FIRST in every pass**, before even
 `drain_intents()` — see `run()`'s own ordering. Every `operations` row with
-`outcome IS NULL` (a genuine crash, or a call site's deliberately-left-open
-ambiguity — both look the same from here) gets asked about directly:
-`_hermes_cc_status(job_id)` for `implement` (a pruned job returns 404,
-byte-identical to a job id that never existed, so absence maps to `unknown`,
-never `failed`); `gh pr view <pr> --repo <owner>/<repo>` for `merge` (the PR
-is parsed from `dispatches.artifact_url` with the same regex `cmd_merge`
-itself uses). A `merge` operation GitHub reports as merged always resolves to
-`done`, carrying `mergeCommit` in its receipt — never `merge_blocked`, which
-is the exact "silently read as failure" bug DESIGN.md names. The deploy half
-has no remote answer (`ssh <host> make <target>` returns only an exit code to
-a process that is gone), so a reconciled merge's receipt honestly records
-`"deploy": "unknown"` rather than guessing. **An operation that reconciliation
-still cannot resolve moves its item to `needs_human`** — "we do not know
-whether the world changed" is exactly the case this system routes to a
-person.
+`outcome IS NULL` (a genuine crash — nothing ever ran the completion code at
+all) gets asked about directly: `clients.sideclaw.get(job_id)` for
+`implement` (a pruned job returns a bare `None`, byte-identical to a job id
+that never existed, so absence maps to `unknown`, never `failed`; `cancelled`
+joins `failed`/`interrupted`); `gh pr view <pr> --repo <owner>/<repo>` for
+`merge` (unchanged — GitHub is authoritative, and the PR is parsed from
+`dispatches.artifact_url`). A `merge` operation GitHub reports as merged
+always resolves to `done`, carrying `mergeCommit` in its receipt — never
+`merge_blocked`, which is the exact "silently read as failure" bug DESIGN.md
+names. For `deploy`: a `mergeCommit` (recovered from the receipt, or from the
+sibling `merge` operation's own completed receipt) is looked up via
+`clients.github.actions_runs()` — any run found resolves `done`, folding the
+runs into the receipt, and (if the item is still `merged` on a
+`deployOnMerge` repo) advances it to `liveness_pending`; no run found and the
+operation started over 2h ago resolves `failed`; no run found and it is still
+recent leaves the row genuinely open, no write at all, for the next pass to
+ask again. An ssh (`autoDeploy`) deploy left open by a genuine crash has no
+remote receipt to ask for at all, so it resolves `unknown` outright.
+**An operation that reconciliation still cannot resolve moves its item to
+`needs_human`** — "we do not know whether the world changed" is exactly the
+case this system routes to a person.
+
+**Proving it, deliberately: `WARDEN_KILL_AT`.** `scripts/lifecycle/chaos.py`'s
+`crash_point(name)` is a no-op unless the env var `WARDEN_KILL_AT` names that
+exact point, in which case the process exits hard (`os._exit(137)`, no
+cleanup) right there — the same shape a real `kill -9` or a power loss would
+leave behind. This is how the crash-recovery claims above are actually
+exercised rather than merely reasoned about (DESIGN.md § Migration Wave 3's
+stop-condition exercise). The closed list of points, in call order across a
+chain: `before-implement-open`, `after-implement-op`, `after-implement-submit`
+(all three in the implement path), `before-merge`, `after-merge-op`,
+`after-merge-put`, `after-merged-at`, `after-deploy-op`,
+`after-merge-before-state` (the merge/deploy path), `before-fixed` (the
+liveness-confirm write). A name outside this list raises `ValueError` —
+chaos points are a closed allowlist, same reasoning as `_SET_STATE_COLUMNS`.
 
 ## Closing the loop — verdict → implement → validate → merge → deploy → verify
 
@@ -1036,15 +1098,24 @@ dispatched episodes each run one, same as `escalate_cluster()` always has.
 **Step 6 — `maybe_auto_implement()`.** A `verdict`-state item whose folded
 investigate verdict already reads `nextAction: implement` at
 `confidence: high`, and has never been auto-implemented before
-(`implement_job IS NULL`), gets one `hermes-cc.sh dispatch <repo> --tier
-implement --auto-from-item <event_id>` call. `--auto-from-item` is
-hermes-cc.sh's own second door into `implement` — a precondition the caller
-cannot fabricate cheaply (every fact it checks is a row a REAL, completed
-investigation wrote earlier), not a cryptographic proof of origin the way
-`--confirm`'s signed approval is. See `docs/dispatch-bridge.md` for the full
-gate. State: `verdict` → `implementing`.
+(`implement_job IS NULL`), is checked against `lifecycle.policy`'s own
+`require_auto_from_item()` and `check_repo_not_in_flight()` — the same
+precondition/in-flight checks a `--auto-from-item` dispatch always ran, now
+read straight off the ledger instead of re-derived inside a subprocess. A
+refusal here is a DEFERRAL, never a rollback: nothing was claimed yet, so
+the item stays in `verdict` with the reason written into `note`, prefixed
+`deferred: ` (DESIGN.md § What must not be lost — a deferral must be
+visible), and the card is synced immediately. On success the item is claimed
+(compare-and-set to `implementing`, BEFORE the episode opens — this is the
+whole fix for the historical duplication bug, see `lifecycle/dispatch.py`'s
+own `open_episode()`), then `open_episode(tier="implement", …)` is called
+directly — no subprocess, no CLI door. `RemoteError(maybe_mutated=True)`
+(sideclaw may have already accepted the job) leaves the item claimed with
+the operation already resolved `unknown` by `open_episode()` itself; every
+other refusal hands the claim back to `verdict`. State: `verdict` →
+`implementing`.
 
-**Step 7 — `poll_implement_jobs()` → `_run_hermes_cc_validation()`.** Once the
+**Step 7 — `poll_implement_jobs()` → a second `open_episode()`.** Once the
 implement episode finishes with a pull request, a SECOND `investigate`
 episode opens against the same repo, on `VALIDATION_MODEL`
 (`claude-opus-5[1m]`) — deliberately a different model from the
@@ -1058,62 +1129,73 @@ uses. **`VALIDATION_MODEL` was probed live, not guessed**: a throwaway
 outright (`[claude-code:unrecognized_model]`, exit 1 — not the harmless
 stderr telemetry line CLAUDE.md documents for that string elsewhere);
 `claude-opus-5[1m]` ran a real session and returned a structured verdict.
-Re-probe before changing this constant. An implement episode with no PR
-(failed, interrupted, or done with nothing to show) skips validation
-entirely and goes straight to `merge_blocked`. State: `implementing` →
-`validating` | `merge_blocked`.
+Re-probe before changing this constant. An implement episode that finished
+`failed`, `interrupted`, `cancelled`, or `done` with nothing to show skips
+validation entirely and goes straight to `merge_blocked`. State:
+`implementing` → `validating` | `merge_blocked`.
 
-**Step 8 — `poll_validation_jobs()` → `_run_hermes_cc_merge()`.** A
-DISAGREEING, FAILED, or ERRORED validation blocks the merge outright — never
-read as a pass. Only an explicit `CONFIRMED` marker (and no `DISAGREE`
-marker in the same text) calls `hermes-cc.sh merge <job-id> --confirm`.
-`merge`'s own `--confirm` is instruction-level, not signed (owner decision —
-confirming the implement WAS the approval, landing it finishes the thing
-already said yes to), so this call is not itself a trust boundary — the real
-bounds are inside `cmd_merge` itself, re-keyed off **declared path scope**:
-see `docs/dispatch-bridge.md`'s merge-verb section for the full gate
-(`autoMergePaths`, `noCiRequired`, the step-7 `validation_status` check).
-State: `validating` → `merged` | `liveness_pending` | `merge_blocked`.
+**Step 8 — `poll_validation_jobs()` → `lifecycle.merge.plan_or_land()`.** A
+DISAGREEING, FAILED, ERRORED, or CANCELLED validation blocks the merge
+outright — never read as a pass. Only an explicit `CONFIRMED` marker (and no
+`DISAGREE` marker in the same text) calls `plan_or_land(confirm=True,
+dry_run=False)` in-process. `confirm=True` is instruction-level, not signed
+(owner decision — confirming the implement WAS the approval, landing it
+finishes the thing already said yes to), so this call is not itself a trust
+boundary — the real bounds are inside `plan_or_land()`/`merge_gate_check()`
+itself, re-keyed off **declared path scope**: see that module's own
+docstring for the full gate (`autoMergePaths`, `noCiRequired`, the step-7
+`validation_status` check). `plan_or_land()` owns its own `merge` operation
+end to end (recorded before the mutating call, completed after) — triage.py
+no longer records one itself. A `PolicyError`/`PreconditionError` blocks the
+merge; a `RemoteError(maybe_mutated=True)` leaves the item in `validating`
+untouched (the merge may already have landed — `reconcile_operations()`
+asks GitHub on the next pass); any other `RemoteError` blocks. State:
+`validating` → `merged` | `liveness_pending` | `merge_blocked`.
 
-**Step 9 — deploy, inside `cmd_merge` itself, OFF by default.** Merging a
-repo like `vps` is not shipping — `observability/` has no CI, so an alert
-change only takes effect once `make hyperdx-apply ENV=prod` actually runs.
-On a successful merge, hermes-cc.sh checks the repo's own
-`config/triage-policy.json` entry: `autoDeploy` (default **false** — the
-mechanism ships reviewed but inert everywhere) and a `deploy` key from its
-own closed allowlist (`deploy_argv()` — a policy file names a KEY, never a
-command, same principle as `verb`/`evidence` above). **Turning it on**: flip
-`"autoDeploy": true` on the repo's entry in `config/triage-policy.json` —
-only after watching a run of merges land cleanly with it still off. For
-every path matching `observability/alerts/*.json` in the merged diff, the
-deploy step also fetches that file's content AT THE MERGE SHA (GitHub's
-contents API, never the local checkout) and records
-`name`/`threshold`/`thresholdType` as `deploy_expect_json` on the triage
-item — what step 10 verifies against. State: `merged` (no deploy) |
-`liveness_pending` (deploy attempted and succeeded).
+**Step 9 — deploy, inside `plan_or_land()`'s own `rollout_after_merge()`, OFF
+by default.** Merging a repo like `vps` is not shipping — `observability/`
+has no CI, so an alert change only takes effect once `make hyperdx-apply
+ENV=prod` actually runs. On a successful merge, `rollout_after_merge()`
+checks the repo's own `config/triage-policy.json` entry: `autoDeploy`
+(**true today for `vps`** — the mechanism has been proven safe with it off,
+see STATE.md, and is now live) and a `deploy` key from its own closed
+allowlist (`clients/rollout.py`'s `ROLLOUTS` — a policy file names a KEY,
+never a command, same principle as `verb`/`evidence` above). This is its own
+`deploy` operation now (schema 7), recorded and completed by
+`rollout_after_merge()` itself, never folded into the `merge` operation's
+receipt. For every path matching `observability/alerts/*.json` in the merged
+diff, the deploy step also fetches that file's content AT THE MERGE SHA
+(GitHub's contents API, never the local checkout) and folds
+`name`/`threshold`/`thresholdType` into `poll_validation_jobs()`'s own
+`deploy_expect_json` write on the triage item — what step 10 verifies
+against. State: `merged` (no deploy) | `liveness_pending` (deploy attempted
+and succeeded).
 
 **Step 8b — merge-is-deploy (`deployOnMerge`, item 1b).** A third outcome of
 the same `poll_validation_jobs()` merge branch, checked only once the
 `deploy.attempted && deploy.ok` case above has already said no (a
 `deployOnMerge` repo never declares `autoDeploy`, so the two never actually
 compete): if the repo's `config/triage-policy.json` entry sets
-`"deployOnMerge": true` and the merge result carried a usable 40-char-hex
-`mergeCommit`, the item goes straight to `liveness_pending` on that sha —
-`deploy_expect_json` becomes `[{"commit": "<sha>"}]`, the same
-list-of-dicts shape step 9's alert-expectation payload already uses, just
-with one key instead of three. There is no ssh half here for `deploy` to be
-`attempted`/`ok` about — this repo's own CI/CD (GitHub Actions → RollHook)
-*is* the deploy, which `DESIGN.md` § Deploy already claimed and had no code
-path for until this slice (see STATE.md §47's reconnaissance). The receipt
-`ssh <host> make <target>` structurally cannot provide — an exit code to a
-process that is dead the moment it returns — a GitHub Actions run CAN: it has
-an id, queryable after the fact by anyone. `gh run list --commit <sha>` is
-folded into the merge operation's own `receipt_json` under `deploy`
-(`{"mechanism": "deploy-on-merge", "commit": <sha>, "runs": [...] |
-"unknown"}` — `"unknown"` only when the read itself failed, an empty list
-when the workflow genuinely has not appeared yet; neither is fabricated, and
-neither is retried in a loop). A merge result with no usable sha falls
-through to plain `merged` with a reason instead — entering
+`"deployOnMerge": true` and `plan_or_land()`'s own `MergeResult.merge_commit`
+carried a usable 40-char-hex sha, the item goes straight to
+`liveness_pending` on that sha — `deploy_expect_json` becomes
+`[{"commit": "<sha>"}]`, the same list-of-dicts shape step 9's
+alert-expectation payload already uses, just with one key instead of three.
+There is no ssh half here for `deploy` to be `attempted`/`ok` about — this
+repo's own CI/CD (GitHub Actions → RollHook) *is* the deploy, which
+`DESIGN.md` § Deploy already claimed and had no code path for until this
+slice (see STATE.md §47's reconnaissance). The receipt `ssh <host> make
+<target>` structurally cannot provide — an exit code to a process that is
+dead the moment it returns — a GitHub Actions run CAN: it has an id,
+queryable after the fact by anyone. `rollout_after_merge()`'s own `deploy`
+operation already carries the run identity (`clients.github.actions_runs()`
+— `"unknown"` only when the read itself failed, an empty list, left OPEN for
+`reconcile_operations()`, when the workflow genuinely has not appeared yet;
+neither is fabricated, and neither is retried in a loop by the live path).
+`poll_validation_jobs()` itself does not re-query Actions at all any more —
+the receipt is already on the deploy operation by the time it reads
+`result.deploy`/`result.merge_commit`. A merge result with no usable sha
+falls through to plain `merged` with a reason instead — entering
 `liveness_pending` with nothing to compare against would just sit until
 `liveness_deadline` and reopen the item, worse than an honest `merged`.
 State: `validating` → `liveness_pending` (deployOnMerge, usable sha) |
@@ -1159,7 +1241,7 @@ before this file existed at all.
       "autoMergePaths": ["observability/**"],
       "noCiRequired": true,
       "deploy": "hyperdx-apply",
-      "autoDeploy": false,
+      "autoDeploy": true,
       "liveness": "hyperdx-alert-state"
     },
     "argo": {
@@ -1171,8 +1253,8 @@ before this file existed at all.
 ```
 
 `autoMergePaths`/`noCiRequired`/`deploy`/`autoDeploy` are read by
-`hermes-cc.sh`'s `cmd_merge` (via `HERMES_CC_TRIAGE_POLICY_JSON`, defaulting
-to this same file); `liveness` and `deployOnMerge` are read here, by
+`scripts/lifecycle/merge.py` (via `WARDEN_TRIAGE_POLICY`, defaulting to this
+same file); `liveness` and `deployOnMerge` are read here, by
 `maybe_check_liveness()` and `poll_validation_jobs()` respectively. Every
 changed path in a PR must match `autoMergePaths` or the merge refuses
 outright — a repo absent from `repos`, or with no `autoMergePaths`, refuses
