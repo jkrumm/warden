@@ -6447,3 +6447,76 @@ executes it; `dispatch-repos.json` located in `warden/config`; skill roster
 Wave 9 — the field review — is the owner's to start, by hand, after days
 unattended, from `docs/handover-field-review.md`. Owner items unchanged:
 argo PR #19, the PAT Issues permission, the 4.3 Slack acceptance.
+
+## 58. First field look — automatic work off Max, cards that say what to do (2026-09-11, 10:00Z → 12:30Z)
+
+Not Wave 9. The owner asked, after two days unattended, why nothing was
+actionable and what the loop had cost. Three read-only forensics passes
+(ledger + logs, sideclaw usage + routing, Slack + Argo surface) and two fixes.
+
+### What the ledger showed (2026-09-09 19:43Z → 2026-09-11 10:00Z)
+
+| | |
+|-|-|
+| Items | 57: quiet 33, needs_human 8, ignored 8, note 8, closed 4, merge_blocked 4, fixed 1, new 1 |
+| Dispatches | 20 (ids 24–43), all `done` except one `failed` superseded by a retry |
+| Real fixes | 1 `fixed` (the argo canary), 4 `closed` (3 resolved externally, 1 by a human) — zero infra recurrences resolved by the loop |
+| Loop cadence | 57 ticks in 534 min after 9c19ead, no gap >20 min; one `database is locked` in `ingest()`, poll/sweep each crashed twice on schema-version mismatch during the night migrations and self-healed |
+| needs_human | 6 distinct issues: hermes gateway wedged (uk:175/185, the slack-bolt reconnect signal with **362** occurrences), sideclaw crash (uk:204), meteo probe (uk:220), hermes patch corruption (uk:229), research-gateway OOM (uk:193) |
+| merge_blocked | 3 argo canary items (self-tests, correctly refused) + dispatch-scratch#9 (no `autoMergePaths`) |
+
+The loop is working as designed. The owner's long-standing issues are all
+host-level actions (restart a gateway, bump `slack_sdk`, read `journalctl`)
+that the design sends to `needs_human` on purpose. The gap is that a
+`needs_human` card lands once and then nothing reminds until the 168h clock
+dismisses it — `docs/api.md`'s "reminder at 1d" is still **not built**.
+
+### Cost (sideclaw.jsonl, `session.end` shadow cost since 09-09)
+
+All 17 real automatic dispatches ran on `claude-sonnet-5[1m]`/max (2 on
+Opus, manual `--model`), because warden passed `model=None` and landed on
+sideclaw's JUDGE route. Validation reviews: router on glm-5.3-flash/iu, then
+angles + synthesis on Sonnet/max. Total sideclaw spend ≈ $95, of which ≈ $80
+Sonnet/max. `usage-tracker` cannot attribute any of it to warden — sideclaw
+sets no `USAGE_LANE`, so 98 % of the last three days' spend is untagged.
+
+### Fixes (this §)
+
+- `AUTO_DISPATCH_MODEL` (`scripts/triage.py`, env
+  `TRIAGE_AUTO_DISPATCH_MODEL`, default `glm-5.3-flash`) replaces `model=None`
+  at the two automatic call sites (auto-investigate, auto-implement).
+  sideclaw's `withModel()` derives backend `iu` for a non-Claude id. Human
+  paths (`warden run --model`, approval clicks) untouched. Step-7 validation
+  has no per-call model knob; moving it is `SIDECLAW_MODEL_REVIEW` in
+  sideclaw's `.env`, which is global and a separate decision.
+- `needs_human` / `merge_blocked` cards render a `section` block: bold
+  `Action required — …`, `Do this: <note>`, and `Auto-dismissed in Nd if
+  untouched (<date>)` from `state_deadline` at day granularity so the
+  `card_hash` short-circuit still holds. Replaces the italic `↳ _note_`
+  footnote. `warden abort` refuses `merge_blocked`, so the default retry verb
+  on that card is `warden merge`.
+- `tests/test_triage.py` 213/213 (two new card tests; two existing dispatch
+  tests now assert the model).
+
+### Surface findings, not fixed here
+
+- argo PR #19 is a **draft** — that is why it never merged; every tick still
+  404s. Merging it gives the board, funnel and timelines; it cannot approve
+  (`DESIGN.md`: Argo records intent, Slack signs).
+- `#agents` has two voices: warden's cards and Hermes's project-narratives
+  digest. Dispatch-approval buttons post to `#hermes`, not next to the card.
+- The three `warden_canary` merge_blocked items sit among real ones on the
+  board.
+
+### Decisions
+
+- Automatic episodes run on the cheap IU tier; the owner overrode
+  `model-routing.md`'s "JUDGE = Sonnet over Max" for warden's unattended path.
+  Review validation stays where sideclaw routes it until measured.
+
+### Next action
+
+Owner: mark argo PR #19 ready and merge it; act on or dismiss the 6
+`needs_human` cards. Loop: build the 1-day `needs_human` reminder; tag
+sideclaw sessions with `USAGE_LANE` so cost per item is a query, not a join
+done by hand. Wave 9 remains the field review, after the reminder exists.

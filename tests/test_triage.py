@@ -1108,6 +1108,10 @@ def test_dispatch_brief_on_stdin_and_capped():
             f"brief was {len(brief)} chars, over the {triage.MAX_BRIEF_CHARS} cap"
         )
         assert brief, "brief was empty"
+        assert calls[0]["model"] == triage.AUTO_DISPATCH_MODEL, (
+            "auto-investigate must dispatch on the cheap IU model, not the owner's Max "
+            f"subscription — got {calls[0]['model']!r}"
+        )
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_INVESTIGATING
@@ -2697,6 +2701,10 @@ def test_auto_implement_fires_only_at_high_confidence():
         triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert len(calls) == 1, f"expected exactly the high-confidence item, got {len(calls)} submit call(s)"
+        assert calls[0]["model"] == triage.AUTO_DISPATCH_MODEL, (
+            "auto-implement must dispatch on the cheap IU model, not the owner's Max "
+            f"subscription — got {calls[0]['model']!r}"
+        )
         item_hi = triage._get_item(conn, eid_hi)
         assert item_hi["state"] == triage.STATE_IMPLEMENTING
         assert item_hi["implement_job"] is not None
@@ -5885,6 +5893,68 @@ def test_drain_intents_retries_pending_approved_and_never_under_dry_run():
 
         triage.drain_intents(conn, NOW, dry_run=False)
         assert spend_calls == [nonce], f"expected the pending approval to be retried, got {spend_calls}"
+
+
+def test_action_required_block_keeps_countdown_under_a_long_note():
+    """A note long enough to exhaust SECTION_TEXT_MAX must lose its own tail,
+    never the auto-dismiss countdown — the countdown is the one line the
+    human cannot recover from anywhere else on the card."""
+    deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3)).isoformat()
+    block = triage._action_required_block(triage.STATE_NEEDS_HUMAN, "x" * 5000, deadline)
+    text = block["text"]["text"]
+    assert len(text) <= triage.SECTION_TEXT_MAX
+    assert text.startswith("*Action required")
+    assert "Auto-dismissed in 3d" in text or "Auto-dismissed in 2d" in text
+    assert text.splitlines()[1].startswith("Do this: xxx")
+
+
+def test_needs_human_and_merge_blocked_cards_say_what_to_do():
+    """render_card_blocks() must render needs_human/merge_blocked as an
+    explicit instruction, not a footnote the owner can miss — see
+    _action_required_block()'s own docstring for why. Covers: a note
+    present, a note absent (the default `Do this:` line), and a
+    `state_deadline` present (the countdown line)."""
+    with _triage_env() as (conn, _ctx):
+        eid_human = _seed_expiring_item(
+            conn, external_id="sig-render-needs-human", state=triage.STATE_NEEDS_HUMAN,
+            state_deadline=None, note="the fix needs a 1Password vault the episode cannot reach",
+        )
+        item = triage._get_item(conn, eid_human)
+        event = triage._get_event(conn, eid_human)
+        blocks = triage.render_card_blocks([item], [event], conn)
+        text_blob = json.dumps(blocks)
+        assert "Action required" in text_blob, text_blob
+        assert "Do this:" in text_blob, text_blob
+        assert "the fix needs a 1Password vault" in text_blob, text_blob
+        assert "Auto-dismissed" not in text_blob, "no deadline was set, so no countdown line"
+
+        eid_human_empty = _seed_expiring_item(
+            conn, external_id="sig-render-needs-human-empty", state=triage.STATE_NEEDS_HUMAN,
+            state_deadline=None, note=None,
+        )
+        item = triage._get_item(conn, eid_human_empty)
+        event = triage._get_event(conn, eid_human_empty)
+        blocks = triage.render_card_blocks([item], [event], conn)
+        text_blob = json.dumps(blocks)
+        assert "Action required" in text_blob, text_blob
+        assert "Do this: read the verdict above and decide" in text_blob, text_blob
+
+        deadline = (NOW + dt.timedelta(hours=50)).isoformat()
+        eid_blocked = _seed_expiring_item(
+            conn, external_id="sig-render-merge-blocked", state=triage.STATE_MERGE_BLOCKED,
+            state_deadline=deadline, note="merge refused: required check failed",
+        )
+        item = triage._get_item(conn, eid_blocked)
+        event = triage._get_event(conn, eid_blocked)
+        blocks = triage.render_card_blocks([item], [event], conn)
+        text_blob = json.dumps(blocks)
+        assert "Action required" in text_blob and "merge blocked" in text_blob, text_blob
+        assert "Do this: merge refused: required check failed" in text_blob, text_blob
+        assert "Auto-dismissed" in text_blob, text_blob
+
+        for block in blocks:
+            if block["type"] == "section":
+                assert len(block["text"]["text"]) <= triage.SECTION_TEXT_MAX
 
 
 def test_card_renders_reverted_state():

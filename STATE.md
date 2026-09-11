@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-11 |
-| Current wave | Estate chain Wave 8 done (§57). Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
+| Last updated | 2026-09-11 (§58) |
+| Current wave | Estate chain Wave 8 done (§57); first field look §58. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 8 |
-| Tests | `tests/test_triage.py` 211/211 is the gate; `make test` runs all suites |
+| Tests | `tests/test_triage.py` 213/213 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -36,8 +36,12 @@ loop.
   event source `github_go`), or `human` (`warden run`, typed in herdr or
   through Hermes's door with `--origin-channel`/`--origin-thread`). See
   `docs/history/state-log.md` §55.
-- Validation is a sideclaw `review` job on the pull request; automatic
-  dispatches pass `model=None` and run on sideclaw's JUDGE route.
+- Automatic investigate/implement dispatches pass `AUTO_DISPATCH_MODEL`
+  (`glm-5.3-flash`, env `TRIAGE_AUTO_DISPATCH_MODEL`) and run on the IU
+  backend, never Max. Validation is a sideclaw `review` job on the pull
+  request and still runs on sideclaw's JUDGE route (no per-call knob).
+- `needs_human` / `merge_blocked` cards carry an `Action required` section:
+  `Do this: <note>` plus a day-granularity auto-dismiss countdown.
 - `push_argo_snapshot()` runs as step 10 of `run()`, after every tick.
 - Slack delivery is a plain HTTP client (`chat.postMessage`/`chat.update`),
   never the gateway's live `slack_bolt` connection.
@@ -48,8 +52,11 @@ loop.
 
 ## Open — owner actions
 
-- Merge argo PR #19 — until then every tick logs `argo push —
-  http-error:404`.
+- Mark argo PR #19 ready and merge it — it is a **draft**, which is why it
+  never landed; until then every tick logs `argo push — http-error:404`.
+- Six `needs_human` cards in `#agents` (hermes gateway wedged, sideclaw crash,
+  meteo probe, hermes patch corruption, research-gateway OOM) need a hand
+  action or a dismissal; the 168h clock dismisses them 2026-09-16.
 - Grant the loop's PAT (`op://mini/github/token`) Issues read/write — the
   `github_issue` origin cannot poll or comment under the LaunchAgent until
   then.
@@ -59,8 +66,13 @@ loop.
 ## Carried debt
 
 - sideclaw `fallow` fails at HEAD — pre-existing, not this repo's.
-- Cost per Warden item needs a join on ledger job ids; the usage lanes only
-  give `sideclaw:dispatch`/`sideclaw:review` today.
+- Cost per Warden item needs a join on ledger job ids; sideclaw sets no
+  `USAGE_LANE`, so usage-tracker cannot attribute its spend at all (§58).
+- The 1-day `needs_human` reminder from `docs/api.md` is not built; a card
+  lands once, then silence until the 168h dismissal.
+- `#agents` carries both warden cards and Hermes's narrative digest; approval
+  buttons post to `#hermes`. Three `warden_canary` merge_blocked items still
+  sit on the board.
 - No ledger restore path yet.
 
 ## History
@@ -74,11 +86,13 @@ loop.
 - Wave 6 — §55
 - Wave 7 — §56
 - Wave 8 — §57
+- First field look — §58
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-Wave 9, the field review, run by the owner from
-`docs/handover-field-review.md`.
+Owner: merge argo PR #19, clear the six `needs_human` cards. Loop: the
+1-day `needs_human` reminder, then `USAGE_LANE` tagging in sideclaw. Wave 9,
+the field review, from `docs/handover-field-review.md` after that.

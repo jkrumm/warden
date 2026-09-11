@@ -1001,6 +1001,23 @@ PROPOSE_UNSURE_COOLDOWN_DAYS = 7.0
 # JSON is enforced by the system prompt and the parse below, not by temperature.
 PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "gpt-5.6-luna")
 
+# Automatic investigate/implement episodes (loop-driven, not human-typed) run
+# on the cheap IU tier: modelpick's 2026-08-31 bake-off scored glm-5.3-flash
+# 1.00 alongside Sonnet at ~32x lower cost. Passing any non-Claude model id
+# makes sideclaw's withModel() derive backend `iu` for the dispatch; passing
+# `None` instead would land it on sideclaw's own JUDGE route, which is Sonnet
+# over the owner's Claude Max subscription. Manual `warden run --model` calls
+# and Slack approval-click dispatches carry their own model and are
+# unaffected; step-7 review validation has no model knob at all and stays on
+# sideclaw's routing.
+AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL", "glm-5.3-flash")
+if not AUTO_DISPATCH_MODEL or AUTO_DISPATCH_MODEL.startswith("claude"):
+    # A Claude id (or an empty override) would route automatic episodes back
+    # onto sideclaw's Max-backed JUDGE route — the cost regression §58 fixed.
+    # Loud, not fatal: the loop must keep ticking, the operator must notice.
+    print(f"triage: WARNING TRIAGE_AUTO_DISPATCH_MODEL={AUTO_DISPATCH_MODEL!r} routes automatic "
+          "dispatches onto Max — expected a non-Claude IU model id", file=sys.stderr)
+
 # Mirrors .env.tpl's own OPENAI_API_KEY ref exactly — never a plaintext key.
 _OPENAI_API_KEY_REF = "op://common/anthropic/API_KEY"
 
@@ -2558,7 +2575,8 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
     try:
         target = _policy.resolve_repo(repo)
         opened = _dispatch.open_episode(
-            conn, target=target, tier="investigate", brief=brief, context=None, why=None, model=None,
+            conn, target=target, tier="investigate", brief=brief, context=None, why=None,
+            model=AUTO_DISPATCH_MODEL,
             origin=_dispatch.Origin(channel=own_channel or channel, thread_ts=own_thread,
                                      event_id=primary["event_id"]),
             authorized_by=None,
@@ -3170,6 +3188,54 @@ def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+class _ActionRequired(NamedTuple):
+    heading: str
+    default_do: str
+
+
+# Per-state card copy for the two states that need a human. `default_do` is
+# the `Do this:` line when `note` is empty — `_set_state()` guarantees a note
+# in the common paths, but a row edited by hand outside this file still needs
+# an actionable card rather than a blank instruction. `warden abort` refuses
+# `merge_blocked` (it only cancels an in-flight episode — see cmd_abort's own
+# investigating/implementing/validating check), so that retry verb is
+# `warden merge`, which re-attempts landing a blocked PR.
+_ACTION_REQUIRED: dict[str, _ActionRequired] = {
+    STATE_NEEDS_HUMAN: _ActionRequired(
+        heading="*Action required — needs a human*",
+        default_do="read the verdict above and decide",
+    ),
+    STATE_MERGE_BLOCKED: _ActionRequired(
+        heading="*Action required — merge blocked*",
+        default_do='merge by hand via the PR, or retry with `warden merge <job-id> --why "<reason>" --confirm`',
+    ),
+}
+
+
+def _action_required_block(state: str, note: str | None, state_deadline: str | None) -> dict[str, Any]:
+    """The `needs_human` / `merge_blocked` card body: a `section` block (not
+    `context`) so it reads as an instruction, not a footnote. The countdown is
+    deliberately day-granularity only (see sync_card()'s card_hash
+    short-circuit): an hour-granularity line would change on every 10-minute
+    tick and defeat that short-circuit, turning one Slack update per real
+    change into one every tick. The note is truncated on its own, after the
+    heading and the countdown have reserved their space, so a long note can
+    never push the countdown off the card."""
+    copy = _ACTION_REQUIRED[state]
+    lines = [copy.heading]
+    tail: list[str] = []
+    deadline = _parse_ts(state_deadline)
+    if deadline is not None:
+        now = dt.datetime.now(dt.timezone.utc)
+        days_left = max(int((deadline - now).total_seconds() // 86400), 0)
+        tail.append(f"Auto-dismissed in {days_left}d if untouched ({_fmt_ts(state_deadline)})")
+    note_text = (note or "").strip()
+    do_body = _escape(note_text) if note_text else copy.default_do
+    budget = SECTION_TEXT_MAX - sum(len(x) + 1 for x in lines + tail) - len("Do this: ")
+    lines.append(f"Do this: {do_body[:max(budget, 0)]}")
+    return {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines + tail)}}
+
+
 def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row], conn: sqlite3.Connection
                         ) -> list[dict[str, Any]]:
     primary = members[0]
@@ -3222,13 +3288,13 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
         artifact_url = primary["artifact_url"]
         if artifact_url:
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Artifact:* <{artifact_url}>"}})
-        if state == STATE_NEEDS_HUMAN and primary["note"]:
-            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"↳ _{_escape(primary['note'])}_"}]})
-    elif state == STATE_NEEDS_HUMAN and primary["note"]:
+        if state == STATE_NEEDS_HUMAN:
+            blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
+    elif state == STATE_NEEDS_HUMAN:
         # A verb outcome (run_verbs()) — no dispatch_job at all, since no
         # sideclaw episode was ever opened. The note IS the whole verdict: a
         # deterministic local probe's output, not an episode's.
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _escape(primary["note"])[:SECTION_TEXT_MAX]}})
+        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
     elif state == STATE_SNOOZED:
         blocks.append({
             "type": "context",
@@ -3270,8 +3336,7 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
             text += f"\nPull request: <{primary['pr_url']}>"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}})
     elif state == STATE_MERGE_BLOCKED:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                        "text": _escape(primary["note"] or "blocked, no further detail")[:SECTION_TEXT_MAX]}})
+        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
     elif state == STATE_MERGED:
         text = f"Merged: <{primary['pr_url']}>" if primary["pr_url"] else "Merged"
         if primary["note"]:
@@ -4056,7 +4121,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 conn, target=target, tier="implement", brief=brief,
                 context=_verdict_as_context(item["dispatch_job"], verdict),
                 why="triage auto-implement: investigation concluded implement at high confidence",
-                model=None, origin=_dispatch.Origin(event_id=item["event_id"]),
+                model=AUTO_DISPATCH_MODEL, origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
             )
         except RemoteError as exc:
