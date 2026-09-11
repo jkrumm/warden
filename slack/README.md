@@ -1,7 +1,6 @@
 # Slack app identity
 
-App ID: `<pending>` — not created yet; fill this in once `make slack-app-create`
-returns one (use it for every later `apps.manifest.update`).
+App ID: `A0C13NMFLD9` — use it for every later `apps.manifest.update`.
 
 `app-manifest.json` declares warden's own Slack bot, so triage cards,
 remediation receipts and reminders are attributable at a glance instead of
