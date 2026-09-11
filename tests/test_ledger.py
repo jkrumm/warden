@@ -257,7 +257,7 @@ def test_migrate_adopts_pre_versioned_database():
         assert cols <= post_cols[table], f"{table} lost columns: {cols - post_cols[table]}"
     assert post_cols["triage_items"] - pre_cols["triage_items"] == {
         "state_deadline", "occurrence_mark", "revert_pr", "origin", "max_tier", "brief",
-        "origin_channel", "origin_thread_ts",
+        "origin_channel", "origin_thread_ts", "reminder_count", "last_reminder_at",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -690,6 +690,59 @@ def test_v5_database_migrates_to_v6_matching_a_fresh_one():
     for table in ledger._VERSIONED_TABLES:
         assert _table_columns(fresh, table) == _table_columns(conn, table), (
             f"{table}: a v5-upgraded schema diverges from a fresh one")
+    fresh.close()
+    conn.close()
+
+
+def test_migration_9_adds_reminder_columns():
+    """See _MIGRATION_9 — the needs_human/merge_blocked reminder
+    (scripts/triage.py's remind_needs_human()). `reminder_count` defaults to
+    0 so every pre-existing row reads as never-reminded."""
+    conn = ledger.connect(_tmp_path(), migrate=True)
+    cols = _table_columns(conn, "triage_items")
+    assert "reminder_count" in cols, cols
+    assert "last_reminder_at" in cols, cols
+    conn.close()
+
+
+def test_v8_database_migrates_to_v9_matching_a_fresh_one():
+    """A real upgrade path, not adoption: a database already stamped at
+    schema_version 8 must reach LEDGER_SCHEMA_VERSION 9 with a schema
+    identical to a fresh database's, and an existing triage_items row must
+    default to reminder_count=0, never NULL (the column is NOT NULL
+    DEFAULT 0, same as occurrence_mark's own migration 3 shape)."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    conn.executescript(ledger._MIGRATION_2)
+    conn.executescript(ledger._MIGRATION_3)
+    conn.executescript(ledger._MIGRATION_4)
+    conn.executescript(ledger._MIGRATION_5)
+    conn.executescript(ledger._MIGRATION_6)
+    conn.executescript(ledger._MIGRATION_7)
+    conn.executescript(ledger._MIGRATION_8)
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (8, 'test')")
+    conn.execute(
+        "INSERT INTO events(source, external_id, title, first_seen) VALUES ('uk', 'pre-v9', 't', 'test')"
+    )
+    conn.execute(
+        "INSERT INTO triage_items(event_id, signature, state, occurrences, first_seen, last_seen, "
+        "created_at, updated_at) VALUES (1, 'uk:pre-v9', 'needs_human', 1, 'test', 'test', 'test', 'test')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
+    row = conn.execute("SELECT reminder_count, last_reminder_at FROM triage_items WHERE event_id=1").fetchone()
+    assert row["reminder_count"] == 0, row["reminder_count"]
+    assert row["last_reminder_at"] is None, row["last_reminder_at"]
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    for table in ledger._VERSIONED_TABLES:
+        assert _table_columns(fresh, table) == _table_columns(conn, table), (
+            f"{table}: a v8-upgraded schema diverges from a fresh one")
     fresh.close()
     conn.close()
 

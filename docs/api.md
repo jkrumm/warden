@@ -108,7 +108,7 @@ Same fresh-read-only-connection, 503-on-schema-mismatch contract as above.
 ```json
 {
   "generated_at": "2026-09-11T00:00:00+00:00",
-  "schema_version": 8,
+  "schema_version": 9,
   "counts": {
     "new": 0, "investigating": 1, "verdict": 0, "implementing": 0,
     "validating": 0, "merged": 0, "liveness_pending": 0, "needs_human": 2,

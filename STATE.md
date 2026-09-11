@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-11 (§59) |
+| Last updated | 2026-09-11 (§60) |
 | Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
-| Ledger | `~/.warden/warden.db`, schema 8 |
-| Tests | `tests/test_triage.py` 231/231 is the gate; `make test` runs all suites |
+| Ledger | `~/.warden/warden.db`, schema 9 |
+| Tests | `tests/test_triage.py` 242/242 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -63,10 +63,9 @@ loop.
 
 ## Open — owner actions
 
-- Three `needs_human` cards remain after §59 (sideclaw crash uk:204, meteo
-  probe uk:220, hermes patch corruption uk:229, research-gateway OOM uk:193 —
-  the last has no host verb because rollhook numbers its container); the
-  168h clock dismisses them 2026-09-16.
+- One `needs_human` card remains (meteo probe uk:220), closed by item 996's
+  PR when it merges. The other eight were closed 2026-09-11 with reasons in
+  the ledger (§60).
 - Grant the loop's PAT (`op://mini/github/token`) Issues read/write — the
   `github_issue` origin cannot poll or comment under the LaunchAgent until
   then.
@@ -78,8 +77,6 @@ loop.
 - sideclaw `fallow` fails at HEAD — pre-existing, not this repo's.
 - Cost per Warden item needs a join on ledger job ids; sideclaw sets no
   `USAGE_LANE`, so usage-tracker cannot attribute its spend at all (§58).
-- The 1-day `needs_human` reminder from `docs/api.md` is not built; a card
-  lands once, then silence until the 168h dismissal.
 - `#agents` is warden-only since 2026-09-11 (Hermes's narratives cron moved to
   `#hermes`); approval buttons still post to `#hermes`. Three `warden_canary`
   merge_blocked items still sit on the board.
@@ -98,14 +95,16 @@ loop.
 - Wave 8 — §57
 - First field look — §58
 - Autonomy: host verbs, Argo live, GLM routing — §59
+- Closing the queue: reminders, the heartbeat probe, Kuma sync — §60
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-Watch the three hermes items leave `liveness_pending` as `fixed` on the next
-Kuma push. Loop: a host verb for uk:204 (sideclaw kickstart, guarded by
-no-dispatch-in-flight), the 1-day `needs_human` reminder, `USAGE_LANE`
-tagging in sideclaw. Wave 9, the field review, from
-`docs/handover-field-review.md` after that.
+Watch item 996 (meteo watchdog heartbeat gate, `implementing` on GLM) land
+its PR and merge; then close uk:220. The three hermes items resolved as
+`quiet` before the Kuma-heartbeat probe landed, so the first `fixed` from a
+host verb is still ahead. Loop: a host verb for uk:204 (sideclaw kickstart,
+guarded by no dispatch in flight). Wave 9, the field review, from
+`docs/handover-field-review.md` after a few days of this.

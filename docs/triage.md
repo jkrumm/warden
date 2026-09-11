@@ -555,8 +555,10 @@ every other one sits there with nothing scheduled to touch it. `split` is the
 same kind of addition, for the same reason — nothing scheduled to touch it
 unless `escalate()` finds it a free per-repo slot this run — at the same 24h,
 matching `verdict`'s own rule, well clear of `cooldownHours` so `escalate()`
-gets several real chances first. `needs_human`'s "reminder at 1d" is NOT
-built: a reminder is a notification, not a deadline. (A fourth deviation —
+gets several real chances first. `needs_human`'s "reminder at 1d" is a
+notification, not a deadline, so it is built separately from this table —
+see `remind_needs_human()`, wired into `run()` right after
+`sweep_deadlines()`, which also covers `merge_blocked`. (A fourth deviation —
 `merged` expiring to `resolved` instead of `closed` — was here until the
 `resolved` split landed; `merged` now expires to `closed`, matching
 DESIGN.md's own table exactly.)

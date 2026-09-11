@@ -230,8 +230,10 @@ chat.update), never shells out to hermes-cc.sh, never shells out to `gh`,
 never runs a HOST_VERB_ALLOWLIST verb (maybe_auto_remediate() prints
 `[dry-run] would run host verb <key> for <signature>` and does nothing
 else — the same shape run_verbs() already uses for VERB_ALLOWLIST, applied
-to the more sensitive fifth allowlist), and never pushes to Argo — those
-five are the only externally-visible actions this script can take.
+to the more sensitive fifth allowlist), never posts a needs_human/
+merge_blocked reminder reply (remind_needs_human() prints `[dry-run] would
+remind <signature>` and posts nothing), and never pushes to Argo — those
+six are the only externally-visible actions this script can take.
 (`gh` is the newest of them and the only READ-ONLY one: reconcile_operations()
 uses `gh pr view` to ask GitHub whether a merge it lost the answer to
 actually landed. It is still a shell-out to a remote system, so it is named
@@ -641,9 +643,13 @@ _STATE_DEADLINE_COLUMN = "state_deadline"
 #     every other verdict sits in `verdict` with nothing scheduled to touch it
 #     again. 24h -> needs_human. An ADDITION to the design's table, not a
 #     contradiction of it.
-#   * `needs_human`'s "reminder at 1d" is NOT built here. A reminder is a
-#     notification feature, not a deadline — it changes nothing about when the
-#     row may stop existing. Scoped out on purpose, not missed.
+#   * `needs_human`'s "reminder at 1d" is NOT built HERE, deliberately: a
+#     reminder is a notification feature, not a deadline — it changes
+#     nothing about when the row may stop existing. It is built as its own
+#     step, remind_needs_human(), run right after sweep_deadlines() in
+#     run() — see that function's own docstring. `merge_blocked` gets the
+#     same reminder, for the same reason it shares this row's 168h/operator
+#     shape below.
 #   * `split` is the same third addition as `verdict` above, for the same
 #     reason: post-verdict, nothing scheduled to touch it unless a specific
 #     condition is met (here: escalate() finding it a free per-repo slot —
@@ -737,6 +743,20 @@ DEFAULT_QUIET_RESOLVE_HOURS = 2.0
 # THIS item is a deterministic failure, not a third try waiting to happen.
 DEFAULT_HOST_VERB_COOLDOWN_HOURS = 6.0
 DEFAULT_HOST_VERB_MAX_ATTEMPTS = 2
+
+# remind_needs_human()'s own knob — DESIGN.md:247's "7d, reminder at 1d" for
+# `needs_human`, applied to `merge_blocked` too (same shape: a human-owned
+# state with a 168h dismiss clock and nothing else polling it). The second,
+# FINAL reminder fires at REMINDER_SECOND_MULTIPLIER times this, never
+# separately configurable — two knobs for one cadence would let a policy
+# edit decouple them into something that reads as a bug (a second reminder
+# BEFORE the first, or the reverse). Validated the same
+# stderr-fallback-on-a-bad-value shape as hostVerbCooldownHours
+# (_valid_host_verb_positive_number(), reused as-is — it was already generic
+# over `key`/`default`/`cast`, not actually hostVerb-specific).
+DEFAULT_NEEDS_HUMAN_REMINDER_HOURS = 24.0
+REMINDER_SECOND_MULTIPLIER = 3
+REMINDER_MAX_COUNT = 2
 
 # The owner's follow-up decision, 2026-09-11: `confidence: high` was the
 # wrong bar for THIS mechanism specifically. A restart from
@@ -1327,12 +1347,16 @@ def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, st
     return ok, data.get("ts")
 
 
-def post_blocks(channel: str, blocks: list[dict[str, Any]], text_fallback: str, token: str) -> tuple[bool, str | None]:
-    return _slack_call(
-        f"{_slack_api_base()}/chat.postMessage",
-        {"channel": channel, "blocks": blocks, "text": text_fallback, "unfurl_links": False},
-        token,
-    )
+def post_blocks(channel: str, blocks: list[dict[str, Any]], text_fallback: str, token: str, *,
+                 thread_ts: str | None = None) -> tuple[bool, str | None]:
+    """`thread_ts`, when given, posts as a reply under an existing message
+    (e.g. remind_needs_human()'s own reminder, threaded under the item's
+    card) rather than a new top-level message — every other caller leaves it
+    unset and gets today's behaviour unchanged."""
+    payload: dict[str, Any] = {"channel": channel, "blocks": blocks, "text": text_fallback, "unfurl_links": False}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    return _slack_call(f"{_slack_api_base()}/chat.postMessage", payload, token)
 
 
 def update_blocks(channel: str, ts: str, blocks: list[dict[str, Any]], text_fallback: str,
@@ -1473,6 +1497,9 @@ def load_policy() -> dict[str, Any]:
             data.get("hostVerbMaxAttempts"), key="hostVerbMaxAttempts",
             default=DEFAULT_HOST_VERB_MAX_ATTEMPTS, cast=int),
         "hostVerbMinConfidence": _valid_host_verb_min_confidence(data.get("hostVerbMinConfidence")),
+        "needsHumanReminderHours": _valid_host_verb_positive_number(
+            data.get("needsHumanReminderHours"), key="needsHumanReminderHours",
+            default=DEFAULT_NEEDS_HUMAN_REMINDER_HOURS, cast=float),
         # `ignore` entries are usually a bare pattern string (hand-authored).
         # propose_mappings() instead appends a stamped object
         # ({"match", "proposedAt", "proposedBy", "reason"}) so an auto-added
@@ -2600,17 +2627,62 @@ def _gather_kuma_push_last(event_rows: list[sqlite3.Row]) -> str:
     return matches[-1][1]
 
 
+_KUMA_HEARTBEAT_ROW_RE = re.compile(
+    r"^\s*(\d+)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(\d+)(?:\s+(.*))?$"
+)
+
+
+def _parse_kuma_heartbeat_rows(rows_text: str) -> list[tuple[dt.datetime, int]]:
+    """`hermes-ops.sh kuma-db heartbeats <id> --json`'s own `rows` field is a
+    TEXT table (`sqlite3 -header -column` output piped straight through, not
+    re-shaped into JSON — see that command's own comment: "a second error
+    object would break the --json contract", the same reasoning that kept
+    this one field a string instead of a nested array), so this is the one
+    place that table gets parsed: header line, a dashes separator, then data
+    lines shaped `monitor_id  time  status  msg`, `time` itself two
+    whitespace-separated tokens (`heartbeat.time` is UTC-naive
+    `YYYY-MM-DD HH:MM:SS[.ffffff]`, per that command's own comment). Any
+    line that doesn't match — the header, the dashes, a truncated tail, a
+    future column added upstream — is silently skipped rather than raising:
+    this feeds a liveness probe that must fail CLOSED on the rows it cannot
+    parse, not abort on them."""
+    beats: list[tuple[dt.datetime, int]] = []
+    for line in rows_text.splitlines():
+        m = _KUMA_HEARTBEAT_ROW_RE.match(line)
+        if not m:
+            continue
+        date_part, time_part, status_part = m.group(2), m.group(3), m.group(4)
+        try:
+            when = dt.datetime.fromisoformat(f"{date_part} {time_part}").replace(tzinfo=dt.timezone.utc)
+        except ValueError:
+            continue
+        beats.append((when, int(status_part)))
+    return beats
+
+
 def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     """LIVENESS_ALLOWLIST gatherer for a host-verb remediation (see
     HOST_VERB_ALLOWLIST/maybe_auto_remediate()): true only if the declared
-    push-heartbeat UptimeKuma monitor posted a `[<title>] ...` line to
-    #alerts AFTER the restart operation's own timestamp. Reuses
-    _gather_kuma_push_last()'s proven Slack-fetch path (same #alerts channel,
-    same HOMELAB_API_KEY) rather than a second HTTP mechanism, but — unlike
-    that EVIDENCE_ALLOWLIST gatherer, which returns raw text for a human to
-    read — this is a LIVENESS_ALLOWLIST gatherer, so it returns a genuine
-    (ok, detail) POSITIVE/NEGATIVE pair, same shape as
-    _gather_hyperdx_alert_state()/_gather_argo_commit_live() above.
+    push-heartbeat UptimeKuma monitor recorded an UP heartbeat AFTER the
+    restart operation's own timestamp.
+
+    Reads UptimeKuma's own heartbeat table through hermes-ops.sh (tier A,
+    read-only) rather than #alerts: the monitor this gatherer confirms
+    against never goes DOWN across a `launchctl kickstart` restart (the push
+    window tolerates the brief gap), so no `[<title>] ... Up` recovery line
+    is ever posted to Slack for it to match — the #alerts-based version of
+    this gatherer could therefore never confirm a genuine restart, only ever
+    time out at `liveness_deadline` and reopen the item to `new`, which
+    re-escalates and restarts the same process again after
+    `hostVerbCooldownHours`. Two calls: `monitors --json` resolves the
+    monitor TITLE this item recorded to an id (titles are what
+    HOST_VERB_LIVENESS_MONITOR/deploy_expect_json carry; UptimeKuma's own
+    heartbeat table is keyed by id), then `kuma-db heartbeats <id> --json`
+    reads its last 25 beats. Both go through `_run_verb()` — same
+    never-raise, parse-`--json`-stdout contract every other bounded local
+    probe in this file already uses, reused here rather than duplicated
+    because a spawn failure, a timeout, a non-zero exit or unparsable stdout
+    must all read as "no evidence" for BOTH calls, identically.
 
     `expected` is the same list-of-dicts shape every other LIVENESS_ALLOWLIST
     gatherer reads off `deploy_expect_json` — here written by
@@ -2634,12 +2706,6 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     since = expected[0].get("since")
     if not monitor_title or not since:
         return False, "expected liveness record carried no monitor title/since timestamp"
-    wp = _wp_module()
-    if wp is None:
-        return False, "watchdog-poll.py sibling module did not load — cannot fetch #alerts"
-    token = wp.resolve_secret("HOMELAB_API_KEY")
-    if not token:
-        return False, "HOMELAB_API_KEY unresolved — cannot fetch #alerts history"
     since_parsed = _parse_ts(since)
     if since_parsed is None:
         # Fail CLOSED, not open: an unparsable `since` must never read as
@@ -2647,32 +2713,38 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
         # corrupted or malformed deploy_expect_json record confirm liveness
         # off a push that has nothing to do with THIS restart.
         return False, f"unparsable since timestamp {since!r} — cannot confirm liveness against it"
-    monitor_key = normalize_title(monitor_title)
-    msgs, _latest, ok = wp.poll_slack_messages({"HOMELAB_API_KEY": token}, ALERTS_CHANNEL, None,
-                                                skip_uk_push=False)
-    if not ok:
-        return False, "#alerts fetch failed (see watchdog-poll.py's own poll_slack_messages)"
-    for m in msgs:
-        text = (m.get("payload") or {}).get("text") or m.get("title") or ""
-        bm = _BRACKET_PREFIX_RE.match(text.strip())
-        if not (bm and normalize_title(bm.group(1)) == monitor_key):
-            continue
-        try:
-            msg_dt = dt.datetime.fromtimestamp(float(m.get("external_id") or "0"), tz=dt.timezone.utc)
-        except (TypeError, ValueError):
-            continue
-        if msg_dt > since_parsed:
-            return True, f"push observed at {_fmt_ts(msg_dt.isoformat())}: {text[:200]}"
-    return False, (f"no `[{monitor_title}] ...` push observed after {_fmt_ts(since)} in the last "
-                   f"{len(msgs)} #alerts messages")
+    monitors_result = _run_verb([str(_HERMES_OPS_BIN), "monitors", "--json"], timeout=EVIDENCE_TIMEOUT)
+    if "_error" in monitors_result:
+        return False, f"hermes-ops.sh monitors --json failed: {monitors_result['_error']}"
+    monitor_id = next(
+        (m.get("id") for m in (monitors_result.get("monitors") or [])
+         if isinstance(m, dict) and m.get("name") == monitor_title),
+        None,
+    )
+    if monitor_id is None:
+        return False, f"no UptimeKuma monitor named {monitor_title!r} in hermes-ops.sh monitors --json"
+    heartbeats_result = _run_verb(
+        [str(_HERMES_OPS_BIN), "kuma-db", "heartbeats", str(monitor_id), "--json"], timeout=EVIDENCE_TIMEOUT
+    )
+    if "_error" in heartbeats_result:
+        return False, f"hermes-ops.sh kuma-db heartbeats {monitor_id} --json failed: {heartbeats_result['_error']}"
+    rows_text = heartbeats_result.get("rows")
+    if not isinstance(rows_text, str):
+        return False, "hermes-ops.sh kuma-db heartbeats --json carried no 'rows' text table"
+    fresh = [(when, status) for when, status in _parse_kuma_heartbeat_rows(rows_text) if when > since_parsed]
+    up = [when for when, status in fresh if status == 1]
+    if up:
+        latest = max(up)
+        return True, f"{monitor_title} heartbeat OK at {_fmt_ts(latest.isoformat())} (> since {_fmt_ts(since)})"
+    return False, f"{len(fresh)} heartbeats since {_fmt_ts(since)}, none up"
 
 
 # Registered here, not in the LIVENESS_ALLOWLIST literal above, because
-# _gather_kuma_push_fresh() needs `_wp_module()`/`ALERTS_CHANNEL`/
-# `normalize_title`/`_BRACKET_PREFIX_RE`, all defined below that literal's own
-# line in the file — same "assemble the registry near the functions, not at
-# the top of the module" shape _EVIDENCE_GATHERERS uses for its own four
-# entries, applied to one key instead of a whole dict.
+# _gather_kuma_push_fresh() needs `_run_verb()`/`_HERMES_OPS_BIN`, both
+# defined below that literal's own line in the file — same "assemble the
+# registry near the functions, not at the top of the module" shape
+# _EVIDENCE_GATHERERS uses for its own four entries, applied to one key
+# instead of a whole dict.
 LIVENESS_ALLOWLIST["kuma-push-fresh"] = _gather_kuma_push_fresh
 
 
@@ -5420,6 +5492,102 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
     conn.commit()
 
 
+# --- remind_needs_human() — the needs_human/merge_blocked reminder ----------
+#
+# DESIGN.md:247's "7d, reminder at 1d" — the one row of the deadline table
+# this module's own STATE_DEADLINES comment and docs/api.md's carried-debt
+# note both flagged NOT built. Runs immediately after sweep_deadlines(), on
+# the same reasoning: a row that just expired THIS pass must never also get
+# a reminder in the same tick (sweep_deadlines() already moved it out of
+# `needs_human`/`merge_blocked` by the time this runs), and a row about to
+# expire should be reminded right up to the moment it is.
+
+_CANARY_SIGNATURE_PREFIX = "warden_canary:"
+
+
+def remind_needs_human(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
+    """One thread reply under the item's own card for every `needs_human`/
+    `merge_blocked` row whose LAST REAL transition into that state is older
+    than `needsHumanReminderHours` (default 24h) and has not yet been
+    reminded, then a second, FINAL one at REMINDER_SECOND_MULTIPLIER times
+    that interval (default 72h) — never a third (REMINDER_MAX_COUNT).
+
+    "Last transition into that state", read from `item_transitions`
+    (append-only, one row per REAL state change — ledger.py migration 4),
+    not from `state_deadline` or `updated_at`: `state_deadline` is
+    RECOMPUTED to `now + 168h` by every _set_state() call that re-enters the
+    SAME state (a merge retry, a deferred verdict note) even when
+    `prior_state == state` — see that function's own docstring, the
+    item_transitions paragraph — so it answers "when does this expire NEXT",
+    not "when did this begin". `updated_at` is rewritten by ingest() on
+    every open row on every pass regardless of state. Only
+    `item_transitions` answers the actual question.
+
+    Never reminds a `warden_canary:`-prefixed signature (self-test items —
+    see _CANARY_SIGNATURE_PREFIX) and never an item with no `card_ts` —
+    nothing to thread a reply under — counting the latter on one aggregate
+    stderr line rather than dropping it silently. `reminder_count` is never
+    reset on a later re-entry into the same state: "never more than two" is
+    a lifetime cap on this mechanism per item, not per episode, the simplest
+    reading of the brief and the one that cannot loop a chronically
+    re-opening item into an unbounded reminder stream."""
+    reminder_hours = policy["needsHumanReminderHours"]
+    second_hours = reminder_hours * REMINDER_SECOND_MULTIPLIER
+    rows = conn.execute(
+        "SELECT * FROM triage_items WHERE state IN (?, ?) ORDER BY event_id",
+        (STATE_NEEDS_HUMAN, STATE_MERGE_BLOCKED),
+    ).fetchall()
+    no_thread = 0
+    token: str | None = None
+    for row in rows:
+        if row["signature"].startswith(_CANARY_SIGNATURE_PREFIX):
+            continue
+        reminder_count = row["reminder_count"] or 0
+        if reminder_count >= REMINDER_MAX_COUNT:
+            continue
+        threshold = reminder_hours if reminder_count == 0 else second_hours
+        entered = conn.execute(
+            "SELECT at FROM item_transitions WHERE event_id=? AND to_state=? ORDER BY id DESC LIMIT 1",
+            (row["event_id"], row["state"]),
+        ).fetchone()
+        entered_at = _parse_ts(entered["at"]) if entered is not None else None
+        if entered_at is None:
+            continue
+        hours_in_state = (now - entered_at).total_seconds() / 3600
+        if hours_in_state < threshold:
+            continue
+        if not row["card_ts"]:
+            no_thread += 1
+            continue
+        note_text = (row["note"] or "").strip()
+        do_body = _escape(note_text)[:300] if note_text else "no note recorded"
+        text = (f"Still waiting on you — {int(hours_in_state)}h in `{row['state']}`. "
+                f"Do this: {do_body}. Auto-dismissed {_fmt_ts(row['state_deadline'])} if untouched.")
+        if dry_run:
+            print(f"[dry-run] would remind {row['signature']}")
+            continue
+        if token is None:
+            token = resolve_slack_token() or ""
+        if not token:
+            print(f"triage: no Slack token, cannot post reminder for {row['signature']}", file=sys.stderr)
+            continue
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}}]
+        ok, _ts = post_blocks(row["card_channel"] or _card_channel(policy), blocks, text, token,
+                               thread_ts=row["card_ts"])
+        if not ok:
+            print(f"triage: reminder post failed for {row['signature']}", file=sys.stderr)
+            continue
+        conn.execute(
+            "UPDATE triage_items SET reminder_count=reminder_count+1, last_reminder_at=?, updated_at=? "
+            "WHERE event_id=?",
+            (_now_iso(now), _now_iso(now), row["event_id"]),
+        )
+        conn.commit()
+    if no_thread:
+        print(f"triage: {no_thread} needs_human/merge_blocked item(s) eligible for a reminder have no "
+              f"card_ts to thread under — skipped", file=sys.stderr)
+
+
 # --- propose_mappings() — step 8, the one LLM call in this file --------------
 #
 # See the module docstring's PROPOSE MAPPINGS paragraph for the full contract.
@@ -6158,6 +6326,12 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # chance before the clock takes it away, and an expiry has to be on the card
     # in the same pass it happens.
     sweep_deadlines(conn, now, dry_run=dry_run)
+
+    # Right after sweep_deadlines(), for the same reason: a row that just
+    # expired out of `needs_human`/`merge_blocked` this pass must never also
+    # get a reminder threaded under a card that no longer describes its
+    # current state.
+    remind_needs_human(conn, policy, now, dry_run=dry_run)
 
     for _key, members in _cluster_groups(conn).items():
         members = sorted(members, key=lambda r: r["event_id"])

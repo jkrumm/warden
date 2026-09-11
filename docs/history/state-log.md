@@ -6601,3 +6601,69 @@ discharged.
 Watch items 2, 261 and 815 reach `fixed` on the next Kuma push. Then: a
 sideclaw host verb for uk:204 guarded by no dispatch in flight; the 1-day
 `needs_human` reminder; `USAGE_LANE` tagging in sideclaw. Wave 9 after that.
+
+## 60. Closing the queue — reminders, a real heartbeat probe, and the Kuma sync that ignored `active` (2026-09-11, 13:00Z → 14:10Z)
+
+The owner, after §59: "why do I have to approve things that are obviously
+right? Check them, then do them." Everything §59 listed as "still needs you"
+or "not built" was checked against live state and either done or dispatched.
+
+### The nine open items, decided from evidence
+
+| Item | Evidence | Outcome |
+|-|-|-|
+| uk:204 sideclaw crash | Kuma push recovered 10:16Z; sideclaw reloaded twice today, healthy | closed |
+| uk:193 research-gateway OOM | monitor recovered 09:16Z; container at 111 MiB of 2 GiB; no OOM kill in the VPS kernel log for four days | closed |
+| uk:229 "Hermes - HTTP" | endpoint answers 200 with the keyword; the Kuma monitor had been **paused** since its pre-deploy 404 days and every `make uk-sync` left it paused | fixed: homelab `sync.py` now converges pause state (`resume_monitor`/`pause_monitor` after `edit_monitor`, which ignores `active`); monitor UP; closed |
+| uk:220 "Meteo Watchdog - Push" | watchdog runs but skips its heartbeat because `obs_freshness:candhis` fails — five CANDHIS buoys silent 74–83 h, an upstream outage | `warden run meteo --tier implement` (item 996): degrade instead of blocking the heartbeat; investigate verdict came back high, auto-implement fired on GLM |
+| hermes_log connector-is-closed (×2) | sibling of the discharged reconnect signal; gateway restarted 11:36Z | closed |
+| three `warden_canary` items | §54's stop-condition exercise | closed |
+| dispatch-scratch#9 | disposable fixture repo, no `autoMergePaths` by design | closed |
+
+`needs_human` went from 8 to 1. Every close carries its reason in the
+ledger (`triage.py --close <sig> --reason …`).
+
+### The probe that could not confirm
+
+The three hermes items sat in `liveness_pending` for two hours and then
+reopened: `kuma-push-fresh` searched `#alerts` for a `[Hermes Agent - Push]
+… Up` line, but a `kickstart` restart never takes the monitor DOWN, so no
+recovery line ever exists. They resolved as `quiet` on silence, honestly not
+`fixed`. `_gather_kuma_push_fresh()` now reads Kuma's own heartbeat table
+through hermes-ops (`monitors --json` → id, `kuma-db heartbeats <id> --json`
+→ rows), a positive probe: a `status=1` row after the operation's
+`started_at`. The next host-verb run can reach `fixed`.
+
+### The reminder, built
+
+`remind_needs_human()` runs after `sweep_deadlines()`: one thread reply
+under the card at `needsHumanReminderHours` (24) in `needs_human` or
+`merge_blocked`, a second at 3×, never a third; canary and card-less items
+skipped and counted on stderr. Schema 9 adds `reminder_count` and
+`last_reminder_at` to `triage_items`. warden-api was kickstarted onto
+schema 9 by hand; poll and sweep pick it up on their next run.
+
+### Elsewhere
+
+- sideclaw already tagged every worker session with `USAGE_LANE`
+  (commit 49a065e); the §58 audit grepped the wrong directory. Review
+  sub-steps now share `sideclaw:review` so one review is one line in
+  usage-tracker. Not reloaded yet: a meteo episode was running.
+- Hermes's narratives cron delivers to `#hermes`; `#agents` is warden-only.
+- homelab: `docs(uptime-kuma)` comment and the `sync.py` pause fix, pushed
+  and applied with `make uk-sync`.
+
+### Numbers
+
+| | |
+|-|-|
+| `tests/test_triage.py` | 242/242 (§59: 231); `test_ledger.py` 24/24 |
+| Ledger schema | 9 |
+| `needs_human` | 1 (uk:220, pending item 996) |
+| Items closed with a reason today | 8 |
+
+### Next action
+
+Item 996 lands its PR; close uk:220. The first host-verb `fixed` is still
+ahead. A sideclaw host verb for uk:204-shaped crashes, guarded by no
+dispatch in flight. Wave 9 after a few days of this.

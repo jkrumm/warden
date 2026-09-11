@@ -163,6 +163,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         "MAX_OPEN_INVESTIGATIONS": triage.MAX_OPEN_INVESTIGATIONS,
         "DAILY_INVESTIGATE_BUDGET": triage.DAILY_INVESTIGATE_BUDGET,
         "VERB_ALLOWLIST": dict(triage.VERB_ALLOWLIST),
+        "_HERMES_OPS_BIN": triage._HERMES_OPS_BIN,
         "HOST_VERB_ALLOWLIST": dict(triage.HOST_VERB_ALLOWLIST),
         "_watchdog_poll": triage._watchdog_poll,
         "METEO_HEALTH_PATH": triage.METEO_HEALTH_PATH,
@@ -237,10 +238,11 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         updated: list[dict[str, Any]] = []
         _ts_counter = {"n": 0}
 
-        def _fake_post(channel, blocks, text_fallback, token):
+        def _fake_post(channel, blocks, text_fallback, token, *, thread_ts=None):
             _ts_counter["n"] += 1
             ts = f"1000.{_ts_counter['n']:06d}"
-            posted.append({"channel": channel, "blocks": blocks, "text": text_fallback, "ts": ts})
+            posted.append({"channel": channel, "blocks": blocks, "text": text_fallback, "ts": ts,
+                           "thread_ts": thread_ts})
             return True, ts
 
         def _fake_update(channel, ts, blocks, text_fallback, token):
@@ -6568,6 +6570,53 @@ def _seed_liveness_pending_host_item(conn, *, external_id="175", monitor_title="
     return eid
 
 
+def _write_kuma_stub(tmp_dir: Path, *, monitors: list[dict[str, Any]] | None = None,
+                      monitors_exit: int = 0, heartbeat_rows: str = "", heartbeats_exit: int = 0) -> Path:
+    """A stub standing in for hermes-ops.sh's `monitors --json` AND `kuma-db
+    heartbeats <id> --json` — the two calls _gather_kuma_push_fresh() makes,
+    both against the SAME binary (`_HERMES_OPS_BIN`) — so one stub dispatches
+    on `sys.argv[1]` rather than needing two allowlist entries the real
+    function never goes through (it builds its argv directly, not via
+    VERB_ALLOWLIST, since it needs a monitor id only the FIRST call
+    resolves)."""
+    stub_path = tmp_dir / "hermes-ops-kuma-stub.py"
+    monitors_json = json.dumps({"verb": "monitors", "ok": True, "tier": "A", "monitors": monitors or []})
+    heartbeats_json = json.dumps({"verb": "kuma-db", "ok": True, "tier": "A", "preset": "heartbeats",
+                                   "rows": heartbeat_rows})
+    stub_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"MONITORS_JSON = {monitors_json!r}\n"
+        f"HEARTBEATS_JSON = {heartbeats_json!r}\n"
+        "if sys.argv[1] == 'monitors':\n"
+        "    print(MONITORS_JSON)\n"
+        f"    sys.exit({monitors_exit})\n"
+        "elif sys.argv[1:3] == ['kuma-db', 'heartbeats']:\n"
+        "    print(HEARTBEATS_JSON)\n"
+        f"    sys.exit({heartbeats_exit})\n"
+        "else:\n"
+        "    sys.exit(1)\n"
+    )
+    stub_path.chmod(0o755)
+    return stub_path
+
+
+def _kuma_rows(*rows: tuple[str, int]) -> str:
+    """`sqlite3 -header -column`'s own shape for `kuma-db heartbeats` —
+    header, dashes, then `monitor_id  time  status  msg` lines — built from
+    (time, status) pairs so a test names only what it cares about."""
+    lines = [
+        "monitor_id  time                     status  msg",
+        "----------  -----------------------  ------  ----",
+    ]
+    lines += [f"172         {time_str}  {status}       OK" for time_str, status in rows]
+    return "\n".join(lines)
+
+
+_KUMA_MONITOR_TITLE = "Hermes Agent - Push"
+_KUMA_MONITORS = [{"id": "172", "name": _KUMA_MONITOR_TITLE, "type": "push", "active": True}]
+
+
 def test_liveness_kuma_push_fresh_positive_confirms_fixed():
     with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
         since = NOW
@@ -6575,13 +6624,14 @@ def test_liveness_kuma_push_fresh_positive_confirms_fixed():
         eid = _seed_liveness_pending_host_item(conn, since=since, deadline=deadline)
 
         # No push yet, still inside the window — stays liveness_pending.
-        triage._watchdog_poll = _fake_wp_module([])
+        triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
         triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(minutes=5), dry_run=False)
         assert triage._get_item(conn, eid)["state"] == triage.STATE_LIVENESS_PENDING
 
-        # A push AFTER `since` -> STATE_FIXED, the one genuinely-verified state.
-        push_ts = str((since + dt.timedelta(minutes=10)).timestamp())
-        triage._watchdog_poll = _fake_wp_module([_slack_msg(push_ts, "[Hermes Agent - Push] OK")])
+        # An UP heartbeat AFTER `since` -> STATE_FIXED, the one genuinely-verified state.
+        push_dt = since + dt.timedelta(minutes=10)
+        rows = _kuma_rows((push_dt.strftime("%Y-%m-%d %H:%M:%S.000"), 1))
+        triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
         triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(minutes=15), dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_FIXED, item["state"]
@@ -6594,13 +6644,13 @@ def test_liveness_kuma_push_fresh_never_confirmed_reopens_past_deadline():
     STATE_FIXED (a positive probe) or a reopen to STATE_NEW past the
     deadline — it never sets STATE_QUIET itself (that state is produced only
     by the grouped-source silence paths, resolve_quiet_grouped()/
-    apply_resolutions()). A push that never arrives is "not proven, try
+    apply_resolutions()). A heartbeat that never arrives is "not proven, try
     again as a fresh occurrence", which this asserts."""
     with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
         since = NOW
         deadline = NOW + dt.timedelta(hours=1)
         eid = _seed_liveness_pending_host_item(conn, since=since, deadline=deadline)
-        triage._watchdog_poll = _fake_wp_module([])  # never a matching push
+        triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
         triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(hours=2), dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEW, item["state"]
@@ -6609,18 +6659,62 @@ def test_liveness_kuma_push_fresh_never_confirmed_reopens_past_deadline():
 def test_gather_kuma_push_fresh_unparsable_since_fails_closed():
     """An unparsable `since` must never read as "no lower bound, anything
     confirms it" — that would let a corrupted deploy_expect_json confirm
-    liveness off a push unrelated to the restart it is supposed to verify.
-    Even a push that would otherwise match the monitor title must be
-    refused."""
-    saved = triage._watchdog_poll
-    try:
-        triage._watchdog_poll = _fake_wp_module([_slack_msg(str(NOW.timestamp()), "[Hermes Agent - Push] OK")])
+    liveness off a heartbeat unrelated to the restart it is supposed to
+    verify. Refused before hermes-ops.sh is even invoked."""
+    ok, detail = triage._gather_kuma_push_fresh(
+        [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": "not-a-timestamp"}])
+    assert ok is False, detail
+    assert "unparsable" in detail.lower(), detail
+
+
+def test_gather_kuma_push_fresh_rows_before_since_fail():
+    """A heartbeat that predates the restart cannot confirm it — only rows
+    STRICTLY AFTER `since` count."""
+    with _triage_env() as (conn, ctx):
+        since = NOW
+        older = since - dt.timedelta(minutes=5)
+        rows = _kuma_rows((older.strftime("%Y-%m-%d %H:%M:%S.000"), 1))
+        triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
         ok, detail = triage._gather_kuma_push_fresh(
-            [{"monitorTitle": "Hermes Agent - Push", "since": "not-a-timestamp"}])
+            [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": since.isoformat()}])
         assert ok is False, detail
-        assert "unparsable" in detail.lower(), detail
-    finally:
-        triage._watchdog_poll = saved
+
+
+def test_gather_kuma_push_fresh_status_zero_only_fails():
+    """A DOWN heartbeat (status 0) after `since` is not a confirmation —
+    only an UP (status 1) row proves the restart landed."""
+    with _triage_env() as (conn, ctx):
+        since = NOW
+        fresh = since + dt.timedelta(minutes=5)
+        rows = _kuma_rows((fresh.strftime("%Y-%m-%d %H:%M:%S.000"), 0))
+        triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
+        ok, detail = triage._gather_kuma_push_fresh(
+            [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": since.isoformat()}])
+        assert ok is False, detail
+        assert "none up" in detail, detail
+
+
+def test_gather_kuma_push_fresh_title_not_in_monitors_fails():
+    """`monitors --json` not carrying the expected title (a rename, a
+    monitor deleted in UptimeKuma) must fail closed, never guess an id."""
+    with _triage_env() as (conn, ctx):
+        triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=[{"id": "1", "name": "Something Else"}])
+        ok, detail = triage._gather_kuma_push_fresh(
+            [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": NOW.isoformat()}])
+        assert ok is False, detail
+        assert "no UptimeKuma monitor named" in detail, detail
+
+
+def test_gather_kuma_push_fresh_hermes_ops_nonzero_exit_fails():
+    """A non-zero exit from either hermes-ops.sh call — an ssh failure, a
+    docker-exec refusal — must read as no evidence, never raise and never
+    read as confirmed."""
+    with _triage_env() as (conn, ctx):
+        triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, monitors_exit=1)
+        ok, detail = triage._gather_kuma_push_fresh(
+            [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": NOW.isoformat()}])
+        assert ok is False, detail
+        assert "monitors --json failed" in detail, detail
 
 
 def test_reconcile_crashed_host_operation_lands_needs_human():
@@ -6659,6 +6753,139 @@ def test_reconcile_crashed_host_operation_lands_needs_human():
                              ).fetchone()["n"] == 1, "the cooldown must have refused a second host op"
         assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_HUMAN, (
             "a cooldown-refused pass must leave the item exactly where it was")
+
+
+# =============================================================================
+# remind_needs_human() — DESIGN.md:247's "7d, reminder at 1d", the one
+# deadline-table row STATE_DEADLINES' own comment and docs/api.md's
+# carried-debt note both flagged NOT built.
+# =============================================================================
+
+def _seed_needs_human_reminder_item(conn, *, signature="uk:rem-1", entered_at: dt.datetime,
+                                     note: str = "read the verdict and decide",
+                                     state: str = None, card_ts: str | None = "1000.000777") -> int:
+    """A carded `needs_human` (or `merge_blocked`) row whose LAST REAL
+    transition into that state landed at `entered_at` — via a real
+    `_set_state()` call, so it lands an `item_transitions` row the same way
+    a live transition would, rather than hand-inserting one and risking a
+    shape remind_needs_human()'s own query does not actually match."""
+    state = state or triage.STATE_NEEDS_HUMAN
+    external_id = signature.split(":", 1)[1]
+    eid = _insert_event(conn, source="uk", external_id=external_id, title="t", first_seen=entered_at)
+    conn.execute(
+        "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, last_seen, "
+        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (eid, signature, None, triage.STATE_NEW, 1, entered_at.isoformat(), entered_at.isoformat(),
+         entered_at.isoformat(), entered_at.isoformat()),
+    )
+    conn.commit()
+    triage._set_state(conn, eid, state, entered_at, note=note, card_channel="C0TESTCHAN01", card_ts=card_ts)
+    conn.commit()
+    return eid
+
+
+def test_remind_needs_human_fires_at_24h_not_23h():
+    with _triage_env() as (conn, ctx):
+        entered_at = NOW - dt.timedelta(hours=23)
+        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at)
+        triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=False)
+        assert ctx.posted == [], "must not remind before the 24h threshold"
+        assert triage._get_item(conn, eid)["reminder_count"] == 0
+
+        triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0},
+                                   entered_at + dt.timedelta(hours=24), dry_run=False)
+        assert len(ctx.posted) == 1, ctx.posted
+        post = ctx.posted[0]
+        assert post["thread_ts"] == "1000.000777"
+        assert post["channel"] == "C0TESTCHAN01"
+        assert "Do this:" in post["text"], post["text"]
+        assert "read the verdict and decide" in post["text"]
+        item = triage._get_item(conn, eid)
+        assert item["reminder_count"] == 1, item["reminder_count"]
+        assert item["last_reminder_at"] is not None
+
+
+def test_remind_needs_human_second_at_72h_never_a_third():
+    policy = DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}
+    with _triage_env() as (conn, ctx):
+        entered_at = NOW
+        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at)
+
+        triage.remind_needs_human(conn, policy, entered_at + dt.timedelta(hours=25), dry_run=False)
+        assert len(ctx.posted) == 1
+        assert triage._get_item(conn, eid)["reminder_count"] == 1
+
+        # Short of 72h — the second, final reminder must not fire early.
+        triage.remind_needs_human(conn, policy, entered_at + dt.timedelta(hours=71), dry_run=False)
+        assert len(ctx.posted) == 1, "second reminder must not fire before 3x the interval"
+
+        triage.remind_needs_human(conn, policy, entered_at + dt.timedelta(hours=72), dry_run=False)
+        assert len(ctx.posted) == 2, ctx.posted
+        assert triage._get_item(conn, eid)["reminder_count"] == 2
+
+        # Never a third, no matter how much later this runs.
+        triage.remind_needs_human(conn, policy, entered_at + dt.timedelta(hours=1000), dry_run=False)
+        assert len(ctx.posted) == 2, "must never send a third reminder"
+        assert triage._get_item(conn, eid)["reminder_count"] == 2
+
+
+def test_remind_needs_human_skips_canary_signature():
+    with _triage_env() as (conn, ctx):
+        entered_at = NOW - dt.timedelta(hours=48)
+        eid = _seed_needs_human_reminder_item(conn, signature="warden_canary:probe-1", entered_at=entered_at)
+        triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=False)
+        assert ctx.posted == [], "a warden_canary: item must never be reminded"
+        assert triage._get_item(conn, eid)["reminder_count"] == 0
+
+
+def test_remind_needs_human_dry_run_posts_nothing():
+    with _triage_env() as (conn, ctx):
+        entered_at = NOW - dt.timedelta(hours=48)
+        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=True)
+        assert ctx.posted == [], "dry-run must never post"
+        assert "[dry-run] would remind uk:rem-1" in buf.getvalue(), buf.getvalue()
+        assert triage._get_item(conn, eid)["reminder_count"] == 0, "dry-run must never write state"
+
+
+def test_remind_needs_human_skips_item_with_no_card_ts_and_counts_it():
+    with _triage_env() as (conn, ctx):
+        entered_at = NOW - dt.timedelta(hours=48)
+        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at, card_ts=None)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=False)
+        assert ctx.posted == [], "nothing to thread under — must not post"
+        assert triage._get_item(conn, eid)["reminder_count"] == 0
+        assert "no card_ts" in buf.getvalue(), buf.getvalue()
+
+
+def test_remind_needs_human_applies_to_merge_blocked_too():
+    with _triage_env() as (conn, ctx):
+        entered_at = NOW - dt.timedelta(hours=25)
+        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at, state=triage.STATE_MERGE_BLOCKED,
+                                               note="merge by hand via the PR")
+        triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=False)
+        assert len(ctx.posted) == 1, ctx.posted
+        assert "merge_blocked" in ctx.posted[0]["text"]
+        assert triage._get_item(conn, eid)["reminder_count"] == 1
+
+
+def test_needs_human_reminder_hours_rejects_zero_and_negative():
+    """Same closed-key stderr-fallback contract as
+    test_host_verb_cooldown_and_max_attempts_reject_zero_and_negative — a
+    configured `0` must not silently disable the threshold (which would
+    read as `hours_in_state >= 0`, i.e. remind on every single pass)."""
+    for bad_value in (0, -1):
+        policy = dict(DEFAULT_POLICY, needsHumanReminderHours=bad_value)
+        with _triage_env(policy=policy) as (conn, ctx):
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                loaded = triage.load_policy()
+            assert loaded["needsHumanReminderHours"] == triage.DEFAULT_NEEDS_HUMAN_REMINDER_HOURS
+            assert str(bad_value) in buf.getvalue(), buf.getvalue()
 
 
 if __name__ == "__main__":

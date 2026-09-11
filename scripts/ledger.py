@@ -63,7 +63,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
 # verdict schemas and are asserted per job by assert_result_schema and by
 # `make check-schemas` — two independent pins that must never be conflated.
-LEDGER_SCHEMA_VERSION = 8
+LEDGER_SCHEMA_VERSION = 9
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -459,6 +459,36 @@ ALTER TABLE triage_items ADD COLUMN origin_channel TEXT;
 ALTER TABLE triage_items ADD COLUMN origin_thread_ts TEXT;
 """
 
+# Version 9 — the `needs_human`/`merge_blocked` reminder (DESIGN.md:247's
+# "7d, reminder at 1d", the one row of its own deadline table triage.py's
+# STATE_DEADLINES comment and docs/api.md's carried-debt note both flagged
+# as NOT built). Two columns on `triage_items`, mirroring the same
+# reminder_count/last_reminder_at SHAPE `events` already carries for the
+# grouped-source poller's OWN reminder cadence (BASE_SCHEMA) — but never the
+# same COLUMNS: `events.reminder_count`/`last_reminder_at` belong to
+# watchdog-poll.py's occurrence-batching poller, an entirely different
+# mechanism against a different table, and reusing them here would make one
+# counter answer two unrelated questions ("how many times has this alert
+# recurred" vs "how many reminder replies has a human been sent").
+#
+#   triage_items.reminder_count    0 (DEFAULT, so every pre-existing row
+#     reads as "never reminded", correctly — this mechanism did not exist
+#     before this migration) until remind_needs_human() posts a reminder,
+#     then 1, then 2 — capped there for good, by that function's own logic,
+#     never by a CHECK constraint (closed vocabularies live in code in this
+#     repo, not in DDL — see e.g. _valid_host_verb_rule()).
+#
+#   triage_items.last_reminder_at  NULL until the first reminder, then the
+#     timestamp of the MOST RECENT one — read by nothing yet (eligibility is
+#     computed from `item_transitions`, not this column — see
+#     remind_needs_human()'s own docstring for why), kept purely as the
+#     human-visible "when did warden last poke me about this" fact a card or
+#     a future /items response can read without re-deriving it.
+_MIGRATION_9 = """
+ALTER TABLE triage_items ADD COLUMN reminder_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE triage_items ADD COLUMN last_reminder_at TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -468,6 +498,7 @@ MIGRATIONS: dict[int, str] = {
     6: _MIGRATION_6,
     7: _MIGRATION_7,
     8: _MIGRATION_8,
+    9: _MIGRATION_9,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live
