@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-11 (§62) |
+| Last updated | 2026-09-11 (§63) |
 | Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 9 |
@@ -56,12 +56,13 @@ loop.
   (`SIDECLAW_MODEL_REVIEW`/`SIDECLAW_MODEL_DISPATCH` in sideclaw's `.env`).
 - Slack delivery is a plain HTTP client (`chat.postMessage`/`chat.update`),
   never the gateway's live `slack_bolt` connection.
-- Cards, receipts and reminders post under warden's own Slack app identity
-  (`resolve_slack_token()` tries `op://common/slack/WARDEN_BOT_TOKEN` first),
-  falling back to Hermes's bot user until that app is created and seeded —
-  `slack/README.md` has the owner steps. The read path (`#alerts`/`#updates`
-  history in `watchdog-poll.py`) stays pinned to Hermes's token regardless
-  (`resolve_alerts_read_token()`) — a `chat:write`-only app cannot read.
+- Cards, receipts and reminders post under warden's own Slack app, `warden`
+  (app `A0C13NMFLD9`, bot user `U0C15C9QZFX`), live since 2026-09-11:
+  `resolve_slack_token()` resolves `op://common/slack/WARDEN_BOT_TOKEN` from
+  the headless cache; the Hermes fallback exists only for a missing cache.
+  The read path (`#alerts`/`#updates` history in `watchdog-poll.py`) stays
+  pinned to Hermes's token (`resolve_alerts_read_token()`) — a
+  `chat:write`-only app cannot read.
 - The `#agents` overview digest is retired.
 - sideclaw's published verdict schemas are pinned in
   `scripts/clients/sideclaw.py` (`DISPATCH_SCHEMA_VERSION=2`,
@@ -69,12 +70,6 @@ loop.
 
 ## Open — owner actions
 
-- Create the Warden Slack app: mint a config token at api.slack.com/apps,
-  `make slack-app-create SLACK_CONFIG_TOKEN=…`, install, store the bot token
-  at `op://common/slack/WARDEN_BOT_TOKEN`, and only THEN add the ref to
-  `dotfiles-private/headless.refs` — `secrets-seed.sh` is `set -e` and an
-  unresolvable ref breaks the next reseal for every consumer (§62). Until
-  then warden posts as Hermes and says so once per run on stderr.
 - The §55 4.3 "human types in Slack" acceptance is still open.
 - `warden-api`'s "LAST EXIT -15" is the §55 kickstart; cosmetic.
 
@@ -105,6 +100,7 @@ loop.
 - Closing the queue: reminders, the heartbeat probe, Kuma sync — §60
 - Warden's own Slack identity — §61
 - MacBook field report folded in: PAT was never gated, repo bundle — §62
+- Warden Slack app live — §63
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
@@ -112,8 +108,7 @@ log's past sections.
 ### Next action
 
 `needs_human` is 0; item 996 landed (meteo master 95d3e3b, watchdog
-105/105, Kuma 220 UP with `degraded: true`). Owner: the Warden Slack app
-(above). Loop: the first host-verb `fixed` is still ahead — the three hermes
+105/105, Kuma 220 UP with `degraded: true`). Owner: nothing. Loop: the first host-verb `fixed` is still ahead — the three hermes
 items resolved as `quiet` before the heartbeat probe landed; a sideclaw host
 verb for uk:204-shaped crashes, guarded by no dispatch in flight; the ledger
 restore path. Wave 9, the field review, from `docs/handover-field-review.md`

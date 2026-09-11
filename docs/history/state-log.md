@@ -6717,3 +6717,21 @@ watchdog 105/105, Kuma 220 UP, `degraded: true`); `needs_human` is 0. The
 handover doc's `sqlite3 "file:…?mode=ro"` snippets are replaced with a plain
 path: this box's CLI cannot open a WAL ledger read-only while nothing else
 holds it, and the form only ever worked while warden-api did.
+
+## 63. The Warden Slack app is live (2026-09-11, 19:00Z)
+
+Owner steps from §61 done on the MacBook: app `A0C13NMFLD9` from
+`slack/app-manifest.json` (id recorded in `slack/README.md`, 40cb1c3),
+installed, bot user `warden` (`U0C15C9QZFX`, bot `B0C24BVM6RW`);
+`op://common/slack/WARDEN_BOT_TOKEN` set, the ref added to
+`dotfiles-private/headless.refs` (1869b1d) and resealed to the mini.
+Verified on the mini: `resolve_slack_token()` returns the Warden token with
+no fallback warning, `auth.test` answers as `warden`, and a post reached
+`#agents` without an invite. The read path stays on Hermes. `STATE.md`
+drops the owner action; the only open risk the field review named, the
+remote-less repo, is covered by §62's bundle.
+
+Concurrent, not this §: a second session is plumbing a
+`TRIAGE_VALIDATION_DISPATCH_MODEL` through `open_review()`/`submit_review()`
+and sideclaw's review route so step-7 validation leaves Max too. Its files
+are left uncommitted here on purpose.
