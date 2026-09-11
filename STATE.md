@@ -6106,3 +6106,167 @@ the manual remedy today); `abort` does not sync the Slack card itself (the
 loop's next tick does); reconcile still reads GitHub through `gh` for merges
 while everything else uses `clients/github.py`; the 4.3 "human types in
 Slack" acceptance is still the owner's — the plugin now reports from the row.
+
+## 55. Wave 6 (estate chain) — every origin opens an item; Hermes is the door (2026-09-10, 22:00Z →)
+
+One Fable orchestrator, Sonnet implementers, sideclaw reviews on all three repos.
+Live facts as they happened.
+
+### Timeline of the live system
+
+| When (UTC) | What |
+|-|-|
+| 22:00:58 | `com.jkrumm.warden-loop` and `com.jkrumm.warden-sweep` **booted out** for the edit window (schema 8 and `triage.py` mid-edit; same reason as §54). `warden-poll`, `warden-backup`, `warden-api` kept running. |
+| 22:40:30 | sideclaw `e9b6584` committed; `make reload` at 22:40 — `GET /api/dispatch-schema` → version **2**, twelve outcomes; `GET /api/review-schema` → version **1**. MCP children left alive on purpose (`RESTART_MCP=1` would kill this session's MCP client; warden reaches sideclaw over HTTP, not MCP). |
+| 22:41:20 → 22:43:15 | Live proof of check-before-push: an implement on `dispatch-scratch` told to add a `package.json` whose test script exits 1. Result `outcome: checks_failed, schemaVersion: 2, nextAction: human, branch: dispatch/…-b534ccc6, artifactUrl: null` in 115 s. Branch pushed, **no PR**. Branch deleted by hand afterwards. |
+| 22:41:39 → 22:42:46 | Live proof of review-by-ref: `review {cwd: rollhook, pr: 23}` → `actionable`, 0 blocking, `schemaVersion: 1`, 67 s; `refs/sideclaw-review/*` and the worktree gone afterwards. |
+| 23:12:04 | First hand tick (`triage.py --run`, LaunchAgent still out): live ledger **7 → 8** (`triage_items.{origin,max_tier,brief,origin_channel,origin_thread_ts}`). `warden-api` (old process, pinned 7) 503'd until `kickstart -k` at 23:17:54. Manual `VACUUM INTO` snapshot `backups/pre-schema-v8-20260910T2310Z.db` taken first. |
+| 23:12 | **Finding:** `label:"warden:go"` (quoted) returns nothing from GitHub's search index; `label:warden:go` returns the issue. Fixed in `clients/github.py`. |
+| 23:13 | **Finding, owner's:** the loop's PAT (`op://mini/github/token`) has **no Issues permission** — `GET /repos/jkrumm/dispatch-scratch/issues` → 403 "Resource not accessible by personal access token", while pulls, labels and the repo itself read fine and `gh issue create` with it fails the same way. The `github_issue` origin cannot poll or comment under the LaunchAgent until the owner grants that PAT Issues read/write. Every live run below used a one-off `WARDEN_SECRETS_RUN` shim resolving the `gh` keyring OAuth token instead — nothing durable changed. |
+| 23:14:58 | Hand tick with the shim: `ingest_github_go` opened item **986** (`github_issue`, `jkrumm/dispatch-scratch#9`, author `jkrumm` → `max_tier: implement`) in `new`. Escalation refused: "refusing to run inside a Claude Code session" — the recursion guard, because the tick ran from this session. The item **waited in `new`**, nothing dropped. |
+| 23:15:17 | Same tick with the four session markers unset: 986 → `investigating`, job `350d128f`, Slack card `1789082119.426889`. |
+| 23:15:20 → 23:15:41 | `warden run dispatch-scratch --wait --json --origin-channel C0BVDE5R562` (markers unset): item **989** (`human`, `max_tier: investigate`), job `0788caa9`, `waited: true`, verdict inline (`outcome: verdict_only, schemaVersion: 2`) after 21 s. Budget line: 15/20 used, 4/5 implement. |
+| 23:17:42 | 986's investigate done: `nextAction: implement, confidence: high` — "README needs one added sentence on when to read NOTES.md". |
+| 23:17:54 | `warden-api` kickstarted: `/board` live (`investigating: 2, needs_human: 8, merge_blocked: 3`, 13 open items, 46 terminal in 24 h), `/items/989` live, `/items/abc` → 400. `/health` `ok: false` only because the loop and sweep are out. |
+| 23:18:23 | Hand sweep: 986 `investigating → verdict`; **comment-back posted on dispatch-scratch#9** (own issue). 989 **did not fold** — the CLI's `--wait` had stamped `reported_at`, and the sweep only folds unreported rows. Finding 7 below. |
+| 23:18:27 | Hand tick: 986 `verdict → implementing` through `maybe_auto_implement` (ceiling `implement`, verdict implement/high), job `edf0847e`. |
+| 23:20:21 | `edf0847e` **failed at the push**: `remote: fatal error in commit_refs … [remote rejected]` — GitHub's side, a transient; sideclaw salvaged the commit to `~/.local/state/sideclaw/salvage/dispatch-a-prior-read-only-investigation-of-this-edf0847e.bundle`. The check before push had passed (the repo has nothing to run). Next tick: 986 → `merge_blocked` with that error verbatim. The implement budget for the UTC day was now 5/5. |
+| 23:50:34 | 989 folded by hand with the fixed fold: `closed`, note `answered: NOTES.md housekeeping steps … are still accurate`. |
+
+### What landed, by repo
+
+**warden (this commit).** Schema 8. `open_origin_item()` — one `events` row
+(`source` = `human`, or `github_go` for a labelled issue; deliberately not
+`github_issue`, which `watchdog-poll.py` already uses for *stale* issues under
+staleness semantics) plus one `triage_items` row in `new` with `origin`,
+`max_tier`, `brief`, `origin_channel/thread`; one open item per signature, a
+terminal item is never reopened by a stale label. `ingest_github_go()` — every
+tick, `search_issues(label="warden:go")` paged through `total_count` (a short
+page raises and the tick skips resolution rather than resolving live items);
+issues gone from the result set resolve their event, and the existing
+`new`-only silence rule closes an item nobody started. Own author →
+`max_tier: implement`; anyone else, or an unparseable author → `investigate`,
+regardless of the label, and the body is fenced as untrusted with the epilogue
+guaranteed to survive truncation. `escalate_origin_items()` — each origin item
+is a cluster of one, claimed `new → investigating` by compare-and-set before
+the submit (the loop and `warden run` are two callers), exempt from the alert
+gates and from `DAILY_INVESTIGATE_BUDGET`, subject to `MAX_OPEN_INVESTIGATIONS`
+and the CLI's own dispatch budget with the deferral in `note`. An
+investigate-ceiling origin item lands `closed` / `answered:` on its verdict.
+`maybe_auto_implement` and `require_auto_from_item` both refuse
+`max_tier != 'implement'`. Comment-back on an own issue happens after the
+compare-and-set transition commits, once, with `payload_json.commented_at` as
+the durable marker; never under dry-run, never on a third-party issue.
+
+`warden run <repo> [--tier] [--why] [--wait] [--origin-channel/--origin-thread]`
+— the `human` origin; `--wait` returns the verdict inline and folds the item
+before returning. `dispatch` stays: a bare episode, the Slack-click door for an
+implement. `poll_implement_jobs` reads `result.outcome` against the pinned
+`DISPATCH_OUTCOMES` (schema 2): `pr_opened → validating`, `checks_failed →
+needs_human`, `no_changes` and the refusals → `merge_blocked`, `salvaged`,
+wrong-tier outcomes, unknown outcomes and `nextAction: human` → `needs_human`;
+a `schemaVersion` or outcome outside the pin is a `RemoteError` and
+`needs_human` with that sentence. Step-7 validation is a sideclaw **`review`**
+job on the pull request (`open_review`, tier `review` in `dispatches`):
+`clean`, or `actionable` with no `blocking` → `confirmed`; `blocking` →
+`blocked` + `merge_blocked` with the first three findings; `needs-human` →
+`needs_human`; anything else fails closed to `needs_human`. `validation_status`
+is `confirmed | blocked | needs_human | error`; the markers, `VALIDATION_MODEL`
+and `TRIAGE_VALIDATION_MODEL` are gone. `make status` gained a `schemas` row
+(`check-schema-versions.py`: dispatch=2 review=1, outcome sets compared).
+`warden-api`: `GET /board`, `GET /items/<id>`, and `reverts` is a real count.
+
+**sideclaw `e9b6584`.** `review` takes `pr` or `branch`, fetches into a per-job
+ref, reviews in a read worktree cut at the fetched OID, diffs `base...HEAD`,
+cleans both up on every path (the ref by its own flag); branch names and the
+GitHub-reported default branch pass one allowlist before any shell.
+`REVIEW_SCHEMA_VERSION = 1` on every result, `GET /api/review-schema`. The
+implement tier runs `check` in its worktree after the commit and the diff
+refusal and before the push; red → branch pushed, no PR, `checks_failed`,
+`nextAction: human`; a cancel during the check propagates and never pushes.
+`DISPATCH_SCHEMA_VERSION = 2`. Drain grace +10 min, poll ceiling 6600, docs
+and plist prose aligned. 621 tests.
+
+**hermes-agent `11bb095`.** `SOUL.md`: Hermes alerts, narrates and answers;
+Warden decides and dispatches. `claude-dispatch` v3 documents `run`; the
+replay path is gone and the skill says so; the ceiling list, the policy file's
+location and the shim target corrected. New read-only `warden` skill on
+`127.0.0.1:7734` (linked into `~/.hermes/skills`). The morning briefing reads
+`/board` (with a timeout) instead of a second `gh search`;
+`briefing-coverage.py` prints `GITHUB_AVAILABLE=false` on a failed search so an
+outage is never read as clean. `capture` may add `--label warden:go` only on
+Johannes's explicit word. `warden` is discoverable by `project-narratives`
+(never denied; it simply has not reached the front of the never-revised queue
+yet — no change needed).
+
+### What the reviews caught before commit
+
+sideclaw (two rounds): a cancel during the check was folded into
+`checks_failed` and still pushed; `identity.defaultBranch` (GitHub-controlled)
+spliced into `bash -c`; the fetch ref leaked into the caller's live repo when
+base resolution failed after the fetch; the check ran before the diff refusal
+(a secret-leaking tree would have reached a model session); the Makefile poll
+ceiling no longer outlasted the drain (a test caught it). hermes-agent: a
+stale ceiling list, skill counts off by one, no curl timeout, GitHub outages
+masked as clean. warden: the validation switch failed OPEN (an unknown review
+outcome with empty `blocking` would have merged); the issue comment was posted
+before the transaction committed (duplicate on crash or overlapping sweeps);
+`escalate_origin_items` had two callers and no compare-and-set; a long
+third-party body truncated the fence and the investigate-only epilogue away;
+`search_issues` past 50 hits would have resolved live items; the `dispatches`
+INSERT existed twice. Two more from the live run: the quoted label query, and
+`run --wait` stamping `reported_at` so the sweep never folded the item.
+
+Declined, recorded: extracting the origin subsystem into `lifecycle/origins.py`
+(right shape, but the test suite monkeypatches `triage` module globals and the
+blast radius is a wave of its own); the `runReview` orchestration refactor in
+sideclaw (`resolveReviewSource`); `CHAIN_STATES` in `api.py` staying a
+hand-mirrored tuple; `_dispatch_investigate_and_advance` not distinguishing
+`maybe_mutated` on an ambiguous investigate submit (the next tick's orphan
+reclaim covers it).
+
+### The chain, end to end, for a labelled issue (item 986)
+
+| When (UTC) | Observed |
+|-|-|
+| 00:00:21 | Implement budget rolled over. 986 returned to `verdict` by hand (`implement_job NULL`, note names the GitHub transient). |
+| 00:00:22 | Hand tick: `verdict → implementing`, job `d3914c59`. |
+| 00:02:22 | `outcome: pr_opened, schemaVersion: 2` — **PR jkrumm/dispatch-scratch#10** (draft) `docs: clarify when to read NOTES.md`, in 120 s including the mechanical check. Hand tick: `implementing → validating`, review job `536f5390` (`tier: review` in `dispatches`). |
+| 00:03:24 | Review `outcome: clean, schemaVersion: 1`, 0 blocking, 62 s. Hand tick: `validation_status = confirmed`, the merge gate reached — and **refused: "dispatch d3914c59 finished as 'running', not 'done'"**. False reason: only the sweep syncs `dispatches.status`, and the sweep was out. **Finding 9, fixed in this commit:** the loop now calls `sync_record(reported=False)` itself when it reads a terminal job, so ledger consistency never depends on a sibling agent's timing. |
+| 00:04:08 | Hand sweep (rows synced; the `review` row "no origin_channel — closing with a sentinel", i.e. never Slack-delivered, as designed). 986 returned to `validating` by hand. Hand tick: **`merge_blocked` — "no autoMergePaths declared for 'dispatch-scratch' — path scope is the primary merge gate now; nothing merges without an explicit declared scope."** The designed end for a repo with no scope. |
+| 00:05 | PR #10 closed and its branch deleted by hand; issue #9 closed with a note. Sideclaw's salvage bundle from the rejected push left in place. |
+
+So a GitHub label became, with no human step after the label: an item, an
+investigate episode, a comment on the issue, an implement episode that ran the
+repo's checks before pushing, a draft pull request, a second-model review with
+a typed verdict, a confirmed validation, and a merge refused by the only gate
+that may refuse it. The human-origin twin (989) became an answered question in
+21 seconds. Every step was executed, none argued.
+
+### What is now true that was not
+
+Three origins open items that ride one lifecycle; the ceiling is a column, not
+a convention. Hermes hands work in through one verb and reads the board back
+through one skill instead of guessing. The implement path and the interactive
+path share sideclaw's `check` and `review` vocabulary, typed and version-pinned
+at both ends; a shape that moves is a loud refusal. A red check is a human's,
+never a pull request.
+
+### Next action
+
+Wave 7 (`dotfiles/docs/waves/PLAN.md`): the surfaces and the model choices.
+Owner items: (1) grant the PAT at `op://mini/github/token` **Issues read &
+write** — until then the search API answers the PAT with 200 and zero hits
+(no error line; the origin is silently dead, which is worse than a 403 — the
+owner item, not a loop bug), and comment-back would 403; (2) the 4.3 "human types in
+Slack" acceptance is still open. Carried: the `propose_mappings` 503/403 on the
+cheap route (every tick, Wave 7); `escalate_origin_items` writes a deferral
+note every tick while waiting (churn on `updated_at`, cosmetic); the
+`checks_failed` note renders a step twice when `check` reports two `test`
+steps; the origin subsystem lives in `triage.py` (extraction declined, see
+above); `warden run --tier implement` from Hermes is bounded by
+`autoMergePaths`, budgets and the second-model review, not by the Slack click —
+a deliberate line, recorded here so it is not rediscovered as a gap; the
+`meteo` venv on this box held 8 GB RSS during the wave and got a background
+runner killed for memory. `com.jkrumm.warden-loop` and `-sweep` bootstrapped again at **00:14:54Z**
+(2026-09-11); `make status` green, `sideclaw schemas ✓ dispatch=2 review=1`.

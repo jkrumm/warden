@@ -265,6 +265,36 @@ def main() -> int:
     check("done-with-no-result rendering identical with and without merged_at",
           no_result_without_merge == no_result_with_merge)
 
+    # --- checks_failed outcome: branch + failing-steps text render (Wave 6.2) --
+    #
+    # An implement job whose repo checks failed before push carries `branch`
+    # but no `artifactUrl`, and the worker's own `verdict` prose is where the
+    # failing-steps summary lives (sideclaw appends it there — there is no
+    # separate field). Pins that format_message() already surfaces both
+    # without any change: the branch line, and the verdict prose beneath it.
+    checks_failed_body = format_message(
+        repo="example", tier="implement", job_id=JOB_ID, status="done",
+        result={
+            "summary": "The repo's checks failed before push.",
+            "verdict": "lint failed: 3 errors in scripts/x.py; typecheck failed: 1 error in scripts/y.py",
+            "confidence": "high", "recommendation": "Fix the lint errors and re-run.",
+            "evidence": [], "nextAction": "human", "outcome": "checks_failed",
+            "branch": "dispatch/example-42",
+        },
+        error=None,
+    )
+    checks_failed_checks = [
+        ("branch line renders, no artifact line",
+         "*Branch pushed, no PR opened:* `dispatch/example-42`" in checks_failed_body
+         and "*Artifact:*" not in checks_failed_body),
+        ("the failing-steps text (in `verdict`) renders",
+         "lint failed: 3 errors in scripts/x.py" in checks_failed_body
+         and "typecheck failed: 1 error in scripts/y.py" in checks_failed_body),
+    ]
+    for label, cond in checks_failed_checks:
+        check(f"checks_failed rendering: {label}", cond)
+    checks_failed_ok = sum(1 for _, cond in checks_failed_checks if cond)
+
     # --- wake-up nudge: is_actionable() predicate ------------------------
     #
     # WHY THIS SECTION EXISTS. The verdict sent via `hermes send` posts as
@@ -299,6 +329,8 @@ def main() -> int:
          _actionable(tier="author") is False),
         ("tier=investigate => not actionable",
          _actionable(tier="investigate") is False),
+        ("tier=review => not actionable",
+         _actionable(tier="review") is False),
         ("status=failed => not actionable",
          _actionable(status="failed") is False),
         ("status=interrupted => not actionable",
@@ -546,6 +578,56 @@ def main() -> int:
         check(f"delivery: {label}", cond)
     delivery_ok = sum(1 for _, cond in delivery_checks if cond)
 
+    # --- review-tier rows: never treated as a Slack-deliverable verdict -------
+    #
+    # `_open_validation_dispatch()`'s step-7 `review` job (Wave 6.2) opens
+    # with `Origin(event_id=...)` only — no origin_channel. Pins that such a
+    # row rides the exact same "no origin_channel -> sentinel, nothing
+    # posted" path every other originless dispatch already takes, rather
+    # than somehow being rendered as a verdict Slack message.
+    review_checks: list[tuple[str, bool]] = []
+    tmpdb3 = Path(_tempfile.mkdtemp(prefix="dispatch-sweep-review-")) / "watchdog.db"
+    orig_db3, orig_poll3, orig_send3 = dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message
+    review_post_calls: list[tuple] = []
+    try:
+        dispatch_sweep.DB_PATH = tmpdb3
+        conn = dispatch_sweep._ledger.connect(tmpdb3, migrate=True)
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) "
+            "VALUES('review-job-1','review','example','review PR #9','queued','2026-09-07T00:00:00+00:00')")
+        conn.commit(); conn.close()
+
+        def row3(job_id):
+            c = _sqlite3.connect(tmpdb3); c.row_factory = _sqlite3.Row
+            r = c.execute("SELECT * FROM dispatches WHERE job_id=?", (job_id,)).fetchone(); c.close()
+            return r
+
+        dispatch_sweep.poll_job = lambda job_id: {
+            "status": "done",
+            "result": {"outcome": "clean", "blocking": [], "improvements": [], "discussions": [],
+                       "testGaps": [], "summary": "clean", "schemaVersion": 1},
+        }
+
+        def fail_if_posted(target, body):
+            review_post_calls.append((target, body))
+            return 0, "delivered"
+        dispatch_sweep.send_message = fail_if_posted
+
+        dispatch_sweep.main([])
+
+        r = row3("review-job-1")
+        review_checks.append(("review row with no origin_channel: never posted", review_post_calls == []))
+        review_checks.append(("review row with no origin_channel: closed with the sentinel",
+                               r["delivery_status"] == dispatch_sweep.UNDELIVERABLE_SENTINEL))
+        review_checks.append(("review row with no origin_channel: reported_at is a real timestamp",
+                               r["reported_at"] is not None
+                               and r["reported_at"] != dispatch_sweep.UNDELIVERABLE_SENTINEL))
+    finally:
+        dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message = orig_db3, orig_poll3, orig_send3
+    for label, cond in review_checks:
+        check(f"review-tier: {label}", cond)
+    review_ok = sum(1 for _, cond in review_checks if cond)
+
     print(f"unmerged byte-identical      {unmerged_ok}/{unmerged_cases}")
     print(f"merged rendering             {merged_ok}/{len(merged_checks)}")
     print(f"garbage merged_at            {garbage_ok}/{len(garbage_checks)}")
@@ -557,6 +639,8 @@ def main() -> int:
     print(f"nudge body content            {nudge_ok}/{len(nudge_checks)}")
     print(f"pruned jobs                   {lost_ok}/{len(lost_checks)}")
     print(f"delivery                      {delivery_ok}/{len(delivery_checks)}")
+    print(f"checks_failed rendering       {checks_failed_ok}/{len(checks_failed_checks)}")
+    print(f"review-tier rows              {review_ok}/{len(review_checks)}")
 
     if failures:
         print("\nFAILURES:")

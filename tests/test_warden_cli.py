@@ -494,6 +494,144 @@ def test_dispatch_wait_returns_terminal_result():
     assert proc.returncode == 0 and out["waited"] is True and out["status"] == "done", out
 
 
+# --- run (Wave 6.1: the `human` origin) --------------------------------------
+
+
+def test_run_record_round_trip():
+    h = Harness()
+    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-rt", "status": "running"}})})
+    try:
+        proc = h.run(["run", "alpha", "--json"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0, out
+    assert out["verb"] == "run" and out["origin"] == "human" and out["repo"] == "alpha"
+    assert out["maxTier"] == "investigate" and out["queued"] is False
+    assert out["jobId"] == "job-run-rt" and out["state"] == "investigating"
+    assert out["eventId"] is not None
+
+
+def test_run_with_origin_channel_and_thread_carries_onto_the_dispatch_row():
+    """Hermes answering in its own thread (`--origin-channel --origin-thread`,
+    no `--wait`): the investigate dispatch's row must carry that thread, not
+    the shared triage card's — the verdict has to land where the asker can
+    read it."""
+    h = Harness()
+    db = h.new_db()
+    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-origin", "status": "running"}})})
+    try:
+        proc = h.run(
+            ["run", "alpha", "--origin-channel", "C0ORIGIN0001", "--origin-thread", "1111.000001", "--json"],
+            env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF,
+        )
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0, out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT origin_channel, origin_thread_ts FROM dispatches ORDER BY id DESC LIMIT 1")
+    conn.close()
+    assert row["origin_channel"] == "C0ORIGIN0001", dict(row)
+    assert row["origin_thread_ts"] == "1111.000001", dict(row)
+
+
+def test_run_without_origin_channel_uses_the_shared_card_as_before():
+    """No `--origin-channel`/`--origin-thread`: the dispatch row's origin
+    channel is the shared triage card's (triage-policy.json's cardChannel,
+    or the module default) — unchanged from before these columns existed."""
+    h = Harness()
+    db = h.new_db()
+    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-noorigin", "status": "running"}})})
+    try:
+        proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0, out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT origin_channel FROM dispatches ORDER BY id DESC LIMIT 1")
+    conn.close()
+    assert row["origin_channel"] is not None, "must fall back to the shared card's channel, not stay NULL"
+
+
+def test_run_dry_run_opens_nothing():
+    h = Harness()
+    db = h.new_db()
+    env = h.base_env(db=db)
+    proc = h.run(["run", "alpha", "--dry-run", "--json"], env=env, stdin=VALID_BRIEF)
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["dryRun"] is True, out
+    conn, _ = _connect(db)
+    count = conn.execute("SELECT COUNT(*) FROM triage_items").fetchone()[0]
+    conn.close()
+    assert count == 0, "a dry-run must never open an item"
+
+
+def test_run_tier_implement_without_why_is_usage_error():
+    h = Harness()
+    proc = h.run(["run", "gamma", "--tier", "implement", "--json"], stdin=VALID_BRIEF)
+    out = _json_or_fail(proc)
+    assert proc.returncode == 64 and "--why" in out["error"], out
+
+
+def test_run_wait_returns_result():
+    h = Harness()
+    srv = stubs.StubServer({
+        ("POST", "/api/jobs"): (200, {"job": {"id": "job-run-w", "status": "running"}}),
+        ("GET", "/api/jobs/job-run-w"): (200, {"job": {"id": "job-run-w", "status": "done",
+                                                        "result": {"summary": "ok"}}}),
+    })
+    try:
+        proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["waited"] is True, out
+    assert out["result"]["verdict"]["summary"] == "ok", out
+
+
+def test_run_wait_folds_the_verdict_before_returning():
+    """The bug this test pins: `run --wait` used to call
+    `dispatch.sync_record(conn, job, reported=True)` and stop there — that
+    stamps `reported_at`, so dispatch-sweep.py's own sweep (which only ever
+    folds a dispatch with `reported_at IS NULL`) would never fold this one,
+    leaving the item stuck in `investigating` with a DONE job underneath it
+    forever. `run --wait` must fold the verdict itself before it returns,
+    the same call dispatch-sweep.py's process_dispatch() makes."""
+    h = Harness()
+    db = h.new_db()
+    srv = stubs.StubServer({
+        ("POST", "/api/jobs"): (200, {"job": {"id": "job-run-fold", "status": "running"}}),
+        ("GET", "/api/jobs/job-run-fold"): (200, {"job": {"id": "job-run-fold", "status": "done",
+                                                           "result": {"summary": "all good, no fix needed"}}}),
+    })
+    try:
+        proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(db=db, sideclaw=srv.base),
+                      stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["waited"] is True, out
+    assert out["state"] == "closed", out
+    assert out["note"] and out["note"].startswith("answered:"), out
+
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, note FROM triage_items WHERE event_id=?", (out["eventId"],))
+    conn.close()
+    assert row["state"] == "closed", dict(row)
+    assert row["note"].startswith("answered:"), dict(row)
+
+
+def test_run_reports_queued_true_when_budget_exhausted():
+    h = Harness()
+    proc = h.run(["run", "alpha", "--json"], env_extra={"WARDEN_DAILY_BUDGET": "0"}, stdin=VALID_BRIEF)
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0, out
+    assert out["queued"] is True and out["jobId"] is None
+    assert out["note"] and "deferred" in out["note"]
+
+
 def test_status_unknown_job_is_usage_error():
     h = Harness()
     srv = stubs.StubServer({"default": (404, {"error": "no such job"})})

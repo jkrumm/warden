@@ -141,6 +141,15 @@ check-policy:
 	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
 	@"$(PY)" "$(WARDEN_REPO)/scripts/check-dispatch-policy.py"
 
+# The dispatch/review verdict schema versions this warden pins
+# (clients/sideclaw.py) against what the running sideclaw actually serves —
+# see check-schema-versions.py's own docstring for why "unreachable" is not a
+# failure here but a version/outcome-set mismatch is.
+.PHONY: check-schemas
+check-schemas:
+	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
+	@"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py"
+
 .PHONY: status
 status:
 	@echo "warden"
@@ -191,6 +200,8 @@ status:
 	else \
 		echo "DISAGREES with sideclaw — run 'make check-policy'"; \
 	fi
+	@printf '  %-24s ' "sideclaw schemas"; \
+	"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py" 2>&1 | head -1
 	@printf '  %-24s ' "ledger"; \
 	if [ -f "$(WARDEN_HOME)/warden.db" ]; then \
 		ls -lh "$(WARDEN_HOME)/warden.db" | awk '{print $$5, $$6, $$7, $$8}'; \

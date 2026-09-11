@@ -138,13 +138,20 @@ def _target(name="warden", tier="implement", sensitive=False, path=None) -> poli
     return policy.RepoTarget(name=name, path=path or Path(f"/tmp/{name}"), max_tier=tier, sensitive=sensitive)
 
 
-def _seed_triage_item(conn, event_id, *, repo, state, dispatch_job=None):
+def _seed_triage_item(conn, event_id, *, repo, state, dispatch_job=None, max_tier=None):
     now = _now().isoformat()
-    conn.execute(
-        "INSERT INTO triage_items(event_id, signature, repo, state, dispatch_job, occurrences, "
-        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-        (event_id, f"sig-{event_id}", repo, state, dispatch_job, 0, now, now),
-    )
+    if max_tier is None:
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, dispatch_job, occurrences, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (event_id, f"sig-{event_id}", repo, state, dispatch_job, 0, now, now),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, dispatch_job, occurrences, "
+            "created_at, updated_at, max_tier) VALUES (?,?,?,?,?,?,?,?,?)",
+            (event_id, f"sig-{event_id}", repo, state, dispatch_job, 0, now, now, max_tier),
+        )
     conn.commit()
 
 
@@ -586,6 +593,17 @@ def test_require_auto_from_item_repo_mismatch():
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
         assert "own recorded repo" in str(e), e
+    else:
+        raise AssertionError("expected PolicyError")
+
+
+def test_require_auto_from_item_rejects_investigate_ceiling():
+    conn, _ = _fresh_ledger()
+    _seed_triage_item(conn, 1, repo="warden", state="verdict", max_tier="investigate")
+    try:
+        policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
+    except PolicyError as e:
+        assert "max_tier='investigate'" in str(e), e
     else:
         raise AssertionError("expected PolicyError")
 

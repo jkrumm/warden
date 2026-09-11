@@ -96,7 +96,7 @@ semantics.
 | **Gate to start** | label `warden:go` — **not** every open issue |
 
 ```
-W  ingest github_issue -> item, origin=github_issue
+W  loop tick polls `warden:go` issues (ingest_github_go) -> item, origin=github_issue
 W  investigate episode against the named repo
 S  verdict + a plan comment posted back on the issue
 W  implement -> PR that closes the issue -> validate -> merge

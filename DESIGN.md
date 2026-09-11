@@ -174,8 +174,10 @@ executor closes a loop that has no outside.
 | **Intent** | An unsigned request for a human decision. | any surface |
 | **Decision** | One signed human answer, bound to bytes. Single-use. | the signer |
 
-Origins (Wave 3+, deliberately not in the first release): `alert` today;
-`github_issue`, `github_pr`, `human`, `agent` later.
+Origins: `alert`, `human` and `github_issue` are real as of Wave 6.1 — every
+`triage_items` row carries `origin` and a `max_tier` ceiling
+(`implement`/`investigate`); see `docs/triage.md`'s own *Origins* section for
+the mechanics. `github_pr`, `agent` later.
 
 ### Lifecycle
 

@@ -61,11 +61,16 @@ def _event(conn, event_id: int, now: dt.datetime, source: str = "s") -> None:
 
 
 def _item(conn, event_id: int, *, state: str, repo: str | None = "r", dispatch_job: str | None = None,
-         now: dt.datetime) -> None:
+         implement_job: str | None = None, validation_job: str | None = None,
+         origin: str = "alert", max_tier: str = "implement", note: str | None = None,
+         pr_url: str | None = None, occurrences: int = 0,
+         now: dt.datetime, updated_at: dt.datetime | None = None) -> None:
     conn.execute(
-        "INSERT INTO triage_items (event_id, signature, repo, state, dispatch_job, created_at, updated_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (event_id, f"sig{event_id}", repo, state, dispatch_job, _iso(now), _iso(now)),
+        "INSERT INTO triage_items (event_id, signature, repo, state, dispatch_job, implement_job, "
+        "validation_job, origin, max_tier, note, pr_url, occurrences, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (event_id, f"sig{event_id}", repo, state, dispatch_job, implement_job, validation_job,
+         origin, max_tier, note, pr_url, occurrences, _iso(now), _iso(updated_at or now)),
     )
 
 
@@ -444,7 +449,9 @@ def test_metric5_per_poller_ages_and_worst_case():
 
 # --- Metric 6: reverts and reopen-after-fixed -----------------------------------
 
-def test_metric6_reopen_after_fixed_counts_and_reverts_is_null():
+def test_metric6_reopen_after_fixed_counts_and_reverts_is_a_real_zero():
+    """`reverts` now has a real primitive (`revert_pr`/`reverted`) — a `0`
+    here is a genuine measurement, not the permanent `null` it used to be."""
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)  # keep history_since well before the 7d window
@@ -455,8 +462,32 @@ def test_metric6_reopen_after_fixed_counts_and_reverts_is_null():
     history_since = api._item_transitions_history_since(conn)
     m = api._metric_reverts_and_reopens(conn, now, history_since)
     assert m["reopen_after_fixed"]["value"] == 1, m
-    assert m["reverts"]["value"] is None
-    assert m["reverts"]["unavailable"] and len(m["reverts"]["unavailable"]) > 0
+    assert m["reverts"]["value"] == 0, m
+    assert m["reverts"]["unavailable"] is None, m
+    conn.close()
+
+
+def test_metric6_reverts_counts_revert_pr_and_reverted_state_within_window():
+    """The count is an OR of two signals (`revert_pr IS NOT NULL`, or
+    `state='reverted'`) — a row can carry either independently depending on
+    exactly when the sweep observed it — windowed on `updated_at` like every
+    other leaf here. An item updated outside the window must not count."""
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _seed_old_history_anchor(conn, now)
+    _event(conn, 1, now)
+    _item(conn, 1, state="reverted", now=now, updated_at=now - dt.timedelta(hours=1))
+    _event(conn, 2, now)
+    _item(conn, 2, state="merged", now=now, updated_at=now - dt.timedelta(hours=1))
+    conn.execute("UPDATE triage_items SET revert_pr = 42 WHERE event_id = 2")
+    _event(conn, 3, now)
+    _item(conn, 3, state="reverted", now=now, updated_at=now - dt.timedelta(days=30))  # outside window
+    conn.commit()
+
+    history_since = api._item_transitions_history_since(conn)
+    m = api._metric_reverts_and_reopens(conn, now, history_since)
+    assert m["reverts"]["value"] == 2, m
+    assert m["reverts"]["unavailable"] is None, m
     conn.close()
 
 
@@ -499,6 +530,208 @@ def test_history_since_is_earliest_transition():
     payload = api.metrics_payload(conn)
     assert payload["history_since"] == _iso(earliest)
     conn.close()
+
+
+# --- /board ------------------------------------------------------------------
+
+def test_board_counts_items_shape_ordering_and_terminal_24h():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    for i, state in enumerate(api.CHAIN_STATES, start=1):
+        _event(conn, i, now)
+        _item(conn, i, state=state, dispatch_job=f"j{i}", now=now, updated_at=now - dt.timedelta(minutes=i))
+    human_id = len(api.CHAIN_STATES) + 1
+    _event(conn, human_id, now)
+    _item(conn, human_id, state="needs_human", origin="human", now=now, updated_at=now - dt.timedelta(seconds=5))
+    fixed_id = human_id + 1
+    _event(conn, fixed_id, now)
+    _item(conn, fixed_id, state="fixed", now=now, updated_at=now - dt.timedelta(hours=1))
+    closed_id = fixed_id + 1
+    _event(conn, closed_id, now)
+    _item(conn, closed_id, state="closed", now=now, updated_at=now - dt.timedelta(days=3))
+    conn.commit()
+
+    payload = api.board_payload(conn)
+    for state in api.CHAIN_STATES:
+        expected = 2 if state == "needs_human" else 1
+        assert payload["counts"][state] == expected, payload["counts"]
+    assert payload["terminal_24h"] == 1, "only the 1h-old `fixed` row, not the 3d-old `closed` row"
+    assert len(payload["items"]) == len(api.CHAIN_STATES) + 1, "terminal items must be excluded"
+    assert "truncated" not in payload
+
+    updated_ats = [item["updated_at"] for item in payload["items"]]
+    assert updated_ats == sorted(updated_ats, reverse=True), "items must be ORDER BY updated_at DESC"
+
+    one = next(item for item in payload["items"] if item["event_id"] == 1)
+    assert set(one.keys()) == {
+        "event_id", "origin", "repo", "state", "state_deadline", "max_tier", "title", "note",
+        "pr_url", "dispatch_job", "implement_job", "validation_job", "occurrences",
+        "created_at", "updated_at", "origin_channel", "origin_thread_ts",
+    }
+    assert one["title"] == "title1"
+    conn.close()
+
+
+def test_board_caps_items_at_200_and_reports_truncated():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    for i in range(1, api.BOARD_ITEMS_CAP + 5):
+        _event(conn, i, now)
+        _item(conn, i, state="new", now=now, updated_at=now - dt.timedelta(seconds=i))
+    conn.commit()
+
+    payload = api.board_payload(conn)
+    assert len(payload["items"]) == api.BOARD_ITEMS_CAP
+    assert payload["truncated"] is True
+    conn.close()
+
+
+# --- /items/<event_id> ---------------------------------------------------------
+
+def test_item_payload_full_shape():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="verdict", dispatch_job="j1", now=now)
+    verdict = {
+        "summary": "s", "nextAction": "implement", "confidence": "high",
+        "recommendation": "do it", "outcome": "pending", "schemaVersion": 1,
+    }
+    _dispatch(conn, "j1", tier="investigate", verdict_json=json.dumps(verdict), origin_event_id=1, now=now)
+    _operation(conn, "op1", event_id=1, now=now)
+    _transition(conn, 1, "new", "verdict", now)
+    conn.commit()
+
+    payload = api.item_payload(conn, 1)
+    assert payload["item"]["event_id"] == 1
+    assert payload["item"]["state"] == "verdict"
+    assert payload["item"]["brief_truncated"] is False
+    assert payload["event"]["title"] == "title1"
+    assert payload["event"]["payload"] is None
+
+    assert len(payload["dispatches"]) == 1, payload["dispatches"]
+    d = payload["dispatches"][0]
+    assert d["job_id"] == "j1"
+    assert d["verdict"] == verdict
+
+    assert len(payload["operations"]) == 1, payload["operations"]
+    assert payload["operations"][0]["op_id"] == "op1"
+
+    assert len(payload["transitions"]) == 1, payload["transitions"]
+    assert payload["transitions"][0]["from_state"] == "new"
+    assert payload["transitions"][0]["to_state"] == "verdict"
+
+    assert payload["approvals"] == []
+    conn.close()
+
+
+def test_item_payload_brief_truncated_at_2000_chars():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="verdict", origin="human", now=now)
+    conn.execute("UPDATE triage_items SET brief = ? WHERE event_id = 1", ("x" * 3000,))
+    conn.commit()
+
+    payload = api.item_payload(conn, 1)
+    assert payload["item"]["brief_truncated"] is True
+    assert len(payload["item"]["brief"]) == 2000
+    conn.close()
+
+
+def test_item_payload_approval_linked_via_params_json_origin_event_id():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="needs_human", now=now)
+    conn.execute(
+        "INSERT INTO dispatch_approvals (nonce, verb, repo, tier, payload_hash, created_at, expires_at, "
+        "params_json) VALUES (?,?,?,?,?,?,?,?)",
+        ("secret-nonce", "implement", "r", "implement", "hash", _iso(now), _iso(now),
+         json.dumps({"origin_event_id": 1, "why": "test"})),
+    )
+    conn.commit()
+
+    payload = api.item_payload(conn, 1)
+    assert len(payload["approvals"]) == 1, payload["approvals"]
+    approval = payload["approvals"][0]
+    assert approval["verb"] == "implement"
+    assert "nonce" not in approval
+    assert "stdin_text" not in approval
+    assert "context_text" not in approval
+    assert "params_json" not in approval
+    conn.close()
+
+
+def test_item_payload_raises_not_found():
+    conn, _ = _fresh_conn()
+    try:
+        api.item_payload(conn, 999999)
+        raise AssertionError("expected ItemNotFoundError")
+    except api.ItemNotFoundError:
+        pass
+    conn.close()
+
+
+def test_items_invalid_id_is_400_and_unknown_id_is_404():
+    conn, path = _fresh_conn()
+    conn.close()
+    handle = _ServerHandle(path)
+    try:
+        status, body = handle.get("/items/abc")
+        assert status == 400, (status, body)
+        assert "event_id" in body.get("error", ""), body
+        status, body = handle.get("/items/999999")
+        assert status == 404, (status, body)
+        assert "999999" in body.get("error", ""), body
+    finally:
+        handle.stop()
+
+
+def test_items_prefix_does_not_hijack_itemsx():
+    conn, path = _fresh_conn()
+    conn.close()
+    handle = _ServerHandle(path)
+    try:
+        status, body = handle.get("/itemsx")
+        assert status == 404, (status, body)
+        assert body.get("error") == "no such path: /itemsx", body
+    finally:
+        handle.stop()
+
+
+def test_board_is_200_over_http():
+    conn, path = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="new", now=now)
+    conn.commit()
+    conn.close()
+    handle = _ServerHandle(path)
+    try:
+        status, body = handle.get("/board")
+        assert status == 200, body
+        for key in ("generated_at", "schema_version", "counts", "items", "terminal_24h"):
+            assert key in body, f"missing {key}"
+    finally:
+        handle.stop()
+
+
+def test_items_by_id_is_200_over_http():
+    conn, path = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="new", now=now)
+    conn.commit()
+    conn.close()
+    handle = _ServerHandle(path)
+    try:
+        status, body = handle.get("/items/1")
+        assert status == 200, body
+        for key in ("item", "event", "dispatches", "operations", "approvals", "transitions"):
+            assert key in body, f"missing {key}"
+    finally:
+        handle.stop()
 
 
 # --- HTTP-level: schema mismatch, method surface, read-only structural guard ----
@@ -582,6 +815,12 @@ def test_schema_mismatch_returns_503_not_200():
         assert "schema_version" in body.get("error", ""), body
         status, body = handle.get("/health")
         assert status == 503, (status, body)
+        status, body = handle.get("/board")
+        assert status == 503, (status, body)
+        assert "schema_version" in body.get("error", ""), body
+        status, body = handle.get("/items/1")
+        assert status == 503, (status, body)
+        assert "schema_version" in body.get("error", ""), body
     finally:
         handle.stop()
 
@@ -593,7 +832,7 @@ def test_post_is_405_and_unknown_path_is_404():
     try:
         assert handle.request("POST", "/metrics") == 405
         assert handle.request("PUT", "/health") == 405
-        status, body = handle.get("/board")
+        status, body = handle.get("/nope")
         assert status == 404, (status, body)
     finally:
         handle.stop()

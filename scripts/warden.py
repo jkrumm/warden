@@ -9,7 +9,11 @@ thin argument-parsing and JSON-rendering layer over `scripts/clients/` and
 `python3 -c '...'` fragments.
 
 VERBS
-  dispatch <repo>    open an episode (brief on stdin, never argv)
+  dispatch <repo>    open a BARE episode, no item (brief on stdin, never argv);
+                     its own --tier implement path is the Slack-click approval door
+  run <repo>         open an ITEM riding the alert lifecycle (investigate first,
+                     implement only if the verdict says so and policy allows;
+                     brief on stdin) — the intake for a human or for Hermes
   status <job-id>    poll one
   list [scope]        open | today | all
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
@@ -36,6 +40,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +50,10 @@ if str(REPO_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(REPO_SCRIPTS))
 
 import ledger  # noqa: E402
+# Wave 6.1's `run` verb opens a triage_items row through triage.py's own
+# open_origin_item()/escalate_origin_items() — the same functions the loop
+# calls — rather than a second copy of that logic here.
+import triage  # noqa: E402
 from clients import github, sideclaw  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError, WardenError  # noqa: E402
 from lifecycle import approvals, dispatch, items, merge, operations, policy  # noqa: E402
@@ -111,7 +120,7 @@ def _redact(text: str) -> str:
 
 
 def _mode(verb: str | None, state: _State) -> str:
-    if verb in ("dispatch", "merge"):
+    if verb in ("dispatch", "run", "merge"):
         if state.did_mutate:
             return "merged" if verb == "merge" else "opened"
         if state.dry_run:
@@ -518,6 +527,146 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, origi
     return out
 
 
+# --- run (Wave 6.1: the `human` origin) --------------------------------------
+
+
+def _run_plan_payload(conn, *, name: str, tier: str, target: policy.RepoTarget, brief: str,
+                       why: str | None, now: dt.datetime) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "verb": "run", "ok": True, "dryRun": True, "repo": name, "tier": tier,
+        "repoMaxTier": target.max_tier, "cwd": str(target.path), "briefChars": len(brief),
+        "why": why or None,
+        "note": "nothing ran — no item was opened, no episode was dispatched, and no budget was consumed",
+    }
+    budget = _budget_payload(conn, now)
+    if budget:
+        out["budget"] = budget
+    return out
+
+
+def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
+    """`run` opens an ITEM riding the same lifecycle an alert does
+    (investigating -> verdict -> auto-implement -> validating -> merged ->
+    ...), starting at `investigate` and reaching `implement` only if the
+    verdict says so AND policy allows it. `dispatch` stays the bare-episode,
+    no-item door — its own `--tier implement` path is the Slack-click
+    approval flow, unaffected by this verb. `run` is the intake for a human
+    typing at a terminal and for Hermes answering in a Slack thread."""
+    if not positional:
+        raise UsageError(
+            "usage: warden run <repo> [--tier investigate|implement] [--wait] [--json] "
+            "<<'BRIEF' ... BRIEF"
+        )
+    name = positional[0]
+
+    require_no_recursion()
+    require_backend()
+
+    target = policy.resolve_repo(name)
+    tier = flags.tier or "investigate"
+    policy.resolve_tier(tier, target)
+    state.tier = tier
+
+    if tier == "implement" and not flags.why:
+        raise UsageError(
+            'tier \'implement\' requires --why "<reason>". It lands in the audit log and is the '
+            "record of why this item was allowed to auto-implement on its own verdict, with no "
+            "default."
+        )
+
+    policy.valid_origin(channel=flags.origin_channel, thread_ts=flags.origin_thread)
+
+    brief = dispatch.normalize_brief(_read_brief(flags))
+    max_tier = "implement" if tier == "implement" else "investigate"
+
+    state.target = f"{name}:{tier}"
+    now = dt.datetime.now(dt.timezone.utc)
+    policy.budget_counts(conn, now)  # read for reporting; a rehearsal spends nothing
+
+    if flags.dry_run:
+        return _run_plan_payload(conn, name=name, tier=tier, target=target, brief=brief, why=flags.why, now=now)
+
+    event_id = triage.open_origin_item(
+        conn, origin="human", repo=name, brief=brief, max_tier=max_tier,
+        external_id=f"human:{uuid.uuid4()}", title=(flags.why or brief.splitlines()[0] or name)[:200],
+        payload={"why": flags.why}, now=now,
+        origin_channel=flags.origin_channel or None, origin_thread_ts=flags.origin_thread or None,
+    )
+    if event_id is None:
+        # open_origin_item() only returns None for an ALREADY-TERMINAL item at
+        # this exact external_id — unreachable here, since external_id is a
+        # fresh uuid4 on every call and can never collide with an existing
+        # row. Kept as a named refusal rather than an assert so a future
+        # external_id scheme change fails loudly here instead of silently
+        # dropping the brief.
+        raise PreconditionError("warden run: could not open an item for this brief (no event_id returned)")
+
+    triage.escalate_origin_items(conn, now)
+    conn.commit()
+    state.did_mutate = True
+
+    item = conn.execute("SELECT * FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
+    item_state = item["state"] if item else None
+    job_id = item["dispatch_job"] if item else None
+    queued = item_state == triage.STATE_NEW
+
+    out: dict[str, Any] = {
+        "verb": "run", "ok": True, "eventId": event_id, "jobId": job_id, "state": item_state,
+        "origin": "human", "maxTier": max_tier, "repo": name, "queued": queued,
+        "note": item["note"] if item else None,
+    }
+    budget = _budget_payload(conn, dt.datetime.now(dt.timezone.utc))
+    if budget:
+        out["budget"] = budget
+
+    if flags.wait and job_id:
+        job = sideclaw.wait(job_id, timeout_s=WAIT_TIMEOUT, interval_s=WAIT_INTERVAL)
+        out["waited"] = True
+        if job is None:
+            out["waitedSeconds"] = WAIT_TIMEOUT
+            out["note"] = (
+                "Still running after the in-turn wait. The item and its dispatch record are written, "
+                "so the sweeper will deliver the verdict into the origin thread — say so and move on "
+                "rather than waiting again."
+            )
+            return out
+        dispatch.sync_record(conn, job, reported=True)
+        # Fold the verdict onto the item's own row NOW — the same call
+        # dispatch-sweep.py's process_dispatch() makes once a dispatch
+        # reaches a terminal status. sync_record() above just stamped
+        # `reported_at`, and dispatch-sweep.py's own sweep only ever folds a
+        # dispatch with `reported_at IS NULL` — without this call the item
+        # would sit in `investigating` forever, its job already done, folded
+        # by nothing (live item 989's bug). dispatch-sweep.py's own path is
+        # unaffected: it always folds before it ever reports, so a dispatch
+        # this call already folded is simply a no-op repeat fold for it.
+        try:
+            triage.fold_dispatch_verdict(conn, origin_event_id=event_id, job_id=job_id,
+                                          now=dt.datetime.now(dt.timezone.utc), dry_run=False)
+        except Exception as e:  # a folding failure must never hide the verdict itself
+            print(f"warden: run --wait: folding the verdict onto the item failed: {e}", file=sys.stderr)
+        folded_item = conn.execute("SELECT * FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
+        if folded_item is not None:
+            out["state"] = folded_item["state"]
+            out["note"] = folded_item["note"]
+        # Derived the same way _result_payload() derives it for `dispatch`,
+        # so Hermes's in-turn answer keeps the same shape regardless of
+        # which verb opened the episode — nested under `result` rather than
+        # returned as this verb's own payload, since `run`'s own top-level
+        # shape (eventId/state/origin/maxTier/queued) has no `dispatch`
+        # equivalent to collide with.
+        result = job.get("result")
+        r = result if isinstance(result, dict) else {}
+        out["status"] = job.get("status")
+        out["result"] = {
+            "artifactUrl": r.get("artifactUrl"),
+            "branch": r.get("branch"),
+            "verdict": result,
+            "error": job.get("error"),
+        }
+    return out
+
+
 def cmd_status(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
     if not positional:
         raise UsageError("usage: warden status <job-id> [--json]")
@@ -746,6 +895,26 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
             print(f"dispatch opened: {out['jobId']} ({out['repo']}, tier {out['tier']})")
             print(f"not finished — poll: warden status {out['jobId']}")
         _print_budget_text(out)
+    elif verb == "run":
+        if out.get("dryRun"):
+            print("PLAN — nothing executed.")
+            print(f"  repo:  {out['repo']} ({out.get('cwd', '')})")
+            print(f"  tier:  {out['tier']} (repo ceiling: {out.get('repoMaxTier')})")
+            print(f"  brief: {out.get('briefChars')} chars")
+            if out.get("why"):
+                print(f"  why:   {out['why']}")
+            print("Re-invoke without --dry-run to open the item.")
+        else:
+            print(f"item opened: event {out['eventId']} ({out['repo']}, state {out['state']})")
+            if out.get("queued"):
+                print(f"queued — {out.get('note') or 'waiting for a free slot or budget'}")
+            elif out.get("jobId"):
+                print(f"investigating — job {out['jobId']}, not finished — poll: warden status {out['jobId']}")
+            if out.get("result"):
+                v = out["result"].get("verdict") or {}
+                if v:
+                    print(f"summary: {v.get('summary', '')}")
+        _print_budget_text(out)
     elif verb == "status":
         _print_result_text(out)
         _print_budget_text(out)
@@ -764,7 +933,11 @@ _HELP_TEXT = """\
 warden — the CLI over warden's lifecycle modules.
 
 VERBS
-  dispatch <repo>    open an episode (brief on stdin, never argv)
+  dispatch <repo>    open a BARE episode, no item (brief on stdin, never argv);
+                     its own --tier implement path is the Slack-click approval door
+  run <repo>         open an ITEM riding the alert lifecycle (investigate first,
+                     implement only if the verdict says so and policy allows;
+                     brief on stdin) — the intake for a human or for Hermes
   status <job-id>    poll one
   list [scope]        open | today | all
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
@@ -827,6 +1000,8 @@ def main(argv: list[str]) -> int:
         try:
             if verb == "dispatch":
                 out = cmd_dispatch(conn, flags, rest, state, argv)
+            elif verb == "run":
+                out = cmd_run(conn, flags, rest, state)
             elif verb == "status":
                 out = cmd_status(conn, flags, rest, state)
             elif verb == "list":
@@ -841,7 +1016,8 @@ def main(argv: list[str]) -> int:
                 raise UsageError(
                     f"unknown verb: {verb}\n"
                     "valid verbs:\n"
-                    "  dispatch <repo>   open an episode (brief on stdin)\n"
+                    "  dispatch <repo>   open a bare episode, no item (brief on stdin)\n"
+                    "  run <repo>        open an item riding the alert lifecycle (brief on stdin)\n"
                     "  status <job-id>   poll one\n"
                     "  list [scope]      open | today | all\n"
                     "  merge <job-id>    land the draft PR that dispatch opened (--why --confirm)\n"

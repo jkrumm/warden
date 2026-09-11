@@ -1,11 +1,13 @@
-"""warden HTTP API — GET /metrics and GET /health, read-only.
+"""warden HTTP API — GET /metrics, /health, /board, /items/<event_id>, read-only.
 
-WHAT THIS IS NOT YET. `/board`, `/items/:id`, `POST /items/:id/intent` and
-`POST /items/:id/note` are DESIGN.md's real contract (§ HTTP API) and are Wave 4,
-built alongside Argo — the only consumer of the write-adjacent endpoints. Building
-them now, unconsumed, would be dead surface with no caller to prove it correct.
-This wave is deliberately narrower: the six funnel numbers and a liveness check,
-because those are useful the moment they exist, with nothing else to wire up.
+WHAT THIS IS STILL NOT. `POST /items/:id/intent` and `POST /items/:id/note` are
+DESIGN.md's real contract (§ HTTP API) and are Wave 4, built alongside Argo — the
+only consumer of the write-adjacent endpoints. Building them now, unconsumed,
+would be dead surface with no caller to prove it correct. `/board` and
+`/items/<event_id>` (Wave 6.3) are the two read-only projections that ARE useful
+the moment they exist: a funnel-snapshot list of every non-terminal item, and the
+full detail behind any one item — dispatches, verdicts, operations, approvals,
+transition history.
 
 BIND AND AUTH. `127.0.0.1:7734` (7734 is the next free port in dotfiles'
 Caddyfile registry), loopback only, no bearer token. Per DESIGN.md § Security
@@ -105,6 +107,27 @@ WINDOW_DAYS = 7
 DISPOSITION_STATES = (
     "implementing", "validating", "merge_blocked", "merged", "liveness_pending",
     "pr_open", "fixed", "closed", "needs_human", "dismissed",
+)
+
+# --- /board's state vocabulary -------------------------------------------------
+#
+# The ten non-terminal chain states DESIGN.md's own lifecycle diagram names,
+# in the order a card moves through them. Mirrored from triage.py's STATE_*
+# constants by literal value — same reasoning as DISPOSITION_STATES above:
+# this module stays a read-only, dependency-free reader of the ledger rather
+# than importing the 3400-line act-loop module for ten string literals that
+# change on the schema's own rare cadence. `needs_human` is the one state
+# ledger.py already exposes as a constant (STATE_NEEDS_HUMAN, shared with
+# watchdog-poll.py), so that one entry is the real import, not a copy.
+# `snoozed` and `pr_open` are deliberately absent — they are real non-terminal
+# states but not part of this list's guaranteed-zero shape; if either is
+# present in the ledger it still surfaces in `/board`'s counts, just without
+# a guaranteed zero when it is not.
+BOARD_ITEMS_CAP = 200
+
+CHAIN_STATES = (
+    "new", "investigating", "verdict", "implementing", "validating", "merged",
+    "liveness_pending", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", "split",
 )
 
 # cursors key -> the LaunchAgent StartInterval it heartbeats against (seconds),
@@ -438,13 +461,21 @@ def _metric_poller_ages(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
 def _metric_reverts_and_reopens(
     conn: sqlite3.Connection, now: dt.datetime, history_since: str | None,
 ) -> dict[str, Any]:
-    """# 6 — reverts and reopen-after-fixed. `reverts` has no primitive yet
-    (DESIGN.md § Abort and revert: `warden revert` is Wave 3) so it is served
-    `null` with a reason, never `0` — a `0` here would read as "measured, zero
-    reverts happened" instead of "not tracked at all". `reopen_after_fixed` is
-    `item_transitions`-derived and goes through the same leaf-level history
-    guard as metrics 3 and 4 (see `_history_guard_reason`) for the same
-    reason: an empty or young table must never present a fabricated `0`."""
+    """# 6 — reverts and reopen-after-fixed.
+
+    `reverts` now has a real primitive (`warden revert`, Wave 5.3):
+    `triage_items.revert_pr` records the revert PR, and STATE_REVERTED
+    (`reverted`) is the state a merged/liveness_pending/fixed item lands in
+    once it's reverted (ledger.py schema 7 + `TERMINAL_STATES`). A row can
+    carry `revert_pr` without (yet) being in `reverted` and vice versa
+    depending on exactly when the sweep observes it, so the count is an OR
+    of both, windowed on `updated_at` like every other metric here. This is
+    the first honest, non-null value this leaf has ever produced — it reads
+    `0` freely now, because `0` is a real measurement, not a stand-in for
+    "not tracked". `reopen_after_fixed` is unchanged: `item_transitions`-
+    derived, behind the same leaf-level history guard as metrics 3 and 4
+    (`_history_guard_reason`) for the same reason — an empty or young table
+    must never present a fabricated `0`."""
     window_start = now - dt.timedelta(days=WINDOW_DAYS)
     guard_reason = _history_guard_reason(history_since, window_start)
     if guard_reason:
@@ -456,14 +487,17 @@ def _metric_reverts_and_reopens(
             (window_start.isoformat(),),
         ).fetchone()["n"]
         reopen_reason = None
+    reverts_value = conn.execute(
+        "SELECT COUNT(*) AS n FROM triage_items WHERE (revert_pr IS NOT NULL OR state = ?) AND updated_at >= ?",
+        (_ledger.STATE_REVERTED, window_start.isoformat()),
+    ).fetchone()["n"]
     return {
         "reopen_after_fixed": {
             "value": reopen_value, "unavailable": reopen_reason,
             "windowed": True, "window_days": WINDOW_DAYS,
         },
         "reverts": {
-            "value": None,
-            "unavailable": "no revert primitive exists yet — `warden revert` is Wave 3 (DESIGN.md § Abort and revert)",
+            "value": reverts_value, "unavailable": None,
             "windowed": True, "window_days": WINDOW_DAYS,
         },
     }
@@ -541,12 +575,200 @@ def health_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+# --- /board and /items/<event_id> -----------------------------------------------
+
+class ItemNotFoundError(Exception):
+    """Raised by `item_payload()` when no `triage_items` row exists for the
+    given event_id. Caught by `Handler._serve()` and turned into a 404 —
+    never a 503, which stays reserved for a rejected connection or a schema
+    mismatch."""
+
+
+def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The whole `/board` body: a funnel-snapshot counts map plus the
+    non-terminal `triage_items` rows themselves, newest first. Same honesty
+    posture as `/metrics` — `schema_version` is the constant, not a fresh
+    read, because `_serve()` already ran `assert_schema_version()` on this
+    exact connection before calling here; a mismatch would have 503'd before
+    this function ever ran."""
+    now = dt.datetime.now(dt.timezone.utc)
+    terminal_placeholders = ",".join("?" for _ in _ledger.TERMINAL_STATES)
+
+    counts = {state: 0 for state in CHAIN_STATES}
+    for row in conn.execute(
+        f"SELECT state, COUNT(*) AS n FROM triage_items "
+        f"WHERE state NOT IN ({terminal_placeholders}) GROUP BY state",
+        _ledger.TERMINAL_STATES,
+    ):
+        counts[row["state"]] = row["n"]
+
+    rows = conn.execute(
+        f"SELECT ti.*, e.title AS event_title FROM triage_items ti "
+        f"JOIN events e ON e.id = ti.event_id "
+        f"WHERE ti.state NOT IN ({terminal_placeholders}) "
+        f"ORDER BY ti.updated_at DESC LIMIT ?",
+        (*_ledger.TERMINAL_STATES, BOARD_ITEMS_CAP + 1),
+    ).fetchall()
+    truncated = len(rows) > BOARD_ITEMS_CAP
+    items = [_board_item(row) for row in rows[:BOARD_ITEMS_CAP]]
+
+    terminal_24h_start = (now - dt.timedelta(hours=24)).isoformat()
+    terminal_24h = conn.execute(
+        f"SELECT COUNT(*) AS n FROM triage_items "
+        f"WHERE state IN ({terminal_placeholders}) AND updated_at >= ?",
+        (*_ledger.TERMINAL_STATES, terminal_24h_start),
+    ).fetchone()["n"]
+
+    payload: dict[str, Any] = {
+        "generated_at": now.isoformat(),
+        "schema_version": _ledger.SCHEMA_VERSION,
+        "counts": counts,
+        "items": items,
+        "terminal_24h": terminal_24h,
+    }
+    if truncated:
+        payload["truncated"] = True
+    return payload
+
+
+def _board_item(row: sqlite3.Row) -> dict[str, Any]:
+    """One `/board` item, in the exact shape the brief names — never a raw
+    `dict(row)`, which would leak `card_hash`/`deploy_expect_json`/etc and
+    silently reshape itself on every future schema migration."""
+    return {
+        "event_id": row["event_id"],
+        "origin": row["origin"],
+        "repo": row["repo"],
+        "state": row["state"],
+        "state_deadline": row["state_deadline"],
+        "max_tier": row["max_tier"],
+        "title": row["event_title"],
+        "note": row["note"],
+        "pr_url": row["pr_url"],
+        "dispatch_job": row["dispatch_job"],
+        "implement_job": row["implement_job"],
+        "validation_job": row["validation_job"],
+        "occurrences": row["occurrences"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "origin_channel": row["origin_channel"],
+        "origin_thread_ts": row["origin_thread_ts"],
+    }
+
+
+def item_payload(conn: sqlite3.Connection, event_id: int) -> dict[str, Any]:
+    """The whole `/items/<event_id>` body — the item itself, its parent
+    event, and every dispatch/operation/approval/transition that names it.
+    Raises `ItemNotFoundError` for the 404 case; `Handler._serve()` owns
+    turning that into an HTTP response, same shell/deep-module split as
+    `metrics_payload()`/`health_payload()`/`board_payload()`."""
+    item_row = conn.execute("SELECT * FROM triage_items WHERE event_id = ?", (event_id,)).fetchone()
+    if item_row is None:
+        raise ItemNotFoundError(f"no item {event_id}")
+    item = dict(item_row)
+    brief = item.get("brief")
+    item["brief_truncated"] = bool(brief) and len(brief) > 2000
+    if item["brief_truncated"]:
+        item["brief"] = brief[:2000]
+
+    event_row = conn.execute(
+        "SELECT id, source, external_id, title, url, payload_json, first_seen, resolved_at "
+        "FROM events WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+    event = dict(event_row) if event_row is not None else None
+    if event is not None:
+        payload_json = event.pop("payload_json")
+        event["payload"] = json.loads(payload_json) if payload_json else None
+
+    dispatch_rows = conn.execute(
+        "SELECT job_id, tier, repo, status, created_at, finished_at, reported_at, merged_at, artifact_url, "
+        "validation_job_id, validation_status, delivery_status, verdict_json "
+        "FROM dispatches WHERE origin_event_id = ? OR job_id IN (?, ?, ?) ORDER BY created_at",
+        (event_id, item.get("dispatch_job"), item.get("implement_job"), item.get("validation_job")),
+    ).fetchall()
+    dispatches = [_dispatch_detail(row) for row in dispatch_rows]
+
+    operations = [
+        dict(row) for row in conn.execute(
+            "SELECT * FROM operations WHERE event_id = ? ORDER BY started_at", (event_id,)
+        )
+    ]
+
+    approvals = _approvals_for_item(conn, event_id)
+
+    transitions = [
+        dict(row) for row in conn.execute(
+            "SELECT * FROM item_transitions WHERE event_id = ? ORDER BY id", (event_id,)
+        )
+    ]
+
+    return {
+        "item": item,
+        "event": event,
+        "dispatches": dispatches,
+        "operations": operations,
+        "approvals": approvals,
+        "transitions": transitions,
+    }
+
+
+def _dispatch_detail(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    verdict_json = d.pop("verdict_json")
+    d["verdict"] = _parse_verdict(verdict_json)
+    return d
+
+
+def _parse_verdict(verdict_json: str | None) -> dict[str, Any] | None:
+    if verdict_json is None:
+        return None
+    verdict = json.loads(verdict_json)
+    return {
+        "summary": verdict.get("summary"),
+        "nextAction": verdict.get("nextAction"),
+        "confidence": verdict.get("confidence"),
+        "recommendation": verdict.get("recommendation"),
+        "outcome": verdict.get("outcome"),
+        "schemaVersion": verdict.get("schemaVersion"),
+    }
+
+
+def _approvals_for_item(conn: sqlite3.Connection, event_id: int) -> list[dict[str, Any]]:
+    """`dispatch_approvals` carries no `event_id` column at all — the only
+    link back to an item is `params_json.origin_event_id`, the closed
+    parameter dict the spend replays (ledger.py schema 7's own docstring).
+    `nonce` (the table's actual primary key) and `stdin_text`/`context_text`
+    are never selected, let alone returned — see this module's docstring on
+    secrets. `rowid` stands in for a stable `id` a consumer can key on
+    without exposing the nonce itself."""
+    result: list[dict[str, Any]] = []
+    for row in conn.execute(
+        "SELECT rowid AS id, verb, repo, tier, created_at, expires_at, decided_at, decision, decided_by, "
+        "spent_at, spent_job_id, spend_error, params_json FROM dispatch_approvals"
+    ):
+        params_json = row["params_json"]
+        params = json.loads(params_json) if params_json else {}
+        if params.get("origin_event_id") != event_id:
+            continue
+        d = dict(row)
+        d.pop("params_json")
+        result.append(d)
+    return result
+
+
 # --- HTTP handler ---------------------------------------------------------------
 
 _ROUTES: dict[str, Callable[[sqlite3.Connection], dict[str, Any]]] = {
     "/metrics": metrics_payload,
     "/health": health_payload,
+    "/board": board_payload,
 }
+
+# `/items/<event_id>` is a prefix match, not an exact one — kept OUT of
+# _ROUTES (which do_GET still checks first for everything else) rather than
+# reshaping that dict into something route-pattern-aware for one path.
+_ITEMS_PREFIX = "/items/"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -574,6 +796,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             _ledger.assert_schema_version(conn)
             self._write_json(200, fn(conn))
+        except ItemNotFoundError as e:
+            self._write_json(404, {"error": str(e)})
         except RuntimeError as e:
             self._write_json(503, {"error": str(e)})
         finally:
@@ -581,10 +805,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         fn = _ROUTES.get(self.path)
-        if fn is None:
-            self._write_json(404, {"error": f"no such path: {self.path}"})
+        if fn is not None:
+            self._serve(fn)
             return
-        self._serve(fn)
+        if self.path.startswith(_ITEMS_PREFIX):
+            raw_id = self.path[len(_ITEMS_PREFIX):]
+            if not raw_id.isdigit():
+                self._write_json(400, {"error": "event_id must be an integer"})
+                return
+            event_id = int(raw_id)
+            self._serve(lambda conn: item_payload(conn, event_id))
+            return
+        self._write_json(404, {"error": f"no such path: {self.path}"})
 
     def _method_not_allowed(self) -> None:
         self._write_json(405, {"error": f"{self.command} not allowed — GET only"})

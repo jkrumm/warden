@@ -216,6 +216,102 @@ def actions_runs(owner: str, repo: str, *, head_sha: str) -> list[dict[str, Any]
     return body["workflow_runs"]
 
 
+_SEARCH_PER_PAGE = 50
+_SEARCH_MAX_PAGES = 10
+
+
+def search_issues(*, owner: str, label: str) -> list[dict[str, Any]]:
+    """`GET /search/issues` for every OPEN issue in an `owner` repo carrying
+    `label` — the poll behind `warden:go` (triage.py's `ingest_github_go()`).
+    `repo` in each returned dict is the SHORT name (`nameWithOwner`'s tail,
+    read off `repository_url`, never the search hit's own `html_url`, which
+    is not guaranteed to be parseable the same way) — the value
+    `open_origin_item()`/`policy.resolve_repo()` expect, not `owner/repo`.
+
+    `query` is percent-encoded before it ever reaches `api()` (`safe="+:"` so
+    the `+` word-separators and `:` qualifier colons GitHub's search syntax
+    needs stay literal) — `api()` sends whatever path it is given verbatim,
+    with no encoding of its own, so an unescaped `"` or `&` inside `label`
+    would otherwise land in the URL unescaped and could smuggle extra query
+    parameters into the request.
+
+    Paged through `total_count`, up to `_SEARCH_MAX_PAGES` pages of
+    `_SEARCH_PER_PAGE` — `ingest_github_go()` resolves any still-open
+    `github_go` event NOT in this result set, so a silently-truncated first
+    page (the old shape: one `per_page=50` request, no paging) would read a
+    live item past #50 as gone and resolve it out from under a human still
+    waiting on it (DESIGN.md § What must not be lost: "overflow waits, never
+    drops"). If GitHub's own `total_count` still exceeds what
+    `_SEARCH_MAX_PAGES` pages fetched, this raises rather than returning a
+    partial set — `ingest_github_go()`'s own `except RemoteError` then skips
+    resolution for this tick entirely, the fail-closed side of that same
+    rule."""
+    # Unquoted on purpose: GitHub's search index returns NOTHING for
+    # `label:"warden:go"` (quoted) and the matching issue for `label:warden:go`
+    # (observed live 2026-09-11 against jkrumm/dispatch-scratch#9). A label with
+    # a space would need quotes; ours never carry one.
+    query = f"owner:{owner}+is:issue+is:open+label:{label}"
+    encoded_query = urllib.parse.quote(query, safe="+:")
+
+    items: list[dict[str, Any]] = []
+    total_count: int | None = None
+    for page in range(1, _SEARCH_MAX_PAGES + 1):
+        path = f"/search/issues?q={encoded_query}&per_page={_SEARCH_PER_PAGE}"
+        if page > 1:
+            path += f"&page={page}"
+        status, body = api("GET", path)
+        if status != 200:
+            raise RemoteError(f"GitHub returned HTTP {status} searching issues for label {label!r}")
+        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
+            raise RemoteError(f"GitHub returned an unusable body searching issues for label {label!r}")
+        total_count = body.get("total_count")
+        page_items = body["items"]
+        items.extend(page_items)
+        if len(page_items) < _SEARCH_PER_PAGE:
+            break
+        if isinstance(total_count, int) and len(items) >= total_count:
+            break
+
+    if isinstance(total_count, int) and len(items) < total_count:
+        raise RemoteError(
+            f"GitHub reports {total_count} open issues for label {label!r} but only {len(items)} "
+            f"were fetched across up to {_SEARCH_MAX_PAGES} pages of {_SEARCH_PER_PAGE} — refusing "
+            f"to resolve missing github_go events against a partial result set"
+        )
+
+    out: list[dict[str, Any]] = []
+    for it in items:
+        repo_url = it.get("repository_url") or ""
+        repo = repo_url.rsplit("/", 1)[-1] if repo_url else "?"
+        author_obj = it.get("user") or {}
+        author = author_obj.get("login") if isinstance(author_obj, dict) else None
+        out.append({
+            "repo": repo,
+            "number": it.get("number"),
+            "title": it.get("title", "?"),
+            "body": it.get("body") or "",
+            "url": it.get("html_url", ""),
+            "author": author,
+            "updated_at": it.get("updated_at"),
+        })
+    return out
+
+
+def create_issue_comment(repo_full: str, number: int, body: str) -> dict[str, Any]:
+    """`repo_full` is `owner/repo` — the comment-back door for a `github_issue`
+    item whose verdict just landed (triage.py's own trust check happens
+    before this is ever called; this function posts unconditionally)."""
+    if "/" not in repo_full:
+        raise PreconditionError(f"{repo_full!r} is not an owner/repo full name")
+    owner, repo = repo_full.split("/", 1)
+    status, resp = api("POST", f"/repos/{owner}/{repo}/issues/{number}/comments", {"body": body})
+    if status not in (200, 201):
+        raise RemoteError(
+            f"GitHub returned HTTP {status} commenting on {repo_full}#{number}", maybe_mutated=True,
+        )
+    return resp
+
+
 def pick_merge_method(repo_json: dict[str, Any]) -> str | None:
     """Squash first: a dispatch branch is one unit of work by construction.
     Rebase next, merge commit last — a merge commit on a linear-history repo

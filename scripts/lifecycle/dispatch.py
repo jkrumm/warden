@@ -63,6 +63,39 @@ class Opened:
     op_id: str | None
 
 
+def _insert_dispatch_row(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    tier: str,
+    repo: str,
+    brief: str,
+    why: str | None,
+    origin: Origin,
+    status: str,
+    now: dt.datetime,
+) -> None:
+    """The one `dispatches` INSERT shape — `open_episode()` and
+    `open_review()` share it rather than each carrying its own copy, so this
+    table never grows a THIRD hand-written INSERT with its own drift."""
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,why,origin_channel,origin_thread_ts,"
+        "origin_event_id,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (
+            job_id,
+            tier,
+            repo,
+            brief,
+            why or None,
+            origin.channel or None,
+            origin.thread_ts or None,
+            origin.event_id,
+            status,
+            now.isoformat(),
+        ),
+    )
+
+
 def open_episode(
     conn: sqlite3.Connection,
     *,
@@ -147,28 +180,47 @@ def open_episode(
 
     job_id = job["id"]
     status = job.get("status") or "unknown"
-    conn.execute(
-        "INSERT INTO dispatches(job_id,tier,repo,brief,why,origin_channel,origin_thread_ts,"
-        "origin_event_id,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (
-            job_id,
-            tier,
-            target.name,
-            brief,
-            why or None,
-            origin.channel or None,
-            origin.thread_ts or None,
-            origin.event_id,
-            status,
-            now.isoformat(),
-        ),
-    )
+    _insert_dispatch_row(conn, job_id=job_id, tier=tier, repo=target.name, brief=brief, why=why,
+                         origin=origin, status=status, now=now)
     conn.commit()
 
     if gated and opened_op_id is not None:
         operations.complete(conn, opened_op_id, outcome="done", receipt=json.dumps({"jobId": job_id}))
 
     return Opened(job=job, job_id=job_id, op_id=opened_op_id)
+
+
+def open_review(
+    conn: sqlite3.Connection,
+    *,
+    target: policy.RepoTarget,
+    pr: int,
+    context: str | None,
+    origin: Origin,
+    now: dt.datetime | None = None,
+) -> Opened:
+    """Submit one sideclaw `review` episode and record it in `dispatches`
+    with `tier='review'` — the review counterpart to `open_episode()` above,
+    sharing its exact `dispatches` INSERT shape (job_id, tier, repo, brief,
+    why, origin_channel, origin_thread_ts, origin_event_id, status,
+    created_at) so this table never grows a THIRD code path writing its own
+    row. `brief` has no review equivalent — `dispatches.brief` is NOT NULL,
+    so this stores a short description of what was reviewed instead.
+
+    Not gated: `review` runs read-only on sideclaw's side (no write tool
+    profile, no branch, no PR), so unlike `open_episode()`'s `implement`
+    path there is no `operations` row to cover a crash between submit and
+    record — a review job with no matching `dispatches` row is, at worst, an
+    orphaned read-only sideclaw session, not an unaccounted mutation."""
+    policy.require_no_recursion()
+    now = now or dt.datetime.now(dt.timezone.utc)
+    job = sideclaw.submit_review(cwd=target.path, pr=pr, context=context)
+    job_id = job["id"]
+    status = job.get("status") or "unknown"
+    _insert_dispatch_row(conn, job_id=job_id, tier="review", repo=target.name,
+                         brief=f"review PR #{pr}", why=None, origin=origin, status=status, now=now)
+    conn.commit()
+    return Opened(job=job, job_id=job_id, op_id=None)
 
 
 def sync_record(conn: sqlite3.Connection, job: dict, *, reported: bool, now: dt.datetime | None = None) -> None:

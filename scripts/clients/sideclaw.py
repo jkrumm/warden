@@ -17,6 +17,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
 
 from .errors import PolicyError, RemoteError
@@ -29,6 +30,34 @@ _TIMEOUT_S = 30
 TERMINAL = frozenset({"done", "failed", "interrupted", "cancelled"})
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+# The two verdict schemas warden consumes — published by sideclaw
+# (server/jobs/handlers/{dispatch,review}.ts) at GET /api/dispatch-schema and
+# GET /api/review-schema, pinned here rather than copied by hand so drift is
+# a loud refusal (assert_result_schema()) instead of a silently-ignored
+# verdict. Bump these ONLY after re-reading the source constants they mirror
+# — never guess a version or an outcome list.
+DISPATCH_SCHEMA_VERSION = 2
+REVIEW_SCHEMA_VERSION = 1
+
+# server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES at schema version 2.
+DISPATCH_OUTCOMES: tuple[str, ...] = (
+    "verdict_only",
+    "issue_declined",
+    "issue_failed",
+    "issue_filed",
+    "no_changes",
+    "diff_refused",
+    "checks_failed",
+    "branch_no_pr",
+    "pr_failed",
+    "pr_opened",
+    "salvaged",
+    "withheld",
+)
+
+# server/jobs/handlers/review.ts REVIEW_OUTCOMES at schema version 1.
+REVIEW_OUTCOMES: tuple[str, ...] = ("clean", "actionable", "needs-human")
 
 
 def _base() -> str:
@@ -94,6 +123,37 @@ def submit(
     job = parsed.get("job") if isinstance(parsed, dict) else None
     if not isinstance(job, dict) or "id" not in job:
         raise RemoteError("sideclaw accepted the job but returned no id")
+    return job
+
+
+def submit_review(*, cwd: Path, pr: int, context: str | None = None) -> dict[str, Any]:
+    """The `review` counterpart to `submit()` — same transport, error
+    handling and `{"job": {...}}` envelope, different tool/params shape
+    (`POST /api/jobs {"tool":"review","params":{cwd,pr,context}}`)."""
+    params: dict[str, Any] = {"cwd": str(cwd), "pr": pr}
+    if context:
+        params["context"] = context
+    body = {"tool": "review", "params": params}
+
+    try:
+        status, text = _request("POST", "/api/jobs", body)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise RemoteError(
+            f"sideclaw review submit failed (is the LaunchAgent up? curl {_base()}/health)",
+            maybe_mutated=True,
+        )
+
+    if status != 200:
+        raise RemoteError(f"sideclaw returned HTTP {status}: {text[:300]}")
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
+
+    job = parsed.get("job") if isinstance(parsed, dict) else None
+    if not isinstance(job, dict) or "id" not in job:
+        raise RemoteError("sideclaw accepted the review job but returned no id")
     return job
 
 
@@ -167,3 +227,82 @@ def cancel(job_id: str) -> dict[str, Any]:
     if not isinstance(job, dict):
         raise RemoteError(f"sideclaw returned no job cancelling {job_id}")
     return job
+
+
+def assert_result_schema(job: dict[str, Any], expected: int, tool: str) -> None:
+    """Raise a LOUD refusal when a terminal `done` job's `result.schemaVersion`
+    does not match `expected` — the failure this exists to design out is a
+    consumer (this file's own callers in triage.py) silently parsing a verdict
+    whose shape moved under it. Every loop poll that reads a `result` off an
+    `investigate`/`implement`/`review` job calls this first; the caller is
+    expected to land the item `needs_human` with the exact message this
+    raises, per DESIGN.md's "deferral must be visible" — a silently-skipped
+    item would just hit its deadline instead.
+
+    Only checked on `status == "done"`: a failed/interrupted/cancelled job
+    carries no `result` worth pinning a shape to."""
+    if job.get("status") != "done":
+        return
+    result = job.get("result")
+    version = result.get("schemaVersion") if isinstance(result, dict) else None
+    if version != expected:
+        raise RemoteError(
+            f"sideclaw {tool} result schemaVersion {version}, warden expects {expected} — refusing to parse"
+        )
+
+
+def assert_outcome(job: dict[str, Any], outcomes: tuple[str, ...], tool: str) -> None:
+    """Companion to `assert_result_schema()`: raises a LOUD refusal when a
+    terminal `done` job's `result.outcome` is missing, or is not one of the
+    pinned `outcomes` (`DISPATCH_OUTCOMES`/`REVIEW_OUTCOMES` above) — the
+    same "a consumer must never silently parse a verdict shape that moved"
+    contract, now covering the outcome VOCABULARY as well as the schema
+    version number. A caller that let an unrecognised outcome fall through
+    to its own switch's `else` branch is fail-closed by construction, but a
+    switch missing an `else` (or one whose `else` is itself permissive, as
+    `poll_validation_jobs()` was before this) is not — this is the check
+    that makes that impossible regardless of how the caller's own switch is
+    written. Only checked on `status == "done"`, same as
+    `assert_result_schema()`."""
+    if job.get("status") != "done":
+        return
+    result = job.get("result")
+    outcome = result.get("outcome") if isinstance(result, dict) else None
+    if outcome not in outcomes:
+        raise RemoteError(
+            f"sideclaw {tool} result outcome {outcome!r}, warden expects one of {outcomes} — refusing to parse"
+        )
+
+
+def check_schema_versions() -> dict[str, dict[str, Any]]:
+    """GET /api/dispatch-schema and /api/review-schema, compare `version` AND
+    the published `outcomes` set against this module's pinned constants.
+    Never raises — a connection failure is reported as `reachable: False` so
+    `make status` can print `unreachable` rather than failing outright; only
+    an actual version/outcome-set MISMATCH is `ok: False` with `reachable`
+    True, the loud-refusal case `assert_result_schema()` enforces per-job."""
+    out: dict[str, dict[str, Any]] = {}
+    for tool, path, expected_version, expected_outcomes in (
+        ("dispatch", "/api/dispatch-schema", DISPATCH_SCHEMA_VERSION, DISPATCH_OUTCOMES),
+        ("review", "/api/review-schema", REVIEW_SCHEMA_VERSION, REVIEW_OUTCOMES),
+    ):
+        try:
+            status, text = _request("GET", path, None)
+            parsed = json.loads(text) if status == 200 else None
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            out[tool] = {"reachable": False, "ok": False}
+            continue
+        remote_version = parsed.get("version")
+        remote_outcomes = tuple(parsed.get("outcomes") or ())
+        ok = remote_version == expected_version and set(remote_outcomes) == set(expected_outcomes)
+        out[tool] = {
+            "reachable": True,
+            "ok": ok,
+            "expectedVersion": expected_version,
+            "remoteVersion": remote_version,
+            "expectedOutcomes": expected_outcomes,
+            "remoteOutcomes": remote_outcomes,
+        }
+    return out

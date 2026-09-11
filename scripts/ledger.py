@@ -58,7 +58,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # frozen at its pre-cutover state and written by nothing, kept as the rollback —
 # so if you are reading this to work out which database is real, it is this one.
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -415,6 +415,45 @@ ALTER TABLE dispatch_approvals ADD COLUMN spend_error TEXT;
 ALTER TABLE triage_items ADD COLUMN revert_pr INTEGER;
 """
 
+# Version 8 — Wave 6.1 (every origin opens an item). Three columns, one
+# table, for the same reason: `triage_items` needs to represent a row that
+# did not come from `ingest()`'s seven alert sources at all.
+#
+#   triage_items.origin       `alert | human | github_issue` (DESIGN.md:177).
+#     DEFAULT 'alert' so every pre-existing row — the entire ingest() family —
+#     keeps its true origin with no backfill. Written once, at INSERT, by
+#     `open_origin_item()` for the two new sources and by `ingest()` (which
+#     never sets it, so it rides the default) for the seven alert ones.
+#
+#   triage_items.max_tier     the ceiling THIS item may reach on its own —
+#     `implement` (the pre-Wave-6 behaviour: policy + autoMergePaths decide,
+#     same as every alert item today) or `investigate` (maybe_auto_implement()
+#     and lifecycle/policy.py's require_auto_from_item() both refuse to cross
+#     it). DEFAULT 'implement' for the same backfill-free reason as `origin`:
+#     every alert item today already behaves as if its ceiling were
+#     `implement`, so the default is honest, not a placeholder.
+#
+#   triage_items.brief        the human's brief, or the GitHub issue's body.
+#     NULL for `alert` (an alert's "brief" is built fresh every escalation by
+#     _build_cluster_brief() from the clustered signatures — there is no
+#     single fixed text to store), set once at INSERT for the other two
+#     origins and read back verbatim by escalate_origin_items().
+#
+#   triage_items.origin_channel / origin_thread_ts   the Slack thread a
+#     `warden run --origin-channel --origin-thread` call answers into (Hermes,
+#     replying in its own thread) — set once at INSERT by `open_origin_item()`
+#     from `cmd_run`'s flags, NULL for every other origin. Read by
+#     `_dispatch_investigate_and_advance()` to build the investigate episode's
+#     `Origin`: when set, the verdict must land in the ASKER's thread, not the
+#     shared triage card's — a card is a projection, not the origin.
+_MIGRATION_8 = """
+ALTER TABLE triage_items ADD COLUMN origin TEXT NOT NULL DEFAULT 'alert';
+ALTER TABLE triage_items ADD COLUMN max_tier TEXT NOT NULL DEFAULT 'implement';
+ALTER TABLE triage_items ADD COLUMN brief TEXT;
+ALTER TABLE triage_items ADD COLUMN origin_channel TEXT;
+ALTER TABLE triage_items ADD COLUMN origin_thread_ts TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -423,6 +462,7 @@ MIGRATIONS: dict[int, str] = {
     5: _MIGRATION_5,
     6: _MIGRATION_6,
     7: _MIGRATION_7,
+    8: _MIGRATION_8,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live

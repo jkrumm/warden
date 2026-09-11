@@ -49,6 +49,57 @@ table or `cluster_id` column — membership is derived, and a cluster's
 lifetime already equals its dispatch's lifetime. See *Escalation — the two
 edges* and *Clustering* below.
 
+## Origins (Wave 6.1)
+
+Every `triage_items` row now carries `origin` (`alert | human | github_issue`,
+DESIGN.md:177) and `max_tier` (`implement | investigate` — the ceiling this
+item may reach on its own; `brief` (the human's text or the issue body, NULL
+for `alert`); and, since Wave 6.2, `origin_channel`/`origin_thread_ts` — the
+Slack thread this item's own verdict must answer into (`human` origin, from
+`warden run --origin-channel --origin-thread`; NULL for `github_issue`, which
+has no thread of its own yet). `_dispatch_investigate_and_advance()` reads
+these off the item and, when set, builds the investigate episode's `Origin`
+from them instead of the shared triage card's channel — the card is a
+projection, the asker's own thread is the origin, and `dispatch-sweep.py`
+must land the answer THERE. When unset (a plain `warden run`, or any alert
+cluster, which never carries these columns), behaviour is unchanged from
+before Wave 6.2: the card's own channel, retro-filled onto the `dispatches`
+row's `origin_thread_ts` once the card posts.
+
+- **`alert`** — the seven `INGEST_SOURCES` above, via `ingest()`.
+  `max_tier='implement'`: policy + `autoMergePaths` decide, as always.
+- **`human`** — `warden run <repo>` (`scripts/warden.py`'s `cmd_run`), brief on
+  stdin. Default `--tier investigate`; `--tier implement` requires `--why` and
+  sets `max_tier='implement'`. `--origin-channel`/`--origin-thread` (Hermes
+  answering in its own thread, no `--wait`) set the two columns above.
+- **`github_issue`** — a GitHub issue in one of `_github.GH_OWNER`'s repos
+  carrying the label `warden:go`, polled once per loop tick
+  (`ingest_github_go()`). The owner's own issues (author == `GH_OWNER`) get
+  `max_tier='implement'`; every third-party issue gets `max_tier='investigate'`
+  **always**, regardless of the label — every repo here is public, so anyone
+  can apply it. A third-party issue body is wrapped as untrusted,
+  attacker-influenceable text before it ever reaches a brief.
+
+Both non-alert origins insert their `triage_items` row through
+`open_origin_item()` (dedup on `(origin, repo, external_id)`: a non-terminal
+match reuses it, a terminal match opens nothing — a stale label after the
+work finished is not a new handover) and escalate as their OWN cluster of one
+through `escalate_origin_items()` — no `minOccurrences`/`minOpenMinutes`/
+`cooldownHours` gate (a human or a trusted label already decided), no
+`DAILY_INVESTIGATE_BUDGET` (that bounds the loop's own autonomous escalation
+of alert noise), but still bounded by `MAX_OPEN_INVESTIGATIONS` (overflow
+waits in `new`, never drops) and the same dispatch budget `warden dispatch`
+itself is bound by.
+
+`max_tier='investigate'` is a hard ceiling, enforced twice: `maybe_auto_implement()`'s
+own eligibility query excludes it, and `lifecycle/policy.py`'s
+`require_auto_from_item()` refuses it by name (defence in depth — the loop and
+the CLI's `--auto-from-item` both pass through the same function). When the
+investigate verdict lands for an `investigate`-ceiling origin item, it goes
+straight to `closed` with `answered: <summary>` instead of `verdict` — a
+question was asked and answered, and the `verdict -> needs_human` 24h deadline
+would only manufacture noise for something nobody is going to act on further.
+
 ## The loop, per run
 
 1. **Ingest** — upsert one `triage_items` row per open event in
@@ -451,11 +502,13 @@ verdict ──────(24h)──> needs_human      needs_human ──(7d)�
 implementing ─(2h)──> merge_blocked     pr_open ─────(14d)──> dismissed
 validating ───(1h)──> merge_blocked     merged ──────(1h)──> closed
 
-implementing ──(implement episode done, PR opened)──> validating (step 7, a DIFFERENT model)
-             └──(implement failed / no PR)──────────> merge_blocked
+implementing ──(outcome=pr_opened)────────────────────> validating (step 7, sideclaw's own `review` job)
+             └──(checks_failed / salvaged / unexpected)─> needs_human
+             └──(no_changes / diff_refused / etc.)──────> merge_blocked
 
-validating ──(VALIDATION_CONFIRM_MARKER, merge lands)──> merged | liveness_pending (step 8/9)
-           └──(disagree / error / merge refused)───────> merge_blocked
+validating ──(review outcome=clean, or actionable+no blocking; merge lands)──> merged | liveness_pending (step 8/9)
+           └──(blocking findings / merge refused)────────────────────────────> merge_blocked
+           └──(review outcome=needs-human)─────────────────────────────────────> needs_human
 
 liveness_pending ──(positive liveness match)──────────> fixed (step 10)
                  └──(window elapses, still not live)──> new  (REOPENED, full history on the card)
@@ -951,7 +1004,8 @@ agent driving a dispatch by hand:
 
 | Verb | What |
 |-|-|
-| `dispatch <repo>` | Open a sideclaw episode (`--tier`, `--why`, `--context-file`, `--origin-*`) |
+| `dispatch <repo>` | Open a BARE sideclaw episode, no `triage_items` row (`--tier`, `--why`, `--context-file`, `--origin-*`) |
+| `run <repo>` | Open an ITEM riding this file's own lifecycle (`--tier investigate\|implement`, `--why`, `--origin-*`) — see *Origins* below |
 | `status <job>` | Read one job's current status |
 | `list` | Open/today/all dispatches |
 | `merge <job> --why --confirm` | Land a completed `implement` episode's pull request |
@@ -1115,42 +1169,77 @@ the operation already resolved `unknown` by `open_episode()` itself; every
 other refusal hands the claim back to `verdict`. State: `verdict` →
 `implementing`.
 
-**Step 7 — `poll_implement_jobs()` → a second `open_episode()`.** Once the
-implement episode finishes with a pull request, a SECOND `investigate`
-episode opens against the same repo, on `VALIDATION_MODEL`
-(`claude-opus-5[1m]`) — deliberately a different model from the
-`claude-sonnet-5` default that wrote the change. Its brief asks it to read
-the PR's actual diff and say whether the change is correct and whether the
-PR body's own claims match it, ending with the exact phrase `VALIDATION:
-CONFIRMED` or `VALIDATION: DISAGREE` — a plain substring check
-(`poll_validation_jobs()`), the same technique `DISSOLVE_MARKER` already
-uses. **`VALIDATION_MODEL` was probed live, not guessed**: a throwaway
-`investigate` job at `model: "gpt-5.6-terra"` crashed the Claude Code session
-outright (`[claude-code:unrecognized_model]`, exit 1 — not the harmless
-stderr telemetry line CLAUDE.md documents for that string elsewhere);
-`claude-opus-5[1m]` ran a real session and returned a structured verdict.
-Re-probe before changing this constant. An implement episode that finished
-`failed`, `interrupted`, `cancelled`, or `done` with nothing to show skips
-validation entirely and goes straight to `merge_blocked`. State:
-`implementing` → `validating` | `merge_blocked`.
+**Step 6 → 7 — `poll_implement_jobs()` reads a TYPED outcome, not just
+`artifactUrl`.** A `done` implement job's `result.outcome`
+(`clients.sideclaw.DISPATCH_OUTCOMES`, schema version
+`DISPATCH_SCHEMA_VERSION` — pinned in `clients/sideclaw.py`, checked by
+`assert_result_schema()` on every poll; a mismatch is a loud `needs_human`,
+never a best-effort parse) drives the state, not a guess from which fields
+happen to be present:
 
-**Step 8 — `poll_validation_jobs()` → `lifecycle.merge.plan_or_land()`.** A
-DISAGREEING, FAILED, ERRORED, or CANCELLED validation blocks the merge
-outright — never read as a pass. Only an explicit `CONFIRMED` marker (and no
-`DISAGREE` marker in the same text) calls `plan_or_land(confirm=True,
-dry_run=False)` in-process. `confirm=True` is instruction-level, not signed
-(owner decision — confirming the implement WAS the approval, landing it
-finishes the thing already said yes to), so this call is not itself a trust
-boundary — the real bounds are inside `plan_or_land()`/`merge_gate_check()`
-itself, re-keyed off **declared path scope**: see that module's own
-docstring for the full gate (`autoMergePaths`, `noCiRequired`, the step-7
-`validation_status` check). `plan_or_land()` owns its own `merge` operation
-end to end (recorded before the mutating call, completed after) — triage.py
-no longer records one itself. A `PolicyError`/`PreconditionError` blocks the
-merge; a `RemoteError(maybe_mutated=True)` leaves the item in `validating`
-untouched (the merge may already have landed — `reconcile_operations()`
-asks GitHub on the next pass); any other `RemoteError` blocks. State:
-`validating` → `merged` | `liveness_pending` | `merge_blocked`.
+| `result.outcome` | next state | note |
+|-|-|-|
+| `pr_opened` (with `artifactUrl`) | `validating` | opens the step-7 `review` job below |
+| `checks_failed` | `needs_human` | a red check is a human's, never a PR |
+| `no_changes` | `merge_blocked` | the episode's own reason |
+| `diff_refused` / `branch_no_pr` / `pr_failed` / `withheld` | `merge_blocked` | outcome named in the note |
+| `salvaged` | `needs_human` | sideclaw itself failed to get a structured verdict |
+| `issue_declined` / `issue_failed` / `issue_filed` / `verdict_only` | `needs_human` | wrong tier's outcome — never guessed |
+| missing / unrecognized | `needs_human` | `unknown implement outcome '<x>'` |
+| `result.nextAction == "human"` | `needs_human` | overrides every row above |
+
+A non-`done` terminal status (`failed`/`interrupted`/`cancelled`) blocks the
+chain outright — `merge_blocked`, never a silent drop. State: `implementing`
+→ `validating` | `merge_blocked` | `needs_human`.
+
+**Step 7 — `_open_validation_dispatch()` → sideclaw's own `review` job, not a
+second `investigate` episode.** Once the implement job's outcome is
+`pr_opened`, this parses the PR number out of `artifactUrl` (a strict
+`/pull/(\d+)$` regex — unparseable is `merge_blocked` with `could not parse
+the PR number`, never a guess) and opens a sideclaw **`review`** job
+(`clients/sideclaw.py`'s `submit_review()`, `lifecycle/dispatch.py`'s
+`open_review()`) against that PR, in a throwaway read-only worktree sideclaw
+manages itself — not a second `dispatch` episode on a different model asked
+to end its prose with a marker phrase. `review` already runs a multi-angle
+synthesis (architect, senior-dev, security, ... — its own router picks the
+rest) and returns a TYPED verdict (`outcome`/`blocking`/`improvements`/
+`discussions`/`testGaps`/`summary`), schema version `REVIEW_SCHEMA_VERSION`.
+The `dispatches` row this opens carries `tier='review'` — sharing
+`open_episode()`'s exact INSERT shape via `open_review()`, so `dispatches`
+never grows a third writer — and has no `origin_channel` (`Origin(event_id=…)`
+only), so `dispatch-sweep.py` never tries to render it as a verdict; it rides
+the ordinary "no origin_channel → closed with the undeliverable sentinel"
+path every other originless dispatch already takes. `validation_job_id` on
+the IMPLEMENT dispatch's own row is bound the moment this opens, same as
+before. State: `implementing` → `validating`.
+
+**Step 8 — `poll_validation_jobs()` → `lifecycle.merge.plan_or_land()`.**
+Reads the `review` job's TYPED outcome, not a marker substring-matched out of
+prose:
+
+| review `result` | `dispatches.validation_status` | item state |
+|-|-|-|
+| `outcome == "clean"`, or `"actionable"` with `blocking` EMPTY | `confirmed` | calls `merge` |
+| `blocking` non-empty (any outcome) | `blocked` | `merge_blocked` — note is the first three findings as `file:line — message`, ≤600 chars |
+| `outcome == "needs-human"` | `needs_human` | `needs_human` — note is the review's own summary |
+| FAILED / ERRORED / CANCELLED | `error` | `merge_blocked` |
+
+`result.schemaVersion` is asserted against `REVIEW_SCHEMA_VERSION` first — a
+mismatch is a loud `needs_human`, never a best-effort parse, same rule as
+step 6→7. Only `confirmed` calls `plan_or_land(confirm=True, dry_run=False)`
+in-process. `confirm=True` is instruction-level, not signed (owner decision —
+confirming the implement WAS the approval, landing it finishes the thing
+already said yes to), so this call is not itself a trust boundary — the real
+bounds are inside `plan_or_land()`/`merge_gate_check()` itself, re-keyed off
+**declared path scope**: see that module's own docstring for the full gate
+(`autoMergePaths`, `noCiRequired`, the step-7 `validation_status` check).
+`plan_or_land()` owns its own `merge` operation end to end (recorded before
+the mutating call, completed after) — triage.py no longer records one
+itself. A `PolicyError`/`PreconditionError` blocks the merge; a
+`RemoteError(maybe_mutated=True)` leaves the item in `validating` untouched
+(the merge may already have landed — `reconcile_operations()` asks GitHub on
+the next pass); any other `RemoteError` blocks. State: `validating` →
+`merged` | `liveness_pending` | `merge_blocked` | `needs_human`.
 
 **Step 9 — deploy, inside `plan_or_land()`'s own `rollout_after_merge()`, OFF
 by default.** Merging a repo like `vps` is not shipping — `observability/`
@@ -1339,8 +1428,9 @@ zero `chat.postMessage` (the 2026-09-08 correction, both directions), plus an
 (_SILENCE_RESOLVE_ELIGIBLE_STATES); `maybe_auto_implement()` firing on a `confidence: high` verdict
 and never firing at `medium`; `poll_implement_jobs()` opening the step-7
 validation on a successful implement episode and blocking outright on a
-failed one; a DISAGREEING validation blocking the merge without ever calling
-it and writing `validation_status='disagreed'`; a CONFIRMED validation
+failed one; a `review` verdict carrying `blocking` findings refusing the
+merge without ever calling it and writing `validation_status='blocked'`; a
+CONFIRMED validation
 merging and landing `merged` when deploy is off, or `deploy_expect_json`
 lands correctly and `liveness_pending` is entered when deploy succeeds;
 liveness CONFIRMING and resolving the item (exactly one `chat.update`),

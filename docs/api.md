@@ -13,11 +13,12 @@ boundary, since anything that can read a token file can query this socket
 directly. The real protections are the loopback bind (nothing off-box reaches it
 at all) and the read-only handle (nothing that does reach it can write).
 
-**Not built in this wave**, and deliberately: a Caddy or tailnet door, `/board`,
-`/items/:id`, `POST /items/:id/intent`, `POST /items/:id/note`. DESIGN.md's real
-HTTP API contract includes those; they belong with Argo (Wave 4), the only
-intended remote consumer, and building them unconsumed now would be dead surface
-with nothing to prove them correct against.
+**Not built yet**, and deliberately: a Caddy or tailnet door, `POST
+/items/:id/intent`, `POST /items/:id/note`. DESIGN.md's real HTTP API contract
+includes those; they belong with Argo (Wave 4), the only intended remote
+consumer, and building them unconsumed now would be dead surface with nothing to
+prove them correct against. `/board` and `/items/<event_id>` (Wave 6.3) are
+built — see below.
 
 ## Endpoints
 
@@ -88,6 +89,119 @@ a window whose start predates `history_since`, returns `null` with a reason
 naming which case applied — never a fabricated `0`. This means all three
 currently read `null` and will keep doing so until the window no longer
 predates `history_since` (7 days after the earliest row lands).
+
+**`reverts` (metric 6) is a real windowed count, not `null`.** `warden revert`
+(Wave 5.3) gave it a primitive: `triage_items.revert_pr IS NOT NULL` OR
+`state = 'reverted'` (`ledger.STATE_REVERTED`), counted within the 7-day
+window on `updated_at` — an OR of both signals because a row can carry either
+independently depending on exactly when the sweep observed it. Unlike metrics
+3/4/6's `reopen_after_fixed`, this is **not** gated by the `item_transitions`
+history guard: it reads `triage_items` directly, which has existed since
+schema version 1, so `0` here is a real measurement from the moment this
+column existed (schema 7), never a stand-in for "not tracked".
+
+### `GET /board`
+
+A funnel-snapshot board: every non-terminal `triage_items` row, plus counts.
+Same fresh-read-only-connection, 503-on-schema-mismatch contract as above.
+
+```json
+{
+  "generated_at": "2026-09-11T00:00:00+00:00",
+  "schema_version": 8,
+  "counts": {
+    "new": 0, "investigating": 1, "verdict": 0, "implementing": 0,
+    "validating": 0, "merged": 0, "liveness_pending": 0, "needs_human": 2,
+    "merge_blocked": 0, "split": 0
+  },
+  "items": [ {
+    "event_id": 42, "origin": "alert", "repo": "warden", "state": "needs_human",
+    "state_deadline": "2026-09-18T00:00:00+00:00", "max_tier": "implement",
+    "title": "watchdog: sideclaw dispatch stuck", "note": null,
+    "pr_url": null, "dispatch_job": "j-abc", "implement_job": null,
+    "validation_job": null, "occurrences": 3,
+    "created_at": "2026-09-10T00:00:00+00:00", "updated_at": "2026-09-11T00:00:00+00:00",
+    "origin_channel": null, "origin_thread_ts": null
+  } ],
+  "terminal_24h": 4,
+  "truncated": true
+}
+```
+
+`counts` always carries a zero for each of the ten non-terminal chain states
+(`new`, `investigating`, `verdict`, `implementing`, `validating`, `merged`,
+`liveness_pending`, `needs_human`, `merge_blocked`, `split` — DESIGN.md's own
+lifecycle order) even when nothing is in it, so a reader always sees the whole
+shape; any *other* non-terminal state actually present in the ledger (e.g.
+`snoozed`) still appears in `counts`, just without a guaranteed zero when
+absent. `items` holds only non-terminal rows, `ORDER BY updated_at DESC`,
+capped at 200 — `truncated: true` appears only when the cap was hit (omitted
+otherwise, never a fabricated `false`). `origin_channel`/`origin_thread_ts`
+read `null` on a row from before the migration that added them, rather than
+raising. `terminal_24h` counts items whose state is terminal (`ledger.
+TERMINAL_STATES`) and `updated_at` is within the last 24 hours.
+
+```bash
+curl -s http://127.0.0.1:7734/board | jq .
+```
+
+### `GET /items/<event_id>`
+
+The full detail behind one item: itself, its parent event, and every
+dispatch/operation/approval/transition that names it. `<event_id>` must be
+all-digits — `GET /items/abc` is `400 {"error": "event_id must be an
+integer"}`; an id with no matching row is `404 {"error": "no item <id>"}`.
+`/items/` is a path-prefix match ahead of the exact-path table, so
+`/itemsx` correctly falls through to the generic 404 rather than being
+captured by it.
+
+```json
+{
+  "item": { "...every triage_items column, as stored, plus": null,
+            "brief": "(truncated to 2000 chars)", "brief_truncated": false },
+  "event": { "id": 42, "source": "slack_alert", "external_id": "...",
+             "title": "...", "url": null, "first_seen": "...",
+             "resolved_at": null, "payload": null },
+  "dispatches": [ {
+    "job_id": "j-abc", "tier": "implement", "repo": "warden", "status": "done",
+    "created_at": "...", "finished_at": "...", "reported_at": "...",
+    "merged_at": null, "artifact_url": null, "validation_job_id": null,
+    "validation_status": null, "delivery_status": "delivered",
+    "verdict": { "summary": "...", "nextAction": "implement", "confidence": "high",
+                 "recommendation": "...", "outcome": "...", "schemaVersion": 1 }
+  } ],
+  "operations": [ { "op_id": "op-1", "event_id": 42, "kind": "implement",
+                     "repo": "warden", "authorized_by": "auto-from-item",
+                     "started_at": "...", "outcome": "ok", "outcome_at": "...",
+                     "receipt_json": null, "reconciled_at": null, "note": null } ],
+  "approvals": [ { "id": 7, "verb": "implement", "repo": "warden", "tier": "implement",
+                    "created_at": "...", "expires_at": "...", "decided_at": null,
+                    "decision": null, "decided_by": null, "spent_at": null,
+                    "spent_job_id": null, "spend_error": null } ],
+  "transitions": [ { "id": 100, "event_id": 42, "from_state": "new",
+                      "to_state": "investigating", "at": "...", "note": null } ]
+}
+```
+
+`item` is every `triage_items` column as stored, except `brief` — the
+human's own text (`origin='human'`) — which is truncated to 2000 characters
+with `brief_truncated: true` when that happened (`false` otherwise, never
+omitted). `dispatches` matches every row whose `origin_event_id` equals this
+event, OR whose `job_id` is one of the item's own `dispatch_job` /
+`implement_job` / `validation_job`, `ORDER BY created_at`; `verdict` is
+`null` when `verdict_json` is `null`, otherwise the six named fields parsed
+out of it. `operations` and `transitions` key off `event_id` directly
+(`item_transitions` oldest-first). `dispatch_approvals` has no `event_id`
+column at all — an approval links to an item only through
+`params_json.origin_event_id` (the closed parameter dict the spend replays,
+schema 7) — so `approvals` is derived from that, keyed by SQLite's own
+`rowid` as a stable, non-secret `id` since the table's real primary key
+(`nonce`) is never returned. `stdin_text`/`context_text` are never returned
+either — see this file's own secrets note above.
+
+```bash
+curl -s http://127.0.0.1:7734/items/42 | jq .
+```
 
 **`item_transitions` is history after the first state, not from creation.**
 `ingest()` inserts a brand-new `triage_items` row directly with `state='new'`

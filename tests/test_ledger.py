@@ -255,7 +255,10 @@ def test_migrate_adopts_pre_versioned_database():
     # renamed: adopting a live database stays additive.
     for table, cols in pre_cols.items():
         assert cols <= post_cols[table], f"{table} lost columns: {cols - post_cols[table]}"
-    assert post_cols["triage_items"] - pre_cols["triage_items"] == {"state_deadline", "occurrence_mark", "revert_pr"}, (
+    assert post_cols["triage_items"] - pre_cols["triage_items"] == {
+        "state_deadline", "occurrence_mark", "revert_pr", "origin", "max_tier", "brief",
+        "origin_channel", "origin_thread_ts",
+    }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
     assert post_counts == pre_counts, f"rows lost: {post_counts} != {pre_counts}"

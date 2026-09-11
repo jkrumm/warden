@@ -366,7 +366,7 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
     event_id_int = int(event_id)
 
     row = conn.execute(
-        "SELECT state, repo, dispatch_job FROM triage_items WHERE event_id=?", (event_id_int,)
+        "SELECT state, repo, dispatch_job, max_tier FROM triage_items WHERE event_id=?", (event_id_int,)
     ).fetchone()
     if row is None:
         raise PolicyError(
@@ -377,6 +377,12 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
         raise PolicyError(
             f"triage item {event_id_int} is in state '{row['state']}', not 'verdict' — --auto-from-item "
             "only fires off a completed investigation"
+        )
+    if row["max_tier"] != "implement":
+        raise PolicyError(
+            f"triage item {event_id_int} has max_tier='{row['max_tier']}', not 'implement' — its origin "
+            "capped it below auto-implement (Wave 6: a human or a third-party GitHub issue may ask for "
+            "investigate-only) and --auto-from-item may not exceed that ceiling"
         )
     if row["repo"] != repo:
         raise PolicyError(

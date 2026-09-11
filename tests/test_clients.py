@@ -257,6 +257,165 @@ def test_cancel_409_raises_policy_error():
         srv.stop()
 
 
+def test_submit_review_body_shape():
+    srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "r1", "status": "running"}})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        job = sideclaw.submit_review(cwd=Path("/repo"), pr=17, context="ctx")
+        assert job == {"id": "r1", "status": "running"}, job
+        assert srv.requests[0]["body"] == {
+            "tool": "review", "params": {"cwd": "/repo", "pr": 17, "context": "ctx"},
+        }, srv.requests[0]["body"]
+    finally:
+        srv.stop()
+
+
+def test_submit_review_omits_context_when_absent():
+    srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "r2"}})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        sideclaw.submit_review(cwd=Path("/repo"), pr=5)
+        assert srv.requests[0]["body"]["params"] == {"cwd": "/repo", "pr": 5}
+    finally:
+        srv.stop()
+
+
+def test_submit_review_500_raises_remote_error():
+    srv = _StubServer({("POST", "/api/jobs"): (500, {"error": "boom"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit_review(cwd=Path("/repo"), pr=1)
+        except RemoteError as e:
+            assert "500" in str(e), e
+        else:
+            raise AssertionError("expected RemoteError")
+    finally:
+        srv.stop()
+
+
+def test_assert_result_schema_ok_on_matching_version():
+    sideclaw.assert_result_schema(
+        {"status": "done", "result": {"schemaVersion": 2}}, 2, "implement"
+    )  # must not raise
+
+
+def test_assert_result_schema_raises_on_mismatch():
+    try:
+        sideclaw.assert_result_schema({"status": "done", "result": {"schemaVersion": 1}}, 2, "implement")
+    except RemoteError as e:
+        assert str(e) == (
+            "sideclaw implement result schemaVersion 1, warden expects 2 — refusing to parse"
+        ), e
+    else:
+        raise AssertionError("expected RemoteError")
+
+
+def test_assert_result_schema_skips_non_done_jobs():
+    sideclaw.assert_result_schema({"status": "failed", "result": None}, 2, "implement")  # must not raise
+    sideclaw.assert_result_schema({"status": "cancelled"}, 2, "review")  # must not raise
+
+
+def test_assert_outcome_ok_on_known_outcome():
+    sideclaw.assert_outcome({"status": "done", "result": {"outcome": "clean"}},
+                             sideclaw.REVIEW_OUTCOMES, "review")  # must not raise
+
+
+def test_assert_outcome_raises_on_unrecognized_outcome():
+    try:
+        sideclaw.assert_outcome(
+            {"status": "done", "result": {"outcome": "a_future_outcome"}},
+            sideclaw.REVIEW_OUTCOMES, "review",
+        )
+    except RemoteError as e:
+        assert "'a_future_outcome'" in str(e) and "refusing to parse" in str(e), e
+    else:
+        raise AssertionError("expected RemoteError")
+
+
+def test_assert_outcome_raises_on_missing_outcome():
+    try:
+        sideclaw.assert_outcome({"status": "done", "result": {}}, sideclaw.DISPATCH_OUTCOMES, "implement")
+    except RemoteError as e:
+        assert "None" in str(e) and "refusing to parse" in str(e), e
+    else:
+        raise AssertionError("expected RemoteError")
+
+
+def test_assert_outcome_skips_non_done_jobs():
+    sideclaw.assert_outcome({"status": "failed", "result": None}, sideclaw.DISPATCH_OUTCOMES, "implement")
+    sideclaw.assert_outcome({"status": "cancelled"}, sideclaw.REVIEW_OUTCOMES, "review")
+
+
+def test_check_schema_versions_ok():
+    srv = _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, {
+            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
+        }),
+        ("GET", "/api/review-schema"): (200, {
+            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
+        }),
+    })
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        results = sideclaw.check_schema_versions()
+        assert results["dispatch"]["reachable"] is True and results["dispatch"]["ok"] is True, results
+        assert results["review"]["reachable"] is True and results["review"]["ok"] is True, results
+    finally:
+        srv.stop()
+
+
+def test_check_schema_versions_version_mismatch():
+    srv = _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, {
+            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION + 1,
+            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
+        }),
+        ("GET", "/api/review-schema"): (200, {
+            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
+        }),
+    })
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        results = sideclaw.check_schema_versions()
+        assert results["dispatch"]["ok"] is False, results
+        assert results["review"]["ok"] is True, results
+    finally:
+        srv.stop()
+
+
+def test_check_schema_versions_outcome_set_mismatch():
+    """A version match with a DIFFERENT outcome set is still a mismatch —
+    sideclaw could add/rename an outcome without bumping the version, and a
+    consumer that only compared `version` would silently miss it."""
+    srv = _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, {
+            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
+            "outcomes": [*sideclaw.DISPATCH_OUTCOMES, "a_new_outcome"],
+        }),
+        ("GET", "/api/review-schema"): (200, {
+            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
+        }),
+    })
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        results = sideclaw.check_schema_versions()
+        assert results["dispatch"]["ok"] is False, results
+    finally:
+        srv.stop()
+
+
+def test_check_schema_versions_unreachable_never_raises():
+    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+    results = sideclaw.check_schema_versions()
+    assert results["dispatch"] == {"reachable": False, "ok": False}, results
+    assert results["review"] == {"reachable": False, "ok": False}, results
+
+
 # --- github ----------------------------------------------------------------
 
 def test_token_memoized_and_resolved_via_secrets_run():
@@ -593,6 +752,157 @@ def test_actions_runs_invalid_sha_raises_precondition_error_before_any_request()
         else:
             raise AssertionError("expected PreconditionError")
         assert srv.requests == [], "a malformed sha must never reach a request"
+    finally:
+        srv.stop()
+        _gh_cleanup()
+
+
+def test_search_issues_parses_a_search_response():
+    body = {
+        "items": [
+            {
+                "repository_url": "https://api.github.com/repos/jkrumm/argo",
+                "number": 42,
+                "title": "fix the thing",
+                "body": "please fix it",
+                "html_url": "https://github.com/jkrumm/argo/issues/42",
+                "user": {"login": "jkrumm"},
+                "updated_at": "2026-09-10T00:00:00Z",
+            },
+        ],
+    }
+    encoded_path = '/search/issues?q=owner:jkrumm+is:issue+is:open+label:warden:go&per_page=50'
+    srv = _StubServer({("GET", encoded_path): (200, body)})
+    _gh_env(srv)
+    try:
+        hits = github.search_issues(owner="jkrumm", label="warden:go")
+    finally:
+        srv.stop()
+        _gh_cleanup()
+    assert hits == [{
+        "repo": "argo", "number": 42, "title": "fix the thing", "body": "please fix it",
+        "url": "https://github.com/jkrumm/argo/issues/42", "author": "jkrumm",
+        "updated_at": "2026-09-10T00:00:00Z",
+    }], hits
+    # The request path the stub actually saw — pins that `+`/`:` stay literal
+    # (GitHub's own search syntax) while the quotes around the label are
+    # percent-encoded, not sent raw.
+    assert srv.requests[-1]["path"] == encoded_path, srv.requests[-1]["path"]
+
+
+def test_search_issues_url_encodes_a_label_with_special_characters():
+    """`label` reaches the query string only through `urllib.parse.quote` —
+    a label carrying `&`/`=`/a space must not be able to smuggle extra query
+    parameters into the GitHub request (`api()` sends whatever path it is
+    given verbatim, with no encoding of its own)."""
+    srv = _StubServer({"default": (200, {"items": []})})
+    _gh_env(srv)
+    try:
+        github.search_issues(owner="jkrumm", label="a&b=c d")
+    finally:
+        srv.stop()
+        _gh_cleanup()
+    path = srv.requests[-1]["path"]
+    assert path == '/search/issues?q=owner:jkrumm+is:issue+is:open+label:a%26b%3Dc%20d&per_page=50', path
+    assert "&b=" not in path and " " not in path
+
+
+def test_search_issues_pages_through_total_count():
+    """A `total_count` bigger than one page of 50 must be paged through, not
+    silently truncated at page 1 — see `ingest_github_go()`'s reliance on the
+    FULL result set to decide what to resolve."""
+    def _hit(n: int) -> dict[str, Any]:
+        return {
+            "repository_url": "https://api.github.com/repos/jkrumm/argo",
+            "number": n, "title": "t", "body": "b",
+            "html_url": f"https://github.com/jkrumm/argo/issues/{n}",
+            "user": {"login": "jkrumm"}, "updated_at": "2026-09-10T00:00:00Z",
+        }
+    page1_path = "/search/issues?q=owner:jkrumm+is:issue+is:open+label:warden:go&per_page=50"
+    page2_path = page1_path + "&page=2"
+    srv = _StubServer({
+        ("GET", page1_path): (200, {"total_count": 60, "items": [_hit(n) for n in range(50)]}),
+        ("GET", page2_path): (200, {"total_count": 60, "items": [_hit(n) for n in range(50, 60)]}),
+    })
+    _gh_env(srv)
+    try:
+        hits = github.search_issues(owner="jkrumm", label="warden:go")
+    finally:
+        srv.stop()
+        _gh_cleanup()
+    assert len(hits) == 60, len(hits)
+    assert [h["number"] for h in hits] == list(range(60))
+
+
+def test_search_issues_total_count_exceeding_max_pages_raises_remote_error():
+    """`total_count` still bigger than everything `_SEARCH_MAX_PAGES` pages
+    could fetch must refuse outright — DESIGN.md's "overflow waits, never
+    drops" means a caller that cannot see the whole result set must not
+    resolve anything out of it, not silently act on a partial one."""
+    def _hit(n: int) -> dict[str, Any]:
+        return {
+            "repository_url": "https://api.github.com/repos/jkrumm/argo",
+            "number": n, "title": "t", "body": "b",
+            "html_url": f"https://github.com/jkrumm/argo/issues/{n}",
+            "user": {"login": "jkrumm"}, "updated_at": "2026-09-10T00:00:00Z",
+        }
+    srv = _StubServer({"default": (200, {"total_count": 1_000_000, "items": [_hit(n) for n in range(50)]})})
+    _gh_env(srv)
+    try:
+        try:
+            github.search_issues(owner="jkrumm", label="warden:go")
+        except RemoteError as e:
+            assert "1000000" in str(e), e
+            assert "refusing to resolve" in str(e), e
+        else:
+            raise AssertionError("expected RemoteError")
+        # Exactly _SEARCH_MAX_PAGES requests, never an unbounded loop.
+        assert len(srv.requests) == github._SEARCH_MAX_PAGES, len(srv.requests)
+    finally:
+        srv.stop()
+        _gh_cleanup()
+
+
+def test_search_issues_non_200_raises_remote_error():
+    srv = _StubServer({"default": (500, {"error": "boom"})})
+    _gh_env(srv)
+    try:
+        try:
+            github.search_issues(owner="jkrumm", label="warden:go")
+        except RemoteError:
+            pass
+        else:
+            raise AssertionError("expected RemoteError")
+    finally:
+        srv.stop()
+        _gh_cleanup()
+
+
+def test_create_issue_comment_posts_to_the_right_url():
+    srv = _StubServer({
+        ("POST", "/repos/jkrumm/argo/issues/42/comments"): (201, {"id": 1, "body": "hi"}),
+    })
+    _gh_env(srv)
+    try:
+        resp = github.create_issue_comment("jkrumm/argo", 42, "hi")
+    finally:
+        srv.stop()
+        _gh_cleanup()
+    assert resp == {"id": 1, "body": "hi"}, resp
+    assert srv.requests[0]["body"] == {"body": "hi"}, srv.requests[0]
+
+
+def test_create_issue_comment_bad_repo_full_raises_precondition_error():
+    srv = _StubServer({})
+    _gh_env(srv)
+    try:
+        try:
+            github.create_issue_comment("not-owner-slash-repo", 1, "hi")
+        except PreconditionError:
+            pass
+        else:
+            raise AssertionError("expected PreconditionError")
+        assert srv.requests == []
     finally:
         srv.stop()
         _gh_cleanup()
