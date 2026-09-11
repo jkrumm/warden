@@ -32,7 +32,14 @@ Produces three artifacts, implements nothing: a dated `§` appended to
   last manual `kickstart -k` — cross-check `api (/health)`, which independently
   reports `ok`.
 
-- The loop's last tick: `sqlite3 "file:$HOME/.warden/warden.db?mode=ro" "SELECT
+- Open the ledger with a plain path, not `file:…?mode=ro` and not
+  `-readonly`: this box's `/usr/bin/sqlite3` 3.51 cannot open a WAL database
+  read-only while no other connection holds it (no `-shm` file to attach to)
+  and fails with "unable to open database file (14)"; it worked in earlier
+  sessions only because warden-api happened to hold the file. A plain open
+  with SELECT-only statements is safe under WAL. Python's `sqlite3` module
+  (`ledger.py`, `api.py`) keeps `mode=ro`, which works there.
+- The loop's last tick: `sqlite3 "$HOME/.warden/warden.db" "SELECT
   value, updated_at FROM cursors WHERE key='triage_last_run';"` — `value` is
   the last pass's state histogram, `updated_at` its timestamp. Compare against
   `600s` (the LaunchAgent interval) and `/health`'s own `poller_ages.loop`.
@@ -68,10 +75,10 @@ is `null` only paired with a non-empty `unavailable` reason — **never** read a
 ### (b) `needs_human` queue — count and age
 
 ```bash
-sqlite3 "file:$HOME/.warden/warden.db?mode=ro" \
+sqlite3 "$HOME/.warden/warden.db" \
   "SELECT count(*) FROM triage_items WHERE state='needs_human';"
 
-sqlite3 "file:$HOME/.warden/warden.db?mode=ro" "
+sqlite3 "$HOME/.warden/warden.db" "
 SELECT ti.event_id,
        ROUND((julianday('now') - julianday(t.at)) * 24, 1) AS hours_in_state
 FROM triage_items ti
@@ -95,10 +102,10 @@ bad: ages clustering near 7d (dismissed by expiry, not decided).
 ### (c) Reverts and reopen-after-`fixed`
 
 ```bash
-sqlite3 "file:$HOME/.warden/warden.db?mode=ro" \
+sqlite3 "$HOME/.warden/warden.db" \
   "SELECT count(*) FROM item_transitions WHERE from_state='fixed';"
 
-sqlite3 "file:$HOME/.warden/warden.db?mode=ro" \
+sqlite3 "$HOME/.warden/warden.db" \
   "SELECT count(*) FROM triage_items WHERE revert_pr IS NOT NULL OR state='reverted';"
 ```
 
@@ -112,7 +119,7 @@ to build, not a query to fix.
 ### (d) False `fixed` — reached `fixed` and reopened, or the signal recurred
 
 ```bash
-sqlite3 "file:$HOME/.warden/warden.db?mode=ro" \
+sqlite3 "$HOME/.warden/warden.db" \
   "SELECT event_id, from_state, to_state, at, note FROM item_transitions
    WHERE from_state='fixed' ORDER BY at DESC;"
 ```
@@ -129,7 +136,7 @@ held back by policy/budget, syncing the card immediately — DESIGN.md's "a
 deferral must be visible" rule.
 
 ```bash
-sqlite3 "file:$HOME/.warden/warden.db?mode=ro" \
+sqlite3 "$HOME/.warden/warden.db" \
   "SELECT count(*) FROM triage_items WHERE note LIKE 'deferred:%';"
 ```
 
@@ -150,11 +157,11 @@ decides whether building that join (usage row → job id → `dispatches` →
 ### (g) Dispatch volume by origin and tier
 
 ```bash
-sqlite3 "file:$HOME/.warden/warden.db?mode=ro" \
+sqlite3 "$HOME/.warden/warden.db" \
   "SELECT ti.origin, d.tier, count(*) FROM dispatches d
    JOIN triage_items ti ON ti.event_id = d.origin_event_id
    GROUP BY ti.origin, d.tier ORDER BY 3 DESC;"
-sqlite3 "file:$HOME/.warden/warden.db?mode=ro" \
+sqlite3 "$HOME/.warden/warden.db" \
   "SELECT origin, max_tier, count(*) FROM triage_items GROUP BY origin, max_tier;"
 ```
 

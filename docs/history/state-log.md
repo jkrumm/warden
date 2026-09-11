@@ -6690,3 +6690,30 @@ run `make slack-app-create`, install in the UI, store the bot token at
 `op://common/slack/WARDEN_BOT_TOKEN`, add the ref to `dotfiles-private/
 headless.refs`, `make secrets-seed` on the MacBook. `tests/test_triage.py`
 244/244, `test_clients.py` 91/91.
+
+## 62. The MacBook field report, folded in (2026-09-11, 15:00Z)
+
+A MacBook-side review of §61 sent three findings; two changed `STATE.md`.
+
+- **The PAT was never gated.** `op://mini/github/token` answers `GET
+  /repos/jkrumm/rollhook/issues` with 200 and a `POST …/comments` with an
+  empty body gets 422, not 403 (`x-accepted-github-permissions:
+  issues=write`). The "grant Issues read/write" owner action, carried since
+  §55, is dropped; the `github_issue` origin has been live all along.
+- **The Warden Slack app stays owner-gated, with one trap.** No `xoxe`
+  config token exists in 1Password and the MCP browser has no Slack session,
+  so minting and installing are the owner's. Do **not** add
+  `op://common/slack/WARDEN_BOT_TOKEN` to `headless.refs` before the value
+  exists: `secrets-seed.sh` is `set -euo pipefail` and an unresolvable ref
+  breaks the next reseal for every consumer. `slack/README.md` step 3 says so.
+- **The repo was in no backup path.** `~/SourceRoot/warden` has no remote;
+  `warden-backup.sh` shipped only `~/.warden`. It now writes
+  `git bundle create --all` into the same snapshot directory, verifies it,
+  gates the Kuma heartbeat on it, and rsyncs it with the ledger. Proven:
+  `git clone` of the shipped bundle on homelab checks out 28ce459.
+
+Also: item 996 landed while §61 was being written (meteo master 95d3e3b,
+watchdog 105/105, Kuma 220 UP, `degraded: true`); `needs_human` is 0. The
+handover doc's `sqlite3 "file:…?mode=ro"` snippets are replaced with a plain
+path: this box's CLI cannot open a WAL ledger read-only while nothing else
+holds it, and the form only ever worked while warden-api did.

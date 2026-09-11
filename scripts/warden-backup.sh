@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Daily ledger backup — snapshot ~/.warden/warden.db, then rsync ~/.warden/ to homelab.
+# Daily backup — snapshot ~/.warden/warden.db, bundle the repo, then rsync ~/.warden/ to homelab.
 #
 # WHY A SNAPSHOT AND NOT JUST rsync. The ledger is live WAL-mode SQLite with the loop
 # writing to it every 10 minutes. rsync of an open database copies a torn file: the
@@ -122,6 +122,32 @@ else
   SNAP_RC=1
 fi
 
+# --- repo bundle -----------------------------------------------------------------
+# The repo at $REPO has no git remote (2026-09-11: five commits on one disk, per the
+# MacBook-side review). A bundle of every ref rides along in the same snapshot
+# directory, so restic's B2 walk covers the code that decides what to do with the
+# ledger, not just the ledger. Overwritten each run; restic keeps the history.
+# `git bundle verify` is the restore-side check; the restore itself is
+# `git clone warden-repo.bundle`. Non-fatal like the snapshot, and it gates the
+# heartbeat the same way: a backup that silently lost the repo must not read as ok.
+BUNDLE_RC=0
+BUNDLE="$SNAP_DIR/warden-repo.bundle"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  mkdir -p "$SNAP_DIR"
+  if git -C "$REPO" bundle create "$BUNDLE.tmp" --all >/dev/null 2>&1 \
+     && git bundle verify "$BUNDLE.tmp" >/dev/null 2>&1; then
+    mv -f "$BUNDLE.tmp" "$BUNDLE"
+    echo "bundle $BUNDLE ($(du -h "$BUNDLE" | cut -f1), $(git -C "$REPO" rev-parse --short HEAD))"
+  else
+    echo "bundle FAILED for $REPO — shipping the ledger only" >&2
+    rm -f "$BUNDLE.tmp"
+    BUNDLE_RC=1
+  fi
+else
+  echo "no git repo at $REPO — nothing to bundle" >&2
+  BUNDLE_RC=1
+fi
+
 # --- ship -------------------------------------------------------------------------
 PUSH_URL=""
 [[ -x "$SECRETS_RUN" ]] && PUSH_URL=$(timeout 10 "$SECRETS_RUN" read "$PUSH_REF" 2>/dev/null)
@@ -140,7 +166,7 @@ RC=$?
 # than reporting success. A failed ping never overrides rsync's exit code (RC is
 # captured before it), and an unresolvable ref is non-fatal: the backup still ran,
 # only the ping is skipped, which UptimeKuma reads as a missed heartbeat.
-if [[ $RC -eq 0 && $SNAP_RC -eq 0 && -n "${PUSH_URL:-}" ]]; then
+if [[ $RC -eq 0 && $SNAP_RC -eq 0 && $BUNDLE_RC -eq 0 && -n "${PUSH_URL:-}" ]]; then
   # uptime.jkrumm.com sits behind Cloudflare, which 403s a default library
   # User-Agent — curl's own UA is what the other push monitors already send.
   /usr/bin/curl -fsS --max-time 10 "$PUSH_URL" >/dev/null

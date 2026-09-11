@@ -40,8 +40,11 @@ Then, in order — the owner's steps, nothing here can do these for you:
    value but only gains scopes on install.
 2. Store the Bot User OAuth Token in 1Password at
    `op://common/slack/WARDEN_BOT_TOKEN`.
-3. Add that ref to `~/SourceRoot/dotfiles-private/headless.refs` and run
-   `make secrets-seed` on the MacBook — the mini resolves secrets from the
+3. Only after step 2 has a value: add that ref to
+   `~/SourceRoot/dotfiles-private/headless.refs` and run `make secrets-seed`
+   on the MacBook. Not before — `secrets-seed.sh` is `set -euo pipefail` and
+   dies on an unresolvable ref, which breaks the next reseal for every
+   consumer on the mini. The mini resolves secrets from the cache that seeds — the mini resolves secrets from the
    offline cache that seeds, never `op` directly (see `~/.claude/CLAUDE.md`
    § Secrets).
 4. Nothing else. `chat:write.public` reaches `#agents` (`C0BVDE5R562`,

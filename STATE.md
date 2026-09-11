@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-11 (§61) |
+| Last updated | 2026-09-11 (§62) |
 | Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 9 |
@@ -69,24 +69,25 @@ loop.
 
 ## Open — owner actions
 
-- One `needs_human` card remains (meteo probe uk:220), closed by item 996's
-  PR when it merges. The other eight were closed 2026-09-11 with reasons in
-  the ledger (§60).
-- Grant the loop's PAT (`op://mini/github/token`) Issues read/write — the
-  `github_issue` origin cannot poll or comment under the LaunchAgent until
-  then.
+- Create the Warden Slack app: mint a config token at api.slack.com/apps,
+  `make slack-app-create SLACK_CONFIG_TOKEN=…`, install, store the bot token
+  at `op://common/slack/WARDEN_BOT_TOKEN`, and only THEN add the ref to
+  `dotfiles-private/headless.refs` — `secrets-seed.sh` is `set -e` and an
+  unresolvable ref breaks the next reseal for every consumer (§62). Until
+  then warden posts as Hermes and says so once per run on stderr.
 - The §55 4.3 "human types in Slack" acceptance is still open.
 - `warden-api`'s "LAST EXIT -15" is the §55 kickstart; cosmetic.
 
 ## Carried debt
 
 - sideclaw `fallow` fails at HEAD — pre-existing, not this repo's.
-- Cost per Warden item needs a join on ledger job ids; sideclaw sets no
-  `USAGE_LANE`, so usage-tracker cannot attribute its spend at all (§58).
+- Cost per Warden item is a usage-tracker query on `sub_tool` now that
+  sideclaw tags every session (`sideclaw:<tool>`, §60); the ledger join is
+  still not built.
 - `#agents` is warden-only since 2026-09-11 (Hermes's narratives cron moved to
-  `#hermes`); approval buttons still post to `#hermes`. Three `warden_canary`
-  merge_blocked items still sit on the board.
-- No ledger restore path yet.
+  `#hermes`); approval buttons still post to `#hermes`.
+- No ledger restore path yet. The repo itself has no remote; since §62 the
+  daily backup ships a `git bundle` of every ref next to the ledger snapshots.
 
 ## History
 
@@ -103,15 +104,17 @@ loop.
 - Autonomy: host verbs, Argo live, GLM routing — §59
 - Closing the queue: reminders, the heartbeat probe, Kuma sync — §60
 - Warden's own Slack identity — §61
+- MacBook field report folded in: PAT was never gated, repo bundle — §62
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-Watch item 996 (meteo watchdog heartbeat gate, `implementing` on GLM) land
-its PR and merge; then close uk:220. The three hermes items resolved as
-`quiet` before the Kuma-heartbeat probe landed, so the first `fixed` from a
-host verb is still ahead. Loop: a host verb for uk:204 (sideclaw kickstart,
-guarded by no dispatch in flight). Wave 9, the field review, from
-`docs/handover-field-review.md` after a few days of this.
+`needs_human` is 0; item 996 landed (meteo master 95d3e3b, watchdog
+105/105, Kuma 220 UP with `degraded: true`). Owner: the Warden Slack app
+(above). Loop: the first host-verb `fixed` is still ahead — the three hermes
+items resolved as `quiet` before the heartbeat probe landed; a sideclaw host
+verb for uk:204-shaped crashes, guarded by no dispatch in flight; the ledger
+restore path. Wave 9, the field review, from `docs/handover-field-review.md`
+after a few days of this.
