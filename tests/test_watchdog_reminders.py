@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression suite for STATE.md §49 — "the notifier does not read the
+"""Regression suite for state-log.md §49 — "the notifier does not read the
 ledger". `reconcile()`'s reminder branch used to anchor purely on
 `events.last_reminder_at`/`notified_at` against `REM_HOURS[source]`, with no
 read of the event's own `triage_items` row — so a settled verdict

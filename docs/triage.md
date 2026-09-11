@@ -625,7 +625,7 @@ have.
 ## The `split` state
 
 Before Wave 3, a dissolved member reset all the way to `new`. Live on
-2026-09-09 21:09-21:39Z (STATE.md §43): two members carrying a real, correct
+2026-09-09 21:09-21:39Z (docs/history/state-log.md §43): two members carrying a real, correct
 verdict about an active `hermes-agent` watchdog race were dissolved to `new`,
 missed re-escalation inside `cooldownHours` (correctly — that's the cooldown
 anchor working as designed), and were silently quiet-resolved by
@@ -1273,7 +1273,7 @@ alert-expectation payload already uses, just with one key instead of three.
 There is no ssh half here for `deploy` to be `attempted`/`ok` about — this
 repo's own CI/CD (GitHub Actions → RollHook) *is* the deploy, which
 `DESIGN.md` § Deploy already claimed and had no code path for until this
-slice (see STATE.md §47's reconnaissance). The receipt `ssh <host> make
+slice (see docs/history/state-log.md §47's reconnaissance). The receipt `ssh <host> make
 <target>` structurally cannot provide — an exit code to a process that is
 dead the moment it returns — a GitHub Actions run CAN: it has an id,
 queryable after the fact by anyone. `rollout_after_merge()`'s own `deploy`
@@ -1305,7 +1305,7 @@ merged diff set; and `argo-commit-live` (item 1b), which re-reads argo's own
 matches the merge sha EXACTLY — never inferred from the service merely being
 reachable, since a restart-time-only probe cannot distinguish a landed
 deploy from a container that bounced for an unrelated reason (the exact
-ambiguity STATE.md §47's own research-gateway/meteo reconnaissance hit, and
+ambiguity docs/history/state-log.md §47's own research-gateway/meteo reconnaissance hit, and
 part of why `argo` is the deployOnMerge repo seeded here rather than one of
 those two). Both gatherer functions own their own endpoint directly, never a
 config-driven URL — a policy file may name and parameterise a behaviour,

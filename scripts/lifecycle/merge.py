@@ -12,7 +12,7 @@ a trust.
 decision, the retired bash CLI 2044-2049): Johannes approved the change when he
 confirmed the `implement`; merging is finishing the thing he said yes to.
 
-Deploy is a second write-point since Wave 5 (STATE.md §48's "one operation,
+Deploy is a second write-point since Wave 5 (docs/history/state-log.md §48's "one operation,
 not two" limitation) — `rollout_after_merge()` records its own `operations`
 row rather than riding inside the merge operation, because the ssh-argv
 path (`autoDeploy`) and the GitHub-Actions path (`deployOnMerge`) are each
@@ -44,7 +44,7 @@ _FORBIDDEN_PATH_RE = re.compile(r"^\.github/(workflows|actions)/")
 
 # `deployOnMerge` only fires once a real merge commit exists — a 40-hex sha,
 # never `None`/"" (both reject) nor a malformed one (present-but-wrong is a
-# defect, not a missing value — see STATE.md §51's mutation note on the same
+# defect, not a missing value — see docs/history/state-log.md §51's mutation note on the same
 # shaped guard in triage.py).
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -256,7 +256,7 @@ def collect_expected_alerts(
 # `autoDeploy` and `deployOnMerge` are mutually exclusive policy shapes for
 # the same repo, and each gets its OWN operations row — the ssh-argv call
 # and the GitHub Actions push-trigger are two structurally different
-# external mutations, each with its own crash window (STATE.md §48/§51).
+# external mutations, each with its own crash window (docs/history/state-log.md §48/§51).
 def rollout_after_merge(
     conn: sqlite3.Connection, *, repo: str, owner: str, files: list[dict[str, Any]],
     merge_sha: str | None, event_id: int | None, authorized_by: str,

@@ -170,7 +170,7 @@ def test_fresh_migrate_creates_all_tables_and_indexes():
         "operations_event",            # version 5
     }
     assert indexes == expected, f"got {indexes}"
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     conn.close()
 
 
@@ -182,7 +182,7 @@ def test_connect_without_migrate_raises_naming_both_versions():
     except RuntimeError as e:
         msg = str(e)
         assert "0" in msg, msg
-        assert str(ledger.SCHEMA_VERSION) in msg, msg
+        assert str(ledger.LEDGER_SCHEMA_VERSION) in msg, msg
 
 
 def test_wal_is_actually_on():
@@ -241,12 +241,12 @@ def test_migrate_adopts_pre_versioned_database():
     assert pre_has_schema_version is None, "fixture must start without schema_version"
 
     conn = ledger.connect(path, migrate=True)
-    # SCHEMA_VERSION, not 1. Adoption establishes that the file is at version
+    # LEDGER_SCHEMA_VERSION, not 1. Adoption establishes that the file is at version
     # 1's SHAPE; it does not establish that it is at the current version, so it
     # stamps 1 and then falls through the migration loop like any other
-    # database. Asserting `== 1` here is what hid that bug while SCHEMA_VERSION
+    # database. Asserting `== 1` here is what hid that bug while LEDGER_SCHEMA_VERSION
     # happened to be 1.
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
 
     post_cols = {t: _table_columns(conn, t) for t in ledger._ADOPTABLE_TABLES}
     post_counts = _row_counts(conn, ledger._ADOPTABLE_TABLES)
@@ -278,7 +278,7 @@ def test_adopting_a_pre_versioned_ledger_runs_every_later_migration():
 
     `_run_migrations()`'s adoption branch used to stamp version 1 and `return`,
     skipping the migration loop entirely. That was invisible for exactly as long
-    as SCHEMA_VERSION stayed 1. The moment it became 2, adopting a pre-versioned
+    as LEDGER_SCHEMA_VERSION stayed 1. The moment it became 2, adopting a pre-versioned
     ledger would stamp it 1, skip migration 2, and then fail `_verify_columns()`
     on the column migration 2 would have added.
 
@@ -294,9 +294,9 @@ def test_adopting_a_pre_versioned_ledger_runs_every_later_migration():
 
     conn = ledger.connect(path, migrate=True)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == ledger.SCHEMA_VERSION, (
+    assert version == ledger.LEDGER_SCHEMA_VERSION, (
         f"adoption stopped at version {version} instead of running on to "
-        f"{ledger.SCHEMA_VERSION} — every migration after the adopted one was skipped")
+        f"{ledger.LEDGER_SCHEMA_VERSION} — every migration after the adopted one was skipped")
 
     cols = _table_columns(conn, "triage_items")
     assert "state_deadline" in cols, "migration 2 did not run against the adopted ledger"
@@ -320,7 +320,7 @@ def test_migrate_is_idempotent():
     conn.close()
 
     conn2 = ledger.connect(path, migrate=True)
-    assert conn2.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn2.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     assert conn2.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1, "must stay a single row"
     second_counts = _row_counts(conn2, ledger._ADOPTABLE_TABLES)
     second_cols = {t: _table_columns(conn2, t) for t in ledger._ADOPTABLE_TABLES}
@@ -331,15 +331,15 @@ def test_migrate_is_idempotent():
 
 def test_migrate_refuses_a_newer_database():
     conn = ledger.connect(_tmp_path(), migrate=True)
-    conn.execute("UPDATE schema_version SET version = ?", (ledger.SCHEMA_VERSION + 1,))
+    conn.execute("UPDATE schema_version SET version = ?", (ledger.LEDGER_SCHEMA_VERSION + 1,))
     conn.commit()
     try:
         ledger.migrate(conn)
         raise AssertionError("expected RuntimeError on a newer-than-us database")
     except RuntimeError as e:
         msg = str(e)
-        assert str(ledger.SCHEMA_VERSION + 1) in msg, msg
-        assert str(ledger.SCHEMA_VERSION) in msg, msg
+        assert str(ledger.LEDGER_SCHEMA_VERSION + 1) in msg, msg
+        assert str(ledger.LEDGER_SCHEMA_VERSION) in msg, msg
     conn.close()
 
 
@@ -381,7 +381,7 @@ def test_migration_3_adds_occurrence_mark():
 def test_v2_database_migrates_to_v3_matching_a_fresh_one():
     """A real upgrade path, not adoption: a database already stamped at
     schema_version 2 (state_deadline present, occurrence_mark not yet) must
-    reach SCHEMA_VERSION 3 with a schema identical to a fresh database's."""
+    reach LEDGER_SCHEMA_VERSION 3 with a schema identical to a fresh database's."""
     path = _tmp_path()
     conn = sqlite3.connect(path)
     conn.executescript(ledger.BASE_SCHEMA)
@@ -392,7 +392,7 @@ def test_v2_database_migrates_to_v3_matching_a_fresh_one():
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     cols = {t: _table_columns(conn, t) for t in ledger._ADOPTABLE_TABLES}
     assert "occurrence_mark" in cols["triage_items"]
 
@@ -425,7 +425,7 @@ def test_migration_4_converts_resolved_to_quiet_and_creates_item_transitions():
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     row = conn.execute("SELECT state FROM triage_items WHERE event_id=1").fetchone()
     assert row["state"] == "quiet", "migration 4 must convert every `resolved` row to `quiet`"
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -437,7 +437,7 @@ def test_migration_4_converts_resolved_to_quiet_and_creates_item_transitions():
 
 def test_v3_database_migrates_to_v4_matching_a_fresh_one():
     """A real upgrade path, not adoption: a database already stamped at
-    schema_version 3 must reach SCHEMA_VERSION 4 with a schema identical to a
+    schema_version 3 must reach LEDGER_SCHEMA_VERSION 4 with a schema identical to a
     fresh database's, including the new item_transitions table."""
     path = _tmp_path()
     conn = sqlite3.connect(path)
@@ -450,7 +450,7 @@ def test_v3_database_migrates_to_v4_matching_a_fresh_one():
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
 
     fresh = ledger.connect(_tmp_path(), migrate=True)
     for table in (*ledger._ADOPTABLE_TABLES, "item_transitions"):
@@ -501,7 +501,7 @@ def test_adoption_tolerates_an_unexpected_extra_column() -> None:
 
     conn = sqlite3.connect(tmp)
     ledger.migrate(conn)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     conn.close()
 
 
@@ -527,7 +527,7 @@ def test_migration_5_creates_operations_table_and_indexes():
 def test_v4_database_migrates_to_v5_matching_a_fresh_one():
     """A real upgrade path, not adoption: a database already stamped at
     schema_version 4 (item_transitions present, operations not yet) must
-    reach SCHEMA_VERSION 5 with a schema identical to a fresh database's."""
+    reach LEDGER_SCHEMA_VERSION 5 with a schema identical to a fresh database's."""
     path = _tmp_path()
     conn = sqlite3.connect(path)
     conn.executescript(ledger.BASE_SCHEMA)
@@ -540,7 +540,7 @@ def test_v4_database_migrates_to_v5_matching_a_fresh_one():
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "operations" in tables, "migration 5 did not run against the v4-stamped database"
 
@@ -553,11 +553,11 @@ def test_v4_database_migrates_to_v5_matching_a_fresh_one():
 
 
 def test_verify_columns_catches_missing_operations_column():
-    """Closes STATE.md §41 known-open item 5: item_transitions' (and now
+    """Closes state-log.md §41 known-open item 5: item_transitions' (and now
     operations') shape was created by a migration but never asserted by
     _verify_columns(), because it only ever walked _ADOPTABLE_TABLES —
     exactly the five original BASE_SCHEMA tables, never a table a LATER
-    migration added. A database stamped at SCHEMA_VERSION with an
+    migration added. A database stamped at LEDGER_SCHEMA_VERSION with an
     `operations` table missing a declared column must be refused, the same
     way test_adoption_refuses_a_structurally_incomplete_database already
     proves for `dispatches`."""
@@ -669,7 +669,7 @@ def test_migration_6_backfills_delivery_status_from_reported_at():
 
 def test_v5_database_migrates_to_v6_matching_a_fresh_one():
     """A real upgrade path, not adoption: a database already stamped at
-    schema_version 5 must reach SCHEMA_VERSION 6 with a schema identical to a
+    schema_version 5 must reach LEDGER_SCHEMA_VERSION 6 with a schema identical to a
     fresh database's."""
     path = _tmp_path()
     conn = sqlite3.connect(path)
@@ -684,7 +684,7 @@ def test_v5_database_migrates_to_v6_matching_a_fresh_one():
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
 
     fresh = ledger.connect(_tmp_path(), migrate=True)
     for table in ledger._VERSIONED_TABLES:

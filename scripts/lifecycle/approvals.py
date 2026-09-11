@@ -3,7 +3,7 @@ decided.
 
 The Python port of the retired bash CLI's `approval_hash` (963-972),
 `post_approval_buttons` (977-1038), `mint_approval` (1081-1114) and
-`require_signed_approval` (1119-1191) — reshaped for STATE.md §46's Shape
+`require_signed_approval` (1119-1191) — reshaped for docs/history/state-log.md §46's Shape
 note: the bash `--confirm` re-invocation is gone. `intents.py`'s `drain()`
 is what lands a signed Slack decision onto the `dispatch_approvals` row
 (`decision`, `decided_at`, `decided_by`, `signature`); `execute_approved()`

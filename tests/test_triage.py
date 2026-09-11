@@ -899,7 +899,7 @@ def test_dissolve_cluster_dry_run_performs_state_change_without_slack_call():
 
 
 def test_split_state_survives_apply_resolutions_state_43_regression():
-    """STATE.md §43, reproduced then closed: two dissolved cluster members
+    """state-log.md §43, reproduced then closed: two dissolved cluster members
     carrying a correct, real verdict were sent to `new`, missed
     re-escalation inside cooldownHours, and were silently quiet-resolved by
     apply_resolutions() before anyone ever saw the verdict — which survived
@@ -936,7 +936,7 @@ def test_split_state_survives_apply_resolutions_state_43_regression():
             item = triage._get_item(conn, eid)
             assert item["state"] == triage.STATE_SPLIT, (
                 f"a split row's verdict must survive silence — got {item['state']} (this is the exact "
-                f"STATE.md §43 defect: the verdict reached nobody)"
+                f"state-log.md §43 defect: the verdict reached nobody)"
             )
             assert item["note"] is not None and item["note"].startswith(triage.SPLIT_VERDICT_NOTE_PREFIX), (
                 "the dissolve verdict must still be readable on the row after a silence pass"
@@ -1068,7 +1068,7 @@ def test_a_capped_attempt_does_not_claim_to_have_deferred_anyone():
 
 
 def test_cooldown_holds_back_split_member_inside_cooldown_hours():
-    """The STATE.md §43 mechanism itself, now harmless: a split member's
+    """The state-log.md §43 mechanism itself, now harmless: a split member's
     retained dispatch_job still anchors a real cooldownHours wait, so it does
     not instantly re-escalate in the very same run — it simply no longer
     loses its verdict while it waits (see the §43 regression test above)."""
@@ -3656,7 +3656,7 @@ def test_confirmed_validation_merges_real_path_deploy_on_merge():
 
 # --- the loop syncs its own dispatches row before any state transition ------
 #
-# The defect (STATE.md, item 986): poll_implement_jobs()/poll_validation_jobs()
+# The defect (state-log.md, item 986): poll_implement_jobs()/poll_validation_jobs()
 # read a terminal sideclaw job and moved the ITEM, but never folded the
 # outcome back onto the `dispatches` row that job belongs to — that fold
 # lived only on dispatch-sweep.py's own 300s cadence. With the sweep
@@ -5296,7 +5296,7 @@ def test_sync_card_never_posts_a_first_card_for_any_never_carded_terminal_state(
 # operations — the crash-recovery unit (schema 5, DESIGN.md § Crash recovery).
 # record_operation()/complete_operation() are the two writers; reconcile_operations()
 # is the sole resolver of a row an external call left ambiguous, and it runs
-# FIRST in run(), before anything that could retry. See STATE.md §46's
+# FIRST in run(), before anything that could retry. See state-log.md §46's
 # write-ordering map for the two bugs this section pins down: the `merged_at`
 # read-as-failure bug (poll_validation_jobs' merge branch) and the
 # maybe_auto_implement() duplication bug (a timeout wrongly read as a refusal).
@@ -5423,7 +5423,7 @@ def test_auto_implement_maps_each_failure_mode():
 
 def test_reconcile_implement_sideclaw_404_becomes_unknown_not_failed_and_needs_human():
     """A pruned sideclaw job returns 404, byte-identical to a job id that
-    never existed (STATE.md §46) — absence proves nothing, so an in-flight
+    never existed (state-log.md §46) — absence proves nothing, so an in-flight
     implement operation reconcile_operations() cannot confirm must land on
     `unknown`, never `failed`, and the item must move to needs_human rather
     than being silently written off."""
@@ -5454,7 +5454,7 @@ def test_reconcile_implement_sideclaw_404_becomes_unknown_not_failed_and_needs_h
 
 
 def test_reconcile_merge_github_reports_merged_becomes_done_with_merge_commit_not_merge_blocked():
-    """The exact bug STATE.md §46 names: `dispatches.merged_at` written AFTER
+    """The exact bug state-log.md §46 names: `dispatches.merged_at` written AFTER
     `PUT /pulls/:pr/merge`, so a crash in between used to leave the retry
     reading `merged_at` NULL while GitHub says `merged: true` — and
     `policy_err` fired, recording `merge_blocked` for a PR that was actually

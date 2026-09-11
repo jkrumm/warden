@@ -914,7 +914,7 @@ def test_wrong_schema_version_is_precondition_error():
     h = Harness()
     db = h.new_db()
     conn, mod = _connect(db)
-    conn.execute("UPDATE schema_version SET version=?", (mod.SCHEMA_VERSION + 1,))
+    conn.execute("UPDATE schema_version SET version=?", (mod.LEDGER_SCHEMA_VERSION + 1,))
     conn.commit()
     conn.close()
     proc = h.run(["list", "--json"], env=h.base_env(db=db))

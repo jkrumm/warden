@@ -350,7 +350,7 @@ def _metric_median_needs_human_to_decision(
 # triage.py's own STATE_FIXED; "signed:" is the authorized_by prefix
 # triage.py's record_operation() docstring documents for a spent SIGNED
 # approval (as opposed to the literal "auto-from-item", which is the only
-# value this chain has ever actually produced — see STATE.md §46 Correction 1).
+# value this chain has ever actually produced — see docs/history/state-log.md §46 Correction 1).
 _FIXED_STATE = "fixed"
 _SIGNED_AUTHORIZED_BY_PREFIX = "signed:"
 
@@ -359,7 +359,7 @@ def _metric_verified_unattended_fixes_per_week(
     conn: sqlite3.Connection, now: dt.datetime, history_since: str | None,
 ) -> dict[str, Any]:
     """# 4 — verified UNATTENDED fixes per week. The qualifier IS now
-    derivable (schema 5, `operations` — see STATE.md §46 Correction 1 and
+    derivable (schema 5, `operations` — see docs/history/state-log.md §46 Correction 1 and
     DESIGN.md § Crash recovery): an item is unattended if none of the
     `operations` rows tied to its event_id carries a `signed:` authorization.
     `operations` is written on BOTH the auto-from-item and the (not yet
@@ -372,7 +372,7 @@ def _metric_verified_unattended_fixes_per_week(
     landing this fix" is a real question to ask.
 
     Still returns `null` today — but for a DIFFERENT and correct reason than
-    before: STATE.md §46 Correction 3 measured zero `item_transitions` into
+    before: docs/history/state-log.md §46 Correction 3 measured zero `item_transitions` into
     `fixed` in production (the chain has never run), so either the window
     predates `history_since` entirely, or it does not and there are simply
     zero `fixed` transitions to evaluate — both are "no basis", never a
@@ -397,7 +397,7 @@ def _metric_verified_unattended_fixes_per_week(
     # event_id, so a per-transition numerator subtracted from a per-item
     # signed set is a count of one thing minus a count of another. That is
     # precisely the shape of the metric-1 defect the Wave 2 boundary review
-    # caught (STATE.md §42 defect 1) — dispatch counts divided while broken
+    # caught (docs/history/state-log.md §42 defect 1) — dispatch counts divided while broken
     # down by item counts — and it is not being repeated here.
     fixed_event_ids = [
         row["event_id"] for row in conn.execute(
@@ -544,7 +544,7 @@ def health_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     now = dt.datetime.now(dt.timezone.utc)
     version_row = conn.execute("SELECT version FROM schema_version").fetchone()
     version = version_row["version"] if version_row is not None else None
-    schema_ok = version == _ledger.SCHEMA_VERSION
+    schema_ok = version == _ledger.LEDGER_SCHEMA_VERSION
 
     db_file = conn.execute("PRAGMA database_list").fetchone()["file"]
     try:
@@ -567,7 +567,7 @@ def health_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     return {
         "ok": schema_ok and all_pollers_ok,
         "schema_version": version,
-        "schema_version_expected": _ledger.SCHEMA_VERSION,
+        "schema_version_expected": _ledger.LEDGER_SCHEMA_VERSION,
         "db_path": db_file,
         "db_mtime": db_mtime,
         "pollers": pollers,
@@ -621,7 +621,7 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
 
     payload: dict[str, Any] = {
         "generated_at": now.isoformat(),
-        "schema_version": _ledger.SCHEMA_VERSION,
+        "schema_version": _ledger.LEDGER_SCHEMA_VERSION,
         "counts": counts,
         "items": items,
         "terminal_24h": terminal_24h,

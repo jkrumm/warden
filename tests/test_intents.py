@@ -474,7 +474,7 @@ def test_cli_drain_refuses_a_ledger_at_the_wrong_schema_version():
     that never runs in normal operation, which is exactly why it has to be run
     here."""
     conn, db = _fresh_ledger()
-    conn.execute("UPDATE schema_version SET version=?", (ledger.SCHEMA_VERSION + 1,))
+    conn.execute("UPDATE schema_version SET version=?", (ledger.LEDGER_SCHEMA_VERSION + 1,))
     conn.commit()
     conn.close()
 

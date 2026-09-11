@@ -1,4 +1,4 @@
-"""Watchdog poll — runs every 30 min as Hermes cron pre-run.
+"""Watchdog poll — runs every 1800 s as the `com.jkrumm.warden-poll` LaunchAgent.
 
 Polls UptimeKuma, Docker (homelab + vps), GitHub, Slack #alerts/#updates,
 Hermes self-state, 1Password ref health on homelab + vps (a no-op
@@ -116,7 +116,7 @@ REM_HOURS = {
     "stray_skill": 168,
 }
 
-# STATE.md §49 — an event whose triage_items row is STATE_NEEDS_HUMAN carries a
+# docs/history/state-log.md §49 — an event whose triage_items row is STATE_NEEDS_HUMAN carries a
 # real outstanding decision (a verdict with a 7-day deadline), which is a
 # different thing than "still down/unresolved on the source's own cadence".
 # 24h, not the source's REM_HOURS entry — §41 known-open item 3 scoped
@@ -352,7 +352,7 @@ def _dispatch_status(conn: sqlite3.Connection, dispatch_id: int | None) -> sqlit
 
 def _triage_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
     """Look up one triage_items row for the reminder path's own state check
-    (STATE.md §49 — the reminder branch never read the ledger's own
+    (docs/history/state-log.md §49 — the reminder branch never read the ledger's own
     classification of the event it was about to remind on). None whenever
     there's nothing to project: the triage_items table doesn't exist yet
     (triage.py may never have run against a fresh ledger), or no row for this
@@ -422,7 +422,7 @@ def poll_uk(env: dict[str, str]) -> list[dict[str, Any]]:
     for m in monitors:
         if not isinstance(m, dict):
             continue
-        # STATE.md §49 / DESIGN.md § Open questions ("Resolved since v1"):
+        # docs/history/state-log.md §49 / DESIGN.md § Open questions ("Resolved since v1"):
         # group monitors (uk:95 "VPS", uk:179 "Services", uk:186 "Local") are
         # group PARENTS whose children alert on their own — repo IS NULL, so
         # escalate() can never dispatch on them, and they remind every 6h
@@ -940,7 +940,7 @@ def reconcile(conn: sqlite3.Connection, source: str, observed: list[dict[str, An
             new_events.append(dict(row))
             cur.execute("UPDATE events SET notified_at=? WHERE id=?", (now.isoformat(), row["id"]))
         elif reminder_h:
-            # Ledger projection (STATE.md §49): the reminder path used to
+            # Ledger projection (docs/history/state-log.md §49): the reminder path used to
             # anchor purely on events/REM_HOURS and never look at the ledger's
             # own classification of the event. A triage_items row in a
             # TERMINAL_STATES state (ignored/note included) is a settled
@@ -1232,7 +1232,7 @@ def _render_bullet(item: dict[str, Any], kind: str, now: dt.datetime) -> str:
             # its outcome instead of a bare "reminder #N".
             body += f" — {dispatch_summary}"
         elif triage_note:
-            # Ledger projection (STATE.md §49): needs_human carries a real
+            # Ledger projection (docs/history/state-log.md §49): needs_human carries a real
             # verdict already — report it instead of a bare "reminder #N".
             body += f" — needs human: {triage_note}"
         else:
@@ -1268,7 +1268,9 @@ def compose_slack_body(
 ) -> str:
     """Returns the Slack mrkdwn message body, or empty string for suppression.
 
-    Empty stdout maps to silent delivery under cron `no_agent` mode.
+    Under `--post` (the `com.jkrumm.warden-poll` LaunchAgent's production
+    path), an empty return means no Slack call is made at all — silent by
+    design, not an error.
     """
     if quiet or vacation:
         return ""
@@ -1546,7 +1548,8 @@ def main(argv: list[str] | None = None) -> int:
                          resolved_count=len(all_res), slack_blind=bool(slack_blind))
         conn.close()
 
-    # stderr, never stdout: under no_agent the stdout of --slack-body IS the Slack message.
+    # stderr, never stdout: --post delivers the digest itself via chat.postMessage,
+    # so stdout carries no message for anything to consume.
     if slack_blind:
         print(slack_blind, file=sys.stderr)
 

@@ -12,7 +12,7 @@ Three kinds, each one external mutation:
   deploy     — the rollout after a merge: either the closed-allowlist argv
                (`autoDeploy`) or the GitHub Actions run a push to the default
                branch triggers (`deployOnMerge`). Its own write-point since
-               Wave 5 — STATE.md §48's "one operation, not two" limitation
+               Wave 5 — docs/history/state-log.md §48's "one operation, not two" limitation
                existed only because of the subprocess boundary.
 
 `investigate` and validation episodes deliberately get none: they run

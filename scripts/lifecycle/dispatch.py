@@ -5,7 +5,7 @@ record (the Python port of the retired bash CLI's `read_brief`/`read_context`
 
 `open_episode()` is the one function in this module that did not exist in
 the bash script in this shape: the old `--confirm` re-invocation is gone
-(STATE.md §46), so opening the sideclaw episode for a signed approval now
+(docs/history/state-log.md §46), so opening the sideclaw episode for a signed approval now
 happens in-process, in `lifecycle/approvals.py`'s `execute_approved()`,
 which calls this function rather than re-running a CLI.
 """

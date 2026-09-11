@@ -322,10 +322,10 @@ def test_metric3_null_with_history_reason_when_table_is_young():
 # --- Metric 4: verified unattended fixes per week -------------------------------
 #
 # Schema 5's `operations` table makes the "unattended" qualifier derivable —
-# see STATE.md §46 Correction 1 and api.py's own docstring on this metric.
+# see state-log.md §46 Correction 1 and api.py's own docstring on this metric.
 # An item counts as unattended if none of the `operations` rows tied to its
 # event_id carries a `signed:` authorized_by. In production today this chain
-# has only ever produced the literal "auto-from-item" (STATE.md §46
+# has only ever produced the literal "auto-from-item" (state-log.md §46
 # Correction 1), so these seeds are what the real ledger would actually hold.
 
 def test_metric4_counts_a_fixed_item_with_no_signed_operation_as_unattended():
@@ -374,7 +374,7 @@ def test_metric4_counts_an_item_once_even_if_it_reaches_fixed_twice():
     probe reopens it to `new` -> `fixed` again), and without DISTINCT that
     item would contribute 2 to the numerator while its signed operation
     could only ever remove 1. That is the exact shape of the metric-1 defect
-    the Wave 2 boundary review caught (STATE.md §42 defect 1)."""
+    the Wave 2 boundary review caught (state-log.md §42 defect 1)."""
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)
@@ -804,7 +804,7 @@ class _ServerHandle:
 def test_schema_mismatch_returns_503_not_200():
     path = _tmp_db()
     conn = ledger.connect(path, migrate=True)
-    conn.execute("UPDATE schema_version SET version = ?", (ledger.SCHEMA_VERSION + 1,))
+    conn.execute("UPDATE schema_version SET version = ?", (ledger.LEDGER_SCHEMA_VERSION + 1,))
     conn.commit()
     conn.close()
 

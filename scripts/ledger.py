@@ -16,7 +16,7 @@ raised from whichever query touches the missing column first, in production,
 possibly at 3am.
 
 The fix is not "add a fifth copy that is more careful." It is one module that
-is the schema: one `SCHEMA_VERSION`, one ordered `MIGRATIONS` map, one
+is the schema: one `LEDGER_SCHEMA_VERSION`, one ordered `MIGRATIONS` map, one
 `migrate()` that only the process that owns the loop's 10-minute boot is
 allowed to run, and one `assert_schema_version()` that every other process
 calls instead — so a poller or a sweeper that starts before the loop has
@@ -58,7 +58,12 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # frozen at its pre-cutover state and written by nothing, kept as the rollback —
 # so if you are reading this to work out which database is real, it is this one.
 
-SCHEMA_VERSION = 8
+# Named LEDGER_SCHEMA_VERSION, not SCHEMA_VERSION, deliberately: it pins this
+# module's own SQLite schema, distinct from scripts/clients/sideclaw.py's
+# DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
+# verdict schemas and are asserted per job by assert_result_schema and by
+# `make check-schemas` — two independent pins that must never be conflated.
+LEDGER_SCHEMA_VERSION = 8
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -272,7 +277,7 @@ CREATE INDEX IF NOT EXISTS idx_item_transitions_event ON item_transitions(event_
 # Version 5 — `operations`, the crash-recovery unit DESIGN.md § Crash recovery
 # calls for: "an operation id recorded before dispatch... unknown is an
 # explicit outcome, reconciled before any retry — never silently read as
-# failure." STATE.md §46 Correction 1 is why this hangs off its OWN table
+# failure." docs/history/state-log.md §46 Correction 1 is why this hangs off its OWN table
 # rather than `dispatch_approvals`: the unattended door (--auto-from-item) can
 # never produce an approval row (`mint_approval` has one call site, behind
 # PLANNED=1, and `awaiting_confirm()` is false whenever AUTO_FROM_ITEM is set —
@@ -471,7 +476,7 @@ MIGRATIONS: dict[int, str] = {
 # which only ever look at schema_version itself.
 _ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "dispatch_approvals", "triage_items")
 
-# Every table this schema declares AT SCHEMA_VERSION, used only by
+# Every table this schema declares AT LEDGER_SCHEMA_VERSION, used only by
 # _expected_columns()/_verify_columns() — deliberately a DIFFERENT set from
 # _ADOPTABLE_TABLES above, and the two must stay separate. _ADOPTABLE_TABLES
 # answers "is this the live pre-versioned ledger" (table presence only, at the
@@ -479,9 +484,9 @@ _ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "dispatch_approvals", "t
 # neither item_transitions nor operations yet, since both are created by
 # migrations 4 and 5, which adoption falls through into immediately after).
 # _VERSIONED_TABLES answers a different question — "does a database stamped
-# at SCHEMA_VERSION actually have the columns that version declares" — and has
+# at LEDGER_SCHEMA_VERSION actually have the columns that version declares" — and has
 # to include every table ever added by a migration, or a later migration's
-# table silently stops being checked. This closes STATE.md §41 known-open item
+# table silently stops being checked. This closes docs/history/state-log.md §41 known-open item
 # 5: item_transitions' shape was created by migration 4 but never asserted by
 # _verify_columns(), because it only ever walked _ADOPTABLE_TABLES.
 _VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
@@ -490,7 +495,7 @@ _VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
 # STATE_* constants (triage.py:332-427) and its TERMINAL_STATES (triage.py:531).
 # ledger.py is the schema owner, so it is the home for the state names that
 # OTHER files (watchdog-poll.py, which must not import triage.py by path — see
-# that file's reminder branch in reconcile() and STATE.md §49) need without
+# that file's reminder branch in reconcile() and docs/history/state-log.md §49) need without
 # pulling in triage.py itself. triage.py does not import these back yet
 # (STATE.md follow-up); tests/test_watchdog_reminders.py asserts the two
 # tuples stay identical so this copy cannot silently drift from the original.
@@ -577,16 +582,16 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     immediately.
 
     Refuses loudly, before touching anything, if the database is already
-    past SCHEMA_VERSION — that can only mean an older warden was pointed at
+    past LEDGER_SCHEMA_VERSION — that can only mean an older warden was pointed at
     a ledger a newer warden already migrated, and the only safe move is to
     stop, not to guess which of its own migrations might still apply.
     """
     conn.execute(_SCHEMA_VERSION_TABLE)
     current = _current_version(conn)
 
-    if current > SCHEMA_VERSION:
+    if current > LEDGER_SCHEMA_VERSION:
         raise RuntimeError(
-            f"ledger schema_version={current} is newer than this warden's SCHEMA_VERSION={SCHEMA_VERSION} — "
+            f"ledger schema_version={current} is newer than this warden's LEDGER_SCHEMA_VERSION={LEDGER_SCHEMA_VERSION} — "
             "refusing to migrate. This means an older warden was started against a ledger a newer warden "
             "has already migrated forward; running an old migrator against it would guess, and guessing is "
             "how data gets destroyed. Upgrade this warden (or point it at a different database) before "
@@ -599,9 +604,9 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         conn.executescript(f"BEGIN;\n{_stamp_version_sql(1, _now_iso())}COMMIT;\n")
         # ...and then FALL THROUGH to the migration loop below rather than
         # returning. Adoption establishes that this file is at version 1's
-        # shape; it does not establish that it is at SCHEMA_VERSION. This
+        # shape; it does not establish that it is at LEDGER_SCHEMA_VERSION. This
         # `return` used to be unconditional, and was harmless for exactly as
-        # long as SCHEMA_VERSION stayed 1 — the moment it became 2, adopting a
+        # long as LEDGER_SCHEMA_VERSION stayed 1 — the moment it became 2, adopting a
         # pre-versioned ledger would stamp it 1, skip migration 2, and then fail
         # `_verify_columns()` on a column the migration it skipped would have
         # added. The path that does that is the ROLLBACK
@@ -609,7 +614,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # have failed at exactly the moment it was needed.
         current = 1
 
-    for version in range(current + 1, SCHEMA_VERSION + 1):
+    for version in range(current + 1, LEDGER_SCHEMA_VERSION + 1):
         ddl = MIGRATIONS[version]
         # executescript() commits any pending transaction before it runs and
         # performs no other implicit transaction control of its own (stdlib
@@ -623,7 +628,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
 
 
 def _expected_columns() -> dict[str, set[str]]:
-    """What the schema AT `SCHEMA_VERSION` says each table has, derived by
+    """What the schema AT `LEDGER_SCHEMA_VERSION` says each table has, derived by
     replaying BASE_SCHEMA and then every migration up to it against an
     in-memory database, rather than by keeping a second hand-written list
     beside it. A hand-written list is a copy, and a copy of a schema is a
@@ -637,7 +642,7 @@ def _expected_columns() -> dict[str, set[str]]:
         # order instead, which is the same "derive it, never copy it" property
         # one version further on.
         for version in sorted(MIGRATIONS):
-            if version <= SCHEMA_VERSION:
+            if version <= LEDGER_SCHEMA_VERSION:
                 mem.executescript(MIGRATIONS[version])
         return {
             t: {r[1] for r in mem.execute(f"PRAGMA table_info('{t}')")}
@@ -674,7 +679,7 @@ def _verify_columns(conn: sqlite3.Connection) -> None:
             problems.append(f"  {table}: missing {sorted(missing)}")
     if problems:
         raise RuntimeError(
-            f"ledger is stamped schema_version={SCHEMA_VERSION} but does not match that schema:\n"
+            f"ledger is stamped schema_version={LEDGER_SCHEMA_VERSION} but does not match that schema:\n"
             + "\n".join(problems)
             + "\n\nThis is a database that carried all the expected TABLES (so it was adopted rather "
             "than created) while missing columns the schema declares. Adopting it further would "
@@ -698,14 +703,14 @@ def assert_schema_version(conn: sqlite3.Connection) -> None:
     alone: either the migrating process (triage.py, the loop) has not run
     yet against this file, or this process is stale and needs upgrading."""
     version = _current_version(conn)
-    if version != SCHEMA_VERSION:
+    if version != LEDGER_SCHEMA_VERSION:
         # The connection's own idea of its file, not the module-global DB_PATH —
         # a caller that passed an explicit `path=` (a test, a --db override) would
         # otherwise get an error naming the wrong file.
         db_file = conn.execute("PRAGMA database_list").fetchone()["file"]
         raise RuntimeError(
             f"warden ledger at {db_file} is at schema_version={version}, this process expects "
-            f"SCHEMA_VERSION={SCHEMA_VERSION}. Only the loop (triage.py, via `connect(migrate=True)`) "
+            f"LEDGER_SCHEMA_VERSION={LEDGER_SCHEMA_VERSION}. Only the loop (triage.py, via `connect(migrate=True)`) "
             "is allowed to migrate this file — run it at least once, or if this ledger has already been "
             "migrated past this process's version, upgrade this process before pointing it here."
         )
@@ -804,11 +809,11 @@ def snapshot(conn: sqlite3.Connection, dest: Path | str) -> Path:
 #                                        also what a test fixture needs.
 #   python3 ledger.py --check <path>     assert the version and print it. Exit 1 on
 #                                        mismatch, so a caller can fail closed.
-#   python3 ledger.py --version          print SCHEMA_VERSION and exit.
+#   python3 ledger.py --version          print LEDGER_SCHEMA_VERSION and exit.
 
 def _main(argv: list[str]) -> int:
     if "--version" in argv:
-        print(SCHEMA_VERSION)
+        print(LEDGER_SCHEMA_VERSION)
         return 0
     for flag in ("--migrate", "--check"):
         if flag in argv:

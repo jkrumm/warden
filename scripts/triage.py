@@ -4,12 +4,13 @@ investigation attached once a signature repeats or stays open. THE ACT PATH
 (ingest -> classify -> cluster -> escalate -> card -> resolve) MAKES NO LLM
 CALL AT ALL (the dispatched sideclaw `investigate` episode itself runs Claude
 Code, which is inherent to what "investigate" means — that is a property of
-hermes-cc.sh, not of this script). The ONE exception in the whole file is
-`propose_mappings()` — a bounded, once-a-day maintenance pass, batched, never
-in the act path itself — see PROPOSE MAPPINGS below.
+sideclaw's dispatch tier, reached here via scripts/clients/sideclaw.py, not of
+this script). The ONE exception in the whole file is `propose_mappings()` — a
+bounded, once-a-day maintenance pass, batched, never in the act path itself —
+see PROPOSE MAPPINGS below.
 
-Runs every 10 min as a Hermes `no_agent` cron script (via triage-cron.py, the
-thin loader — see that file's docstring for why it has to stay thin).
+Runs every 600 s as the `com.jkrumm.warden-loop` LaunchAgent (`scripts/triage.py
+--run`).
 
 WHY THIS EXISTS. `scripts/watchdog-poll.py` already ingests `#alerts` and the
 other sources into `events` (deduplicated by `normalize_title()`/UNIQUE(source,
@@ -538,7 +539,7 @@ LIVENESS_CONFIRMED_NOTE_PREFIX = "liveness confirmed: "
 # _dissolve_cluster()'s own note prefix — the dissolve verdict's text
 # (summary + verdict + recommendation, the same text_blob DISSOLVE_MARKER is
 # matched against), so a `split` row's obligation is readable on its own row,
-# not only inside dispatches.verdict_json where STATE.md §43 found nobody
+# not only inside dispatches.verdict_json where docs/history/state-log.md §43 found nobody
 # ever reads it. Safe to write here where a note was not safe on `new`
 # (apply_resolutions() clears note=NULL, but a `split` row is never a
 # candidate for that function — see _SILENCE_RESOLVE_ELIGIBLE_STATES): this
@@ -888,7 +889,7 @@ ARGO_HEALTH_URL = os.environ.get("TRIAGE_ARGO_HEALTH_URL", "https://argo.jkrumm.
 
 
 def _gather_argo_commit_live(expected: list[dict[str, Any]]) -> tuple[bool, str]:
-    """The deployOnMerge liveness probe for `argo` (item 1b, STATE.md §47/§48).
+    """The deployOnMerge liveness probe for `argo` (item 1b, docs/history/state-log.md §47/§48).
     Re-reads argo's own `GET /api/health` — tailnet-reachable, no auth, no
     secret, verified directly against a real merge (jkrumm/argo#16, 56s
     merge-to-served) — and asserts its `commit` field matches the merge
@@ -901,7 +902,7 @@ def _gather_argo_commit_live(expected: list[dict[str, Any]]) -> tuple[bool, str]
     `ok` is a genuine exact-sha-match POSITIVE confirmation, never inferred
     from the service merely being reachable or having recently restarted. A
     restart-time-only probe cannot distinguish a landed deploy from a
-    container that bounced for an unrelated reason — STATE.md §47's own
+    container that bounced for an unrelated reason — docs/history/state-log.md §47's own
     research-gateway/meteo reconnaissance hit exactly this ambiguity, which
     is why it stopped short of using `lastRestartAt` here. `fixed` is the
     one state in this file that claims a change actually worked
@@ -3096,7 +3097,7 @@ def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now:
     passed down rather than re-read from `dispatches` here, which would be a
     second source of truth for the same string) is written into every
     member's `note` under SPLIT_VERDICT_NOTE_PREFIX. This is the actual fix
-    for STATE.md §43: the split verdict used to survive only in
+    for docs/history/state-log.md §43: the split verdict used to survive only in
     `dispatches.verdict_json`, which nothing reads — now it survives on the
     row itself, in the one state silence can never touch.
 
@@ -3489,7 +3490,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 # Everything below is downstream of a STATE_VERDICT item whose folded
 # investigate verdict already said nextAction=implement at confidence=high.
 # Every step calls straight into the `clients`/`lifecycle` packages now (no
-# subprocess, no hermes-cc.sh — that script is retired, see STATE.md's Wave
+# subprocess, no hermes-cc.sh — that script is retired, see docs/history/state-log.md's Wave
 # 5 entries) and re-derives what it needs from the ledger every run, same as
 # the rest of this file. No LLM call happens IN THIS FILE at any of these
 # steps either — the dispatched episodes run one each, which is inherent to
@@ -3531,12 +3532,12 @@ def complete_operation(conn: sqlite3.Connection, op_id: str, *, outcome: str,
 
 
 # Same shape as the retired bash CLI's own `url_re` inside cmd_merge — reused
-# rather than reinvented, per STATE.md §46's explicit instruction not to
+# rather than reinvented, per docs/history/state-log.md §46's explicit instruction not to
 # write a second parser for the same URL.
 _PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)$")
 
 # A full git commit sha, lowercase hex, exactly 40 chars — what hermes-cc.sh's
-# own `merge_sha` and `gh`'s `mergeCommit.oid` both produce (STATE.md §47's
+# own `merge_sha` and `gh`'s `mergeCommit.oid` both produce (docs/history/state-log.md §47's
 # jkrumm/argo#16 verification). Used by the deployOnMerge branches below (item
 # 1b) to refuse a probe with nothing real to compare against, rather than
 # entering `liveness_pending` on a short/garbled/empty value that could never
@@ -3568,7 +3569,7 @@ def _run_gh_pr_view(owner: str, repo: str, pr: int) -> dict[str, Any] | None:
 
     `mergeCommit` in `gh`'s own JSON output is a nested `{"oid": "<sha>"}`
     object, not a plain string (verified directly against this host's `gh
-    2.100.0` on a real merged PR, jkrumm/vps#8 — STATE.md §46's own example);
+    2.100.0` on a real merged PR, jkrumm/vps#8 — docs/history/state-log.md §46's own example);
     the caller unwraps it, this function returns the raw object verbatim."""
     argv = [str(GH_BIN), "pr", "view", str(pr), "--repo", f"{owner}/{repo}",
             "--json", "state,mergedAt,mergeCommit"]
@@ -3590,7 +3591,7 @@ def _run_gh_pr_view(owner: str, repo: str, pr: int) -> dict[str, Any] | None:
 
 def _run_gh_run_list(owner: str, repo: str, sha: str) -> list[dict[str, Any]] | None:
     """`gh run list --repo <owner>/<repo> --commit <sha> --json databaseId,name,status,conclusion,createdAt`
-    — read-only, used only by the deployOnMerge path (item 1b, STATE.md §47)
+    — read-only, used only by the deployOnMerge path (item 1b, docs/history/state-log.md §47)
     to attach the GitHub Actions run as the merge's deploy RECEIPT. This is
     the thing DESIGN.md § Crash recovery asks for and the ssh deploy path
     structurally cannot provide: `ssh <host> make <target>` returns only an
@@ -3836,7 +3837,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # GitHub says MERGED, leaves the item sitting in `validating` — whose
         # STATE_DEADLINES rule expires it to `merge_blocked` after 1h. The
         # operations table would correctly read "merged, here is the sha"
-        # while the item read "blocked", which is STATE.md §46's
+        # while the item read "blocked", which is docs/history/state-log.md §46's
         # merged-but-recorded-as-failure bug wearing a different hat.
         #
         # `deploy`, resolved `done`: only worth an item transition when the
@@ -3929,7 +3930,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         elif repo_entry.get("autoDeploy"):
             # Merged, and the deploy rode along inside the same lost
             # subprocess. `ssh <host> make <target>` leaves no remote handle
-            # to ask (STATE.md §46), so whether production changed is
+            # to ask (docs/history/state-log.md §46), so whether production changed is
             # genuinely unknown — and `merged` would quietly expire to
             # `closed`, claiming a clean landing nobody verified.
             _set_state(conn, row["event_id"], STATE_NEEDS_HUMAN, now,
@@ -4297,7 +4298,7 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
     row but before the item's own state write (WARDEN_KILL_AT=
     after-merge-before-state). Calling merge again would refuse with "already
     merged" and land the item `merge_blocked` for a pull request that is
-    merged and deploying — the exact misreport STATE.md §46 measured. So the
+    merged and deploying — the exact misreport docs/history/state-log.md §46 measured. So the
     post-merge state is derived from the merge operation's receipt instead,
     the same way the confirmed-merge branch derives it from a fresh result."""
     op = conn.execute(
@@ -4658,7 +4659,7 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
     _dissolve_cluster()) — the one unactioned obligation this sweeper can
     expire. Overwriting it at the exact moment the row finally becomes
     visible again (split -> needs_human, which IS carded) would lose the
-    verdict a second time, on top of the loss STATE.md §43 already recorded
+    verdict a second time, on top of the loss docs/history/state-log.md §43 already recorded
     once. So THIS ONE CASE appends the expiry note to the existing one
     instead of replacing it. Deliberately NOT generalised to every state's
     prior note — the other five expiry paths' prior notes are HISTORICAL

@@ -1,14 +1,11 @@
 """Dispatch sweep — the return path that closes a dispatch without a human.
 
-Runs every 5 min as a Hermes `no_agent` cron script, invoked as `python3
-<path>` with no args. Under `no_agent`, the script's stdout would normally
-BE the delivered message (see cron/scheduler.py) — but this script already
+Runs every 300 s as the `com.jkrumm.warden-sweep` LaunchAgent. This script
 does its own per-dispatch delivery, straight over the Slack Web API
 (scripts/slack_client.py's `chat.postMessage`), into each dispatch's own
-origin thread, which is a different target per row, not the cron's single
-configured target. So production stdout is always empty; every diagnostic
-goes to stderr, and empty stdout on the cron path just means "no framework
-double-delivery," not "nothing happened."
+origin thread, which is a different target per row. So production stdout
+(routed to `warden-sweep.log`) is always empty on purpose; every diagnostic
+goes to stderr (`warden-sweep.err`).
 
 DELIVERY TRANSPORT. This used to shell out to `hermes send`, which posts
 through the gateway's Slack Socket Mode connection — the one piece of

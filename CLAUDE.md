@@ -5,7 +5,10 @@ actually is: what is done, what is in flight, what failed and why, and the exact
 next action. `DESIGN.md` is authoritative for *what warden is*; `FLOWS.md` for how
 six real scenarios run end to end; `REVIEW.md` records what four reviews rejected,
 so settled arguments stay settled. Do not re-litigate `REVIEW.md` without new
-evidence, and say so explicitly if you have some.
+evidence, and say so explicitly if you have some. `docs/history/state-log.md` is
+the verbatim build log (§§1–56 and onward, append-only); `STATE.md` itself is a
+two-page current-state summary that gets rewritten each wave, while the log is
+only ever appended to.
 
 `DESIGN.md` § *What must not be lost* is nine details that read like accidents and
 are not. Check against it before every merge.
@@ -158,5 +161,6 @@ reaching a brief produces words, and words cannot mint a signature.
 ## Git
 
 Direct-to-master. `/commit` per logical concern, no attribution footers.
-Update `STATE.md` in the same commit as the work it describes — it is the memory,
-and the next session is a stranger.
+Append a § to `docs/history/state-log.md` and rewrite `STATE.md` in the same
+commit as the work it describes — it is the memory, and the next session is a
+stranger.

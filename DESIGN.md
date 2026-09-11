@@ -449,7 +449,7 @@ has no CI and self-documents "CI-less for now," so it belongs with
 `vps/observability/`, `homelab` and `homelab-private` in the group that needs a
 deploy key.
 
-**As of item 1b (STATE.md §47/§48), "merge is deploy" has a mechanism, not just
+**As of item 1b (docs/history/state-log.md §47/§48), "merge is deploy" has a mechanism, not just
 a claim.** Reconnaissance (§47) found no code path into it at all — a merge in a
 repo with no `deploy` key landed in `merged` and expired to `closed` after 1h,
 never `liveness_pending`, never a probe, never `fixed`. A `deployOnMerge: true`
@@ -526,7 +526,7 @@ read-only, in their own worktree, and `dispatch-sweep.py`'s existing
 
 - An **operation id** is recorded (and durably committed) BEFORE the external
   call — `hermes-cc.sh dispatch --tier implement`, or `merge --confirm` — that
-  it covers. STATE.md §46 Correction 1 is why this lives in its own table
+  it covers. docs/history/state-log.md §46 Correction 1 is why this lives in its own table
   rather than on `dispatch_approvals`: the unattended door (`--auto-from-item`)
   structurally never produces an approval row, so attribution has to hang off
   something both doors write.
