@@ -9,8 +9,9 @@ the moment they exist: a funnel-snapshot list of every non-terminal item, and th
 full detail behind any one item — dispatches, verdicts, operations, approvals,
 transition history.
 
-BIND AND AUTH. `127.0.0.1:7734` (7734 is the next free port in dotfiles'
-Caddyfile registry), loopback only, no bearer token. Per DESIGN.md § Security
+BIND AND AUTH. `127.0.0.1:7735` (reserved by comment in dotfiles' Caddyfile
+registry; it sat on 7734 until 2026-09-11, where sy-serendipity's `kill-port
+7734` dev script would have killed it), loopback only, no bearer token. Per DESIGN.md § Security
 model, an episode on this host runs unrestricted `Bash` under
 `--dangerously-skip-permissions` — a bearer token would be theatre, not a
 boundary, because anything that can read a token file can also just query this
@@ -82,7 +83,7 @@ _ledger = importlib.util.module_from_spec(_ledger_spec)
 _ledger_spec.loader.exec_module(_ledger)
 
 BIND_HOST = "127.0.0.1"
-BIND_PORT = 7734
+BIND_PORT = 7735
 
 # --- Funnel window + disposition vocabulary -----------------------------------
 
@@ -105,7 +106,7 @@ WINDOW_DAYS = 7
 # diagram itself (DESIGN.md § Lifecycle) is a smaller risk than pulling in the
 # whole 3400-line act-loop module just to read its constants.
 DISPOSITION_STATES = (
-    "implementing", "validating", "merge_blocked", "merged", "liveness_pending",
+    "implementing", "remediating", "validating", "merge_blocked", "merged", "liveness_pending",
     "pr_open", "fixed", "closed", "needs_human", "dismissed",
 )
 

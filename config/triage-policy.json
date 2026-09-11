@@ -159,6 +159,33 @@
     "past the canary is a separate operator decision — do not add paths here to \"complete\"",
     "this entry.",
     "",
+    "`hostVerbs` (list) is the FIFTH closed allowlist's own rule set — the owner's 2026-09-11",
+    "decision that warden may run an idempotent host-level restart itself, rather than card",
+    "`needs_human` for a fix it is already confident in (STATE.md, docs/history/state-log.md §59). Same",
+    "match-target/first-match-wins shape as `rules` above: each entry is",
+    "`{\"match\": \"<glob>\", \"verb\": \"<key>\"}`, and `verb` names a KEY from",
+    "HOST_VERB_ALLOWLIST in scripts/triage.py, never an argv — an unknown key drops the whole",
+    "rule at load, loudly, same as `rules`'/`evidence`'s own unknown-key handling.",
+    "maybe_auto_remediate() ALSO requires the item's own folded investigate verdict to RANK AT",
+    "OR ABOVE `hostVerbMinConfidence` (default \"medium\" — validated at load to one of",
+    "high/medium/low, anything else falls back to \"medium\" with a stderr line) before it will",
+    "ever run one of these — a `hostVerbs` match alone is not enough. `high` is deliberately NOT",
+    "the floor here (unlike auto-implement's own confidence gate): a restart from",
+    "HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE liveness probe before the item is",
+    "ever marked done, and capped at `hostVerbMaxAttempts` — so a wrong guess costs one restart",
+    "and a `needs_human` card carrying the receipt, which is cheaper than a human running that",
+    "exact same restart by hand. `hostVerbCooldownHours` (default 6) and `hostVerbMaxAttempts`",
+    "(default 2) bound repeats against the SAME item, mirroring `cooldownHours` above but against",
+    "the `operations` ledger instead of `dispatches`. Seeded with the three signatures behind the",
+    "recurring hermes-agent gateway restart (uk:175 `Hermes Agent`, uk:185 `Hermes Watchdog -",
+    "Push`, and the hermes_log `session-is-closed` reconnect signal) mapped to",
+    "`restart-hermes-gateway`. uk:193 (`Research Gateway - HTTP`) was deliberately NOT seeded:",
+    "hermes-ops.sh's `restart <host> <container>` needs the container's LIVE name, and",
+    "apps/research-gateway/compose.yml pins neither a `container_name:` nor a project `name:`,",
+    "so the actual name on vps could not be confirmed from the repo alone — guessing one into",
+    "this allowlist is exactly the kind of policy-file expression this mechanism exists to",
+    "prevent. Add the entry once `hermes-ops.sh containers vps --json` confirms the name.",
+    "",
     "`proposeMappingsAgeDays` (default 7) gates scripts/triage.py's propose_mappings() —",
     "the ONE LLM call anywhere in that file, and the only mechanism that ever grows THIS",
     "file automatically. Once every 24h it batches every signature that has sat unmapped",
@@ -177,6 +204,9 @@
   "cooldownHours": 6,
   "quietResolveHours": 2,
   "proposeMappingsAgeDays": 7,
+  "hostVerbCooldownHours": 6,
+  "hostVerbMaxAttempts": 2,
+  "hostVerbMinConfidence": "medium",
   "ignoreUnstructuredSlackProse": true,
   "repos": {
     "vps": {
@@ -191,8 +221,17 @@
       "autoMergePaths": ["docs/DEPLOY-VERIFICATION.md"],
       "deployOnMerge": true,
       "liveness": "argo-commit-live"
+    },
+    "hermes-agent": {
+      "_note": "No autoMergePaths — hermes-agent stays NOT auto-mergeable (FLOWS.md flow 5). `liveness` is here only so a host-verb restart (maybe_auto_remediate(), STATE_LIVENESS_PENDING) has a repo-scoped key to read; it is never reached via the merge/deploy chain because this repo never gets that far.",
+      "liveness": "kuma-push-fresh"
     }
   },
+  "hostVerbs": [
+    {"match": "uk:hermes-agent", "verb": "restart-hermes-gateway"},
+    {"match": "uk:hermes-watchdog-push", "verb": "restart-hermes-gateway"},
+    {"match": "hermes_log:*session-is-closed*", "verb": "restart-hermes-gateway"}
+  ],
   "rules": [
     {"match": "docker_*:unhealthy:garmin-*", "repo": "homelab"},
     {"match": "docker_*:restart:garmin-*", "repo": "homelab"},

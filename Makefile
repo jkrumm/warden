@@ -185,7 +185,7 @@ status:
 	@# other agent here), but "loaded" is not "answering." This is the one check
 	@# that actually asks the process something, over the loopback bind itself.
 	@printf '  %-24s ' "api (/health)"; \
-	if out=$$(curl -fsS --max-time 2 http://127.0.0.1:7734/health 2>/dev/null); then \
+	if out=$$(curl -fsS --max-time 2 http://127.0.0.1:7735/health 2>/dev/null); then \
 		if echo "$$out" | grep -q '"ok": true'; then \
 			echo "✓ reachable, ok"; \
 		else \

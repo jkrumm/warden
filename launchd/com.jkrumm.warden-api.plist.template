@@ -16,7 +16,7 @@
        `KeepAlive` is `true` (relaunch on any exit, clean or not) and there is
        deliberately NO `StartInterval` — launchd would spawn a SECOND server on
        top of the first one still running, and both would try to bind
-       127.0.0.1:7734.
+       127.0.0.1:7735.
 
        `ThrottleInterval` (10s) is what stops a crash loop from spinning: if the
        process dies immediately after every relaunch (a stuck bind, a missing
@@ -26,7 +26,7 @@
        relaunches by design; only a `KeepAlive` job with no interval of its own
        can crash-loop at all.
 
-       Binds 127.0.0.1:7734 only — see scripts/api.py's own docstring for why a
+       Binds 127.0.0.1:7735 only — see scripts/api.py's own docstring for why a
        bearer token would be theatre on a host where an episode already runs
        unrestricted Bash, and why no Caddy/tailnet door is added in this wave
        (that is Wave 4, alongside Argo, the only intended remote consumer). -->

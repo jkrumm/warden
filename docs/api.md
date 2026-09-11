@@ -6,7 +6,7 @@ reference for the endpoints and the six funnel numbers' exact definitions.
 
 ## Bind and auth
 
-`127.0.0.1:7734`, loopback only, no bearer token. Per DESIGN.md § Security model,
+`127.0.0.1:7735`, loopback only, no bearer token. Per DESIGN.md § Security model,
 an episode on this host runs unrestricted `Bash` under
 `--dangerously-skip-permissions` — a bearer token would be theatre, not a
 boundary, since anything that can read a token file can query this socket
@@ -142,7 +142,7 @@ raising. `terminal_24h` counts items whose state is terminal (`ledger.
 TERMINAL_STATES`) and `updated_at` is within the last 24 hours.
 
 ```bash
-curl -s http://127.0.0.1:7734/board | jq .
+curl -s http://127.0.0.1:7735/board | jq .
 ```
 
 ### `GET /items/<event_id>`
@@ -200,7 +200,7 @@ schema 7) — so `approvals` is derived from that, keyed by SQLite's own
 either — see this file's own secrets note above.
 
 ```bash
-curl -s http://127.0.0.1:7734/items/42 | jq .
+curl -s http://127.0.0.1:7735/items/42 | jq .
 ```
 
 **`item_transitions` is history after the first state, not from creation.**

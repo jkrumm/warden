@@ -6520,3 +6520,84 @@ Owner: mark argo PR #19 ready and merge it; act on or dismiss the 6
 `needs_human` cards. Loop: build the 1-day `needs_human` reminder; tag
 sideclaw sessions with `USAGE_LANE` so cost per item is a query, not a join
 done by hand. Wave 9 remains the field review, after the reminder exists.
+
+## 59. Autonomy — host verbs, the board goes live, judgment work off Max (2026-09-11, 11:00Z → 13:00Z)
+
+The owner, after §58: "if warden is confident in a fix it must do it, even a
+host-level action like restarting a process. `needs_human` for a restart is
+friction. Explanations belong on Argo, not in Slack prose. GLM 5.3 flash,
+not Sonnet over Max, usually always."
+
+### The fifth closed allowlist
+
+`HOST_VERB_ALLOWLIST` in `scripts/triage.py`: code owns the argv, the policy's
+`hostVerbs` list may only name a key (an unknown key is dropped at load,
+loudly). Seeded with one verb, `restart-hermes-gateway`
+(`launchctl kickstart -k gui/$UID/ai.hermes.gateway`). `restart-research-gateway`
+was not seeded: rollhook numbers the container
+(`research-gateway-research-gateway-15`), so no static argv names it.
+
+`maybe_auto_remediate()` runs between `run_verbs()` and
+`maybe_auto_implement()`. Gates, in order: a folded investigate verdict exists;
+no open `kind=host` operation; `hostVerbs` match; confidence at or above
+`hostVerbMinConfidence` (default `medium` — a restart is idempotent,
+liveness-verified and capped, so a wrong guess costs one restart and a card
+with the receipt); per-verb cooldown (`hostVerbCooldownHours`, 6) and attempt
+cap (`hostVerbMaxAttempts`, 2) keyed on `operations.note = "verb=<key>"`
+across every item. Items sharing a verb are claimed together with the CAS
+into `STATE_REMEDIATING` (1h crash backstop → `needs_human`), the verb runs
+once, one `operations` row carries every discharged `event_id`, and all of
+them move to `liveness_pending`, verified by the new positive probe
+`kuma-push-fresh` (a Kuma push after the operation's `started_at`). Dry-run
+prints `[dry-run] would run host verb …` and runs nothing.
+
+### What happened live
+
+The loop runs the working tree. At 11:36Z, with the medium floor in place and
+the cooldown still per item, one pass kickstarted the gateway three times in
+a row (items 2, 261, 815). The gateway came back with Slack connected at
+11:37:33Z; all three items sit in `liveness_pending`. The per-verb grouping
+landed in the same hour and is what §59 ships. That was warden's first
+autonomous host fix, and the 362-occurrence reconnect signal is the item it
+discharged.
+
+### Surfaces
+
+- argo PR #19 was a draft, so it never merged. Marked ready, rebase-merged
+  as 62d9633, deployed 11:00Z; the first `argo push — ok (75182 bytes, 13
+  items)` landed at 11:06Z. The board renders each item's note inline.
+- Hermes's project-narratives cron (`9909f808fe17`) now delivers to
+  `#hermes`; `#agents` carries only warden cards. Everything there still posts
+  under the one "Hermes" bot identity, since warden uses Hermes's token.
+- `warden-api` moved from 7734 to 7735: sy-serendipity's dev script runs
+  `kill-port 7734`, and `localhost:7734` already answered that site over
+  `[::1]`. 7735 is reserved by comment in dotfiles' Caddyfile; hermes-agent's
+  skills, dotfiles' docs and the brain wiki follow.
+- sideclaw: `SIDECLAW_MODEL_REVIEW` and `SIDECLAW_MODEL_DISPATCH` set to
+  `glm-5.3-flash`, backend `iu` implied; no Max fallback remains on those
+  two routes.
+
+### Numbers
+
+| | |
+|-|-|
+| `tests/test_triage.py` | 231/231 (§58: 213) |
+| Host verbs in the allowlist | 1 |
+| `hostVerbs` rules | 3 (uk:175, uk:185, the hermes_log reconnect signal) |
+| Items discharged by the first run | 3 |
+| Remaining `needs_human` | 4 (uk:204, uk:220, uk:229, uk:193) plus the two hermes_log rows at 260 with no verdict of their own |
+
+### Decisions
+
+- A closed-allowlist, idempotent, liveness-verified restart is not
+  human-essential case 2. DESIGN.md carries the carve-out; FLOWS.md flow 5 is
+  rewritten; "four closed allowlists" is five everywhere.
+- The confidence floor for host verbs is a policy value, default `medium`.
+- Judgment work (review, dispatch) runs on GLM over IU. Review quality is to
+  be measured, not assumed.
+
+### Next action
+
+Watch items 2, 261 and 815 reach `fixed` on the next Kuma push. Then: a
+sideclaw host verb for uk:204 guarded by no dispatch in flight; the 1-day
+`needs_human` reminder; `USAGE_LANE` tagging in sideclaw. Wave 9 after that.

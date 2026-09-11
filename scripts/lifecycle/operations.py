@@ -5,7 +5,7 @@ commit is the whole contract: a crash inside the call leaves a row with
 `outcome IS NULL` that `reconcile_operations()` (triage.py) resolves on the
 next pass, before anything could retry.
 
-Three kinds, each one external mutation:
+Four kinds, each one external mutation:
 
   implement  — a sideclaw implement episode (branch + draft PR)
   merge      — ready-for-review + PUT /merge + branch delete
@@ -14,6 +14,13 @@ Three kinds, each one external mutation:
                branch triggers (`deployOnMerge`). Its own write-point since
                Wave 5 — docs/history/state-log.md §48's "one operation, not two" limitation
                existed only because of the subprocess boundary.
+  host       — an idempotent HOST_VERB_ALLOWLIST argv (triage.py's
+               maybe_auto_remediate(), STATE.md's 2026-09-11 owner decision) —
+               a process restart run BY warden itself, on the same
+               crash-recovery contract as the other three: recorded before
+               the subprocess runs, resolved after it returns. Has no remote
+               receipt to reconcile from (see reconcile_operations()'s own
+               `host` branch) — a crashed run always resolves `unknown`.
 
 `investigate` and validation episodes deliberately get none: they run
 read-only in their own worktree and dispatch-sweep.py already covers a
@@ -25,7 +32,7 @@ import datetime as dt
 import sqlite3
 import uuid
 
-KINDS = ("implement", "merge", "deploy")
+KINDS = ("implement", "merge", "deploy", "host")
 OUTCOMES = ("done", "failed", "unknown")
 
 

@@ -36,7 +36,7 @@ against a ledger that had stopped receiving signals.
 
 `warden-api` is the odd shape: a long-running server, not a periodic job — see
 its own plist template for why that changes `KeepAlive`/`StartInterval` and adds
-a `ThrottleInterval`. It binds `127.0.0.1:7734` only, loopback and no auth — see
+a `ThrottleInterval`. It binds `127.0.0.1:7735` only, loopback and no auth — see
 `docs/api.md` for the endpoints, the six funnel numbers' exact definitions, the
 honesty rules (`null` + reason, never a fabricated `0`), and what is deliberately
 not built yet.
@@ -83,7 +83,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **213/213**. Any other number is a
+`tests/test_triage.py` is the regression gate at **231/231**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -142,8 +142,9 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 - **The dry-run contract**: never touches Slack, never shells out, everything else
   real. With no staging environment it is the only pre-production surface there is.
 - **A policy file may name and parameterise, never express.** Config carries
-  validated values; code owns the argv array. The four closed allowlists are one
-  principle in four instances.
+  validated values; code owns the argv array. The five closed allowlists are one
+  principle in five instances (a fifth, `HOST_VERB_ALLOWLIST`, added 2026-09-11
+  for the owner's host-restart decision — DESIGN.md § The host-verb carve-out).
 - **Deferral must be visible.** A budget hit that only reaches a `.err` file is
   indistinguishable from a broken loop.
 

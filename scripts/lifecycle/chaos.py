@@ -31,6 +31,7 @@ POINTS = (
     "after-deploy-op",
     "after-merge-before-state",
     "before-fixed",
+    "before-host-verb",
 )
 
 

@@ -160,8 +160,19 @@ live app.
 **Argo** — full function. It is on the VPS. **This is the flow that justifies
 Argo existing.**
 
-**Decision needed: yes, case 2** — reviving a wedged gateway needs a human at a
-machine.
+**Decision needed: case 2, UNLESS it is a plain wedge.** The worked example
+above — a corrupted patch in `chat_completions.py` — is a genuine code fix
+(case 3: two plausible root causes, materially different fixes) and still
+needs a human. But `uk:175`/`uk:185` (the Socket Mode session stuck on a
+closed `aiohttp.ClientSession`, no code involved) is the DESIGN.md § The
+host-verb carve-out case: once an investigate episode reads it at
+`confidence: high`, warden runs the restart itself, through
+`HOST_VERB_ALLOWLIST`'s closed, idempotent `restart-hermes-gateway` verb, and
+confirms it live before ever marking the item done — no card, no wait.
+**Case 2 stands whenever that chain cannot resolve it**: a lower-confidence
+verdict, an unmapped signature, a restart that exits non-zero, or a restart
+that runs but never gets a confirmed liveness push all land right back on
+`needs_human`, and warden fails closed exactly as below.
 
 **Corrected 2026-09-09 (Wave 1).** This paragraph used to say *"You approve in
 Argo, or at a TTY."* Both halves were false. Argo **records intents and cannot
@@ -173,10 +184,14 @@ refuses `op://Private/*` unconditionally, and the mini's cache resolves headless
 — an episode reads whatever an operator stores). See DESIGN.md § The decision
 primitive for the full withdrawal.
 
-**What you actually do:** restart the gateway —
-`launchctl kickstart -k gui/$UID/ai.hermes.gateway`, ~8s measured, the plugin
-republishes its public key on boot — then approve in Slack as normal. You are
-already at a machine in this flow; that is what "case 2" means.
+**What you actually do, when it lands on `needs_human` anyway:** restart the
+gateway — `launchctl kickstart -k gui/$UID/ai.hermes.gateway`, ~8s measured,
+the plugin republishes its public key on boot — then approve in Slack as
+normal. You are already at a machine in this flow; that is what "case 2"
+means. This is the SAME command `HOST_VERB_ALLOWLIST["restart-hermes-gateway"]`
+runs unattended for the plain-wedge sub-case above — a human only ever runs
+it by hand now when warden's own attempt already failed, or the item never
+reached `confidence: high` in the first place.
 
 **Friction, named honestly:** if the gateway cannot be restarted at all, no
 approval can be minted and **warden fails closed** — it keeps triaging and

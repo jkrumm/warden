@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-11 (§58) |
-| Current wave | Estate chain Wave 8 done (§57); first field look §58. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
+| Last updated | 2026-09-11 (§59) |
+| Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 8 |
-| Tests | `tests/test_triage.py` 213/213 is the gate; `make test` runs all suites |
+| Tests | `tests/test_triage.py` 231/231 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -26,7 +26,7 @@ loop.
 | `com.jkrumm.warden-poll` | ingest | 1800s |
 | `com.jkrumm.warden-sweep` | `scripts/dispatch-sweep.py` | 300s |
 | `com.jkrumm.warden-backup` | `scripts/warden-backup.sh` | daily 03:10 |
-| `com.jkrumm.warden-api` | `scripts/api.py --serve` (GET /metrics, /health) | long-running, `KeepAlive` |
+| `com.jkrumm.warden-api` | `scripts/api.py --serve` (GET /metrics, /health) on `127.0.0.1:7735` | long-running, `KeepAlive` |
 
 - The `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`,
   `revert`) replaces the old bash verbs; the loop calls `scripts/lifecycle/`
@@ -42,7 +42,18 @@ loop.
   request and still runs on sideclaw's JUDGE route (no per-call knob).
 - `needs_human` / `merge_blocked` cards carry an `Action required` section:
   `Do this: <note>` plus a day-granularity auto-dismiss countdown.
-- `push_argo_snapshot()` runs as step 10 of `run()`, after every tick.
+- `push_argo_snapshot()` runs as step 10 of `run()`, after every tick; argo
+  PR #19 merged 2026-09-11 (62d9633), the first `argo push — ok` landed at
+  11:06Z, the `/warden` board is live.
+- `maybe_auto_remediate()` runs between `run_verbs()` and
+  `maybe_auto_implement()`: a `hostVerbs` policy match plus a folded verdict
+  at or above `hostVerbMinConfidence` (medium) runs one `HOST_VERB_ALLOWLIST`
+  argv per verb per pass, cooldown and attempt cap keyed per verb, receipt in
+  `operations` (`kind=host`), then `liveness_pending` verified by
+  `kuma-push-fresh`. First real run 11:36Z: `restart-hermes-gateway`, three
+  items discharged (§59).
+- sideclaw routes `review` and `dispatch` to `glm-5.3-flash` on IU
+  (`SIDECLAW_MODEL_REVIEW`/`SIDECLAW_MODEL_DISPATCH` in sideclaw's `.env`).
 - Slack delivery is a plain HTTP client (`chat.postMessage`/`chat.update`),
   never the gateway's live `slack_bolt` connection.
 - The `#agents` overview digest is retired.
@@ -52,11 +63,10 @@ loop.
 
 ## Open — owner actions
 
-- Mark argo PR #19 ready and merge it — it is a **draft**, which is why it
-  never landed; until then every tick logs `argo push — http-error:404`.
-- Six `needs_human` cards in `#agents` (hermes gateway wedged, sideclaw crash,
-  meteo probe, hermes patch corruption, research-gateway OOM) need a hand
-  action or a dismissal; the 168h clock dismisses them 2026-09-16.
+- Three `needs_human` cards remain after §59 (sideclaw crash uk:204, meteo
+  probe uk:220, hermes patch corruption uk:229, research-gateway OOM uk:193 —
+  the last has no host verb because rollhook numbers its container); the
+  168h clock dismisses them 2026-09-16.
 - Grant the loop's PAT (`op://mini/github/token`) Issues read/write — the
   `github_issue` origin cannot poll or comment under the LaunchAgent until
   then.
@@ -70,9 +80,9 @@ loop.
   `USAGE_LANE`, so usage-tracker cannot attribute its spend at all (§58).
 - The 1-day `needs_human` reminder from `docs/api.md` is not built; a card
   lands once, then silence until the 168h dismissal.
-- `#agents` carries both warden cards and Hermes's narrative digest; approval
-  buttons post to `#hermes`. Three `warden_canary` merge_blocked items still
-  sit on the board.
+- `#agents` is warden-only since 2026-09-11 (Hermes's narratives cron moved to
+  `#hermes`); approval buttons still post to `#hermes`. Three `warden_canary`
+  merge_blocked items still sit on the board.
 - No ledger restore path yet.
 
 ## History
@@ -87,12 +97,15 @@ loop.
 - Wave 7 — §56
 - Wave 8 — §57
 - First field look — §58
+- Autonomy: host verbs, Argo live, GLM routing — §59
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-Owner: merge argo PR #19, clear the six `needs_human` cards. Loop: the
-1-day `needs_human` reminder, then `USAGE_LANE` tagging in sideclaw. Wave 9,
-the field review, from `docs/handover-field-review.md` after that.
+Watch the three hermes items leave `liveness_pending` as `fixed` on the next
+Kuma push. Loop: a host verb for uk:204 (sideclaw kickstart, guarded by
+no-dispatch-in-flight), the 1-day `needs_human` reminder, `USAGE_LANE`
+tagging in sideclaw. Wave 9, the field review, from
+`docs/handover-field-review.md` after that.

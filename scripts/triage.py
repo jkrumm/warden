@@ -226,9 +226,12 @@ tracking is needed) and the card's note IS the whole verdict — the dangling
 item name plus the exact remediation, so no further investigation is needed.
 
 DRY-RUN CONTRACT. `--dry-run` never touches Slack (no chat.postMessage/
-chat.update), never shells out to hermes-cc.sh, never shells out to `gh`, and
-never pushes to Argo — those four are the only externally-visible actions
-this script can take.
+chat.update), never shells out to hermes-cc.sh, never shells out to `gh`,
+never runs a HOST_VERB_ALLOWLIST verb (maybe_auto_remediate() prints
+`[dry-run] would run host verb <key> for <signature>` and does nothing
+else — the same shape run_verbs() already uses for VERB_ALLOWLIST, applied
+to the more sensitive fifth allowlist), and never pushes to Argo — those
+five are the only externally-visible actions this script can take.
 (`gh` is the newest of them and the only READ-ONLY one: reconcile_operations()
 uses `gh pr view` to ask GitHub whether a merge it lost the answer to
 actually landed. It is still a shell-out to a remote system, so it is named
@@ -440,6 +443,18 @@ STATE_VALIDATING = "validating"          # sideclaw's own `review` job reviewing
 STATE_MERGE_BLOCKED = "merge_blocked"    # implement failed, validation blocked/errored, or merge itself refused
 STATE_MERGED = "merged"                  # landed; no deploy configured/enabled for this repo
 STATE_LIVENESS_PENDING = "liveness_pending"  # deployed; waiting on a positive liveness signal
+# The host-verb sibling of STATE_IMPLEMENTING, added 2026-09-11 for the fifth
+# closed allowlist (HOST_VERB_ALLOWLIST — see that constant's own docstring
+# for the owner decision this exists to serve). maybe_auto_remediate() claims
+# an item into this state with the SAME compare-and-set shape
+# maybe_auto_implement() uses for STATE_IMPLEMENTING, immediately before
+# running the verb, so a crash mid-verb leaves a real, reconcilable
+# `operations` row (kind='host') rather than a silently-abandoned claim. Exits
+# to STATE_LIVENESS_PENDING on a successful (rc=0) run, or straight back to
+# STATE_NEEDS_HUMAN on a non-zero exit — never re-enters `verdict`, because a
+# failed restart is not "try the same episode again", it is a human's problem
+# now (see maybe_auto_remediate()'s own docstring).
+STATE_REMEDIATING = "remediating"
 # Terminal, like `ignored` — never escalates, never gets its own card — but
 # UNLIKE `ignored`, it is NOT a recovery/known-benign match: it's a
 # `slack_alert` row that doesn't look like a structured bot alert
@@ -517,7 +532,7 @@ STATE_REVERTED = "reverted"
 # carded.
 CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR_OPEN,
                   STATE_FIXED, STATE_QUIET, STATE_CLOSED,
-                  STATE_IMPLEMENTING, STATE_VALIDATING, STATE_MERGE_BLOCKED, STATE_MERGED,
+                  STATE_IMPLEMENTING, STATE_REMEDIATING, STATE_VALIDATING, STATE_MERGE_BLOCKED, STATE_MERGED,
                   STATE_LIVENESS_PENDING, STATE_DISMISSED, STATE_REVERTED)
 
 # `triage_items.note` prefixes for the grouped-source resolve paths (see
@@ -561,6 +576,7 @@ STATE_EMOJI = {
     STATE_CLOSED: ":ballot_box_with_check:",
     STATE_SNOOZED: ":zzz:",
     STATE_IMPLEMENTING: ":hammer_and_wrench:",
+    STATE_REMEDIATING: ":gear:",
     STATE_VALIDATING: ":test_tube:",
     STATE_MERGE_BLOCKED: ":no_entry:",
     STATE_MERGED: ":rocket:",
@@ -655,6 +671,18 @@ STATE_DEADLINES: dict[str, _DeadlineRule] = {
     STATE_SPLIT: _DeadlineRule("escalate", 24, STATE_NEEDS_HUMAN, "unre-evaluated", _STATE_DEADLINE_COLUMN),
     STATE_IMPLEMENTING: _DeadlineRule("poll_implement_jobs", 2, STATE_MERGE_BLOCKED, None,
                                        _STATE_DEADLINE_COLUMN),
+    # A THIRD addition beyond DESIGN.md's own table, same shape as `verdict`/
+    # `split` above: maybe_auto_remediate() resolves this state SYNCHRONOUSLY,
+    # within the same pass that claims it (record the operation, run the
+    # verb, complete it, transition on) — so this deadline is a backstop for
+    # a crash between the claim and the completion, not the normal exit path.
+    # 1h clears HOST_VERB_TIMEOUT (90s) by a wide margin. A row that reaches
+    # this deadline live has an `operations` row with outcome IS NULL that
+    # reconcile_operations() (which runs FIRST, every pass) will have already
+    # resolved to `needs_human` — see that function's own `host` branch —
+    # long before this clock ever fires.
+    STATE_REMEDIATING: _DeadlineRule("maybe_auto_remediate", 1, STATE_NEEDS_HUMAN, None,
+                                      _STATE_DEADLINE_COLUMN),
     STATE_VALIDATING: _DeadlineRule("poll_validation_jobs", 1, STATE_MERGE_BLOCKED, None,
                                      _STATE_DEADLINE_COLUMN),
     STATE_MERGE_BLOCKED: _DeadlineRule("operator", 168, STATE_DISMISSED, "unresolved",
@@ -701,6 +729,29 @@ DEFAULT_COOLDOWN_HOURS = 6
 # fixed-and-deployed alert still closes the same day instead of sitting
 # open for a week. See resolve_quiet_grouped().
 DEFAULT_QUIET_RESOLVE_HOURS = 2.0
+
+# maybe_auto_remediate()'s own cooldown/attempt-cap defaults — same shape as
+# DEFAULT_COOLDOWN_HOURS above but against `operations`, not `dispatches`
+# (see _host_verb_cooldown_ok()): a flapping signal must not restart a live
+# process every 10 minutes, and a verb that has already failed twice against
+# THIS item is a deterministic failure, not a third try waiting to happen.
+DEFAULT_HOST_VERB_COOLDOWN_HOURS = 6.0
+DEFAULT_HOST_VERB_MAX_ATTEMPTS = 2
+
+# The owner's follow-up decision, 2026-09-11: `confidence: high` was the
+# wrong bar for THIS mechanism specifically. A restart from
+# HOST_VERB_ALLOWLIST is idempotent, followed by a positive liveness probe
+# before the item is ever marked done, and capped at `hostVerbMaxAttempts` —
+# so a wrong guess costs one restart and a `needs_human` card with the
+# receipt attached, which is cheaper than a human running the exact same
+# restart by hand. `high` stayed the right bar for auto-IMPLEMENT (a
+# multi-file code change, no positive probe, no cheap undo); it is the wrong
+# bar for a bounded, reversible, verified host verb. Ranked so a policy may
+# only ever choose a LOWER bar than `high`, never something outside this
+# vocabulary — same closed-set shape as every other policy-selectable value
+# in this file.
+_CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+DEFAULT_HOST_VERB_MIN_CONFIDENCE = "medium"
 
 # Concurrency ceiling: simultaneously-open CLUSTERS (distinct dispatch_job
 # values in state=investigating) this loop is allowed to have outstanding at
@@ -776,6 +827,81 @@ VERB_ALLOWLIST: dict[str, list[str]] = {
 # a legitimately slow-but-healthy probe before hermes-ops.sh's own timeout
 # ever got a chance to fire.
 VERB_TIMEOUT = 260
+
+# --- host verbs — the FIFTH closed allowlist ----------------------------------
+#
+# The owner's decision (2026-09-11, STATE.md, docs/history/state-log.md §59): "if warden is
+# confident in a fix it must do it, even a host-level action like restarting
+# a process. `needs_human` for a restart is friction." Every one of the
+# repeat needs_human cards this decision is about reads the SAME shape: a
+# read-only investigate episode correctly diagnoses a wedged process and
+# correctly names the restart that clears it, but cannot itself run a host
+# command (see DESIGN.md § Security model — the episode is not contained,
+# `Bash` unrestricted but a restart still needs judgement about WHICH host and
+# WHICH process, not just an open shell). This is that judgement, encoded
+# once, in code, the same shape VERB_ALLOWLIST/EVIDENCE_ALLOWLIST/
+# LIVENESS_ALLOWLIST/the deploy allowlist already use: a policy rule (see
+# `hostVerbs` in load_policy()) may SELECT a key from this dict, never
+# express an argv of its own — a launchd label or a container/host name
+# reaching config would be DESIGN.md's own C2 in a different costume (see
+# HOST_VERB_ALLOWLIST's own docstring... this comment).
+#
+# Seeded with exactly ONE verb. `restart-research-gateway` was drafted
+# against hermes-ops.sh's own `cmd_restart <host> <container> --why --confirm`
+# (a `docker restart <container>` over ssh, container name validated live
+# against `containers_for()` — see that function's own comment) for the
+# uk:193 "Research Gateway - HTTP" needs_human item, but the ACTUAL container
+# name on vps could not be pinned from the repo alone: apps/research-gateway/
+# compose.yml declares no `container_name:` and no top-level `name:`, and the
+# vps Makefile's `research-gateway-up` target runs `docker compose -f
+# apps/research-gateway/compose.yml … up -d` with no `-p` — Compose's default
+# project name in that shape is the COMPOSE FILE'S OWN DIRECTORY basename
+# ("research-gateway"), which makes the live container name either
+# "research-gateway" or "research-gateway-research-gateway-1" depending on a
+# convention this repo cannot observe without an ssh session. Guessing wrong
+# into a closed, security-relevant allowlist is exactly the kind of
+# expression this section exists to prevent, so the entry is dropped rather
+# than shipped unverified — uk:193 stays on `needs_human` untouched by this
+# slice; add the entry once the container name is confirmed live (`hermes-ops.sh
+# containers vps --json`).
+HOST_VERB_ALLOWLIST: dict[str, list[str]] = {
+    "restart-hermes-gateway": ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/ai.hermes.gateway"],
+}
+HOST_VERB_TIMEOUT = 90
+
+# The push-heartbeat UptimeKuma monitor whose Slack line PROVES a given host
+# verb's target actually came back — lives in CODE, not policy, same
+# reasoning as _gather_argo_commit_live()'s own ARGO_HEALTH_URL: a policy
+# edit must never be able to choose what a positive liveness probe is
+# confirming. Keyed by VERB, not by the triggering item's own signature —
+# uk:175, uk:185 and the hermes_log `session-is-closed` reconnect signal all
+# map to the SAME restart, so they share the SAME liveness check regardless
+# of which one fired first (see _gather_kuma_push_fresh()'s own docstring for
+# why deriving this from the item's signature instead would be the wrong
+# shape here).
+HOST_VERB_LIVENESS_MONITOR: dict[str, str] = {
+    "restart-hermes-gateway": "Hermes Agent - Push",
+}
+
+# Enforced at IMPORT time, not left as a maybe_auto_remediate()-time gap: a
+# HOST_VERB_ALLOWLIST key with no matching HOST_VERB_LIVENESS_MONITOR entry
+# would still run — the verb executes fine — but its item would get
+# `deploy_expect_json="[]"` on success (see maybe_auto_remediate()'s own
+# `monitor_title` branch), and _gather_kuma_push_fresh() unconditionally
+# refuses an empty `expected`, so the item would cycle liveness_pending ->
+# new on every liveness_deadline, forever, never confirmed and never
+# reaching a human either — exactly the silently-stuck-item failure
+# DESIGN.md's own deadline table exists to close, just one level removed
+# from what that table actually checks. A missing pairing is a bug in THIS
+# FILE, not a policy mistake, so it fails the whole module import rather
+# than waiting to be discovered live.
+_missing_liveness_monitor = sorted(set(HOST_VERB_ALLOWLIST) - set(HOST_VERB_LIVENESS_MONITOR))
+if _missing_liveness_monitor:
+    raise AssertionError(
+        f"HOST_VERB_ALLOWLIST key(s) {_missing_liveness_monitor} have no matching "
+        f"HOST_VERB_LIVENESS_MONITOR entry — every host verb needs a push monitor to confirm "
+        f"liveness against, or its items can never resolve"
+    )
 
 # --- evidence commands — declared runtime-state probes, fenced into the brief -
 #
@@ -1257,6 +1383,69 @@ def _valid_rule(r: Any) -> bool:
     return True
 
 
+def _valid_host_verb_rule(r: Any) -> bool:
+    """A `hostVerbs` rule needs `match` and a `verb` FROM HOST_VERB_ALLOWLIST
+    — same closed-key-set contract as `_valid_rule()`'s own `verb` branch,
+    split into its own function because a hostVerbs rule has no `repo`/
+    `evidence` shape to also validate, and because HOST_VERB_ALLOWLIST is a
+    genuinely different, more sensitive allowlist (a host-level restart, not
+    a read-only local probe) that deserves its own loud rejection message
+    rather than sharing VERB_ALLOWLIST's."""
+    if not (isinstance(r, dict) and r.get("match") and r.get("verb")):
+        return False
+    verb = r["verb"]
+    if verb not in HOST_VERB_ALLOWLIST:
+        print(f"triage: policy hostVerbs rule {r.get('match')!r} names verb {verb!r}, not in "
+              f"HOST_VERB_ALLOWLIST {sorted(HOST_VERB_ALLOWLIST)} — dropping this rule", file=sys.stderr)
+        return False
+    return True
+
+
+def _valid_host_verb_min_confidence(value: Any) -> str:
+    """`hostVerbMinConfidence` names a level from `_CONFIDENCE_RANK`
+    (`high`/`medium`/`low`), never a number — same closed-vocabulary
+    validate-at-load shape as `_valid_host_verb_rule()` just above. An
+    absent value defaults to DEFAULT_HOST_VERB_MIN_CONFIDENCE silently (that
+    IS the default, not a bug); an unrecognized one is a policy typo and
+    falls back the same way, but LOUDLY, so it does not read as "warden
+    quietly decided to require less confidence than the file says.\""""
+    if value is None:
+        return DEFAULT_HOST_VERB_MIN_CONFIDENCE
+    level = str(value).strip().lower()
+    if level in _CONFIDENCE_RANK:
+        return level
+    print(f"triage: policy hostVerbMinConfidence {value!r} is not one of {sorted(_CONFIDENCE_RANK)} — "
+          f"falling back to {DEFAULT_HOST_VERB_MIN_CONFIDENCE!r}", file=sys.stderr)
+    return DEFAULT_HOST_VERB_MIN_CONFIDENCE
+
+
+def _valid_host_verb_positive_number(value: Any, *, key: str, default: float, cast: type) -> float | int:
+    """Shared by `hostVerbCooldownHours`/`hostVerbMaxAttempts` at load time.
+
+    Deliberately NOT `data.get(key) or default` — that treats `0` as absent
+    (falsy-or) and falls back to the default INSTEAD OF THE CONFIGURED ZERO,
+    the same trap _valid_rule()/_valid_host_verb_min_confidence() avoid for
+    their own vocabularies by checking `is None` explicitly. A configured
+    `0` or a negative number is not "unset", it is a policy value that would
+    make the cooldown/attempt-cap gates always pass or never bind — same
+    closed-vocabulary LOUD-fallback contract as
+    _valid_host_verb_min_confidence() just above: an absent value defaults
+    silently (that IS the default), anything present but non-numeric or
+    `<= 0` is a policy mistake and falls back the same way, but with a
+    stderr line naming what was rejected."""
+    if value is None:
+        return default
+    try:
+        parsed = cast(value)
+    except (TypeError, ValueError):
+        print(f"triage: policy {key} {value!r} is not a number — falling back to {default!r}", file=sys.stderr)
+        return default
+    if parsed <= 0:
+        print(f"triage: policy {key} {value!r} must be > 0 — falling back to {default!r}", file=sys.stderr)
+        return default
+    return parsed
+
+
 def load_policy() -> dict[str, Any]:
     try:
         data = json.loads(POLICY_PATH.read_text())
@@ -1271,6 +1460,19 @@ def load_policy() -> dict[str, Any]:
         "cooldownHours": int(data.get("cooldownHours") or DEFAULT_COOLDOWN_HOURS),
         "quietResolveHours": float(data.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS),
         "rules": [r for r in (data.get("rules") or []) if _valid_rule(r)],
+        # The fifth closed allowlist's own rule set (HOST_VERB_ALLOWLIST) —
+        # same match-target/first-match-wins shape as `rules` above (see
+        # maybe_auto_remediate()), validated the same way at load time, never
+        # at use time, so a typo'd verb key is a loud stderr line here
+        # instead of a rule that silently never fires.
+        "hostVerbs": [r for r in (data.get("hostVerbs") or []) if _valid_host_verb_rule(r)],
+        "hostVerbCooldownHours": _valid_host_verb_positive_number(
+            data.get("hostVerbCooldownHours"), key="hostVerbCooldownHours",
+            default=DEFAULT_HOST_VERB_COOLDOWN_HOURS, cast=float),
+        "hostVerbMaxAttempts": _valid_host_verb_positive_number(
+            data.get("hostVerbMaxAttempts"), key="hostVerbMaxAttempts",
+            default=DEFAULT_HOST_VERB_MAX_ATTEMPTS, cast=int),
+        "hostVerbMinConfidence": _valid_host_verb_min_confidence(data.get("hostVerbMinConfidence")),
         # `ignore` entries are usually a bare pattern string (hand-authored).
         # propose_mappings() instead appends a stamped object
         # ({"match", "proposedAt", "proposedBy", "reason"}) so an auto-added
@@ -2398,6 +2600,82 @@ def _gather_kuma_push_last(event_rows: list[sqlite3.Row]) -> str:
     return matches[-1][1]
 
 
+def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
+    """LIVENESS_ALLOWLIST gatherer for a host-verb remediation (see
+    HOST_VERB_ALLOWLIST/maybe_auto_remediate()): true only if the declared
+    push-heartbeat UptimeKuma monitor posted a `[<title>] ...` line to
+    #alerts AFTER the restart operation's own timestamp. Reuses
+    _gather_kuma_push_last()'s proven Slack-fetch path (same #alerts channel,
+    same HOMELAB_API_KEY) rather than a second HTTP mechanism, but — unlike
+    that EVIDENCE_ALLOWLIST gatherer, which returns raw text for a human to
+    read — this is a LIVENESS_ALLOWLIST gatherer, so it returns a genuine
+    (ok, detail) POSITIVE/NEGATIVE pair, same shape as
+    _gather_hyperdx_alert_state()/_gather_argo_commit_live() above.
+
+    `expected` is the same list-of-dicts shape every other LIVENESS_ALLOWLIST
+    gatherer reads off `deploy_expect_json` — here written by
+    maybe_auto_remediate() as `[{"monitorTitle": <str>, "since": <iso>}]` at
+    the moment the item entered `liveness_pending`, never the alert/commit
+    shape the other two gatherers use. Deliberately keyed by VERB
+    (HOST_VERB_LIVENESS_MONITOR), not by the triggering item's own
+    signature — uk:175 (`Hermes Agent`), uk:185 (`Hermes Watchdog - Push`)
+    and the hermes_log `session-is-closed` reconnect signal all resolve to
+    the SAME restart-hermes-gateway verb and must therefore all confirm
+    against the SAME push monitor, regardless of which one happened to fire
+    first. A restart whose triggering item was never a `uk:` monitor at all
+    (a hermes_log-origin remediation) still gets a real monitor title this
+    way — there is no "not a uk: monitor, fall back to silence" case in this
+    design, which is a deliberate simplification from a signature-derived
+    title: this loop is checking whether the RESTARTED PROCESS is alive
+    again, not re-confirming whichever signal happened to trigger it."""
+    if not expected:
+        return False, "no expected monitor was captured when this item entered liveness_pending"
+    monitor_title = expected[0].get("monitorTitle")
+    since = expected[0].get("since")
+    if not monitor_title or not since:
+        return False, "expected liveness record carried no monitor title/since timestamp"
+    wp = _wp_module()
+    if wp is None:
+        return False, "watchdog-poll.py sibling module did not load — cannot fetch #alerts"
+    token = wp.resolve_secret("HOMELAB_API_KEY")
+    if not token:
+        return False, "HOMELAB_API_KEY unresolved — cannot fetch #alerts history"
+    since_parsed = _parse_ts(since)
+    if since_parsed is None:
+        # Fail CLOSED, not open: an unparsable `since` must never read as
+        # "no lower bound, any push confirms it" — that would let a
+        # corrupted or malformed deploy_expect_json record confirm liveness
+        # off a push that has nothing to do with THIS restart.
+        return False, f"unparsable since timestamp {since!r} — cannot confirm liveness against it"
+    monitor_key = normalize_title(monitor_title)
+    msgs, _latest, ok = wp.poll_slack_messages({"HOMELAB_API_KEY": token}, ALERTS_CHANNEL, None,
+                                                skip_uk_push=False)
+    if not ok:
+        return False, "#alerts fetch failed (see watchdog-poll.py's own poll_slack_messages)"
+    for m in msgs:
+        text = (m.get("payload") or {}).get("text") or m.get("title") or ""
+        bm = _BRACKET_PREFIX_RE.match(text.strip())
+        if not (bm and normalize_title(bm.group(1)) == monitor_key):
+            continue
+        try:
+            msg_dt = dt.datetime.fromtimestamp(float(m.get("external_id") or "0"), tz=dt.timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if msg_dt > since_parsed:
+            return True, f"push observed at {_fmt_ts(msg_dt.isoformat())}: {text[:200]}"
+    return False, (f"no `[{monitor_title}] ...` push observed after {_fmt_ts(since)} in the last "
+                   f"{len(msgs)} #alerts messages")
+
+
+# Registered here, not in the LIVENESS_ALLOWLIST literal above, because
+# _gather_kuma_push_fresh() needs `_wp_module()`/`ALERTS_CHANNEL`/
+# `normalize_title`/`_BRACKET_PREFIX_RE`, all defined below that literal's own
+# line in the file — same "assemble the registry near the functions, not at
+# the top of the module" shape _EVIDENCE_GATHERERS uses for its own four
+# entries, applied to one key instead of a whole dict.
+LIVENESS_ALLOWLIST["kuma-push-fresh"] = _gather_kuma_push_fresh
+
+
 _EVIDENCE_GATHERERS = {
     "meteo-health": _gather_meteo_health,
     "gateway-starts": _gather_gateway_starts,
@@ -2539,6 +2817,63 @@ def _cooldown_ok(conn: sqlite3.Connection, item: sqlite3.Row, policy: dict[str, 
     if created is None:
         return True
     return (now - created).total_seconds() >= policy["cooldownHours"] * 3600
+
+
+def _host_verb_cooldown_ok(conn: sqlite3.Connection, verb_key: str, policy: dict[str, Any],
+                            now: dt.datetime) -> bool:
+    """Same shape as _cooldown_ok() above, against the `operations` ledger
+    instead of `dispatches` — but keyed by VERB, not by item. Corrected
+    2026-09-11 11:36Z: three triage items (uk:175, uk:185, the hermes_log
+    `session-is-closed` signal) all named `restart-hermes-gateway`, and a
+    per-item cooldown let all three pass it independently in the SAME pass,
+    restarting the same process three times. The process being restarted is
+    the same physical target no matter which item named it, so the cooldown
+    has to be too — no PRIOR `kind='host'` operation for THIS VERB (matched
+    on `note`, which record_operation() below is always called with as
+    `f"verb={verb_key}"`) -> always ok; otherwise wait out
+    hostVerbCooldownHours from the newest such operation's own
+    `started_at`."""
+    row = conn.execute(
+        "SELECT started_at FROM operations WHERE kind='host' AND note=? ORDER BY started_at DESC LIMIT 1",
+        (f"verb={verb_key}",),
+    ).fetchone()
+    if row is None:
+        return True
+    started = _parse_ts(row["started_at"])
+    if started is None:
+        return True
+    return (now - started).total_seconds() >= policy["hostVerbCooldownHours"] * 3600
+
+
+def _host_verb_attempts(conn: sqlite3.Connection, verb_key: str, policy: dict[str, Any],
+                         now: dt.datetime) -> list[sqlite3.Row]:
+    """Prior `kind='host'` operations for this VERB — not this item, same
+    reasoning as _host_verb_cooldown_ok() just above — bounded to the last
+    `hostVerbCooldownHours * hostVerbMaxAttempts` hours. The bound matters:
+    without it, a verb that legitimately ran twice months ago would sit at
+    the attempt cap FOREVER, permanently refusing an otherwise-eligible
+    restart long after either prior attempt could plausibly still be
+    relevant — the window is sized so the cooldown gate above always gets a
+    full `hostVerbMaxAttempts` worth of genuinely-spaced-out tries before the
+    cap can ever bind."""
+    window_hours = policy["hostVerbCooldownHours"] * policy["hostVerbMaxAttempts"]
+    since = (now - dt.timedelta(hours=window_hours)).isoformat()
+    return conn.execute(
+        "SELECT receipt_json FROM operations WHERE kind='host' AND note=? AND started_at>=? ORDER BY started_at",
+        (f"verb={verb_key}", since),
+    ).fetchall()
+
+
+def _sync_cards(conn: sqlite3.Connection, items: list[sqlite3.Row], policy: dict[str, Any]) -> None:
+    """Re-render each of `items`' own (single-row) card after a state write.
+    maybe_auto_remediate()'s group operations touch several UNRELATED
+    triage_items rows — not a cluster sharing one `dispatch_job`, which is
+    what sync_card()'s usual multi-member callers group by — so each item
+    gets its own one-row sync_card() call rather than one shared render."""
+    for item in items:
+        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
+        if fresh_item is not None and fresh_event is not None:
+            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 
 def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, brief: str,
@@ -3023,6 +3358,25 @@ def _run_verb(argv: list[str], *, timeout: int) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else {"_error": f"non-object JSON: {r.stdout[:300]}"}
 
 
+def _run_host_verb(argv: list[str], *, timeout: int) -> dict[str, Any]:
+    """Run one HOST_VERB_ALLOWLIST-resolved argv and report its raw outcome —
+    deliberately NOT `_run_verb()` above: that helper's whole contract is
+    parsing a `--json` stdout (env-check's own shape), and a host verb
+    (`launchctl kickstart`, an ssh `docker restart`) prints little or nothing
+    on a SUCCESSFUL run, which would read as `_run_verb()`'s own "non-JSON
+    output" error on every single success. Never raises — a spawn failure or
+    a timeout both fold into `exitCode=-1` with the exception text as
+    `output`, the same "never abort the run" contract every other bounded
+    call in this file keeps. Returns exactly the two fields
+    maybe_auto_remediate()'s own receipt needs; that caller adds `verb`."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"exitCode": -1, "output": str(e)}
+    output = ((r.stdout or "") + (r.stderr or "")).strip()
+    return {"exitCode": r.returncode, "output": output[:2000]}
+
+
 def _render_env_check_note(output: dict[str, Any] | None) -> str:
     """Deterministic prose for the needs_human card — no LLM, straight from
     hermes-ops.sh's own --json shape: {"ok", "homelab": {"danglingItems": [...],
@@ -3327,6 +3681,15 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
         blocks.append({
             "type": "context",
             "elements": [{"type": "mrkdwn", "text": f"Auto-implement running — job `{primary['implement_job'][:8]}`"}],
+        })
+    elif state == STATE_REMEDIATING:
+        # maybe_auto_remediate() writes the claim's own note as
+        # "restarting via <verb>" — render it verbatim rather than
+        # re-deriving the verb from `dispatch_job`, which this state does
+        # not own.
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"{_escape(primary['note'] or 'restarting')} …"}],
         })
     elif state == STATE_VALIDATING:
         text = "Independent validation running"
@@ -3878,12 +4241,48 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                         # the item read `merge_blocked` for a pull request
                         # nobody had touched. The retry is CAPPED below.
                         new_receipt["untouched"] = True
+        elif row["kind"] == "host":
+            # A host verb (`launchctl kickstart`, an ssh `docker restart`)
+            # has no remote receipt to ask for — same shape as the ssh
+            # (autoDeploy) branch above, not the Actions-run branch: a crash
+            # between the subprocess returning and complete_operation()
+            # running genuinely cannot be told apart from one that crashed
+            # BEFORE the verb ran at all. Always unknown, never guessed
+            # either way — see HOST_VERB_ALLOWLIST's own docstring for why a
+            # host verb must stay idempotent, which is what makes "run it
+            # again from `needs_human`" a safe human decision either way.
+            #
+            # The crash explanation goes in the RECEIPT, never in `note` —
+            # `_host_verb_cooldown_ok()`/`_host_verb_attempts()` filter
+            # `operations WHERE note=?` on the exact `f"verb={verb_key}"`
+            # string record_operation() stamped at claim time (see both
+            # functions' own docstrings). Overwriting it here via
+            # complete_operation()'s own `note=` COALESCE would make this
+            # row invisible to both queries FOREVER, silently bypassing the
+            # cooldown and the attempt cap for every future crash on this
+            # verb — passing `note=None` to complete_operation() below (see
+            # the call itself) is what keeps `verb=<key>` intact regardless
+            # of outcome.
+            outcome = "unknown"
+            new_receipt = {"reconciled": "crashed before completion"}
+            note = f"host verb operation {row['op_id']} crashed before recording its outcome"
         else:
             outcome = "unknown"
             note = f"reconcile_operations: unrecognized operation kind {row['kind']!r}"
 
+        # `note` above is used TWICE, for two different rows: the
+        # triage_items note written below (via _set_state(), on genuine
+        # human-facing text) and, by default, the SAME text going into
+        # `operations.note` through complete_operation()'s own `note=`
+        # COALESCE. For `kind='host'` those two must diverge — see the
+        # branch's own comment just above — so `complete_note` overrides to
+        # None (a no-op COALESCE, preserving `verb=<key>`) for that kind
+        # only; every other kind keeps writing `note` into `operations.note`
+        # exactly as it always has.
+        complete_note = None if row["kind"] == "host" else note
         complete_operation(conn, row["op_id"], outcome=outcome,
-                            receipt=json.dumps(new_receipt) if new_receipt is not None else None, note=note)
+                            receipt=json.dumps(new_receipt) if new_receipt is not None else None,
+                            note=complete_note)
         conn.execute("UPDATE operations SET reconciled_at=? WHERE op_id=?", (_now_iso(now), row["op_id"]))
         conn.commit()
 
@@ -4029,6 +4428,205 @@ def _verdict_as_context(job_id: str, verdict: dict[str, Any]) -> str:
         parts.append(f"{key}: {val if isinstance(val, str) else json.dumps(val, indent=2)}")
     text = "\n\n".join(parts)
     return text[: _dispatch.MAX_CONTEXT_CHARS]
+
+
+def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                          *, dry_run: bool) -> None:
+    """The fifth closed allowlist's own poller (STATE.md's 2026-09-11 owner
+    decision, docs/history/state-log.md §59): "if warden is confident in a fix it must do
+    it, even a host-level action like restarting a process. `needs_human` for
+    a restart is friction." Modelled line for line on maybe_auto_implement()
+    below — same claim-before-execute shape, for the same reason: recording
+    the claim only after the verb runs leaves a crash window where a second
+    pass restarts the same process a second time.
+
+    Runs BEFORE maybe_auto_implement() in run() (see that function's own
+    ordering comment) so an item this function moves on cannot also be
+    picked up by the implement chain in the same pass — the two are mutually
+    exclusive by construction: this only ever claims a row still sitting in
+    `verdict` or `needs_human`, and both branches below leave it in neither.
+
+    TWO-PHASE, keyed by VERB, not by item — corrected 2026-09-11 11:36Z: three
+    triage items (`uk:175`, `uk:185`, the hermes_log `session-is-closed`
+    signal) all mapped to `restart-hermes-gateway`, and a PER-ITEM cooldown
+    let all three pass it independently in the same pass, restarting the same
+    process three times in a row against one `operations` row each. The
+    process being restarted is the thing the cooldown/attempt-cap protect —
+    it is one physical target no matter how many items happen to name it —
+    so a verb may run AT MOST ONCE PER PASS, and that one run discharges
+    every item that named it.
+
+    Phase 1 — collect every candidate passing gates 1-4 below into
+    `by_verb: dict[verb_key, list[item]]`, one entry per row, no writes yet:
+      1. `state IN ('verdict', 'needs_human') AND dispatch_job IS NOT NULL` —
+         a row with no folded investigate verdict to read confidence/
+         nextAction off has nothing this function can act on.
+      2. no `operations` row of `kind='host'` still open (`outcome IS NULL`)
+         for this item's OWN event_id — reconcile_operations() runs FIRST in
+         run(), before even this, so a row still open here is genuinely in
+         flight this same pass, not a crash left behind. (A crash between
+         this function's own claim and its own record_operation() call is a
+         narrower window this check cannot see into — STATE_REMEDIATING's
+         own STATE_DEADLINES entry is the backstop for exactly that gap.)
+      3. the item's own signature matches a `hostVerbs` policy rule (same
+         two match targets, same first-match-wins shape as `rules` —
+         see _match_targets()/_match_rule()).
+      4. the folded verdict's confidence RANKS AT OR ABOVE
+         `policy["hostVerbMinConfidence"]` (default `medium` —
+         DEFAULT_HOST_VERB_MIN_CONFIDENCE, see _CONFIDENCE_RANK) AND
+         `nextAction in ("human", "implement")`. `high` is deliberately NOT
+         the floor here, unlike maybe_auto_implement()'s own confidence gate
+         below — the owner's follow-up decision, 2026-09-11: a restart from
+         HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE liveness
+         probe before the item is ever marked done, and capped at
+         `hostVerbMaxAttempts`, so a wrong guess costs one restart and a
+         `needs_human` card carrying the receipt — cheaper than a human
+         running that exact same restart by hand. A multi-file code change
+         (maybe_auto_implement()) has no such cheap, verified undo, which is
+         why `high` stays the right bar THERE and not here.
+
+    Phase 2 — one decision PER VERB KEY, never per item:
+      5. cooldown — `_host_verb_cooldown_ok()`, now keyed by verb: a flapping
+         signal must not restart a live process every 10 minutes, and three
+         items sharing one verb must not either.
+      6. attempt cap — `_host_verb_attempts()` (also keyed by verb, bounded
+         to the last `hostVerbCooldownHours * hostVerbMaxAttempts` hours —
+         see that function's own docstring for why the window exists) at
+         `hostVerbMaxAttempts` -> every item in the group moves to
+         STATE_NEEDS_HUMAN ONCE, note lists every prior attempt's exit code.
+         NOT a deferral: a verb that has already failed this many times is a
+         deterministic failure, and leaving its items to be retried forever
+         is the exact silent-stuck-item failure DESIGN.md's own deadline
+         table exists to close.
+
+    Every item in a verb's group is claimed with the SAME compare-and-set
+    maybe_auto_implement() uses (`_set_state(..., STATE_REMEDIATING,
+    expect_state=item["state"])`) — an item whose OWN claim loses (a
+    concurrent run, or a state that moved between phase 1 and phase 2) is
+    simply excluded from `claimed`, never restarted on its own. `_run_host_verb()`
+    — NOT `_run_verb()`, see that function's own docstring for why — then
+    runs synchronously ONCE (bounded by HOST_VERB_TIMEOUT), covering every
+    claimed item: ONE `operations` row, `event_id` set to the FIRST claimed
+    item, receipt carrying `"items": [<every claimed event_id>]` so the
+    group is reconstructable from the row alone. Every claimed item leaves
+    `remediating` before this function returns, together, with the SAME
+    note: STATE_LIVENESS_PENDING on `exitCode == 0`, STATE_NEEDS_HUMAN
+    otherwise. There is no async poll step here — unlike the implement
+    chain, a host verb's own subprocess IS the whole operation, so
+    `_run_host_verb()` returning is the terminal answer for this pass;
+    STATE_REMEDIATING's own STATE_DEADLINES entry is a crash backstop only
+    (see that entry's own comment)."""
+    candidates = conn.execute(
+        "SELECT * FROM triage_items WHERE state IN (?, ?) AND dispatch_job IS NOT NULL ORDER BY event_id",
+        (STATE_VERDICT, STATE_NEEDS_HUMAN),
+    ).fetchall()
+    host_verbs = policy.get("hostVerbs") or []
+    if not host_verbs:
+        return
+
+    # --- Phase 1 — gates 1-4, grouped by verb. No writes below this point. ---
+    by_verb: dict[str, list[sqlite3.Row]] = {}
+    argv_by_verb: dict[str, list[str]] = {}
+    for item in candidates:
+        open_host_op = conn.execute(
+            "SELECT 1 FROM operations WHERE event_id=? AND kind='host' AND outcome IS NULL LIMIT 1",
+            (item["event_id"],),
+        ).fetchone()
+        if open_host_op:
+            continue  # genuinely in flight this pass — reconcile_operations() owns a crashed one
+
+        event_row = _get_event(conn, item["event_id"])
+        if event_row is None:
+            continue
+        rule = _match_rule(_match_targets(event_row), host_verbs)
+        if rule is None:
+            continue
+        verb_key = rule["verb"]
+        argv = HOST_VERB_ALLOWLIST.get(verb_key)
+        if argv is None:
+            continue  # defence in depth — load_policy() already dropped an unknown verb
+
+        d = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone()
+        if d is None:
+            continue
+        verdict = _safe_json(d["verdict_json"])
+        verdict_confidence = (verdict.get("confidence") or "").strip().lower()
+        min_rank = _CONFIDENCE_RANK.get(policy["hostVerbMinConfidence"], _CONFIDENCE_RANK["high"])
+        if _CONFIDENCE_RANK.get(verdict_confidence, -1) < min_rank:
+            continue
+        if (verdict.get("nextAction") or "").strip().lower() not in ("human", "implement"):
+            continue
+
+        by_verb.setdefault(verb_key, []).append(item)
+        argv_by_verb[verb_key] = argv
+
+    # --- Phase 2 — one cooldown/attempt-cap/execute decision PER VERB. ---
+    for verb_key, items in by_verb.items():
+        if dry_run:
+            print(f"[dry-run] would run host verb {verb_key} for {[it['signature'] for it in items]}")
+            continue
+
+        if not _host_verb_cooldown_ok(conn, verb_key, policy, now):
+            continue
+
+        prior_ops = _host_verb_attempts(conn, verb_key, policy, now)
+        if len(prior_ops) >= policy["hostVerbMaxAttempts"]:
+            attempts = "; ".join(
+                f"attempt {i + 1}: exit {_safe_json(op['receipt_json']).get('exitCode', '?')}"
+                for i, op in enumerate(prior_ops)
+            )
+            note = (f"host verb {verb_key!r} hit hostVerbMaxAttempts="
+                    f"{policy['hostVerbMaxAttempts']} ({attempts}) — needs a human")
+            for item in items:
+                _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
+            conn.commit()
+            _sync_cards(conn, items, policy)
+            continue
+
+        # CLAIM EVERY ITEM IN THE GROUP before executing — same
+        # claim-before-execute reasoning as maybe_auto_implement()'s own
+        # comment: recording the operation only after the verb runs leaves a
+        # crash window where a second pass restarts the same process again.
+        # An item whose own CAS loses is excluded from `claimed`, never
+        # restarted separately from the rest of the group.
+        claimed = [
+            item for item in items
+            if _set_state(conn, item["event_id"], STATE_REMEDIATING, now,
+                          expect_state=item["state"], note=f"restarting via {verb_key}")
+        ]
+        conn.commit()
+        if not claimed:
+            continue
+
+        _chaos.crash_point("before-host-verb")
+        primary = claimed[0]
+        op_id = record_operation(conn, event_id=primary["event_id"], kind="host", repo=primary["repo"] or "",
+                                  authorized_by="auto-remediate", note=f"verb={verb_key}")
+        result = _run_host_verb(argv_by_verb[verb_key], timeout=HOST_VERB_TIMEOUT)
+        receipt = json.dumps({
+            "verb": verb_key, "exitCode": result["exitCode"], "output": result["output"],
+            "items": [it["event_id"] for it in claimed],
+        })
+
+        if result["exitCode"] == 0:
+            complete_operation(conn, op_id, outcome="done", receipt=receipt)
+            monitor_title = HOST_VERB_LIVENESS_MONITOR.get(verb_key)
+            deploy_expect = (
+                json.dumps([{"monitorTitle": monitor_title, "since": _now_iso(now)}]) if monitor_title else "[]"
+            )
+            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
+            note = f"restarted via {verb_key}; awaiting liveness"
+            for item in claimed:
+                _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+                           liveness_deadline=deadline, deploy_expect_json=deploy_expect, note=note)
+        else:
+            complete_operation(conn, op_id, outcome="failed", receipt=receipt)
+            note = (f"host verb {verb_key!r} failed (exit {result['exitCode']}): "
+                    f"{result['output'][:500] or '(no output)'}")
+            for item in claimed:
+                _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
+        conn.commit()
+        _sync_cards(conn, claimed, policy)
 
 
 def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -5535,6 +6133,13 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     escalate_origin_items(conn, now, dry_run=dry_run)
     escalate(conn, policy, now, dry_run=dry_run)
     run_verbs(conn, policy, now, dry_run=dry_run)
+
+    # The fifth closed allowlist's own poller (STATE.md's 2026-09-11 owner
+    # decision) — BEFORE the implement chain, on purpose: a verdict/
+    # needs_human row this claims moves straight to `remediating`, which is
+    # neither `verdict` nor `needs_human` any more, so maybe_auto_implement()
+    # below can never also pick it up in the same pass.
+    maybe_auto_remediate(conn, policy, now, dry_run=dry_run)
 
     # Steps 6-10 — verdict -> implement -> validate -> merge -> deploy ->
     # verify. Each is a poll-once-per-run step over its own state, so this

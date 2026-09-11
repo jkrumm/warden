@@ -264,6 +264,45 @@ Four cases. Everything else runs unattended.
    config, alert thresholds, log levels, the health check, warden's own policy
    files. **This case is never promotable to automatic.**
 
+### The host-verb carve-out — why a restart is not case 2
+
+The owner's decision, 2026-09-11 (STATE.md, docs/history/state-log.md §59): "if warden is
+confident in a fix it must do it, even a host-level action like restarting a
+process. `needs_human` for a restart is friction." FLOWS.md flow 5 used to read
+a wedged-gateway restart as case 2 — "only a human can supply it" — and that
+was the wrong reading of case 2's OWN reason. Case 2 is about **presence**: a
+biometric `op` prompt, a tailnet ACL push, a console-only action literally
+need a human's body at a keyboard, because nothing else can supply the
+credential or the click. `launchctl kickstart -k gui/<uid>/ai.hermes.gateway`
+needs none of that — it is a plain, already-scriptable command the very
+LaunchAgent running warden's own loop could always have issued.
+
+So: a restart run through a **fifth closed allowlist**
+(`HOST_VERB_ALLOWLIST`, scripts/triage.py — same shape as the deploy
+allowlist, VERB_ALLOWLIST, EVIDENCE_ALLOWLIST and LIVENESS_ALLOWLIST; a policy
+rule may SELECT a key, never express an argv), gated to run only against an
+**idempotent** verb (a restart is safe to issue twice), and followed by a
+**liveness-verified** confirmation (maybe_check_liveness()'s own
+LIVENESS_ALLOWLIST probe — a positive push, never silence) before the item
+is ever marked done, is not case 2 — it is the SAME shape the existing
+merge → deploy → verify chain already runs unattended for a code change, one
+step shorter. **Corrected 2026-09-11**: it does NOT require `confidence: high`
+on the folded investigate verdict — `hostVerbMinConfidence` defaults to
+`medium`, deliberately below auto-implement's own `high` floor, because a
+restart from this allowlist is idempotent, confirmed by a positive liveness
+probe before the item is ever marked done, and capped at
+`hostVerbMaxAttempts`: a wrong guess costs one restart and a `needs_human`
+card carrying the receipt, which is cheaper than a human running that exact
+same restart by hand — a multi-file code change has no such cheap, verified
+undo, which is why `high` stays the right bar there and not here. A failed or
+unconfirmed restart still falls back to `needs_human` — case 2 stands
+whenever the closed allowlist itself cannot resolve the situation. What makes
+a case-2 action
+promotable here and not elsewhere is specific to a **host restart**: cases 1
+and 4 above are not being reopened by this carve-out, and neither is "only a
+human can supply it" for anything that genuinely needs a human's own
+credential or presence.
+
 ### Self-concealing change — why case 4 exists
 
 The seeded auto-merge scope is `vps/observability/**` and the seeded liveness
@@ -435,9 +474,10 @@ quoting — is what makes this safe. With every field constrained to a charset t
 cannot express a metacharacter, the concatenation is safe by construction, and
 adding a repo is one line of config with no code diff.
 
-`VERB_ALLOWLIST`, `EVIDENCE_ALLOWLIST` and `LIVENESS_ALLOWLIST` keep the closed
-`case` shape unchanged — they name behaviours, not arguments, so there is nothing
-to validate and no friction to remove.
+`VERB_ALLOWLIST`, `EVIDENCE_ALLOWLIST`, `LIVENESS_ALLOWLIST` and
+`HOST_VERB_ALLOWLIST` (the fifth, added 2026-09-11 — see § The host-verb
+carve-out) keep the closed `case` shape unchanged — they name behaviours, not
+arguments, so there is nothing to validate and no friction to remove.
 
 Even with perfect quoting, a Make target executes repo code, so *who may modify
 the target* matters more than *who may name it* — hence the `Makefile`/`scripts/**`
@@ -622,8 +662,9 @@ Details in the current implementation that read like accidents and are not.
 5. **`note` vs `ignored`.** `ignored` is invisible; `note` is uncarded but in the
    daily digest. The split exists because the DB contains a human message naming
    a root cause and its two-line fix, never shipped.
-6. **The four closed allowlists.** One principle, four instances. v1 broke the
-   fourth; don't break the others while generalizing.
+6. **The five closed allowlists.** One principle, five instances (a fifth,
+   `HOST_VERB_ALLOWLIST`, added 2026-09-11 — § The host-verb carve-out). v1
+   broke the fourth; don't break the others while generalizing.
 7. **Overflow waits, never drops** — cluster members past 5 stay `new`.
 8. **The dry-run contract** — never touches Slack, never shells out, everything
    else real. With no staging environment this is the only pre-production surface

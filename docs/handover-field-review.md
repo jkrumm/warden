@@ -48,7 +48,7 @@ Produces three artifacts, implements nothing: a dated `§` appended to
 ### (a) The six funnel metrics — `GET /metrics`
 
 ```bash
-curl -s http://127.0.0.1:7734/metrics | python3 -m json.tool
+curl -s http://127.0.0.1:7735/metrics | python3 -m json.tool
 ```
 
 Name each exactly as `docs/api.md` does, and restate its honesty rule: `value`

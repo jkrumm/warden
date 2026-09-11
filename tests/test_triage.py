@@ -163,6 +163,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         "MAX_OPEN_INVESTIGATIONS": triage.MAX_OPEN_INVESTIGATIONS,
         "DAILY_INVESTIGATE_BUDGET": triage.DAILY_INVESTIGATE_BUDGET,
         "VERB_ALLOWLIST": dict(triage.VERB_ALLOWLIST),
+        "HOST_VERB_ALLOWLIST": dict(triage.HOST_VERB_ALLOWLIST),
         "_watchdog_poll": triage._watchdog_poll,
         "METEO_HEALTH_PATH": triage.METEO_HEALTH_PATH,
         "GATEWAY_STARTS_LOG": triage.GATEWAY_STARTS_LOG,
@@ -6153,6 +6154,511 @@ def test_reconcile_open_untouched_pr_retry_is_capped():
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGE_BLOCKED, item["state"]
         assert "2 merge attempts" in (item["note"] or ""), item["note"]
+
+
+# =============================================================================
+# The fifth closed allowlist — HOST_VERB_ALLOWLIST / maybe_auto_remediate()
+# (the owner's 2026-09-11 decision, STATE.md/docs/history/state-log.md §59): "if warden is
+# confident in a fix it must do it, even a host-level action like restarting
+# a process." Same client-boundary-faking shape the auto-implement chain
+# tests above use — HOST_VERB_ALLOWLIST is stubbed with a REAL executable
+# script (same pattern test_op_refs_route_to_env_check_verb_not_episode uses
+# for VERB_ALLOWLIST), so these tests exercise the real subprocess boundary
+# (`_run_host_verb()`) rather than mocking it away.
+# =============================================================================
+
+HOST_VERB_POLICY = dict(
+    DEFAULT_POLICY,
+    hostVerbs=[
+        {"match": "uk:hermes-agent", "verb": "restart-hermes-gateway"},
+        {"match": "uk:hermes-watchdog-push", "verb": "restart-hermes-gateway"},
+    ],
+    hostVerbCooldownHours=6,
+    hostVerbMaxAttempts=2,
+    # The owner's 2026-09-11 follow-up: `medium`, not `high`, is the default
+    # floor for THIS mechanism — see maybe_auto_remediate()'s own gate-4
+    # docstring for why an idempotent, liveness-verified, attempt-capped
+    # restart gets a lower bar than auto-implement's `high`.
+    hostVerbMinConfidence="medium",
+    repos={"hermes-agent": {"liveness": "kuma-push-fresh"}},
+)
+
+
+def _seed_host_verb_item(conn, *, external_id="175", title="Hermes Agent", repo="hermes-agent",
+                          state=None, confidence="high", next_action="human",
+                          investigate_job="investigate-host") -> int:
+    """A `uk`-sourced item whose TITLE-derived match target (`uk:hermes-agent`
+    — see _match_targets()) matches HOST_VERB_POLICY's own seeded `hostVerbs`
+    rule. Same shape _seed_verdict_item() uses for the implement chain above,
+    keyed by title rather than the bare numeric monitor id because that IS
+    the target maybe_auto_remediate() actually matches against."""
+    state = state if state is not None else triage.STATE_NEEDS_HUMAN
+    eid = _insert_event(conn, source="uk", external_id=external_id, title=title, first_seen=OLD)
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (investigate_job, "investigate", repo, "b", "done",
+         json.dumps({"summary": "s", "nextAction": next_action, "confidence": confidence}),
+         NOW.isoformat()),
+    )
+    conn.execute(
+        "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+        "last_seen, created_at, updated_at, dispatch_job) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (eid, f"uk:{external_id}", repo, state, 3,
+         OLD.isoformat(), OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), investigate_job),
+    )
+    conn.commit()
+    return eid
+
+
+def _write_host_verb_stub(tmp_dir: Path, *, exit_code: int = 0, output: str = "restarted",
+                           calls_file: Path | None = None) -> Path:
+    """A stub standing in for a HOST_VERB_ALLOWLIST argv (`launchctl
+    kickstart`, an ssh `docker restart`) — plain text output, never JSON:
+    _run_host_verb() deliberately does not parse stdout as JSON the way
+    _run_verb()'s own env-check stub's output is parsed (see that
+    function's own docstring for why reusing _run_verb() here would be
+    wrong). `calls_file`, when given, gets one appended line per invocation
+    — the only way to assert "ran exactly once" against the REAL subprocess
+    boundary this suite exercises here, rather than a mocked call count."""
+    stub_path = tmp_dir / "host-verb-stub.py"
+    calls_line = f"open({str(calls_file)!r}, 'a').write('called\\n')\n" if calls_file is not None else ""
+    stub_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"{calls_line}"
+        f"print({output!r})\n"
+        f"sys.exit({exit_code})\n"
+    )
+    stub_path.chmod(0o755)
+    return stub_path
+
+
+def test_host_verb_allowlist_shape():
+    """The real, shipped argv — never exercised by subprocess in this suite
+    (that would actually kick the mini's gateway), but its SHAPE is a fact
+    worth pinning: a `launchctl kickstart -k gui/<uid>/ai.hermes.gateway`
+    argv, matching FLOWS.md flow 5's own "what you actually do"."""
+    argv = triage.HOST_VERB_ALLOWLIST["restart-hermes-gateway"]
+    assert argv[:3] == ["launchctl", "kickstart", "-k"]
+    assert argv[3].startswith("gui/") and argv[3].endswith("/ai.hermes.gateway")
+
+
+def test_every_host_verb_has_a_liveness_monitor():
+    """Enforced at import time too (see the AssertionError right after
+    HOST_VERB_LIVENESS_MONITOR's own definition) — a verb with no monitor
+    would still run, but its item's `deploy_expect_json` would carry no
+    `monitorTitle`, and _gather_kuma_push_fresh() unconditionally refuses an
+    empty `expected`, so the item would cycle liveness_pending -> new
+    forever, never confirmed and never escalated to a human either. This
+    test is the regression: it fails LOUDLY here, at test time, if the two
+    dicts ever drift apart, rather than only at import (which would take
+    the whole module — and therefore every LaunchAgent depending on it —
+    down at once, a much worse place to first discover the same drift)."""
+    missing = set(triage.HOST_VERB_ALLOWLIST) - set(triage.HOST_VERB_LIVENESS_MONITOR)
+    assert not missing, f"HOST_VERB_ALLOWLIST key(s) {sorted(missing)} have no HOST_VERB_LIVENESS_MONITOR entry"
+
+
+def test_auto_remediate_fires_at_the_default_medium_floor_not_below_it():
+    """The owner's 2026-09-11 follow-up: `medium` is the DEFAULT floor for
+    this mechanism (not `high` — that stays auto-implement's own bar), so a
+    medium-confidence verdict must now fire, and only `low` is refused."""
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir)
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid_med = _seed_host_verb_item(conn, external_id="175", confidence="medium",
+                                        investigate_job="investigate-med")
+        eid_low = _seed_host_verb_item(conn, external_id="185", title="Hermes Watchdog - Push",
+                                        state=triage.STATE_VERDICT, confidence="low",
+                                        investigate_job="investigate-low")
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+
+        item_med = triage._get_item(conn, eid_med)
+        assert item_med["state"] == triage.STATE_LIVENESS_PENDING, item_med["state"]
+        op = conn.execute("SELECT kind, outcome, repo, receipt_json FROM operations WHERE event_id=?",
+                           (eid_med,)).fetchone()
+        assert op["kind"] == "host" and op["outcome"] == "done" and op["repo"] == "hermes-agent"
+        receipt = json.loads(op["receipt_json"])
+        assert receipt == {"verb": "restart-hermes-gateway", "exitCode": 0, "output": "restarted",
+                            "items": [eid_med]}
+
+        item_low = triage._get_item(conn, eid_low)
+        assert item_low["state"] == triage.STATE_VERDICT, (
+            "a low-confidence verdict must still never auto-remediate at the default floor")
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
+                             (eid_low,)).fetchone()["n"] == 0
+
+
+def test_auto_remediate_high_floor_refuses_a_medium_verdict():
+    """A policy that explicitly raises `hostVerbMinConfidence` back to
+    `high` must refuse a medium-confidence verdict — the floor is a policy
+    choice, not a hardcoded constant."""
+    policy = dict(HOST_VERB_POLICY, hostVerbMinConfidence="high")
+    with _triage_env(policy=policy) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir)
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid = _seed_host_verb_item(conn, external_id="175", state=triage.STATE_VERDICT,
+                                    confidence="medium", investigate_job="investigate-raised-floor")
+        triage.maybe_auto_remediate(conn, policy, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERDICT, item["state"]
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
+                             (eid,)).fetchone()["n"] == 0
+
+
+def test_host_verb_min_confidence_invalid_value_falls_back_to_medium():
+    """Same closed-vocabulary contract as `hostVerbs`' own unknown-verb
+    rejection: an unrecognized `hostVerbMinConfidence` is a policy typo, not
+    a silent tightening or loosening of the floor — falls back to the
+    documented default, loudly."""
+    policy = dict(DEFAULT_POLICY, hostVerbMinConfidence="critical")
+    with _triage_env(policy=policy) as (conn, ctx):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            loaded = triage.load_policy()
+        assert loaded["hostVerbMinConfidence"] == "medium", loaded["hostVerbMinConfidence"]
+        assert "critical" in buf.getvalue() and "medium" in buf.getvalue(), buf.getvalue()
+
+
+def test_host_verb_cooldown_and_max_attempts_reject_zero_and_negative():
+    """`data.get(key) or default` treats a configured `0` as ABSENT
+    (falsy-or), silently substituting the default instead of the zero the
+    file actually says — and a negative number would pass through
+    unchanged, making the cooldown always-satisfied or the attempt cap
+    never-binding. Both `0` and `-1` must fall back to the documented
+    default, loudly, for both keys."""
+    for key, default in (("hostVerbCooldownHours", triage.DEFAULT_HOST_VERB_COOLDOWN_HOURS),
+                         ("hostVerbMaxAttempts", triage.DEFAULT_HOST_VERB_MAX_ATTEMPTS)):
+        for bad_value in (0, -1):
+            policy = dict(DEFAULT_POLICY, **{key: bad_value})
+            with _triage_env(policy=policy) as (conn, ctx):
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    loaded = triage.load_policy()
+                assert loaded[key] == default, (key, bad_value, loaded[key])
+                assert str(bad_value) in buf.getvalue(), (key, bad_value, buf.getvalue())
+
+
+def test_auto_remediate_no_matching_rule_untouched():
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir)
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid = _seed_host_verb_item(conn, external_id="999", title="Unrelated Thing",
+                                    state=triage.STATE_VERDICT, confidence="high",
+                                    investigate_job="investigate-unmatched")
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERDICT, item["state"]
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations").fetchone()["n"] == 0
+
+
+def test_auto_remediate_cooldown_blocks_a_second_run_of_the_same_verb():
+    """Cooldown is keyed by VERB (see _host_verb_cooldown_ok()), exercised
+    here through the SAME item flapping back — the single-item case is a
+    special case of the general one, covered on its own by
+    test_auto_remediate_cooldown_is_keyed_by_verb_not_by_item below."""
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir)
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid = _seed_host_verb_item(conn, external_id="175", confidence="high",
+                                    investigate_job="investigate-cooldown")
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_LIVENESS_PENDING
+
+        # The SAME item flaps back to needs_human moments later — inside
+        # hostVerbCooldownHours, a second restart of THIS VERB must be
+        # deferred, not run again.
+        triage._set_state(conn, eid, triage.STATE_NEEDS_HUMAN, NOW + dt.timedelta(minutes=1))
+        conn.commit()
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, "cooldown must block a second run on the same item"
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
+                             (eid,)).fetchone()["n"] == 1, "only the first attempt's operation must exist"
+
+
+def test_auto_remediate_cooldown_is_keyed_by_verb_not_by_item():
+    """The 2026-09-11 11:36Z incident this whole redesign fixes: a FRESH
+    item mapping to a verb that ran minutes ago ON A DIFFERENT ITEM must be
+    deferred by the SAME cooldown, not treated as a brand-new, never-run
+    verb just because this particular item never ran it itself."""
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir)
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid_a = _seed_host_verb_item(conn, external_id="175", confidence="high",
+                                      investigate_job="investigate-verb-a")
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid_a)["state"] == triage.STATE_LIVENESS_PENDING
+
+        # A SECOND, previously-untouched item, mapping to the SAME verb,
+        # appears 10 minutes later — well inside hostVerbCooldownHours=6.
+        eid_b = _seed_host_verb_item(conn, external_id="185", title="Hermes Watchdog - Push",
+                                      confidence="high", investigate_job="investigate-verb-b")
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+        item_b = triage._get_item(conn, eid_b)
+        assert item_b["state"] == triage.STATE_NEEDS_HUMAN, (
+            "a fresh item on a verb someone else just ran must be deferred by the same cooldown")
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations").fetchone()["n"] == 1, (
+            "the cooldown must have prevented a second operation entirely")
+
+
+def test_auto_remediate_groups_every_item_sharing_a_verb_into_one_run():
+    """The 2026-09-11 11:36Z incident itself: three items (uk:175, uk:185,
+    the hermes_log session-is-closed signal) all mapping to
+    `restart-hermes-gateway` must run the verb EXACTLY ONCE, in ONE
+    `operations` row, and all three must land in `liveness_pending`
+    together."""
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        calls_file = ctx.tmp_dir / "host-verb-calls.txt"
+        stub = _write_host_verb_stub(ctx.tmp_dir, calls_file=calls_file)
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid1 = _seed_host_verb_item(conn, external_id="175", confidence="high",
+                                     investigate_job="investigate-group-1")
+        eid2 = _seed_host_verb_item(conn, external_id="185", title="Hermes Watchdog - Push",
+                                     confidence="high", investigate_job="investigate-group-2")
+        eid3 = _insert_event(conn, source="hermes_log",
+                              external_id="slack-bolt-asyncapp-failed-to-connect-error-session-is-closed-retrying",
+                              title="slack_bolt.AsyncApp: Failed to connect (error: Session is closed)",
+                              first_seen=OLD)
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("investigate-group-3", "investigate", "hermes-agent", "b", "done",
+             json.dumps({"summary": "s", "nextAction": "human", "confidence": "high"}), NOW.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+            "last_seen, created_at, updated_at, dispatch_job) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid3, "hermes_log:slack-bolt-asyncapp-failed-to-connect-error-session-is-closed-retrying",
+             "hermes-agent", triage.STATE_NEEDS_HUMAN, 3, OLD.isoformat(), OLD.isoformat(),
+             NOW.isoformat(), NOW.isoformat(), "investigate-group-3"),
+        )
+        conn.commit()
+
+        policy = dict(HOST_VERB_POLICY, hostVerbs=HOST_VERB_POLICY["hostVerbs"] + [
+            {"match": "hermes_log:*session-is-closed*", "verb": "restart-hermes-gateway"},
+        ])
+        triage.maybe_auto_remediate(conn, policy, NOW, dry_run=False)
+
+        assert calls_file.read_text().count("\n") == 1, (
+            f"the verb must run exactly once for all three items, ran {calls_file.read_text().count(chr(10))} times")
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations").fetchone()["n"] == 1, (
+            "exactly one operations row must cover the whole group")
+        op = conn.execute("SELECT event_id, receipt_json FROM operations").fetchone()
+        assert op["event_id"] == eid1, "the operation's event_id must be the FIRST claimed item"
+        receipt = json.loads(op["receipt_json"])
+        assert sorted(receipt["items"]) == sorted([eid1, eid2, eid3]), receipt["items"]
+
+        for eid in (eid1, eid2, eid3):
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_LIVENESS_PENDING, (eid, item["state"])
+            assert item["note"] == "restarted via restart-hermes-gateway; awaiting liveness"
+
+
+def _backdate_latest_host_op(conn: sqlite3.Connection, verb_key: str, started_at: dt.datetime) -> None:
+    """operations.record() (scripts/lifecycle/operations.py) always stamps
+    `started_at` from the real wall clock, never from a caller's simulated
+    `now` — correct for production, but it means a test driving
+    hour-scale, exact-boundary cooldown/attempt-window math against a
+    SIMULATED `now` needs the row's timestamp pinned explicitly, or it is
+    off by whatever real wall-clock time elapsed while the test itself
+    ran (milliseconds, but enough to flip a `>=` exactly at a boundary)."""
+    conn.execute(
+        "UPDATE operations SET started_at=? WHERE op_id = ("
+        "  SELECT op_id FROM operations WHERE kind='host' AND note=? ORDER BY started_at DESC LIMIT 1)",
+        (started_at.isoformat(), f"verb={verb_key}"),
+    )
+    conn.commit()
+
+
+def test_auto_remediate_attempt_cap_lands_needs_human_with_attempts_noted():
+    """Uses the policy's real (non-zero) cooldownHours=6/maxAttempts=2, with
+    attempts spaced EXACTLY hostVerbCooldownHours apart (t=0, t=6h, t=12h):
+    each pass's cooldown gate just clears (>= 6h since the last attempt),
+    and the attempt-cap's own bounded window (cooldownHours *
+    hostVerbMaxAttempts = 12h) still just includes the first attempt at the
+    exact moment the third pass checks it — the tightest realistic spacing,
+    not a generous one, since the cooldown and the window share one formula
+    on purpose (see _host_verb_attempts()'s own docstring). Backdates each
+    operation's `started_at` to the exact simulated timestamp — see
+    _backdate_latest_host_op()'s own docstring for why that is necessary at
+    this exact-boundary a spacing."""
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir, exit_code=1, output="restart failed")
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid = _seed_host_verb_item(conn, external_id="175", confidence="high",
+                                    investigate_job="investigate-cap")
+
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_HUMAN
+        _backdate_latest_host_op(conn, "restart-hermes-gateway", NOW)
+
+        # Re-open it and try again exactly hostVerbCooldownHours=6h later.
+        triage._set_state(conn, eid, triage.STATE_VERDICT, NOW + dt.timedelta(hours=6))
+        conn.commit()
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(hours=6), dry_run=False)
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
+                             (eid,)).fetchone()["n"] == 2, "hostVerbMaxAttempts=2 prior attempts must exist by now"
+        _backdate_latest_host_op(conn, "restart-hermes-gateway", NOW + dt.timedelta(hours=6))
+
+        # A third pass, another 6h later (t=12h) — cooldown clears again, but
+        # the cap fires BEFORE a third attempt: both priors (t=0h, t=6h) are
+        # still (just) inside the 12h bounded window at t=12h.
+        triage._set_state(conn, eid, triage.STATE_VERDICT, NOW + dt.timedelta(hours=12))
+        conn.commit()
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(hours=12), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "hostVerbMaxAttempts=2" in (item["note"] or ""), item["note"]
+        assert "attempt 1: exit 1" in item["note"] and "attempt 2: exit 1" in item["note"], item["note"]
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
+                             (eid,)).fetchone()["n"] == 2, "the cap gate must not run a third attempt"
+
+
+def test_auto_remediate_nonzero_exit_lands_needs_human_operation_failed():
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir, exit_code=1, output="boom")
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid = _seed_host_verb_item(conn, external_id="175", confidence="high",
+                                    investigate_job="investigate-fail")
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "exit 1" in item["note"] and "boom" in item["note"], item["note"]
+        op = conn.execute("SELECT outcome, receipt_json FROM operations WHERE event_id=?", (eid,)).fetchone()
+        assert op["outcome"] == "failed"
+        assert json.loads(op["receipt_json"]) == {"verb": "restart-hermes-gateway", "exitCode": 1,
+                                                    "output": "boom", "items": [eid]}
+
+
+def test_auto_remediate_dry_run_prints_and_does_nothing():
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir)
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid = _seed_host_verb_item(conn, external_id="175", confidence="high",
+                                    investigate_job="investigate-dry")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=True)
+        assert "[dry-run] would run host verb restart-hermes-gateway for ['uk:175']" in buf.getvalue(), buf.getvalue()
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, "dry-run must never write state"
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations").fetchone()["n"] == 0
+
+
+def test_unknown_host_verb_key_is_rejected_at_policy_load():
+    """Same closed-key-set contract as VERB_ALLOWLIST's own
+    test_unknown_verb_key_is_rejected_at_policy_load — a `hostVerbs` entry
+    naming a verb outside HOST_VERB_ALLOWLIST must be dropped at load, not
+    passed through to a function that would otherwise KeyError on it."""
+    policy = dict(DEFAULT_POLICY, hostVerbs=[{"match": "uk:hermes-agent", "verb": "rm-rf-the-mini"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        loaded = triage.load_policy()
+        assert loaded["hostVerbs"] == [], "an unknown host verb key must be dropped, not passed through"
+
+
+def _seed_liveness_pending_host_item(conn, *, external_id="175", monitor_title="Hermes Agent - Push",
+                                      since: dt.datetime, deadline: dt.datetime) -> int:
+    eid = _seed_host_verb_item(conn, external_id=external_id, confidence="high", state=triage.STATE_VERDICT,
+                                investigate_job=f"investigate-live-{external_id}")
+    triage._set_state(conn, eid, triage.STATE_LIVENESS_PENDING, since,
+                      liveness_deadline=deadline.isoformat(),
+                      deploy_expect_json=json.dumps([{"monitorTitle": monitor_title, "since": since.isoformat()}]))
+    conn.commit()
+    return eid
+
+
+def test_liveness_kuma_push_fresh_positive_confirms_fixed():
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        since = NOW
+        deadline = NOW + dt.timedelta(hours=triage.LIVENESS_WINDOW_HOURS)
+        eid = _seed_liveness_pending_host_item(conn, since=since, deadline=deadline)
+
+        # No push yet, still inside the window — stays liveness_pending.
+        triage._watchdog_poll = _fake_wp_module([])
+        triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(minutes=5), dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_LIVENESS_PENDING
+
+        # A push AFTER `since` -> STATE_FIXED, the one genuinely-verified state.
+        push_ts = str((since + dt.timedelta(minutes=10)).timestamp())
+        triage._watchdog_poll = _fake_wp_module([_slack_msg(push_ts, "[Hermes Agent - Push] OK")])
+        triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(minutes=15), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FIXED, item["state"]
+        assert triage.LIVENESS_CONFIRMED_NOTE_PREFIX in (item["note"] or ""), item["note"]
+
+
+def test_liveness_kuma_push_fresh_never_confirmed_reopens_past_deadline():
+    """Written against maybe_check_liveness()'s ACTUAL behaviour, not a
+    literal `STATE_QUIET` outcome: this poller only ever produces
+    STATE_FIXED (a positive probe) or a reopen to STATE_NEW past the
+    deadline — it never sets STATE_QUIET itself (that state is produced only
+    by the grouped-source silence paths, resolve_quiet_grouped()/
+    apply_resolutions()). A push that never arrives is "not proven, try
+    again as a fresh occurrence", which this asserts."""
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        since = NOW
+        deadline = NOW + dt.timedelta(hours=1)
+        eid = _seed_liveness_pending_host_item(conn, since=since, deadline=deadline)
+        triage._watchdog_poll = _fake_wp_module([])  # never a matching push
+        triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(hours=2), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEW, item["state"]
+
+
+def test_gather_kuma_push_fresh_unparsable_since_fails_closed():
+    """An unparsable `since` must never read as "no lower bound, anything
+    confirms it" — that would let a corrupted deploy_expect_json confirm
+    liveness off a push unrelated to the restart it is supposed to verify.
+    Even a push that would otherwise match the monitor title must be
+    refused."""
+    saved = triage._watchdog_poll
+    try:
+        triage._watchdog_poll = _fake_wp_module([_slack_msg(str(NOW.timestamp()), "[Hermes Agent - Push] OK")])
+        ok, detail = triage._gather_kuma_push_fresh(
+            [{"monitorTitle": "Hermes Agent - Push", "since": "not-a-timestamp"}])
+        assert ok is False, detail
+        assert "unparsable" in detail.lower(), detail
+    finally:
+        triage._watchdog_poll = saved
+
+
+def test_reconcile_crashed_host_operation_lands_needs_human():
+    """Also the regression for the review finding this whole slice fixes:
+    complete_operation()'s `note=` COALESCEs, so passing the crash
+    explanation as `note` here would overwrite `verb=<key>` on the
+    operations row FOREVER, making it invisible to
+    _host_verb_cooldown_ok()/_host_verb_attempts() (both filter
+    `WHERE note=?`) and silently bypassing the cooldown and the attempt cap
+    on every future crash against this verb. Proven two ways: the row's own
+    `note` still reads `verb=<key>` right after reconcile, AND a subsequent
+    maybe_auto_remediate() pass is still refused by the cooldown (if the bug
+    were back, that pass would find no matching operation at all and run
+    the verb again immediately)."""
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        stub = _write_host_verb_stub(ctx.tmp_dir)
+        triage.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid = _seed_host_verb_item(conn, external_id="175", confidence="high",
+                                    state=triage.STATE_REMEDIATING, investigate_job="investigate-crash")
+        op_id = triage.record_operation(conn, event_id=eid, kind="host", repo="hermes-agent",
+                                         authorized_by="auto-remediate", note="verb=restart-hermes-gateway")
+        triage.reconcile_operations(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        op = conn.execute("SELECT outcome, note FROM operations WHERE op_id=?", (op_id,)).fetchone()
+        assert op["outcome"] == "unknown", op["outcome"]
+        assert (op["note"] or "").startswith("verb="), (
+            f"note must still be 'verb=<key>' after reconcile, not overwritten with the crash "
+            f"explanation — got {op['note']!r}")
+
+        # A pass right after must be refused by the cooldown, not run the
+        # verb again — proves the row above is still visible to
+        # _host_verb_cooldown_ok()'s own note= filter.
+        triage.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE note='verb=restart-hermes-gateway'"
+                             ).fetchone()["n"] == 1, "the cooldown must have refused a second host op"
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_HUMAN, (
+            "a cooldown-refused pass must leave the item exactly where it was")
 
 
 if __name__ == "__main__":
