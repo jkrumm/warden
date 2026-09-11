@@ -220,3 +220,56 @@ primitive exists before `warden revert` (Wave 3). #4's "unattended" qualifier
 because production has never produced a `fixed` transition to evaluate — both
 are served as `null` with a named reason rather than omitted, so a consumer
 can render "not yet measurable" instead of silently missing a key.
+
+## Argo push
+
+This endpoint is pull-only and loopback-bound, so Argo (the dashboard on the
+VPS) cannot reach it at all — there is no Caddy or tailnet door onto it, by
+design (see § Bind and auth above). Instead, `scripts/triage.py`'s loop pushes
+its own projection to Argo, over `scripts/clients/argo.py`'s `push_snapshot()`,
+as the last step of every 10-minute pass (`push_argo_snapshot()`, after
+`record_heartbeat()`).
+
+The pushed payload is `build_argo_snapshot()`'s output: `machine`,
+`generatedAt`, and this same module's `health_payload()`/`metrics_payload()`/
+`board_payload()` verbatim, plus `budget` (the same object `warden budget`
+prints), `items` (full `item_payload()` detail for the first 50 board items,
+keyed by event_id as a string) with `itemsTruncated` alongside it, and
+`intents` (spooled-intent state from `~/.warden/intents`: full `pending`/
+`rejected` counts, but at most 20 per-status file entries — `entriesTruncated`
+says whether either status is currently over that cap. Because `rejected/`
+files are never deleted, this cap is what stops the intents section from
+growing the whole snapshot past `clients.argo.MAX_BODY_BYTES` and silently
+taking health/metrics/board down with it. An entry never carries `signature`/
+`nonce` (the fields that carry authority in an `approval_decision` intent),
+and a rejected entry carries `has_error: bool` only — never its `.err`
+sibling's text, which can itself embed the raw rejected signature/nonce).
+
+Every push logs exactly one line to `warden-loop.err`. Every status the line
+can carry, and what an operator does about it:
+
+| Status | Meaning | Operator action |
+|-|-|-|
+| `ok` | 2xx from Argo. | None — this is the steady state. |
+| `no-secret` | `ARGO_API_SECRET`/`op://common/api/SECRET` did not resolve; nothing was sent. | Re-seed the secrets cache (`make secrets-seed` in dotfiles, biometric, MacBook-only). |
+| `too-large` | The encoded snapshot exceeds `clients.argo.MAX_BODY_BYTES` (1 MB); nothing was sent. | Check `board`/`items`/`intents` sizing — one of the caps above is not holding. |
+| `encode-error` | The snapshot was not JSON-serializable; nothing was sent. | A bug in a builder — check the most recent code change to `build_argo_snapshot()`. |
+| `http-error:<code>` | Argo answered with a non-2xx. `404` is expected and a non-event until `POST /warden/snapshot` deploys on the Argo side. | `404`: none, this is expected pre-deploy. Any other code: check the Argo side. |
+| `network-error` | Unreachable host, timeout, or any other transport failure. | Check Argo's own health/connectivity from the mini. |
+| `build-failed` | Building or JSON-encoding the snapshot raised. | A bug — check the stderr line's own exception text, then the most recent code change. |
+| `client-error` | `clients.argo.push_snapshot()` itself raised, defensively caught (its own contract is never-raise). | A bug in the client — this should never happen; treat as a regression. |
+| `dry-run` | `--dry-run`: nothing was built into a real request or sent. | None — this is the expected `--dry-run` line. |
+
+```
+triage: argo push — ok (5054 bytes, 1 items)
+triage: argo push — http-error:404 (3801 bytes, 0 items)
+triage: argo push — dry-run, would push 5049 bytes (1 items)
+```
+
+A bug building or sending the snapshot is always caught and logged, never
+raised — the loop finishes its pass regardless. `--dry-run` never pushes at
+all (nor does it build a real network request) — see triage.py's own
+DRY-RUN CONTRACT.
+
+Argo is a **projection** of this pushed snapshot, never a second source of
+truth — the ledger (`~/.warden/warden.db`) remains the only one.

@@ -80,10 +80,11 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **157/157**. Any other number is a
+`tests/test_triage.py` is the regression gate at **211/211**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
-temp dir and monkeypatches ~21 module globals including every `_run_hermes_cc_*`
-shim, so nothing reaches Slack or sideclaw. **Do not delete, skip or weaken a test
+temp dir and monkeypatches the module globals and every client boundary
+(`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
+sideclaw, GitHub or Argo. **Do not delete, skip or weaken a test
 to make it pass** — if it cannot pass without changing production behaviour, that
 is the finding.
 

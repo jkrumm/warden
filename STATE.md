@@ -6270,3 +6270,109 @@ a deliberate line, recorded here so it is not rediscovered as a gap; the
 `meteo` venv on this box held 8 GB RSS during the wave and got a background
 runner killed for memory. `com.jkrumm.warden-loop` and `-sweep` bootstrapped again at **00:14:54Z**
 (2026-09-11); `make status` green, `sideclaw schemas ✓ dispatch=2 review=1`.
+
+## 56. Wave 7 (estate chain) — the surfaces and the model choices (2026-09-11, 00:20Z →)
+
+One Fable orchestrator, Sonnet implementers and verifier, sideclaw reviews on
+argo, sideclaw, hermes-agent and warden. Six repos committed, nothing pushed
+except the one argo branch that is a pull request by design.
+
+### Timeline of the live system
+
+| When (UTC) | What |
+|-|-|
+| 00:20 | `/board`: 12 open (needs_human 8, merge_blocked 4), 47 terminal in 24 h. `make status` green except `warden-api` "LAST EXIT -15" — the §55 `kickstart -k`, cosmetic. |
+| 00:25 | **The carried `propose_mappings` failure root-caused by executing it**: the IU endpoint answers `gpt-5.6-luna` with 503 `Unsupported parameter: 'max_tokens'` and, once fixed, 503 `'temperature' does not support 0`; `max_completion_tokens` alone → 200 `OK`. The one LLM call in this loop had never succeeded. Hermes's `config.yaml` had recorded the same lesson for its approval classifier. |
+| 00:40 | `hermes cron remove 72aa2fb36307` — the `#agents` overview digest, paused since 2026-09-08 with `paused_reason: null` (the CLI's `cron pause` cannot record one), **retired**. Four jobs remain, all enabled. |
+| ~00:35 | The LaunchAgent loop, running the checkout, ticked with the new push: `triage: argo push — http-error:404 (73183 bytes, 12 items)` — the designed non-event until Argo deploys. Every tick since logs the same line. |
+| ~01:00 | sideclaw `49a065e` reloaded; `GET /api/overview.txt` renders `warden · 12 open · needs_human 8 · merge_blocked 4 · in flight 0` and eight prioritised item lines under the roster; the herdr `overview` pane's `watch` picked it up on its next 30 s tick. First render clipped `merge_blocked` to `merge_blocke` — fixed to fit-the-column, seen only on the live pane. |
+| 00:50 | argo PR **#19** (`warden-board`, draft) opened — landing it is the owner's, argo master deploys. |
+| 01:15 | **Verifier, against a local Argo on the branch with the real 73 KB snapshot: `POST /warden/snapshot` → 422** — `reverts_and_reopens` is a composite of two leaves with no top-level `value`, and the ingest schema demanded one on every metric. Every unit test had passed with hand-written fixtures. The page rendered its empty state honestly (six `n/a` tiles, no bare 0, Warden in the nav). Fixed on the branch: metrics ride through loosely (only `machine`/`generatedAt` are strict, as the contract said), and the funnel tile treats a composite as headline-from-first-real-value plus one detail line per leaf; the real snapshot file is now a test fixture. |
+| 01:16 | **Verifier, second pass, same local Argo at `402d126`:** `POST` → 201, `GET` → `raw.generatedAt` verbatim; six tiles honest (72 %, 9 %, `n/a` + reason ×2, poller age, reverts `0` with `reopen_after_fixed: n/a — …`), budget 2/20 and 1/5, `needs_human` bucket 8, Warden in the nav, no bare 0 anywhere. Three display defects seen only on the real render (an unrounded float, nested `item_states` JSON spilling into a tile, the STATE badge clipped to `NE…` because Mantine's Badge hides overflow) fixed at `1f245b1`; the row click that the headless pass could not confirm is a plain `onClick` in basalt-ui's data table (`data-table.tsx:1543`), an automation miss, not a defect. |
+
+### What landed, by repo
+
+**warden (this commit).** `clients/argo.py` (`push_snapshot` → a status string,
+never raises; `resolve_argo_token` via the new shared `clients/secrets.py`,
+which `slack.py` now uses too — `github.py` deliberately not, it raises rather
+than returning ""). `build_argo_snapshot()` reuses `api.py`'s own
+`health_payload`/`metrics_payload`/`board_payload`/`item_payload` by path-load
+(no second definition of "what /board counts"), adds `budget`, per-item
+timelines for the first 50 board items, and the intent spool as counts plus at
+most 20 entries per status with `has_error: bool` and never the `.err` line
+(a rejected intent's error message embeds the raw submitted signature —
+caught by the security angle). `push_argo_snapshot()` is step 10 of `run()`,
+after the heartbeat; dry-run builds and logs the byte count, never sends;
+encode failures are `build-failed`, never a failed tick. `docs/api.md` lists
+every status the log line can carry and what an operator does about each.
+`_propose_mappings_request_body()`: `max_completion_tokens`, no `temperature`.
+`tests/test_triage.py` **211/211** (203 at HEAD — CLAUDE.md said 157 since
+Wave 5; corrected), `test_clients.py` 88.
+
+**argo PR #19 (`1f245b1`).** `POST /warden/snapshot` + `GET /warden/snapshot`
+(raw jsonb verbatim, 7-day retention pruned on ingest, 1 MB cap) sharing a new
+`lib/snapshot-store.ts` with the agents route; `/warden` page: six funnel
+tiles that render `n/a` plus the reason for a `null` (never a fabricated 0),
+buckets by state with **deferred (budget)** first-class (`verdict` + note
+`deferred:`), an **unknown** bucket so an out-of-vocabulary state can never
+vanish (review finding), per-item timeline modal (transitions, dispatches
+with verdicts, PR, validation, operation receipts, approvals), "Recorded
+intents — not approvals". 1012 api tests, 223 dashboard tests.
+
+**sideclaw `49a065e`.** `warden-board.ts` fetches `/board` (2 s timeout, own
+45 s cache, `warden.board_unavailable` warn, ten counts keys required by
+schema); `renderWardenBlock` in the same file, called from `renderText`;
+needs_human and merge_blocked share bucket 0, in-flight bucket 1; `… N more`
+past eight lines; every rendered warden string control-byte stripped (alert
+and issue titles are attacker-influenced; the human-queue path already did
+this). The block rides the payload Argo already receives. Worker env
+`USAGE_LANE=sideclaw:<tool>`. Routing table prose in CLAUDE.md/README →
+`GET /api/routing` + the brain page; the otel exemption stated in-repo. 648
+tests. `fallow` fails at HEAD before and after (two unused MCP tool files, 23
+never-imported `agents.ts` exports, four CRITICAL functions) — pre-existing,
+not this wave's.
+
+**hermes-agent `5f5c7c6`.** The digest retired in the registry
+(`docs/scheduled-jobs.md` gains a State column and a Retired section with
+the correct `hermes cron create` form — the review caught a wrong flag
+syntax); `scripts/check-cron-registry.py` compares registry ↔ `jobs.json` in
+both directions (a paused job without a reason and a live job absent from the
+registry are findings, enabled or not; mismatch exit 1, cannot-compare exit
+2); `agents-cron.py` deleted; README/CLAUDE.md/agents-overview.md/
+dispatch-bridge.md corrected (four jobs; validation is a sideclaw review, not
+Opus). `make status`: `✓ cron registry (4 live, 0 paused, 1 retired)`.
+
+**dotfiles `6dfba3e`.** `rd wave`/`rd bg` default to **sonnet**
+(`RD_WAVE_MODEL`/`RD_BG_MODEL` override; this chain passes `fable`) and export
+`USAGE_LANE` into the pane shell — verified with a scratch workspace that the
+export survives into the pane's child processes; the SessionStart hook logs
+`lane`; `rd`/`agent-dispatch` help names the three lanes; CLAUDE.md rationale
+prose → pointers. **usage-tracker `ae805b3`**: `sub_tool` = the session's
+lane. **brain `a180ec6`**: `wiki/engineering/model-routing.md` is the one
+rationale page (two lanes, five sideclaw tiers reconciled against modelpick,
+Warden's routes, the otel decision, launcher defaults, usage lanes).
+**modelpick `baf441c`**: `docs/decisions/sideclaw-tiers.md`.
+
+### Decisions, recorded once
+
+- **Digest: retire**, not resume — it read sideclaw, never the ledger; it
+  reposted one blocked pane 35 times; `#agents` is the card board now.
+- **otel stays inline on JUDGE/Max** — interactive, in-turn, Max has no
+  per-token cost; the only cost is quota, now visible as `sideclaw:otel`.
+- **Warden requests no model** — every automatic dispatch passes
+  `model=None` and runs on sideclaw's JUDGE route; `propose_mappings` stays on
+  `gpt-5.6-luna` (once a day, now working).
+- **Warden pushes its own projection**; sideclaw does not relay it to Argo on
+  Warden's behalf (it does carry the board inside its overview payload, which
+  is a different, herdr-facing surface).
+
+### Next action
+
+Wave 8 (`dotfiles/docs/waves/PLAN.md`): docs to the estate that exists, and
+the field-review handover. **Owner:** (1) merge argo PR #19 — until then every
+tick logs `argo push — http-error:404`; (2) `op://common/api/SECRET` must be in
+the mini's offline cache or the line reads `no-secret` (it is: the sideclaw
+push uses the same ref); (3) the PAT Issues permission and the 4.3 Slack
+acceptance from §55 are still open. Carried: sideclaw `fallow` debt; cost per
+Warden item is a join on ledger job ids that nobody has built (Wave 9 will
+want it); `warden-api`'s "LAST EXIT -15" is the §55 kickstart.

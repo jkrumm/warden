@@ -75,8 +75,10 @@ INTENTS_DIR = (
 # Where a file that could not be parsed, validated or applied goes. Never
 # deleted — DESIGN.md principle 7, "Nothing is silently discarded to stay under
 # a bound." A rejected intent is evidence; a deleted one is a story nobody can
-# check.
-_REJECTED_SUBDIR = "rejected"
+# check. Public: triage.py's own Argo-snapshot builder reads this directory
+# too (read-only — it never writes here), and a copied literal is exactly the
+# kind of drift this repo's dispatch-policy/verdict-schema comments refuse.
+REJECTED_SUBDIR = "rejected"
 
 SCHEMA_V = 1
 
@@ -271,7 +273,7 @@ def _reject(path: Path, err: Exception) -> str:
     """Move a file that could not be applied into `rejected/` and drop a
     `.err` sibling beside it. NEVER unlink it — an intent that could not be
     applied is the one file worth keeping."""
-    rejected_dir = _ensure_dir(INTENTS_DIR / _REJECTED_SUBDIR)
+    rejected_dir = _ensure_dir(INTENTS_DIR / REJECTED_SUBDIR)
     dest = rejected_dir / path.name
     os.replace(path, dest)
     (rejected_dir / f"{path.name}.err").write_text(f"{type(err).__name__}: {err}\n", encoding="utf-8")

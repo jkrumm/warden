@@ -117,6 +117,11 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
   9. Once a day, one digest message with up to three sections: signatures
      that matched no policy rule, STATE_NOTE rows (see step 3), and whatever
      step 8 just auto-added this run.
+  10. Push        — the last step of every pass: POST the whole projection
+                   (health, metrics, board, budget, intents) to Argo's
+                   `/warden/snapshot`, because Argo cannot reach this box to
+                   probe it directly. The ledger stays the one source of
+                   truth; Argo only ever holds a pushed-to projection of it.
 
 PROPOSE MAPPINGS — the one LLM call in this file. `config/triage-policy.json`
 was designed to grow only by a human reading the daily unmapped digest and
@@ -220,8 +225,9 @@ tracking is needed) and the card's note IS the whole verdict — the dangling
 item name plus the exact remediation, so no further investigation is needed.
 
 DRY-RUN CONTRACT. `--dry-run` never touches Slack (no chat.postMessage/
-chat.update), never shells out to hermes-cc.sh, and never shells out to `gh`
-— those three are the only externally-visible actions this script can take.
+chat.update), never shells out to hermes-cc.sh, never shells out to `gh`, and
+never pushes to Argo — those four are the only externally-visible actions
+this script can take.
 (`gh` is the newest of them and the only READ-ONLY one: reconcile_operations()
 uses `gh pr view` to ask GitHub whether a merge it lost the answer to
 actually landed. It is still a shell-out to a remote system, so it is named
@@ -274,7 +280,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from clients import github as _github, sideclaw as _sideclaw  # noqa: E402
+from clients import argo as _argo, github as _github, sideclaw as _sideclaw  # noqa: E402
 from clients.errors import (  # noqa: E402
     PolicyError,
     PreconditionError,
@@ -983,11 +989,15 @@ DEFAULT_PROPOSE_MAPPINGS_AGE_DAYS = 7.0
 PROPOSE_UNSURE_COOLDOWN_DAYS = 7.0
 
 # Cheapest reasonable use of a model this file makes: chat_completions, no
-# tools, temperature 0, over the SAME OpenAI-compatible endpoint config.yaml
-# already points gpt-5.6-luna at (api_mode: chat_completions, e.g. the
-# auxiliary blocks around OPENAI_BASE_URL/OPENAI_API_KEY) — never the
-# Responses-API leg the main agent uses (codex_responses), which this file
-# has no reason to touch.
+# tools, over the SAME OpenAI-compatible endpoint config.yaml already points
+# gpt-5.6-luna at (api_mode: chat_completions, e.g. the auxiliary blocks
+# around OPENAI_BASE_URL/OPENAI_API_KEY) — never the Responses-API leg the
+# main agent uses (codex_responses), which this file has no reason to touch.
+# Measured directly against the endpoint: this reasoning model 503s on
+# `max_tokens` ("Use 'max_completion_tokens' instead") and on any non-default
+# `temperature` ("Only the default (1) value is supported") — the same lesson
+# hermes-agent's own config.yaml already recorded for this model family. Strict
+# JSON is enforced by the system prompt and the parse below, not by temperature.
 PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "gpt-5.6-luna")
 
 # Mirrors .env.tpl's own OPENAI_API_KEY ref exactly — never a plaintext key.
@@ -1019,6 +1029,19 @@ _intents_spec = importlib.util.spec_from_file_location("intents", _INTENTS_PATH)
 assert _intents_spec and _intents_spec.loader, "Failed to load scripts/intents.py"
 _intents = importlib.util.module_from_spec(_intents_spec)
 _intents_spec.loader.exec_module(_intents)
+
+# scripts/api.py — same by-path load as ledger.py/intents.py above. Its
+# `health_payload()`/`metrics_payload()`/`board_payload()`/`item_payload()`
+# take an already-open connection and return a plain dict; importing it has
+# no side effect beyond that (its HTTP server only starts behind `main()`'s
+# own `--serve` check under `if __name__ == "__main__"`) — reused here
+# verbatim rather than re-derived, so build_argo_snapshot() and warden-api's
+# own `/health`/`/metrics`/`/board`/`/items` agree by construction.
+_API_PATH = Path(__file__).resolve().parent / "api.py"
+_api_spec = importlib.util.spec_from_file_location("warden_api", _API_PATH)
+assert _api_spec and _api_spec.loader, "Failed to load scripts/api.py"
+_api = importlib.util.module_from_spec(_api_spec)
+_api_spec.loader.exec_module(_api)
 
 
 def drain_intents(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
@@ -4907,6 +4930,22 @@ def _build_propose_mappings_prompt(candidates: list[sqlite3.Row], repo_names: li
     return "\n".join(lines)
 
 
+def _propose_mappings_request_body(prompt: str) -> dict[str, Any]:
+    """The request body `_call_propose_mappings_model` sends, extracted so a
+    test can assert its shape without a network round-trip. `max_completion_
+    tokens`, never `max_tokens`, and NO `temperature` key at all — see
+    PROPOSE_MAPPINGS_MODEL's own comment for the measured 503s that make
+    both of those non-negotiable on this endpoint."""
+    return {
+        "model": PROPOSE_MAPPINGS_MODEL,
+        "messages": [
+            {"role": "system", "content": "You output strict JSON only — no prose, no markdown fences."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_completion_tokens": PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS,
+    }
+
+
 def _call_propose_mappings_model(prompt: str) -> dict[str, Any] | None:
     """The ONLY LLM call in this file. One request, strict JSON, hard-bounded
     on every axis this loop can bound (timeout, output tokens, and the
@@ -4921,15 +4960,7 @@ def _call_propose_mappings_model(prompt: str) -> dict[str, Any] | None:
         print("triage: propose_mappings — OPENAI_BASE_URL/OPENAI_API_KEY unresolved, skipping",
               file=sys.stderr)
         return None
-    body = json.dumps({
-        "model": PROPOSE_MAPPINGS_MODEL,
-        "messages": [
-            {"role": "system", "content": "You output strict JSON only — no prose, no markdown fences."},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS,
-        "temperature": 0,
-    }).encode()
+    body = json.dumps(_propose_mappings_request_body(prompt)).encode()
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/chat/completions",
         data=body,
@@ -5259,6 +5290,156 @@ def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], un
     conn.commit()
 
 
+# --- Argo push --------------------------------------------------------------
+#
+# Argo (the dashboard on the VPS) cannot reach this box — there is no tailnet
+# door onto warden-api's loopback-only bind (see scripts/api.py's own
+# docstring) — so the mini pushes its own projection to Argo instead of Argo
+# pulling it. `POST /warden/snapshot` is being built in parallel on the Argo
+# side; until it deploys, every push here 404s, which push_argo_snapshot()
+# logs as a plain status line, never a failed tick.
+
+ARGO_SNAPSHOT_ITEMS_CAP = 50
+
+# `rejected/` is never cleaned (intents.py's own "nothing is silently
+# discarded" docstring) — so unlike `pending`, which drains to near-zero
+# every pass, `rejected` only ever grows. Without a per-status cap here the
+# whole snapshot — health/metrics/board included, not just intents — would
+# eventually cross clients.argo.MAX_BODY_BYTES and Argo would silently stop
+# receiving ANY of it. `pending`/`rejected` below stay full, honest counts;
+# only `entries` (the per-file detail) is capped.
+ARGO_SNAPSHOT_INTENTS_CAP = 20
+
+
+def _argo_intents_snapshot() -> dict[str, Any]:
+    """The spooled-intent state Argo cannot otherwise see: files still
+    waiting for this loop's own drain (INTENTS_DIR), and files a previous
+    drain already rejected (parked in `intents.REJECTED_SUBDIR`, never
+    deleted — see intents.py's own docstring). Reads the spool directly,
+    the same glob drain_intents()'s own --dry-run branch already uses.
+
+    Never ships `signature`/`nonce` — the two fields that carry authority in
+    an `approval_decision` intent — and never ships a rejected file's `.err`
+    content at all: `intents.py`'s own validators embed the raw offending
+    value (a fake signature, a nonce) directly in that exception text (see
+    `_validate_approval_decision()`), so even a single line of it is not
+    safe to publish. `has_error` (a bool) is all a rejected entry carries
+    about its own failure."""
+    pending_dir = _intents.INTENTS_DIR
+    rejected_dir = pending_dir / _intents.REJECTED_SUBDIR
+
+    def _entry(path: Path, *, status: str) -> dict[str, Any]:
+        try:
+            intent = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            intent = {}
+        entry: dict[str, Any] = {
+            "file": path.name,
+            "kind": intent.get("kind"),
+            "created_at": intent.get("created_at"),
+            "source": intent.get("source"),
+            "status": status,
+        }
+        if "decision" in intent:
+            entry["decision"] = intent["decision"]
+        if status == "rejected":
+            entry["has_error"] = path.with_name(path.name + ".err").exists()
+        return entry
+
+    def _files(directory: Path) -> list[Path]:
+        return [p for p in directory.glob("*.json") if p.is_file()] if directory.exists() else []
+
+    def _newest_first(paths: list[Path]) -> list[Path]:
+        # mtime, not the filename's own timestamp prefix: drain() moves a
+        # rejected file with os.replace(), which preserves the original
+        # spool name (and its lexical/chronological order) but this is a
+        # SEPARATE directory being read fresh each pass, so mtime is the one
+        # honest "most recently landed here" ordering for either directory.
+        return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    pending_files = _files(pending_dir)
+    rejected_files = _files(rejected_dir)
+    pending_entries = [
+        _entry(p, status="pending")
+        for p in _newest_first(pending_files)[:ARGO_SNAPSHOT_INTENTS_CAP]
+    ]
+    rejected_entries = [
+        _entry(p, status="rejected")
+        for p in _newest_first(rejected_files)[:ARGO_SNAPSHOT_INTENTS_CAP]
+    ]
+    return {
+        "pending": len(pending_files),
+        "rejected": len(rejected_files),
+        "entries": pending_entries + rejected_entries,
+        "entriesTruncated": (
+            len(pending_files) > ARGO_SNAPSHOT_INTENTS_CAP or len(rejected_files) > ARGO_SNAPSHOT_INTENTS_CAP
+        ),
+    }
+
+
+def build_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime) -> dict[str, Any]:
+    """The whole payload POSTed to Argo's `/warden/snapshot` after every
+    pass. Every section reuses api.py's own builders verbatim (health_
+    payload/metrics_payload/board_payload/item_payload) rather than
+    re-deriving them — a second definition of "what /board counts" is
+    exactly the drift this repo's dispatch-policy/verdict-schema comments
+    already refuse. `items` carries full detail for only the first
+    `ARGO_SNAPSHOT_ITEMS_CAP` board items (already ORDER BY updated_at DESC),
+    keyed by event_id as a string (JSON object keys are always strings)."""
+    board = _api.board_payload(conn)
+    board_items = board["items"][:ARGO_SNAPSHOT_ITEMS_CAP]
+    items = {str(item["event_id"]): _api.item_payload(conn, item["event_id"]) for item in board_items}
+
+    limits = _policy.limits_from_env()
+    counts = _policy.budget_counts(conn, now)
+
+    return {
+        "machine": os.environ.get("WARDEN_MACHINE", "mini"),
+        "generatedAt": _now_iso(now),
+        "health": _api.health_payload(conn),
+        "metrics": _api.metrics_payload(conn),
+        "board": board,
+        "budget": _policy.budget_json(counts, limits),
+        "items": items,
+        "itemsTruncated": len(board["items"]) > ARGO_SNAPSHOT_ITEMS_CAP,
+        "intents": _argo_intents_snapshot(),
+    }
+
+
+def push_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> str:
+    """The last step of every pass. Builds the snapshot fresh — nothing here
+    is cached across ticks — then either reports what it WOULD push (dry-run:
+    never touches the network, same posture as every other outward-facing
+    step in this file) or actually pushes it, logging exactly one stderr
+    line either way. Building AND encoding the snapshot are both wrapped in
+    one try (a non-serializable field must fail the same way a builder bug
+    does — `"build-failed"`, logged, never raised — even under --dry-run,
+    which still needs a real byte count to report); the push itself is
+    wrapped too, defensively, even though `clients.argo.push_snapshot()`'s
+    own contract is never-raise — this loop must not depend on that contract
+    holding to finish a tick."""
+    try:
+        snapshot = build_argo_snapshot(conn, now)
+        body = json.dumps(snapshot).encode()
+    except Exception as e:  # noqa: BLE001 — building/encoding the projection must never fail the tick
+        print(f"triage: argo push — build failed: {e}", file=sys.stderr)
+        return "build-failed"
+
+    item_count = len(snapshot["items"])
+    if dry_run:
+        print(f"triage: argo push — dry-run, would push {len(body)} bytes ({item_count} items)",
+              file=sys.stderr)
+        return "dry-run"
+
+    try:
+        status = _argo.push_snapshot(snapshot)
+    except Exception as e:  # noqa: BLE001 — defensive: the client contract is never-raise
+        print(f"triage: argo push — client raised: {e}", file=sys.stderr)
+        return "client-error"
+    print(f"triage: argo push — {status} ({len(body)} bytes, {item_count} items)", file=sys.stderr)
+    return status
+
+
 # --- the loop --------------------------------------------------------------
 
 def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
@@ -5324,6 +5505,10 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     # No timestamp argument, deliberately — see record_heartbeat().
     record_heartbeat(conn, dry_run=dry_run)
+
+    # Step 10 — the last step of every pass. See push_argo_snapshot()'s own
+    # docstring and this module's docstring, step 10.
+    push_argo_snapshot(conn, now, dry_run=dry_run)
     return 0
 
 

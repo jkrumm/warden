@@ -27,7 +27,7 @@ S  reads observability/alerts/*.json, returns typed verdict
    nextAction=implement, confidence=high
 W  auto-implement (no human: case 1 fails - scoped; case 4 FIRES - see below)
 S  opens draft PR
-W  validate on a different model (opus-5, on Max)
+W  validate: a sideclaw review job, a typed verdict from a second session (model per sideclaw's routing)
 W  merge if every changed path is inside observability/**
 W  deploy: ssh vps -- make hyperdx-apply ENV=prod
 W  verify: re-read live thresholds; must match the merged diff

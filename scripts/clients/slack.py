@@ -24,11 +24,11 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Any
+
+from .secrets import resolve_secret
 
 SLACK_POST_URL = "https://slack.com/api/chat.postMessage"
 
@@ -45,7 +45,6 @@ def slack_api_base() -> str:
 # always used: the gateway's own env var first (set when this runs inside
 # it), then the offline secrets-run cache (safe headless — see
 # ~/.claude/CLAUDE.md § Secrets, "never `op read`/`op run` on the mini").
-_SECRETS_RUN = Path.home() / ".local" / "bin" / "secrets-run"
 _SLACK_TOKEN_REF = "op://hermes/slack/bot-token"
 
 
@@ -53,20 +52,9 @@ def resolve_slack_token() -> str:
     """`SLACK_BOT_TOKEN` env first, else `secrets-run read op://hermes/slack/
     bot-token` with a 15s timeout. "" on any failure — a caller decides
     whether a missing token is fatal or best-effort, this function never
-    does."""
-    val = os.environ.get("SLACK_BOT_TOKEN", "")
-    if val:
-        return val
-    env = os.environ.copy()
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
-    try:
-        r = subprocess.run(
-            [str(_SECRETS_RUN), "read", _SLACK_TOKEN_REF],
-            capture_output=True, text=True, timeout=15, env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
+    does. Thin wrapper over `clients.secrets.resolve_secret()`, the resolver
+    every plain-HTTP client in this package shares."""
+    return resolve_secret("SLACK_BOT_TOKEN", _SLACK_TOKEN_REF)
 
 
 def slack_post_message(token: str, channel: str, text: str,

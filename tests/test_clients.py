@@ -26,7 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
-from clients import github, rollout, signer, sideclaw  # noqa: E402
+from clients import argo, github, rollout, signer, sideclaw  # noqa: E402
 from clients import slack as clients_slack  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError  # noqa: E402
 
@@ -1084,6 +1084,173 @@ def test_shim_reexports_same_objects():
     module.resolve_slack_token = lambda: "patched"
     assert clients_slack.resolve_slack_token is original
     assert module.resolve_slack_token() == "patched"
+
+
+# --- argo (the loop's own push to the Argo dashboard) --------------------------
+
+class _FakeArgoResp:
+    def __init__(self, status: int, body: bytes = b"{}"):
+        self.status = status
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def _with_fake_urlopen(fn):
+    """Patch `argo.urllib.request.urlopen` for the duration of the `with`
+    block, restoring it on exit — no real network in any of these tests."""
+
+    class _Ctx:
+        def __enter__(self):
+            self.saved = argo.urllib.request.urlopen
+            argo.urllib.request.urlopen = fn
+            return self
+
+        def __exit__(self, *_a):
+            argo.urllib.request.urlopen = self.saved
+            return False
+
+    return _Ctx()
+
+
+def test_push_snapshot_201_is_ok_and_carries_bearer_and_body():
+    captured: dict[str, Any] = {}
+
+    def _fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeArgoResp(201)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.push_snapshot({"machine": "mini"}, token="test-token")
+
+    assert status == "ok", status
+    req = captured["req"]
+    assert req.get_header("Authorization") == "Bearer test-token", req.headers
+    assert req.get_header("Content-type") == "application/json", req.headers
+    assert json.loads(req.data.decode()) == {"machine": "mini"}
+
+
+def test_push_snapshot_http_error_404():
+    def _fake_urlopen(req, timeout=None):
+        raise argo.urllib.error.HTTPError(req.full_url, 404, "not found", None, None)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.push_snapshot({}, token="test-token")
+    assert status == "http-error:404", status
+
+
+def test_push_snapshot_url_error_is_network_error():
+    def _fake_urlopen(req, timeout=None):
+        raise argo.urllib.error.URLError("connection refused")
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.push_snapshot({}, token="test-token")
+    assert status == "network-error", status
+
+
+def test_push_snapshot_empty_token_is_no_secret_with_no_network_call():
+    called = {"n": 0}
+
+    def _fake_urlopen(req, timeout=None):
+        called["n"] += 1
+        return _FakeArgoResp(201)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.push_snapshot({}, token="")
+    assert status == "no-secret", status
+    assert called["n"] == 0
+
+
+def test_push_snapshot_oversize_is_too_large_with_no_network_call():
+    called = {"n": 0}
+
+    def _fake_urlopen(req, timeout=None):
+        called["n"] += 1
+        return _FakeArgoResp(201)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.push_snapshot({"data": "x" * (argo.MAX_BODY_BYTES + 10)}, token="test-token")
+    assert status == "too-large", status
+    assert called["n"] == 0
+
+
+def test_push_snapshot_non_serializable_payload_is_encode_error_with_no_network_call():
+    called = {"n": 0}
+
+    def _fake_urlopen(req, timeout=None):
+        called["n"] += 1
+        return _FakeArgoResp(201)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.push_snapshot({"bad": object()}, token="test-token")
+    assert status == "encode-error", status
+    assert called["n"] == 0
+
+
+# --- clients.secrets — the shared env-then-secrets-run resolver ----------------
+
+def test_secrets_resolve_secret_env_var_first():
+    from clients import secrets as clients_secrets
+    os.environ["TEST_WARDEN_SECRET_ENV"] = "from-env"
+    try:
+        assert clients_secrets.resolve_secret("TEST_WARDEN_SECRET_ENV", "op://x/y/z") == "from-env"
+    finally:
+        os.environ.pop("TEST_WARDEN_SECRET_ENV", None)
+
+
+def test_secrets_resolve_secret_falls_back_to_secrets_run():
+    from clients import secrets as clients_secrets
+    stub = _tmp_secrets_run("from-secrets-run")
+    saved = clients_secrets._SECRETS_RUN
+    clients_secrets._SECRETS_RUN = stub
+    os.environ.pop("TEST_WARDEN_SECRET_ENV_2", None)
+    try:
+        assert clients_secrets.resolve_secret("TEST_WARDEN_SECRET_ENV_2", "op://x/y/z") == "from-secrets-run"
+    finally:
+        clients_secrets._SECRETS_RUN = saved
+
+
+def test_secrets_resolve_secret_empty_on_failure():
+    from clients import secrets as clients_secrets
+    stub = _tmp_secrets_run("ignored", exit_code=1)
+    saved = clients_secrets._SECRETS_RUN
+    clients_secrets._SECRETS_RUN = stub
+    os.environ.pop("TEST_WARDEN_SECRET_ENV_3", None)
+    try:
+        assert clients_secrets.resolve_secret("TEST_WARDEN_SECRET_ENV_3", "op://x/y/z") == ""
+    finally:
+        clients_secrets._SECRETS_RUN = saved
+
+
+def test_slack_and_argo_resolvers_delegate_to_shared_secrets_module():
+    from clients import secrets as clients_secrets
+    assert argo._ARGO_TOKEN_REF == "op://common/api/SECRET"
+    assert clients_slack._SLACK_TOKEN_REF == "op://hermes/slack/bot-token"
+
+    calls: list[tuple[str, str]] = []
+
+    def _fake_resolve(env_var, ref, *, timeout=15.0):
+        calls.append((env_var, ref))
+        return "stub-token"
+
+    saved = clients_secrets.resolve_secret
+    argo.resolve_secret = _fake_resolve
+    clients_slack.resolve_secret = _fake_resolve
+    try:
+        assert argo.resolve_argo_token() == "stub-token"
+        assert clients_slack.resolve_slack_token() == "stub-token"
+    finally:
+        argo.resolve_secret = saved
+        clients_slack.resolve_secret = saved
+    assert ("ARGO_API_SECRET", "op://common/api/SECRET") in calls
+    assert ("SLACK_BOT_TOKEN", "op://hermes/slack/bot-token") in calls
 
 
 # --- runner --------------------------------------------------------------------

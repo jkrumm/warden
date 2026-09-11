@@ -188,6 +188,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         ("_github", "create_issue_comment"): triage._github.create_issue_comment,
         ("_merge", "plan_or_land"): triage._merge.plan_or_land,
         ("_approvals", "execute_approved"): triage._approvals.execute_approved,
+        ("_argo", "push_snapshot"): triage._argo.push_snapshot,
     }
     prev_deny = _RESOLVE_REPO_DENY["deny"]
     # NOT part of `saved` above: the spool lives on triage._intents, not on
@@ -249,6 +250,17 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage.post_blocks = _fake_post
         triage.update_blocks = _fake_update
 
+        # Never a real network call for the Argo push either — every test in
+        # this file that runs a full pass would otherwise reach out to
+        # https://argo.jkrumm.com. Records each pushed payload on `ctx.argo_pushes`.
+        argo_pushes: list[dict[str, Any]] = []
+
+        def _fake_push_snapshot(payload, *, token=None, timeout=15.0):
+            argo_pushes.append(payload)
+            return "ok"
+
+        triage._argo.push_snapshot = _fake_push_snapshot
+
         conn = triage.db_connect()
 
         class Ctx:
@@ -256,6 +268,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
                 self.posted = posted
                 self.updated = updated
                 self.tmp_dir = tmp_dir
+                self.argo_pushes = argo_pushes
 
             def total_calls(self) -> int:
                 return len(self.posted) + len(self.updated)
@@ -4018,6 +4031,18 @@ def test_deploy_on_merge_liveness_confirmed_produces_a_fixed_row():
 
 # --- propose_mappings() — the one LLM call in this file ---------------------
 
+def test_propose_mappings_request_body_has_no_max_tokens_or_temperature():
+    """Measured directly against the endpoint: this reasoning model 503s on
+    `max_tokens` and on any non-default `temperature` — see
+    PROPOSE_MAPPINGS_MODEL's own comment. `max_completion_tokens` is the
+    replacement; `temperature` must not be sent at all."""
+    body = triage._propose_mappings_request_body("a prompt")
+    assert body["model"] == triage.PROPOSE_MAPPINGS_MODEL
+    assert body["max_completion_tokens"] == triage.PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS
+    assert "max_tokens" not in body
+    assert "temperature" not in body
+
+
 def test_propose_candidates_age_reads_the_signature_not_the_row():
     """Age must come from the payload's ts_first, not events.first_seen.
 
@@ -4289,6 +4314,114 @@ def test_propose_mappings_dry_run_makes_zero_calls():
         applied = triage.propose_mappings(conn, policy, NOW, dry_run=True)
         assert applied == []
         assert calls["n"] == 0, "--dry-run must never call the model"
+
+
+# --- Argo push — the loop's own projection, pushed after every pass -----------
+
+_ARGO_SNAPSHOT_REQUIRED_KEYS = {
+    "machine", "generatedAt", "health", "metrics", "board", "budget",
+    "items", "itemsTruncated", "intents",
+}
+
+
+def test_run_calls_argo_push_exactly_once_with_full_payload():
+    with _triage_env() as (conn, ctx):
+        assert triage.run(conn, dry_run=False) == 0
+        assert len(ctx.argo_pushes) == 1, f"expected exactly one push, got {len(ctx.argo_pushes)}"
+        payload = ctx.argo_pushes[0]
+        assert _ARGO_SNAPSHOT_REQUIRED_KEYS <= set(payload), sorted(payload)
+
+
+def test_run_dry_run_never_calls_argo_push():
+    with _triage_env() as (conn, ctx):
+        assert triage.run(conn, dry_run=True) == 0
+        assert ctx.argo_pushes == [], "a --dry-run pass must never push to Argo"
+
+
+def test_argo_push_client_raising_does_not_fail_the_tick():
+    """Defensive: `clients.argo.push_snapshot()`'s own contract is
+    never-raise, but the loop must not depend on that contract holding."""
+    with _triage_env() as (conn, _ctx):
+        def _raising_push(payload, *, token=None, timeout=15.0):
+            raise RuntimeError("boom")
+
+        triage._argo.push_snapshot = _raising_push
+        assert triage.run(conn, dry_run=False) == 0, "a raising client must never fail the tick"
+
+
+def test_build_argo_snapshot_includes_open_item_timeline():
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="argo-item", title="Argo item",
+                             first_seen=VERY_OLD)
+        triage.ingest(conn, NOW)
+        snapshot = triage.build_argo_snapshot(conn, NOW)
+        assert str(eid) in snapshot["items"], sorted(snapshot["items"])
+        detail = snapshot["items"][str(eid)]
+        assert "transitions" in detail
+        assert detail["item"]["event_id"] == eid
+
+
+def _write_intent_file(directory: Path, name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(json.dumps({
+        "v": 1, "kind": "approval_decision", "created_at": NOW.isoformat(), "source": "test",
+        "nonce": "deadbeef", "decision": "approve", "decided_by": "test", "signature": "ab" * 32,
+    }))
+    return path
+
+
+def test_argo_intents_snapshot_caps_entries_but_keeps_full_counts():
+    """25 rejected files must never grow the pushed snapshot without bound —
+    `rejected/` is never cleaned, so without a cap it eventually crosses
+    clients.argo.MAX_BODY_BYTES and Argo stops receiving health/metrics/board
+    too, not just intents."""
+    with _triage_env() as (conn, _ctx):
+        rejected_dir = triage._intents.INTENTS_DIR / triage._intents.REJECTED_SUBDIR
+        for i in range(25):
+            _write_intent_file(rejected_dir, f"intent-{i:03d}.json")
+
+        snapshot = triage.build_argo_snapshot(conn, NOW)
+        intents = snapshot["intents"]
+        assert intents["rejected"] == 25, intents["rejected"]
+        assert intents["pending"] == 0, intents["pending"]
+        assert len(intents["entries"]) == 20, len(intents["entries"])
+        assert intents["entriesTruncated"] is True
+
+
+def test_argo_intents_snapshot_never_ships_err_content():
+    """`intents.py`'s own validators embed the raw offending value (a fake
+    signature, a nonce) directly in the exception text a rejected file's
+    `.err` sibling carries — this must never reach the pushed payload, not
+    even truncated to one line. Only `has_error` (a bool) may."""
+    with _triage_env() as (conn, _ctx):
+        rejected_dir = triage._intents.INTENTS_DIR / triage._intents.REJECTED_SUBDIR
+        path = _write_intent_file(rejected_dir, "intent-bad.json")
+        fake_signature = "deadfeed" * 8
+        (rejected_dir / f"{path.name}.err").write_text(
+            f"ValueError: intent field 'signature' must be hex, got {fake_signature!r} (bad)\n"
+        )
+
+        snapshot = triage.build_argo_snapshot(conn, NOW)
+        entries = snapshot["intents"]["entries"]
+        assert len(entries) == 1
+        assert entries[0]["status"] == "rejected"
+        assert entries[0]["has_error"] is True
+        assert "error" not in entries[0]
+        assert fake_signature not in json.dumps(snapshot), "a raw signature must never reach the pushed payload"
+
+
+def test_push_argo_snapshot_non_serializable_field_is_build_failed_not_a_crash():
+    for dry in (False, True):
+        with _triage_env() as (conn, ctx):
+            saved_build = triage.build_argo_snapshot
+            triage.build_argo_snapshot = lambda conn, now: {"bad": object()}
+            try:
+                status = triage.push_argo_snapshot(conn, NOW, dry_run=dry)
+            finally:
+                triage.build_argo_snapshot = saved_build
+            assert status == "build-failed", (dry, status)
+            assert ctx.argo_pushes == [], "an unserializable snapshot must never reach the client"
 
 
 def test_heartbeat_written_on_every_pass_including_an_idle_one():
