@@ -1330,6 +1330,12 @@ except Exception:  # pragma: no cover - defensive: keep triage.py independently 
 
 
 def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, str | None]:
+    """Second element is Slack's own `ts` on success, or Slack's own `error`
+    string (e.g. `cant_update_message`) on a Slack-side rejection — `None`
+    only for a transport/parse failure that never got a Slack response to
+    read an error out of. `sync_card()` reads this to decide whether a
+    failed `chat.update` is the specific, recoverable "wrong app identity"
+    case worth reposting over, rather than parsing stderr."""
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=body,
@@ -1343,8 +1349,10 @@ def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, st
         return False, None
     ok = bool(data.get("ok"))
     if not ok:
-        print(f"triage: slack call failed: {data.get('error', 'unknown')}", file=sys.stderr)
-    return ok, data.get("ts")
+        error = data.get("error", "unknown")
+        print(f"triage: slack call failed: {error}", file=sys.stderr)
+        return False, error
+    return True, data.get("ts")
 
 
 def post_blocks(channel: str, blocks: list[dict[str, Any]], text_fallback: str, token: str, *,
@@ -3855,7 +3863,20 @@ def sync_card(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: 
               f"{[m['signature'] for m in members]}", file=sys.stderr)
         return members
     if primary["card_ts"]:
-        ok, ts = update_blocks(channel, primary["card_ts"], blocks, fallback, token)
+        ok, result = update_blocks(channel, primary["card_ts"], blocks, fallback, token)
+        if not ok and result == "cant_update_message":
+            # Slack refuses chat.update across app identities — the old
+            # card was posted by a different app than the one holding
+            # `token` now (e.g. a pre-cutover Hermes-posted card, Warden's
+            # token now seeded). Post a fresh card instead of leaving this
+            # cluster stuck re-failing the same update every pass. Anything
+            # threaded under the old card (remind_needs_human()'s
+            # reminders) is orphaned — Slack has no "move a thread" call —
+            # so those replies are simply lost.
+            print(f"triage: cant_update_message for cluster {[m['signature'] for m in members]} "
+                  f"(old card_ts {primary['card_ts']}) — reposting as a new card", file=sys.stderr)
+            ok, result = post_blocks(channel, blocks, fallback, token)
+        ts = result
     else:
         ok, ts = post_blocks(channel, blocks, fallback, token)
     if not ok:
@@ -5572,10 +5593,17 @@ def remind_needs_human(conn: sqlite3.Connection, policy: dict[str, Any], now: dt
             print(f"triage: no Slack token, cannot post reminder for {row['signature']}", file=sys.stderr)
             continue
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}}]
-        ok, _ts = post_blocks(row["card_channel"] or _card_channel(policy), blocks, text, token,
-                               thread_ts=row["card_ts"])
+        ok, result = post_blocks(row["card_channel"] or _card_channel(policy), blocks, text, token,
+                                  thread_ts=row["card_ts"])
         if not ok:
-            print(f"triage: reminder post failed for {row['signature']}", file=sys.stderr)
+            # Same treatment as sync_card()'s cant_update_message case, one
+            # level down: a thread reply under a card this app cannot see
+            # (cant_update_message/message_not_found — the parent was
+            # reposted under a new ts, or predates this app entirely) is
+            # skipped, logged, and never counted as a reminder — there is no
+            # "post under the new card instead," the whole point of a
+            # reminder is being threaded under the specific card it answers.
+            print(f"triage: reminder post failed for {row['signature']}: {result}", file=sys.stderr)
             continue
         conn.execute(
             "UPDATE triage_items SET reminder_count=reminder_count+1, last_reminder_at=?, updated_at=? "

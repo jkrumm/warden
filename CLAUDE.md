@@ -44,7 +44,9 @@ not built yet.
 Slack delivery from the loop is a **plain HTTP client** (`chat.postMessage` /
 `chat.update` with a token from `resolve_slack_token()`), never the gateway's live
 `slack_bolt` connection. That is what makes a gateway-independent agent safe, and
-it is not an implementation detail — it is the property.
+it is not an implementation detail — it is the property. It posts under warden's
+own Slack app identity, falling back to Hermes's token until that app is seeded —
+see `slack/README.md` for creating and seeding it.
 
 ## Running it
 
@@ -83,7 +85,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **242/242**. Any other number is a
+`tests/test_triage.py` is the regression gate at **244/244**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,

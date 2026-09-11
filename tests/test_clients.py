@@ -13,6 +13,8 @@ Run: .venv/bin/python3 tests/test_clients.py
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import stat
@@ -56,6 +58,24 @@ def _tmp_secrets_run(token: str, *, exit_code: int = 0) -> Path:
         f"exit {exit_code}\n",
         encoding="utf-8",
     )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def _tmp_secrets_run_by_ref(by_ref: dict[str, str]) -> Path:
+    """Like `_tmp_secrets_run()` but branches on the `read <ref>` argument
+    (called as `[secrets-run, "read", ref]` — `$2` in the script below) so a
+    single stub can answer differently per op:// ref, the shape
+    `resolve_slack_token()`'s two-tier resolution needs to be exercised for
+    real rather than through a monkeypatched `resolve_secret`. A ref with no
+    entry exits non-zero, matching `resolve_secret()`'s own "" on failure."""
+    d = Path(tempfile.mkdtemp(prefix="clients-secrets-multi-"))
+    script = d / "secrets-run"
+    lines = ["#!/bin/sh", 'ref="$2"']
+    for ref, token in by_ref.items():
+        lines.append(f'if [ "$ref" = "{ref}" ]; then echo "{token}"; exit 0; fi')
+    lines.append("exit 1")
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return script
 
@@ -1233,14 +1253,19 @@ def test_slack_and_argo_resolvers_delegate_to_shared_secrets_module():
     from clients import secrets as clients_secrets
     assert argo._ARGO_TOKEN_REF == "op://common/api/SECRET"
     assert clients_slack._SLACK_TOKEN_REF == "op://hermes/slack/bot-token"
+    assert clients_slack._WARDEN_SLACK_TOKEN_REF == "op://common/slack/WARDEN_BOT_TOKEN"
 
     calls: list[tuple[str, str]] = []
 
     def _fake_resolve(env_var, ref, *, timeout=15.0):
         calls.append((env_var, ref))
-        return "stub-token"
+        # Warden's own pair resolves empty here so resolve_slack_token() falls
+        # through to the Hermes pair — exercising both legs of its own
+        # resolution order through this one shared fake, same as before.
+        return "" if env_var == "WARDEN_SLACK_BOT_TOKEN" else "stub-token"
 
     saved = clients_secrets.resolve_secret
+    saved_warned = clients_slack._warned_hermes_fallback
     argo.resolve_secret = _fake_resolve
     clients_slack.resolve_secret = _fake_resolve
     try:
@@ -1249,8 +1274,66 @@ def test_slack_and_argo_resolvers_delegate_to_shared_secrets_module():
     finally:
         argo.resolve_secret = saved
         clients_slack.resolve_secret = saved
+        clients_slack._warned_hermes_fallback = saved_warned
     assert ("ARGO_API_SECRET", "op://common/api/SECRET") in calls
+    assert ("WARDEN_SLACK_BOT_TOKEN", "op://common/slack/WARDEN_BOT_TOKEN") in calls
     assert ("SLACK_BOT_TOKEN", "op://hermes/slack/bot-token") in calls
+
+
+def test_resolve_slack_token_prefers_warden_env_over_everything():
+    """`WARDEN_SLACK_BOT_TOKEN` in the env short-circuits before secrets-run
+    is even consulted for either identity — the cheapest, most direct override
+    a caller (or a test) can give it."""
+    os.environ["WARDEN_SLACK_BOT_TOKEN"] = "warden-env-token"
+    os.environ.pop("SLACK_BOT_TOKEN", None)
+    try:
+        assert clients_slack.resolve_slack_token() == "warden-env-token"
+    finally:
+        os.environ.pop("WARDEN_SLACK_BOT_TOKEN", None)
+
+
+def test_resolve_slack_token_prefers_warden_ref_over_hermes_fallback():
+    """Neither env var set: secrets-run resolves Warden's own ref
+    (`op://common/slack/WARDEN_BOT_TOKEN`) before the Hermes fallback ref is
+    ever tried — a seeded Warden app always wins, unconditionally."""
+    from clients import secrets as clients_secrets
+    stub = _tmp_secrets_run_by_ref({
+        clients_slack._WARDEN_SLACK_TOKEN_REF: "warden-ref-token",
+        clients_slack._SLACK_TOKEN_REF: "hermes-ref-token",
+    })
+    saved = clients_secrets._SECRETS_RUN
+    clients_secrets._SECRETS_RUN = stub
+    os.environ.pop("WARDEN_SLACK_BOT_TOKEN", None)
+    os.environ.pop("SLACK_BOT_TOKEN", None)
+    try:
+        assert clients_slack.resolve_slack_token() == "warden-ref-token"
+    finally:
+        clients_secrets._SECRETS_RUN = saved
+
+
+def test_resolve_slack_token_falls_back_to_hermes_and_warns_once():
+    """Warden's identity unresolved on both env and ref: falls back to the
+    Hermes token unchanged, and prints exactly one stderr line for it no
+    matter how many times resolve_slack_token() is called in this process —
+    the module-level `_warned_hermes_fallback` guard, not a per-call print."""
+    from clients import secrets as clients_secrets
+    stub = _tmp_secrets_run_by_ref({clients_slack._SLACK_TOKEN_REF: "hermes-ref-token"})
+    saved_bin = clients_secrets._SECRETS_RUN
+    saved_warned = clients_slack._warned_hermes_fallback
+    clients_secrets._SECRETS_RUN = stub
+    clients_slack._warned_hermes_fallback = False
+    os.environ.pop("WARDEN_SLACK_BOT_TOKEN", None)
+    os.environ.pop("SLACK_BOT_TOKEN", None)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            assert clients_slack.resolve_slack_token() == "hermes-ref-token"
+            assert clients_slack.resolve_slack_token() == "hermes-ref-token"
+    finally:
+        clients_secrets._SECRETS_RUN = saved_bin
+        clients_slack._warned_hermes_fallback = saved_warned
+    lines = [l for l in buf.getvalue().splitlines() if "Slack posting as Hermes" in l]
+    assert len(lines) == 1, buf.getvalue()
 
 
 # --- runner --------------------------------------------------------------------

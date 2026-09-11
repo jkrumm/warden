@@ -34,6 +34,8 @@ help:
 	@echo "  make status    what is loaded, what ran last, is the ledger reachable"
 	@echo "  make agents    (re)load the LaunchAgents from launchd/"
 	@echo "  make unload    unload the LaunchAgents"
+	@echo "  make slack-app-create SLACK_CONFIG_TOKEN=xoxe-...           create the Warden Slack app"
+	@echo "  make slack-app-update SLACK_CONFIG_TOKEN=xoxe-... APP_ID=... update it — see slack/README.md"
 
 .PHONY: setup
 setup: venv render-plists agents
@@ -208,3 +210,28 @@ status:
 	else \
 		echo "absent ($(WARDEN_HOME)/warden.db)"; \
 	fi
+
+# ---------------------------------------------------------------------------
+# Slack app identity
+# ---------------------------------------------------------------------------
+
+# See slack/README.md for the full flow (owner steps, token seeding). The app
+# configuration token is human-only and 12-hour-lived — it lives only in this
+# shell's argv for the one curl call below and is never written to disk.
+
+.PHONY: slack-app-create
+slack-app-create:
+	@[ -n "$(SLACK_CONFIG_TOKEN)" ] || { echo "warden: SLACK_CONFIG_TOKEN not set — see slack/README.md"; exit 1; }
+	@curl -s -X POST https://slack.com/api/apps.manifest.create \
+		-H "Authorization: Bearer $(SLACK_CONFIG_TOKEN)" -H 'content-type: application/json' \
+		-d "$$(jq -n --slurpfile m "$(WARDEN_REPO)/slack/app-manifest.json" '{manifest: $$m[0]}')" \
+		| jq '{ok, app_id, error}'
+
+.PHONY: slack-app-update
+slack-app-update:
+	@[ -n "$(SLACK_CONFIG_TOKEN)" ] || { echo "warden: SLACK_CONFIG_TOKEN not set — see slack/README.md"; exit 1; }
+	@[ -n "$(APP_ID)" ] || { echo "warden: APP_ID not set — e.g. make slack-app-update APP_ID=A0123456789"; exit 1; }
+	@curl -s -X POST https://slack.com/api/apps.manifest.update \
+		-H "Authorization: Bearer $(SLACK_CONFIG_TOKEN)" -H 'content-type: application/json' \
+		-d "$$(jq -n --arg id "$(APP_ID)" --slurpfile m "$(WARDEN_REPO)/slack/app-manifest.json" '{app_id: $$id, manifest: $$m[0]}')" \
+		| jq '{ok, error}'

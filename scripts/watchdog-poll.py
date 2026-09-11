@@ -196,9 +196,12 @@ _CACHE_REFS: dict[str, str] = {
     "GITHUB_TOKEN": "op://hermes/github/token",
     "HOMELAB_API_KEY": "op://common/api/SECRET",
     "UPTIME_PUSH_WATCHDOG": "op://hermes/uptime-kuma/watchdog-push-url",
-    # Same ref triage.py's resolve_slack_token() uses (_SLACK_TOKEN_REF) — kept
-    # in sync by hand, the same way that file's own Slack helpers are hand-
-    # mirrored rather than imported (see its "Reused, not reimplemented" note).
+    # The Hermes fallback ref triage.py's resolve_slack_token() also carries
+    # (its _SLACK_TOKEN_REF) — kept in sync by hand, the same way that file's
+    # own Slack helpers are hand-mirrored rather than imported (see its
+    # "Reused, not reimplemented" note). Used here ONLY through
+    # resolve_alerts_read_token() below, never through resolve_slack_token()'s
+    # own Warden-first resolution — see that function's docstring for why.
     "SLACK_BOT_TOKEN": "op://hermes/slack/bot-token",
 }
 
@@ -217,6 +220,20 @@ def _resolve_ref(ref: str) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def resolve_alerts_read_token() -> str:
+    """Pinned to the Hermes identity — env `SLACK_BOT_TOKEN`, else
+    `secrets-run read op://hermes/slack/bot-token` — deliberately never
+    Warden's own app (`scripts/clients/slack.py`'s `resolve_slack_token()`,
+    which now tries Warden's `WARDEN_BOT_TOKEN` first). The digest this
+    poller composes summarizes Slack history read via the homelab API
+    (`poll_slack_messages()`, `HOMELAB_API_KEY`, itself proxying to Slack's
+    own `conversations.history` with read scopes Warden's `chat:write`-only
+    app does not have and is not meant to), so posting that digest under a
+    second identity would fragment one feed across two apps for zero
+    benefit — this whole read-then-digest path stays Hermes end to end."""
+    return resolve_secret("SLACK_BOT_TOKEN")
 
 
 def resolve_secret(key: str) -> str:
@@ -1575,7 +1592,7 @@ def main(argv: list[str] | None = None) -> int:
             # unnoticed in the first place. The retiring wrapper pinged on rc == 0
             # regardless of whether a body was printed, and that is the behaviour.
             if body:
-                token = resolve_secret("SLACK_BOT_TOKEN")
+                token = resolve_alerts_read_token()
                 if not token:
                     print("watchdog: no Slack token, cannot post digest", file=sys.stderr)
                     return 1

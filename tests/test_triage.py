@@ -1966,6 +1966,23 @@ def test_op_refs_raw_fallback_dedups_across_timestamps():
     assert key3 == key4
 
 
+def test_watchdog_poll_alerts_read_token_pinned_to_hermes():
+    """resolve_alerts_read_token() (the digest post that follows reading
+    #alerts/#updates via the homelab API's own Hermes-authenticated proxy)
+    must stay pinned to the Hermes identity — unlike
+    scripts/clients/slack.py's resolve_slack_token(), a Warden env var must
+    have zero effect on it. A Warden app with chat:write/chat:write.public
+    only cannot read history at all, so mixing identities on this one path
+    would silently break it rather than just relabel it."""
+    os.environ["WARDEN_SLACK_BOT_TOKEN"] = "should-never-be-read-here"
+    os.environ["SLACK_BOT_TOKEN"] = "hermes-alerts-token"
+    try:
+        assert watchdog_poll.resolve_alerts_read_token() == "hermes-alerts-token"
+    finally:
+        os.environ.pop("WARDEN_SLACK_BOT_TOKEN", None)
+        os.environ.pop("SLACK_BOT_TOKEN", None)
+
+
 def test_unknown_verb_key_is_rejected_at_policy_load():
     """A policy rule must never be able to name an arbitrary command — only
     a key in the code-side VERB_ALLOWLIST is accepted."""
@@ -5301,6 +5318,44 @@ def test_sync_card_never_posts_a_first_card_for_any_never_carded_terminal_state(
             event = triage._get_event(conn, eid)
             triage.sync_card(conn, [item], [event], DEFAULT_POLICY, dry_run=False)
         assert ctx.total_calls() == 0, "a never-carded state must never post a first card"
+
+
+def test_sync_card_reposts_as_new_card_on_cant_update_message():
+    """Slack refuses `chat.update` on a message a DIFFERENT app posted
+    (`cant_update_message`) — e.g. an old card carded under Hermes's
+    identity, this pass holding Warden's token. sync_card() must not get
+    stuck re-failing the same update every pass: it posts a fresh card
+    instead, stores the NEW ts (never the stale one), and names the
+    cluster and the old ts on stderr rather than failing silently. Anything
+    threaded under the old card is lost — see the docstring, not re-tested
+    here since Slack has no API to prove a thread was orphaned."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-cant-update", title="x", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        conn.execute(
+            "UPDATE triage_items SET card_channel=?, card_ts=?, card_hash=? WHERE event_id=?",
+            ("C0TESTCHAN01", "999.999999", "stale-hash-forces-a-sync", eid),
+        )
+        conn.commit()
+        item = triage._get_item(conn, eid)
+        event = triage._get_event(conn, eid)
+
+        def _fake_update_cant_update_message(channel, ts, blocks, text_fallback, token):
+            return False, "cant_update_message"
+
+        triage.update_blocks = _fake_update_cant_update_message
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            triage.sync_card(conn, [item], [event], DEFAULT_POLICY, dry_run=False)
+
+        assert len(ctx.posted) == 1, "must repost as a new card rather than give up"
+        assert len(ctx.updated) == 0, "the failed update must not itself count as a call"
+        new_item = triage._get_item(conn, eid)
+        assert new_item["card_ts"] == ctx.posted[0]["ts"]
+        assert new_item["card_ts"] != "999.999999", "must store the NEW ts, never the stale one"
+        stderr_text = buf.getvalue()
+        assert "cant_update_message" in stderr_text
+        assert "999.999999" in stderr_text, "must name the old ts on stderr"
 
 
 # =============================================================================

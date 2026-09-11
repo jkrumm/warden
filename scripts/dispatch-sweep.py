@@ -13,9 +13,12 @@ infrastructure a control-plane sweeper cannot depend on staying up (it was
 found in a reconnect loop the day this changed). It now calls
 scripts/slack_client.py's `slack_post_message()` directly: plain `urllib`
 over HTTPS, the exact same client scripts/triage.py already used for its
-own cards, no subprocess, no gateway. The message still posts as Hermes's
-own Slack bot user (same `op://hermes/slack/bot-token`) — see WAKE-UP NUDGE
-below for why that still matters.
+own cards, no subprocess, no gateway. The message posts under Warden's own
+Slack app identity (`op://common/slack/WARDEN_BOT_TOKEN` — see
+slack/README.md) once seeded, falling back to Hermes's bot user (same
+`op://hermes/slack/bot-token` as before) until then — `resolve_slack_token()`
+tries Warden first, unconditionally, everywhere it's called. See WAKE-UP
+NUDGE below for why the Hermes case specifically still matters.
 
 WHAT IT DOES, one pass: read every dispatch row with `reported_at IS NULL`
 (watchdog.db's `dispatches` table, owned by scripts/hermes-cc.sh — see
@@ -59,10 +62,16 @@ the process died between "sent" and "recorded." An occasional duplicate
 message in a thread is a cosmetic annoyance; a lost verdict is the thing
 Phase 3 exists to prevent.
 
-WAKE-UP NUDGE. The verdict above is posted as Hermes's own Slack bot user —
-and Slack ingest unconditionally drops Hermes's own messages (echo-loop
-protection), so nothing wakes the agent when an episode finishes. For an
-*actionable* dispatch (done, implement tier, has an artifact URL, not
+WAKE-UP NUDGE. This existed because the verdict above used to post
+unconditionally as Hermes's own Slack bot user, and Slack ingest
+unconditionally drops Hermes's own messages (echo-loop protection), so
+nothing woke the agent when an episode finished. That is still exactly true
+during the Hermes-fallback window (Warden's own token unseeded — see
+DELIVERY TRANSPORT above); once Warden's identity is live the verdict posts
+as a distinct app the echo filter never sees, which may make this nudge
+redundant for that case — a hermes-agent-side question, out of this repo's
+scope, and harmless to leave running either way (best-effort, never raises).
+For an *actionable* dispatch (done, implement tier, has an artifact URL, not
 already merged — see is_actionable()), this script additionally posts a
 short nudge through argo's Slack API, which posts as the HomeLab bot — a
 different user Hermes does ingest — strictly AFTER `reported_at` is

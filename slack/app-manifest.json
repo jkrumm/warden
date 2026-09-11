@@ -1,0 +1,23 @@
+{
+  "display_information": {
+    "name": "Warden",
+    "description": "Warden control plane — triage cards, remediation receipts and reminders post under this identity",
+    "background_color": "#4a154b"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Warden",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["chat:write", "chat:write.public"]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

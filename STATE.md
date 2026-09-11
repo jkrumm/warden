@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-11 (§60) |
+| Last updated | 2026-09-11 (§61) |
 | Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 9 |
-| Tests | `tests/test_triage.py` 242/242 is the gate; `make test` runs all suites |
+| Tests | `tests/test_triage.py` 244/244 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -56,6 +56,12 @@ loop.
   (`SIDECLAW_MODEL_REVIEW`/`SIDECLAW_MODEL_DISPATCH` in sideclaw's `.env`).
 - Slack delivery is a plain HTTP client (`chat.postMessage`/`chat.update`),
   never the gateway's live `slack_bolt` connection.
+- Cards, receipts and reminders post under warden's own Slack app identity
+  (`resolve_slack_token()` tries `op://common/slack/WARDEN_BOT_TOKEN` first),
+  falling back to Hermes's bot user until that app is created and seeded —
+  `slack/README.md` has the owner steps. The read path (`#alerts`/`#updates`
+  history in `watchdog-poll.py`) stays pinned to Hermes's token regardless
+  (`resolve_alerts_read_token()`) — a `chat:write`-only app cannot read.
 - The `#agents` overview digest is retired.
 - sideclaw's published verdict schemas are pinned in
   `scripts/clients/sideclaw.py` (`DISPATCH_SCHEMA_VERSION=2`,
@@ -96,6 +102,7 @@ loop.
 - First field look — §58
 - Autonomy: host verbs, Argo live, GLM routing — §59
 - Closing the queue: reminders, the heartbeat probe, Kuma sync — §60
+- Warden's own Slack identity — §61
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.

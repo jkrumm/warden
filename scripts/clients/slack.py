@@ -16,14 +16,17 @@ mirrors this module by hand rather than importing it — that plugin runs
 inside a different process, in a different repo, and this repo's modules
 are reached by local path, not a package it can depend on.
 
-stdlib only, no logging side effects — every function here either returns
-a value or raises; it never prints. Callers own their own diagnostics.
+stdlib only. Every function here either returns a value or raises and never
+prints, with one deliberate exception: `resolve_slack_token()` prints once
+per process when it falls back off Warden's own identity onto Hermes's — see
+its own docstring. Every other caller still owns its own diagnostics.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 from typing import Any
@@ -41,20 +44,53 @@ def slack_api_base() -> str:
     return os.environ.get("WARDEN_SLACK_API", "https://slack.com/api")
 
 
-# Same secret, same fallback order triage.py's resolve_slack_token() has
-# always used: the gateway's own env var first (set when this runs inside
-# it), then the offline secrets-run cache (safe headless — see
-# ~/.claude/CLAUDE.md § Secrets, "never `op read`/`op run` on the mini").
+# The pre-Warden identity, unchanged: the gateway's own env var first (set
+# when this runs inside it), then the offline secrets-run cache (safe
+# headless — see ~/.claude/CLAUDE.md § Secrets, "never `op read`/`op run` on
+# the mini"). Kept as the FALLBACK below, not the primary — see
+# resolve_slack_token()'s own docstring for why a second identity exists at
+# all and slack/README.md for how it's created and seeded.
 _SLACK_TOKEN_REF = "op://hermes/slack/bot-token"
+
+# Warden's own app (slack/app-manifest.json) — chat:write/chat:write.public
+# only, no incoming-webhook, no socket mode. Tried FIRST so triage cards,
+# remediation receipts and reminders are attributable to Warden rather than
+# riding under the Hermes bot's username.
+_WARDEN_SLACK_TOKEN_REF = "op://common/slack/WARDEN_BOT_TOKEN"
+
+# Printed at most once per process (see resolve_slack_token()) so a
+# still-unseeded Warden app is loud exactly once in cron output rather than
+# once per card.
+_warned_hermes_fallback = False
 
 
 def resolve_slack_token() -> str:
-    """`SLACK_BOT_TOKEN` env first, else `secrets-run read op://hermes/slack/
-    bot-token` with a 15s timeout. "" on any failure — a caller decides
-    whether a missing token is fatal or best-effort, this function never
-    does. Thin wrapper over `clients.secrets.resolve_secret()`, the resolver
-    every plain-HTTP client in this package shares."""
-    return resolve_secret("SLACK_BOT_TOKEN", _SLACK_TOKEN_REF)
+    """Warden's own identity first: env `WARDEN_SLACK_BOT_TOKEN`, else
+    `secrets-run read op://common/slack/WARDEN_BOT_TOKEN`. Falls back,
+    unchanged, to the pre-Warden identity: env `SLACK_BOT_TOKEN`, else
+    `secrets-run read op://hermes/slack/bot-token`. "" on total failure — a
+    caller decides whether a missing token is fatal or best-effort, this
+    function never does.
+
+    Landing on the Hermes fallback prints one stderr line PER PROCESS
+    (`_warned_hermes_fallback` below), not per call — triage.py alone calls
+    this once per card per pass, and a LaunchAgent process lives for exactly
+    one pass, so "once" here already means "once per tick" without a caller
+    having to know that. Thin wrapper over `clients.secrets.resolve_secret()`,
+    the resolver every plain-HTTP client in this package shares."""
+    global _warned_hermes_fallback
+    token = resolve_secret("WARDEN_SLACK_BOT_TOKEN", _WARDEN_SLACK_TOKEN_REF)
+    if token:
+        return token
+    token = resolve_secret("SLACK_BOT_TOKEN", _SLACK_TOKEN_REF)
+    if token and not _warned_hermes_fallback:
+        print(
+            "triage: Slack posting as Hermes — op://common/slack/WARDEN_BOT_TOKEN "
+            "unresolved; see slack/README.md",
+            file=sys.stderr,
+        )
+        _warned_hermes_fallback = True
+    return token
 
 
 def slack_post_message(token: str, channel: str, text: str,

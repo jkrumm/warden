@@ -6667,3 +6667,26 @@ schema 9 by hand; poll and sweep pick it up on their next run.
 Item 996 lands its PR; close uk:220. The first host-verb `fixed` is still
 ahead. A sideclaw host verb for uk:204-shaped crashes, guarded by no
 dispatch in flight. Wave 9 after a few days of this.
+
+## 61. Warden's own Slack identity (2026-09-11, 14:20Z → 14:50Z)
+
+The owner: the VPS, Argo and HomeLab identities were created as their own
+Slack apps through `apps.manifest.create`; warden gets the same. `slack/
+app-manifest.json` (scopes `chat:write`, `chat:write.public`), `slack/
+README.md`, `make slack-app-create SLACK_CONFIG_TOKEN=xoxe-…` and
+`slack-app-update APP_ID=…`, the token never stored.
+
+Token resolution for posting: env `WARDEN_SLACK_BOT_TOKEN` → `op://common/
+slack/WARDEN_BOT_TOKEN` → env `SLACK_BOT_TOKEN` → `op://hermes/slack/
+bot-token`, one stderr line per process while it still posts as Hermes. The
+read path (`watchdog-poll.py`, `#alerts` history) stays pinned to the Hermes
+token by name: a `chat:write`-only app cannot read. `sync_card()` re-posts a
+card when `chat.update` answers `cant_update_message`, which is what happens
+to every Hermes-authored card the first tick after the switch; thread
+replies under the old card are lost, the ledger stores the new `card_ts`.
+
+Owner steps, in `slack/README.md`: mint a config token at api.slack.com/apps,
+run `make slack-app-create`, install in the UI, store the bot token at
+`op://common/slack/WARDEN_BOT_TOKEN`, add the ref to `dotfiles-private/
+headless.refs`, `make secrets-seed` on the MacBook. `tests/test_triage.py`
+244/244, `test_clients.py` 91/91.
