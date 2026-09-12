@@ -1557,7 +1557,17 @@ def main(argv: list[str] | None = None) -> int:
             DB_PATH = original_db
             shutil.rmtree(tmpdir, ignore_errors=True)
     else:
-        conn = db_connect()
+        try:
+            conn = db_connect()
+        except _ledger.LedgerBehind as e:
+            print(
+                f"watchdog: ledger behind this process's schema ({e}) — skipping this pass; "
+                "the loop migrates at its next tick",
+                file=sys.stderr,
+            )
+            if post and not dry_run:
+                _push_uptime_heartbeat()
+            return 0
         all_new, all_rem, all_res = _run_poll(conn, now, env, deliver=deliver)
         conn.commit()
         slack_blind = slack_poll_failure(conn)

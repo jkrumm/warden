@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-12 (§64) |
+| Last updated | 2026-09-12 (§65) |
 | Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
@@ -62,6 +62,16 @@ loop.
   a 60 min ceiling, not one wall-clock timer — a slow glm episode is not a
   wedged one (§64). A dispatch that ends terminal with no verdict folds to
   `needs_human` carrying `dispatches.error`, never into `verdict`.
+- sideclaw's runner reads the result envelope before stderr on a non-zero
+  exit (`6a9325c`, §65): a worker that hits `--max-turns` reports
+  `error_max_turns` and takes the 12-turn salvage retry; the CLI's
+  `unrecognized_model … generate_session_title` stderr line is benign noise on
+  every gateway model and is stripped from constructed errors.
+- A ledger stamped *behind* the process (the window between a schema bump
+  landing and the loop's next tick) raises `ledger.LedgerBehind`; poll and
+  sweep skip the pass with one stderr line and exit 0, the poll still pushing
+  its Kuma heartbeat (§65). A ledger *ahead* of the process stays a loud
+  `RuntimeError`.
 - Slack delivery is a plain HTTP client (`chat.postMessage`/`chat.update`),
   never the gateway's live `slack_bolt` connection.
 - Cards, receipts and reminders post under warden's own Slack app, `warden`
@@ -83,6 +93,18 @@ loop.
 
 ## Carried debt
 
+- Item 253 sits in `verdict` with no verdict (folded before §64); its 24 h
+  deadline moves it to `needs_human` at 2026-09-13 05:00Z. Left alone.
+- `AUTO_DISPATCH_MODEL` (`triage.py`) is a hand copy of sideclaw
+  `routing.ts`'s `GLM_FLASH` with no `make check-*` behind it — the one
+  unchecked cross-repo pin (§65).
+- Small duplicated helpers inside warden (Slack POST ×3, `_now_iso` ×5,
+  secrets resolution ×5, `_parse_pr_url` ×2) and `agents-overview.py` in
+  hermes-agent still rendering the retired `#agents` digest — mapped in §65,
+  consolidation deferred to Wave 9. Dead code: none (AST-verified).
+- sideclaw never persists a worker's Claude session id to `jobs.db` and never
+  `--resume`s; a forced restart mid-dispatch lands `interrupted` →
+  `needs_human`. Zero such events measured so far (§65).
 - sideclaw `fallow` fails at HEAD — pre-existing, not this repo's.
 - Cost per Warden item is a usage-tracker query on `sub_tool` now that
   sideclaw tags every session (`sideclaw:<tool>`, §60); the ledger join is
@@ -110,13 +132,17 @@ loop.
 - MacBook field report folded in: PAT was never gated, repo bundle — §62
 - Warden Slack app live — §63
 - A killed episode is not a verdict: idle watchdog, `dispatches.error` — §64
+- The consolidation look: max_turns misreported, the deploy window, the
+  audit, the comparison — §65
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-`needs_human` is 0; item 996 landed (meteo master 95d3e3b, watchdog
+`needs_human` is 1: item 1007, the owner's consolidation brief, answered by
+§65 (a session, not an episode — a brief that shape exceeds the investigate
+tier's 25 turns by design); dismiss it from the card. Item 996 landed (meteo master 95d3e3b, watchdog
 105/105, Kuma 220 UP with `degraded: true`). Owner: nothing. Loop: the first host-verb `fixed` is still ahead — the three hermes
 items resolved as `quiet` before the heartbeat probe landed; a sideclaw host
 verb for uk:204-shaped crashes, guarded by no dispatch in flight; the ledger

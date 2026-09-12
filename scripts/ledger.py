@@ -65,6 +65,12 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # `make check-schemas` — two independent pins that must never be conflated.
 LEDGER_SCHEMA_VERSION = 10
 
+
+class LedgerBehind(RuntimeError):
+    """The ledger is older than this process's schema and the loop has not
+    migrated it yet — a transient, expected state during a deploy, never a
+    data hazard."""
+
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
 # needs to answer; "is it at the version this process expects, right now" is
@@ -768,12 +774,15 @@ def assert_schema_version(conn: sqlite3.Connection) -> None:
         # a caller that passed an explicit `path=` (a test, a --db override) would
         # otherwise get an error naming the wrong file.
         db_file = conn.execute("PRAGMA database_list").fetchone()["file"]
-        raise RuntimeError(
+        message = (
             f"warden ledger at {db_file} is at schema_version={version}, this process expects "
             f"LEDGER_SCHEMA_VERSION={LEDGER_SCHEMA_VERSION}. Only the loop (triage.py, via `connect(migrate=True)`) "
             "is allowed to migrate this file — run it at least once, or if this ledger has already been "
             "migrated past this process's version, upgrade this process before pointing it here."
         )
+        if version < LEDGER_SCHEMA_VERSION:
+            raise LedgerBehind(message)
+        raise RuntimeError(message)
 
 
 def connect(

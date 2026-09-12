@@ -6861,3 +6861,142 @@ survived, `warden-20260909T121018Z.db` (the genuine oldest) was pruned instead,
 and seven are retained. This is also the answer to a question nobody had asked
 yet — there is still no restore path, and now there is at least something
 current to restore FROM.
+
+## 65. The consolidation look: the failed brief, the deploy window, and what the rest is made of (2026-09-12, 09:13Z → 12:30Z)
+
+Item 1007 was the owner's own voice-transcribed brief — consolidate warden,
+compare it with the other agent control planes, clean up, sharpen the
+lifecycle — sent through `warden run warden` at 09:13Z. sideclaw's investigate
+episode ran eleven minutes on `glm-5.3-flash`, did real work (29 Bash calls
+against the ledger, two fetches, a web search), and failed with
+
+```
+Session exited with code 1. stderr: [claude-code:unrecognized_model]
+{"model":"glm-5.3-flash","query_source":"generate_session_title"}
+```
+
+§64's fold worked exactly as built: `needs_human`, `dispatches.error` carrying
+that text. The text was wrong, and that is this section's first finding.
+
+**The stderr line is noise; the cause was `--max-turns 25`.** The CLI's own
+transcript ends on `{"attachment":{"type":"max_turns_reached","maxTurns":25,
+"turnCount":26}}` 184 ms before exit. The `unrecognized_model` line is the
+CLI's session-title helper complaining about a non-Claude model name — 88
+occurrences in `sideclaw.jsonl`, including the two dispatches that succeeded
+right before (jobs `35c9dd64`, `42b07613`, exit 0, full cost records). The
+runner's `exitCode !== 0` branch returned before ever reading the result
+envelope it had already parsed, built `error` from whatever stderr was
+buffered, and so `isSalvageable()`'s `max_turns` regex — written for exactly
+this case — never matched. Eleven minutes discarded, no 12-turn salvage retry.
+Fixed in sideclaw `6a9325c`: the envelope's `subtype` wins (`error_max_turns`),
+`noOutput` is set so the salvage path fires, known-benign stderr lines are
+stripped from constructed errors and kept in the raw debug log, and the
+model's own `result` text is deliberately *not* folded into `error` — that
+string feeds the reactive fallback classifier and a `needs_human` card, and a
+brief is attacker-influenceable.
+
+The turn budget itself is not the defect. Alert-shaped investigations took 13
+and 17 turns. A brief of item 1007's shape — read the whole repo, research
+four external products, produce a plan — is not an investigate episode and
+should not be sent as one; it is a session, which is what answered it.
+
+**Every schema bump pages Kuma.** Item 815's verdict (the one real product of
+the morning, glm, `confidence: high`) diagnosed it precisely: `watchdog-poll.py`
+and `dispatch-sweep.py` call `assert_schema_version()` at `db_connect()` and
+crash with a traceback whenever `LEDGER_SCHEMA_VERSION` runs ahead of the file —
+the window between a commit landing and the loop's next 600 s tick. The poll
+never reaches `_push_uptime_heartbeat()`, so "Hermes Watchdog - Push" fires,
+becomes an item, and gets dispatched. Schema 7→8 on 09-11 and 9→10 on 09-12
+both did this; the second produced item 815's own re-investigation. A deploy
+that alarms on itself and then spends an episode explaining why.
+
+Fixed here: `ledger.LedgerBehind(RuntimeError)`, raised only when the file is
+*older* than the process (the plain `RuntimeError` for a stale process stays
+loud). Poll and sweep catch it, print one stderr line, exit 0; the poll still
+pushes its Kuma heartbeat under `--post` because that monitor measures "is the
+poller alive", not "did the ledger open". `warden-api` still restarts into the
+window under `KeepAlive` — `ThrottleInterval` bounds it, `/health` reads
+unreachable for at most one loop interval, accepted.
+
+**Pre-§64 leftover.** Item 253 (`homelab`, dispatch `c7d73a1c` failed under the
+old wall-clock timer) still sits in `verdict` with no verdict — it was folded
+before §64 landed and nothing re-folds a settled row. Its 24 h deadline expires
+it to `needs_human` at 2026-09-13 05:00Z. Left alone: hand-editing the ledger
+for one row is worse than the row.
+
+**Unknown localhost client.** `warden-api.err` holds 19 739 `GET / → 404` from
+`127.0.0.1`, one every ~7 s from 2026-09-10 22:06 local to 2026-09-12 11:18
+local, then nothing. Nothing in dotfiles, sideclaw, hermes-agent or argo names
+port 7735 except this repo; a 12 s `lsof` catch found no client. Not
+harmful; noted so a return is recognised.
+
+**What the code is made of** (AST audit over 344 module-level defs, all of
+`scripts/` and `tests/`):
+
+- Dead code: none. Zero unreferenced defs, zero test-only survivors, no
+  `_v2`/`_legacy` variants, no always-on flag. A grep-based pass reports ~60
+  false positives because docstrings here name sibling functions in prose;
+  audit this repo with AST or not at all.
+- Duplication inside warden, all small, all real: the Slack POST transport
+  three times (`triage._slack_call`, `watchdog-poll._slack_call`,
+  `clients/slack.py`); `_now_iso` five times under three semantics
+  (`intents`, `ledger`, `lifecycle/operations` identical; `lifecycle/items`
+  and `triage` take an argument and differ); secrets resolution five times
+  (`clients/secrets.py` is the shared one; `watchdog-poll`, `dispatch-sweep`,
+  `clients/github`, `warden.py` each carry their own); `_parse_pr_url` twice;
+  `_apply_db_override` twice; the dispatch-verdict rendering ladder twice by
+  its own admission (`watchdog-summary.py:47`). `watchdog-summary.py:118` opens
+  the ledger with a raw `sqlite3.connect(mode=ro)` past `ledger.connect()`.
+- `triage.py` is 6658 lines, 84 defs, and 961 of its first lines carry three
+  of them. Two regions are 35 % of the file: evidence gathering + escalation
+  (2479–3449) and operations/crash recovery (4095–5448).
+- warden ↔ hermes-agent: the extraction is clean — no `.py` twin remains, only
+  stale `__pycache__`. `hermes-agent/scripts/agents-overview.py` (763 lines) is
+  the retired `#agents` digest renderer, still alive, still referenced from
+  the morning-briefing prompt, and it carries copies of `_resolve_ref`,
+  `resolve_slack_token`, `post_blocks`, `_escape`. `warden.py` is a structural
+  Python port of `hermes-ops.sh`'s front matter (`redact`, `audit`,
+  `require_backend`, `run_plan`, `cmd_status`), same names in two languages.
+- warden ↔ sideclaw: verdict schema pinned and drift-checked (`make
+  check-schemas`); repo allowlist deliberately two-sided and drift-checked
+  (`check-dispatch-policy.py`); idle/ceiling timers live only in sideclaw.
+  **The one unchecked copy is `AUTO_DISPATCH_MODEL = "glm-5.3-flash"`** against
+  `routing.ts`'s `GLM_FLASH` — a value with no `make check-*` behind it.
+
+**Redeploy survival**, the owner's other worry: already mostly true. sideclaw's
+`make reload` polls `/api/jobs/health` and refuses while a job runs unless
+`FORCE=1`; the normal path is `POST /api/shutdown` with a ~50 min drain. All 13
+reloads in the retained log carried `killedWorkers:0`; zero `interrupted` rows
+exist. When a worker *is* killed, `check`/`review` get one re-run from scratch,
+`dispatch` lands `interrupted` with its worktree bundled to
+`~/.local/state/sideclaw/salvage/`, and warden folds it to `needs_human` — no
+retry anywhere, by §64's decision. The gap is that the worker's Claude
+`sessionId` reaches only the usage-tracker log, never `jobs.db`; `--resume` is
+used nowhere. Durable resumption across a forced restart is buildable — persist
+the id, keep the worktree, resume on boot — and is not yet needed by any
+measured event.
+
+**The comparison** (research-gateway, 171 pages, `status: ok`). Mastra Factory
+is beta, `@mastra/factory` 0.14.0, board-owned gates through `defineBoard()`
+(triage → plan → build → review → completion), LibSQL storage adapter — the
+same lifecycle shape as ours with a UI and a supervisor agent on top. Factory
+Droid's `droid exec` has session continuation and JSON-RPC progress but no
+managed auto-merge. Jules exposes `AWAITING_PLAN_APPROVAL` as a real API state.
+Copilot's cloud agent hard-caps a session at 59 min and cannot merge its own
+PR. Every one of them keeps merge as a separate, explicit gate under branch
+protection; none exposes a stuck-vs-slow classifier — that is always the
+caller's ledger, from heartbeats and deadlines. The vendor-neutral consensus is
+what DESIGN.md already says: SQLite owns truth and policy, runners own
+execution, GitHub owns the last gate. Nothing there to adopt as a dependency;
+two things worth stealing — an explicit *plan-approval* state for
+`implement`-tier human briefs (Jules), and the per-episode record of runner
+version + base SHA + session id (everyone) which we have only in
+usage-tracker.
+
+**Decisions this § does not make**, left for Wave 9 as designed: whether to
+lift duplicated helpers into `clients/` (mechanical, ~200 lines, zero
+behaviour), whether to split `triage.py` along its two big regions, whether to
+retire `agents-overview.py` in hermes-agent, whether to add
+`make check-routing` for the model pin, and whether to persist the session id
+in sideclaw. None is blocked on evidence except the last, which is blocked on
+an interruption ever happening.

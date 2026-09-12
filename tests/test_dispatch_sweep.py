@@ -714,6 +714,46 @@ def main() -> int:
         check(f"pruned dispatches.error: {label}", cond)
     pruned_error_ok = sum(1 for _, cond in pruned_error_checks if cond)
 
+    # --- ledger behind this process's schema: skip the pass, exit 0 --------
+    #
+    # A ledger stamped one version behind (the window between a
+    # LEDGER_SCHEMA_VERSION bump landing and the loop's next 600s migration
+    # tick) must never crash the sweeper or process any row — it waits for
+    # the loop, quietly, and says so once on stderr.
+    import contextlib
+    import io as _io
+
+    ledger_behind_checks: list[tuple[str, bool]] = []
+    tmpdb6 = Path(_tempfile.mkdtemp(prefix="dispatch-sweep-behind-")) / "watchdog.db"
+    orig_db6, orig_process = dispatch_sweep.DB_PATH, dispatch_sweep.process_dispatch
+    process_calls: list[str] = []
+    try:
+        dispatch_sweep.DB_PATH = tmpdb6
+        conn = dispatch_sweep._ledger.connect(tmpdb6, migrate=True)
+        conn.execute(
+            "UPDATE schema_version SET version = ?",
+            (dispatch_sweep._ledger.LEDGER_SCHEMA_VERSION - 1,),
+        )
+        conn.commit(); conn.close()
+
+        def fake_process_dispatch(conn, row, *, dry_run):
+            process_calls.append(row["job_id"])
+        dispatch_sweep.process_dispatch = fake_process_dispatch
+
+        stderr = _io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = dispatch_sweep.main([])
+        err = stderr.getvalue()
+        ledger_behind_checks.append(("main() returns 0", rc == 0))
+        ledger_behind_checks.append(("stderr names the skip", "ledger behind this process's schema" in err))
+        ledger_behind_checks.append(("stderr is a single line", err.count("\n") <= 1))
+        ledger_behind_checks.append(("process_dispatch was never called", process_calls == []))
+    finally:
+        dispatch_sweep.DB_PATH, dispatch_sweep.process_dispatch = orig_db6, orig_process
+    for label, cond in ledger_behind_checks:
+        check(f"ledger behind: {label}", cond)
+    ledger_behind_ok = sum(1 for _, cond in ledger_behind_checks if cond)
+
     print(f"unmerged byte-identical      {unmerged_ok}/{unmerged_cases}")
     print(f"merged rendering             {merged_ok}/{len(merged_checks)}")
     print(f"garbage merged_at            {garbage_ok}/{len(garbage_checks)}")
@@ -729,6 +769,7 @@ def main() -> int:
     print(f"review-tier rows              {review_ok}/{len(review_checks)}")
     print(f"dispatches.error              {error_ok}/{len(error_checks)}")
     print(f"pruned dispatches.error       {pruned_error_ok}/{len(pruned_error_checks)}")
+    print(f"ledger behind                 {ledger_behind_ok}/{len(ledger_behind_checks)}")
 
     if failures:
         print("\nFAILURES:")

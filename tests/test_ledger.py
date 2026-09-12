@@ -185,6 +185,34 @@ def test_connect_without_migrate_raises_naming_both_versions():
         assert str(ledger.LEDGER_SCHEMA_VERSION) in msg, msg
 
 
+def test_assert_schema_version_raises_ledger_behind_when_older():
+    conn = ledger.connect(_tmp_path(), migrate=True)
+    conn.execute("UPDATE schema_version SET version = ?", (ledger.LEDGER_SCHEMA_VERSION - 1,))
+    conn.commit()
+    try:
+        ledger.assert_schema_version(conn)
+        raise AssertionError("expected LedgerBehind")
+    except ledger.LedgerBehind as e:
+        assert isinstance(e, RuntimeError), "LedgerBehind must stay a RuntimeError"
+    finally:
+        conn.close()
+
+
+def test_assert_schema_version_raises_plain_runtime_error_when_newer():
+    conn = ledger.connect(_tmp_path(), migrate=True)
+    conn.execute("UPDATE schema_version SET version = ?", (ledger.LEDGER_SCHEMA_VERSION + 1,))
+    conn.commit()
+    try:
+        ledger.assert_schema_version(conn)
+        raise AssertionError("expected RuntimeError")
+    except ledger.LedgerBehind:
+        raise AssertionError("a newer-than-us ledger must not raise LedgerBehind")
+    except RuntimeError:
+        pass
+    finally:
+        conn.close()
+
+
 def test_wal_is_actually_on():
     conn = ledger.connect(_tmp_path(), migrate=True)
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"

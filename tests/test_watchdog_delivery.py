@@ -287,6 +287,34 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("zero Slack calls", len(ctx.posts), 0)
     check("zero heartbeat calls", ctx.heartbeats["n"], 0)
 
+print("\n13. ledger behind this process's schema, --post — pass skipped, heartbeat still fires")
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:
+    behind_conn = sqlite3.connect(ctx.db_path)
+    behind_conn.execute("UPDATE schema_version SET version = ?", (wp._ledger.LEDGER_SCHEMA_VERSION - 1,))
+    behind_conn.commit()
+    behind_conn.close()
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        rc = wp.main(["--post"])
+    check("rc == 0", rc, 0)
+    check("zero Slack calls (pass skipped before delivery)", len(ctx.posts), 0)
+    # The Kuma monitor measures "is the poller alive", not "did the ledger open" —
+    # a pass deliberately skipped during a migration window is a live poller.
+    check("heartbeat still fires", ctx.heartbeats["n"], 1)
+    check("stderr names the skip", "ledger behind this process's schema" in stderr.getvalue(), True)
+
+print("\n14. ledger behind this process's schema, no --post — heartbeat NOT pushed")
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:
+    behind_conn = sqlite3.connect(ctx.db_path)
+    behind_conn.execute("UPDATE schema_version SET version = ?", (wp._ledger.LEDGER_SCHEMA_VERSION - 1,))
+    behind_conn.commit()
+    behind_conn.close()
+
+    rc = wp.main([])
+    check("rc == 0", rc, 0)
+    check("heartbeat NOT pushed without --post", ctx.heartbeats["n"], 0)
+
 print()
 if failures:
     print(f"{len(failures)} failure(s):")

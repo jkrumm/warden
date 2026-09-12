@@ -813,7 +813,15 @@ def main(argv: list[str] | None = None) -> int:
     _apply_db_override(argv)
 
     errors = 0
-    conn = db_connect()
+    try:
+        conn = db_connect()
+    except _ledger.LedgerBehind as e:
+        print(
+            f"dispatch-sweep: ledger behind this process's schema ({e}) — skipping this pass; "
+            "the loop migrates at its next tick",
+            file=sys.stderr,
+        )
+        return 0
     try:
         rows = conn.execute(
             "SELECT * FROM dispatches WHERE reported_at IS NULL ORDER BY id"
