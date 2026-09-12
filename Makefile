@@ -152,6 +152,17 @@ check-schemas:
 	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
 	@"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py"
 
+# The model warden pins for automatic dispatch/review (triage.py's
+# AUTO_DISPATCH_MODEL / TRIAGE_VALIDATION_DISPATCH_MODEL) against what
+# sideclaw's live routing table (server/lib/routing.ts, GET /api/routing)
+# actually routes those tools to — the third copy-with-no-drift-check
+# alongside check-policy and check-schemas, same mould, same honesty rule:
+# unreachable is not a failure, a genuine model mismatch is.
+.PHONY: check-routing
+check-routing:
+	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
+	@"$(PY)" "$(WARDEN_REPO)/scripts/check-routing.py"
+
 .PHONY: status
 status:
 	@echo "warden"
@@ -204,6 +215,8 @@ status:
 	fi
 	@printf '  %-24s ' "sideclaw schemas"; \
 	"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py" 2>&1 | head -1
+	@printf '  %-24s ' "routing"; \
+	"$(PY)" "$(WARDEN_REPO)/scripts/check-routing.py" 2>&1 | head -1
 	@printf '  %-24s ' "ledger"; \
 	if [ -f "$(WARDEN_HOME)/warden.db" ]; then \
 		ls -lh "$(WARDEN_HOME)/warden.db" | awk '{print $$5, $$6, $$7, $$8}'; \

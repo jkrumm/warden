@@ -128,6 +128,11 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   copy is defence in depth; sideclaw's is the boundary. If the two disagree, the
   boundary is quietly allowing something the control plane forbids — they must be
   checked against each other, not assumed to agree.
+- **The dispatch model warden pins (`triage.py`'s `AUTO_DISPATCH_MODEL`) is a
+  third such copy** of a fact sideclaw owns (`server/lib/routing.ts`, `GET
+  /api/routing`) — `make check-routing` catches drift the same way
+  `check-schema-versions.py`/`check-dispatch-policy.py` do for the verdict
+  schema and the allowlist.
 - **Warden may never hold tier ≥ 1 on `sideclaw` or on `warden` itself.**
   Auto-merging PRs against your own executor closes a loop that has no outside.
 - **An episode is not contained.** `readOnly` is three tool names on a CLI flag
