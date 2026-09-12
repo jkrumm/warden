@@ -58,9 +58,9 @@ loop.
   `.env` (§64): `dispatch` on `glm-5.3-flash`/IU (the `AGENT` tier), `review`
   and `otel` held on Sonnet/Max (`JUDGE`), `narrative`/`excalidraw` on
   Sonnet/Max (`PROSE`). Live table: `GET /api/routing`.
-- A sideclaw worker is killed by an idle watchdog (5 min with no stdout) plus
-  a 60 min ceiling, not one wall-clock timer — a slow glm episode is not a
-  wedged one (§64). A dispatch that ends terminal with no verdict folds to
+- A sideclaw worker is killed by an idle watchdog (5 min with no stdout) and
+  nothing else — the 60 min ceiling of §64 went in §66; a slow glm episode is
+  not a wedged one. A dispatch that ends terminal with no verdict folds to
   `needs_human` carrying `dispatches.error`, never into `verdict`.
 - **Workers have no turn limit and no wall-clock ceiling** (sideclaw
   `8459357`, §66): the idle watchdog (no stdout for 5 min) is the only kill
