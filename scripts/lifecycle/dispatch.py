@@ -197,6 +197,7 @@ def open_review(
     pr: int,
     context: str | None,
     origin: Origin,
+    model: str | None = None,
     now: dt.datetime | None = None,
 ) -> Opened:
     """Submit one sideclaw `review` episode and record it in `dispatches`
@@ -211,10 +212,14 @@ def open_review(
     profile, no branch, no PR), so unlike `open_episode()`'s `implement`
     path there is no `operations` row to cover a crash between submit and
     record — a review job with no matching `dispatches` row is, at worst, an
-    orphaned read-only sideclaw session, not an unaccounted mutation."""
+    orphaned read-only sideclaw session, not an unaccounted mutation.
+
+    `model` mirrors `open_episode()`'s own parameter — `None` leaves the job
+    on sideclaw's own routing, a non-Claude IU model id pins it there
+    instead."""
     policy.require_no_recursion()
     now = now or dt.datetime.now(dt.timezone.utc)
-    job = sideclaw.submit_review(cwd=target.path, pr=pr, context=context)
+    job = sideclaw.submit_review(cwd=target.path, pr=pr, context=context, model=model)
     job_id = job["id"]
     status = job.get("status") or "unknown"
     _insert_dispatch_row(conn, job_id=job_id, tier="review", repo=target.name,

@@ -747,6 +747,56 @@ def test_v8_database_migrates_to_v9_matching_a_fresh_one():
     conn.close()
 
 
+def test_migration_10_adds_error_column():
+    """See _MIGRATION_10 — the 2026-09-12 defect (item 253): a terminal
+    dispatch with no verdict must have somewhere to record why. NULL on a
+    fresh database (no dispatch has ever failed yet), same no-backfill
+    contract as every other additive migration in this file."""
+    conn = ledger.connect(_tmp_path(), migrate=True)
+    cols = _table_columns(conn, "dispatches")
+    assert "error" in cols, cols
+    conn.close()
+
+
+def test_v9_database_migrates_to_v10_matching_a_fresh_one():
+    """A real upgrade path, not adoption: a database already stamped at
+    schema_version 9 must reach LEDGER_SCHEMA_VERSION 10 with a schema
+    identical to a fresh database's, and a pre-existing dispatch row must
+    read `error` as NULL — no backfill, a pre-migration failure genuinely has
+    no recorded reason."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    conn.executescript(ledger._MIGRATION_2)
+    conn.executescript(ledger._MIGRATION_3)
+    conn.executescript(ledger._MIGRATION_4)
+    conn.executescript(ledger._MIGRATION_5)
+    conn.executescript(ledger._MIGRATION_6)
+    conn.executescript(ledger._MIGRATION_7)
+    conn.executescript(ledger._MIGRATION_8)
+    conn.executescript(ledger._MIGRATION_9)
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (9, 'test')")
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) "
+        "VALUES ('pre-v10-job','investigate','r','b','failed','2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
+    row = conn.execute("SELECT error FROM dispatches WHERE job_id='pre-v10-job'").fetchone()
+    assert row["error"] is None, row["error"]
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    for table in ledger._VERSIONED_TABLES:
+        assert _table_columns(fresh, table) == _table_columns(conn, table), (
+            f"{table}: a v9-upgraded schema diverges from a fresh one")
+    fresh.close()
+    conn.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
               if name.startswith("test_") and callable(fn)]

@@ -576,10 +576,15 @@ def _mark_pruned(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     # verdict_json is explicitly cleared — there never was one to record, and
     # this is now a genuine status='failed' row indistinguishable from a real
-    # failure except by having no verdict at all.
+    # failure except by having no verdict at all. `error` gets warden's OWN
+    # reason (there is no sideclaw failure text for a job sideclaw itself has
+    # forgotten) — kept consistent with, not a duplicate of, pruned_notice()'s
+    # Slack wording.
     conn.execute(
-        "UPDATE dispatches SET status=?, verdict_json=NULL, finished_at=?, poll_misses=? WHERE job_id=?",
-        (PRUNED_STATUS, now_iso, misses, job_id),
+        "UPDATE dispatches SET status=?, verdict_json=NULL, finished_at=?, poll_misses=?, error=? "
+        "WHERE job_id=?",
+        (PRUNED_STATUS, now_iso, misses,
+         f"sideclaw pruned this job before it reported ({misses} consecutive 404s)", job_id),
     )
     conn.commit()
     stamp: str | None = None
@@ -660,6 +665,11 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
     # reader of this column (and the actionable predicate below) filters on
     # IS NOT NULL / truthiness.
     artifact_url = ((result.get("artifactUrl") if isinstance(result, dict) else None) or "").strip() or None
+    # Same normalization as artifact_url above, for the same reason: triage.py's
+    # fold_dispatch_verdict() (ledger.py migration 10) reads this column to know
+    # WHY a terminal dispatch carries no verdict, and "" vs NULL must not become
+    # two shapes of "no reason recorded".
+    error_text = (str(error).strip() if error else "") or None
 
     # Fold the terminal outcome back into the row and commit it BEFORE any
     # delivery attempt — see the module docstring's crash-safety contract.
@@ -669,13 +679,14 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
         # GitHub projection is a column read, not a JSON parse — the briefing and the
         # watchdog both want "what did this dispatch produce" without unpacking a blob.
         conn.execute(
-            "UPDATE dispatches SET status=?, verdict_json=?, artifact_url=?, finished_at=? "
+            "UPDATE dispatches SET status=?, verdict_json=?, artifact_url=?, finished_at=?, error=? "
             "WHERE job_id=?",
             (
                 status,
                 json.dumps(result) if result is not None else None,
                 artifact_url,
                 now_iso,
+                error_text,
                 job_id,
             ),
         )

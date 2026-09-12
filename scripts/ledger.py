@@ -63,7 +63,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
 # verdict schemas and are asserted per job by assert_result_schema and by
 # `make check-schemas` — two independent pins that must never be conflated.
-LEDGER_SCHEMA_VERSION = 9
+LEDGER_SCHEMA_VERSION = 10
 
 # Single row, updated in place — never a history table. "Which version was
 # this database at three migrations ago" is not a question anything here
@@ -489,6 +489,34 @@ ALTER TABLE triage_items ADD COLUMN reminder_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE triage_items ADD COLUMN last_reminder_at TEXT;
 """
 
+# Version 10 — the 2026-09-12 defect (item 253, `docker_homelab:unhealthy:
+# garmin-collector`): a sideclaw `investigate` episode was killed by a
+# timeout, `verdict_json` was left NULL, and fold_dispatch_verdict() (which
+# never read `dispatches.status`) computed `result = {}` -> `next_action = ""`
+# -> `new_state = STATE_VERDICT` with `note = NULL`. The item parked as a
+# verdict-less verdict, invisible until its 24h deadline, and the ledger held
+# no reason at all — sideclaw's own failure text reached Slack via
+# dispatch-sweep.py's format_message() but was never persisted anywhere.
+# DESIGN.md's "deferral must be visible" is exactly the property this closes.
+#
+#   dispatches.error   sideclaw's terminal failure text verbatim (job.get
+#     ("error") — see clients/sideclaw.py's own job shape), or warden's own
+#     pruned-notice reason for a row _mark_pruned() closes without ever
+#     polling a real answer (dispatch-sweep.py's `_mark_pruned()`). NULL on
+#     every successful dispatch, and NULL on every pre-existing row — no
+#     backfill, because a row that failed before this migration genuinely has
+#     no recorded reason, and inventing one would be worse than admitting the
+#     gap (the same "empty by construction, not zero" rule migrations 4 and 5
+#     already document for their own no-backfill tables).
+#
+# A COLUMN, not a field folded into `verdict_json`: that column is sideclaw's
+# own PUBLISHED verdict schema (see CLAUDE.md § Talking to sideclaw — "the
+# verdict schema is published by sideclaw, not copied here"), and a failed
+# dispatch has no verdict at all to carry a field on. The reason needs
+# somewhere of its own that is not shaped like an answer to a question
+# nobody answered.
+_MIGRATION_10 = """ALTER TABLE dispatches ADD COLUMN error TEXT;"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -499,6 +527,7 @@ MIGRATIONS: dict[int, str] = {
     7: _MIGRATION_7,
     8: _MIGRATION_8,
     9: _MIGRATION_9,
+    10: _MIGRATION_10,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live

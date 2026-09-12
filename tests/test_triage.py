@@ -103,7 +103,7 @@ def _default_fake_get(job_id):
     return None
 
 
-def _default_fake_submit_review(*, cwd, pr, context=None):
+def _default_fake_submit_review(*, cwd, pr, context=None, model=None):
     """The module-level default for `triage._sideclaw.submit_review` inside
     `_triage_env()` — same "an accidental real HTTP call is structurally
     impossible" contract as `_default_fake_submit` above, for the step-7
@@ -338,9 +338,9 @@ def _fake_submit_review(calls: list[dict[str, Any]], *, ok: bool = True):
     replaced the second `investigate` episode on a different model)."""
     counter = {"n": 0}
 
-    def _submit_review(*, cwd, pr, context=None):
+    def _submit_review(*, cwd, pr, context=None, model=None):
         counter["n"] += 1
-        calls.append({"cwd": cwd, "pr": pr, "context": context})
+        calls.append({"cwd": cwd, "pr": pr, "context": context, "model": model})
         if not ok:
             raise triage.RemoteError("test: review dispatch refused")
         job_id = f"review-job-{counter['n']:06d}"
@@ -1466,6 +1466,111 @@ def test_fold_dispatch_verdict_alert_items_still_land_verdict():
         item = triage._get_item(conn, eid)
         assert item["origin"] == "alert" and item["max_tier"] == "implement"
         assert item["state"] == triage.STATE_VERDICT, item["state"]
+
+
+def test_fold_dispatch_verdict_failed_with_no_verdict_lands_needs_human():
+    """The 2026-09-12 defect (item 253, docker_homelab:unhealthy:garmin-
+    collector — see ledger.py migration 10): a killed episode with
+    verdict_json left NULL must never park in `verdict` — it must reach
+    `needs_human` with a note naming the tier and sideclaw's own error text."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-timeout-1",
+                             title="alert timeout", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        job_id = "job-timed-out-1"
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,error,"
+            "created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (job_id, "investigate", "demo-repo", "b", eid, "failed", None,
+             "Session timed out after 480000ms", NOW.isoformat()),
+        )
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job=job_id)
+        conn.commit()
+
+        triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert item["note"], "a failed episode with no verdict must carry a note"
+        assert "investigate" in item["note"], item["note"]
+        assert "Session timed out after 480000ms" in item["note"], item["note"]
+
+
+def test_fold_dispatch_verdict_failed_with_artifact_still_lands_pr_open():
+    """Ordering guard: an implement episode that failed AFTER opening its
+    draft PR must still land in pr_open, never be downgraded to needs_human
+    by the terminal-with-no-verdict branch — the artifact_url check runs
+    first."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-fail-pr-1",
+                             title="alert fail pr", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        job_id = "job-fail-with-pr-1"
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,"
+            "artifact_url,error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (job_id, "implement", "demo-repo", "b", eid, "failed", None,
+             "https://github.com/jkrumm/demo-repo/pull/9", "worker crashed after push",
+             NOW.isoformat()),
+        )
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job=job_id)
+        conn.commit()
+
+        triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_PR_OPEN, item["state"]
+        assert item["artifact_url"] == "https://github.com/jkrumm/demo-repo/pull/9"
+
+
+def test_fold_dispatch_verdict_interrupted_with_real_verdict_folds_normally():
+    """The `not result` guard: an `interrupted` job that nonetheless returned
+    a schema-valid verdict answered the question, and must fold exactly as a
+    `done` job would — not be swept into the failure branch just because its
+    status isn't `done`."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-interrupted-1",
+                             title="alert interrupted", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        job_id = "job-interrupted-1"
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,error,"
+            "created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (job_id, "investigate", "demo-repo", "b", eid, "interrupted",
+             json.dumps({"summary": "found the root cause", "nextAction": "review"}),
+             "cancelled by operator", NOW.isoformat()),
+        )
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job=job_id)
+        conn.commit()
+
+        triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERDICT, item["state"]
+
+
+def test_fold_dispatch_verdict_failed_human_origin_reaches_needs_human_not_closed():
+    """The investigate-ceiling shortcut (origin != alert, max_tier ==
+    investigate) closes a REAL answer as `answered` — it must never fire for
+    a failed episode with no verdict. A human's question whose episode
+    failed must reach a human, not be silently closed."""
+    with _triage_env() as (conn, ctx):
+        eid = triage.open_origin_item(
+            conn, origin="human", repo="demo-repo", brief="what is going on here",
+            max_tier="investigate", external_id="human:failed-1", title="ask", now=NOW,
+        )
+        job_id = "job-human-failed-1"
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,error,"
+            "created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (job_id, "investigate", "demo-repo", "b", eid, "failed", None,
+             "Session timed out after 480000ms", NOW.isoformat()),
+        )
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job=job_id)
+        conn.commit()
+
+        triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert item["state"] != triage.STATE_CLOSED
+        assert item["note"] and "Session timed out after 480000ms" in item["note"], item["note"]
 
 
 def test_ingest_github_go_third_party_issue_gets_investigate_ceiling():

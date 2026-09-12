@@ -290,6 +290,18 @@ def test_submit_review_body_shape():
         srv.stop()
 
 
+def test_submit_review_body_shape_with_model():
+    srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "r3"}})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        sideclaw.submit_review(cwd=Path("/repo"), pr=17, context="ctx", model="glm-5.3-flash")
+        assert srv.requests[0]["body"] == {
+            "tool": "review", "params": {"cwd": "/repo", "pr": 17, "context": "ctx", "model": "glm-5.3-flash"},
+        }, srv.requests[0]["body"]
+    finally:
+        srv.stop()
+
+
 def test_submit_review_omits_context_when_absent():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "r2"}})})
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base

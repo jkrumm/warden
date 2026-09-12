@@ -85,7 +85,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **244/244**. Any other number is a
+`tests/test_triage.py` is the regression gate at **248/248**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -149,6 +149,10 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   for the owner's host-restart decision — DESIGN.md § The host-verb carve-out).
 - **Deferral must be visible.** A budget hit that only reaches a `.err` file is
   indistinguishable from a broken loop.
+- **A dispatch that ends terminal with no verdict is not a verdict.** It folds
+  to `needs_human` carrying `dispatches.error`, never into `verdict` — a
+  verdict-less `verdict` row is the same invisibility in a different column
+  (§64). It is never retried automatically.
 
 ## Cross-repo facts
 

@@ -628,6 +628,92 @@ def main() -> int:
         check(f"review-tier: {label}", cond)
     review_ok = sum(1 for _, cond in review_checks if cond)
 
+    # --- dispatches.error: a terminal failed job persists sideclaw's reason ---
+    #
+    # See ledger.py migration 10 and triage.py's fold_dispatch_verdict() — the
+    # 2026-09-12 defect (item 253) where a timed-out episode's failure text
+    # reached Slack but was never recorded anywhere on the row.
+    error_checks: list[tuple[str, bool]] = []
+    tmpdb4 = Path(_tempfile.mkdtemp(prefix="dispatch-sweep-error-")) / "watchdog.db"
+    orig_db4, orig_poll4, orig_send4 = dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message
+    try:
+        dispatch_sweep.DB_PATH = tmpdb4
+        conn = dispatch_sweep._ledger.connect(tmpdb4, migrate=True)
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_channel) "
+            "VALUES('timed-out-job','investigate','example','b','queued','2026-09-12T00:00:00+00:00','Cerr')")
+        conn.commit(); conn.close()
+
+        def row4(job_id):
+            c = _sqlite3.connect(tmpdb4); c.row_factory = _sqlite3.Row
+            r = c.execute("SELECT * FROM dispatches WHERE job_id=?", (job_id,)).fetchone(); c.close()
+            return r
+
+        dispatch_sweep.poll_job = lambda job_id: {
+            "status": "failed",
+            "error": "Session timed out after 480000ms",
+        }
+        dispatch_sweep.send_message = lambda target, body: (0, "delivered")
+        dispatch_sweep.main([])
+
+        r = row4("timed-out-job")
+        error_checks.append(("terminal failed job persists dispatches.error verbatim",
+                              r["error"] == "Session timed out after 480000ms"))
+        error_checks.append(("terminal failed job status is 'failed'", r["status"] == "failed"))
+
+        # a job that finishes with no error at all persists NULL, not ""
+        conn = dispatch_sweep._ledger.connect(tmpdb4)
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_channel) "
+            "VALUES('clean-done-job','investigate','example','b','queued','2026-09-12T00:00:00+00:00','Cerr')")
+        conn.commit(); conn.close()
+        dispatch_sweep.poll_job = lambda job_id: {
+            "status": "done",
+            "result": {"summary": "ok", "confidence": "high", "nextAction": "none", "evidence": []},
+        }
+        dispatch_sweep.main([])
+        r2 = row4("clean-done-job")
+        error_checks.append(("a clean done job persists error as NULL, not ''", r2["error"] is None))
+    finally:
+        dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message = (
+            orig_db4, orig_poll4, orig_send4)
+    for label, cond in error_checks:
+        check(f"dispatches.error: {label}", cond)
+    error_ok = sum(1 for _, cond in error_checks if cond)
+
+    # --- dispatches.error: a pruned job persists warden's own reason ----------
+    pruned_error_checks: list[tuple[str, bool]] = []
+    tmpdb5 = Path(_tempfile.mkdtemp(prefix="dispatch-sweep-pruned-error-")) / "watchdog.db"
+    orig_db5, orig_poll5, orig_send5 = dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message
+    try:
+        dispatch_sweep.DB_PATH = tmpdb5
+        conn = dispatch_sweep._ledger.connect(tmpdb5, migrate=True)
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_channel) "
+            "VALUES('pruned-error-job','investigate','example','b','queued','2026-09-12T00:00:00+00:00','Cerr2')")
+        conn.commit(); conn.close()
+
+        dispatch_sweep.poll_job = lambda job_id: dispatch_sweep.NOT_FOUND
+        dispatch_sweep.send_message = lambda target, body: (0, "delivered")
+        for _ in range(dispatch_sweep.LOST_AFTER_MISSES):
+            dispatch_sweep.main([])
+
+        def row5(job_id):
+            c = _sqlite3.connect(tmpdb5); c.row_factory = _sqlite3.Row
+            r = c.execute("SELECT * FROM dispatches WHERE job_id=?", (job_id,)).fetchone(); c.close()
+            return r
+
+        r = row5("pruned-error-job")
+        pruned_error_checks.append(("pruned row persists its own reason, naming the miss count",
+                                     bool(r["error"]) and "3 consecutive 404s" in r["error"]))
+        pruned_error_checks.append(("pruned row status is 'failed'", r["status"] == "failed"))
+    finally:
+        dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message = (
+            orig_db5, orig_poll5, orig_send5)
+    for label, cond in pruned_error_checks:
+        check(f"pruned dispatches.error: {label}", cond)
+    pruned_error_ok = sum(1 for _, cond in pruned_error_checks if cond)
+
     print(f"unmerged byte-identical      {unmerged_ok}/{unmerged_cases}")
     print(f"merged rendering             {merged_ok}/{len(merged_checks)}")
     print(f"garbage merged_at            {garbage_ok}/{len(garbage_checks)}")
@@ -641,6 +727,8 @@ def main() -> int:
     print(f"delivery                      {delivery_ok}/{len(delivery_checks)}")
     print(f"checks_failed rendering       {checks_failed_ok}/{len(checks_failed_checks)}")
     print(f"review-tier rows              {review_ok}/{len(review_checks)}")
+    print(f"dispatches.error              {error_ok}/{len(error_checks)}")
+    print(f"pruned dispatches.error       {pruned_error_ok}/{len(pruned_error_checks)}")
 
     if failures:
         print("\nFAILURES:")

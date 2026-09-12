@@ -1154,8 +1154,8 @@ PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "gpt-5.6-luna")
 # `None` instead would land it on sideclaw's own JUDGE route, which is Sonnet
 # over the owner's Claude Max subscription. Manual `warden run --model` calls
 # and Slack approval-click dispatches carry their own model and are
-# unaffected; step-7 review validation has no model knob at all and stays on
-# sideclaw's routing.
+# unaffected; step-7 review validation carries its own knob,
+# TRIAGE_VALIDATION_DISPATCH_MODEL below.
 AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL", "glm-5.3-flash")
 if not AUTO_DISPATCH_MODEL or AUTO_DISPATCH_MODEL.startswith("claude"):
     # A Claude id (or an empty override) would route automatic episodes back
@@ -1163,6 +1163,39 @@ if not AUTO_DISPATCH_MODEL or AUTO_DISPATCH_MODEL.startswith("claude"):
     # Loud, not fatal: the loop must keep ticking, the operator must notice.
     print(f"triage: WARNING TRIAGE_AUTO_DISPATCH_MODEL={AUTO_DISPATCH_MODEL!r} routes automatic "
           "dispatches onto Max — expected a non-Claude IU model id", file=sys.stderr)
+
+# Step-7 review validation (_open_validation_dispatch() below) had no model knob
+# at all and always took sideclaw's own JUDGE route. It now has one — but it
+# deliberately defaults to `None`, i.e. that same JUDGE route, rather than to
+# the cheap tier AUTO_DISPATCH_MODEL uses.
+#
+# Why review is the exception, and it is NOT the same call as implement /
+# investigate: measured 2026-09-11 on this machine, with
+# SIDECLAW_MODEL_REVIEW=glm-5.3-flash a review of a ~1000-line diff looped its
+# senior-dev angle on a single grep/sed for 17 minutes across 80,000+ turns and
+# never produced a synthesis; it was cancelled and the route reverted. Multi-
+# angle review over a large diff is a different workload shape from the 10-task
+# agentic coding suite that scored glm-5.3-flash 10/10 — and it is the one tool
+# where the cheap tier has actually been measured failing. sideclaw's own
+# routing.ts carries the same exclusion and the same reason.
+#
+# The failure shape is the worst available here: `validating` carries a
+# deadline, so a review that never returns lands the item in `merge_blocked`
+# with no signal about why. A non-Claude id additionally drops sideclaw's Max
+# fallback for `review` entirely (Max serves only Claude ids), leaving a failing
+# review nowhere to go. So the knob exists for experimentation — set it once a
+# cheap model has been measured completing a multi-angle review — and until then
+# the default stays on the route that works. Max is a flat subscription, so
+# unlike the implement/investigate lanes this costs nothing per run.
+TRIAGE_VALIDATION_DISPATCH_MODEL = os.environ.get("TRIAGE_VALIDATION_DISPATCH_MODEL") or None
+if TRIAGE_VALIDATION_DISPATCH_MODEL and not TRIAGE_VALIDATION_DISPATCH_MODEL.startswith("claude"):
+    # Inverted relative to AUTO_DISPATCH_MODEL's guard above, on purpose: for
+    # review the cheap tier is the unproven choice, not the safe one. Loud, not
+    # fatal: the loop must keep ticking, the operator must notice.
+    print(f"triage: WARNING TRIAGE_VALIDATION_DISPATCH_MODEL={TRIAGE_VALIDATION_DISPATCH_MODEL!r} routes "
+          "automatic review validation onto a cheap IU model and drops the Max fallback — "
+          "glm-5.3-flash was measured looping without synthesis on a large diff (2026-09-11)",
+          file=sys.stderr)
 
 # Mirrors .env.tpl's own OPENAI_API_KEY ref exactly — never a plaintext key.
 _OPENAI_API_KEY_REF = "op://common/anthropic/API_KEY"
@@ -3904,7 +3937,11 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     sweep for a row already folded — the card_hash short-circuit makes a
     repeat call a no-op. `origin_event_id` is used only as a sanity check
     (the primary member should be among the rows found by job_id); job_id is
-    authoritative for cluster membership.
+    authoritative for cluster membership. "The verdict" here also covers the
+    terminal-with-no-verdict case (a timeout, a kill, a pruned job — see
+    ledger.py migration 10's `dispatches.error`): that folds to
+    STATE_NEEDS_HUMAN with a note naming the tier, the terminal status and
+    sideclaw's own reason, never silently into STATE_VERDICT.
 
     Each member's state transition is its own compare-and-set (`_set_state`'s
     `expect_state=`, read fresh off THIS row right before the write) committed
@@ -3930,14 +3967,34 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
               f"{len(members)} rows sharing dispatch_job {job_id} — proceeding on job_id anyway",
               file=sys.stderr)
     d = conn.execute(
-        "SELECT status, verdict_json, artifact_url FROM dispatches WHERE job_id=?", (job_id,)
+        "SELECT status, verdict_json, artifact_url, tier, error FROM dispatches WHERE job_id=?", (job_id,)
     ).fetchone()
     if d is None:
         return
     result = _safe_json(d["verdict_json"]) if d["verdict_json"] else {}
     next_action = (result.get("nextAction") or "").strip().lower()
     if d["artifact_url"]:
+        # Ordering is load-bearing, checked FIRST: an `implement` episode can
+        # fail AFTER already opening its draft PR (e.g. it degraded partway
+        # through validation) — the artifact exists and still needs a human to
+        # review it, so `pr_open` (which carries its own downstream chain) must
+        # keep winning over the "terminal with no verdict" branch below, not
+        # get downgraded to a plain needs_human that drops the PR link.
         new_state = STATE_PR_OPEN
+    elif d["status"] != "done" and not result:
+        # A dispatch that ended some way OTHER than "done" (failed, interrupted,
+        # cancelled, sideclaw's own pruned-as-failed — see dispatch-sweep.py's
+        # PRUNED_STATUS) AND produced no schema-valid verdict at all — see
+        # ledger.py migration 10 for why `error` exists to answer why. `not
+        # result` is required, not just the status check alone: an
+        # `interrupted` episode that nonetheless returned a real verdict HAS
+        # answered the question, and downgrading it to needs_human here would
+        # throw away a real answer sideclaw actually produced.
+        #
+        # No retry — a failed episode routes to a human. Automatically
+        # retrying a killed/timed-out episode is a separate decision this
+        # migration does not make.
+        new_state = STATE_NEEDS_HUMAN
     elif next_action == "human":
         new_state = STATE_NEEDS_HUMAN
     else:
@@ -3945,6 +4002,14 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     blocker = ""
     if new_state == STATE_NEEDS_HUMAN:
         blocker = (result.get("recommendation") or result.get("summary") or "").strip()
+        if not blocker and not result:
+            # The "terminal, no verdict" branch above: name the tier and the
+            # terminal status so the card reads as a diagnosis, not a blank
+            # needs_human, and cap it the same way SPLIT_VERDICT_NOTE_PREFIX
+            # caps its own verdict text — a long stack trace must not blow up
+            # the Slack card.
+            reason = (d["error"] or "").strip() or "sideclaw recorded no reason"
+            blocker = _cap_brief(f"{d['tier']} episode {d['status']} with no verdict: {reason}")
 
     def _member_state_and_note(m: sqlite3.Row) -> tuple[str, str | None]:
         member_state, member_note = new_state, (blocker or None)
@@ -3956,6 +4021,16 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         # `alert` items are untouched: this branch only ever fires for
         # `new_state == STATE_VERDICT`, and an alert's own verdict still
         # needs maybe_auto_implement() to look at it.
+        #
+        # Also, structurally, why a FAILED episode can never reach this
+        # shortcut: `new_state == STATE_VERDICT` requires a real, schema-valid
+        # `result` (see the "terminal, no verdict" branch above, which routes
+        # a failure straight to STATE_NEEDS_HUMAN before this function is ever
+        # called for that member). A human-origin question whose episode
+        # FAILED must land in front of a human, never be closed here as
+        # "answered" — this gate already guarantees that by construction, but
+        # it is exactly the invariant a future edit to either branch must not
+        # break.
         if new_state == STATE_VERDICT and m["origin"] != "alert" and m["max_tier"] == "investigate":
             summary = (result.get("summary") or result.get("recommendation") or "").strip()
             member_state = STATE_CLOSED
@@ -4883,6 +4958,7 @@ def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: 
         opened = _dispatch.open_review(
             conn, target=target, pr=pr_number, context=None,
             origin=_dispatch.Origin(event_id=event_id),
+            model=TRIAGE_VALIDATION_DISPATCH_MODEL,
         )
     except WardenError as e:
         print(f"triage: validation dispatch failed for {repo}: {e}", file=sys.stderr)

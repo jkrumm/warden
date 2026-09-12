@@ -126,13 +126,15 @@ def submit(
     return job
 
 
-def submit_review(*, cwd: Path, pr: int, context: str | None = None) -> dict[str, Any]:
+def submit_review(*, cwd: Path, pr: int, context: str | None = None, model: str | None = None) -> dict[str, Any]:
     """The `review` counterpart to `submit()` — same transport, error
     handling and `{"job": {...}}` envelope, different tool/params shape
     (`POST /api/jobs {"tool":"review","params":{cwd,pr,context}}`)."""
     params: dict[str, Any] = {"cwd": str(cwd), "pr": pr}
     if context:
         params["context"] = context
+    if model:
+        params["model"] = model
     body = {"tool": "review", "params": params}
 
     try:

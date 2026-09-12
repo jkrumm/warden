@@ -6735,3 +6735,104 @@ Concurrent, not this §: a second session is plumbing a
 `TRIAGE_VALIDATION_DISPATCH_MODEL` through `open_review()`/`submit_review()`
 and sideclaw's review route so step-7 validation leaves Max too. Its files
 are left uncommitted here on purpose.
+
+## 64. A killed episode is not a verdict (2026-09-12, 09:00Z → 11:30Z)
+
+Item 253, `docker_homelab:unhealthy:garmin-collector`, sat in `verdict` for five
+hours carrying an empty note while the container recovered on its own. Two
+independent defects stacked, one on each side of the sideclaw boundary.
+
+**sideclaw was killing healthy workers.** `runSessionAttempt` had a single
+`setTimeout(timeoutMs)`, and `TIERS.investigate.timeoutMs` is 8 min. Both
+automatic dispatches since dispatch moved to `glm-5.3-flash` (§59) died at
+exactly 480000 ms: job `c7d73a1c` (this item) at turn 28 with **1504 ms** of
+idle, mid-`Bash: sed -n 1,90p scripts/garmin-auto-relogin.sh`; job `4b3f1e01`
+(brain) at turn 22 with **2000 ms**, mid-`responding`. Neither was stuck; both
+were working when SIGTERM landed. A single wall-clock timer cannot tell "slow"
+from "wedged", and glm-5.3-flash defaults to max reasoning effort — minutes per
+turn is its normal shape on hard work, not a symptom.
+
+Fixed in sideclaw `3c44689`: an idle watchdog that kills only after 5 min with
+no stdout chunk (stderr never resets it) plus an absolute ceiling at
+`max(timeoutMs, 60 min)`, with `timeout_idle`/`timeout_ceiling` and
+`idleMsAtKill` on the attribution record so a wedge and a long episode stop
+reading as the same event. The same commit takes `retryAfterOutput` off
+check/overview/review-router — re-laning onto Haiku the moment a slow worker
+missed its timeout was compensating for the timer that had just been fixed —
+and moves the tier decision out of sideclaw's `.env` into `routing.ts` (`AGENT`
+for dispatch; review and otel stay on `JUDGE`, for the reasons dated
+2026-09-11). That last part is load-bearing: reloading sideclaw with only the
+watchdog would have silently thrown dispatch back onto Sonnet/Max, because the
+`SIDECLAW_MODEL_DISPATCH` override lived in a `.env` the running process had
+read at boot and nobody had reloaded since.
+
+**warden folded the failure as if it were an answer.** `fold_dispatch_verdict()`
+never read `dispatches.status`. `failed` + `verdict_json` NULL gave
+`result = {}` → `next_action = ""` → `STATE_VERDICT` with `note = NULL`.
+`maybe_auto_implement()` correctly declined it (no `nextAction=implement` at
+`confidence=high`), and nothing else was scheduled to touch the row until its
+24 h deadline. sideclaw's failure text reached Slack through `format_message()`
+and was persisted nowhere at all. That is DESIGN.md's "deferral must be visible"
+inverted: a failed episode was indistinguishable from a broken loop.
+
+Migration 10 adds `dispatches.error` — sideclaw's terminal failure text
+verbatim, or warden's own reason for a row `_mark_pruned()` closes without ever
+polling a real answer. No backfill: rows that failed before this genuinely have
+no recorded reason, and inventing one is worse than admitting the gap. A COLUMN,
+not a field inside `verdict_json`, because that blob is sideclaw's *published*
+schema and a failed dispatch has no verdict to hang a field on.
+
+`fold_dispatch_verdict()` gains exactly one branch, ordered between the
+`artifact_url` and `nextAction == "human"` checks:
+`status != "done" and not result` → `STATE_NEEDS_HUMAN`, note =
+`"<tier> episode <status> with no verdict: <reason>"`, capped by `_cap_brief()`.
+Both halves of that condition are load-bearing and commented as such —
+`artifact_url` must keep winning first because an `implement` episode can fail
+*after* opening its draft PR, and `not result` is required because an
+`interrupted` episode that nonetheless returned a schema-valid verdict has
+answered the question. No automatic retry: a killed episode routes to a human,
+and retrying one is a separate decision this § does not make.
+
+**And the knob that would have done nothing.** §63's concurrent session left
+`TRIAGE_VALIDATION_DISPATCH_MODEL` uncommitted, plumbing a `model` through
+`open_review()`/`submit_review()` so step-7 validation could leave Max.
+sideclaw's `REVIEW_INPUT` is a plain `z.object`, not `z.strictObject` — Zod
+would have silently stripped that param and the review would have run on its
+default route looking configured. sideclaw `4e16aa5` adds the field (reaching
+the angle and synthesis sessions only; the router's cheap CLASSIFY route and the
+adversary critic are excluded at the call site, commented so neither gets
+"fixed" later) and omits it from the MCP-facing schema, since an interactive
+`/review` caller has no reason to leave the measured-good route. The knob still
+defaults to `None`: review is the one tool where the cheap tier has actually
+been measured failing.
+
+Ops: all five agents `make unload`ed for the duration of the edit.
+`warden-sweep` had already crashed once on its 300 s tick, refusing a
+`schema_version=9` ledger against a working tree already bumped to 10 — the one
+migrator rule working exactly as written, and the reason the agents came down.
+Tests: `test_triage.py` 244 → 248, `test_ledger.py` 26, sideclaw 651 → 657.
+
+**Proven in production, not only in tests.** Item 1006 re-ran the exact brief
+that died at 480000 ms (`warden run homelab --tier investigate`, job
+`42b07613`). It ran **519487 ms — 8 m 39 s** — crossing the old 8-minute
+ceiling at 09:07:24Z still `running`, and returned `done` at 19 turns with a
+`confidence: high` verdict. Under the timer this § replaces it would have been
+SIGTERMed 39 seconds short of its answer, for the third time. The concurrent
+`hermes-agent` episode the loop escalated on its own at reload (job `35c9dd64`)
+finished clean at 394741 ms. Item 1006 folded to `closed` carrying the summary,
+the human-origin/`max_tier=investigate` shortcut behaving exactly as written.
+
+The verdict itself: garmin-collector's `/health` returns 503 whenever its
+background authenticated Garmin probe (every 15 min) fails, so a dead OAuth
+refresh token flips the container unhealthy without the process being down.
+Garmin invalidated the token ~3 d after the last relogin, inside
+`garmin-auto-relogin.sh`'s 4-day proactive window; the 2-hourly cron caught it
+at 06:00Z, reauthed through the MFA-email fallback after two 429s, and
+force-recreated the container at 06:00:23Z. `RestartCount=0` — nothing restarted
+it at 08:26Z, and no human was involved. It self-healed correctly and will
+recur by design. `nextAction: none`.
+
+Item 253, the original, is deliberately left to expire on its own 24 h clock:
+the new branch only fires when a dispatch reaches terminal, and 253's already
+reported, so re-folding it would mean hand-editing the ledger to prove a point
+item 1006 proves honestly.

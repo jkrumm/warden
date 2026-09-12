@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-11 (§63) |
+| Last updated | 2026-09-12 (§64) |
 | Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
-| Ledger | `~/.warden/warden.db`, schema 9 |
-| Tests | `tests/test_triage.py` 244/244 is the gate; `make test` runs all suites |
+| Ledger | `~/.warden/warden.db`, schema 10 |
+| Tests | `tests/test_triage.py` 248/248 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -39,7 +39,9 @@ loop.
 - Automatic investigate/implement dispatches pass `AUTO_DISPATCH_MODEL`
   (`glm-5.3-flash`, env `TRIAGE_AUTO_DISPATCH_MODEL`) and run on the IU
   backend, never Max. Validation is a sideclaw `review` job on the pull
-  request and still runs on sideclaw's JUDGE route (no per-call knob).
+  request; `TRIAGE_VALIDATION_DISPATCH_MODEL` can re-point it but defaults to
+  `None`, i.e. sideclaw's JUDGE route — review is the one tool where the cheap
+  tier has been measured failing (§64).
 - `needs_human` / `merge_blocked` cards carry an `Action required` section:
   `Do this: <note>` plus a day-granularity auto-dismiss countdown.
 - `push_argo_snapshot()` runs as step 10 of `run()`, after every tick; argo
@@ -52,8 +54,14 @@ loop.
   `operations` (`kind=host`), then `liveness_pending` verified by
   `kuma-push-fresh`. First real run 11:36Z: `restart-hermes-gateway`, three
   items discharged (§59).
-- sideclaw routes `review` and `dispatch` to `glm-5.3-flash` on IU
-  (`SIDECLAW_MODEL_REVIEW`/`SIDECLAW_MODEL_DISPATCH` in sideclaw's `.env`).
+- sideclaw's per-tool routing lives in `server/lib/routing.ts`, not its
+  `.env` (§64): `dispatch` on `glm-5.3-flash`/IU (the `AGENT` tier), `review`
+  and `otel` held on Sonnet/Max (`JUDGE`), `narrative`/`excalidraw` on
+  Sonnet/Max (`PROSE`). Live table: `GET /api/routing`.
+- A sideclaw worker is killed by an idle watchdog (5 min with no stdout) plus
+  a 60 min ceiling, not one wall-clock timer — a slow glm episode is not a
+  wedged one (§64). A dispatch that ends terminal with no verdict folds to
+  `needs_human` carrying `dispatches.error`, never into `verdict`.
 - Slack delivery is a plain HTTP client (`chat.postMessage`/`chat.update`),
   never the gateway's live `slack_bolt` connection.
 - Cards, receipts and reminders post under warden's own Slack app, `warden`
@@ -101,6 +109,7 @@ loop.
 - Warden's own Slack identity — §61
 - MacBook field report folded in: PAT was never gated, repo bundle — §62
 - Warden Slack app live — §63
+- A killed episode is not a verdict: idle watchdog, `dispatches.error` — §64
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
