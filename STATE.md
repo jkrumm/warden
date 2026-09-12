@@ -65,7 +65,11 @@ loop.
 - **Workers have no turn limit and no wall-clock ceiling** (sideclaw
   `8459357`, §66): the idle watchdog (no stdout for 5 min) is the only kill
   rule. Slow is not stuck. Lifecycle deadlines on items (verdict 24 h,
-  needs_human 7 d) are a different fact and stay.
+  needs_human 7 d) are a different fact and stay. The rule is global since
+  2026-09-12 (`dotfiles/rules/agent-limits.md`) and applied the same day in
+  hermes-agent (`max_turns: 0`), research-gateway (idle watchdog for step
+  caps and deadlines), audio-gateway, and the MCP client side
+  (`MCP_TOOL_TIMEOUT` 24 h, sideclaw entry `timeout` 30 min).
 - sideclaw's runner reads the result envelope before stderr on a non-zero
   exit (`6a9325c`, §65); the CLI's `unrecognized_model … generate_session_title`
   stderr line is benign noise on every gateway model and is stripped from
