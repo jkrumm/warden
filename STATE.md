@@ -107,9 +107,11 @@ loop.
 - `warden.py` still carries its own `_secrets_run_path` copy (left out of the
   §66 consolidation because the `close` verb landed in the same file at the
   same time).
-- sideclaw session-id persistence + `--resume` on boot + unbounded self-drain:
-  in flight at §66; until it lands a forced restart mid-dispatch still
-  produces `interrupted` → `needs_human`.
+- sideclaw `96c917a`: a dispatch killed mid-episode is resumed on the next
+  boot (`jobs.session_id` + kept worktree, `--resume`, attempt cap 2), and
+  the self-drain waits for running jobs with no wall-clock cap. Unmeasured
+  in the field; the vendored CLI notes warn a mid-tool-call kill can resume
+  a corrupted transcript — the cap and the salvage bundle bound it.
 - sideclaw `fallow` fails at HEAD — pre-existing, not this repo's.
 - Cost per Warden item is a usage-tracker query on `sub_tool` now that
   sideclaw tags every session (`sideclaw:<tool>`, §60); the ledger join is
