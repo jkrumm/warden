@@ -36,6 +36,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Callable
 
 # Same env-var-first, documented-default-second shape every CLI binary path in
 # this repo already uses — an operator or a test overrides one variable and
@@ -585,6 +586,14 @@ def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+# Public alias — scripts/intents.py and scripts/lifecycle/operations.py used
+# to carry byte-identical zero-arg copies of this; both now call this one
+# instead of hand-mirroring it. (scripts/lifecycle/items.py's and
+# scripts/triage.py's own `_now_iso(now)` take an argument and are
+# deliberately NOT this function — see the one-line comment on each.)
+now_iso = _now_iso
+
+
 def _stamp_version_sql(version: int, applied_at: str) -> str:
     """SQL text (no parameter binding — see migrate()'s docstring for why)
     that stamps schema_version's single row to `version`, inserting it if
@@ -852,6 +861,29 @@ def connect(
         assert_schema_version(conn)
 
     return conn
+
+
+def apply_db_override(argv: list[str], set_db_path: Callable[[Path], None], *,
+                       env_var: str | None = None) -> None:
+    """--db PATH — lets a test or a `--dry-run` inspection point a caller's
+    own module-level DB_PATH at a throwaway copy of the ledger without
+    touching the real ~/.warden/warden.db. `set_db_path` rebinds the
+    CALLER's own global; this function owns no `DB_PATH` of its own to
+    assume — triage.py and dispatch-sweep.py each carry their own module
+    global and must keep doing so. `env_var`, when given, is checked ONLY
+    as a fallback for a bare `--db` with nothing after it (or no `--db` at
+    all) — triage.py passes `HERMES_CC_DB` here; dispatch-sweep.py passes
+    none, since its own WARDEN_DB override is already applied once at
+    module load, before argv is ever parsed."""
+    if "--db" in argv:
+        idx = argv.index("--db")
+        if idx + 1 < len(argv):
+            set_db_path(Path(argv[idx + 1]).expanduser())
+            return
+    if env_var:
+        env_override = os.environ.get(env_var)
+        if env_override:
+            set_db_path(Path(env_override).expanduser())
 
 
 def snapshot(conn: sqlite3.Connection, dest: Path | str) -> Path:

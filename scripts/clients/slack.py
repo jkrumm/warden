@@ -93,6 +93,29 @@ def resolve_slack_token() -> str:
     return token
 
 
+def slack_raw_post(url: str, payload: dict[str, Any], token: str, *,
+                    timeout: int = 15) -> dict[str, Any] | None:
+    """The bare `chat.*` POST that `scripts/triage.py`'s and
+    `scripts/watchdog-poll.py`'s own `_slack_call()` wrappers share —
+    arbitrary `url` (postMessage or update), Slack's parsed JSON on any
+    completed round-trip, `None` on a transport/parse failure. Each wrapper
+    interprets `None` and Slack's own `{"ok": false}` its own,
+    historically-different way, which is why this stays the bare primitive
+    rather than folding their differing return shapes in here."""
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
+            TimeoutError, OSError):
+        return None
+
+
 def slack_post_message(token: str, channel: str, text: str,
                         thread_ts: str | None = None, *, timeout: int = 15) -> dict[str, Any]:
     """POST `chat.postMessage`. Returns Slack's own parsed JSON response on

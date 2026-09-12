@@ -806,20 +806,17 @@ MAX_BRIEF_CHARS = 8000
 # substring check on the folded verdict's own text, never an LLM call here.
 DISSOLVE_MARKER = "UNRELATED SIGNATURES"
 
-# `WARDEN_SLACK_API`-overridable (mirrors clients/slack.py's own
-# slack_api_base(), the same env var `warden.py`'s test harness already
-# points at a stub server) — read at CALL time inside post_blocks()/
-# update_blocks(), not baked into a module-level constant, so a test that
-# sets the env var after this module is imported (every subprocess test in
+# `WARDEN_SLACK_API`-overridable — the same env var `warden.py`'s test
+# harness already points at a stub server, read at CALL time inside
+# post_blocks()/update_blocks() via clients/slack.py's own slack_api_base()
+# (not baked into a module-level constant here), so a test that sets the env
+# var after this module is imported (every subprocess test in
 # tests/test_warden_cli.py) still gets intercepted. Wave 6.1's `warden run`
 # is the first caller that can reach this code SYNCHRONOUSLY from the CLI
 # (escalate_origin_items() -> sync_card()) — before it, only the loop
 # (under its own LaunchAgent) ever posted a card, and test_triage.py already
 # replaces post_blocks()/update_blocks() wholesale rather than relying on
 # this override. Defaults to real Slack, unchanged.
-def _slack_api_base() -> str:
-    return os.environ.get("WARDEN_SLACK_API", "https://slack.com/api")
-
 
 SECTION_TEXT_MAX = 3000  # Block Kit section text hard limit
 
@@ -1303,16 +1300,13 @@ def _apply_db_override(argv: list[str]) -> None:
     """--db PATH, or the HERMES_CC_DB env var hermes-cc.sh/dispatch-sweep.py
     already honor (same table) — lets a test or a --dry-run inspection point
     this at a throwaway copy of the DB without touching the real
-    ~/.hermes/watchdog.db."""
-    global DB_PATH
-    if "--db" in argv:
-        idx = argv.index("--db")
-        if idx + 1 < len(argv):
-            DB_PATH = Path(argv[idx + 1]).expanduser()
-            return
-    env_override = os.environ.get("HERMES_CC_DB")
-    if env_override:
-        DB_PATH = Path(env_override).expanduser()
+    ~/.hermes/watchdog.db. Thin wrapper over ledger.apply_db_override(),
+    which owns no DB_PATH of its own — this module's global is rebound via
+    the setter below."""
+    def _set(path: Path) -> None:
+        global DB_PATH
+        DB_PATH = path
+    _ledger.apply_db_override(argv, _set, env_var="HERMES_CC_DB")
 
 
 # --- resolve_slack_token() -----------------------------------------------
@@ -1368,17 +1362,12 @@ def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, st
     only for a transport/parse failure that never got a Slack response to
     read an error out of. `sync_card()` reads this to decide whether a
     failed `chat.update` is the specific, recoverable "wrong app identity"
-    case worth reposting over, rather than parsing stderr."""
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=body,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, OSError):
+    case worth reposting over, rather than parsing stderr. Transport is
+    clients/slack.py's shared slack_raw_post() (loaded above as
+    _slack_client); this wrapper owns only the return-shape and the
+    "triage:"-prefixed stderr line."""
+    data = _slack_client.slack_raw_post(url, payload, token)
+    if data is None:
         return False, None
     ok = bool(data.get("ok"))
     if not ok:
@@ -1397,13 +1386,13 @@ def post_blocks(channel: str, blocks: list[dict[str, Any]], text_fallback: str, 
     payload: dict[str, Any] = {"channel": channel, "blocks": blocks, "text": text_fallback, "unfurl_links": False}
     if thread_ts:
         payload["thread_ts"] = thread_ts
-    return _slack_call(f"{_slack_api_base()}/chat.postMessage", payload, token)
+    return _slack_call(f"{_slack_client.slack_api_base()}/chat.postMessage", payload, token)
 
 
 def update_blocks(channel: str, ts: str, blocks: list[dict[str, Any]], text_fallback: str,
                    token: str) -> tuple[bool, str | None]:
     return _slack_call(
-        f"{_slack_api_base()}/chat.update",
+        f"{_slack_client.slack_api_base()}/chat.update",
         {"channel": channel, "ts": ts, "blocks": blocks, "text": text_fallback},
         token,
     )
@@ -4127,11 +4116,6 @@ def complete_operation(conn: sqlite3.Connection, op_id: str, *, outcome: str,
     _operations.complete(conn, op_id, outcome=outcome, receipt=receipt, note=note)
 
 
-# Same shape as the retired bash CLI's own `url_re` inside cmd_merge — reused
-# rather than reinvented, per docs/history/state-log.md §46's explicit instruction not to
-# write a second parser for the same URL.
-_PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)$")
-
 # A full git commit sha, lowercase hex, exactly 40 chars — what hermes-cc.sh's
 # own `merge_sha` and `gh`'s `mergeCommit.oid` both produce (docs/history/state-log.md §47's
 # jkrumm/argo#16 verification). Used by the deployOnMerge branches below (item
@@ -4145,13 +4129,13 @@ def _parse_pr_url(url: str | None) -> tuple[str, str, int] | None:
     """(owner, repo, pr_number) parsed from a GitHub pull request URL, or
     None for anything that isn't one — including a NULL/empty artifact_url,
     which a dispatch that never reached `implement` completion legitimately
-    has."""
+    has. Same shape as the retired bash CLI's own `url_re` inside cmd_merge —
+    reused rather than reinvented, per docs/history/state-log.md §46's
+    explicit instruction not to write a second parser for the same URL; the
+    parser itself now lives once, in clients/github.py's own parse_pr_url()."""
     if not url:
         return None
-    m = _PR_URL_RE.match(url)
-    if not m:
-        return None
-    return m.group(1), m.group(2), int(m.group(3))
+    return _github.parse_pr_url(url)
 
 
 def _run_gh_pr_view(owner: str, repo: str, pr: int) -> dict[str, Any] | None:

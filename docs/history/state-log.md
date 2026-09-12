@@ -7000,3 +7000,66 @@ retire `agents-overview.py` in hermes-agent, whether to add
 `make check-routing` for the model pin, and whether to persist the session id
 in sideclaw. None is blocked on evidence except the last, which is blocked on
 an interruption ever happening.
+
+## 66. No limits, and the owner's own verdicts (2026-09-12, 12:30Z → 14:30Z)
+
+The owner's answer to §65 was not a question. Three things, said plainly.
+
+**No turn limit, no wall-clock ceiling, anywhere.** "The workers are agents
+doing big things — why would we cap their turns? I don't need a turn limit.
+The agent runs as long as it needs." The only liveness rule left is
+sideclaw's idle watchdog: no stdout for 5 min means wedged. sideclaw
+`8459357` removes `--max-turns` from `buildSessionArgs`, deletes every
+`maxTurns`/`retryTurns`/`timeoutMs` from the dispatch tiers and from
+check/review/overview/narrative/excalidraw/otel, and deletes the 60-min
+ceiling (`timeout_ceiling` no longer exists as an outcome). The salvage retry
+stays for an episode that ran but produced no schema-valid output; it runs
+unbounded like everything else. Warden itself never had a turn limit — its
+only deadlines are lifecycle ones on ledger items (verdict 24 h, needs_human
+7 d), which are a different fact and stay. dotfiles carries none either; the
+`max-turns` hits in modelpick are its benchmark harness, not a worker path.
+Recorded as standing feedback in this session's memory so it is never
+re-introduced "for safety".
+
+**Do the Wave-9 list now, fanned out.** Five implementers, one commit each:
+
+- `warden close <event-id> --why` — a `needs_human`/`verdict`/`new`/
+  `merge_blocked`/`quiet`/`note` item can be resolved from the terminal;
+  in-flight states refuse (exit 2, `abort` is the verb), terminal states
+  no-op. `sync_card()`'s hash covers state+note, so the card re-renders on
+  the next tick unaided. Items 1007 and 253 are closed with it, each with
+  the reason in its note. Until now the only way to answer "I dealt with it"
+  was a Slack button or a 7-day expiry — the owner asked what on earth he was
+  supposed to do with 1007, and the honest answer was "nothing, and it will
+  nag you until Friday". That was the flaw.
+- `make check-routing` — the third drift check, in the mould of
+  `check-schemas` and `check-policy`: `triage.AUTO_DISPATCH_MODEL` (and
+  `TRIAGE_VALIDATION_DISPATCH_MODEL` when set) against sideclaw's live
+  `GET /api/routing`; `make status` carries the line.
+- Helper consolidation, zero behaviour change, 248/248 untouched: one Slack
+  POST primitive (`clients/slack.py:slack_raw_post`) under both `_slack_call`s;
+  `ledger.now_iso` under `intents`/`operations`; `clients/secrets.resolve_secret`
+  under the poll and the sweep; `clients/github.parse_pr_url` under triage;
+  `ledger.apply_db_override(argv, setter)` under triage and the sweep;
+  `clients/sideclaw.classify_dispatch_outcome` under both verdict renderers;
+  `watchdog-summary.py` opens the ledger through `ledger.connect(readonly=True)`.
+  One correction to §65's map: `connect(readonly=True)` does not assert the
+  schema version — the read-only branch returns before the check.
+- hermes-agent `0bad94d`: the `--slack-body` digest path in
+  `agents-overview.py` is deleted (838 → 538 lines); `--briefing` and
+  `--post-full` are the live paths and keep their helpers, so the cross-repo
+  copies of `_resolve_ref`/`post_blocks` stay — they are load-bearing there.
+  `docs/dispatch-bridge.md` is Hermes-side only now (628 → 75). §65's audit
+  also misread `make agent-overview` as hermes-agent's; it is a dotfiles herdr
+  pane over sideclaw's `GET /api/overview.txt`, and the handover doc says so.
+- sideclaw, in flight as this § is written: `jobs.session_id`, `--resume` on
+  boot for a dispatch killed mid-episode with its worktree kept, and a
+  self-drain with no wall-clock cap.
+
+**Not done, on purpose:** splitting `triage.py`. `_triage_env()` and 248
+tests monkeypatch that module's globals by name; a split is a day of moving
+names and patch targets for no behaviour. It stays one file until a real
+reason appears.
+
+**Item 1007's answer is §65**, closed with that note. The next brief of that
+shape goes to a session, not to `warden run` — recorded in memory.

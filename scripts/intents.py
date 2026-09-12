@@ -103,8 +103,7 @@ _KIND_FIELDS: dict[str, tuple[str, ...]] = {
 _NEVER_FROM_FILE = ("expires_at", "payload_hash")
 
 
-def _now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
+_now_iso = ledger.now_iso
 
 
 def _require_nonempty_str(intent: dict[str, Any], field: str) -> str:

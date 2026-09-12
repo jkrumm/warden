@@ -28,16 +28,15 @@ forgotten job.
 """
 from __future__ import annotations
 
-import datetime as dt
 import sqlite3
 import uuid
+
+import ledger
 
 KINDS = ("implement", "merge", "deploy", "host")
 OUTCOMES = ("done", "failed", "unknown")
 
-
-def _now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
+_now_iso = ledger.now_iso
 
 
 def record(conn: sqlite3.Connection, *, event_id: int | None, kind: str, repo: str,

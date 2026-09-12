@@ -9,7 +9,7 @@ Source of truth: ~/SourceRoot/warden/scripts/watchdog-summary.py
 from __future__ import annotations
 
 import datetime as dt
-import json
+import importlib.util
 import os
 import sqlite3
 import sys
@@ -25,6 +25,26 @@ WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
                if os.environ.get("WARDEN_HOME") else Path.home() / ".warden")
 DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
            if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
+
+# scripts/ledger.py — loaded by path, the same mechanism triage.py/
+# watchdog-poll.py/dispatch-sweep.py already use (the sibling filenames here
+# are not importable). Used below only for its own connect(readonly=True),
+# so this read-only script opens the database the one way every other
+# reader/writer of it does.
+_LEDGER_PATH = Path(__file__).resolve().parent / "ledger.py"
+_ledger_spec = importlib.util.spec_from_file_location("ledger", _LEDGER_PATH)
+assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
+_ledger = importlib.util.module_from_spec(_ledger_spec)
+_ledger_spec.loader.exec_module(_ledger)
+
+# scripts/ (this file's own directory) onto sys.path so `clients` is
+# importable as a real package — the same reason triage.py/watchdog-poll.py/
+# dispatch-sweep.py do this.
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from clients import sideclaw as _sideclaw  # noqa: E402
 
 # "Overnight" for the morning briefing: a dispatch that finished within this
 # many hours of the poll is still worth mentioning; older ones have already
@@ -44,22 +64,19 @@ def fmt_age(now: dt.datetime, iso: str) -> str:
 
 
 def _dispatch_outcome_note(status: str, verdict_json: str | None) -> str:
-    """Same rendering intent as watchdog-poll.py's _dispatch_summary — kept as
-    its own small copy rather than a shared import, matching this repo's
-    existing convention of independent, self-contained cron scripts."""
-    if status in ("failed", "interrupted"):
-        return status
-    if not verdict_json:
+    """Same rendering intent as watchdog-poll.py's _dispatch_summary — both
+    now share clients/sideclaw.py's classify_dispatch_outcome() for the
+    classification; this function owns only its own wording."""
+    kind, detail = _sideclaw.classify_dispatch_outcome(status, verdict_json)
+    if kind == "failed":
+        return detail or status
+    if kind == "no_verdict":
         return "done, no verdict"
-    try:
-        v = json.loads(verdict_json)
-    except json.JSONDecodeError:
+    if kind == "unreadable":
         return "done, verdict unreadable"
-    if not isinstance(v, dict):
-        return "done, verdict unreadable"
-    if v.get("degraded"):
+    if kind == "degraded":
         return "degraded (tool failure, not a finding)"
-    return (v.get("summary") or "").strip() or "done, no summary"
+    return detail or "done, no summary"
 
 
 def emit_dispatches(conn: sqlite3.Connection, now: dt.datetime) -> None:
@@ -115,8 +132,7 @@ def main() -> int:
         print("WATCHDOG_AVAILABLE=false")
         return 0
 
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = _ledger.connect(DB_PATH, readonly=True)
     now = dt.datetime.now(dt.timezone.utc)
 
     open_rows = conn.execute(

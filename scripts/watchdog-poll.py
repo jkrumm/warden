@@ -53,6 +53,27 @@ _ledger_spec = importlib.util.spec_from_file_location("ledger", _LEDGER_PATH)
 assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
 _ledger = importlib.util.module_from_spec(_ledger_spec)
 _ledger_spec.loader.exec_module(_ledger)
+
+# scripts/slack_client.py — same by-path loading mechanism, the same shim
+# triage.py and dispatch-sweep.py already load: the plain Slack Web API HTTP
+# client (scripts/clients/slack.py) this file's own _slack_call() shares its
+# request construction with below.
+_SLACK_CLIENT_PATH = Path(__file__).resolve().parent / "slack_client.py"
+_slack_client_spec = importlib.util.spec_from_file_location("slack_client", _SLACK_CLIENT_PATH)
+assert _slack_client_spec and _slack_client_spec.loader, "Failed to load scripts/slack_client.py"
+_slack_client = importlib.util.module_from_spec(_slack_client_spec)
+_slack_client_spec.loader.exec_module(_slack_client)
+
+# scripts/ (this file's own directory) onto sys.path so `clients` is
+# importable as a real package — the same reason triage.py and
+# dispatch-sweep.py do this (slack_client.py's own load above already does
+# it too, but this makes the precondition explicit for the import below).
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from clients import secrets as _secrets, sideclaw as _sideclaw  # noqa: E402
+
 STATE_PATH = HERMES_HOME / "scripts" / "briefing-state.json"
 JOBS_PATH = HERMES_HOME / "cron" / "jobs.json"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
@@ -191,7 +212,6 @@ def _strip_op_refs_timestamps(text: str) -> str:
 # ~/.hermes/.env anymore — so any of these missing from os.environ is resolved on
 # demand from the encrypted cache via `secrets-run read` (the drop-in op shim:
 # cache backend on the mini, biometric op on the MacBook). Mirrors ~/.hermes/.env.tpl.
-SECRETS_RUN = Path.home() / ".local" / "bin" / "secrets-run"
 _CACHE_REFS: dict[str, str] = {
     "GITHUB_TOKEN": "op://hermes/github/token",
     "HOMELAB_API_KEY": "op://common/api/SECRET",
@@ -204,22 +224,6 @@ _CACHE_REFS: dict[str, str] = {
     # own Warden-first resolution — see that function's docstring for why.
     "SLACK_BOT_TOKEN": "op://hermes/slack/bot-token",
 }
-
-
-def _resolve_ref(ref: str) -> str:
-    """Resolve one op:// ref via the secrets-run shim; '' on any failure."""
-    env = os.environ.copy()
-    # secrets-run's cache backend needs sops+jq (Homebrew); ensure they resolve even
-    # under a minimal PATH (the gateway spawns cron scripts with a sanitized env).
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
-    try:
-        r = subprocess.run(
-            [str(SECRETS_RUN), "read", ref],
-            capture_output=True, text=True, timeout=15, env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def resolve_alerts_read_token() -> str:
@@ -239,13 +243,12 @@ def resolve_alerts_read_token() -> str:
 def resolve_secret(key: str) -> str:
     """Resolve one needed secret: the inherited process env (the gateway exports
     cache-resolved secrets; some survive the cron subprocess sanitizer) first, else
-    the encrypted cache via secrets-run. Warns to stderr on total failure so a broken
-    cache surfaces in cron output instead of a silently degraded (but rc=0) poll."""
-    val = os.environ.get(key, "")
-    if val:
-        return val
+    the encrypted cache via secrets-run — clients/secrets.py's shared resolve_secret(),
+    same 15s timeout, same widened PATH every plain-HTTP client in this repo already
+    uses. Warns to stderr on total failure so a broken cache surfaces in cron output
+    instead of a silently degraded (but rc=0) poll."""
     ref = _CACHE_REFS.get(key, "")
-    val = _resolve_ref(ref) if ref else ""
+    val = _secrets.resolve_secret(key, ref) if ref else os.environ.get(key, "")
     if not val:
         print(
             f"watchdog: secret {key} unresolved (process env and secrets cache both "
@@ -313,16 +316,11 @@ SLACK_POST_URL = "https://slack.com/api/chat.postMessage"
 
 
 def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, str | None]:
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=body,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, OSError):
+    """Transport is clients/slack.py's shared slack_raw_post() (loaded above
+    as _slack_client); this wrapper owns only the return-shape and the
+    "watchdog:"-prefixed stderr line."""
+    data = _slack_client.slack_raw_post(url, payload, token)
+    if data is None:
         return False, None
     ok = bool(data.get("ok"))
     if not ok:
@@ -390,20 +388,19 @@ def _triage_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
 def _dispatch_summary(status: str | None, verdict_json: str | None) -> str:
     """Render a completed dispatch's outcome for the reminder digest, in place
     of a bare 'reminder #N'. Deterministic, no LLM — verdict_json is sideclaw's
-    own schema-shaped result object, persisted verbatim by dispatch-sweep.py."""
-    if status in ("failed", "interrupted"):
-        return f"dispatch {status}"
-    if not verdict_json:
+    own schema-shaped result object, persisted verbatim by dispatch-sweep.py.
+    Classification lives once, in clients/sideclaw.py's classify_dispatch_outcome();
+    this function owns only the wording."""
+    kind, detail = _sideclaw.classify_dispatch_outcome(status, verdict_json)
+    if kind == "failed":
+        return f"dispatch {detail}"
+    if kind == "no_verdict":
         return "dispatch finished, no verdict"
-    try:
-        v = json.loads(verdict_json)
-    except json.JSONDecodeError:
+    if kind == "unreadable":
         return "dispatch finished, verdict unreadable"
-    if not isinstance(v, dict):
-        return "dispatch finished, verdict unreadable"
-    if v.get("degraded"):
+    if kind == "degraded":
         return "dispatch degraded (tool failure, not a repo finding)"
-    return (v.get("summary") or "").strip() or "dispatch finished, no summary"
+    return detail or "dispatch finished, no summary"
 
 
 def cursor_get(conn: sqlite3.Connection, key: str) -> str | None:

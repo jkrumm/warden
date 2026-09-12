@@ -109,7 +109,6 @@ import datetime as dt
 import importlib.util
 import json
 import os
-import subprocess
 import sqlite3
 import sys
 import urllib.error
@@ -123,7 +122,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from clients import sideclaw as _sideclaw  # noqa: E402
+from clients import secrets as _secrets, sideclaw as _sideclaw  # noqa: E402
 from clients.errors import RemoteError  # noqa: E402
 
 HERMES_HOME = Path.home() / ".hermes"
@@ -168,7 +167,6 @@ PRUNED_STATUS = "failed"
 # briefing-coverage.py's implementation exactly.
 ARGO_API_BASE = "https://argo.jkrumm.com/api"
 ARGO_API_KEY_REF = "op://common/api/SECRET"
-SECRETS_RUN = Path.home() / ".local" / "bin" / "secrets-run"
 ARGO_HTTP_TIMEOUT = 10  # seconds; a bare POST against a remote HTTP API
 
 # A dispatch with no origin_channel was never asked from a Slack thread (e.g.
@@ -238,12 +236,12 @@ def _apply_db_override(argv: list[str]) -> None:
     without touching the real ~/.warden/warden.db. Mirrors watchdog-poll.py's
     dry-run DB_PATH swap: reassign the module-level global before db_connect()
     ever opens it. The env-var override is WARDEN_DB, already applied once at
-    module load (see DB_PATH above) — this only ever handles the argv form."""
-    global DB_PATH
-    if "--db" in argv:
-        idx = argv.index("--db")
-        if idx + 1 < len(argv):
-            DB_PATH = Path(argv[idx + 1]).expanduser()
+    module load (see DB_PATH above) — this only ever handles the argv form.
+    Thin wrapper over ledger.apply_db_override(), no env_var of its own."""
+    def _set(path: Path) -> None:
+        global DB_PATH
+        DB_PATH = path
+    _ledger.apply_db_override(argv, _set)
 
 
 NOT_FOUND = "not_found"
@@ -288,20 +286,10 @@ def resolve_api_key() -> str:
     process env first (HOMELAB_API_KEY), then the secrets-run cache shim with
     a widened PATH (the cache backend needs sops+jq, which the gateway's
     minimal cron PATH may not reach). Returns "" on any failure — a missing
-    key is simply a nudge failure, never a hard error for this script."""
-    val = os.environ.get("HOMELAB_API_KEY", "")
-    if val:
-        return val
-    env = os.environ.copy()
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
-    try:
-        r = subprocess.run(
-            [str(SECRETS_RUN), "read", ARGO_API_KEY_REF],
-            capture_output=True, text=True, timeout=15, env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
+    key is simply a nudge failure, never a hard error for this script. Thin
+    wrapper over clients/secrets.py's resolve_secret(), the resolver every
+    plain-HTTP client in this repo shares."""
+    return _secrets.resolve_secret("HOMELAB_API_KEY", ARGO_API_KEY_REF)
 
 
 def is_actionable(*, status: str, tier: str, artifact_url: str | None,

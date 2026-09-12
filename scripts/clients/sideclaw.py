@@ -308,3 +308,36 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
             "remoteOutcomes": remote_outcomes,
         }
     return out
+
+
+def classify_dispatch_outcome(status: str | None, verdict_json: str | None) -> tuple[str, str | None]:
+    """Classify a finished dispatch's outcome from sideclaw's own published
+    verdict shape — the ladder `scripts/watchdog-poll.py`'s `_dispatch_summary()`
+    and `scripts/watchdog-summary.py`'s `_dispatch_outcome_note()` used to carry
+    as two hand-mirrored copies. Returns `(kind, detail)`:
+
+      "failed"     — `status` was `failed`/`interrupted`; `detail` is that status.
+      "no_verdict" — dispatch finished with no `verdict_json` at all.
+      "unreadable" — `verdict_json` didn't parse as a JSON object.
+      "degraded"   — the verdict's own `degraded` flag was set (tool failure,
+                     not a repo finding).
+      "summary"    — the normal case; `detail` is the verdict's own `summary`
+                     text, stripped, or `None` if it was empty.
+
+    This function owns only the CLASSIFICATION — never the wording. Each
+    caller renders `kind`/`detail` into its own phrasing, which is why the two
+    downstream strings still read differently ("dispatch failed" vs. plain
+    "failed") despite sharing this ladder now."""
+    if status in ("failed", "interrupted"):
+        return "failed", status
+    if not verdict_json:
+        return "no_verdict", None
+    try:
+        v = json.loads(verdict_json)
+    except json.JSONDecodeError:
+        return "unreadable", None
+    if not isinstance(v, dict):
+        return "unreadable", None
+    if v.get("degraded"):
+        return "degraded", None
+    return "summary", (v.get("summary") or "").strip() or None

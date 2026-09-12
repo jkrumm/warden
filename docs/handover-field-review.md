@@ -182,7 +182,7 @@ real `warden:go` usage, or near-zero? Is `alert` volume dominated by one repo
   by state (`deferred (budget)` and `unknown` are first-class), per-item
   timeline, banner "Recorded intents — not approvals." Could you answer "what
   happened to item X" from the board alone, without the ledger?
-- hermes-agent's `make agent-overview`, or sideclaw's `GET /api/overview.txt`
+- dotfiles' `make agent-overview` herdr pane, or sideclaw's `GET /api/overview.txt` behind it
   — the `warden` block (`warden · N open · needs_human … · merge_blocked … ·
   in flight …` plus prioritised item lines), the herdr-facing surface.
 - `scripts/warden list` (`open`/`today`/`all`) and `scripts/warden status
