@@ -6836,3 +6836,28 @@ Item 253, the original, is deliberately left to expire on its own 24 h clock:
 the new branch only fires when a dispatch reaches terminal, and 253's already
 reported, so re-folding it would mean hand-editing the ledger to prove a point
 item 1006 proves honestly.
+
+**And a bug found only by checking.** Shipping §64 meant running
+`scripts/warden-backup.sh` by hand (warden has no remote — §62's bundle is the
+off-box copy). It reported `snapshot warden-20260912T091719Z.db (1.2M)` and the
+file was not there afterwards, on either side of the rsync.
+
+The rotation glob was `(NOm[$((KEEP+1)),-1])`. zsh's time-based sort qualifiers
+read backwards from the name-based ones: `om` is newest-first, `Om` is its
+reverse, oldest-first. So the slice selected everything past the seven OLDEST
+snapshots — the script deleted the snapshot it had just taken, on every run,
+from the moment the directory first reached `KEEP=7`. The freshest surviving
+snapshot on homelab was two days old, and the only CURRENT copy there was the
+rsynced live `warden.db` + `warden.db-wal` pair, captured at two different
+instants: precisely the artifact CLAUDE.md § The ledger forbids relying on, and
+precisely why `VACUUM INTO` exists in that script at all. Nothing was lost —
+restic holds the long tail — but the daily backup had quietly stopped producing
+a restorable same-day artifact, and `make status` cannot see it, because the
+script exits 0 and prints a filename either way.
+
+One character, `Om` -> `om`, with the reasoning written at the call site so it
+does not get "simplified" back. Verified by re-running: the new snapshot
+survived, `warden-20260909T121018Z.db` (the genuine oldest) was pruned instead,
+and seven are retained. This is also the answer to a question nobody had asked
+yet — there is still no restore path, and now there is at least something
+current to restore FROM.

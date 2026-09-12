@@ -114,7 +114,17 @@ conn.close()
   # not growing the rsync source without bound. `(N)` is zsh's null_glob qualifier —
   # without it an unmatched glob is a hard error here, which is what the very first
   # run (no snapshots yet) always is.
-  for old in "$SNAP_DIR"/warden-*.db(NOm[$((KEEP + 1)),-1]); do
+  #
+  # `om`, NOT `Om`. zsh's time-based sort qualifiers read backwards from the
+  # name-based ones: `om` is newest-first and `Om` is its reverse, oldest-first.
+  # This was `Om` until 2026-09-12, so `[KEEP+1,-1]` selected everything past the
+  # seven OLDEST — i.e. it deleted the snapshot it had just taken, every run, the
+  # moment the directory reached $KEEP. Measured that day: the freshest surviving
+  # snapshot was 2 days old and every run since had silently destroyed its own
+  # output, leaving the rsynced live `warden.db` + `-wal` pair (captured at two
+  # different instants — the exact thing CLAUDE.md's § The ledger forbids relying
+  # on) as the only current copy on homelab.
+  for old in "$SNAP_DIR"/warden-*.db(Nom[$((KEEP + 1)),-1]); do
     rm -f "$old"
   done
 else
