@@ -19,6 +19,7 @@ VERBS
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
   revert <event-id>   record a revert PR against a merged item (--pr --why)
+  close <event-id>    resolve an open item by hand (--why required)
   help
 
 Global flags, anywhere on the line, `--flag value` or `--flag=value`:
@@ -96,6 +97,7 @@ class _State:
     did_mutate: bool = False
     dry_run: bool = False
     planned: bool = False
+    noop: bool = False
     start_monotonic: float = field(default_factory=time.monotonic)
 
 
@@ -132,6 +134,14 @@ def _mode(verb: str | None, state: _State) -> str:
         return "aborted" if state.did_mutate else "refused"
     if verb == "revert":
         return "reverted" if state.did_mutate else "refused"
+    if verb == "close":
+        if state.did_mutate:
+            return "closed"
+        if state.noop:
+            return "noop"
+        if state.dry_run:
+            return "dry-run"
+        return "refused"
     return "read"
 
 
@@ -852,6 +862,94 @@ def cmd_revert(conn, flags: Flags, positional: list[str], state: _State) -> dict
     return {"verb": "revert", "ok": True, "eventId": event_id, "pullRequest": pr_number, "state": ledger.STATE_REVERTED}
 
 
+# --- close ---------------------------------------------------------------------
+
+# States a human can resolve by hand: no episode or operation is in flight,
+# and the item is not already terminal. Mirrors the closed-allowlist shape
+# used elsewhere in this repo (items._EXTRA_COLUMNS, triage.py's own
+# _NEVER_CARDED_FIRST_STATES) — a state not named here is refused, never
+# silently allowed.
+_CLOSE_ALLOWED_STATES = (
+    triage.STATE_NEW, triage.STATE_VERDICT, triage.STATE_NEEDS_HUMAN,
+    triage.STATE_MERGE_BLOCKED, triage.STATE_QUIET, triage.STATE_NOTE,
+)
+# An episode or operation is in flight for these — `abort` is the verb for
+# that, not `close`.
+_CLOSE_INFLIGHT_STATES = (
+    triage.STATE_INVESTIGATING, triage.STATE_IMPLEMENTING, triage.STATE_VALIDATING,
+    triage.STATE_REMEDIATING, triage.STATE_LIVENESS_PENDING, triage.STATE_PR_OPEN,
+)
+# Already terminal — closing again is a no-op, not a refusal.
+_CLOSE_TERMINAL_STATES = (
+    ledger.STATE_CLOSED, triage.STATE_FIXED, triage.STATE_IGNORED, triage.STATE_DISMISSED,
+)
+
+
+def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
+    """Resolve an open item by hand — the terminal counterpart to `abort`
+    (which cancels an in-flight episode) for the items nothing is currently
+    running against: a `needs_human`/`merge_blocked` card the owner answered
+    outside warden entirely, or a `new`/`verdict`/`quiet`/`note` item that
+    needs no further action. Writes through the same `items.transition()`
+    every other CLI-only transition uses, so the state change and its
+    `item_transitions` row are the loop's own shape, not a hand-rolled UPDATE."""
+    require_no_recursion()
+    # No require_backend(): close only ever writes triage_items/item_transitions
+    # in the local ledger — no GitHub or sideclaw call to authenticate for.
+    if not positional:
+        raise UsageError('usage: warden close <event-id> --why "<reason>" [--json]')
+    event_id = _parse_int(positional[0], "event-id")
+    if not flags.why:
+        raise UsageError(
+            'close requires --why "<reason>" (it lands in the audit log and becomes the item\'s note)'
+        )
+    state.target = str(event_id)
+
+    row = conn.execute("SELECT event_id, state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
+    if row is None:
+        raise UsageError(f"no triage_items row for event_id {event_id}")
+    current_state = row["state"]
+
+    if current_state in _CLOSE_TERMINAL_STATES:
+        state.noop = True
+        return {
+            "verb": "close", "ok": True, "eventId": event_id, "fromState": current_state,
+            "toState": current_state,
+            "note": f"item {event_id} is already terminal (state={current_state}) — nothing to do",
+        }
+
+    if current_state not in _CLOSE_ALLOWED_STATES:
+        in_flight = current_state in _CLOSE_INFLIGHT_STATES
+        raise PreconditionError(
+            f"triage item {event_id} is in state '{current_state}'"
+            + (
+                " — an episode or operation is in flight; 'abort' is the verb for that, not 'close'"
+                if in_flight
+                else " — 'close' has no closed-allowlist entry for this state"
+            )
+        )
+
+    to_state = ledger.STATE_CLOSED
+    note = f"closed by hand: {flags.why}"
+
+    if flags.dry_run:
+        state.dry_run = True
+        return {
+            "verb": "close", "ok": True, "dryRun": True, "eventId": event_id, "fromState": current_state,
+            "toState": to_state, "note": "nothing written — no transition row, no state change",
+        }
+
+    now = dt.datetime.now(dt.timezone.utc)
+    items.transition(conn, event_id, to_state=to_state, now=now, note=note)
+    conn.commit()
+    state.did_mutate = True
+
+    return {
+        "verb": "close", "ok": True, "eventId": event_id, "fromState": current_state, "toState": to_state,
+        "note": note,
+    }
+
+
 # --- plain-text rendering (best-effort; --json is the primary contract) ------
 
 
@@ -925,6 +1023,9 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
         for r in rows:
             print(f"{r['job_id'][:8]}  {r['status']:<11} {r['repo']:<18} {r['tier']:<11} {r['created_at'][:19]}")
         _print_budget_text(out)
+    elif verb == "close":
+        print(f"item {out['event_id']}: {out['from_state']} -> {out['to_state']}")
+        print(f"note: {out['note']}")
     else:
         print(json.dumps(out, indent=2))
 
@@ -943,6 +1044,7 @@ VERBS
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
   revert <event-id>   record a revert PR against a merged item (--pr --why)
+  close <event-id>    resolve an open item by hand (--why required)
   help
 
 Global flags, anywhere on the line, --flag value or --flag=value:
@@ -1012,6 +1114,8 @@ def main(argv: list[str]) -> int:
                 out = cmd_abort(conn, flags, rest, state)
             elif verb == "revert":
                 out = cmd_revert(conn, flags, rest, state)
+            elif verb == "close":
+                out = cmd_close(conn, flags, rest, state)
             else:
                 raise UsageError(
                     f"unknown verb: {verb}\n"
@@ -1023,6 +1127,7 @@ def main(argv: list[str]) -> int:
                     "  merge <job-id>    land the draft PR that dispatch opened (--why --confirm)\n"
                     "  abort <event-id>  cancel an in-flight implement/validate episode (--why)\n"
                     "  revert <event-id> record a revert PR against a merged item (--pr --why)\n"
+                    "  close <event-id>  resolve an open item by hand (--why required)\n"
                     "  help"
                 )
         finally:

@@ -1013,6 +1013,7 @@ agent driving a dispatch by hand:
 | `merge <job> --why --confirm` | Land a completed `implement` episode's pull request |
 | `abort <item> --why` | Cancel an in-flight episode for a triage item |
 | `revert <item> --pr N --why` | Record that a later, named PR undid this item's fix (→ `STATE_REVERTED`) |
+| `close <item> --why` | Resolve an open item by hand — no episode in flight, no Slack click needed (→ `STATE_CLOSED`) |
 
 `--run`/`--dry-run`/`--close`/… stay on `triage.py` — those are the loop's own
 bookkeeping verbs, not dispatch-lifecycle ones, and have no reason to move.

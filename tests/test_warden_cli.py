@@ -907,6 +907,78 @@ def test_revert_wrong_state_is_policy_error():
     assert proc.returncode == 4, out
 
 
+# --- close ---------------------------------------------------------------------
+
+
+def test_close_from_needs_human_writes_closed_and_a_transition_row():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 20, state="needs_human", repo="gamma")
+    proc = h.run(["close", "20", "--why", "answered in a session", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["toState"] == "closed", out
+    assert out["note"].startswith("closed by hand: "), out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, note FROM triage_items WHERE event_id=20")
+    assert row["state"] == "closed" and row["note"].startswith("closed by hand: "), dict(row)
+    trans = _row(
+        conn, "SELECT from_state, to_state FROM item_transitions WHERE event_id=20 ORDER BY id DESC LIMIT 1"
+    )
+    assert trans["from_state"] == "needs_human" and trans["to_state"] == "closed", dict(trans)
+    conn.close()
+
+
+def test_close_without_why_is_usage_error():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 21, state="needs_human", repo="gamma")
+    proc = h.run(["close", "21", "--json"], env=h.base_env(db=db))
+    assert proc.returncode == 64, proc
+
+
+def test_close_from_implementing_is_refused_and_item_unchanged():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 22, state="implementing", repo="gamma", implement_job="job-x")
+    proc = h.run(["close", "22", "--why", "nope", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 2, out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state FROM triage_items WHERE event_id=22")
+    assert row["state"] == "implementing", dict(row)
+    count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id=22")["n"]
+    assert count == 0, count
+    conn.close()
+
+
+def test_close_of_an_already_closed_item_is_a_no_op():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 23, state="closed", repo="gamma")
+    proc = h.run(["close", "23", "--why", "still done", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["toState"] == "closed", out
+    conn, _ = _connect(db)
+    count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id=23")["n"]
+    assert count == 0, count
+    conn.close()
+
+
+def test_close_dry_run_writes_nothing():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 24, state="needs_human", repo="gamma")
+    proc = h.run(["close", "24", "--why", "answered", "--dry-run", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out.get("dryRun") is True, out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state FROM triage_items WHERE event_id=24")
+    assert row["state"] == "needs_human", dict(row)
+    count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id=24")["n"]
+    assert count == 0, count
+    conn.close()
+
+
 # --- ledger schema assertion -------------------------------------------------------
 
 
