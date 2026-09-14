@@ -938,9 +938,9 @@ if _missing_liveness_monitor:
 # argv has no way to carry. The closed-key-set contract itself — a policy
 # file can only ever select one of these four, never invent a fifth — is
 # still enforced the same way, at load_policy() time (see _valid_rule()).
-EVIDENCE_ALLOWLIST: tuple[str, ...] = ("meteo-health", "gateway-starts", "hermes-log-tail", "kuma-push-last")
+EVIDENCE_ALLOWLIST: tuple[str, ...] = ("weatherorb-health", "gateway-starts", "hermes-log-tail", "kuma-push-last")
 
-METEO_HEALTH_PATH = Path.home() / "SourceRoot" / "meteo" / "var" / "health.json"
+WEATHERORB_HEALTH_PATH = Path.home() / "SourceRoot" / "weatherorb" / "var" / "health.json"
 GATEWAY_STARTS_LOG = HERMES_HOME / "gateway-starts.log"
 HERMES_ERROR_LOG = HERMES_HOME / "logs" / "errors.log"
 ALERTS_CHANNEL = "C0AS1LAUQ3C"  # #alerts — same channel watchdog-poll.py's slack_alert source reads
@@ -1046,7 +1046,7 @@ def _gather_argo_commit_live(expected: list[dict[str, Any]]) -> tuple[bool, str]
     from the service merely being reachable or having recently restarted. A
     restart-time-only probe cannot distinguish a landed deploy from a
     container that bounced for an unrelated reason — docs/history/state-log.md §47's own
-    research-gateway/meteo reconnaissance hit exactly this ambiguity, which
+    research-gateway/weatherorb reconnaissance hit exactly this ambiguity, which
     is why it stopped short of using `lastRestartAt` here. `fixed` is the
     one state in this file that claims a change actually worked
     (LIVENESS_CONFIRMED_NOTE_PREFIX is "the one genuine 'this is actually
@@ -2552,19 +2552,19 @@ def _run_bounded(fn: Any, *args: Any, timeout: int = EVIDENCE_TIMEOUT) -> tuple[
         ex.shutdown(wait=False)
 
 
-def _gather_meteo_health(_event_rows: list[sqlite3.Row]) -> str:
-    """meteo's own health probe (var/health.json, written by its own
-    heartbeat) — the exact gap the meteo episode named: a repo checkout has
-    no runtime state at all. Summarized (ok/heartbeat/timestamp + failing
+def _gather_weatherorb_health(_event_rows: list[sqlite3.Row]) -> str:
+    """weatherorb's own health probe (var/health.json, written by its own
+    heartbeat) — the exact gap the weatherorb episode named: a repo checkout
+    has no runtime state at all. Summarized (ok/heartbeat/timestamp + failing
     checks only), not dumped raw — the file runs ~40 checks and dumping all
     of them would blow the per-key cap on a mostly-healthy day for no
     benefit."""
     try:
-        data = json.loads(METEO_HEALTH_PATH.read_text())
+        data = json.loads(WEATHERORB_HEALTH_PATH.read_text())
     except (OSError, json.JSONDecodeError) as e:
-        return f"could not read {METEO_HEALTH_PATH}: {e}"
+        return f"could not read {WEATHERORB_HEALTH_PATH}: {e}"
     if not isinstance(data, dict):
-        return f"{METEO_HEALTH_PATH} did not contain a JSON object"
+        return f"{WEATHERORB_HEALTH_PATH} did not contain a JSON object"
     checks = data.get("checks")
     checks = checks if isinstance(checks, list) else []
     bad = [c for c in checks if isinstance(c, dict) and not c.get("ok")]
@@ -2820,7 +2820,7 @@ LIVENESS_ALLOWLIST["kuma-push-fresh"] = _gather_kuma_push_fresh
 
 
 _EVIDENCE_GATHERERS = {
-    "meteo-health": _gather_meteo_health,
+    "weatherorb-health": _gather_weatherorb_health,
     "gateway-starts": _gather_gateway_starts,
     "hermes-log-tail": _gather_hermes_log_tail,
     "kuma-push-last": _gather_kuma_push_last,

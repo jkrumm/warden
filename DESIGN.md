@@ -483,7 +483,7 @@ Even with perfect quoting, a Make target executes repo code, so *who may modify
 the target* matters more than *who may name it* — hence the `Makefile`/`scripts/**`
 exclusion above.
 
-Prefer not needing this at all: `meteo`, `research-gateway` and `argo` deploy via
+Prefer not needing this at all: `weatherorb`, `research-gateway` and `argo` deploy via
 GitHub Actions → RollHook, so merge *is* deploy. **`image-share` does not** — it
 has no CI and self-documents "CI-less for now," so it belongs with
 `vps/observability/`, `homelab` and `homelab-private` in the group that needs a

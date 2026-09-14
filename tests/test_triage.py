@@ -166,7 +166,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         "_HERMES_OPS_BIN": triage._HERMES_OPS_BIN,
         "HOST_VERB_ALLOWLIST": dict(triage.HOST_VERB_ALLOWLIST),
         "_watchdog_poll": triage._watchdog_poll,
-        "METEO_HEALTH_PATH": triage.METEO_HEALTH_PATH,
+        "WEATHERORB_HEALTH_PATH": triage.WEATHERORB_HEALTH_PATH,
         "GATEWAY_STARTS_LOG": triage.GATEWAY_STARTS_LOG,
         "HERMES_ERROR_LOG": triage.HERMES_ERROR_LOG,
         "TRIAGE_REPO_DIR": triage.TRIAGE_REPO_DIR,
@@ -2150,23 +2150,23 @@ def _slack_msg(ts: str, text: str) -> dict[str, Any]:
     return {"external_id": ts, "title": text[:240], "url": "", "payload": {"text": text}}
 
 
-def test_evidence_meteo_health_bounded_output():
-    """meteo-health must summarize (not dump) var/health.json, and the
+def test_evidence_weatherorb_health_bounded_output():
+    """weatherorb-health must summarize (not dump) var/health.json, and the
     rendered evidence block must stay bounded even when the source file is
     large — ~40 real checks, several failing, well over EVIDENCE_CAP_CHARS
     once rendered raw."""
     with _triage_env() as (conn, ctx):
-        health_path = ctx.tmp_dir / "meteo-health.json"
+        health_path = ctx.tmp_dir / "weatherorb-health.json"
         checks = [{"name": f"check-{i}", "ok": False, "detail": "x" * 200} for i in range(40)]
         _write_json(health_path, {"ok": False, "heartbeat": "skipped(failure)",
                                    "timestamp": "2026-09-08T18:47:52+00:00", "checks": checks})
-        triage.METEO_HEALTH_PATH = health_path
+        triage.WEATHERORB_HEALTH_PATH = health_path
 
-        raw = triage._gather_evidence("meteo-health", [])
+        raw = triage._gather_evidence("weatherorb-health", [])
         assert "ok=False" in raw and "40/40 checks failing" in raw
 
-        block = triage._build_evidence_block(["meteo-health"], {1: None}, triage.EVIDENCE_TOTAL_CAP_CHARS)
-        assert "meteo-health" in block
+        block = triage._build_evidence_block(["weatherorb-health"], {1: None}, triage.EVIDENCE_TOTAL_CAP_CHARS)
+        assert "weatherorb-health" in block
         assert len(block) <= triage.EVIDENCE_TOTAL_CAP_CHARS
         assert "…" in block, "a 40-check dump must have been truncated by the per-key cap"
 
@@ -2273,15 +2273,15 @@ def test_evidence_command_failure_is_non_fatal():
             def _boom(_event_rows):
                 raise RuntimeError("simulated evidence failure")
 
-            triage._EVIDENCE_GATHERERS = {**saved_gatherers, "meteo-health": _boom}
+            triage._EVIDENCE_GATHERERS = {**saved_gatherers, "weatherorb-health": _boom}
 
-            single = triage._gather_evidence("meteo-health", [])
-            assert "evidence command 'meteo-health' failed" in single
+            single = triage._gather_evidence("weatherorb-health", [])
+            assert "evidence command 'weatherorb-health' failed" in single
             assert "simulated evidence failure" in single
 
-            block = triage._build_evidence_block(["meteo-health", "gateway-starts"], {1: None},
+            block = triage._build_evidence_block(["weatherorb-health", "gateway-starts"], {1: None},
                                                    triage.EVIDENCE_TOTAL_CAP_CHARS)
-            assert "meteo-health" in block and "gateway-starts" in block
+            assert "weatherorb-health" in block and "gateway-starts" in block
             assert "simulated evidence failure" in block
             assert "gateway start" in block, "a failing key must not take down a sibling key's output"
         finally:
@@ -2305,14 +2305,14 @@ def test_evidence_total_stays_under_brief_cap():
     closing instructions, and a truncation note must say so."""
     policy = dict(DEFAULT_POLICY, rules=[
         {"match": "slack_alert:sig-*", "repo": "demo-repo",
-         "evidence": ["meteo-health", "gateway-starts", "hermes-log-tail", "kuma-push-last"]},
+         "evidence": ["weatherorb-health", "gateway-starts", "hermes-log-tail", "kuma-push-last"]},
     ])
     with _triage_env(policy=policy) as (conn, ctx):
-        health_path = ctx.tmp_dir / "meteo-health.json"
+        health_path = ctx.tmp_dir / "weatherorb-health.json"
         checks = [{"name": f"check-{i}", "ok": False, "detail": "y" * 200} for i in range(40)]
         _write_json(health_path, {"ok": False, "heartbeat": "skipped(failure)",
                                    "timestamp": "2026-09-08T00:00:00+00:00", "checks": checks})
-        triage.METEO_HEALTH_PATH = health_path
+        triage.WEATHERORB_HEALTH_PATH = health_path
         triage.GATEWAY_STARTS_LOG = ctx.tmp_dir / "does-not-exist.log"
         triage.HERMES_ERROR_LOG = ctx.tmp_dir / "does-not-exist-errors.log"
         triage._watchdog_poll = _fake_wp_module([])

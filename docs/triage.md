@@ -291,7 +291,7 @@ source depends on its current behavior.
 
 ## Evidence commands
 
-Every real investigation this loop has run so far (meteo, vps, hermes-agent)
+Every real investigation this loop has run so far (weatherorb, vps, hermes-agent)
 came back `nextAction: human` citing the SAME reason: the dispatched sideclaw
 episode runs in a read-only repo WORKTREE, which has the repo but never the
 live machine — `var/health.json` and `watchdog-alerts.log` are gitignored/
@@ -308,7 +308,7 @@ Seeded with four:
 
 | Key | What | Why it can't come from the repo checkout |
 |-|-|-|
-| `meteo-health` | meteo's own `var/health.json`, summarized (ok/heartbeat/timestamp + failing checks only, never dumped raw) | gitignored, empty in the worktree |
+| `weatherorb-health` | weatherorb's own `var/health.json`, summarized (ok/heartbeat/timestamp + failing checks only, never dumped raw) | gitignored, empty in the worktree |
 | `gateway-starts` | The last 5 lines of `~/.hermes/gateway-starts.log` (an append-only ledger of every gateway process start) | Outside every repo worktree by construction |
 | `hermes-log-tail` | The tail of Hermes's `errors.log`, SLICED at the current gateway process start | Same file, same boundary requirement as `skills/hermes-gateway/SKILL.md` Rule 0 — an unsliced tail mixes a dead incarnation's errors with the live one |
 | `kuma-push-last` | The live `[<monitor name>] ...` UptimeKuma push text for a `uk`-sourced cluster member | `events.payload_json` for a `uk` row is literally `{"type", "status"}` (see `poll_uk()`) — the actual heartbeat line (e.g. `FAIL: disk 90% used`) exists ONLY in raw #alerts Slack text, which `poll_slack_messages()`'s `skip_uk_push` deliberately drops before it ever reaches `events`; argo's own monitor endpoint doesn't carry it either |
@@ -334,7 +334,7 @@ each key at `EVIDENCE_CAP_CHARS` (1200), the whole block at
 `MAX_BRIEF_CHARS` — whichever is smaller. When evidence has to be cut, only
 evidence is cut, never the brief's own structure, and the block says so
 ("…truncated to fit the brief cap"). `config/triage-policy.json` seeds
-`meteo-health` on the meteo rules, `kuma-push-last` on every `uk:*` rule, and
+`weatherorb-health` on the weatherorb rules, `kuma-push-last` on every `uk:*` rule, and
 `gateway-starts`/`hermes-log-tail` on the hermes-agent-related `uk:hermes-*`
 and `hermes_log:*` rules.
 
@@ -937,7 +937,7 @@ its COMPOSE FILE AND DEPLOY TARGET, not the repo that owns its source.
 `make argo-up` — nothing in argo's own repo redeploys it), so a downed argo
 container — and its `api-*`/`dashboard-*` UptimeKuma child monitors — maps
 to `vps`. Most OTHER vps-hosted apps in this policy (audio-gateway,
-research-gateway, meteo, image-gen, image-share) are the opposite:
+research-gateway, weatherorb, image-gen, image-share) are the opposite:
 `dispatch-repos.json`'s own comment documents that they deploy to the VPS on
 every push to THEIR OWN repo's master (GitHub Actions -> RollHook), so a code
 fix in their own repo auto-redeploys — mapping those to their own repo is
@@ -1313,7 +1313,7 @@ merged diff set; and `argo-commit-live` (item 1b), which re-reads argo's own
 matches the merge sha EXACTLY — never inferred from the service merely being
 reachable, since a restart-time-only probe cannot distinguish a landed
 deploy from a container that bounced for an unrelated reason (the exact
-ambiguity docs/history/state-log.md §47's own research-gateway/meteo reconnaissance hit, and
+ambiguity docs/history/state-log.md §47's own research-gateway/weatherorb reconnaissance hit, and
 part of why `argo` is the deployOnMerge repo seeded here rather than one of
 those two). Both gatherer functions own their own endpoint directly, never a
 config-driven URL — a policy file may name and parameterise a behaviour,
@@ -1414,7 +1414,7 @@ their timestamp producing the identical dedup key.
 
 42 cases total — the later 12 cover *Evidence commands* and *Grouped-source
 resolution*: each of the four evidence keys producing correctly-shaped,
-bounded output (`meteo-health` summarizing rather than dumping, `gateway-
+bounded output (`weatherorb-health` summarizing rather than dumping, `gateway-
 starts` showing only the 5 most recent, `hermes-log-tail` excluding every
 line before its computed gateway-start boundary, `kuma-push-last` picking the
 chronologically latest bracket match and normalizing away the glyph), a
