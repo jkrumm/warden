@@ -7162,6 +7162,30 @@ called `setsid` unconditionally, which cost an interactive child its
 controlling terminal (measured under a pty: `/dev/tty` fails); it is now
 skipped when stdin is a terminal. 115/115 in `secrets-run.test.sh`.
 
-**In flight as this § is written:** the argo modal branch (the dispatch
-pushed it but fallow's complexity gate failed on `ItemSummary`, cyclomatic 60,
-so no PR was opened — being flattened), and the Hermes gateway investigation.
+**argo `4213502`**, deployed 20:13Z. The glm dispatch built the modal
+(event title, source:external_id, state/origin badges, signature, seen and
+occurrences, deadline, both reminder counters, note, brief-or-payload, an
+"Unmapped" line, "(showing last X of Y)", synthetic `created`) and pushed its
+branch, but opened no PR: fallow's audit failed on `ItemSummary` (cyclomatic
+60, CRAP 3660). An implementer moved the derivations into `model.ts` as pure,
+tested helpers and split the JSX into flat pieces; `fallow audit --base
+62d9633` clean, the 25 dead-code findings identical on master, dashboard
+tests 250/250. Fast-forwarded to master, the check and deploy runs green.
+Lesson: a dispatch's own gate is the repo's full gate, fallow included, so a
+UI brief should ask for small components up front.
+
+**hermes-agent, applied, not committed.** The investigate dispatch (glm,
+high confidence) traced item 1017: the gateway's non-`--replace` start path
+refuses immediately while a predecessor is still dying, so launchd's KeepAlive
+respawned into five refusals; the `--replace` path already had the wait. Three
+patches under `patches/`, applied to `~/.hermes/hermes-agent` by `git apply`
+(`make patch-check` 14/14), live at the next gateway restart:
+`gateway-start-predecessor-grace` (20 s poll, never signals), `skill-manager-
+colon-hint` (fail-closed YAML error names the unquoted `: `), `shutdown-
+forensics-darwin` (BSD `ps`, `sysctl vm.loadavg`, `sample`, so a stall leaves
+evidence on macOS). The "closed shared OpenAI client" warning is by-design
+self-healing. The implementer's grace-path test unlinked the live gateway's
+pidfile once; it restored it from the process's own cmdline and start time,
+verified. The repo's rows in `CLAUDE.md`/`docs/patches.md` share hunks with the
+uncommitted DeepSeek patches from 2026-09-13, so one commit there waits on that
+work.

@@ -159,7 +159,8 @@ log's past sections.
 (543 now `needs_human`), creation transitions, alert reminders on the event,
 the snapshot bounded to 50 rows per item, `secrets-run`'s group relay
 (dotfiles `a9410e7`), the VPN Watchdog interval (homelab-private `a71ded1`).
-In flight: argo's item modal branch (fallow complexity gate), the Hermes
-gateway stale-instance investigation. Still ahead from before: the first
+argo's item modal is live (`4213502`). hermes-agent: three
+gateway/skill patches applied, uncommitted alongside the DeepSeek patch work —
+one commit there. Still ahead from before: the first
 host-verb `fixed`, the ledger restore path, Wave 9 from
 `docs/handover-field-review.md`.
