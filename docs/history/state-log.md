@@ -7189,3 +7189,23 @@ pidfile once; it restored it from the process's own cmdline and start time,
 verified. The repo's rows in `CLAUDE.md`/`docs/patches.md` share hunks with the
 uncommitted DeepSeek patches from 2026-09-13, so one commit there waits on that
 work.
+
+**Closing out §68 (20:20Z → 20:35Z), owner: "do all the remaining things."**
+- Item 543 closed with `warden close` (root cause: dotfiles `a9410e7`). The
+  verb's text renderer read snake_case keys off its camelCase result and
+  crashed after the write; fixed with a text-path test (`f2176f7`,
+  `test_warden_cli.py` 67/67).
+- hermes-agent: nine commits pushed, including the 09-13 DeepSeek work
+  (`dc22d9d` patches, `ec1f688` config) and ten Hermes-authored skills
+  (`c486d77`). The repo is public, so an exposure audit ran first; it cleared
+  everything but `skills/work/iu-epos-ops`, which carries employer-internal API
+  hosts and debug deletion endpoints. `skills/work/iu-*/` is gitignored and
+  Hermes loads it from disk. The gateway restarted at 22:24 local onto the three
+  new patches, clean (both platforms connected).
+- argo `6765121`: the 09-13 AI-gateway move to deepseek-v4.1-flash with a
+  top-level `reasoning_effort`, stranded uncommitted on the deleted
+  `warden-board` branch. Moved onto master and finished (one formatter fix;
+  api suite 1024/1024). Prod pinned `DEEPSEEK_MODEL=DeepSeek-V4-Flash` via
+  the vps compose fallback, so vps `83c4bc6` removed the pin and ran
+  `make argo-up` first, then the api deployed. `argo-api` healthy on
+  `6765121`.
