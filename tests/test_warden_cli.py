@@ -928,6 +928,18 @@ def test_close_from_needs_human_writes_closed_and_a_transition_row():
     conn.close()
 
 
+def test_close_text_output_prints_the_transition():
+    """Every other close test passes --json; the plain-text renderer read
+    snake_case keys off a camelCase result and crashed after the write
+    (item 543, 2026-09-14)."""
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 25, state="needs_human", repo="gamma")
+    proc = h.run(["close", "25", "--why", "fixed elsewhere"], env=h.base_env(db=db))
+    assert proc.returncode == 0, proc
+    assert "item 25: needs_human -> closed" in proc.stdout, proc.stdout
+
+
 def test_close_without_why_is_usage_error():
     h = Harness()
     db = h.new_db()

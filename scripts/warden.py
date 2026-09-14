@@ -1024,7 +1024,7 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
             print(f"{r['job_id'][:8]}  {r['status']:<11} {r['repo']:<18} {r['tier']:<11} {r['created_at'][:19]}")
         _print_budget_text(out)
     elif verb == "close":
-        print(f"item {out['event_id']}: {out['from_state']} -> {out['to_state']}")
+        print(f"item {out['eventId']}: {out['fromState']} -> {out['toState']}")
         print(f"note: {out['note']}")
     else:
         print(json.dumps(out, indent=2))
