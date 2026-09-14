@@ -7122,3 +7122,46 @@ the 248 → 251 came from.
 - Hermes: a manual stop racing launchd's SIGTERM left pid 61585 half-dead and
   five refused starts (item 1017, self-healed); nothing reaps a stale
   instance on start.
+
+## 68. The open list from §67, done across four repos (2026-09-14, 19:10Z → 20:30Z)
+
+Owner: "do all of them." Routed by where the dispatch policy lets work land:
+warden and dotfiles are `investigate`-capped and homelab-private is denied, so
+those ran as in-session implementers; argo went to a sideclaw `implement`
+dispatch on glm-5.3-flash, and the Hermes gateway friction to an `investigate`
+dispatch on the same model.
+
+**warden (this commit).**
+- Item creation writes a `created` transition (`from_state` NULL, `at` =
+  `created_at`) at both `INSERT INTO triage_items` sites — `ingest()` and
+  `open_origin_item()`, the latter also `warden run`'s path — via
+  `_record_created_transition()`. `_set_state()` stays the writer for every
+  later move. `item_payload()` prepends a synthetic `created` entry
+  (`synthetic: true`, `id` null) for legacy items, only when the history is not
+  truncated.
+- `item_payload()`'s event carries `reminder_count`/`last_reminder_at` — the
+  Slack alert reminders watchdog-poll sends, distinct from
+  `triage_items.reminder_count` (needs_human/merge_blocked). `docs/api.md` names
+  both.
+- `item_payload(history_limit=…)` keeps the newest N transitions and
+  operations, oldest-first, with `transitions_total`/`operations_total` always
+  present. `build_argo_snapshot()` passes `ARGO_SNAPSHOT_HISTORY_LIMIT = 50`;
+  `GET /items/<id>` stays unbounded.
+- Two existing tests shift by the new `created` row (counts +1, same
+  assertions on the real transitions); none weakened. `test_triage.py`
+  255/255, `test_api.py` 41/41.
+
+**homelab-private `a71ded1`.** VPN Watchdog - Push interval 300 → 900 (3× its
+5-min cron), applied through its own `sync.py`; the live monitor reads 900.
+
+**dotfiles `a9410e7`.** `secrets-run`'s no-redaction fast path ran the child
+in the foreground with no trap — the sibling of `d8ac7ed`, which fixed only
+the redacting path. Both now background the child in its own process group
+(`setsid`) and relay INT/TERM/HUP to the group. The worker's first version
+called `setsid` unconditionally, which cost an interactive child its
+controlling terminal (measured under a pty: `/dev/tty` fails); it is now
+skipped when stdin is a terminal. 115/115 in `secrets-run.test.sh`.
+
+**In flight as this § is written:** the argo modal branch (the dispatch
+pushed it but fallow's complexity gate failed on `ItemSummary`, cyclomatic 60,
+so no PR was opened — being flattened), and the Hermes gateway investigation.

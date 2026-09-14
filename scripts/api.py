@@ -657,12 +657,32 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def item_payload(conn: sqlite3.Connection, event_id: int) -> dict[str, Any]:
+def item_payload(
+    conn: sqlite3.Connection, event_id: int, *, history_limit: int | None = None
+) -> dict[str, Any]:
     """The whole `/items/<event_id>` body — the item itself, its parent
     event, and every dispatch/operation/approval/transition that names it.
     Raises `ItemNotFoundError` for the 404 case; `Handler._serve()` owns
     turning that into an HTTP response, same shell/deep-module split as
-    `metrics_payload()`/`health_payload()`/`board_payload()`."""
+    `metrics_payload()`/`health_payload()`/`board_payload()`.
+
+    `history_limit`, when set, keeps only the NEWEST `history_limit` rows of
+    `transitions` and `operations` (still returned oldest-first — a consumer
+    diffing this against the unbounded `GET /items/<id>` shape should see the
+    same order, just a shorter prefix cut off the front). `transitions_total`
+    and `operations_total` are always present at the top level, limited or
+    not, so a caller can tell a full history from a truncated one. This
+    exists because `build_argo_snapshot()` embeds one of these per board item
+    on every tick — an item with a flapping state accumulates transitions
+    without bound, and unbounded here means the whole snapshot grows with it
+    (item 543: ~780B/tick, 232KB before this cap). `GET /items/<id>` itself
+    passes no limit and stays unbounded.
+
+    The synthetic `created` transition (see `_synthetic_created_transition()`)
+    is only prepended when the history is NOT truncated — a truncated
+    `transitions` list is missing its own oldest rows already, so the
+    fetched head is not reliable evidence that no genuine `from_state IS
+    NULL` row exists further back."""
     item_row = conn.execute("SELECT * FROM triage_items WHERE event_id = ?", (event_id,)).fetchone()
     if item_row is None:
         raise ItemNotFoundError(f"no item {event_id}")
@@ -673,7 +693,8 @@ def item_payload(conn: sqlite3.Connection, event_id: int) -> dict[str, Any]:
         item["brief"] = brief[:2000]
 
     event_row = conn.execute(
-        "SELECT id, source, external_id, title, url, payload_json, first_seen, resolved_at "
+        "SELECT id, source, external_id, title, url, payload_json, first_seen, resolved_at, "
+        "reminder_count, last_reminder_at "
         "FROM events WHERE id = ?",
         (event_id,),
     ).fetchone()
@@ -690,27 +711,72 @@ def item_payload(conn: sqlite3.Connection, event_id: int) -> dict[str, Any]:
     ).fetchall()
     dispatches = [_dispatch_detail(row) for row in dispatch_rows]
 
-    operations = [
-        dict(row) for row in conn.execute(
-            "SELECT * FROM operations WHERE event_id = ? ORDER BY started_at", (event_id,)
-        )
-    ]
+    operations, operations_total = _bounded_history(
+        conn, "operations", "started_at", event_id, history_limit
+    )
+    operations = [dict(row) for row in operations]
 
     approvals = _approvals_for_item(conn, event_id)
 
-    transitions = [
-        dict(row) for row in conn.execute(
-            "SELECT * FROM item_transitions WHERE event_id = ? ORDER BY id", (event_id,)
-        )
-    ]
+    transition_rows, transitions_total = _bounded_history(
+        conn, "item_transitions", "id", event_id, history_limit
+    )
+    transitions = [dict(row) for row in transition_rows]
+    truncated = history_limit is not None and transitions_total > len(transitions)
+    if not truncated and not any(t["from_state"] is None for t in transitions):
+        transitions.insert(0, _synthetic_created_transition(item, transitions))
 
     return {
         "item": item,
         "event": event,
         "dispatches": dispatches,
         "operations": operations,
+        "operations_total": operations_total,
         "approvals": approvals,
         "transitions": transitions,
+        "transitions_total": transitions_total,
+    }
+
+
+def _bounded_history(
+    conn: sqlite3.Connection, table: str, order_col: str, event_id: int, limit: int | None
+) -> tuple[list[sqlite3.Row], int]:
+    """Shared by `operations` and `transitions`: total count (unaffected by
+    `limit`) plus the newest `limit` rows, still in oldest-first order — a
+    plain `ORDER BY ... DESC LIMIT ?` fetches the tail cheaply, and the
+    `reversed()` here restores the order every other caller of this table
+    already expects. `table`/`order_col` reach raw SQL, so this is only ever
+    called with the two literals above, never with a request-controlled
+    value."""
+    total = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE event_id = ?", (event_id,)).fetchone()[0]
+    if limit is None:
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE event_id = ? ORDER BY {order_col}", (event_id,)
+        ).fetchall()
+        return rows, total
+    rows = conn.execute(
+        f"SELECT * FROM {table} WHERE event_id = ? ORDER BY {order_col} DESC LIMIT ?", (event_id, limit)
+    ).fetchall()
+    return list(reversed(rows)), total
+
+
+def _synthetic_created_transition(item: dict[str, Any], transitions: list[dict[str, Any]]) -> dict[str, Any]:
+    """A legacy item — created before `_record_created_transition()` existed
+    — has no `from_state IS NULL` row at all. Rather than leave its earliest
+    real transition looking like the item's whole history started mid-flight,
+    fabricate the row it should have had: `to_state` is whatever state the
+    first RECORDED transition moved it FROM (the state it must have been
+    created into), or the item's current state when there is no recorded
+    transition at all — the oldest fact still available."""
+    to_state = transitions[0]["from_state"] if transitions else item["state"]
+    return {
+        "id": None,
+        "event_id": item["event_id"],
+        "from_state": None,
+        "to_state": to_state,
+        "at": item["created_at"],
+        "note": "created",
+        "synthetic": True,
     }
 
 

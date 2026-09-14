@@ -617,9 +617,17 @@ def test_item_payload_full_shape():
     assert len(payload["operations"]) == 1, payload["operations"]
     assert payload["operations"][0]["op_id"] == "op1"
 
-    assert len(payload["transitions"]) == 1, payload["transitions"]
-    assert payload["transitions"][0]["from_state"] == "new"
-    assert payload["transitions"][0]["to_state"] == "verdict"
+    # The fixture item was inserted directly (no _record_created_transition()
+    # row), so item_payload() prepends the synthetic `created` entry ahead of
+    # the one real transition.
+    assert len(payload["transitions"]) == 2, payload["transitions"]
+    assert payload["transitions"][0]["from_state"] is None
+    assert payload["transitions"][0]["to_state"] == "new"
+    assert payload["transitions"][0]["synthetic"] is True
+    assert payload["transitions"][1]["from_state"] == "new"
+    assert payload["transitions"][1]["to_state"] == "verdict"
+    assert payload["transitions_total"] == 1
+    assert payload["operations_total"] == 1
 
     assert payload["approvals"] == []
     conn.close()
@@ -670,6 +678,110 @@ def test_item_payload_raises_not_found():
         raise AssertionError("expected ItemNotFoundError")
     except api.ItemNotFoundError:
         pass
+    conn.close()
+
+
+def test_item_payload_synthetic_created_entry_for_legacy_item():
+    """A legacy item (inserted directly, like every fixture in this file, and
+    like every item created before _record_created_transition() existed) has
+    no `from_state IS NULL` row. item_payload() must fabricate one, reading
+    the state it was created into off the first REAL transition's from_state
+    — never off the item's current state, which would lie once the item has
+    moved on."""
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="needs_human", now=now)
+    _transition(conn, 1, "new", "investigating", now)
+    _transition(conn, 1, "investigating", "needs_human", now)
+    conn.commit()
+
+    payload = api.item_payload(conn, 1)
+    assert len(payload["transitions"]) == 3, payload["transitions"]
+    synthetic = payload["transitions"][0]
+    assert synthetic["id"] is None
+    assert synthetic["event_id"] == 1
+    assert synthetic["from_state"] is None
+    assert synthetic["to_state"] == "new"
+    assert synthetic["note"] == "created"
+    assert synthetic["synthetic"] is True
+    assert payload["transitions_total"] == 2, "synthetic entry must not count toward the real total"
+    conn.close()
+
+
+def test_item_payload_synthetic_created_entry_falls_back_to_item_state():
+    """An item with zero recorded transitions has no earlier fact to read —
+    the synthetic entry falls back to the item's own current state."""
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="new", now=now)
+    conn.commit()
+
+    payload = api.item_payload(conn, 1)
+    assert len(payload["transitions"]) == 1, payload["transitions"]
+    assert payload["transitions"][0]["to_state"] == "new"
+    assert payload["transitions_total"] == 0
+    conn.close()
+
+
+def test_item_payload_event_reminder_fields_present():
+    """`event.reminder_count`/`event.last_reminder_at` are watchdog-poll.py's
+    grouped-source alert reminders, distinct from `item.reminder_count`/
+    `item.last_reminder_at` (the needs_human reminder cadence)."""
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="new", now=now)
+    conn.execute(
+        "UPDATE events SET reminder_count = 3, last_reminder_at = ? WHERE id = 1", (_iso(now),)
+    )
+    conn.commit()
+
+    payload = api.item_payload(conn, 1)
+    assert payload["event"]["reminder_count"] == 3
+    assert payload["event"]["last_reminder_at"] == _iso(now)
+    conn.close()
+
+
+def test_item_payload_history_limit_truncates_newest_first_oldest_returned():
+    """`history_limit` keeps the newest N transitions/operations, still
+    returned oldest-first, with the real totals always present — and skips
+    the synthetic `created` entry once truncated, since the fetched window
+    can no longer prove no genuine `from_state IS NULL` row exists earlier."""
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="needs_human", now=now)
+    # A real `created` row up front (from_state NULL) so the unbounded read
+    # below already has one and this test isn't also exercising the
+    # synthetic-entry path covered elsewhere.
+    _transition(conn, 1, None, "new", now)
+    states = ["new", "investigating", "verdict", "implementing", "needs_human"]
+    for i in range(len(states) - 1):
+        _transition(conn, 1, states[i], states[i + 1], now + dt.timedelta(minutes=i + 1))
+    for i in range(3):
+        _operation(conn, f"op{i}", event_id=1, now=now + dt.timedelta(minutes=i))
+    conn.commit()
+
+    full = api.item_payload(conn, 1)
+    assert len(full["transitions"]) == 5, full["transitions"]
+    assert full["transitions_total"] == 5
+
+    limited = api.item_payload(conn, 1, history_limit=2)
+    assert limited["transitions_total"] == 5
+    assert len(limited["transitions"]) == 2, limited["transitions"]
+    # Newest 2 of the 4 real transitions, still oldest-first, no synthetic entry.
+    assert limited["transitions"][0]["from_state"] == "verdict"
+    assert limited["transitions"][0]["to_state"] == "implementing"
+    assert limited["transitions"][1]["from_state"] == "implementing"
+    assert limited["transitions"][1]["to_state"] == "needs_human"
+    assert not any(t.get("synthetic") for t in limited["transitions"])
+
+    assert limited["operations_total"] == 3
+    limited_ops = api.item_payload(conn, 1, history_limit=2)["operations"]
+    assert len(limited_ops) == 2, limited_ops
+    assert [o["op_id"] for o in limited_ops] == ["op1", "op2"]
     conn.close()
 
 

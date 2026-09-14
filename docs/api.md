@@ -161,7 +161,8 @@ captured by it.
             "brief": "(truncated to 2000 chars)", "brief_truncated": false },
   "event": { "id": 42, "source": "slack_alert", "external_id": "...",
              "title": "...", "url": null, "first_seen": "...",
-             "resolved_at": null, "payload": null },
+             "resolved_at": null, "payload": null,
+             "reminder_count": 0, "last_reminder_at": null },
   "dispatches": [ {
     "job_id": "j-abc", "tier": "implement", "repo": "warden", "status": "done",
     "created_at": "...", "finished_at": "...", "reported_at": "...",
@@ -179,7 +180,9 @@ captured by it.
                     "decision": null, "decided_by": null, "spent_at": null,
                     "spent_job_id": null, "spend_error": null } ],
   "transitions": [ { "id": 100, "event_id": 42, "from_state": "new",
-                      "to_state": "investigating", "at": "...", "note": null } ]
+                      "to_state": "investigating", "at": "...", "note": null } ],
+  "transitions_total": 1,
+  "operations_total": 1
 }
 ```
 
@@ -199,16 +202,48 @@ schema 7) — so `approvals` is derived from that, keyed by SQLite's own
 (`nonce`) is never returned. `stdin_text`/`context_text` are never returned
 either — see this file's own secrets note above.
 
+`event.reminder_count`/`event.last_reminder_at` are watchdog-poll.py's
+grouped-source alert reminders — how many times, and when most recently,
+Slack was reminded about this alert recurring — and are a different counter
+from `item.reminder_count`/`item.last_reminder_at` (schema 9), which count
+the `needs_human`/`merge_blocked` "still waiting on you" reminders instead.
+Same shape, deliberately different tables/columns: see `scripts/ledger.py`'s
+migration 9 comment for why reusing one counter for both would answer two
+unrelated questions with one number.
+
 ```bash
 curl -s http://127.0.0.1:7735/items/42 | jq .
 ```
 
-**`item_transitions` is history after the first state, not from creation.**
-`ingest()` inserts a brand-new `triage_items` row directly with `state='new'`
-rather than going through `_set_state()` (there is no prior state to
-transition from), so an item's entry into `new` is never itself recorded as a
-row here — the table's first entry for an item is always its departure from
-`new` (or later).
+**Every creation site now writes its own `created` transition.** The two
+`INSERT INTO triage_items` sites (`ingest()`, `open_origin_item()`) call
+`_record_created_transition()` right after the insert, appending
+`from_state=NULL, to_state=<the state it was created into>, note='created'`
+— this is the one write of `item_transitions` outside `_set_state()`, because
+a raw `INSERT` (unlike every later move) never goes through it. A **legacy**
+item predating this — every item created before this endpoint's field
+addition — has no such row; `item_payload()` detects that (no transition in
+the (unbounded) returned list has `from_state IS NULL`) and prepends a
+synthetic one instead: `{"id": null, "event_id": ..., "from_state": null,
+"to_state": <the first recorded transition's from_state, or item.state if it
+has none>, "at": item.created_at, "note": "created", "synthetic": true}`.
+This synthetic entry is only added when the returned history is NOT
+truncated by `history_limit` (below) — a truncated list is missing its own
+oldest rows, so a genuine `from_state IS NULL` row further back cannot be
+ruled out.
+
+**`history_limit`.** `item_payload()` (Python call only, not a query
+parameter on this HTTP endpoint) accepts an optional `history_limit: int`
+that keeps only the newest N `transitions` and the newest N `operations`,
+still returned oldest-first. `transitions_total`/`operations_total` are
+always present at the top level — the true row counts, independent of any
+limit — so a caller can tell a full history from a truncated one. `GET
+/items/<event_id>` itself calls `item_payload()` with no limit and stays
+fully unbounded; only the embedded per-item detail in the Argo snapshot
+(below) is bounded, at `ARGO_SNAPSHOT_HISTORY_LIMIT = 50`, because that
+detail is re-embedded on every 10-minute tick and an item with a flapping
+state otherwise grows the snapshot unbounded (item 543: ~780B/tick, 232KB
+before this cap).
 
 ## Why these six and not more
 
@@ -233,8 +268,10 @@ as the last step of every 10-minute pass (`push_argo_snapshot()`, after
 The pushed payload is `build_argo_snapshot()`'s output: `machine`,
 `generatedAt`, and this same module's `health_payload()`/`metrics_payload()`/
 `board_payload()` verbatim, plus `budget` (the same object `warden run`/`dispatch`/`list`
-report under `budget`), `items` (full `item_payload()` detail for the first 50 board items,
-keyed by event_id as a string) with `itemsTruncated` alongside it, and
+report under `budget`), `items` (`item_payload()` detail for the first 50 board items,
+keyed by event_id as a string, each bounded to its newest 50 transitions/operations via
+`history_limit=ARGO_SNAPSHOT_HISTORY_LIMIT` — see `GET /items/<event_id>`'s own
+`history_limit` note above) with `itemsTruncated` alongside it, and
 `intents` (spooled-intent state from `~/.warden/intents`: full `pending`/
 `rejected` counts, but at most 20 per-status file entries — `entriesTruncated`
 says whether either status is currently over that cap. Because `rejected/`

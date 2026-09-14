@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-14 (§67) |
+| Last updated | 2026-09-14 (§68) |
 | Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 252/252 is the gate; `make test` runs all suites |
+| Tests | `tests/test_triage.py` 255/255 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -148,18 +148,18 @@ loop.
 - No limits; `warden close`; `check-routing`; helpers folded; hermes-agent
   roadkill — §66
 - Three recurring alerts: backup bundle verify, tier-cap flap, Kuma interval — §67
+- Creation transitions, event reminders, bounded snapshot; secrets-run relay; VPN interval — §68
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-§67 fixed the backup heartbeat (bundle verify from `/`) and the verdict ↔
-implementing flap on tier-capped repos; item 543 now reaches `needs_human` with
-the modelpick/`secrets-run` signal-relay fix to apply by hand in dotfiles.
-Open, in order: Argo's item modal renders nothing for alert-origin items
-(`item-timeline.tsx` reads only `brief`); a created → new transition at item
-creation; one reminder counter instead of two; bound the transitions and
-operations embedded per snapshot item; the homelab VPN Watchdog monitor
-interval. Still ahead from before: the first host-verb `fixed`, the ledger
-restore path, Wave 9 from `docs/handover-field-review.md`.
+§67/§68 closed the recurring-alert list: backup heartbeat, tier-cap flap
+(543 now `needs_human`), creation transitions, alert reminders on the event,
+the snapshot bounded to 50 rows per item, `secrets-run`'s group relay
+(dotfiles `a9410e7`), the VPN Watchdog interval (homelab-private `a71ded1`).
+In flight: argo's item modal branch (fallow complexity gate), the Hermes
+gateway stale-instance investigation. Still ahead from before: the first
+host-verb `fixed`, the ledger restore path, Wave 9 from
+`docs/handover-field-review.md`.

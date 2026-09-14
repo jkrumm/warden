@@ -1808,6 +1808,11 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     resolved/dismissed row that is still quiet from one a fresh occurrence
     reopened underneath.
 
+    See `_record_created_transition()` for the one exception: the two
+    `INSERT INTO triage_items` creation sites, which start a row at `new`
+    without ever calling this function and so would otherwise leave that
+    first transition unrecorded.
+
     Also appends exactly one `item_transitions` row on a REAL state change —
     rowcount>0 from the UPDATE AND the prior state differs from `state` — and
     nothing otherwise. This is also the only writer of that table, for the
@@ -1876,6 +1881,20 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     return rowcount
 
 
+def _record_created_transition(conn: sqlite3.Connection, event_id: int, state: str, at: str) -> None:
+    """Write the one `item_transitions` row a creation site owes: a raw
+    `INSERT INTO triage_items` (unlike every later move) never goes through
+    `_set_state()`, so without this call a brand-new item has zero rows in
+    its own history. `from_state` is NULL — there was no prior state — and
+    `at` is the item's own `created_at`, not `now()`, so the row lines up
+    with the item it describes rather than with whatever tick happened to
+    run next."""
+    conn.execute(
+        "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+        (event_id, None, state, at, "created"),
+    )
+
+
 # --- 1. ingest -------------------------------------------------------------
 
 def ingest(conn: sqlite3.Connection, now: dt.datetime) -> None:
@@ -1904,6 +1923,7 @@ def ingest(conn: sqlite3.Connection, now: dt.datetime) -> None:
                 (event_id, _signature(ev), None, STATE_NEW, occurrences,
                  ev["first_seen"], last_seen, now_iso, now_iso),
             )
+            _record_created_transition(conn, event_id, STATE_NEW, now_iso)
         else:
             conn.execute(
                 "UPDATE triage_items SET occurrences=?, last_seen=?, updated_at=? WHERE event_id=?",
@@ -1991,6 +2011,7 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
         (event_id, _signature(event_row), repo, STATE_NEW, origin, max_tier, brief,
          origin_channel or None, origin_thread_ts or None, 1, now_iso, now_iso, now_iso, now_iso),
     )
+    _record_created_transition(conn, event_id, STATE_NEW, now_iso)
     conn.commit()
     return event_id
 
@@ -6272,6 +6293,11 @@ def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], un
 
 ARGO_SNAPSHOT_ITEMS_CAP = 50
 
+# Passed as item_payload()'s history_limit for every embedded item below — a
+# flapping item's transitions/operations grow unbounded otherwise (item 543:
+# ~780B/tick, 232KB before this cap). See item_payload()'s own docstring.
+ARGO_SNAPSHOT_HISTORY_LIMIT = 50
+
 # `rejected/` is never cleaned (intents.py's own "nothing is silently
 # discarded" docstring) — so unlike `pending`, which drains to near-zero
 # every pass, `rejected` only ever grows. Without a per-status cap here the
@@ -6359,7 +6385,12 @@ def build_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
     keyed by event_id as a string (JSON object keys are always strings)."""
     board = _api.board_payload(conn)
     board_items = board["items"][:ARGO_SNAPSHOT_ITEMS_CAP]
-    items = {str(item["event_id"]): _api.item_payload(conn, item["event_id"]) for item in board_items}
+    items = {
+        str(item["event_id"]): _api.item_payload(
+            conn, item["event_id"], history_limit=ARGO_SNAPSHOT_HISTORY_LIMIT
+        )
+        for item in board_items
+    }
 
     limits = _policy.limits_from_env()
     counts = _policy.budget_counts(conn, now)

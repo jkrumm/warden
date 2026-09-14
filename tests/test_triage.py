@@ -1225,6 +1225,41 @@ def test_open_origin_item_inserts_event_and_item_and_dedups():
         assert triage._get_item(conn, eid1)["brief"] == "do the thing"
 
 
+def test_open_origin_item_records_created_transition():
+    """The raw `INSERT INTO triage_items` in open_origin_item() never goes
+    through _set_state(), so without _record_created_transition() a
+    human-origin item would have zero rows in its own item_transitions —
+    invisible history from the very moment it started."""
+    with _triage_env() as (conn, ctx):
+        eid = triage.open_origin_item(
+            conn, origin="human", repo="demo-repo", brief="do the thing", max_tier="implement",
+            external_id="human:created-1", title="a human ask", now=NOW,
+        )
+        rows = conn.execute(
+            "SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)
+        ).fetchall()
+        assert len(rows) == 1, rows
+        assert rows[0]["from_state"] is None
+        assert rows[0]["to_state"] == triage.STATE_NEW
+        assert rows[0]["note"] == "created"
+
+
+def test_ingest_records_created_transition():
+    """Same as open_origin_item(): ingest()'s own INSERT must not be the one
+    silent creation site left with no `item_transitions` row."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-ingest-created", title="x",
+                             first_seen=NOW)
+        triage.ingest(conn, NOW)
+        rows = conn.execute(
+            "SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)
+        ).fetchall()
+        assert len(rows) == 1, rows
+        assert rows[0]["from_state"] is None
+        assert rows[0]["to_state"] == triage.STATE_NEW
+        assert rows[0]["note"] == "created"
+
+
 def test_open_origin_item_terminal_item_returns_none_and_inserts_nothing():
     with _triage_env() as (conn, ctx):
         eid = triage.open_origin_item(
@@ -4592,6 +4627,34 @@ def test_build_argo_snapshot_includes_open_item_timeline():
         assert detail["item"]["event_id"] == eid
 
 
+def test_build_argo_snapshot_bounds_embedded_history():
+    """item 543 flapped and grew the snapshot ~780B/tick, 232KB before this
+    cap — build_argo_snapshot() must pass ARGO_SNAPSHOT_HISTORY_LIMIT into
+    every embedded item_payload() call, not embed full unbounded history."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="argo-flap", title="flapping",
+                             first_seen=VERY_OLD)
+        triage.ingest(conn, NOW)
+        for i in range(6):
+            triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW + dt.timedelta(minutes=2 * i))
+            triage._set_state(conn, eid, triage.STATE_NEW, NOW + dt.timedelta(minutes=2 * i + 1))
+        real_total = conn.execute(
+            "SELECT COUNT(*) FROM item_transitions WHERE event_id=?", (eid,)
+        ).fetchone()[0]
+        assert real_total > 3, "fixture must produce more transitions than the test's own limit"
+
+        original_limit = triage.ARGO_SNAPSHOT_HISTORY_LIMIT
+        triage.ARGO_SNAPSHOT_HISTORY_LIMIT = 3
+        try:
+            snapshot = triage.build_argo_snapshot(conn, NOW)
+        finally:
+            triage.ARGO_SNAPSHOT_HISTORY_LIMIT = original_limit
+
+        detail = snapshot["items"][str(eid)]
+        assert detail["transitions_total"] == real_total
+        assert len(detail["transitions"]) == 3, detail["transitions"]
+
+
 def _write_intent_file(directory: Path, name: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
@@ -5462,24 +5525,32 @@ def test_set_state_records_transitions_only_on_real_change():
                              first_seen=OLD)
         triage.ingest(conn, NOW)
 
-        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job="job-t1")
+        # ingest()'s own INSERT already recorded one `created` row (from_state
+        # NULL, to_state=new) via _record_created_transition() — not this
+        # function's concern, but it is the baseline every count below starts from.
         rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)).fetchall()
         assert len(rows) == 1, rows
-        assert rows[0]["from_state"] == triage.STATE_NEW
-        assert rows[0]["to_state"] == triage.STATE_INVESTIGATING
-        assert rows[0]["note"] is None
+        assert rows[0]["from_state"] is None
+        assert rows[0]["to_state"] == triage.STATE_NEW
+
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job="job-t1")
+        rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)).fetchall()
+        assert len(rows) == 2, rows
+        assert rows[1]["from_state"] == triage.STATE_NEW
+        assert rows[1]["to_state"] == triage.STATE_INVESTIGATING
+        assert rows[1]["note"] is None
 
         # Column-only write, state unchanged — must NOT be recorded.
         triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job="job-t1")
         rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=?", (eid,)).fetchall()
-        assert len(rows) == 1, "a column-only write with the state unchanged must not be recorded"
+        assert len(rows) == 2, "a column-only write with the state unchanged must not be recorded"
 
         triage._set_state(conn, eid, triage.STATE_NEEDS_HUMAN, NOW, note="deadline expired: test")
         rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)).fetchall()
-        assert len(rows) == 2, rows
-        assert rows[1]["from_state"] == triage.STATE_INVESTIGATING
-        assert rows[1]["to_state"] == triage.STATE_NEEDS_HUMAN
-        assert rows[1]["note"] == "deadline expired: test"
+        assert len(rows) == 3, rows
+        assert rows[2]["from_state"] == triage.STATE_INVESTIGATING
+        assert rows[2]["to_state"] == triage.STATE_NEEDS_HUMAN
+        assert rows[2]["note"] == "deadline expired: test"
 
 
 def test_cmd_close_closes_with_reason_and_refuses_empty_reason_or_unknown_signature():
