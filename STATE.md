@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-12 (§66) |
+| Last updated | 2026-09-14 (§67) |
 | Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 248/248 is the gate; `make test` runs all suites |
+| Tests | `tests/test_triage.py` 252/252 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -147,16 +147,19 @@ loop.
   audit, the comparison — §65
 - No limits; `warden close`; `check-routing`; helpers folded; hermes-agent
   roadkill — §66
+- Three recurring alerts: backup bundle verify, tier-cap flap, Kuma interval — §67
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-`needs_human` is 0: item 1007 (the owner's brief, answered by §65) and item
-253 (pre-§64 leftover) are closed by hand with `warden close`. Item 996 landed (meteo master 95d3e3b, watchdog
-105/105, Kuma 220 UP with `degraded: true`). Owner: nothing. Loop: the first host-verb `fixed` is still ahead — the three hermes
-items resolved as `quiet` before the heartbeat probe landed; a sideclaw host
-verb for uk:204-shaped crashes, guarded by no dispatch in flight; the ledger
-restore path. Wave 9, the field review, from `docs/handover-field-review.md`
-after a few days of this.
+§67 fixed the backup heartbeat (bundle verify from `/`) and the verdict ↔
+implementing flap on tier-capped repos; item 543 now reaches `needs_human` with
+the modelpick/`secrets-run` signal-relay fix to apply by hand in dotfiles.
+Open, in order: Argo's item modal renders nothing for alert-origin items
+(`item-timeline.tsx` reads only `brief`); a created → new transition at item
+creation; one reminder counter instead of two; bound the transitions and
+operations embedded per snapshot item; the homelab VPN Watchdog monitor
+interval. Still ahead from before: the first host-verb `fixed`, the ledger
+restore path, Wave 9 from `docs/handover-field-review.md`.

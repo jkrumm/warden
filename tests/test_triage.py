@@ -2902,6 +2902,32 @@ def test_auto_implement_in_flight_lock_defers_with_a_visible_note():
         assert item["note"] is not None and item["note"].startswith("deferred: "), item["note"]
 
 
+def test_auto_implement_on_a_tier_capped_repo_folds_to_needs_human_without_dispatching():
+    """A repo capped at `investigate` (dispatch-repos.json `tiers`) can never
+    take an implement episode — sideclaw refuses it at its boundary. Claiming
+    the item and rolling back on that refusal flapped item 543 between
+    verdict and implementing every tick, silently, resetting its deadline
+    forever (§67). The cap is checked locally and the verdict reaches a human."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-capped", repo="capped-repo")
+        triage._policy.resolve_repo = lambda name, policy=None: triage._policy.RepoTarget(
+            name=name, path=Path(f"/fake-repos/{name}"), max_tier="investigate", sensitive=False,
+        )
+        submit_calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(submit_calls)
+
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert submit_calls == [], "a tier-capped repo must never reach sideclaw"
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "capped at tier 'investigate'" in (item["note"] or ""), item["note"]
+        states = [r[0] for r in conn.execute(
+            "SELECT to_state FROM item_transitions WHERE event_id=? ORDER BY id", (eid,))]
+        assert triage.STATE_IMPLEMENTING not in states, states
+
+
 def test_implement_success_opens_a_review_validation():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-impl-ok")

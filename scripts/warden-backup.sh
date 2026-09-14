@@ -144,8 +144,11 @@ BUNDLE_RC=0
 BUNDLE="$SNAP_DIR/warden-repo.bundle"
 if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
   mkdir -p "$SNAP_DIR"
-  if git -C "$REPO" bundle create "$BUNDLE.tmp" --all >/dev/null 2>&1 \
-     && git bundle verify "$BUNDLE.tmp" >/dev/null 2>&1; then
+  # `verify` needs a repository to check prerequisites against: launchd runs this
+  # from `/`, where a bare `git bundle verify` fails every night (§67).
+  # stderr stays on: three nights of "bundle FAILED" never said why.
+  if git -C "$REPO" bundle create "$BUNDLE.tmp" --all >/dev/null \
+     && git -C "$REPO" bundle verify "$BUNDLE.tmp" >/dev/null; then
     mv -f "$BUNDLE.tmp" "$BUNDLE"
     echo "bundle $BUNDLE ($(du -h "$BUNDLE" | cut -f1), $(git -C "$REPO" rev-parse --short HEAD))"
   else

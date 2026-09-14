@@ -4861,6 +4861,21 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
             continue
 
+        # A repo capped below `implement` (dispatch-repos.json `tiers`) is not a
+        # deferral: the cap never lifts on its own, and sideclaw refuses the same
+        # dispatch at its boundary. Checked locally so the verdict reaches a human
+        # instead of a claim/refuse/rollback cycle every tick (item 543, §67).
+        try:
+            _policy.resolve_tier("implement", target)
+        except PolicyError as e:
+            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
+                       note=f"investigation concluded implement, but {e} — apply the fix by hand")
+            conn.commit()
+            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
+            if fresh_item is not None and fresh_event is not None:
+                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+            continue
+
         brief = (
             "A prior read-only investigation of this repo (dispatched by the alert triage loop) "
             "already concluded, at high confidence, that the fix should be implemented — re-read "
@@ -4914,7 +4929,8 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # A definite failure — sideclaw was never reached, or refused
             # outright. open_episode() already completed the operation
             # `failed`, so it is safe to hand the claim back.
-            _set_state(conn, item["event_id"], STATE_VERDICT, now, expect_state=STATE_IMPLEMENTING)
+            _set_state(conn, item["event_id"], STATE_VERDICT, now, expect_state=STATE_IMPLEMENTING,
+                       note=f"deferred: {exc}")
             conn.commit()
             continue
         except (PolicyError, PreconditionError, UsageError) as e:

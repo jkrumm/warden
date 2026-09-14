@@ -7063,3 +7063,62 @@ reason appears.
 
 **Item 1007's answer is §65**, closed with that note. The next brief of that
 shape goes to a session, not to `warden run` — recorded in memory.
+
+## 67. Three recurring alerts, traced to the line (2026-09-14, 18:30Z → 19:10Z)
+
+The owner asked why `Warden Backup - Push`, `MacMini Dev Host - Push` and
+`VPN Watchdog - Push` keep coming back. Three different answers.
+
+**Warden Backup (uk:234, item 1010) was warden's own bug.** The heartbeat is
+gated on `BUNDLE_RC`, and the §62 bundle step failed every 03:10 run since it
+landed: `git bundle verify` needs a repository to check prerequisites against,
+and launchd runs the script from `/` — `error: need a repository to verify a
+bundle`. `bundle create` has `-C "$REPO"`, `verify` did not. Both stderr
+streams went to `/dev/null`, so three nights of `bundle FAILED` never said
+why. Fix: `git -C "$REPO" bundle verify`, stderr kept. Kickstarted at 18:48Z:
+bundle 1.2M at `15e96a4`, exit 0, heartbeat sent. (The 2026-09-12 11:18
+bundle on disk was a load-time catch-up run from a repo cwd, which is why the
+path looked proven.)
+
+**MacMini Dev Host (uk:204, item 543) was a real failure plus a loop bug.**
+The real part: `devhost-health-check.sh` pushed `down` for ~45 h on modelpick
+`node` processes spinning at ~100% CPU — orphaned by `secrets-run`'s missing
+signal relay, which item 543's own investigate verdict (dispatch 51, high
+confidence, `nextAction: implement`) had already named. The bug: `dotfiles` is
+capped at `investigate` in `dispatch-repos.json`, `maybe_auto_implement` never
+checked the ceiling, so every tick it claimed the item (`verdict →
+implementing`), sideclaw refused at its boundary (HTTP 400 `tier 'implement'
+exceeds the ceiling 'investigate'`), and the rollback put it back with no
+note. Two silent transitions every 600 s, the verdict deadline reset each
+time so it could never time out, and the Argo snapshot grew ~780 B per tick
+from the transition rows. Fix: `_policy.resolve_tier("implement", target)`
+before the claim; a cap folds the item to `needs_human` carrying the refusal
+("apply the fix by hand"), and the remote-refusal rollback now carries
+`deferred: <error>` like its siblings. Test
+`test_auto_implement_on_a_tier_capped_repo_folds_to_needs_human_without_dispatching`;
+`test_triage.py` 252/252.
+
+**VPN Watchdog (uk:150) is interval noise on the homelab side**: a 5-min cron
+pusher against a 300 s Kuma interval with `maxretries: 0`, so one slow tick
+pages. The fix belongs to the homelab repo's own monitor config (interval
+≥ 2× cadence, the MacMini monitor's pattern); not touched from here.
+
+Also committed: the 2026-09-13 DeepSeek rollout diff for `propose_mappings`
+(`a4d7c9c`), left uncommitted by the session that wrote it; that is where
+the 248 → 251 came from.
+
+**Found, not fixed:**
+- Argo's item modal (`argo/.../features/warden/item-timeline.tsx:212`) reads
+  only `item.brief`; an alert-origin item shows "No brief recorded" and four
+  empty lists although `GET /items/<id>` already carries the event title,
+  occurrences, first/last seen, signature, deadline and note.
+- Item creation (`INSERT` at the two `triage_items` creation sites) writes no
+  initial `item_transitions` row, so a `new` item reads "Transitions (0)".
+- Two reminder counters: Slack reminders count on `events.reminder_count`
+  (watchdog-poll, 6 h for `uk`), `triage_items.reminder_count` only for
+  `needs_human`/`merge_blocked` — the API's item shows 0 while Slack says #4.
+- `item_payload()` embeds every transition and operation row unbounded in
+  each board snapshot.
+- Hermes: a manual stop racing launchd's SIGTERM left pid 61585 half-dead and
+  five refused starts (item 1017, self-healed); nothing reaps a stale
+  instance on start.
