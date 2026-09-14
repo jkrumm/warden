@@ -797,18 +797,23 @@ it wastes a whole investigate episode), oldest first, capped at
 
 **The call.** One batched request against the Hermes brain over the same
 OpenAI-compatible endpoint `config.yaml` already configures
-(`OPENAI_BASE_URL`/`OPENAI_API_KEY`, model `gpt-5.6-luna`, `chat_completions`
-— never the Responses-API leg the main agent uses), secrets resolved the same
-way every other secret in this file is (`_resolve_openai_api_key()` mirrors
-`resolve_slack_token()`'s own env-var-then-`secrets-run` shape — never a
-plaintext key). Bounded on every axis this loop can bound: a hard timeout
-(`PROPOSE_MAPPINGS_TIMEOUT`, default 90s), a cap on output tokens
-(`PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS`, 2000), and the input cap above. Strict
-JSON only, one of three shapes per signature: `{"action": "ignore", "reason":
-…}`, `{"action": "map", "repo": …, "reason": …}`, or `{"action": "unsure"}`.
-A failed, timed-out, or unparseable call is logged to stderr and otherwise a
-no-op — this loop must never depend on it succeeding, exactly like every
-other externally-visible call in this file.
+(`OPENAI_BASE_URL`/`OPENAI_API_KEY`, model `deepseek-v4.1-flash`,
+`chat_completions` only — this model's `/responses` leg 404s despite `/models`
+listing it, and it is never the Responses-API leg the main agent uses anyway),
+top-level `reasoning_effort: "high"` (`PROPOSE_MAPPINGS_REASONING_EFFORT`),
+secrets resolved the same way every other secret in this file is
+(`_resolve_openai_api_key()` mirrors `resolve_slack_token()`'s own
+env-var-then-`secrets-run` shape — never a plaintext key). Bounded on every
+axis this loop can bound: a hard timeout (`PROPOSE_MAPPINGS_TIMEOUT`, default
+1800s — a hang guard, not a budget, since this is a single non-streaming
+request), a cap on output tokens (`PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS`,
+16000 — this model's thinking expands to fill whatever budget it is given),
+and the input cap above. Strict JSON only, one of three shapes per signature:
+`{"action": "ignore", "reason": …}`, `{"action": "map", "repo": …, "reason":
+…}`, or `{"action": "unsure"}`. A failed, timed-out, empty-content,
+truncated (`finish_reason: "length"`), or unparseable call is logged to
+stderr and otherwise a no-op — this loop must never depend on it succeeding,
+exactly like every other externally-visible call in this file.
 
 **Applying a proposal.** `ignore` and `map` are NEVER written to
 `triage_items` directly — they only ever become policy entries, picked up by

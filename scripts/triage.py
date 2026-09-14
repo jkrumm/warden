@@ -133,7 +133,7 @@ as cheaply as this problem allows: at most once per 24h (a cursor in
 `cursors`, the same table the digest already uses), batched into ONE request
 against the Hermes brain over the same OpenAI-compatible endpoint
 config.yaml already configures (`OPENAI_BASE_URL`/`OPENAI_API_KEY`, model
-`gpt-5.6-luna`), secrets resolved the same way every other secret in this
+`deepseek-v4.1-flash`), secrets resolved the same way every other secret in this
 file is — never a plaintext key. At most `PROPOSE_MAPPINGS_MAX_SIGNATURES`
 candidates per run: every `new` item with no `repo`/`verb` whose event has
 been open longer than `proposeMappingsAgeDays` (policy knob, default 7 — a
@@ -1114,11 +1114,28 @@ PROPOSE_MAPPINGS_MAX_SIGNATURES = 25
 # A batch of at most 25 short JSON decisions (one action + one one-line reason
 # each) comfortably fits well under this; the cap exists so a misbehaving
 # endpoint can't turn one daily maintenance call into an open-ended generation.
-PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS = 2000
+# 16000, not the historic 2000: deepseek-v4.1-flash's thinking expands to fill
+# whatever budget it is given and returns empty with finish_reason "length"
+# below ~1000 tokens — the reasoning tokens come out of this SAME budget, they
+# are not billed/counted separately (completion_tokens_details.reasoning_tokens
+# is misreported as 0 on this endpoint).
+PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS = 16000
+
+# Top-level `reasoning_effort`, sent alongside the model on every call — the
+# only effort knob this endpoint honours for this model (`{"reasoning": {...}}`
+# extra_body is rejected on /chat/completions). "high" per the 2026-09-13
+# estate-wide model rollout; this file's batched daily maintenance call is not
+# latency-critical, so there is no reason to trade quality for speed here.
+PROPOSE_MAPPINGS_REASONING_EFFORT = "high"
 
 # The call itself, separate from SUBPROCESS_TIMEOUT (which bounds a hermes-cc.sh
-# subprocess, not an HTTP request this file makes directly).
-PROPOSE_MAPPINGS_TIMEOUT = int(os.environ.get("TRIAGE_PROPOSE_TIMEOUT", "90"))
+# subprocess, not an HTTP request this file makes directly). 1800s (30 min), not
+# the historic 90s: this is a single non-agentic HTTP request with no streaming,
+# so per this estate's agent-limits rule it needs a hang guard of at least 30
+# min rather than a tight budget — a reasoning model spending minutes on a
+# `high`-effort batch is not a hang, and this call is once-a-day maintenance,
+# never on any latency-sensitive path.
+PROPOSE_MAPPINGS_TIMEOUT = int(os.environ.get("TRIAGE_PROPOSE_TIMEOUT", "1800"))
 
 # A signature younger than this may still be a one-off (a transient blip that
 # resolves on its own before anyone would ever hand-map it) — mapping it this
@@ -1132,17 +1149,20 @@ DEFAULT_PROPOSE_MAPPINGS_AGE_DAYS = 7.0
 # occasionally rather than permanently stuck.
 PROPOSE_UNSURE_COOLDOWN_DAYS = 7.0
 
-# Cheapest reasonable use of a model this file makes: chat_completions, no
-# tools, over the SAME OpenAI-compatible endpoint config.yaml already points
-# gpt-5.6-luna at (api_mode: chat_completions, e.g. the auxiliary blocks
-# around OPENAI_BASE_URL/OPENAI_API_KEY) — never the Responses-API leg the
-# main agent uses (codex_responses), which this file has no reason to touch.
-# Measured directly against the endpoint: this reasoning model 503s on
-# `max_tokens` ("Use 'max_completion_tokens' instead") and on any non-default
-# `temperature` ("Only the default (1) value is supported") — the same lesson
-# hermes-agent's own config.yaml already recorded for this model family. Strict
-# JSON is enforced by the system prompt and the parse below, not by temperature.
-PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "gpt-5.6-luna")
+# Mid-size, single-shot maintenance call — this estate's 2026-09-13 model
+# rollout puts it on deepseek-v4.1-flash, chat_completions only
+# (`/openai/v1/chat/completions` — `/responses` 404s "No suitable backend"
+# for this model despite `/models` listing it), over the SAME OpenAI-
+# compatible endpoint config.yaml already points the Hermes brain at
+# (OPENAI_BASE_URL/OPENAI_API_KEY) — never the Responses-API leg the main
+# agent uses (codex_responses), which this file has no reason to touch.
+# Measured directly against the endpoint: this model accepts `reasoning_effort`
+# (low/high/xhigh/max) and tolerates `temperature`/`max_tokens`, but this file
+# sends `max_completion_tokens` and no `temperature` regardless — the house
+# rule, and portable to the other models this endpoint hosts (gpt-5.6-luna
+# 503s on both). Strict JSON is enforced by the system prompt and the parse
+# below, not by temperature.
+PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "deepseek-v4.1-flash")
 
 # Automatic investigate/implement episodes (loop-driven, not human-typed) run
 # on the cheap IU tier: modelpick's 2026-08-31 bake-off scored glm-5.3-flash
@@ -5853,9 +5873,9 @@ def _build_propose_mappings_prompt(candidates: list[sqlite3.Row], repo_names: li
 def _propose_mappings_request_body(prompt: str) -> dict[str, Any]:
     """The request body `_call_propose_mappings_model` sends, extracted so a
     test can assert its shape without a network round-trip. `max_completion_
-    tokens`, never `max_tokens`, and NO `temperature` key at all — see
-    PROPOSE_MAPPINGS_MODEL's own comment for the measured 503s that make
-    both of those non-negotiable on this endpoint."""
+    tokens`, never `max_tokens`, NO `temperature` key at all, and a top-level
+    `reasoning_effort` — see PROPOSE_MAPPINGS_MODEL's own comment for what is
+    and isn't negotiable on this endpoint."""
     return {
         "model": PROPOSE_MAPPINGS_MODEL,
         "messages": [
@@ -5863,6 +5883,7 @@ def _propose_mappings_request_body(prompt: str) -> dict[str, Any]:
             {"role": "user", "content": prompt},
         ],
         "max_completion_tokens": PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS,
+        "reasoning_effort": PROPOSE_MAPPINGS_REASONING_EFFORT,
     }
 
 
@@ -5871,7 +5892,8 @@ def _call_propose_mappings_model(prompt: str) -> dict[str, Any] | None:
     on every axis this loop can bound (timeout, output tokens, and the
     caller's own cap on how many signatures went into the prompt). ANY
     failure — unresolved secrets, network, timeout, non-2xx, unexpected
-    response shape, or unparseable JSON — is caught here and returns None;
+    response shape, empty content, a truncated (`finish_reason: "length"`)
+    completion, or unparseable JSON — is caught here and returns None;
     propose_mappings() logs to stderr and moves on. This loop must never
     depend on this call succeeding."""
     base_url = _resolve_openai_base_url()
@@ -5894,11 +5916,24 @@ def _call_propose_mappings_model(prompt: str) -> dict[str, Any] | None:
         print(f"triage: propose_mappings — model call failed: {e}", file=sys.stderr)
         return None
     try:
-        content = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError):
         print(f"triage: propose_mappings — unexpected response shape: {str(data)[:300]}", file=sys.stderr)
         return None
+    finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
     content = (content or "").strip()
+    # An under-budgeted reasoning model returns HTTP 200 with empty content and
+    # finish_reason "length", silently — never trust an empty body, and always
+    # surface finish_reason so an empty/truncated response is diagnosable from
+    # stderr alone rather than read as "the model said nothing".
+    if not content:
+        print(f"triage: propose_mappings — empty content (finish_reason={finish_reason!r})", file=sys.stderr)
+        return None
+    if finish_reason == "length":
+        print(f"triage: propose_mappings — response truncated (finish_reason=length), discarding",
+              file=sys.stderr)
+        return None
     if content.startswith("```"):
         content = content.strip("`")
         if content[:4].lower() == "json":

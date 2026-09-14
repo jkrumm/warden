@@ -191,7 +191,7 @@
     "file automatically. Once every 24h it batches every signature that has sat unmapped",
     "(no `rules` match) in state `new` for at least this many days \u2014 a fresh signature may",
     "still be a one-off, and mapping it this early wastes a whole investigate episode \u2014 and",
-    "asks the SAME gpt-5.6-luna brain config.yaml already configures to propose `map`",
+    "asks the SAME deepseek-v4.1-flash brain config.yaml already configures to propose `map`",
     "(append a rule \u2014 a wrong one costs one wasted read-only episode), `ignore` (append to",
     "the ignore list), or `unsure` (leave unmapped, not re-asked for 7 more days). Every",
     "applied entry below is stamped `proposedAt`/`proposedBy: \"triage-auto\"` plus the",

@@ -4165,15 +4165,87 @@ def test_deploy_on_merge_liveness_confirmed_produces_a_fixed_row():
 # --- propose_mappings() — the one LLM call in this file ---------------------
 
 def test_propose_mappings_request_body_has_no_max_tokens_or_temperature():
-    """Measured directly against the endpoint: this reasoning model 503s on
-    `max_tokens` and on any non-default `temperature` — see
-    PROPOSE_MAPPINGS_MODEL's own comment. `max_completion_tokens` is the
-    replacement; `temperature` must not be sent at all."""
+    """House rule for every OpenAI-leg call this file makes: `max_completion_
+    tokens`, never `max_tokens`; no `temperature` at all; a top-level
+    `reasoning_effort` — see PROPOSE_MAPPINGS_MODEL's own comment."""
     body = triage._propose_mappings_request_body("a prompt")
     assert body["model"] == triage.PROPOSE_MAPPINGS_MODEL
     assert body["max_completion_tokens"] == triage.PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS
+    assert body["reasoning_effort"] == triage.PROPOSE_MAPPINGS_REASONING_EFFORT
     assert "max_tokens" not in body
     assert "temperature" not in body
+
+
+def test_propose_mappings_model_and_budget_constants():
+    """Pins the 2026-09-13 estate-wide model rollout for this slot: deepseek-
+    v4.1-flash, `reasoning_effort: "high"`, a 16000-token budget (this model's
+    thinking expands to fill whatever it is given, and returns empty below
+    ~1000), and a 1800s hang guard (this is a single non-streaming request, so
+    per the agent-limits rule it needs a guard, not a tight budget)."""
+    assert triage.PROPOSE_MAPPINGS_MODEL == "deepseek-v4.1-flash"
+    assert triage.PROPOSE_MAPPINGS_REASONING_EFFORT == "high"
+    assert triage.PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS == 16000
+    assert triage.PROPOSE_MAPPINGS_TIMEOUT == 1800
+
+
+class _FakeCompletionResp:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def test_propose_mappings_model_call_empty_content_is_non_fatal_and_logs_finish_reason():
+    """An under-budgeted reasoning model returns HTTP 200 with empty content
+    and `finish_reason: "length"`, silently — this must never be read as a
+    successful empty proposal, and finish_reason must be visible on stderr."""
+    triage._resolve_openai_base_url = lambda: "https://example.test/v1"
+    triage._resolve_openai_api_key = lambda: "test-key"
+
+    body = json.dumps({
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+    }).encode()
+    saved_urlopen = triage.urllib.request.urlopen
+    triage.urllib.request.urlopen = lambda _req, timeout=None: _FakeCompletionResp(body)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            result = triage._call_propose_mappings_model("a prompt")
+    finally:
+        triage.urllib.request.urlopen = saved_urlopen
+
+    assert result is None
+    assert "finish_reason='length'" in err.getvalue()
+
+
+def test_propose_mappings_model_call_truncated_nonempty_content_is_discarded():
+    """`finish_reason: "length"` is a failure even when SOME content came
+    back — a truncated completion is not trustworthy JSON, so it must be
+    discarded rather than handed to the parser."""
+    triage._resolve_openai_base_url = lambda: "https://example.test/v1"
+    triage._resolve_openai_api_key = lambda: "test-key"
+
+    body = json.dumps({
+        "choices": [{"message": {"content": '{"sig-1": {"acti'}, "finish_reason": "length"}],
+    }).encode()
+    saved_urlopen = triage.urllib.request.urlopen
+    triage.urllib.request.urlopen = lambda _req, timeout=None: _FakeCompletionResp(body)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            result = triage._call_propose_mappings_model("a prompt")
+    finally:
+        triage.urllib.request.urlopen = saved_urlopen
+
+    assert result is None
+    assert "finish_reason=length" in err.getvalue()
 
 
 def test_propose_candidates_age_reads_the_signature_not_the_row():
