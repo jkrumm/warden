@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-15 (§73) |
+| Last updated | 2026-09-15 (§75) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 265/265 is the gate; `make test` runs all suites |
+| Tests | `tests/test_triage.py` 270/270 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -120,6 +120,10 @@ loop.
   looks identical to a repo with no open issues. It now confirms via a
   direct `_github.read_issue()` fetch and only resolves on a genuine
   `state == "closed"`; any error leaves the event alone (§73).
+- `_render_env_check_note()` reads both of env-check's failure shapes, not
+  just `danglingItems`: an `ok: false` with an empty dangling list (rate
+  limit, network, expired token) now renders the host's raw `error` text —
+  the transient wording is reserved for a genuine clean pass (§75).
 
 ## Open — owner actions
 
@@ -190,6 +194,10 @@ loop.
   disappearance-resolve bug this surfaced and fixed (a repo the token can't
   search looked identical to a repo with no open issues); two GitHub PAT
   gaps found and left for the owner — §73
+- The self-repo cap lifted: sideclaw and warden implement-reachable again,
+  the loop stays open at merge — §74
+- env-check's second failure shape: a rate limit rendered as "likely
+  transient"; the renderer now reads `error`, not just `danglingItems` — §75
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
@@ -208,6 +216,12 @@ both are implement-reachable again, `make check-policy` agrees with sideclaw,
 and the loop stays open because neither repo ever gets `autoMergePaths` — a
 change to either merges only on the owner's Argo click. The PAT now has
 Issues read/write; it still 403s on Checks and Actions read.
+
+§75 landed the `hermes-agent#2` renderer fix by hand: `hermes-agent` is capped
+at `investigate`, so item 1089 folded to `needs_human` (correct — that cap is
+not a bug) and the change to `triage.py` was made directly. The underlying
+1Password budget exhaustion is item 1088, on `homelab`, and the loop is
+carrying it.
 
 Left behind by Wave 4 (full detail in argo's `docs/waves/PLAN.md`): fallow's
 audit in argo never went fully green — confirmed pre-existing, unrelated

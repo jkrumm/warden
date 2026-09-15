@@ -2079,21 +2079,34 @@ def test_fold_dispatch_verdict_updates_every_cluster_member():
 
 
 def _write_env_check_stub(tmp_dir: Path, *, dangling_homelab: list[str] | None = None,
-                           dangling_vps: list[str] | None = None) -> Path:
+                           dangling_vps: list[str] | None = None,
+                           error_homelab: str | None = None,
+                           error_vps: str | None = None) -> Path:
     """A stub standing in for hermes-ops.sh's `env-check --json`, returning
-    exactly its documented shape."""
+    exactly its documented shape.
+
+    `error_homelab`/`error_vps` model the SECOND failure shape `parse()` can
+    emit: `ok: false` with an EMPTY `danglingItems` and the raw `op run`
+    output in `error` (a rate-limited probe, a network failure, an expired
+    service-account token). `cmd_env_check` exits 3 for both shapes and
+    `_run_verb()` accepts 0 and 3, so both reach the renderer — see
+    `_render_env_check_note()`'s own docstring."""
     stub_path = tmp_dir / "env-check-stub.py"
+    hl_ok = not dangling_homelab and not error_homelab
+    vps_ok = not dangling_vps and not error_vps
     payload = {
-        "verb": "env-check", "ok": not (dangling_homelab or dangling_vps), "tier": "A",
-        "homelab": {"ok": not dangling_homelab, "exitCode": 3 if dangling_homelab else 0,
-                    "danglingItems": dangling_homelab or [], "error": None},
-        "vps": {"ok": not dangling_vps, "exitCode": 3 if dangling_vps else 0,
-                "danglingItems": dangling_vps or [], "error": None},
+        "verb": "env-check", "ok": hl_ok and vps_ok, "tier": "A",
+        "homelab": {"ok": hl_ok, "exitCode": 0 if hl_ok else 3,
+                    "danglingItems": dangling_homelab or [], "error": error_homelab},
+        "vps": {"ok": vps_ok, "exitCode": 0 if vps_ok else 3,
+                "danglingItems": dangling_vps or [], "error": error_vps},
     }
     stub_path.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
         f"print(json.dumps({payload!r}))\n"
+        "import sys\n"
+        f"sys.exit({0 if (hl_ok and vps_ok) else 3})\n"
     )
     stub_path.chmod(0o755)
     return stub_path
@@ -2162,6 +2175,95 @@ def test_op_refs_no_dangling_item_still_reaches_needs_human():
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEEDS_HUMAN
         assert "no dangling item" in item["note"]
+
+
+def test_op_refs_failure_without_dangling_item_renders_the_cause_not_transient():
+    """jkrumm/hermes-agent#2: `ok: false` with an EMPTY `danglingItems` is a
+    real failure — a rate-limited probe, a network failure, an expired
+    service-account token — and the renderer used to print "likely transient;
+    will disappearance-resolve on its own" for all of them, discarding the one
+    line (`error`) that named the cause. The transient wording is correct ONLY
+    for a clean pass."""
+    rate_limit = ("[ERROR] 2026/09/15 18:31:57 Too many requests. Your client has been "
+                  "rate-limited. Try again in  seconds")
+    policy = dict(DEFAULT_POLICY, minOccurrences=1, minOpenMinutes=0,
+                  rules=[{"match": "op_refs_homelab:*", "verb": "env-check"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        stub = _write_env_check_stub(ctx.tmp_dir, error_homelab=rate_limit)
+        triage.VERB_ALLOWLIST = {"env-check": [str(stub)]}
+        eid = _insert_event(conn, source="op_refs_homelab", external_id="raw:rate-limited",
+                             title="1Password refs unresolved on homelab", first_seen=OLD)
+        triage.run(conn, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        note = item["note"]
+        assert item["state"] == triage.STATE_NEEDS_HUMAN
+        assert "likely transient" not in note, note
+        assert "Too many requests" in note, "the raw op stderr is the whole point"
+        assert "homelab" in note
+        assert triage._RATE_LIMIT_HINT in note, "a rate-limit gets its own remediation"
+
+        # The card carries the same text — the note is not the only surface.
+        assert len(ctx.posted) == 1
+        blocks_text = json.dumps(ctx.posted[0]["blocks"])
+        assert "Too many requests" in blocks_text
+        assert "likely transient" not in blocks_text
+
+
+def test_op_refs_non_rate_limit_failure_still_renders_the_cause_without_the_hint():
+    """The non-rate-limit half of the same shape: any other `op run` failure
+    must also surface its own text, and must NOT be handed the rate-limit
+    remediation — a wrong hint is worse than none."""
+    policy = dict(DEFAULT_POLICY, minOccurrences=1, minOpenMinutes=0,
+                  rules=[{"match": "op_refs_vps:*", "verb": "env-check"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        stub = _write_env_check_stub(ctx.tmp_dir, error_vps="[ERROR] connection refused")
+        triage.VERB_ALLOWLIST = {"env-check": [str(stub)]}
+        eid = _insert_event(conn, source="op_refs_vps", external_id="raw:conn-refused",
+                             title="1Password refs unresolved on vps", first_seen=OLD)
+        triage.run(conn, dry_run=False)
+        note = triage._get_item(conn, eid)["note"]
+        assert "likely transient" not in note, note
+        assert "connection refused" in note, note
+        assert triage._RATE_LIMIT_HINT not in note
+
+
+def test_render_env_check_note_transient_wording_only_for_a_clean_pass():
+    """Direct unit coverage of the three shapes, independent of the verb path:
+    clean pass -> transient wording; dangling item -> the dangling remediation;
+    ok:false with no dangling item -> the cause. Also pins the fail-safe for a
+    top-level `ok: false` carrying no per-host detail at all — it must not fall
+    through to the transient wording."""
+    clean = {"ok": True, "homelab": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None},
+             "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
+    assert "likely transient" in triage._render_env_check_note(clean)
+
+    dangling = {"ok": False, "homelab": {"ok": False, "exitCode": 3,
+                                         "danglingItems": ["gateway-secret"], "error": "x"},
+                "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
+    assert "make secrets-seed" in triage._render_env_check_note(dangling)
+
+    failed = {"ok": False, "homelab": {"ok": False, "exitCode": 1, "danglingItems": [],
+                                       "error": "[ERROR] boom"},
+              "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
+    note = triage._render_env_check_note(failed)
+    assert "likely transient" not in note and "[ERROR] boom" in note
+
+    # A host that failed with no error text at all still renders as a failure.
+    silent = {"ok": False, "homelab": {"ok": False, "exitCode": 1, "danglingItems": [],
+                                       "error": None},
+              "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
+    assert "likely transient" not in triage._render_env_check_note(silent)
+
+    # Top-level ok:false with both hosts claiming ok is contradictory, but the
+    # renderer must fail SAFE (report it) rather than print "transient".
+    contradictory = {"ok": False, "homelab": {"ok": True, "exitCode": 0, "danglingItems": [],
+                                              "error": None},
+                     "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
+    assert "likely transient" not in triage._render_env_check_note(contradictory)
+
+    # A probe that never ran keeps its own wording.
+    assert "probe failed to run" in triage._render_env_check_note({"_error": "timeout"})
 
 
 def test_op_refs_raw_fallback_dedups_across_timestamps():

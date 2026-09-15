@@ -7583,3 +7583,46 @@ search, pulls and contents read now 200; `commits/{sha}/check-runs` and
 Also restarted `ai.hermes.gateway` (kickstart): the running PID predated
 hermes-agent `ead94fa` (checkpoint-store fix), which #agents had asked a
 human for twice.
+
+## 75. env-check's second failure shape: the cause, not "likely transient" (2026-09-15)
+
+`jkrumm/hermes-agent#2`, opened by the owner off item 1087's card. The card
+read *"env-check ran and found no dangling item on this pass — likely
+transient; the underlying event will disappearance-resolve on its own if it
+clears"* while every `op`-wrapped cron on homelab was failing. The cause was
+in the JSON the whole time: `[ERROR] Too many requests. Your client has been
+rate-limited.` — the shared 1Password service-account budget (1000/24h,
+account-wide) exhausted.
+
+`cmd_env_check`'s `parse()` emits TWO failure shapes, not one. A missing item
+lands in `danglingItems`; every OTHER non-zero `op run` (rate limit, network,
+expired token) sets `ok: false` with an EMPTY `danglingItems` and the raw
+output in `error`. `_run_verb()` accepts exit 0 and 3 alike, so both shapes
+reach `_render_env_check_note()` intact — and that function read only
+`danglingItems`, so the second shape fell through to the transient wording and
+discarded the one line naming the cause. The transient sentence is correct
+ONLY for a genuine clean pass.
+
+Renderer-only fix in `scripts/triage.py`; `hermes-ops.sh` needed no change
+(the episode's verdict reached the same conclusion independently, and was
+right that the fix is not in the hermes-agent repo at all). When
+`danglingItems` is empty and any host is not `ok`, the card now carries the
+raw `error` text per host, plus a dedicated remediation when the text matches
+a rate limit — the budget window, the op-daemon's cached 4026, and that the
+durable fix is fewer invocations (the homelab `OP_SOCK` pin), not a 1Password
+change. A top-level `ok: false` with no per-host detail fails SAFE into the
+same failure branch rather than the transient one.
+
+`_write_env_check_stub()` grew `error_homelab`/`error_vps` and now exits 3 on
+failure, so the suite exercises the real subprocess boundary for both shapes.
++3 tests, `test_triage.py` 270/270; `make check-schemas`/`check-routing`/
+`check-policy` all green.
+
+Live verification against the actual probe (rate limit still active at
+18:50Z): the rendered note now names `homelab (rc=1)` and the raw stderr.
+
+Not fixed here, and not this repo's: the underlying budget exhaustion is item
+1088, whose verdict (`nextAction: implement`, high confidence) landed on
+homelab's own repo durability — the loop is carrying it. Item 1089 folded to
+`needs_human` because `hermes-agent` is capped at `investigate`, which is
+correct: this change landed by hand instead.

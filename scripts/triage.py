@@ -3527,24 +3527,71 @@ def _run_host_verb(argv: list[str], *, timeout: int) -> dict[str, Any]:
     return {"exitCode": r.returncode, "output": output[:2000]}
 
 
+# `op` reports the shared service-account budget being exhausted as a plain
+# stderr line, not a distinct exit code — the ONE failure shape where the
+# remediation is "wait for the budget window", not "restore an item". Matched
+# so the card can say that instead of handing the reader the raw text alone.
+_RATE_LIMIT_RE = re.compile(r"too many requests|rate-limited|rate limit", re.IGNORECASE)
+_RATE_LIMIT_HINT = (
+    "This is the shared 1Password service-account budget (1000 requests/24h, "
+    "account-wide across every host), not a missing item — there is nothing to "
+    "restore. It clears as the oldest requests age out of the rolling window "
+    "(~04:24 UTC); if errors persist past that, restart the op daemon, which "
+    "caches the 4026. The durable fix is fewer op invocations per day (the "
+    "homelab OP_SOCK cache-daemon pin), not a 1Password change."
+)
+
+
 def _render_env_check_note(output: dict[str, Any] | None) -> str:
     """Deterministic prose for the needs_human card — no LLM, straight from
-    hermes-ops.sh's own --json shape: {"ok", "homelab": {"danglingItems": [...],
-    ...}, "vps": {...}}. The dangling item name and the exact remediation are
-    inlined so the card is the whole answer — no further investigation should
-    be needed."""
+    hermes-ops.sh's own --json shape: {"ok", "homelab": {"ok", "exitCode",
+    "danglingItems": [...], "error"}, "vps": {...}}. The dangling item name and
+    the exact remediation are inlined so the card is the whole answer — no
+    further investigation should be needed.
+
+    `danglingItems` is only ONE of the two failure shapes. `cmd_env_check`'s
+    parse() also carries the raw `op run` output in each host's `error`, and
+    `_run_verb()` passes exit 3 through untouched — so an `ok: false` with an
+    EMPTY `danglingItems` (a rate-limited probe, a network failure, an expired
+    service-account token) reaches this function intact. Reading only the
+    dangling list rendered every such failure as "likely transient", which is
+    the one wording that is wrong: nothing is clearing on its own and the line
+    naming the cause was discarded (jkrumm/hermes-agent#2, 2026-09-15). The
+    transient wording is correct only for a genuine clean pass (both hosts
+    ok)."""
     if output is None or "_error" in output:
         err = (output or {}).get("_error", "no output")
         return f"env-check probe failed to run: {err}. Retry manually: `hermes-ops.sh env-check`."
     dangling: list[str] = []
+    failures: list[str] = []
     for host_key in ("homelab", "vps"):
         host = output.get(host_key)
-        if isinstance(host, dict):
-            for item in host.get("danglingItems") or []:
-                dangling.append(f"{host_key}: `{item}`")
+        if not isinstance(host, dict):
+            continue
+        for item in host.get("danglingItems") or []:
+            dangling.append(f"{host_key}: `{item}`")
+        # `ok: false` with an EMPTY `danglingItems` is a real failure the
+        # renderer used to swallow: cmd_env_check's parse() already puts the
+        # raw `op run` output in `error`, and `_run_verb()` passes exit 3
+        # through untouched, so the only thing that ever lost the cause was
+        # this function never reading either field (2026-09-15: a rate-limited
+        # probe rendered as "likely transient", jkrumm/hermes-agent#2).
+        if not host.get("ok", True):
+            detail = str(host.get("error") or "").strip() or "(no error text)"
+            failures.append(f"{host_key} (rc={host.get('exitCode')}): {detail}")
     if not dangling:
-        return ("env-check ran and found no dangling item on this pass — likely transient; the "
-                "underlying event will disappearance-resolve on its own if it clears.")
+        if not failures and output.get("ok", True):
+            return ("env-check ran and found no dangling item on this pass — likely transient; the "
+                    "underlying event will disappearance-resolve on its own if it clears.")
+        if not failures:
+            failures.append("env-check reported ok:false with no per-host detail")
+        hint = ""
+        if any(_RATE_LIMIT_RE.search(f) for f in failures):
+            hint = ("\n" + _RATE_LIMIT_HINT)
+        return ("env-check ran but FAILED — no dangling 1Password item on either host, so the cause "
+                "is NOT a missing item and this is not the transient case:\n"
+                + "\n".join(f"- {f}" for f in failures) + hint
+                + "\nRetry manually: `hermes-ops.sh env-check`.")
     items_text = "; ".join(dangling)
     return (
         f"Dangling 1Password item(s) — {items_text}. `op run` fails WHOLESALE on the shared "
