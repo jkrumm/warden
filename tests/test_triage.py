@@ -1668,15 +1668,68 @@ def test_ingest_github_issues_issue_disappears_from_poll_while_new_resolves_by_s
         eid = row["event_id"]
         assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW
 
-        # The issue (closed, or `warden:skip` applied) is gone on the next poll.
+        # The issue (closed, or `warden:skip` applied) is gone on the next poll,
+        # AND a direct per-issue check confirms it is actually closed.
         triage._github.search_issues = lambda *, owner, skip_label: []
+        triage._github.read_issue = lambda owner, repo, number: {"state": "closed"}
         triage.ingest_github_issues(conn, NOW)
         event = triage._get_event(conn, eid)
-        assert event["resolved_at"] is not None, "an issue no longer in the result set must be resolved"
+        assert event["resolved_at"] is not None, "an issue confirmed closed must be resolved"
 
         triage.apply_resolutions(conn, NOW)
         assert triage._get_item(conn, eid)["state"] == triage.STATE_QUIET, (
             "a still-`new` item must close through the existing silence-resolve path"
+        )
+
+
+def test_ingest_github_issues_missing_from_search_but_still_open_is_not_resolved():
+    """A repo the token cannot search (e.g. a fine-grained PAT missing
+    `Issues: read` on a private repo) disappears from `search_issues()`'s
+    result set exactly the way a genuinely closed issue does. The direct
+    per-issue check must catch this: `state` still `open` -> leave the event
+    alone. Found live 2026-09-15 against jkrumm/dispatch-scratch."""
+    with _triage_env() as (conn, ctx):
+        hit = {
+            "repo": "argo", "number": 20, "title": "please fix", "body": "text",
+            "url": "https://github.com/jkrumm/argo/issues/20", "author": triage._github.GH_OWNER,
+            "updated_at": NOW.isoformat(), "labels": [],
+        }
+        triage._github.search_issues = lambda *, owner, skip_label: [hit]
+        triage.ingest_github_issues(conn, NOW)
+        eid = conn.execute(
+            "SELECT event_id FROM triage_items WHERE origin='github_issue'"
+        ).fetchone()["event_id"]
+
+        triage._github.search_issues = lambda *, owner, skip_label: []
+        triage._github.read_issue = lambda owner, repo, number: {"state": "open"}
+        triage.ingest_github_issues(conn, NOW)
+        assert triage._get_event(conn, eid)["resolved_at"] is None, (
+            "an issue the search omitted but is still open must not be resolved"
+        )
+
+
+def test_ingest_github_issues_disappearance_check_error_leaves_event_open():
+    """The per-issue confirmation call itself failing (403/404/network) must
+    fail closed, same as `search_issues()`'s own `RemoteError` handling."""
+    with _triage_env() as (conn, ctx):
+        hit = {
+            "repo": "argo", "number": 21, "title": "please fix", "body": "text",
+            "url": "https://github.com/jkrumm/argo/issues/21", "author": triage._github.GH_OWNER,
+            "updated_at": NOW.isoformat(), "labels": [],
+        }
+        triage._github.search_issues = lambda *, owner, skip_label: [hit]
+        triage.ingest_github_issues(conn, NOW)
+        eid = conn.execute(
+            "SELECT event_id FROM triage_items WHERE origin='github_issue'"
+        ).fetchone()["event_id"]
+
+        def _boom(owner, repo, number):
+            raise triage.RemoteError("test: 403 reading issue")
+        triage._github.search_issues = lambda *, owner, skip_label: []
+        triage._github.read_issue = _boom
+        triage.ingest_github_issues(conn, NOW)
+        assert triage._get_event(conn, eid)["resolved_at"] is None, (
+            "an error confirming closure must leave the event open, not resolve it"
         )
 
 

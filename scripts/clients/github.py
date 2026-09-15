@@ -216,6 +216,21 @@ def actions_runs(owner: str, repo: str, *, head_sha: str) -> list[dict[str, Any]
     return body["workflow_runs"]
 
 
+def read_issue(owner: str, repo: str, number: int) -> dict[str, Any]:
+    """GET /repos/{owner}/{repo}/issues/{number} — the single-issue fallback
+    `ingest_github_issues()`'s disappearance-resolve calls before treating a
+    `github_go` event as closed. `search_issues()` silently omits a repo the
+    token cannot search (e.g. a fine-grained PAT missing `Issues: read` on a
+    private repo) exactly the same way it omits a genuinely closed issue —
+    this is the only way to tell the two apart. Raises on anything but 200,
+    same fail-closed contract as `read_pr()`/`read_repo()`: the caller must
+    never resolve an event it could not actually confirm is closed."""
+    status, body = api("GET", f"/repos/{owner}/{repo}/issues/{number}")
+    if status != 200 or not isinstance(body, dict):
+        raise RemoteError(f"GitHub returned HTTP {status} reading {owner}/{repo}#{number}")
+    return body
+
+
 _SEARCH_PER_PAGE = 50
 _SEARCH_MAX_PAGES = 10
 

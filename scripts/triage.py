@@ -2033,12 +2033,24 @@ def ingest_github_issues(conn: sqlite3.Connection, now: dt.datetime) -> None:
     every open issue under `_github.GH_OWNER`, minus anyone carrying
     `GITHUB_SKIP_LABEL`, opens (or reuses, via `open_origin_item()`) one
     `github_issue` item per hit, and marks any still-open `github_go` event
-    whose issue no longer appears in the result set as resolved
+    whose issue no longer appears in the result set — AND that a direct
+    per-issue check confirms is actually closed, see below — as resolved
     (`resolved_at=now`) — the silence path `apply_resolutions()` then closes
     a still-`new` item on that resolution exactly the way it closes a
     disappeared alert (DESIGN.md's silence-resolve rule: cancels the need to
     START, never discharges an obligation already in flight — a `new` item
     carries none yet, which is why this is safe).
+
+    Missing from the result set is NOT proof the issue closed:
+    `search_issues()` silently omits a repo the token cannot search (found
+    live 2026-09-15 against a private repo — a fine-grained PAT missing
+    `Issues: read` gets a 422 from `/search/issues` while `GET
+    /repos/.../issues/{n}` on the same repo 403s, both indistinguishable from
+    "no open issues here" at the search layer). Before resolving, this calls
+    `_github.read_issue()` on that one issue directly and only resolves if it
+    reports `state == "closed"` — any error (403/404/anything else) leaves
+    the event alone, fail-closed, same as `search_issues()`'s own
+    `RemoteError` handling below.
 
     Trust is fail-closed, same rule as watchdog-poll.py's own
     `_github_author()`/`TRUSTED_GH_LOGIN`: only `_github.GH_OWNER` is
@@ -2079,8 +2091,21 @@ def ingest_github_issues(conn: sqlite3.Connection, now: dt.datetime) -> None:
     for row in conn.execute(
         "SELECT id, external_id FROM events WHERE source='github_go' AND resolved_at IS NULL"
     ).fetchall():
-        if row["external_id"] not in seen_external_ids:
-            conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, row["id"]))
+        if row["external_id"] in seen_external_ids:
+            continue
+        owner_part, _, rest = row["external_id"].partition("/")
+        repo_part, _, number_part = rest.partition("#")
+        try:
+            number = int(number_part)
+        except ValueError:
+            continue
+        try:
+            issue = _github.read_issue(owner_part, repo_part, number)
+        except RemoteError:
+            continue
+        if issue.get("state") != "closed":
+            continue
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, row["id"]))
     conn.commit()
 
 
