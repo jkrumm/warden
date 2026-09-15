@@ -758,7 +758,7 @@ port is a constant change, not a string hunt. The ones that matter:
 | `triage.py:214-215` | env `HERMES_CC_BIN` else `$HERMES_HOME/scripts/hermes-cc.sh` | dispatcher | already env-overridable |
 | `triage.py:220-225` | env `HERMES_CC_REPOS_JSON` / `HERMES_TRIAGE_POLICY` | the two configs | already env-overridable |
 | **`triage.py:394`** | `Path(__file__).parent/"hermes-ops.sh"` | **`env-check` verb argv** | **cross-repo: `hermes-ops.sh` (62 KB) STAYS** |
-| `triage.py:425-427` | `~/SourceRoot/meteo/var/health.json`, `$HERMES_HOME/gateway-starts.log`, `$HERMES_HOME/logs/errors.log` | evidence probes | two are hermes-owned files warden must keep reading |
+| `triage.py:425-427` | `~/SourceRoot/weatherorb/var/health.json`, `$HERMES_HOME/gateway-starts.log`, `$HERMES_HOME/logs/errors.log` | evidence probes | two are hermes-owned files warden must keep reading |
 | **`triage.py:575`** | `Path(__file__).parent.parent` = `TRIAGE_REPO_DIR` | **`git -C` target for the policy auto-commit** (`:3033`, `:3054`) | **silent-failure risk, see below** |
 | `watchdog-poll.py:33-36` | `scripts/briefing-state.json`, `cron/jobs.json`, `config.yaml`, `skills/` | four **hermes-owned** inputs | this is Q2's substance |
 | `dispatch-sweep.py:93` | `~/.local/bin/hermes` | **`hermes send`** — its delivery path | the one non-`urllib` Slack path |
@@ -931,7 +931,7 @@ monkeypatches **21+ module globals** (saved/restored dict, `:92-118`): `DB_PATH`
 `POLICY_PATH`, `DISPATCH_REPOS_JSON`, `HERMES_CC_BIN`, `resolve_slack_token`,
 `post_blocks`, `update_blocks`, the five `_run_hermes_cc_*` / `_hermes_cc_status`
 shims, `LIVENESS_ALLOWLIST`, `MAX_OPEN_INVESTIGATIONS`, `DAILY_INVESTIGATE_BUDGET`,
-`VERB_ALLOWLIST`, `_watchdog_poll`, `METEO_HEALTH_PATH`, `GATEWAY_STARTS_LOG`,
+`VERB_ALLOWLIST`, `_watchdog_poll`, `WEATHERORB_HEALTH_PATH`, `GATEWAY_STARTS_LOG`,
 `HERMES_ERROR_LOG`, `TRIAGE_REPO_DIR`, `_call_propose_mappings_model`,
 `_resolve_openai_base_url`, `_resolve_openai_api_key`. Slack is stubbed — no
 network. Two tests write a **real hermes-cc stub script** and exercise the actual
@@ -940,7 +940,7 @@ reads the **real** `config/triage-policy.json` (`:453`).
 
 **It moves to warden essentially verbatim.** The only edits are the `_triage_env`
 entries naming hermes-owned paths (`GATEWAY_STARTS_LOG`, `HERMES_ERROR_LOG`,
-`METEO_HEALTH_PATH`) and the two loader paths at `:44-47` / `:55-56`.
+`WEATHERORB_HEALTH_PATH`) and the two loader paths at `:44-47` / `:55-56`.
 
 **`tests/test_dispatch_approval.py` — the straddle, resolved.** 20 cases. Two
 constants define the seam: `CC_SCRIPT = REPO/"scripts"/"hermes-cc.sh"` (`:57`) →
@@ -4906,7 +4906,7 @@ That decision needs a repo where merge *is* deploy. Mapped, then verified here.
 
 `DESIGN.md` § Deploy says:
 
-> *"Prefer not needing this at all: `meteo`, `research-gateway` and `argo` deploy
+> *"Prefer not needing this at all: `weatherorb`, `research-gateway` and `argo` deploy
 > via GitHub Actions → RollHook, so merge **is** deploy."*
 
 Directionally true and **operationally unreachable**. There is no code path into
@@ -4960,7 +4960,7 @@ strengthens item 1 rather than competing with it.
 
 ### The candidates, measured
 
-| | `meteo` | `research-gateway` | `argo` |
+| | `weatherorb` | `research-gateway` | `argo` |
 |-|-|-|-|
 | Actions → RollHook on master | yes, **paths-filtered** (JS only) | yes | yes (api + dashboard) |
 | Deploy duration, last 5 runs | 60-80s | 55-85s | 67-145s |
@@ -4994,20 +4994,20 @@ probe prove the deploy *landed* rather than that the service *bounced*.
    containers. **Argo does redeploy from its own repo on every master push.**
    Either the rationale is stale or the routing rule points at the wrong repo —
    resolve before argo is added to `repos`.
-2. **`DESIGN.md` overstates meteo.** Only the *edge* (web/nginx) deploys via
-   Actions → RollHook. Meteo's Python half (`uv.lock`, store/blend/tileserver)
+2. **`DESIGN.md` overstates weatherorb.** Only the *edge* (web/nginx) deploys via
+   Actions → RollHook. WeatherOrb's Python half (`uv.lock`, store/blend/tileserver)
    runs on this mini under launchd with no deploy workflow, so a `uv.lock` bump
    would merge and deploy nothing. Half the repo is not merge-is-deploy.
 
 ### The `noCiRequired` trap this walks into
 
-`meteo` and `research-gateway` have **no `pull_request` trigger**, so a PR head
+`weatherorb` and `research-gateway` have **no `pull_request` trigger**, so a PR head
 commit gets zero check runs and both would need `noCiRequired: true`. That is
 exactly the *"vacuously clean"* inversion `hermes-cc.sh`'s own merge gate comments
 say it exists to refuse — "no checks" and "all checks passed" must not be the same
 answer. Only `argo` has genuine PR-time CI.
 
-That pushes toward `argo` on safety and toward `meteo` on the quality of the
+That pushes toward `argo` on safety and toward `weatherorb` on the quality of the
 change being tested (`vite` 8.2.1→8.2.2 goes through the actual production build
 and two bundle-size gates; argo's two installable bumps are dev tools its CI never
 invokes, so a green PR would prove almost nothing). **Not decided here** — it is
@@ -5260,7 +5260,7 @@ The card path obeys it; the reminder digest renders straight off `events`.
 | Population | Rows | Verdict |
 |-|-|-|
 | **Structurally unactionable** | ev269 `Local` (#6), ev285 `VPS` (#7), ev710 `Services` (#7) | `repo IS NULL`, state `new`. `escalate()` requires `repo IS NOT NULL`, so these can never be investigated, never resolve, and remind **every 6h forever**. |
-| **The system working** | ev930 Hermes-HTTP (#8), ev943 Research-Gateway-HTTP (#7), ev261 slack_bolt (#6), ev875 Meteo-Watchdog (#5) | All `needs_human`, all carrying a real verdict — the text in the operator's Slack paste **is** the verdict warden wrote. Four genuine outstanding decisions with 7-day deadlines. |
+| **The system working** | ev930 Hermes-HTTP (#8), ev943 Research-Gateway-HTTP (#7), ev261 slack_bolt (#6), ev875 WeatherOrb-Watchdog (#5) | All `needs_human`, all carrying a real verdict — the text in the operator's Slack paste **is** the verdict warden wrote. Four genuine outstanding decisions with 7-day deadlines. |
 | **No triage row at all** | ev849, ev887 `stray_skill`, ev68 `hermes_cron` | `DESIGN.md` § Open questions 3 named ev849 already: *"no `triage_items` row exists for it at all."* Still true. |
 
 So **3 of 7 lines are noise by construction** and 4 are "you have decisions
@@ -6261,7 +6261,7 @@ steps; the origin subsystem lives in `triage.py` (extraction declined, see
 above); `warden run --tier implement` from Hermes is bounded by
 `autoMergePaths`, budgets and the second-model review, not by the Slack click —
 a deliberate line, recorded here so it is not rediscovered as a gap; the
-`meteo` venv on this box held 8 GB RSS during the wave and got a background
+`weatherorb` venv on this box held 8 GB RSS during the wave and got a background
 runner killed for memory. `com.jkrumm.warden-loop` and `-sweep` bootstrapped again at **00:14:54Z**
 (2026-09-11); `make status` green, `sideclaw schemas ✓ dispatch=2 review=1`.
 
@@ -6462,7 +6462,7 @@ actionable and what the loop had cost. Three read-only forensics passes
 | Dispatches | 20 (ids 24–43), all `done` except one `failed` superseded by a retry |
 | Real fixes | 1 `fixed` (the argo canary), 4 `closed` (3 resolved externally, 1 by a human) — zero infra recurrences resolved by the loop |
 | Loop cadence | 57 ticks in 534 min after 9c19ead, no gap >20 min; one `database is locked` in `ingest()`, poll/sweep each crashed twice on schema-version mismatch during the night migrations and self-healed |
-| needs_human | 6 distinct issues: hermes gateway wedged (uk:175/185, the slack-bolt reconnect signal with **362** occurrences), sideclaw crash (uk:204), meteo probe (uk:220), hermes patch corruption (uk:229), research-gateway OOM (uk:193) |
+| needs_human | 6 distinct issues: hermes gateway wedged (uk:175/185, the slack-bolt reconnect signal with **362** occurrences), sideclaw crash (uk:204), weatherorb probe (uk:220), hermes patch corruption (uk:229), research-gateway OOM (uk:193) |
 | merge_blocked | 3 argo canary items (self-tests, correctly refused) + dispatch-scratch#9 (no `autoMergePaths`) |
 
 The loop is working as designed. The owner's long-standing issues are all
@@ -6615,7 +6615,7 @@ or "not built" was checked against live state and either done or dispatched.
 | uk:204 sideclaw crash | Kuma push recovered 10:16Z; sideclaw reloaded twice today, healthy | closed |
 | uk:193 research-gateway OOM | monitor recovered 09:16Z; container at 111 MiB of 2 GiB; no OOM kill in the VPS kernel log for four days | closed |
 | uk:229 "Hermes - HTTP" | endpoint answers 200 with the keyword; the Kuma monitor had been **paused** since its pre-deploy 404 days and every `make uk-sync` left it paused | fixed: homelab `sync.py` now converges pause state (`resume_monitor`/`pause_monitor` after `edit_monitor`, which ignores `active`); monitor UP; closed |
-| uk:220 "Meteo Watchdog - Push" | watchdog runs but skips its heartbeat because `obs_freshness:candhis` fails — five CANDHIS buoys silent 74–83 h, an upstream outage | `warden run meteo --tier implement` (item 996): degrade instead of blocking the heartbeat; investigate verdict came back high, auto-implement fired on GLM |
+| uk:220 "WeatherOrb Watchdog - Push" | watchdog runs but skips its heartbeat because `obs_freshness:candhis` fails — five CANDHIS buoys silent 74–83 h, an upstream outage | `warden run weatherorb --tier implement` (item 996): degrade instead of blocking the heartbeat; investigate verdict came back high, auto-implement fired on GLM |
 | hermes_log connector-is-closed (×2) | sibling of the discharged reconnect signal; gateway restarted 11:36Z | closed |
 | three `warden_canary` items | §54's stop-condition exercise | closed |
 | dispatch-scratch#9 | disposable fixture repo, no `autoMergePaths` by design | closed |
@@ -6648,7 +6648,7 @@ schema 9 by hand; poll and sweep pick it up on their next run.
 - sideclaw already tagged every worker session with `USAGE_LANE`
   (commit 49a065e); the §58 audit grepped the wrong directory. Review
   sub-steps now share `sideclaw:review` so one review is one line in
-  usage-tracker. Not reloaded yet: a meteo episode was running.
+  usage-tracker. Not reloaded yet: a weatherorb episode was running.
 - Hermes's narratives cron delivers to `#hermes`; `#agents` is warden-only.
 - homelab: `docs(uptime-kuma)` comment and the `sync.py` pause fix, pushed
   and applied with `make uk-sync`.
@@ -6712,7 +6712,7 @@ A MacBook-side review of §61 sent three findings; two changed `STATE.md`.
   gates the Kuma heartbeat on it, and rsyncs it with the ledger. Proven:
   `git clone` of the shipped bundle on homelab checks out 28ce459.
 
-Also: item 996 landed while §61 was being written (meteo master 95d3e3b,
+Also: item 996 landed while §61 was being written (weatherorb master 95d3e3b,
 watchdog 105/105, Kuma 220 UP, `degraded: true`); `needs_human` is 0. The
 handover doc's `sqlite3 "file:…?mode=ro"` snippets are replaced with a plain
 path: this box's CLI cannot open a WAL ledger read-only while nothing else
