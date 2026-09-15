@@ -3054,7 +3054,7 @@ def test_poll_reads_artifact_and_verdict_from_the_nested_result():
                 "nextAction": "none",
                 "summary": "Implement episode landed a correct PR.",
                 "outcome": "pr_opened",
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/99",
                 "branch": "dispatch/demo-repo-99",
             },

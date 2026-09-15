@@ -37,10 +37,10 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 # a loud refusal (assert_result_schema()) instead of a silently-ignored
 # verdict. Bump these ONLY after re-reading the source constants they mirror
 # — never guess a version or an outcome list.
-DISPATCH_SCHEMA_VERSION = 2
+DISPATCH_SCHEMA_VERSION = 3
 REVIEW_SCHEMA_VERSION = 1
 
-# server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES at schema version 2.
+# server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES at schema version 3.
 DISPATCH_OUTCOMES: tuple[str, ...] = (
     "verdict_only",
     "issue_declined",
@@ -52,6 +52,7 @@ DISPATCH_OUTCOMES: tuple[str, ...] = (
     "branch_no_pr",
     "pr_failed",
     "pr_opened",
+    "applied_in_place",
     "salvaged",
     "withheld",
 )
