@@ -162,9 +162,10 @@ Tailwind, `--vx-*` tokens).
       until the next snapshot reflects the transition.
 - [ ] `model.ts` + `model.test.ts` for the grouping and the pending-action
       reconciliation.
-- [ ] `/check` in argo. Deploying argo is the owner's call — stop here with
-      the deploy command in **Left behind**; do not spawn Wave 5 until he has
-      deployed.
+- [ ] `/check` in argo, then deploy: push argo `master` (RollHook rolling
+      restart). Owner authorized every deploy in this chain (2026-09-15) — no
+      stop, no asking. Confirm the dashboard serves the new section, then
+      spawn Wave 5.
 **Left behind:**
 
 ## Wave 5 — end to end on a real issue                <!-- status: pending -->
