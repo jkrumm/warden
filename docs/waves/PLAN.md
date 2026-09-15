@@ -129,26 +129,59 @@ body. Also caught: the implementer's own diff had drifted
 sideclaw-side source to justify it — reverted before commit. Test gate is
 now 265/265 (`test_clients.py` 105/105, `test_api.py` 42/42).
 
-## Wave 3 — argo API: the action queue            <!-- status: active -->
+## Wave 3 — argo API: the action queue            <!-- status: done -->
 Work happens in `~/SourceRoot/argo` (its own CLAUDE.md and rules apply;
 direct-to-master). Contract is whatever Wave 2 shipped on the warden side —
 read `warden/docs/api.md` § Argo push first.
-- [ ] `apps/api/src/db/schema.ts`: `warden_actions` table (id, machine,
+- [x] `apps/api/src/db/schema.ts`: `warden_actions` table (id, machine,
       event_id, verb, payload json, status pending|applied|rejected|failed,
       result, error, created_at, acked_at) + drizzle migration.
-- [ ] `apps/api/src/routes/warden.ts`: `POST /warden/items/:eventId/actions`
+- [x] `apps/api/src/routes/warden.ts`: `POST /warden/items/:eventId/actions`
       (dashboard → queue; validates verb against the same closed list),
       `GET /warden/actions` (warden pulls), `POST /warden/actions/:id/ack`
       (warden reports). Same auth as `POST /warden/snapshot` for the warden
       side; the dashboard route uses whatever the dashboard already uses.
       OpenAPI per `apps/api/.claude/rules/openapi.md`.
-- [ ] `routes/warden.test.ts` cases: enqueue, pull pending only, ack
+- [x] `routes/warden.test.ts` cases: enqueue, pull pending only, ack
       transitions, unknown verb 400, double ack idempotent.
-- [ ] argo CLAUDE.md § Warden: the queue exists, and why (warden is
+- [x] argo CLAUDE.md § Warden: the queue exists, and why (warden is
       loopback-only and pulls).
-**Left behind:**
+**Left behind:** `/review` (sideclaw multi-angle, adversary + concurrency
+angles independently) caught a real bug and it was fixed in the same commit:
+`GET /warden/actions` was a plain `SELECT WHERE status='pending'` with no
+atomic claim, so two overlapping warden polls (a slow tick still applying
+while the next fires) could both fetch the same pending row and double-apply
+a non-idempotent verb (merge/implement/dismiss/note) against the ledger.
+Fixed by making the pull itself an `UPDATE ... WHERE status='pending' ...
+RETURNING` that atomically flips claimed rows to an internal `pulled` status
+(never returned by any route response — schema.ts and the query enum both
+document it); a claim older than 10 minutes (roughly warden's own poll
+cadence) is treated as abandoned and reclaimed by the next pull. Covered by
+new tests (`atomically claims pending rows...`, the two lease-reclaim
+cases). Also fixed from the same review pass: the closed-verb check on
+enqueue used a backwards TS cast (widened the array instead of narrowing
+the input — no runtime effect, but asserted something unproven); jsonb
+`payload`/`result` columns were untyped, forcing an unchecked cast on read;
+`toActionRecord` cast `status` off an unconstrained `text` column with no
+runtime guard; enqueue payload and ack result/error had no size cap (now
+capped at 100 KB, matching the byte-cap posture `warden_snapshots` already
+has). Deferred as discussion-level, not blocking: no dedup guard on rapid
+double-enqueue against the same (event_id, verb) — a partial unique index
+on `status='pending'` is the likely fix, pick up alongside any future
+double-apply investigation; `POST /warden/actions/:id/ack` unconditionally
+overwrites a terminal status on a second ack (tolerates a redelivered
+identical ack, but would also silently accept a genuinely different
+terminal-to-terminal transition with no audit trace); `verb`/`status` are
+plain `text` with only app-level enum enforcement, kept in sync with this
+repo's `ARGO_ACTION_VERBS` by a source comment only — no in-process check
+either side; `machine` on the pull/ack routes is a self-reported string
+under the shared bearer, same trust model as `/warden/snapshot` but now
+covers a write path. Deployed to prod (`argo.jkrumm.com`, RollHook) and
+verified live: `GET /api/health` reports the pushed commit,
+`GET /api/warden/actions?machine=mini&status=pending` returns `[]`
+authenticated, 422 without `machine`.
 
-## Wave 4 — argo dashboard: issues and one-click triage   <!-- status: pending -->
+## Wave 4 — argo dashboard: issues and one-click triage   <!-- status: active -->
 Work happens in `~/SourceRoot/argo/apps/dashboard` (basalt-ui, Mantine, no
 Tailwind, `--vx-*` tokens).
 - [ ] `features/warden/`: a GitHub issues section on `/warden` — repo#number
