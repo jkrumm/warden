@@ -114,27 +114,16 @@
     "question — the CLI refuses to run rather than pick a winner. A name in `sensitive`",
     "that is NOT also in `deny` is the same class of contradiction, refused the same way.",
     "",
-    "sideclaw and warden joined `tiers.investigate` (2026-09-15, GitHub issue intake wave).",
-    "Neither is 'a repo whose damage this bounds' the way hermes-agent above is — the reason",
-    "is structural, not repo-specific: CLAUDE.md's 'Talking to sideclaw' section states it as a",
-    "standing rule, 'Warden may never hold tier >= 1 on `sideclaw` or on `warden` itself.",
-    "Auto-merging PRs against your own executor closes a loop that has no outside.' sideclaw",
-    "is the thing every `implement`/`merge` dispatch this file authorizes runs ON; warden is",
-    "the control plane deciding to authorize it in the first place. An `implement` dispatch",
-    "against either would let this same act-loop propose and (via `merge`) land a change to",
-    "the very machinery that proposes and lands changes — there is no independent check left",
-    "outside that loop to catch a bad one, unlike every other repo here where a human, CI, or",
-    "a downstream deploy target still sits between a draft PR and anything running. `investigate`",
-    "stays available for both — read-only, worktree-isolated, exactly the same shape brain and",
-    "hermes-agent already use — because a self-diagnosis dispatched against warden's own ledger",
-    "or sideclaw's own routing table is still useful and still safe; only turning that diagnosis",
-    "into a self-authored, self-landed change is the closed loop this cap exists to prevent."
+    "sideclaw and warden are implement-reachable (owner, 2026-09-15): an implement episode ends",
+    "as a draft PR, and neither repo carries `autoMergePaths` in triage-policy.json, so every",
+    "change to the executor or the control plane merges only on the owner's own Argo click.",
+    "Never add `autoMergePaths` for either — that, not a tier cap, is what keeps the loop open."
   ],
   "root": "~/SourceRoot",
   "defaultTier": "implement",
   "deny": ["dotfiles-private", "homelab-private"],
   "sensitive": ["dotfiles-private", "homelab-private"],
   "tiers": {
-    "investigate": ["brain", "hermes-agent", "sideclaw", "warden"]
+    "investigate": ["brain", "hermes-agent"]
   }
 }

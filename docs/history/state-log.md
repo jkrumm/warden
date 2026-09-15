@@ -7562,3 +7562,24 @@ correctly without them, as this wave proved by working around both.
 
 `docs/waves/PLAN.md` is now fully done across all five waves and deleted
 in this same commit — this was the last one.
+
+## 74. The self-repo cap, lifted (2026-09-15)
+
+Owner, after Wave 5: the `investigate` cap Wave 1 put on `sideclaw` and
+`warden` was friction — `sideclaw#3`/`#4` could never get past a verdict. The
+rule it encoded ("warden may never hold tier ≥ 1 on its own executor or on
+itself") guarded against a closed propose-and-land loop, and that loop is
+already open without it: an implement episode ends as a draft PR, and
+neither repo carries `autoMergePaths`, so `merge_gate_check()` refuses and
+the item waits in `merge_blocked` for the owner's Argo Merge click. The rule
+is restated as "never auto-merge on sideclaw or warden" (CLAUDE.md,
+`config/dispatch-repos.json` readme); `tiers.investigate` is back to `brain`,
+`hermes-agent`. `make check-policy` agrees with sideclaw again (exit 0).
+
+PAT probe after the owner added Issues read/write: private-repo issues,
+search, pulls and contents read now 200; `commits/{sha}/check-runs` and
+`actions/runs` still 403 — Checks: read and Actions: read are missing.
+
+Also restarted `ai.hermes.gateway` (kickstart): the running PID predated
+hermes-agent `ead94fa` (checkpoint-store fix), which #agents had asked a
+human for twice.

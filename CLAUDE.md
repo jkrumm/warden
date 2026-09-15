@@ -133,8 +133,10 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   /api/routing`) — `make check-routing` catches drift the same way
   `check-schema-versions.py`/`check-dispatch-policy.py` do for the verdict
   schema and the allowlist.
-- **Warden may never hold tier ≥ 1 on `sideclaw` or on `warden` itself.**
-  Auto-merging PRs against your own executor closes a loop that has no outside.
+- **Warden may never auto-merge on `sideclaw` or on `warden` itself.**
+  Implement is allowed (a draft PR), but neither repo ever gets
+  `autoMergePaths`: auto-merging PRs against your own executor closes a loop
+  that has no outside. The owner's Argo Merge click is that outside.
 - **An episode is not contained.** `readOnly` is three tool names on a CLI flag
   under `--dangerously-skip-permissions`; `Bash` is unrestricted and the brief is
   attacker-influenceable (public issues, alert text, log lines all reach it). A

@@ -203,10 +203,11 @@ with the two `op://mini/github/token` grants in Open — owner actions if this
 repo's issue intake is to reach `dispatch-scratch` and actually post
 comments back.
 
-Left behind by Wave 1, still unresolved: sideclaw's own dispatch-policy
-boundary still allows `implement` on `sideclaw`/`warden` — `make check-policy`
-disagrees until sideclaw's side is capped too (out of this plan's scope, a
-sideclaw-repo change).
+The Wave 1 `investigate` cap on `sideclaw`/`warden` is lifted (§74, owner):
+both are implement-reachable again, `make check-policy` agrees with sideclaw,
+and the loop stays open because neither repo ever gets `autoMergePaths` — a
+change to either merges only on the owner's Argo click. The PAT now has
+Issues read/write; it still 403s on Checks and Actions read.
 
 Left behind by Wave 4 (full detail in argo's `docs/waves/PLAN.md`): fallow's
 audit in argo never went fully green — confirmed pre-existing, unrelated
