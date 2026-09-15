@@ -79,9 +79,17 @@ green in `~/SourceRoot/argo`. `/review` on every wave.
       silent drop. Idempotent on action id.
 - [ ] `scripts/lifecycle/policy.py`: `authorized_by="owner:argo"` satisfies
       the implement/merge human gate the way a signed Slack approval does.
-      Budgets (`WARDEN_DAILY_BUDGET`, implement/merge budgets, the per-repo
-      lock, the `investigate` cap on sideclaw/warden) still apply — those are
-      the loop's safety, not approval ceremony.
+      The per-repo lock and the `investigate` cap on sideclaw/warden still
+      apply.
+- [ ] **Remove every daily count budget** (owner, 2026-09-15: "absurd
+      friction"): `WARDEN_DAILY_BUDGET`, `WARDEN_IMPLEMENT_BUDGET`,
+      `WARDEN_MERGE_BUDGET` (policy.py:268-275), `DAILY_INVESTIGATE_BUDGET`
+      (triage.py:787) — the constants, the checks, the deferral notes, the
+      `budget` object in CLI output and the Argo snapshot, their tests and
+      docs. Keep `MAX_OPEN_INVESTIGATIONS` as concurrency pacing (overflow
+      waits, never drops) and the per-repo lock (two PRs on one repo is a
+      correctness bug, not a budget). Record the removal in DESIGN.md and
+      the state log; Wave 4's dashboard shows no budget.
 - [ ] Snapshot: each board item carries `availableActions` (computed from
       state + max_tier) and, for `github_issue` origins, `issue: {repo,
       number, url, author, trusted, labels}`. Keep inside `MAX_BODY_BYTES`.
