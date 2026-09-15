@@ -223,14 +223,14 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage._policy.resolve_repo = _default_fake_resolve_repo
         triage._github.actions_runs = lambda owner, repo, *, head_sha: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake actions_runs registered"))
-        # ingest_github_go() runs unconditionally on every run() pass (Wave
-        # 6.1, same as ingest() itself) — unlike actions_runs above, an
+        # ingest_github_issues() runs unconditionally on every run() pass
+        # (Wave 6.1, same as ingest() itself) — unlike actions_runs above, an
         # unregistered fake here defaults to "no issues found" rather than a
         # loud throw, so every pre-existing test in this file (none of which
         # is about GitHub issues) keeps working unmodified; a test that
         # exercises this path overrides it explicitly, the same shape as
         # every other client-boundary fake in this fixture.
-        triage._github.search_issues = lambda *, owner, label: []
+        triage._github.search_issues = lambda *, owner, skip_label: []
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
 
@@ -1482,6 +1482,37 @@ def test_fold_dispatch_verdict_lands_closed_for_investigate_ceiling_origin_item(
         assert item["note"] and item["note"].startswith("answered:"), item["note"]
 
 
+def test_fold_dispatch_verdict_third_party_github_issue_lands_needs_human_not_closed():
+    """A third-party issue (author != GH_OWNER) is investigate-capped exactly
+    like a human's question, but nobody asked it in a way that means "answer
+    me and we're done" — no human was in the loop when a stranger opened it.
+    Its plain verdict must land in `needs_human` carrying the summary as the
+    note, so the owner sees the assessment on the card/Argo, not `closed` as
+    `answered:` (docs/waves/PLAN.md Wave 1). Owner-issue routing is
+    unaffected — an owner issue opens at max_tier='implement' and never
+    reaches this branch at all."""
+    with _triage_env() as (conn, ctx):
+        eid = triage.open_origin_item(
+            conn, origin="github_issue", repo="demo-repo", brief="a stranger's bug report",
+            max_tier="investigate", external_id="jkrumm/demo-repo#42", title="found a bug", now=NOW,
+        )
+        job_id = "job-third-party-1"
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (job_id, "investigate", "demo-repo", "b", eid, "done",
+             json.dumps({"summary": "confirmed, low priority", "nextAction": "none"}), NOW.isoformat()),
+        )
+        triage._set_state(conn, eid, triage.STATE_INVESTIGATING, NOW, dispatch_job=job_id)
+        conn.commit()
+
+        triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert item["state"] != triage.STATE_CLOSED
+        assert item["note"] == "confirmed, low priority", item["note"]
+
+
 def test_fold_dispatch_verdict_alert_items_still_land_verdict():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-alert-verdict",
@@ -1608,49 +1639,53 @@ def test_fold_dispatch_verdict_failed_human_origin_reaches_needs_human_not_close
         assert item["note"] and "Session timed out after 480000ms" in item["note"], item["note"]
 
 
-def test_ingest_github_go_third_party_issue_gets_investigate_ceiling():
+def test_ingest_github_issues_third_party_issue_gets_investigate_ceiling():
     with _triage_env() as (conn, ctx):
-        triage._github.search_issues = lambda *, owner, label: [{
+        triage._github.search_issues = lambda *, owner, skip_label: [{
             "repo": "argo", "number": 7, "title": "please fix", "body": "third party text",
             "url": "https://github.com/jkrumm/argo/issues/7", "author": "some-stranger",
-            "updated_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(), "labels": [],
         }]
-        triage.ingest_github_go(conn, NOW)
+        triage.ingest_github_issues(conn, NOW)
         row = conn.execute("SELECT * FROM triage_items WHERE origin='github_issue'").fetchone()
         assert row is not None
         assert row["max_tier"] == "investigate", "a third-party issue must never reach 'implement'"
         assert row["repo"] == "argo"
 
 
-def test_ingest_github_go_own_issue_gets_implement_ceiling():
+def test_ingest_github_issues_own_issue_gets_implement_ceiling():
     with _triage_env() as (conn, ctx):
-        triage._github.search_issues = lambda *, owner, label: [{
+        triage._github.search_issues = lambda *, owner, skip_label: [{
             "repo": "argo", "number": 8, "title": "please fix", "body": "my own text",
             "url": "https://github.com/jkrumm/argo/issues/8", "author": triage._github.GH_OWNER,
-            "updated_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(), "labels": [],
         }]
-        triage.ingest_github_go(conn, NOW)
+        triage.ingest_github_issues(conn, NOW)
         row = conn.execute("SELECT * FROM triage_items WHERE origin='github_issue'").fetchone()
         assert row is not None
         assert row["max_tier"] == "implement"
 
 
-def test_ingest_github_go_label_removed_while_new_resolves_by_silence():
+def test_ingest_github_issues_issue_disappears_from_poll_while_new_resolves_by_silence():
+    """No label to remove anymore — the trigger is the issue leaving the
+    open-issue result set entirely (closed, or `warden:skip` applied), same
+    mechanic as before: a still-`new` item closes through the existing
+    silence-resolve path."""
     with _triage_env() as (conn, ctx):
         hit = {
             "repo": "argo", "number": 9, "title": "please fix", "body": "text",
             "url": "https://github.com/jkrumm/argo/issues/9", "author": triage._github.GH_OWNER,
-            "updated_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(), "labels": [],
         }
-        triage._github.search_issues = lambda *, owner, label: [hit]
-        triage.ingest_github_go(conn, NOW)
+        triage._github.search_issues = lambda *, owner, skip_label: [hit]
+        triage.ingest_github_issues(conn, NOW)
         row = conn.execute("SELECT event_id FROM triage_items WHERE origin='github_issue'").fetchone()
         eid = row["event_id"]
         assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW
 
-        # The label (or the issue) is gone on the next poll.
-        triage._github.search_issues = lambda *, owner, label: []
-        triage.ingest_github_go(conn, NOW)
+        # The issue (closed, or `warden:skip` applied) is gone on the next poll.
+        triage._github.search_issues = lambda *, owner, skip_label: []
+        triage.ingest_github_issues(conn, NOW)
         event = triage._get_event(conn, eid)
         assert event["resolved_at"] is not None, "an issue no longer in the result set must be resolved"
 
@@ -1660,12 +1695,12 @@ def test_ingest_github_go_label_removed_while_new_resolves_by_silence():
         )
 
 
-def test_ingest_github_go_survives_a_remote_error():
+def test_ingest_github_issues_survives_a_remote_error():
     with _triage_env() as (conn, ctx):
-        def _boom(*, owner, label):
+        def _boom(*, owner, skip_label):
             raise triage.RemoteError("test: GitHub is down")
         triage._github.search_issues = _boom
-        triage.ingest_github_go(conn, NOW)  # must not raise
+        triage.ingest_github_issues(conn, NOW)  # must not raise
         assert conn.execute("SELECT COUNT(*) FROM triage_items").fetchone()[0] == 0
 
 
@@ -1723,7 +1758,13 @@ def test_comment_back_never_happens_for_third_party_issue():
 
         triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_CLOSED, item["state"]
+        # Wave 1 (docs/waves/PLAN.md): a third-party issue's plain verdict no
+        # longer self-closes as `answered` — it lands in needs_human for the
+        # owner to triage (see
+        # test_fold_dispatch_verdict_third_party_github_issue_lands_needs_human_not_closed).
+        # The property THIS test exists to guard is unchanged either way: no
+        # comment is ever posted back to a stranger's issue.
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
 
 
 def test_fold_dispatch_verdict_repeat_call_never_reposts_comment():

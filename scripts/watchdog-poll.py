@@ -130,15 +130,19 @@ REM_HOURS = {
     "docker_homelab": 6,
     "docker_vps": 6,
     "github_pr": 72,
-    "github_issue": 168,
     "hermes_cron": 6,
     "hermes_log": 24,
     "op_refs_homelab": 6,
     "op_refs_vps": 6,
-    # Governance backlog, not an outage — matches github_issue's weekly cadence
-    # rather than uk/docker/op_refs's 6h operational urgency. Still needs to
-    # recur (not go silent for weeks): that silence is exactly how the
-    # 2026-08-02 stray (89 patches, 20x growth over 18 days) went unnoticed.
+    # Governance backlog, not an outage — a weekly cadence rather than
+    # uk/docker/op_refs's 6h operational urgency. Still needs to recur (not
+    # go silent for weeks): that silence is exactly how the 2026-08-02 stray
+    # (89 patches, 20x growth over 18 days) went unnoticed. `github_issue`
+    # used to share this exact cadence for the same reason — it no longer
+    # appears in this dict at all (docs/waves/PLAN.md Wave 1): every open
+    # issue is now a warden triage item with its own investigate/implement
+    # verdict and its own deadlines, which supersedes this reminder-digest
+    # cadence entirely.
     "stray_skill": 168,
 }
 
@@ -522,8 +526,17 @@ def poll_github(env: dict[str, str]) -> dict[str, list[dict[str, Any]] | None]:
     reconcile() reads as "every open item disappeared" and resolves them all.
     That is what happened from 2026-09-09: launchd's PATH had no `gh`, every
     search raised FileNotFoundError, and six still-open issues were resolved
-    on the first LaunchAgent run and never seen again."""
-    out: dict[str, list[dict[str, Any]] | None] = {"github_pr": None, "github_issue": None}
+    on the first LaunchAgent run and never seen again.
+
+    `github_issue` was dropped from this poll's `out` shape (docs/waves/
+    PLAN.md Wave 1): warden's own no-label issue intake
+    (`triage.py`'s `ingest_github_issues()`) now assesses every open issue
+    directly, which supersedes this stale-issue governance digest entirely —
+    a `github_issue` item carries a real investigate/implement verdict,
+    while this poll only ever produced an age-gated "still open" line.
+    `github_pr` is unaffected: it stays exactly as it was, the review-without-
+    CodeRabbit path (FLOWS.md flow 4) has nothing to do with issue intake."""
+    out: dict[str, list[dict[str, Any]] | None] = {"github_pr": None}
     gh_env = os.environ.copy()
     if env.get("GITHUB_TOKEN"):
         gh_env["GITHUB_TOKEN"] = env["GITHUB_TOKEN"]
@@ -531,7 +544,6 @@ def poll_github(env: dict[str, str]) -> dict[str, list[dict[str, Any]] | None]:
 
     queries = [
         ("github_pr", "prs", "title,repository,url,number,updatedAt,createdAt,isDraft,author"),
-        ("github_issue", "issues", "title,repository,url,number,updatedAt,createdAt,author"),
     ]
     for kind, search, fields in queries:
         try:
@@ -1178,12 +1190,44 @@ def sweep_stale_grouped(conn: sqlite3.Connection, now: dt.datetime,
     return cur.rowcount
 
 
+def resolve_stale_github_issue_events(conn: sqlite3.Connection, now: dt.datetime) -> int:
+    """One-time cleanup (docs/waves/PLAN.md Wave 1): `poll_github()` no
+    longer polls issues at all, so every still-open `github_issue` event
+    this poller wrote before that change would otherwise sit open forever —
+    nothing left reconciles it, since `_run_poll()`'s own `for kind in
+    (...)` loop dropped `github_issue`. `triage.py`'s no-label issue intake
+    (`ingest_github_issues()`, event source `github_go` — deliberately a
+    DIFFERENT source, see `open_origin_item()`'s own docstring) now assesses
+    every open issue directly with a real verdict, which supersedes this
+    digest's age-gated "still open" line entirely.
+
+    Same resolve shape `ingest_github_issues()` already uses for a
+    disappeared `github_go` event: `resolved_at=now`, no note column
+    on `events` to carry one — the explanation lives here, and in the one
+    stderr line this prints when it actually resolves something. Runs on
+    every poll (idempotent: once every open row is resolved, the UPDATE
+    matches zero rows and this is silent), not gated behind a cursor,
+    because unlike `sweep_stale_grouped()` this isn't a recurring TTL sweep —
+    it is a single migration-shaped fact that becomes a permanent no-op the
+    moment it has run once."""
+    cur = conn.execute(
+        "UPDATE events SET resolved_at=? WHERE source='github_issue' AND resolved_at IS NULL",
+        (now.isoformat(),),
+    )
+    if cur.rowcount:
+        print(
+            f"watchdog: resolving {cur.rowcount} stale github_issue digest event(s) — issue items "
+            "now supersede this digest, see docs/waves/PLAN.md Wave 1",
+            file=sys.stderr,
+        )
+    return cur.rowcount
+
+
 SOURCE_EMOJI = {
     "uk": ":satellite_antenna:",
     "docker_homelab": ":whale:",
     "docker_vps": ":whale:",
     "github_pr": ":cat:",
-    "github_issue": ":cat:",
     "slack_alert": ":mega:",
     "slack_update": ":package:",
     "hermes_cron": ":robot_face:",
@@ -1217,7 +1261,7 @@ def _render_bullet(item: dict[str, Any], kind: str, now: dt.datetime) -> str:
     url = (item.get("url") or "").strip()
 
     # source-specific body
-    if src in ("github_pr", "github_issue"):
+    if src == "github_pr":
         ext = (item.get("external_id") or "").strip()
         # Strip owner from "owner/repo#N" — display as "repo#N".
         if "/" in ext:
@@ -1231,11 +1275,11 @@ def _render_bullet(item: dict[str, Any], kind: str, now: dt.datetime) -> str:
         if suffix_bits:
             body += f" ({', '.join(suffix_bits)})"
         # gh search --owner filters by repo OWNER, never item AUTHOR, and every
-        # repo is public — anyone can open an issue/PR here. Mark non-self
-        # items unmistakably so neither Hermes nor Johannes mistakes
+        # repo is public — anyone can open a PR here. Mark non-self items
+        # unmistakably so neither Hermes nor Johannes mistakes
         # attacker-controlled text for his own note (claude-dispatch can pick
-        # a stale issue as a dispatch trigger, which would hand the
-        # attacker's own body to a live Claude Code episode — prompt injection).
+        # a stale PR as a dispatch trigger, which would hand the attacker's
+        # own body to a live Claude Code episode — prompt injection).
         author = _github_author(item)
         if author != TRUSTED_GH_LOGIN:
             who = author or "unknown"
@@ -1408,8 +1452,11 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
         all_new += n; all_rem += r; all_res += res
         conn.commit()
 
+    resolve_stale_github_issue_events(conn, now)
+    conn.commit()
+
     gh = poll_github(env)
-    for kind in ("github_pr", "github_issue"):
+    for kind in ("github_pr",):
         if gh[kind] is None:
             # Search failed this cycle — skip reconciling, same as an
             # unreachable op_refs host: a blind poll must not resolve anything.

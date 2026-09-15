@@ -72,13 +72,14 @@ row's `origin_thread_ts` once the card posts.
   stdin. Default `--tier investigate`; `--tier implement` requires `--why` and
   sets `max_tier='implement'`. `--origin-channel`/`--origin-thread` (Hermes
   answering in its own thread, no `--wait`) set the two columns above.
-- **`github_issue`** — a GitHub issue in one of `_github.GH_OWNER`'s repos
-  carrying the label `warden:go`, polled once per loop tick
-  (`ingest_github_go()`). The owner's own issues (author == `GH_OWNER`) get
+- **`github_issue`** — every open GitHub issue under `_github.GH_OWNER`, minus
+  anyone carrying `GITHUB_SKIP_LABEL` (`warden:skip`, an opt-out, not a gate —
+  every open issue is ingested by default), polled once per loop tick
+  (`ingest_github_issues()`). The owner's own issues (author == `GH_OWNER`) get
   `max_tier='implement'`; every third-party issue gets `max_tier='investigate'`
-  **always**, regardless of the label — every repo here is public, so anyone
-  can apply it. A third-party issue body is wrapped as untrusted,
-  attacker-influenceable text before it ever reaches a brief.
+  **always** — every repo here is public, so anyone can open one. A
+  third-party issue body is wrapped as untrusted, attacker-influenceable text
+  before it ever reaches a brief.
 
 Both non-alert origins insert their `triage_items` row through
 `open_origin_item()` (dedup on `(origin, repo, external_id)`: a non-terminal
@@ -95,10 +96,23 @@ itself is bound by.
 own eligibility query excludes it, and `lifecycle/policy.py`'s
 `require_auto_from_item()` refuses it by name (defence in depth — the loop and
 the CLI's `--auto-from-item` both pass through the same function). When the
-investigate verdict lands for an `investigate`-ceiling origin item, it goes
-straight to `closed` with `answered: <summary>` instead of `verdict` — a
-question was asked and answered, and the `verdict -> needs_human` 24h deadline
-would only manufacture noise for something nobody is going to act on further.
+investigate verdict lands for an `investigate`-ceiling origin item, where it
+goes next splits by WHO asked (`fold_dispatch_verdict()`'s
+`_member_state_and_note()` closure):
+
+- **`human`** — a question was asked and the answer arrived in the same
+  breath, so it goes straight to `closed` with `answered: <summary>` instead
+  of `verdict` — the `verdict -> needs_human` 24h deadline would only
+  manufacture noise over a question nobody is going to act on further.
+- **`github_issue` (third-party)** — nobody was in the loop when a stranger
+  opened the issue, so silently closing the assessment as "answered" would be
+  invisible in exactly the way this whole redesign exists to prevent. It
+  lands in `needs_human` instead, carrying the verdict summary as the note,
+  so the owner sees the assessment on the card and in Argo before anything
+  closes — no public comment, no silent close for a stranger's issue. An
+  owner-authored issue never reaches this branch at all: it opened at
+  `max_tier='implement'`, so it either auto-implements or lands in
+  `needs_human` through the normal alert-shaped path, never this shortcut.
 
 ## The loop, per run
 

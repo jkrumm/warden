@@ -33,36 +33,50 @@ green in `~/SourceRoot/argo`. `/review` on every wave.
   work (CLAUDE.md: warden may never hold tier ≥ 1 on its own executor or on
   itself). Today `config/dispatch-repos.json` gives both `implement` by default.
 
-## Wave 1 — issue intake without a label            <!-- status: active -->
-- [ ] `scripts/clients/github.py` `search_issues()`: drop the label argument —
+## Wave 1 — issue intake without a label            <!-- status: done -->
+- [x] `scripts/clients/github.py` `search_issues()`: drop the label argument —
       query every open issue under the owner (`owner:jkrumm is:issue is:open
       -label:warden:skip`), keep the pagination/`total_count` refusal. Return
       `labels` alongside `author`/`body`/`url`/`updatedAt`.
-- [ ] `scripts/triage.py` `ingest_github_go()` → rename to
+- [x] `scripts/triage.py` `ingest_github_go()` → rename to
       `ingest_github_issues()`; delete `GITHUB_GO_LABEL`, add
       `GITHUB_SKIP_LABEL = "warden:skip"`. Keep event source `github_go` (the
       ledger already has rows under it; renaming a source is a migration, not
       worth it — say so in a comment). Keep the disappearance-resolve for
       `new` items only. Store `labels`, `updatedAt` in the event payload.
-- [ ] Third-party verdict routing: an `investigate`-capped `github_issue` item
+- [x] Third-party verdict routing: an `investigate`-capped `github_issue` item
       whose verdict lands goes to `needs_human` carrying the verdict summary,
       not `closed`/"answered" (docs/triage.md:90-95 describes today's path).
       Owner-issue routing unchanged. Tests for both.
-- [ ] `config/dispatch-repos.json`: cap `sideclaw` and `warden` at
+- [x] `config/dispatch-repos.json`: cap `sideclaw` and `warden` at
       `investigate`; confirm `make check-policy` against sideclaw's
       `GET /api/dispatch-policy` — if sideclaw's boundary still allows
       `implement` there, note it in **Left behind** (sideclaw is not edited by
       this plan).
-- [ ] `scripts/watchdog-poll.py`: stop polling issues in `poll_github()` (PRs
+- [x] `scripts/watchdog-poll.py`: stop polling issues in `poll_github()` (PRs
       stay) — issue items supersede the stale-issue digest line. Resolve the
       open `github_issue` events once with a short note in the state log.
-- [ ] Docs: FLOWS.md flow 3 rewritten (no label, `warden:skip`, third-party →
+- [x] Docs: FLOWS.md flow 3 rewritten (no label, `warden:skip`, third-party →
       `needs_human`), docs/triage.md issue section, STATE.md origin line,
       state-log §70. Grep for `warden:go` repo-wide and leave no stale mention
       outside the state log.
-**Left behind:**
+**Left behind:** `make check-policy` disagrees, as anticipated above: warden's
+copy caps `sideclaw`/`warden` at `investigate` now, but sideclaw's own
+boundary (`server/lib/dispatch-policy.ts`) still reports `ceiling=implement`
+for both — verbatim, `sideclaw: hermes says ceiling=investigate sensitive=False,
+sideclaw says ceiling=implement sensitive=False` (same line for `warden`). The
+self-authoring-loop prohibition (CLAUDE.md "Talking to sideclaw") is not
+actually closed until sideclaw's side matches — a sideclaw-repo change, out of
+this plan's scope; whoever picks that up should land it before relying on the
+cap in practice. `/review` (sideclaw multi-angle) also caught a real bug this
+wave introduced: `search_issues()` didn't check GitHub's `incomplete_results`
+flag, which could silently resolve a genuinely-still-open issue's event on
+a search-index timeout — fixed in the same commit, with a regression test
+(`tests/test_clients.py`, now 93/93). Test gate is now 256/256
+(`test_fold_dispatch_verdict_third_party_github_issue_lands_needs_human_not_closed`),
+recorded in STATE.md and CLAUDE.md.
 
-## Wave 2 — owner actions pulled from Argo            <!-- status: pending -->
+## Wave 2 — owner actions pulled from Argo            <!-- status: active -->
 - [ ] `scripts/clients/argo.py`: `fetch_actions(machine)` →
       `GET /warden/actions?machine=&status=pending` and
       `ack_action(id, {status, result, error})` → `POST /warden/actions/:id/ack`,

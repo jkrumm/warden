@@ -220,9 +220,12 @@ _SEARCH_PER_PAGE = 50
 _SEARCH_MAX_PAGES = 10
 
 
-def search_issues(*, owner: str, label: str) -> list[dict[str, Any]]:
-    """`GET /search/issues` for every OPEN issue in an `owner` repo carrying
-    `label` — the poll behind `warden:go` (triage.py's `ingest_github_go()`).
+def search_issues(*, owner: str, skip_label: str) -> list[dict[str, Any]]:
+    """`GET /search/issues` for every OPEN issue in an `owner` repo, minus
+    anyone carrying `skip_label` — the poll behind no-label issue intake
+    (triage.py's `ingest_github_issues()`). Every open issue is a warden item
+    by default; `skip_label` is the one opt-out a human can apply to keep a
+    specific issue out, not a gate an issue has to earn its way through.
     `repo` in each returned dict is the SHORT name (`nameWithOwner`'s tail,
     read off `repository_url`, never the search hit's own `html_url`, which
     is not guaranteed to be parseable the same way) — the value
@@ -231,26 +234,27 @@ def search_issues(*, owner: str, label: str) -> list[dict[str, Any]]:
     `query` is percent-encoded before it ever reaches `api()` (`safe="+:"` so
     the `+` word-separators and `:` qualifier colons GitHub's search syntax
     needs stay literal) — `api()` sends whatever path it is given verbatim,
-    with no encoding of its own, so an unescaped `"` or `&` inside `label`
+    with no encoding of its own, so an unescaped `"` or `&` inside `skip_label`
     would otherwise land in the URL unescaped and could smuggle extra query
     parameters into the request.
 
     Paged through `total_count`, up to `_SEARCH_MAX_PAGES` pages of
-    `_SEARCH_PER_PAGE` — `ingest_github_go()` resolves any still-open
+    `_SEARCH_PER_PAGE` — `ingest_github_issues()` resolves any still-open
     `github_go` event NOT in this result set, so a silently-truncated first
     page (the old shape: one `per_page=50` request, no paging) would read a
     live item past #50 as gone and resolve it out from under a human still
     waiting on it (DESIGN.md § What must not be lost: "overflow waits, never
     drops"). If GitHub's own `total_count` still exceeds what
     `_SEARCH_MAX_PAGES` pages fetched, this raises rather than returning a
-    partial set — `ingest_github_go()`'s own `except RemoteError` then skips
-    resolution for this tick entirely, the fail-closed side of that same
-    rule."""
+    partial set — `ingest_github_issues()`'s own `except RemoteError` then
+    skips resolution for this tick entirely, the fail-closed side of that
+    same rule."""
     # Unquoted on purpose: GitHub's search index returns NOTHING for
-    # `label:"warden:go"` (quoted) and the matching issue for `label:warden:go`
-    # (observed live 2026-09-11 against jkrumm/dispatch-scratch#9). A label with
-    # a space would need quotes; ours never carry one.
-    query = f"owner:{owner}+is:issue+is:open+label:{label}"
+    # `-label:"warden:skip"` (quoted) and the matching behaviour for
+    # `-label:warden:skip` (observed live 2026-09-11 against
+    # jkrumm/dispatch-scratch#9, the same finding as the old `warden:go`
+    # query). A label with a space would need quotes; ours never carry one.
+    query = f"owner:{owner}+is:issue+is:open+-label:{skip_label}"
     encoded_query = urllib.parse.quote(query, safe="+:")
 
     items: list[dict[str, Any]] = []
@@ -261,9 +265,22 @@ def search_issues(*, owner: str, label: str) -> list[dict[str, Any]]:
             path += f"&page={page}"
         status, body = api("GET", path)
         if status != 200:
-            raise RemoteError(f"GitHub returned HTTP {status} searching issues for label {label!r}")
+            raise RemoteError(f"GitHub returned HTTP {status} searching issues for owner {owner!r}")
         if not isinstance(body, dict) or not isinstance(body.get("items"), list):
-            raise RemoteError(f"GitHub returned an unusable body searching issues for label {label!r}")
+            raise RemoteError(f"GitHub returned an unusable body searching issues for owner {owner!r}")
+        if body.get("incomplete_results"):
+            # GitHub's search index can time out and still return HTTP 200 —
+            # `incomplete_results: true` is the only signal that this page is
+            # not authoritative. Trusting it here would let `ingest_github_issues()`
+            # read a genuinely-still-open issue as "not in this result set" and
+            # resolve its event out from under a human still waiting on it,
+            # exactly the failure the total_count check below already guards
+            # against for a truncated page count — this is the same guard for
+            # a page GitHub itself flags as unreliable.
+            raise RemoteError(
+                f"GitHub flagged this search as incomplete_results for owner {owner!r} — refusing to "
+                f"resolve missing github_go events against an unreliable result set"
+            )
         total_count = body.get("total_count")
         page_items = body["items"]
         items.extend(page_items)
@@ -274,7 +291,7 @@ def search_issues(*, owner: str, label: str) -> list[dict[str, Any]]:
 
     if isinstance(total_count, int) and len(items) < total_count:
         raise RemoteError(
-            f"GitHub reports {total_count} open issues for label {label!r} but only {len(items)} "
+            f"GitHub reports {total_count} open issues for owner {owner!r} but only {len(items)} "
             f"were fetched across up to {_SEARCH_MAX_PAGES} pages of {_SEARCH_PER_PAGE} — refusing "
             f"to resolve missing github_go events against a partial result set"
         )
@@ -285,6 +302,12 @@ def search_issues(*, owner: str, label: str) -> list[dict[str, Any]]:
         repo = repo_url.rsplit("/", 1)[-1] if repo_url else "?"
         author_obj = it.get("user") or {}
         author = author_obj.get("login") if isinstance(author_obj, dict) else None
+        raw_labels = it.get("labels")
+        labels = (
+            [l.get("name") for l in raw_labels if isinstance(l, dict) and l.get("name")]
+            if isinstance(raw_labels, list)
+            else []
+        )
         out.append({
             "repo": repo,
             "number": it.get("number"),
@@ -293,6 +316,7 @@ def search_issues(*, owner: str, label: str) -> list[dict[str, Any]]:
             "url": it.get("html_url", ""),
             "author": author,
             "updated_at": it.get("updated_at"),
+            "labels": labels,
         })
     return out
 

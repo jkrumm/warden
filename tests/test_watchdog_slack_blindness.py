@@ -119,7 +119,7 @@ now = dt.datetime(2026, 9, 7, 10, 0, tzinfo=dt.timezone.utc)
 wp.poll_uk = lambda *a, **k: []
 wp.poll_docker = lambda *a, **k: []
 wp.poll_op_refs = lambda *a, **k: ([], True)
-wp.poll_github = lambda *a, **k: {"github_pr": [], "github_issue": []}
+wp.poll_github = lambda *a, **k: {"github_pr": []}
 wp.poll_hermes_cron = lambda *a, **k: []
 wp.poll_stray_skills = lambda *a, **k: []
 wp.poll_hermes_logs = lambda *a, **k: []

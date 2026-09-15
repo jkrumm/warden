@@ -803,46 +803,46 @@ def test_search_issues_parses_a_search_response():
             },
         ],
     }
-    encoded_path = '/search/issues?q=owner:jkrumm+is:issue+is:open+label:warden:go&per_page=50'
+    encoded_path = '/search/issues?q=owner:jkrumm+is:issue+is:open+-label:warden:skip&per_page=50'
     srv = _StubServer({("GET", encoded_path): (200, body)})
     _gh_env(srv)
     try:
-        hits = github.search_issues(owner="jkrumm", label="warden:go")
+        hits = github.search_issues(owner="jkrumm", skip_label="warden:skip")
     finally:
         srv.stop()
         _gh_cleanup()
     assert hits == [{
         "repo": "argo", "number": 42, "title": "fix the thing", "body": "please fix it",
         "url": "https://github.com/jkrumm/argo/issues/42", "author": "jkrumm",
-        "updated_at": "2026-09-10T00:00:00Z",
+        "updated_at": "2026-09-10T00:00:00Z", "labels": [],
     }], hits
     # The request path the stub actually saw — pins that `+`/`:` stay literal
-    # (GitHub's own search syntax) while the quotes around the label are
+    # (GitHub's own search syntax) while the quotes around the skip label are
     # percent-encoded, not sent raw.
     assert srv.requests[-1]["path"] == encoded_path, srv.requests[-1]["path"]
 
 
-def test_search_issues_url_encodes_a_label_with_special_characters():
-    """`label` reaches the query string only through `urllib.parse.quote` —
-    a label carrying `&`/`=`/a space must not be able to smuggle extra query
-    parameters into the GitHub request (`api()` sends whatever path it is
-    given verbatim, with no encoding of its own)."""
+def test_search_issues_url_encodes_a_skip_label_with_special_characters():
+    """`skip_label` reaches the query string only through `urllib.parse.quote`
+    — a skip label carrying `&`/`=`/a space must not be able to smuggle extra
+    query parameters into the GitHub request (`api()` sends whatever path it
+    is given verbatim, with no encoding of its own)."""
     srv = _StubServer({"default": (200, {"items": []})})
     _gh_env(srv)
     try:
-        github.search_issues(owner="jkrumm", label="a&b=c d")
+        github.search_issues(owner="jkrumm", skip_label="a&b=c d")
     finally:
         srv.stop()
         _gh_cleanup()
     path = srv.requests[-1]["path"]
-    assert path == '/search/issues?q=owner:jkrumm+is:issue+is:open+label:a%26b%3Dc%20d&per_page=50', path
+    assert path == '/search/issues?q=owner:jkrumm+is:issue+is:open+-label:a%26b%3Dc%20d&per_page=50', path
     assert "&b=" not in path and " " not in path
 
 
 def test_search_issues_pages_through_total_count():
     """A `total_count` bigger than one page of 50 must be paged through, not
-    silently truncated at page 1 — see `ingest_github_go()`'s reliance on the
-    FULL result set to decide what to resolve."""
+    silently truncated at page 1 — see `ingest_github_issues()`'s reliance on
+    the FULL result set to decide what to resolve."""
     def _hit(n: int) -> dict[str, Any]:
         return {
             "repository_url": "https://api.github.com/repos/jkrumm/argo",
@@ -850,7 +850,7 @@ def test_search_issues_pages_through_total_count():
             "html_url": f"https://github.com/jkrumm/argo/issues/{n}",
             "user": {"login": "jkrumm"}, "updated_at": "2026-09-10T00:00:00Z",
         }
-    page1_path = "/search/issues?q=owner:jkrumm+is:issue+is:open+label:warden:go&per_page=50"
+    page1_path = "/search/issues?q=owner:jkrumm+is:issue+is:open+-label:warden:skip&per_page=50"
     page2_path = page1_path + "&page=2"
     srv = _StubServer({
         ("GET", page1_path): (200, {"total_count": 60, "items": [_hit(n) for n in range(50)]}),
@@ -858,7 +858,7 @@ def test_search_issues_pages_through_total_count():
     })
     _gh_env(srv)
     try:
-        hits = github.search_issues(owner="jkrumm", label="warden:go")
+        hits = github.search_issues(owner="jkrumm", skip_label="warden:skip")
     finally:
         srv.stop()
         _gh_cleanup()
@@ -882,7 +882,7 @@ def test_search_issues_total_count_exceeding_max_pages_raises_remote_error():
     _gh_env(srv)
     try:
         try:
-            github.search_issues(owner="jkrumm", label="warden:go")
+            github.search_issues(owner="jkrumm", skip_label="warden:skip")
         except RemoteError as e:
             assert "1000000" in str(e), e
             assert "refusing to resolve" in str(e), e
@@ -900,9 +900,29 @@ def test_search_issues_non_200_raises_remote_error():
     _gh_env(srv)
     try:
         try:
-            github.search_issues(owner="jkrumm", label="warden:go")
+            github.search_issues(owner="jkrumm", skip_label="warden:skip")
         except RemoteError:
             pass
+        else:
+            raise AssertionError("expected RemoteError")
+    finally:
+        srv.stop()
+        _gh_cleanup()
+
+
+def test_search_issues_incomplete_results_raises_remote_error():
+    """GitHub's search index can time out and still return HTTP 200 with
+    `incomplete_results: true` — trusting that page would let
+    `ingest_github_issues()` read a genuinely-still-open issue as "not in
+    this result set" and resolve its event out from under a human still
+    waiting on it. Must refuse the same way a truncated `total_count` does."""
+    srv = _StubServer({"default": (200, {"total_count": 1, "incomplete_results": True, "items": []})})
+    _gh_env(srv)
+    try:
+        try:
+            github.search_issues(owner="jkrumm", skip_label="warden:skip")
+        except RemoteError as e:
+            assert "incomplete_results" in str(e), e
         else:
             raise AssertionError("expected RemoteError")
     finally:

@@ -363,9 +363,10 @@ POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
 # Wave 6.1 adds two MORE origins that also open a `triage_items` row and
 # never go through here: `human` (via `warden run`, CLI-only — see
 # open_origin_item()/cmd_run in scripts/warden.py) and `github_issue` (via
-# ingest_github_go(), polled once per loop tick, same as this list). Neither
-# belongs in INGEST_SOURCES — that tuple is `ingest()`'s own alert-source
-# door, and both new origins insert their `triage_items` row directly.
+# ingest_github_issues(), polled once per loop tick, same as this list).
+# Neither belongs in INGEST_SOURCES — that tuple is `ingest()`'s own
+# alert-source door, and both new origins insert their `triage_items` row
+# directly.
 INGEST_SOURCES = ("slack_alert", "uk", "docker_homelab", "docker_vps", "hermes_log",
                    "op_refs_homelab", "op_refs_vps")
 
@@ -1938,12 +1939,18 @@ def ingest(conn: sqlite3.Connection, now: dt.datetime) -> None:
 # `github_issue` items would collide under if this used watchdog-poll.py's own
 # stale-issue source name (see this function's own docstring for why it
 # doesn't — the short version: `github_issue` already means something else,
-# a different poller, a different reconcile()).
+# a different poller, a different reconcile()). `github_go` is a historical
+# artifact of the old label-only intake (`warden:go`, pre no-label wave) —
+# the ledger already carries live rows under this source name, and renaming
+# a source is a migration, not a rename, so it stays `github_go` even though
+# there is no longer a `warden:go` label gating anything.
 ORIGIN_EVENT_SOURCE = {"human": "human", "github_issue": "github_go"}
 
-# The label a GitHub issue must carry for ingest_github_go() to pick it up —
-# "you already decided when you typed it" (FLOWS.md flow 3).
-GITHUB_GO_LABEL = "warden:go"
+# The one opt-out label a GitHub issue can carry to keep ingest_github_issues()
+# from ever opening an item for it — every open issue is ingested by default;
+# this label is how you keep one out, not a gate an issue has to earn its way
+# through.
+GITHUB_SKIP_LABEL = "warden:skip"
 
 
 def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief: str, max_tier: str,
@@ -1954,15 +1961,18 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
     the non-alert counterpart to `ingest()`, which only ever handles the
     seven `INGEST_SOURCES`. Inserts (or reuses) an `events` row keyed on
     `(source, external_id)` — `source` is `human` for a human origin and
-    `github_go` for a GitHub issue, deliberately NOT `github_issue`:
-    watchdog-poll.py's own `poll_github()`/`reconcile()` already write
-    `github_issue` events for STALE issues under the exact same `repo#num`
-    external_id, under staleness semantics (resolved when the issue goes
-    quiet, not when a label changes) — sharing that source here would fold
-    a `warden:go` handover into that reconcile() cycle and either lose it to
-    a false resolve or trip a disappearance-resolve this item was never
-    meant to have. A distinct source keeps the two entirely apart, at the
-    cost of one intentionally-not-matching name.
+    `github_go` for a GitHub issue, deliberately NOT `github_issue`: before
+    Wave 1 of docs/waves/PLAN.md, watchdog-poll.py's own `poll_github()`/
+    `reconcile()` wrote `github_issue` events for STALE issues under the
+    exact same `repo#num` external_id, under staleness semantics (resolved
+    when the issue went quiet, not when a label changed) — sharing that
+    source here would have folded an issue-intake item into that
+    reconcile() cycle and either lost it to a false resolve or tripped a
+    disappearance-resolve this item was never meant to have. `poll_github()`
+    no longer polls issues at all (issue items now supersede that digest,
+    see `scripts/watchdog-poll.py`), but the distinct source name stays —
+    cheap insurance against ever re-introducing that collision, not worth a
+    migration to undo.
 
     One `triage_items` row per open signature: if a NON-TERMINAL item
     already exists for this `(origin, repo, external_id)` — i.e. it is still
@@ -1970,10 +1980,12 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
     `event_id` and inserts nothing (the loop or CLI that dedups against this
     return value never opens a second item for the same handover). If a
     TERMINAL item already exists (fixed/quiet/closed/dismissed/ignored/note/
-    reverted), this does NOTHING and returns None: a stale `warden:go` label
-    still sitting on an issue after the work already finished, or a repeat
-    `warden run` for something already `closed`, is not a new handover — see
-    `ingest_github_go()`'s own docstring for the label-removal side of this.
+    reverted), this does NOTHING and returns None: a repeat sighting of an
+    issue whose work has already finished — because it dropped out of the
+    open-issue poll entirely (closed, or `warden:skip` applied), or a repeat
+    `warden run` for something already `closed` — is not a new handover; see
+    `ingest_github_issues()`'s own docstring for the disappearance side of
+    this.
 
     `origin_channel`/`origin_thread_ts` are the Slack thread this item's own
     verdict must answer into (a `human` origin from `cmd_run`'s
@@ -2016,10 +2028,10 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
     return event_id
 
 
-def ingest_github_go(conn: sqlite3.Connection, now: dt.datetime) -> None:
+def ingest_github_issues(conn: sqlite3.Connection, now: dt.datetime) -> None:
     """Called once per loop tick (`--run`), same cadence as `ingest()`. Polls
-    every open issue across `_github.GH_OWNER`'s repos carrying the
-    `GITHUB_GO_LABEL` label, opens (or reuses, via `open_origin_item()`) one
+    every open issue under `_github.GH_OWNER`, minus anyone carrying
+    `GITHUB_SKIP_LABEL`, opens (or reuses, via `open_origin_item()`) one
     `github_issue` item per hit, and marks any still-open `github_go` event
     whose issue no longer appears in the result set as resolved
     (`resolved_at=now`) — the silence path `apply_resolutions()` then closes
@@ -2032,16 +2044,17 @@ def ingest_github_go(conn: sqlite3.Connection, now: dt.datetime) -> None:
     `_github_author()`/`TRUSTED_GH_LOGIN`: only `_github.GH_OWNER` is
     trusted, so a missing/unparseable author is third-party. `max_tier`
     follows straight from that — `implement` for the owner's own issues,
-    `investigate` always for everyone else, regardless of the label
-    (FLOWS.md flow 3: "never auto-implemented, regardless of label").
+    `investigate` always for everyone else, regardless of labels (FLOWS.md
+    flow 3: "never auto-implemented" — there is no longer a label to key
+    off of at all).
 
     Never raises: a GitHub outage here must not take down the rest of this
     tick — same one-line-and-skip contract `poll_implement_jobs()` already
     has for a `RemoteError` from sideclaw."""
     try:
-        hits = _github.search_issues(owner=_github.GH_OWNER, label=GITHUB_GO_LABEL)
+        hits = _github.search_issues(owner=_github.GH_OWNER, skip_label=GITHUB_SKIP_LABEL)
     except RemoteError as e:
-        print(f"triage: could not poll GitHub for {GITHUB_GO_LABEL!r} issues: {e}", file=sys.stderr)
+        print(f"triage: could not poll GitHub issues for owner {_github.GH_OWNER!r}: {e}", file=sys.stderr)
         return
 
     seen_external_ids: set[str] = set()
@@ -2057,7 +2070,9 @@ def ingest_github_go(conn: sqlite3.Connection, now: dt.datetime) -> None:
         open_origin_item(
             conn, origin="github_issue", repo=repo, brief=hit.get("body") or "", max_tier=max_tier,
             external_id=external_id, title=hit.get("title") or "?", url=hit.get("url"),
-            payload={"repo": repo, "number": number, "author": author}, now=now,
+            payload={"repo": repo, "number": number, "author": author,
+                     "labels": hit.get("labels") or [], "updated_at": hit.get("updated_at")},
+            now=now,
         )
 
     now_iso = _now_iso(now)
@@ -3308,8 +3323,9 @@ def _origin_item_brief(item: sqlite3.Row, event_row: sqlite3.Row) -> str:
 def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool = False) -> None:
     """The origin-aware counterpart to `escalate()`, for every `new` item
     whose `origin != 'alert'` (a `human` `warden run`, or a `github_issue`
-    from `ingest_github_go()`). Each is its own cluster of ONE — a human (or
-    a trusted label) already decided this is ready, so none of `escalate()`'s
+    from `ingest_github_issues()`). Each is its own cluster of ONE — a human
+    (or, for an owner-authored issue, the issue itself) already decided this
+    is ready, so none of `escalate()`'s
     `minOccurrences`/`minOpenMinutes`/`cooldownHours` gates apply, and it is
     never grouped with an alert cluster or with another origin item.
 
@@ -3420,7 +3436,7 @@ def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, ev
     (called from `fold_dispatch_verdict()`, only on a REAL state transition —
     never on an idempotent re-fold). Only ever posts for the owner's own
     issue — trust is re-derived from the event's own stored payload, the
-    same fail-closed check `ingest_github_go()` used to set `max_tier`.
+    same fail-closed check `ingest_github_issues()` used to set `max_tier`.
     Never raises: a GitHub failure here is a logged line, never a state
     change (same contract as every other GitHub call this file makes).
 
@@ -4043,28 +4059,46 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 
     def _member_state_and_note(m: sqlite3.Row) -> tuple[str, str | None]:
         member_state, member_note = new_state, (blocker or None)
-        # An origin item capped at `investigate` (a human's question, or a
-        # third-party GitHub issue) got the answer it asked for the moment a
-        # plain verdict lands — landing it in `verdict` would start a 24h
-        # `verdict -> needs_human` clock (STATE_DEADLINES) over a question
-        # nobody is going to act on further, which only manufactures noise.
-        # `alert` items are untouched: this branch only ever fires for
-        # `new_state == STATE_VERDICT`, and an alert's own verdict still
-        # needs maybe_auto_implement() to look at it.
+        # An origin item capped at `investigate` whose plain verdict just
+        # landed splits by WHO asked, not just that someone asked:
         #
-        # Also, structurally, why a FAILED episode can never reach this
+        #   - `human` — a question was asked and the answer just arrived in
+        #     the same breath; closing it `STATE_CLOSED` as `answered: …` is
+        #     correct, and landing it in `verdict` instead would only start
+        #     a 24h `verdict -> needs_human` clock (STATE_DEADLINES) over a
+        #     question nobody is going to act on further — pure noise.
+        #   - `github_issue` — a THIRD-PARTY issue never had a human in the
+        #     loop at ask time (every repo here is public, so anyone can
+        #     open one), so silently closing the assessment as "answered"
+        #     would be exactly the invisibility this split exists to
+        #     prevent. It lands in `STATE_NEEDS_HUMAN` instead, carrying the
+        #     verdict summary as the note (same shape every other
+        #     needs_human blocker uses), so the owner sees the assessment on
+        #     the card/Argo and decides what happens next — no public
+        #     comment, no silent close for a stranger's issue. An
+        #     owner-authored issue never reaches this branch at all: it
+        #     opened at `max_tier="implement"`.
+        #   - `alert` items are untouched: this branch only ever fires for
+        #     `new_state == STATE_VERDICT`, and an alert's own verdict still
+        #     needs maybe_auto_implement() to look at it.
+        #
+        # Also, structurally, why a FAILED episode can never reach either
         # shortcut: `new_state == STATE_VERDICT` requires a real, schema-valid
         # `result` (see the "terminal, no verdict" branch above, which routes
         # a failure straight to STATE_NEEDS_HUMAN before this function is ever
-        # called for that member). A human-origin question whose episode
-        # FAILED must land in front of a human, never be closed here as
-        # "answered" — this gate already guarantees that by construction, but
-        # it is exactly the invariant a future edit to either branch must not
-        # break.
-        if new_state == STATE_VERDICT and m["origin"] != "alert" and m["max_tier"] == "investigate":
+        # called for that member). A human-origin question or a third-party
+        # issue whose episode FAILED must land in front of a human through
+        # that branch, never be closed here as "answered" — this gate already
+        # guarantees that by construction, but it is exactly the invariant a
+        # future edit to either branch must not break.
+        if new_state == STATE_VERDICT and m["max_tier"] == "investigate":
             summary = (result.get("summary") or result.get("recommendation") or "").strip()
-            member_state = STATE_CLOSED
-            member_note = f"answered: {summary}" if summary else "answered"
+            if m["origin"] == "human":
+                member_state = STATE_CLOSED
+                member_note = f"answered: {summary}" if summary else "answered"
+            elif m["origin"] == "github_issue":
+                member_state = STATE_NEEDS_HUMAN
+                member_note = summary or "investigated, no recommendation"
         return member_state, member_note
 
     if dry_run:
@@ -6459,7 +6493,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     drain_intents(conn, now, dry_run=dry_run)
     ingest(conn, now)
-    ingest_github_go(conn, now)
+    ingest_github_issues(conn, now)
     reopen_if_needed(conn, now)
     unsnooze_if_expired(conn, now)
     unmapped = classify(conn, policy, now)

@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-14 (§68) |
-| Current wave | Estate chain Wave 8 done (§57); field look §58; autonomy §59. Wave 9, the field review, is the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
+| Last updated | 2026-09-15 (§70) |
+| Current wave | GitHub-issues-in-warden chain (`docs/waves/PLAN.md`): Wave 1 done (§70), Wave 2 active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 255/255 is the gate; `make test` runs all suites |
+| Tests | `tests/test_triage.py` 256/256 is the gate; `make test` runs all suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -32,10 +32,11 @@ loop.
   `revert`) replaces the old bash verbs; the loop calls `scripts/lifecycle/`
   as functions, not shell scripts.
 - Every origin opens an item. `triage_items.origin` is one of `alert` (the
-  pollers), `github_issue` (the `warden:go` label only, event source
-  `github_go` — the staleness poller's `github_issue` events are digest
-  lines and never open an item, §69), or `human` (`warden run`, typed in herdr or
-  through Hermes's door with `--origin-channel`/`--origin-thread`). See
+  pollers), `github_issue` (every open GitHub issue under `_github.GH_OWNER`,
+  minus `warden:skip` as the one opt-out — no label gate anymore, event
+  source stays `github_go`, a historical artifact of the old label-only
+  intake), or `human` (`warden run`, typed in herdr or through Hermes's door
+  with `--origin-channel`/`--origin-thread`). See
   `docs/history/state-log.md` §55.
 - Automatic investigate/implement dispatches pass `AUTO_DISPATCH_MODEL`
   (`glm-5.3-flash`, env `TRIAGE_AUTO_DISPATCH_MODEL`) and run on the IU
@@ -150,11 +151,26 @@ loop.
   roadkill — §66
 - Three recurring alerts: backup bundle verify, tier-cap flap, Kuma interval — §67
 - Creation transitions, event reminders, bounded snapshot; secrets-run relay; VPN interval — §68
+- The GitHub poll that resolved every open issue — §69
+- GitHub issues in warden, Wave 1: no-label intake, `warden:skip`, third-party
+  verdicts land in `needs_human` — §70
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
+
+Wave 2 of `docs/waves/PLAN.md` (owner actions pulled from Argo) is next:
+`scripts/clients/argo.py` `fetch_actions()`/`ack_action()`, `triage.py`
+`apply_argo_actions()` with the closed verb allowlist, `authorized_by="owner:argo"`
+satisfying the implement/merge human gate, the daily-budget removal (owner,
+2026-09-15: "absurd friction" — `WARDEN_DAILY_BUDGET`/`WARDEN_IMPLEMENT_BUDGET`/
+`WARDEN_MERGE_BUDGET`/`DAILY_INVESTIGATE_BUDGET` gone entirely, `MAX_OPEN_INVESTIGATIONS`
+and the per-repo lock stay), the DESIGN.md/REVIEW.md C1 override record. Left
+behind by Wave 1: sideclaw's own dispatch-policy boundary still allows
+`implement` on `sideclaw`/`warden` — `make check-policy` disagrees until
+sideclaw's side is capped too (out of this plan's scope, a sideclaw-repo
+change).
 
 §67/§68 closed the recurring-alert list: backup heartbeat, tier-cap flap
 (543 now `needs_human`), creation transitions, alert reminders on the event,

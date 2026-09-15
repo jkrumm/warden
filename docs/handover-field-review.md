@@ -166,8 +166,9 @@ sqlite3 "$HOME/.warden/warden.db" \
 ```
 
 Read against `FLOWS.md`'s six scenarios: is `github_issue` volume tracking
-real `warden:go` usage, or near-zero? Is `alert` volume dominated by one repo
-(worth tuning `minOccurrences`/`cooldownHours` over a code fix)?
+real open-issue traffic across `jkrumm/*`, or near-zero? Is `alert` volume
+dominated by one repo (worth tuning `minOccurrences`/`cooldownHours` over a
+code fix)?
 
 ## What to read
 
@@ -193,10 +194,10 @@ real `warden:go` usage, or near-zero? Is `alert` volume dominated by one repo
 **Herdr.** Did `rd wave`/`rd bg` on Sonnet get the job done, or did anything
 genuinely need Fable? Did the overview pane surface what mattered?
 
-**Hermes.** Did the door — `warden run` from a Slack thread, the `warden:go`
-label, an approval click — actually get used, or did real fixes still go
-through a human typing by hand? Did any approval wait on a human longer than
-felt right (compare against metric 3)?
+**Hermes.** Did the door — `warden run` from a Slack thread, no-label issue
+intake plus the `warden:skip` opt-out, an approval click — actually get used,
+or did real fixes still go through a human typing by hand? Did any approval
+wait on a human longer than felt right (compare against metric 3)?
 
 **Argo.** Was the board opened at all this week? Did the per-item timeline
 answer "what happened to item X" without falling back to a direct ledger query?

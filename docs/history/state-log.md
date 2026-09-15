@@ -7240,3 +7240,50 @@ reconciling a `None` kind, same as an unreachable `op_refs` host. New
 Open: whether owner-authored issues should open items without the label, and
 how a third-party issue's assessment gets approved — a design question, not
 part of this fix.
+
+## 70. GitHub issues in warden, Wave 1: no-label intake (2026-09-15)
+
+Answers §69's open question. `docs/waves/PLAN.md` Wave 1, owner decisions
+2026-09-15 (Argo is the owner over the tailnet — no passkey, no Slack-only
+signing, no opt-in label for his own actions — overriding REVIEW.md C1's
+corollary and DESIGN.md § the decision primitive; the override record itself
+is Wave 2's job, not this one's).
+
+`_github.search_issues()` drops `label` for `skip_label`: every open issue
+under `owner`, minus `-label:warden:skip`. `triage.py`'s `ingest_github_go()`
+renamed `ingest_github_issues()`; `GITHUB_GO_LABEL` → `GITHUB_SKIP_LABEL`. Event
+source stays `github_go` — the ledger has live rows under it, renaming a
+source is a migration, not a rename. Trust and `max_tier` derivation
+(owner → `implement`, everyone else → `investigate`, fail-closed on a
+missing/unparseable author) are unchanged; only the intake gate moved from
+label-required to skip-label-optional.
+
+Third-party verdict routing changed: `fold_dispatch_verdict()`'s
+`_member_state_and_note()` used to close ANY `investigate`-ceiling origin
+item as `answered` the moment a plain verdict landed. Split by who asked —
+`human` (a question, answered in the same breath) still closes; `github_issue`
+(nobody was in the loop when a stranger opened it) now lands in
+`needs_human` carrying the verdict summary, so the owner sees the assessment
+on the card and in Argo before anything closes. No public comment ever
+reaches a third-party issue (unchanged). Owner-issue routing untouched — it
+opens at `max_tier='implement'` and never reaches this branch.
+
+`config/dispatch-repos.json`: `sideclaw`/`warden` joined `tiers.investigate`
+(CLAUDE.md: warden may never hold tier ≥ 1 on its own executor or on itself).
+`watchdog-poll.py`'s `poll_github()` stopped polling issues — `github_pr`
+stays; the digest's `github_issue` events were a one-time resolve
+(`resolve_stale_github_issue_events()`), since issue items now carry a real
+verdict and supersede the age-gated "still open" line entirely.
+
+`/review` (sideclaw multi-angle, `needs-human`) caught a real bug beyond the
+brief: `search_issues()` didn't check GitHub's `incomplete_results` flag — a
+search-index timeout can return HTTP 200 with a page that isn't authoritative,
+which would have silently resolved a genuinely-still-open issue's event.
+Fixed in the same commit, with a regression test. The review's other
+blocking finding — `make check-policy` disagreement, sideclaw's own boundary
+still allowing `implement` on `sideclaw`/`warden` — was already anticipated
+and scoped out of this wave by the plan itself (sideclaw is a different repo);
+left for whoever picks up that side. `test_triage.py` 256/256, `test_clients.py`
+93/93, `make test` green, `make check-routing` green.
+
+`docs/waves/PLAN.md` Wave 2 (owner actions pulled from Argo) is active next.

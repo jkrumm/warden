@@ -92,30 +92,37 @@ semantics.
 
 | | |
 |-|-|
-| **Trigger** | you `gh issue create`, or Hermes files one via `capture` |
-| **Gate to start** | label `warden:go` — **not** every open issue |
+| **Trigger** | you or a stranger opens an issue in any `jkrumm/*` public repo |
+| **Gate to start** | none — `warden:skip` is the only opt-out |
 
 ```
-W  loop tick polls `warden:go` issues (ingest_github_go) -> item, origin=github_issue
+W  loop tick polls every open issue minus `warden:skip` (ingest_github_issues) -> item, origin=github_issue
 W  investigate episode against the named repo
-S  verdict + a plan comment posted back on the issue
-W  implement -> PR that closes the issue -> validate -> merge
+S  verdict + (owner issues only) a plan comment posted back on the issue
+W  owner issue, confidence=high + nextAction=implement -> implement -> PR that closes the issue -> validate -> merge
 W  -> fixed on CI green (these repos have CI) or closed
 ```
 
 **Slack** — a card, same as an alert. **Argo** — same timeline, plus the issue
 body as the brief's source.
 
-**Decision needed: no**, if the repo is at tier ≥ 2 and the issue is yours. The
-label *is* the approval — you already decided when you typed it.
+**Decision needed: no** for your own issues — they auto-implement on the
+existing confidence/nextAction rule the same as any other origin; anything
+short of `confidence=high` + `nextAction=implement` lands in `needs_human`
+the same as an alert would.
 
 **Third-party issues are different.** Every repo is public, so anyone can open
-one. Those get `investigate` only, verdict scanned, never auto-implemented,
-regardless of label. That rule exists today and stays.
+one. Those get `investigate` only, verdict assessed, never auto-implemented —
+that rule exists today and stays. Their verdict does not close itself as
+"answered" the way a human's question does: it lands in `needs_human` carrying
+the verdict summary, so you see the assessment on the card and in Argo before
+anything closes. No public comment is ever posted back to a third-party issue.
 
-**Friction:** one label. Deliberate — without it every stale idea in your issue
-tracker becomes an episode. `warden:go` is you saying "this is ready", which is a
-thing only you know.
+**Friction:** `warden:skip` is the one hand-lever — apply it to keep a specific
+issue out of intake entirely. Everything else that used to be friction (a label
+you had to remember to add before anything happened) is gone: every open issue
+is assessed automatically, and the owner's decision point moved from "did I
+label it" to triaging third-party assessments landing in `needs_human`.
 
 ---
 
