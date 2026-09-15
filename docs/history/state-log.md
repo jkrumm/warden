@@ -7447,3 +7447,118 @@ the section renders the real backlog (6 needs-you, 1 auto-implementing,
 correct per-state buttons), zero console errors.
 
 `docs/waves/PLAN.md` Wave 5 (end to end on a real issue) is active next.
+
+## 73. Wave 5, end to end on a real issue — and the bug that surfaced doing it (2026-09-15)
+
+Ran the whole GitHub-issue pipeline against real repos instead of unit-test
+fixtures: an owner issue (`usage-tracker#3`, "README Usage section is
+missing 'make uninstall-agent'") through ingest -> investigate (high
+confidence, `nextAction=implement`) -> auto-implement -> draft PR
+(`usage-tracker#4`) -> sideclaw `review` validation (clean, 122 turns,
+architect/senior-dev/qa/adversary) -> `merge_blocked` (correctly refused:
+`usage-tracker` has no `autoMergePaths` declared, so nothing merges without
+an explicit scope — the safe default, not a bug). Confirmed in both the
+ledger and the live Argo `/warden` board (authenticated chrome-devtools
+session) at every stage. Closed the PR unmerged and the issue as test
+cleanup per the owner's instruction (delivered mid-wave, not re-litigated);
+the underlying doc fix is real and small enough to redo by hand if wanted.
+
+A third-party-shaped item exercised the other branch:
+`sy-serendipity#24`, ingested as a real owner-authored issue then patched
+in the ledger (`events.payload_json.author`, `triage_items.max_tier`) to
+read as `external-contributor`/`investigate` before the fold — same
+"fixture author" shape the plan called for, since a second real GitHub
+identity was never available. The investigate verdict came back
+`confidence=high, nextAction=implement` anyway, and the third-party gate
+held: landed in `needs_human`, never auto-implemented. Dismissed for real
+through the actual Argo action queue (not a CLI shortcut) — logged in,
+clicked Dismiss, filled the reason modal (Mantine's controlled textarea
+needed a real keystroke event; `fill()` alone left Submit disabled — a
+`press_key`+`type_text` nudge fixed it), watched the row go
+"QUEUED: DISMISS", then `triage.py --run` pulled and applied it
+(`authorized_by="owner:argo"`) — ledger and page both landed on
+`dismissed` with the typed reason as the note.
+
+**The bug this surfaced.** `dispatch-scratch` (the one private repo in the
+whole `jkrumm/*` fleet) never once appeared in `ingest_github_issues()`'s
+search results, even for an issue opened minutes earlier — its own #2 had
+silently gone `resolved_at`-stamped by a *previous* tick despite still
+being open on GitHub. Root cause: `op://mini/github/token` (a fine-grained
+PAT) 403s on `GET /repos/jkrumm/dispatch-scratch/issues` and 422s on
+`/search/issues?q=repo:...` for the same repo — it has Metadata:read
+(`GET /repos/...` succeeds, 200) but not Issues:read on this one private
+repo. `search_issues()` silently drops a repo it can't search exactly the
+way it drops a repo with no open issues; `ingest_github_issues()`'s
+disappearance-resolve treated "missing from the result set" as sufficient
+proof of closure, so a repo the token merely can't see got its still-open
+issue silently marked resolved. Fixed: `clients/github.py` gained
+`read_issue()` (single-issue `GET`, raises on non-200 same as `read_pr()`/
+`read_repo()`); `ingest_github_issues()`'s resolve loop now calls it before
+resolving anything and only proceeds on a confirmed `state == "closed"` —
+any error (403/404/anything) leaves the event alone, fail-closed. Verified
+against `dispatch-scratch` directly (`GET /repos/.../issues/2` also 403s,
+same token) and against a real closure in the field: closing
+`sy-serendipity#24` for cleanup, on the next tick, `read_issue()` returned
+a genuine `state: "closed"` and the event resolved correctly — the fix's
+"confirm, don't infer" path exercised live, not just in the two new
+`test_triage.py` cases (267/267, +2). A second, narrower finding from the
+same probe: the token also 403s on `POST .../issues/{n}/comments` on a
+*public* repo (`usage-tracker`) — the "comment back on the owner's own
+issue" feature (§70/docs/triage.md) has silently no-op'd in production
+since Wave 1 shipped; the try/except around it swallows the 403 as a
+one-line stderr print, so nothing else broke, but the owner never actually
+saw a comment on any of their own issues. Both are the same token missing
+scope, left as an owner action (below) — neither is a warden-code fix.
+
+Also relearned, the hard way, a distinction the plan's own text already
+states but the CLI doesn't enforce: `scripts/triage.py --run` polls
+investigate-tier dispatches through `escalate_origin_items()`/
+`maybe_auto_implement()`/`poll_implement_jobs()`/`poll_validation_jobs()`,
+but an *investigate*-tier job's own terminal poll lives in
+`scripts/dispatch-sweep.py`, not `triage.py`. Running `dispatch-sweep.py`
+against an implement-tier job in flight (`usage-tracker`'s draft-PR
+dispatch) hit its "no origin_channel — closing with a sentinel" branch,
+logged and no-op'd rather than corrupting the item (verified: state and
+`implement_job` were unchanged after) — but it's a sharp edge for anyone
+hand-running ticks outside the LaunchAgent schedule. Filed here rather than
+in code because the behavior is correct (defensive, ledger-safe); the edge
+is procedural, not a bug.
+
+Confirmed the rest of the backlog `docs/waves/PLAN.md` named is on the
+Argo page with correct assessments: `research-gateway#3`/`#5` sitting in
+`merge_blocked` on real validation findings (a regex over-match, an
+under-constrained consistency-correction acceptance — both genuine, both
+worth a human look, neither this wave's to fix), `#6`/`#7` in
+`needs_human`, `sideclaw#3`/`#4` in `needs_human` with the correct
+"capped at tier 'investigate'" note despite a stale `max_tier=implement`
+column stamped before Wave 1's cap took effect (the runtime check at
+dispatch/fold time catches it regardless — confirms the column being stale
+is cosmetic, not a live gap), `basalt-ui#51`/`#52` and `rollhook#21`
+correctly `closed` (shipped/landed-by-hand), `ntfy-mac#12` correctly
+`closed` as non-actionable (a question, not a bug). One pre-existing,
+untouched find while reading the board: `research-gateway#4` has been
+stuck in `implementing` since before this wave, `note` reading "deferred:
+refusing to run inside a Claude Code session (CLAUDECODE is set)" — the
+same recursion guard this wave's own manual ticks kept hitting
+(`env -u CLAUDECODE` fixes it per-invocation), but this item's stall
+predates this session and its next scheduled `warden-loop` tick (LaunchAgent,
+no `CLAUDECODE` set) should clear it on its own; flagged, not touched.
+
+`make test` 267/267 (was 265, +2 for the disappearance-resolve fix),
+`make check-schemas` and `make check-routing` green; `make check-policy`
+still disagrees on the same pre-existing `sideclaw`/`warden` ceiling drift
+Wave 1 left behind (sideclaw's own boundary not yet capped) — unchanged by
+this wave, still a sideclaw-repo fix.
+
+**Owner actions, both on `op://mini/github/token`
+(github.com/settings/personal-access-tokens):** grant `Issues: Read` on
+`dispatch-scratch` specifically (it's the one private repo in scope, so
+this is a one-repo grant, not a blanket widen) so real dispatch-scratch
+issues stop being invisible to intake; separately grant `Issues: Write`
+repo-wide (or at minimum on every repo issues get filed against) so the
+comment-back feature actually posts instead of silently 403ing. Neither
+blocks anything else — third-party and owner-issue routing both work
+correctly without them, as this wave proved by working around both.
+
+`docs/waves/PLAN.md` is now fully done across all five waves and deleted
+in this same commit — this was the last one.

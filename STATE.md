@@ -6,8 +6,8 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-15 (§72) |
-| Current wave | GitHub-issues-in-warden chain (`docs/waves/PLAN.md`): Wave 1 done (§70), Wave 2 done (§71), Wave 3 done (argo API: the action queue — no warden-repo state-log entry, see argo's own `docs/waves/PLAN.md`), Wave 4 done (§72, argo dashboard: issues + one-click triage), Wave 5 active (end to end on a real issue). Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
+| Last updated | 2026-09-15 (§73) |
+| Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
 | Tests | `tests/test_triage.py` 265/265 is the gate; `make test` runs all suites |
@@ -114,11 +114,23 @@ loop.
 - sideclaw's published verdict schemas are pinned in
   `scripts/clients/sideclaw.py` (`DISPATCH_SCHEMA_VERSION=2`,
   `REVIEW_SCHEMA_VERSION=1`) and checked by `make check-schemas`.
+- `ingest_github_issues()`'s disappearance-resolve no longer trusts
+  "missing from `search_issues()`'s result set" as proof an issue closed —
+  a repo the token can't search (a real case, see Open — owner actions)
+  looks identical to a repo with no open issues. It now confirms via a
+  direct `_github.read_issue()` fetch and only resolves on a genuine
+  `state == "closed"`; any error leaves the event alone (§73).
 
 ## Open — owner actions
 
 - The §55 4.3 "human types in Slack" acceptance is still open.
 - `warden-api`'s "LAST EXIT -15" is the §55 kickstart; cosmetic.
+- `op://mini/github/token` (fine-grained PAT) is missing `Issues: Read` on
+  `dispatch-scratch` specifically (the one private repo in the fleet —
+  every issue there is invisible to intake until granted) and missing
+  `Issues: Write` repo-wide (the "comment back on the owner's own issue"
+  feature has silently 403'd since Wave 1). Grant both at
+  github.com/settings/personal-access-tokens; neither blocks routing (§73).
 
 ## Carried debt
 
@@ -173,21 +185,23 @@ loop.
 - GitHub issues in warden, Wave 4: the dashboard's one-click triage section
   (Wave 3, the argo action-queue API, has no warden-repo entry — it happened
   entirely in argo) — §72
+- GitHub issues in warden, Wave 5 (final): a real owner issue and a real
+  third-party-shaped fixture run end to end through Argo; the
+  disappearance-resolve bug this surfaced and fixed (a repo the token can't
+  search looked identical to a repo with no open issues); two GitHub PAT
+  gaps found and left for the owner — §73
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-Wave 5 of `docs/waves/PLAN.md` (end to end on a real issue) is next: open an
-owner issue in `dispatch-scratch`, watch it become an item and get
-investigated, then approve/dismiss from the now-live Argo `/warden` GitHub-
-issues section and confirm the transition lands in both the ledger and the
-page. Also confirm the existing backlog (research-gateway #3–#7, basalt-ui
-#51/#52, rollhook #21, sideclaw #3/#4 → investigate-only, ntfy-mac #12
-third-party) shows correct assessments there — most of it already does, per
-§72's live chrome-devtools check. Once Wave 5 closes, rewrite this file's
-history section one more time and delete `docs/waves/PLAN.md`.
+No wave is active — the GitHub-issues-in-warden chain (`docs/waves/PLAN.md`,
+deleted this commit) is fully done across all five waves. Nothing queued
+here; the next piece of work is whatever the owner picks up next, starting
+with the two `op://mini/github/token` grants in Open — owner actions if this
+repo's issue intake is to reach `dispatch-scratch` and actually post
+comments back.
 
 Left behind by Wave 1, still unresolved: sideclaw's own dispatch-policy
 boundary still allows `implement` on `sideclaw`/`warden` — `make check-policy`
