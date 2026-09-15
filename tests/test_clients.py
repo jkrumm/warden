@@ -1145,8 +1145,8 @@ class _FakeArgoResp:
         self.status = status
         self._body = body
 
-    def read(self):
-        return self._body
+    def read(self, amt: int | None = None):
+        return self._body if amt is None else self._body[:amt]
 
     def __enter__(self):
         return self
@@ -1243,6 +1243,156 @@ def test_push_snapshot_non_serializable_payload_is_encode_error_with_no_network_
     with _with_fake_urlopen(_fake_urlopen):
         status = argo.push_snapshot({"bad": object()}, token="test-token")
     assert status == "encode-error", status
+    assert called["n"] == 0
+
+
+def test_fetch_actions_ok_returns_status_and_list():
+    captured: dict[str, Any] = {}
+
+    def _fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeArgoResp(200, json.dumps([{"id": "a1", "event_id": 1, "verb": "note",
+                                                "payload": {"text": "hi"}}]).encode())
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status, actions = argo.fetch_actions("mini", token="test-token")
+
+    assert status == "ok", status
+    assert actions == [{"id": "a1", "event_id": 1, "verb": "note", "payload": {"text": "hi"}}]
+    req = captured["req"]
+    assert req.get_header("Authorization") == "Bearer test-token", req.headers
+    assert "machine=mini" in req.full_url and "status=pending" in req.full_url, req.full_url
+
+
+def test_fetch_actions_empty_token_is_no_secret_with_no_network_call():
+    called = {"n": 0}
+
+    def _fake_urlopen(req, timeout=None):
+        called["n"] += 1
+        return _FakeArgoResp(200, b"[]")
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status, actions = argo.fetch_actions("mini", token="")
+    assert status == "no-secret", status
+    assert actions == []
+    assert called["n"] == 0
+
+
+def test_fetch_actions_http_error_404():
+    def _fake_urlopen(req, timeout=None):
+        raise argo.urllib.error.HTTPError(req.full_url, 404, "not found", None, None)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status, actions = argo.fetch_actions("mini", token="test-token")
+    assert status == "http-error:404", status
+    assert actions == []
+
+
+def test_fetch_actions_url_error_is_network_error():
+    def _fake_urlopen(req, timeout=None):
+        raise argo.urllib.error.URLError("connection refused")
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status, actions = argo.fetch_actions("mini", token="test-token")
+    assert status == "network-error", status
+    assert actions == []
+
+
+def test_fetch_actions_non_list_body_is_decode_error():
+    def _fake_urlopen(req, timeout=None):
+        return _FakeArgoResp(200, b'{"not": "a list"}')
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status, actions = argo.fetch_actions("mini", token="test-token")
+    assert status == "decode-error", status
+    assert actions == []
+
+
+def test_fetch_actions_invalid_json_is_decode_error():
+    def _fake_urlopen(req, timeout=None):
+        return _FakeArgoResp(200, b"not json at all")
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status, actions = argo.fetch_actions("mini", token="test-token")
+    assert status == "decode-error", status
+    assert actions == []
+
+
+def test_fetch_actions_oversized_body_is_decode_error_never_fully_buffered():
+    # A list of one huge string, well past MAX_BODY_BYTES once encoded.
+    oversized = json.dumps([{"id": "a1", "event_id": 1, "verb": "note",
+                              "payload": {"text": "x" * (argo.MAX_BODY_BYTES + 1000)}}]).encode()
+
+    def _fake_urlopen(req, timeout=None):
+        return _FakeArgoResp(200, oversized)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status, actions = argo.fetch_actions("mini", token="test-token")
+    assert status == "decode-error", status
+    assert actions == []
+
+
+def test_ack_action_ok_carries_status_and_omits_none_fields():
+    captured: dict[str, Any] = {}
+
+    def _fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeArgoResp(200)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.ack_action("a1", status="applied", token="test-token")
+
+    assert status == "ok", status
+    req = captured["req"]
+    assert req.get_header("Authorization") == "Bearer test-token", req.headers
+    body = json.loads(req.data.decode())
+    assert body == {"status": "applied"}, body
+
+
+def test_ack_action_carries_result_and_error_when_given():
+    captured: dict[str, Any] = {}
+
+    def _fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeArgoResp(200)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.ack_action("a1", status="failed", result={"jobId": "j1"}, error="boom",
+                                  token="test-token")
+
+    assert status == "ok", status
+    body = json.loads(captured["req"].data.decode())
+    assert body == {"status": "failed", "result": {"jobId": "j1"}, "error": "boom"}, body
+
+
+def test_ack_action_http_error_404():
+    def _fake_urlopen(req, timeout=None):
+        raise argo.urllib.error.HTTPError(req.full_url, 404, "not found", None, None)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.ack_action("a1", status="applied", token="test-token")
+    assert status == "http-error:404", status
+
+
+def test_ack_action_url_error_is_network_error():
+    def _fake_urlopen(req, timeout=None):
+        raise argo.urllib.error.URLError("connection refused")
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.ack_action("a1", status="applied", token="test-token")
+    assert status == "network-error", status
+
+
+def test_ack_action_empty_token_is_no_secret_with_no_network_call():
+    called = {"n": 0}
+
+    def _fake_urlopen(req, timeout=None):
+        called["n"] += 1
+        return _FakeArgoResp(200)
+
+    with _with_fake_urlopen(_fake_urlopen):
+        status = argo.ack_action("a1", status="applied", token="")
+    assert status == "no-secret", status
     assert called["n"] == 0
 
 

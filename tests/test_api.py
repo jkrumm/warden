@@ -567,8 +567,69 @@ def test_board_counts_items_shape_ordering_and_terminal_24h():
         "event_id", "origin", "repo", "state", "state_deadline", "max_tier", "title", "note",
         "pr_url", "dispatch_job", "implement_job", "validation_job", "occurrences",
         "created_at", "updated_at", "origin_channel", "origin_thread_ts",
+        "availableActions", "issue",
     }
     assert one["title"] == "title1"
+    conn.close()
+
+
+def test_board_item_available_actions_and_issue_shape():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+
+    _event(conn, 1, now)
+    _item(conn, 1, state="verdict", now=now)
+
+    _event(conn, 2, now)
+    _item(conn, 2, state="closed", now=now)
+
+    issue_payload = json.dumps({"repo": "foo", "number": 3, "author": "someone-else", "labels": ["bug"]})
+    conn.execute(
+        "INSERT INTO events (id, source, external_id, title, url, payload_json, first_seen) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (3, "s", "e3", "title3", "https://github.com/jkrumm/foo/issues/3", issue_payload, _iso(now)),
+    )
+    _item(conn, 3, state="verdict", origin="github_issue", now=now)
+
+    conn.execute(
+        "INSERT INTO events (id, source, external_id, title, url, payload_json, first_seen) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (4, "s", "e4", "title4", None, json.dumps([1, 2, 3]), _iso(now)),
+    )
+    _item(conn, 4, state="verdict", origin="github_issue", now=now)
+    conn.commit()
+
+    rows = {
+        row["event_id"]: row
+        for row in conn.execute(
+            "SELECT ti.*, e.title AS event_title, e.url AS event_url, "
+            "e.payload_json AS event_payload_json FROM triage_items ti "
+            "JOIN events e ON e.id = ti.event_id"
+        ).fetchall()
+    }
+
+    verdict_item = api._board_item(rows[1])
+    assert set(verdict_item["availableActions"]) == {"implement", "dismiss", "reinvestigate", "note"}
+    assert verdict_item["issue"] is None
+
+    closed_item = api._board_item(rows[2])
+    assert closed_item["availableActions"] == [], closed_item["availableActions"]
+    assert closed_item["issue"] is None
+
+    issue_item = api._board_item(rows[3])
+    assert issue_item["issue"] == {
+        "repo": "foo",
+        "number": 3,
+        "url": "https://github.com/jkrumm/foo/issues/3",
+        "author": "someone-else",
+        "trusted": False,
+        "labels": ["bug"],
+    }
+
+    # A github_issue-origin row whose payload_json is valid JSON but not an
+    # object (e.g. a list) must yield `issue: None`, never raise.
+    non_dict_payload_item = api._board_item(rows[4])
+    assert non_dict_payload_item["issue"] is None
     conn.close()
 
 

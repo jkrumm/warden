@@ -118,8 +118,12 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
   9. Once a day, one digest message with up to three sections: signatures
      that matched no policy rule, STATE_NOTE rows (see step 3), and whatever
      step 8 just auto-added this run.
+  9.5. Argo actions — pulls the owner's queued Argo actions (implement/merge/
+                   dismiss/reinvestigate/note) and applies each one before
+                   this same pass's own Push step reflects the outcome — see
+                   apply_argo_actions().
   10. Push        — the last step of every pass: POST the whole projection
-                   (health, metrics, board, budget, intents) to Argo's
+                   (health, metrics, board, intents) to Argo's
                    `/warden/snapshot`, because Argo cannot reach this box to
                    probe it directly. The ledger stays the one source of
                    truth; Argo only ever holds a pushed-to projection of it.
@@ -232,8 +236,10 @@ never runs a HOST_VERB_ALLOWLIST verb (maybe_auto_remediate() prints
 else — the same shape run_verbs() already uses for VERB_ALLOWLIST, applied
 to the more sensitive fifth allowlist), never posts a needs_human/
 merge_blocked reminder reply (remind_needs_human() prints `[dry-run] would
-remind <signature>` and posts nothing), and never pushes to Argo — those
-six are the only externally-visible actions this script can take.
+remind <signature>` and posts nothing), never polls Argo for pending owner
+actions (apply_argo_actions() prints `[dry-run] would poll Argo for pending
+owner actions` and does nothing else), and never pushes to Argo — those
+seven are the only externally-visible actions this script can take.
 (`gh` is the newest of them and the only READ-ONLY one: reconcile_operations()
 uses `gh pr view` to ask GitHub whether a merge it lost the answer to
 actually landed. It is still a shell-out to a remote system, so it is named
@@ -776,16 +782,10 @@ DEFAULT_HOST_VERB_MIN_CONFIDENCE = "medium"
 
 # Concurrency ceiling: simultaneously-open CLUSTERS (distinct dispatch_job
 # values in state=investigating) this loop is allowed to have outstanding at
-# once. Independent of the daily budget below — this bounds how many run AT
-# THE SAME TIME, which matters because sideclaw itself has its own
-# concurrency limits shared with every other dispatch source.
+# once — this bounds how many run AT THE SAME TIME, which matters because
+# sideclaw itself has its own concurrency limits shared with every other
+# dispatch source.
 MAX_OPEN_INVESTIGATIONS = int(os.environ.get("TRIAGE_MAX_OPEN_INVESTIGATIONS", "3"))
-# Dispatches opened per rolling UTC day BY THIS LOOP ONLY (counted via
-# dispatches.origin_event_id IS NOT NULL, the same marker escalate_cluster()
-# writes). Deliberately well under hermes-cc.sh's own 20/day so a triage storm
-# can never starve interactive dispatch of its own budget. Counts CLUSTERS
-# (one dispatch row), not member items.
-DAILY_INVESTIGATE_BUDGET = int(os.environ.get("TRIAGE_DAILY_INVESTIGATE_BUDGET", "8"))
 # A bare GET/POST against sideclaw (via hermes-cc.sh, which itself bounds its
 # own HTTP calls) or Slack should never hang a 10-minute cron indefinitely.
 SUBPROCESS_TIMEOUT = int(os.environ.get("TRIAGE_SUBPROCESS_TIMEOUT", "60"))
@@ -1262,7 +1262,7 @@ _api_spec.loader.exec_module(_api)
 def drain_intents(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
     """Step 0 — apply anything a surface spooled since the last pass, then
     retry any signed approval that decided `approve` but never spent (a
-    prior spend refused on budget or the per-repo in-flight lock — see
+    prior spend refused on the per-repo in-flight lock — see
     lifecycle/approvals.py's `pending_approved()`).
 
     Runs FIRST, before ingest(), so a decision recorded between two passes is
@@ -2470,15 +2470,6 @@ def _count_open_investigation_clusters(conn: sqlite3.Connection) -> int:
     return int(row["c"]) if row else 0
 
 
-def _investigate_dispatches_today(conn: sqlite3.Connection, now: dt.datetime) -> int:
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    row = conn.execute(
-        "SELECT count(*) c FROM dispatches WHERE origin_event_id IS NOT NULL AND created_at >= ?",
-        (start,),
-    ).fetchone()
-    return int(row["c"]) if row else 0
-
-
 def _sibling_open_items(conn: sqlite3.Connection, repo: str, exclude_event_ids: list[int],
                          limit: int = 5) -> list[dict[str, str]]:
     # STATE_RESOLVED's three successors plus STATE_IGNORED — same exclusion,
@@ -3149,12 +3140,11 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     deferral that only reaches a `.err` file is indistinguishable from a
     broken loop.
 
-    Concurrency and daily budget are checked once per run, decremented as
-    clusters are opened, so later repos (and later, `new`, attempts) in the
-    same run correctly see an exhausted cap."""
+    Concurrency is checked once per run, decremented as clusters are opened,
+    so later repos (and later, `new`, attempts) in the same run correctly
+    see an exhausted cap."""
     denied = _denied_repos()
     open_investigations = _count_open_investigation_clusters(conn)
-    budget_used_today = _investigate_dispatches_today(conn, now)
 
     candidates = conn.execute(
         "SELECT * FROM triage_items WHERE state IN (?, ?) AND repo IS NOT NULL ORDER BY event_id",
@@ -3187,11 +3177,11 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     #
     # `deferrals` are the lines saying who this attempt pushed to a later run,
     # and they are CARRIED rather than printed here on purpose: an attempt
-    # that never gets past the two caps below did not take anyone's slot, and
+    # that never gets past the cap below did not take anyone's slot, and
     # announcing "N more wait for next run" for a cluster that was itself
     # deferred describes a dispatch that did not happen. That is the shape the
     # cluster-cap message had before `split` existed — the overflow print sat
-    # after both `continue`s — and it is preserved rather than reinvented.
+    # after the `continue` — and it is preserved rather than reinvented.
     attempts: list[tuple[str, list[sqlite3.Row], list[str]]] = []
     claimed_repos: set[str] = set()
     for repo, items in split_by_repo.items():
@@ -3227,22 +3217,16 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
             print(f"triage: at MAX_OPEN_INVESTIGATIONS={MAX_OPEN_INVESTIGATIONS}, deferring cluster in "
                   f"{repo} ({[m['signature'] for m in members]})", file=sys.stderr)
             continue
-        if budget_used_today >= DAILY_INVESTIGATE_BUDGET:
-            print(f"triage: at DAILY_INVESTIGATE_BUDGET={DAILY_INVESTIGATE_BUDGET}, deferring cluster "
-                  f"in {repo}", file=sys.stderr)
-            continue
         for line in deferrals:
             print(line, file=sys.stderr)
         job_id = escalate_cluster(conn, repo, members, now, policy, dry_run=dry_run)
         # escalate_cluster() always returns None under --dry-run (it never
-        # calls hermes-cc.sh) — `or dry_run` keeps the two caps' PREVIEW
+        # calls hermes-cc.sh) — `or dry_run` keeps the cap's PREVIEW
         # meaningful across multiple repos in one dry-run pass (a later repo
         # in the same run correctly sees an exhausted cap), without ever
-        # persisting anything. A REAL run only counts an actual success, so a
-        # failed dispatch is retried next run rather than burning budget.
+        # persisting anything.
         if job_id or dry_run:
             open_investigations += 1
-            budget_used_today += 1
 
 
 # The delimiter escalate_origin_items() wraps a third-party GitHub issue body
@@ -3330,15 +3314,10 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
     never grouped with an alert cluster or with another origin item.
 
     `MAX_OPEN_INVESTIGATIONS` still applies — overflow WAITS in `new`, never
-    drops (DESIGN.md § What must not be lost, item 7) — but
-    `DAILY_INVESTIGATE_BUDGET` does not: that budget bounds AUTONOMOUS
-    escalation of alert noise the loop decided to act on by itself; an
-    origin item was explicitly asked for by a human or a label, so it is
-    governed by the CLI's own dispatch budget instead
-    (`policy.budget_counts`/`policy.check_dispatch_budget`, the same checks
-    `cmd_dispatch` runs). Either refusal leaves the item `new` with a `note`
-    explaining why (deadline must be visible), never errors and never drops
-    it — the next tick (loop or CLI) reconsiders it fresh.
+    drops (DESIGN.md § What must not be lost, item 7). A refusal leaves the
+    item `new` with a `note` explaining why (deadline must be visible),
+    never errors and never drops it — the next tick (loop or CLI)
+    reconsiders it fresh.
 
     Called by both the loop tick (`run()`) and `warden run` — a human
     running `warden run` against an item the very same loop tick is about to
@@ -3356,8 +3335,6 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
     before it could)."""
     policy = load_policy()
     open_investigations = _count_open_investigation_clusters(conn)
-    limits = _policy.limits_from_env()
-
     if not dry_run:
         orphans = conn.execute(
             "SELECT * FROM triage_items WHERE state=? AND origin != 'alert' AND dispatch_job IS NULL",
@@ -3382,17 +3359,6 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
 
         if open_investigations >= MAX_OPEN_INVESTIGATIONS:
             note = f"queued: at MAX_OPEN_INVESTIGATIONS={MAX_OPEN_INVESTIGATIONS}, waiting for a free slot"
-            print(f"triage: {note} ({item['signature']})", file=sys.stderr)
-            if not dry_run:
-                _set_state(conn, item["event_id"], STATE_NEW, now, note=note)
-                conn.commit()
-            continue
-
-        counts = _policy.budget_counts(conn, now)
-        try:
-            _policy.check_dispatch_budget(counts, "investigate", limits)
-        except PolicyError as e:
-            note = f"deferred: {e}"
             print(f"triage: {note} ({item['signature']})", file=sys.stderr)
             if not dry_run:
                 _set_state(conn, item["event_id"], STATE_NEW, now, note=note)
@@ -3567,8 +3533,8 @@ def run_verbs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime
     """Every `new` item routed to a `verb` (never a `repo` — see classify())
     runs its allowlisted local command once eligibility is met, same
     minOccurrences/minOpenMinutes gate as an episode escalation. No
-    concurrency/daily-budget cap: a verb is a bounded local probe, not a
-    sideclaw episode, and doesn't compete for that budget. No cooldown
+    concurrency cap: a verb is a bounded local probe, not a sideclaw
+    episode, and doesn't compete with MAX_OPEN_INVESTIGATIONS. No cooldown
     tracking either — a verb-routed item runs at most ONCE, because its
     terminal state (`needs_human`) falls out of STATE_NEW candidates
     permanently; if the underlying condition later clears, the normal
@@ -4906,7 +4872,6 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         try:
             _policy.require_auto_from_item(conn, event_id=item["event_id"], repo=item["repo"], tier="implement")
             _policy.check_repo_not_in_flight(conn, repo=item["repo"])
-            _policy.check_dispatch_budget(_policy.budget_counts(conn, now), "implement", _policy.limits_from_env())
             target = _policy.resolve_repo(item["repo"])
         except (PolicyError, PreconditionError, UsageError) as e:
             _set_state(conn, item["event_id"], STATE_VERDICT, now, note=f"deferred: {e}")
@@ -6408,6 +6373,296 @@ def _argo_intents_snapshot() -> dict[str, Any]:
     }
 
 
+# The five owner-facing verbs Argo's own action queue may ever name — a
+# closed set for the same reason VERB_ALLOWLIST/HOST_VERB_ALLOWLIST are: the
+# string reaches a dispatcher below that branches on it, and an unrecognized
+# value must be a loud, acked rejection, never a silent drop or a guess.
+ARGO_ACTION_VERBS = frozenset({"implement", "merge", "dismiss", "reinvestigate", "note"})
+
+# The same closed set warden.py's own _CLOSE_ALLOWED_STATES uses for the CLI
+# `close` verb — an owner dismissal pulled off Argo is the same kind of
+# terminal call a human `warden close` makes, so it is gated on identical
+# states. Duplicated here (never imported) so this file's own closed-state
+# lists (TERMINAL_STATES, STATE_DEADLINES) stay self-contained; keep the two
+# in sync by hand if either ever changes.
+_ARGO_DISMISS_ALLOWED_STATES = (
+    STATE_NEW, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_MERGE_BLOCKED, STATE_QUIET, STATE_NOTE,
+)
+# The same six minus STATE_NEW: an item still `new` has not been
+# investigated at all yet, so "re"-investigating it is a no-op state-wise —
+# escalate()/escalate_origin_items() already pick it up on their own.
+_ARGO_REINVESTIGATE_ALLOWED_STATES = (
+    STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_MERGE_BLOCKED, STATE_QUIET, STATE_NOTE,
+)
+
+
+def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
+                           now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
+    if item["state"] not in (STATE_VERDICT, STATE_NEEDS_HUMAN):
+        return "rejected", None, f"item is in state {item['state']!r}, not verdict/needs_human"
+
+    try:
+        target = _policy.resolve_repo(item["repo"])
+        _policy.resolve_tier("implement", target)
+    except (PolicyError, PreconditionError, UsageError) as e:
+        return "rejected", None, str(e)
+
+    # No `expect_null=("implement_job",)` here (unlike maybe_auto_implement()'s
+    # own claim): that function's own SELECT already filters to
+    # `implement_job IS NULL`, so the invariant holds by construction. This
+    # handler instead accepts `needs_human` items that carry a STALE
+    # implement_job from a prior attempt that landed there without ever
+    # clearing it (poll_implement_jobs()'s `nextAction == "human"` and
+    # schema/outcome-assertion-failure branches both do this) — refusing a
+    # re-implement on that column alone would make retrying from Argo
+    # permanently impossible for exactly the item this action exists to
+    # unstick. Overwritten below on success.
+    claimed = _set_state(conn, event_id, STATE_IMPLEMENTING, now, expect_state=item["state"])
+    conn.commit()
+    if not claimed:
+        return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+
+    if item["dispatch_job"]:
+        d = conn.execute(
+            "SELECT verdict_json FROM dispatches WHERE job_id=?", (item["dispatch_job"],)
+        ).fetchone()
+        verdict = _safe_json(d["verdict_json"]) if d else {}
+        context = _verdict_as_context(item["dispatch_job"], verdict)
+        brief = (
+            "The owner reviewed this item in Argo and asked for it to be implemented directly. "
+            "Re-read the prior investigation's own verdict and evidence yourself (it ran against "
+            "this exact repo) before writing anything, then implement the fix it describes. If "
+            "what you find on re-reading no longer supports that conclusion, say so in your own "
+            "verdict and stop rather than forcing a change."
+        )
+    else:
+        context = None
+        brief = "The owner asked, via Argo, for this to be implemented directly. " + (item["brief"] or "")
+
+    try:
+        opened = _dispatch.open_episode(
+            conn, target=target, tier="implement", brief=brief, context=context,
+            why="argo owner action: implement", model=AUTO_DISPATCH_MODEL,
+            origin=_dispatch.Origin(event_id=event_id), authorized_by="owner:argo",
+        )
+    except RemoteError as exc:
+        if exc.maybe_mutated:
+            print(f"triage: argo implement for event {event_id} may have reached sideclaw "
+                  f"({exc}) — left unresolved (operation recorded unknown)", file=sys.stderr)
+            return "applied", {
+                "note": "submitted to sideclaw, outcome ambiguous — left in-flight for reconcile_operations()"
+            }, None
+        _set_state(conn, event_id, STATE_VERDICT if item["state"] == STATE_VERDICT else STATE_NEEDS_HUMAN,
+                   now, expect_state=STATE_IMPLEMENTING, note=f"deferred: {exc}")
+        conn.commit()
+        return "failed", None, str(exc)
+    except (PolicyError, PreconditionError, UsageError) as e:
+        _set_state(conn, event_id, STATE_VERDICT if item["state"] == STATE_VERDICT else STATE_NEEDS_HUMAN,
+                   now, expect_state=STATE_IMPLEMENTING, note=f"deferred: {e}")
+        conn.commit()
+        return "failed", None, str(e)
+
+    conn.execute(
+        "UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
+        (opened.job_id, _now_iso(now), event_id),
+    )
+    conn.commit()
+    fresh_item, fresh_event = _get_item(conn, event_id), _get_event(conn, event_id)
+    if fresh_item is not None and fresh_event is not None:
+        sync_card(conn, [fresh_item], [fresh_event], load_policy(), dry_run=False)
+    return "applied", {"jobId": opened.job_id}, None
+
+
+def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
+                       now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
+    if item["state"] != STATE_MERGE_BLOCKED:
+        return "rejected", None, f"item is in state {item['state']!r}, not merge_blocked"
+    job_id = item["implement_job"]
+    if not job_id:
+        return "rejected", None, "no implement_job on this item to merge"
+
+    try:
+        result = _merge.plan_or_land(
+            conn, job_id=job_id, why="owner approved via Argo",
+            confirm=True, dry_run=False, authorized_by="owner:argo", now=now,
+        )
+    except (PolicyError, PreconditionError) as e:
+        # The item is already `merge_blocked`, which is correct — do not
+        # re-set the state a second time.
+        return "rejected", None, f"merge refused: {e}"
+    except RemoteError as e:
+        if e.maybe_mutated:
+            print(f"triage: argo merge for event {event_id} may have reached GitHub "
+                  f"({e}) — left unresolved for reconcile_operations()", file=sys.stderr)
+            return "applied", {
+                "note": "merge may have reached GitHub, outcome ambiguous — left for reconcile_operations()"
+            }, None
+        return "rejected", None, f"merge refused: {e}"
+
+    return "applied", {"merged": True, **result.to_json()}, None
+
+
+def _apply_argo_dismiss(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int, now: dt.datetime,
+                         payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None, str | None]:
+    if item["state"] not in _ARGO_DISMISS_ALLOWED_STATES:
+        return "rejected", None, f"item is in state {item['state']!r}, dismiss not allowed"
+    reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        return "rejected", None, "dismiss requires a reason"
+    rowcount = _set_state(conn, event_id, STATE_DISMISSED, now, expect_state=item["state"], note=reason)
+    conn.commit()
+    if rowcount == 0:
+        return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+    return "applied", None, None
+
+
+def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
+                               now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
+    if item["state"] not in _ARGO_REINVESTIGATE_ALLOWED_STATES:
+        return "rejected", None, f"item is in state {item['state']!r}, reinvestigate not allowed"
+    try:
+        target = _policy.resolve_repo(item["repo"])
+    except (PolicyError, PreconditionError, UsageError) as e:
+        return "rejected", None, str(e)
+
+    claimed = _set_state(conn, event_id, STATE_INVESTIGATING, now, expect_state=item["state"])
+    conn.commit()
+    if not claimed:
+        return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+
+    if item["origin"] in ("github_issue", "human"):
+        event_row = _get_event(conn, event_id)
+        brief = _origin_item_brief(item, event_row) if event_row is not None else (item["brief"] or "")
+    else:
+        brief = item["brief"] or ""
+
+    try:
+        opened = _dispatch.open_episode(
+            conn, target=target, tier="investigate", brief=brief, context=None,
+            why="owner requested re-investigation via Argo", model=AUTO_DISPATCH_MODEL,
+            origin=_dispatch.Origin(event_id=event_id), authorized_by="owner:argo",
+        )
+    except RemoteError as exc:
+        if exc.maybe_mutated:
+            return "applied", {"note": "submitted, outcome ambiguous"}, None
+        _set_state(conn, event_id, item["state"], now, expect_state=STATE_INVESTIGATING, note=f"deferred: {exc}")
+        conn.commit()
+        return "failed", None, str(exc)
+    except (PolicyError, PreconditionError, UsageError) as e:
+        _set_state(conn, event_id, item["state"], now, expect_state=STATE_INVESTIGATING, note=f"deferred: {e}")
+        conn.commit()
+        return "failed", None, str(e)
+
+    conn.execute(
+        "UPDATE triage_items SET dispatch_job=?, updated_at=? WHERE event_id=?",
+        (opened.job_id, _now_iso(now), event_id),
+    )
+    conn.commit()
+    fresh_item, fresh_event = _get_item(conn, event_id), _get_event(conn, event_id)
+    if fresh_item is not None and fresh_event is not None:
+        sync_card(conn, [fresh_item], [fresh_event], load_policy(), dry_run=False)
+    return "applied", {"jobId": opened.job_id}, None
+
+
+def _apply_argo_note(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int, now: dt.datetime,
+                      payload: dict[str, Any], action_id: str | int) -> tuple[str, dict[str, Any] | None, str | None]:
+    if item["state"] in TERMINAL_STATES:
+        return "rejected", None, "item is terminal, cannot attach a note"
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return "rejected", None, "note requires text"
+    # The action id rides in the stamp itself, not a separate dedup table —
+    # a redelivered action (the ack POST for this exact id failed last tick)
+    # finds its own tag already present and no-ops instead of appending a
+    # second copy, which is what every OTHER verb handler gets for free from
+    # its own state-CAS (see _apply_one_argo_action()'s IDEMPOTENCY CONTRACT
+    # paragraph) but a note, having no state to compare-and-swap on, needs
+    # spelled out explicitly.
+    tag = f"[owner note via Argo #{action_id}, {now.strftime('%Y-%m-%d')}]"
+    if item["note"] and tag in item["note"]:
+        return "applied", None, None
+    merged = (item["note"] + "\n\n" if item["note"] else "") + f"{tag}: {text}"
+    rowcount = _set_state(conn, event_id, item["state"], now, expect_state=item["state"], note=merged)
+    conn.commit()
+    if rowcount == 0:
+        return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+    return "applied", None, None
+
+
+def _apply_one_argo_action(conn: sqlite3.Connection, action: dict[str, Any], now: dt.datetime) -> None:
+    """Validate the shape of one action Argo handed back, dispatch it to the
+    verb handler that owns its state gate, and ack the outcome. Never raises
+    — the caller (apply_argo_actions()) still wraps this in its own
+    try/except as a second line of defense, but every expected failure mode
+    here is folded into an acked `rejected`/`failed`, never an exception.
+
+    IDEMPOTENCY CONTRACT: every verb handler re-checks the item's CURRENT
+    state before mutating anything. A second delivery of the same action
+    (e.g. the ack POST itself failed last tick, so Argo still shows it
+    pending) naturally re-runs the same state check and, finding the item
+    already moved on, rejects with a state-mismatch reason instead of
+    double-applying. No separate dedup table is needed."""
+    action_id = action.get("id")
+    event_id = action.get("event_id")
+    verb = action.get("verb")
+    payload = action.get("payload") or {}
+
+    # `is None`/`== ""`, never a bare truthiness check — a falsy-but-real id
+    # (an integer `0`) must still be ackable, or an id-0 action is silently
+    # dropped and re-delivered forever with nothing ever resolving it.
+    if action_id is None or action_id == "":
+        print(f"triage: argo action with no id, nothing to ack against — dropped ({action!r})",
+              file=sys.stderr)
+        return
+
+    if verb not in ARGO_ACTION_VERBS:
+        status, result, error = "rejected", None, f"unknown verb: {verb!r}"
+    else:
+        item = _get_item(conn, event_id)
+        if item is None:
+            status, result, error = "rejected", None, f"no triage_items row for event_id {event_id}"
+        elif verb == "implement":
+            status, result, error = _apply_argo_implement(conn, item, event_id, now)
+        elif verb == "merge":
+            status, result, error = _apply_argo_merge(conn, item, event_id, now)
+        elif verb == "dismiss":
+            status, result, error = _apply_argo_dismiss(conn, item, event_id, now, payload)
+        elif verb == "reinvestigate":
+            status, result, error = _apply_argo_reinvestigate(conn, item, event_id, now)
+        else:
+            status, result, error = _apply_argo_note(conn, item, event_id, now, payload, action_id)
+
+    ack_status = _argo.ack_action(action_id, status=status, result=result, error=error)
+    if ack_status != "ok":
+        print(f"triage: argo ack for action {action_id} (outcome {status!r}) — {ack_status}",
+              file=sys.stderr)
+
+
+def apply_argo_actions(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
+    """Step 9.5 — pulls the owner's queued pending actions off Argo
+    (`implement`/`merge`/`dismiss`/`reinvestigate`/`note`, see
+    ARGO_ACTION_VERBS) and applies each one, immediately before this same
+    pass's own push_argo_snapshot() reflects the outcome. See this module's
+    own DRY-RUN CONTRACT paragraph, and _apply_one_argo_action()'s own
+    docstring for the idempotency contract every verb handler relies on."""
+    if dry_run:
+        print("[dry-run] would poll Argo for pending owner actions")
+        return
+
+    status, actions = _argo.fetch_actions(os.environ.get("WARDEN_MACHINE", "mini"))
+    if status != "ok":
+        # "no-secret" is expected pre-seed, not an error — logged the same as
+        # push_argo_snapshot()'s own "no-secret" outcome.
+        print(f"triage: argo fetch-actions — {status}", file=sys.stderr)
+        return
+
+    for action in actions:
+        try:
+            _apply_one_argo_action(conn, action, now)
+        except Exception as e:  # noqa: BLE001 — one bad action must never take down the tick
+            print(f"triage: argo action {action.get('id')} raised: {e}", file=sys.stderr)
+
+
 def build_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime) -> dict[str, Any]:
     """The whole payload POSTed to Argo's `/warden/snapshot` after every
     pass. Every section reuses api.py's own builders verbatim (health_
@@ -6426,16 +6681,12 @@ def build_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
         for item in board_items
     }
 
-    limits = _policy.limits_from_env()
-    counts = _policy.budget_counts(conn, now)
-
     return {
         "machine": os.environ.get("WARDEN_MACHINE", "mini"),
         "generatedAt": _now_iso(now),
         "health": _api.health_payload(conn),
         "metrics": _api.metrics_payload(conn),
         "board": board,
-        "budget": _policy.budget_json(counts, limits),
         "items": items,
         "itemsTruncated": len(board["items"]) > ARGO_SNAPSHOT_ITEMS_CAP,
         "intents": _argo_intents_snapshot(),
@@ -6554,6 +6805,10 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     # No timestamp argument, deliberately — see record_heartbeat().
     record_heartbeat(conn, dry_run=dry_run)
+
+    # Step 9.5 — pulls the owner's queued Argo actions before this same
+    # tick's snapshot reflects their outcome.
+    apply_argo_actions(conn, now, dry_run=dry_run)
 
     # Step 10 — the last step of every pass. See push_argo_snapshot()'s own
     # docstring and this module's docstring, step 10.

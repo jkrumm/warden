@@ -4,9 +4,8 @@
 
 Land is the one door in this whole estate that changes what runs on a
 default branch, so it re-checks everything the episode was inspected under
-at dispatch time, against the CURRENT state of the pull request, the
-CURRENT policy, and the CURRENT budget — a stale record is a refusal, never
-a trust.
+at dispatch time, against the CURRENT state of the pull request and the
+CURRENT policy — a stale record is a refusal, never a trust.
 
 `plan_or_land()` is confirm-gated, not signature-gated, deliberately (owner
 decision, the retired bash CLI 2044-2049): Johannes approved the change when he
@@ -74,8 +73,6 @@ class MergePlan:
     merge_method: str
     changed_files: int
     changed_lines: int
-    merge_budget_used: int
-    merge_budget_max: int
 
     def to_json(self) -> dict[str, Any]:
         note = "nothing was merged and nothing was un-drafted"
@@ -108,7 +105,6 @@ class MergePlan:
                 "touching .github/workflows",
                 "never override a failing check or a branch protection rule",
             ],
-            "mergeBudget": {"usedToday": self.merge_budget_used, "max": self.merge_budget_max},
             "note": note,
         }
 
@@ -131,7 +127,6 @@ class MergeResult:
     deploy: dict[str, Any]
     merge_op_id: str
     deploy_op_id: str | None
-    merge_budget: dict[str, Any]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -143,7 +138,6 @@ class MergeResult:
             "mergeCommit": self.merge_commit,
             "branch": self.branch,
             "branchDeleted": self.branch_deleted,
-            "mergeBudget": self.merge_budget,
             "deploy": self.deploy,
             "note": (
                 "This is on the default branch now. Say so plainly, with the "
@@ -151,17 +145,6 @@ class MergeResult:
                 "cannot discover later by reading an open PR list."
             ),
         }
-
-
-def _budget_json(counts: Any, limits: Any) -> dict[str, Any]:
-    used, mx = counts.merges_today, limits.merge
-    out: dict[str, Any] = {"usedToday": used, "max": mx, "remaining": max(mx - used, 0)}
-    if mx - used <= 1:
-        out["warning"] = (
-            f"{max(mx - used, 0)} of {mx} merges left today (UTC day). Raise it "
-            "deliberately with WARDEN_MERGE_BUDGET=<n> if the ceiling is wrong."
-        )
-    return out
 
 
 # --- the merge gate: declared path scope, CI reality, step-7 validation ------
@@ -396,10 +379,6 @@ def plan_or_land(
         )
     policy.merge_precheck_repo(repo)
 
-    limits = policy.limits_from_env()
-    counts = policy.budget_counts(conn, now)
-    policy.check_merge_budget(counts, limits)
-
     pr = github.read_pr(owner, repo, pr_number)
     repo_json = github.read_repo(owner, repo)
 
@@ -496,7 +475,6 @@ def plan_or_land(
             needs_confirm=not confirm,
             repo=slug, pull_request=pr_number, title=pr_title, head=pr_head, base=pr_base,
             merge_method=method, changed_files=pr_files_n, changed_lines=lines,
-            merge_budget_used=counts.merges_today, merge_budget_max=limits.merge,
         )
 
     # --- land it -----------------------------------------------------------
@@ -629,11 +607,8 @@ def plan_or_land(
         event_id=origin_event_id, authorized_by=authorized_by,
     )
 
-    counts_after = policy.budget_counts(conn, now)
-    merge_budget = _budget_json(counts_after, limits)
-
     return MergeResult(
         merged=True, repo_slug=slug, pull_request=pr_number, title=pr_title,
         merge_method=method, merge_commit=merge_sha, branch=pr_head, branch_deleted=deleted,
-        deploy=deploy, merge_op_id=merge_op, deploy_op_id=deploy_op, merge_budget=merge_budget,
+        deploy=deploy, merge_op_id=merge_op, deploy_op_id=deploy_op,
     )

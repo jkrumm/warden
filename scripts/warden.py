@@ -29,7 +29,7 @@ Global flags, anywhere on the line, `--flag value` or `--flag=value`:
 
 There is deliberately no `--brief`: the brief is data, never an argv string.
 
-EXIT CODES  0 ok · 2 precondition failed · 3 remote failed · 4 policy/budget
+EXIT CODES  0 ok · 2 precondition failed · 3 remote failed · 4 policy
             refusal · 64 usage error
 AUDIT LOG   $WARDEN_CLI_LOG, default ~/Library/Logs/warden-cli.log
 """
@@ -366,12 +366,6 @@ def _read_context(flags: Flags) -> str | None:
     return p.read_text(encoding="utf-8")
 
 
-def _budget_payload(conn, now: dt.datetime) -> dict[str, Any] | None:
-    limits = policy.limits_from_env()
-    counts = policy.budget_counts(conn, now)
-    return policy.budget_json(counts, limits)
-
-
 # --- dispatch ------------------------------------------------------------------
 
 
@@ -379,7 +373,7 @@ def _plan_payload(
     conn, *, name: str, tier: str, target: policy.RepoTarget, brief: str, why: str | None,
     needs_confirm: bool, now: dt.datetime,
 ) -> dict[str, Any]:
-    note = "nothing ran — no episode was opened and no budget was consumed"
+    note = "nothing ran — no episode was opened"
     if needs_confirm:
         note += (
             ". This tier is GATED: an approval request is posted to Slack (if --origin-channel was "
@@ -401,9 +395,6 @@ def _plan_payload(
         "wouldNeverDo": _NEVER,
         "note": note,
     }
-    budget = _budget_payload(conn, now)
-    if budget:
-        out["budget"] = budget
     return out
 
 
@@ -429,9 +420,6 @@ def _result_payload(
     }
     if from_record:
         out["fromRecord"] = True
-    budget = _budget_payload(conn, dt.datetime.now(dt.timezone.utc))
-    if budget:
-        out["budget"] = budget
     return out
 
 
@@ -469,7 +457,6 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, origi
 
     state.target = f"{name}:{tier}"
     now = dt.datetime.now(dt.timezone.utc)
-    policy.budget_counts(conn, now)  # read for reporting; a rehearsal spends nothing
 
     needs_confirm = tier == "implement" and not flags.auto_from_item
 
@@ -486,10 +473,6 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, origi
         )
         return _plan_payload(conn, name=name, tier=tier, target=target, brief=brief, why=flags.why,
                               needs_confirm=needs_confirm, now=now)
-
-    limits = policy.limits_from_env()
-    counts = policy.budget_counts(conn, now)
-    policy.check_dispatch_budget(counts, tier, limits)
 
     if flags.auto_from_item:
         policy.check_repo_not_in_flight(conn, repo=name)
@@ -511,7 +494,6 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, origi
     if flags.wait:
         job = sideclaw.wait(opened.job_id, timeout_s=WAIT_TIMEOUT, interval_s=WAIT_INTERVAL)
         if job is None:
-            budget = _budget_payload(conn, dt.datetime.now(dt.timezone.utc))
             out: dict[str, Any] = {
                 "verb": "dispatch", "ok": True, "jobId": opened.job_id, "repo": name, "tier": tier,
                 "status": "running", "waited": True, "waitedSeconds": WAIT_TIMEOUT,
@@ -519,21 +501,16 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, origi
                         "sweeper will deliver the verdict into the origin thread — say so and move on "
                         "rather than waiting again.",
             }
-            if budget:
-                out["budget"] = budget
             return out
         dispatch.sync_record(conn, job, reported=True)
         return _result_payload(conn, job_id=opened.job_id, name=name, tier=tier, job=job, waited=True)
 
-    budget = _budget_payload(conn, dt.datetime.now(dt.timezone.utc))
     out = {
         "verb": "dispatch", "ok": True, "jobId": opened.job_id, "repo": name, "tier": tier,
         "status": opened.job.get("status") or "queued", "waited": False,
         "note": f"Episode opened. It is NOT finished — poll with `warden status {opened.job_id}`, "
                 "or let the 5-minute sweeper deliver the verdict into the origin thread.",
     }
-    if budget:
-        out["budget"] = budget
     return out
 
 
@@ -546,11 +523,8 @@ def _run_plan_payload(conn, *, name: str, tier: str, target: policy.RepoTarget, 
         "verb": "run", "ok": True, "dryRun": True, "repo": name, "tier": tier,
         "repoMaxTier": target.max_tier, "cwd": str(target.path), "briefChars": len(brief),
         "why": why or None,
-        "note": "nothing ran — no item was opened, no episode was dispatched, and no budget was consumed",
+        "note": "nothing ran — no item was opened and no episode was dispatched",
     }
-    budget = _budget_payload(conn, now)
-    if budget:
-        out["budget"] = budget
     return out
 
 
@@ -591,7 +565,6 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
 
     state.target = f"{name}:{tier}"
     now = dt.datetime.now(dt.timezone.utc)
-    policy.budget_counts(conn, now)  # read for reporting; a rehearsal spends nothing
 
     if flags.dry_run:
         return _run_plan_payload(conn, name=name, tier=tier, target=target, brief=brief, why=flags.why, now=now)
@@ -625,9 +598,6 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
         "origin": "human", "maxTier": max_tier, "repo": name, "queued": queued,
         "note": item["note"] if item else None,
     }
-    budget = _budget_payload(conn, dt.datetime.now(dt.timezone.utc))
-    if budget:
-        out["budget"] = budget
 
     if flags.wait and job_id:
         job = sideclaw.wait(job_id, timeout_s=WAIT_TIMEOUT, interval_s=WAIT_INTERVAL)
@@ -711,9 +681,6 @@ def cmd_list(conn, flags: Flags, positional: list[str], state: _State) -> dict[s
     now = dt.datetime.now(dt.timezone.utc)
     rows = dispatch.list_dispatches(conn, scope, now)
     out: dict[str, Any] = {"verb": "list", "ok": True, "scope": scope, "count": len(rows), "dispatches": rows}
-    budget = _budget_payload(conn, now)
-    if budget:
-        out["budget"] = budget
     return out
 
 
@@ -967,13 +934,6 @@ def _print_result_text(out: dict[str, Any]) -> None:
         print(f"error: {out['error']}")
 
 
-def _print_budget_text(out: dict[str, Any]) -> None:
-    b = out.get("budget")
-    if not b:
-        return
-    print(f"budget: {b['usedToday']}/{b['max']} dispatches today · implement {b['implementToday']}/{b['implementMax']}")
-
-
 def _print_text(verb: str | None, out: dict[str, Any]) -> None:
     if verb == "dispatch":
         if out.get("dryRun"):
@@ -992,7 +952,6 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
         else:
             print(f"dispatch opened: {out['jobId']} ({out['repo']}, tier {out['tier']})")
             print(f"not finished — poll: warden status {out['jobId']}")
-        _print_budget_text(out)
     elif verb == "run":
         if out.get("dryRun"):
             print("PLAN — nothing executed.")
@@ -1005,24 +964,21 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
         else:
             print(f"item opened: event {out['eventId']} ({out['repo']}, state {out['state']})")
             if out.get("queued"):
-                print(f"queued — {out.get('note') or 'waiting for a free slot or budget'}")
+                print(f"queued — {out.get('note') or 'waiting for a free slot'}")
             elif out.get("jobId"):
                 print(f"investigating — job {out['jobId']}, not finished — poll: warden status {out['jobId']}")
             if out.get("result"):
                 v = out["result"].get("verdict") or {}
                 if v:
                     print(f"summary: {v.get('summary', '')}")
-        _print_budget_text(out)
     elif verb == "status":
         _print_result_text(out)
-        _print_budget_text(out)
     elif verb == "list":
         rows = out.get("dispatches") or []
         if not rows:
             print("no dispatches")
         for r in rows:
             print(f"{r['job_id'][:8]}  {r['status']:<11} {r['repo']:<18} {r['tier']:<11} {r['created_at'][:19]}")
-        _print_budget_text(out)
     elif verb == "close":
         print(f"item {out['eventId']}: {out['fromState']} -> {out['toState']}")
         print(f"note: {out['note']}")
@@ -1055,7 +1011,7 @@ Global flags, anywhere on the line, --flag value or --flag=value:
 There is deliberately no --brief: the brief is data, never an argv string.
 Pass it on stdin with a QUOTED heredoc (<<'BRIEF' ... BRIEF) or --brief-file.
 
-EXIT CODES  0 ok · 2 precondition failed · 3 remote failed · 4 policy/budget
+EXIT CODES  0 ok · 2 precondition failed · 3 remote failed · 4 policy
             refusal · 64 usage error
 AUDIT LOG   $WARDEN_CLI_LOG, default ~/Library/Logs/warden-cli.log
 """

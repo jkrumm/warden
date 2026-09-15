@@ -1,10 +1,14 @@
-"""policy — repo/tier resolution, origin shape checks and the spend budgets.
+"""policy — repo/tier resolution and origin shape checks.
 
 The Python port of the retired bash CLI's `resolve_repo` (457-583), `resolve_tier`
 (589-606), `tier_rank` (624-631), `require_auto_from_item` (639-705),
-`valid_origin` (745-766), `budget_counts`/`check_budget`/`budget_json`
-(849-915), `merge_precheck_repo` (1659-1682) and the `repos.<repo>` half of
-`config/triage-policy.json` that `run_deploy_if_enabled` reads (1842-1856).
+`valid_origin` (745-766), `merge_precheck_repo` (1659-1682) and the
+`repos.<repo>` half of `config/triage-policy.json` that
+`run_deploy_if_enabled` reads (1842-1856). The bash CLI's `budget_counts`/
+`check_budget`/`budget_json` (849-915) were ported too, then deleted
+entirely (`docs/waves/PLAN.md` Wave 2, 2026-09-15, owner: "absurd friction")
+— every daily count ceiling is gone; `MAX_OPEN_INVESTIGATIONS` (concurrency)
+and `check_repo_not_in_flight()` (the per-repo lock) are unrelated and stay.
 
 Two simplifications versus the bash version, both because this is now the
 ONE implementation instead of a shell script embedding a second one in
@@ -36,9 +40,6 @@ VALID_TIERS = ("investigate", "author", "implement")
 GATED_TIERS = ("implement",)
 
 TIER_RANK = {"investigate": 1, "author": 2, "implement": 3}
-
-BUDGET_WARN_REMAINING = 3
-IMPLEMENT_WARN_REMAINING = 1
 
 
 def require_no_recursion() -> None:
@@ -258,104 +259,24 @@ def valid_origin(*, channel: str | None = None, thread_ts: str | None = None,
             raise UsageError(f"--origin-event must be a watchdog events.id integer (got: {event_id})")
 
 
-@dataclass
-class BudgetLimits:
-    daily: int
-    implement: int
-    merge: int
-
-
-def limits_from_env() -> BudgetLimits:
-    return BudgetLimits(
-        daily=int(os.environ.get("WARDEN_DAILY_BUDGET", "20")),
-        implement=int(os.environ.get("WARDEN_IMPLEMENT_BUDGET", "5")),
-        merge=int(os.environ.get("WARDEN_MERGE_BUDGET", "3")),
-    )
-
-
-@dataclass
-class BudgetCounts:
-    used_today: int
-    implement_today: int
-    merges_today: int
-
-
-def budget_counts(conn: sqlite3.Connection, now: dt.datetime) -> BudgetCounts:
-    utc_now = now.astimezone(dt.timezone.utc) if now.tzinfo else now
-    today = utc_now.date().isoformat()
-    used = conn.execute("SELECT COUNT(*) FROM dispatches WHERE created_at >= ?", (today,)).fetchone()[0]
-    implement = conn.execute(
-        "SELECT COUNT(*) FROM dispatches WHERE created_at >= ? AND tier = ?", (today, "implement")
-    ).fetchone()[0]
-    merges = conn.execute("SELECT COUNT(*) FROM dispatches WHERE merged_at >= ?", (today,)).fetchone()[0]
-    return BudgetCounts(used_today=used, implement_today=implement, merges_today=merges)
-
-
-def check_dispatch_budget(counts: BudgetCounts, tier: str, limits: BudgetLimits) -> None:
-    if counts.used_today >= limits.daily:
-        raise PolicyError(
-            f"daily dispatch budget exhausted ({counts.used_today}/{limits.daily} opened today, UTC — "
-            "resets at 00:00 UTC). This is a structural ceiling on unattended Max spend, not a rate limit. "
-            "To proceed now, raise it deliberately: WARDEN_DAILY_BUDGET=<n>"
-        )
-    if tier == "implement" and counts.implement_today >= limits.implement:
-        remaining = max(limits.daily - counts.used_today, 0)
-        raise PolicyError(
-            f"daily implement budget exhausted ({counts.implement_today}/{limits.implement} opened today, "
-            "UTC — resets at 00:00 UTC). Implement is the expensive tier and each episode produces a PR a "
-            f"human has to read, so it has its own ceiling; the shared budget still has {remaining} slot(s) "
-            "left for the read-only tiers, which is where triage should go. To proceed now, raise it "
-            "deliberately: WARDEN_IMPLEMENT_BUDGET=<n>"
-        )
-
-
-def check_merge_budget(counts: BudgetCounts, limits: BudgetLimits) -> None:
-    if counts.merges_today >= limits.merge:
-        raise PolicyError(
-            f"daily merge budget exhausted ({counts.merges_today}/{limits.merge} landed today, UTC — "
-            "resets at 00:00 UTC). This is the tightest ceiling in the script because a merge is the only "
-            "act here that changes what runs. To proceed now, raise it deliberately: WARDEN_MERGE_BUDGET=<n>"
-        )
-
-
-def budget_json(counts: BudgetCounts, limits: BudgetLimits) -> dict[str, Any]:
-    remaining = max(limits.daily - counts.used_today, 0)
-    implement_remaining = max(limits.implement - counts.implement_today, 0)
-    out: dict[str, Any] = {
-        "usedToday": counts.used_today,
-        "max": limits.daily,
-        "remaining": remaining,
-        "implementToday": counts.implement_today,
-        "implementMax": limits.implement,
-        "implementRemaining": implement_remaining,
-    }
-    warn: list[str] = []
-    if remaining <= BUDGET_WARN_REMAINING:
-        warn.append(
-            f"{remaining} of {limits.daily} dispatches left today (UTC day, resets 00:00). "
-            + ("The next dispatch will be REFUSED. " if remaining == 0 else "")
-            + "This is a spend ceiling, not a rate limit — raise it deliberately with "
-              "WARDEN_DAILY_BUDGET=<n> if it is wrong, do not retry into it."
-        )
-    if implement_remaining <= IMPLEMENT_WARN_REMAINING:
-        warn.append(
-            f"{implement_remaining} of {limits.implement} implement dispatches left today. "
-            + (
-                "The next implement will be REFUSED (read-only tiers are unaffected). "
-                if implement_remaining == 0
-                else ""
-            )
-            + "Raise it deliberately with WARDEN_IMPLEMENT_BUDGET=<n> if it is wrong."
-        )
-    if warn:
-        out["warning"] = " ".join(warn)
-    return out
-
-
 def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, repo: str, tier: str) -> str:
     """Port of the retired bash CLI's `require_auto_from_item` (639-705). Returns the
     linked done investigate job id, or raises one of the nine refusals it
-    names verbatim."""
+    names verbatim.
+
+    A note on `authorized_by` (the gate `dispatch.open_episode()`/
+    `merge.plan_or_land()` actually enforce, `if not authorized_by: raise
+    ValueError(...)`): it is a plain truthy-string check, not a validated
+    allowlist. `"signed:{who}"`, `"auto-remediate"`, `"auto-from-item"` and
+    `"cli:confirm"` are conventional string shapes a human reader relies on,
+    never values this module parses or checks. `"owner:argo"`
+    (`triage.apply_argo_actions()`) is a fifth such convention: an action the
+    owner pulled off Argo's own pending-actions queue and had the loop apply
+    is the owner himself, the same way a signed Slack approval is — per
+    `docs/waves/PLAN.md`'s 2026-09-15 owner-decisions section, tailnet access
+    to Argo IS him. This is documentation of an existing mechanical fact, not
+    new validation — nothing here checks the string any more than it checks
+    the other four."""
     if tier != "implement":
         raise UsageError(f"--auto-from-item is only valid with --tier implement (got '{tier}')")
 

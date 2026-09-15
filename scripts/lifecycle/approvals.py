@@ -170,7 +170,7 @@ def mint(
 
 def pending_approved(conn: sqlite3.Connection, now: dt.datetime) -> list[sqlite3.Row]:
     """Decided-approve, unspent, unexpired — the loop's retry sweep for a
-    spend that refused on budget or an in-flight lock last time."""
+    spend that refused on an in-flight lock last time."""
     return conn.execute(
         "SELECT * FROM dispatch_approvals WHERE decision='approve' AND spent_at IS NULL AND expires_at > ?",
         (now.isoformat(),),
@@ -273,9 +273,6 @@ def execute_approved(conn: sqlite3.Connection, nonce: str, *, now: dt.datetime |
     try:
         target = policy.resolve_repo(row["repo"])
         policy.resolve_tier(row["tier"], target)
-        limits = policy.limits_from_env()
-        counts = policy.budget_counts(conn, now)
-        policy.check_dispatch_budget(counts, row["tier"], limits)
         policy.check_repo_not_in_flight(conn, repo=row["repo"])
     except (PolicyError, PreconditionError) as exc:
         conn.rollback()

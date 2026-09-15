@@ -53,7 +53,6 @@ The cases:
   - an expired approval refuses
   - an approval is single-use: draining a second signed decision is a no-op
   - an Approve click replays the stored brief + context bytes verbatim
-  - a budget refusal leaves the approval unspent, retryable
   - a missing public key refuses rather than falling back to instruction-level
   - only the gateway publishes a signing key, and a clobbered one is republished
     before signing (the 2026-08-03 outage, as a test)
@@ -488,28 +487,6 @@ def test_approve_replays_stored_brief_and_context(h, approver):
     check(captured.get("context") == CONTEXT, f"the spend must replay the stored context: {captured.get('context')!r}")
 
 
-def test_budget_refusal_leaves_approval_unspent(h, approver):
-    db, r = plan_and_db(h, approver)
-    nonce = _only_nonce(db)
-    with _env(**_plugin_env(h, db, approver.pub_path), WARDEN_DAILY_BUDGET="0"):
-        sig_row = _row(db, nonce)
-        expires = (now_utc() + dt.timedelta(minutes=30)).isoformat()
-        sig = approver.sign(nonce, sig_row["payload_hash"], "approve", "U0JOHANNES", expires)
-        conn = _connect(db)
-        conn.execute(
-            "UPDATE dispatch_approvals SET decision='approve', decided_at=?, decided_by='U0JOHANNES', "
-            "signature=?, expires_at=? WHERE nonce=?",
-            (now_utc().isoformat(), sig, expires, nonce),
-        )
-        conn.commit()
-        conn.close()
-        result = lc_approvals.execute_approved(_connect(db), nonce)
-    check(result.status == "refused", f"an over-budget spend must refuse, got {result.status}")
-    row = _row(db, nonce)
-    check(row["spent_at"] is None and row["decision"] == "approve",
-          "the decision stands, but the row stays unspent and retryable")
-
-
 def test_missing_pubkey_refuses(h, approver):
     db, r = plan_and_db(h, approver)
     nonce = _only_nonce(db)
@@ -679,7 +656,6 @@ CASES = [
     test_expired_approval_refuses,
     test_approval_is_single_use,
     test_approve_replays_stored_brief_and_context,
-    test_budget_refusal_leaves_approval_unspent,
     test_missing_pubkey_refuses,
     test_republish_after_clobber,
     test_plugin_has_no_write_path_of_its_own,

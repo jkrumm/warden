@@ -437,6 +437,45 @@ precondition the caller cannot fabricate cheaply,"* not a cryptographic proof �
 *"the threat it closes is the loop being WRONG, not the loop being HOSTILE."*
 That distinction is exactly what a bearer-authenticated `/decide` erased.
 
+### 2026-09-15 override — Argo IS the owner over the tailnet
+
+The paragraph above this one ("Argo shows the queue and records intents. It
+cannot approve.") was correct in 2026-09-09 and is now overridden by an owner
+decision recorded the same day as `docs/waves/PLAN.md` Wave 2
+(`docs/history/state-log.md` §71) — kept here, not deleted, because the
+reasoning it was answering (REVIEW.md **C1**) still has to be checked against
+whatever replaces it.
+
+C1's actual claim was never "Argo must not act" — it was "a bearer token is
+words, and an episode can hold one, so words must never be able to mint a
+signature." That threat model is about **who could produce the request**, not
+about which surface renders a button. Slack's signed-approval path answers it
+by requiring a Slack interaction payload, because that is the one channel an
+attacker-influenced episode cannot forge. Argo answers the identical question a
+different way: it is reachable **only** over the owner's own Tailscale network
+— `dotfiles-private/headless.refs` and the tailnet ACLs are the boundary, not a
+password prompt in the UI — so an action arriving through it is, by
+construction, a click from him and not from anything an injected brief could
+reach. No label, no passkey, no Touch ID, no Slack-only signing gate is added
+for his own actions on his own surfaces; requiring one would treat his tailnet
+identity as less trustworthy than a Slack button, which is backwards.
+
+Mechanically: `scripts/triage.py`'s `apply_argo_actions()` pulls pending
+actions from Argo's queue and applies `implement`/`merge`/`dismiss`/
+`reinvestigate`/`note` through the closed verb allowlist, passing
+`authorized_by="owner:argo"` into `lifecycle/dispatch.open_episode()` and
+`lifecycle/merge.plan_or_land()` — the exact same plain, unvalidated
+truthy-string gate a signed Slack approval's `authorized_by=f"signed:{who}"`
+already satisfies (see `lifecycle/dispatch.py`'s `open_episode()`: `if not
+authorized_by: raise ValueError(...)` — there has never been a prefix
+allowlist, only a non-empty-string requirement). **No signing key touches
+Argo, no new `POST /decide`, no bearer-token gate is reopened** —
+`require_signed_approval()`/`execute_approved()` are byte-for-byte unchanged
+and remain the only path for anything reachable off the tailnet (a Slack
+button clicked by anyone with channel access, which is why THAT path still
+needs a real signature). This is narrower than it looks: it authorizes actions
+taken from a surface only the owner can reach, nothing else.
+
 ### HTTP API (mini, tailnet-only, **read-only**)
 
 | Method | Path | Purpose |
@@ -536,6 +575,23 @@ first-class board state carrying which ceiling held it and what releases it.
 **`warden pause`** — one command or one button, stops all escalation while leaving
 ingest running. During a real outage the ledger should keep recording and the
 robot should hold still.
+
+**Disposition, 2026-09-15 (`docs/waves/PLAN.md` Wave 2, `docs/history/state-log.md`
+§71): every DAILY COUNT ceiling named above is gone.** `DAILY_INVESTIGATE_BUDGET`,
+and the `WARDEN_DAILY_BUDGET`/`WARDEN_IMPLEMENT_BUDGET`/`WARDEN_MERGE_BUDGET` the
+implementation grew beyond this v1 sketch's own `MAX_IMPLEMENT_PER_DAY`/
+`MAX_MERGES_PER_DAY` names, are deleted — code, checks, CLI/Argo-snapshot output,
+tests — on the owner's explicit call ("absurd friction"). This is narrower than
+it reads: `MAX_OPEN_INVESTIGATIONS` (concurrency, not spend) and the per-repo
+in-flight lock two paragraphs below both stay exactly as designed — a count-based
+CEILING is gone, a CONCURRENCY bound and a CORRECTNESS lock are not the same
+thing and neither was in question. The "forty correlated alerts are forty merges"
+scenario this section warns about is now bounded only by
+`MAX_OPEN_INVESTIGATIONS`/the per-repo lock and by `merge_precheck_repo()`'s
+existing PR-required-repo refusal — there is no longer a numeric daily
+backstop underneath those. "Deferral must be visible" stays true for the
+concurrency cap (the `.err` line `MAX_OPEN_INVESTIGATIONS` deferrals write is
+untouched); it no longer applies to a budget, because there is none.
 
 ### Abort and revert — neither exists today
 

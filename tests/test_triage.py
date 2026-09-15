@@ -161,7 +161,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         "update_blocks": triage.update_blocks,
         "LIVENESS_ALLOWLIST": dict(triage.LIVENESS_ALLOWLIST),
         "MAX_OPEN_INVESTIGATIONS": triage.MAX_OPEN_INVESTIGATIONS,
-        "DAILY_INVESTIGATE_BUDGET": triage.DAILY_INVESTIGATE_BUDGET,
         "VERB_ALLOWLIST": dict(triage.VERB_ALLOWLIST),
         "_HERMES_OPS_BIN": triage._HERMES_OPS_BIN,
         "HOST_VERB_ALLOWLIST": dict(triage.HOST_VERB_ALLOWLIST),
@@ -191,6 +190,8 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         ("_merge", "plan_or_land"): triage._merge.plan_or_land,
         ("_approvals", "execute_approved"): triage._approvals.execute_approved,
         ("_argo", "push_snapshot"): triage._argo.push_snapshot,
+        ("_argo", "fetch_actions"): triage._argo.fetch_actions,
+        ("_argo", "ack_action"): triage._argo.ack_action,
     }
     prev_deny = _RESOLVE_REPO_DENY["deny"]
     # NOT part of `saved` above: the spool lives on triage._intents, not on
@@ -264,6 +265,25 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
 
         triage._argo.push_snapshot = _fake_push_snapshot
 
+        # Same never-a-real-network-call posture for the two Argo actions
+        # endpoints apply_argo_actions() polls: fetch_actions() defaults to
+        # "ok, nothing pending" so every pre-existing test's run() pass keeps
+        # working unmodified; a test exercising owner actions overrides
+        # `triage._argo.fetch_actions` directly, the same shape as every
+        # other client-boundary fake in this fixture. ack_action() records
+        # every ack on `ctx.argo_acks`.
+        argo_acks: list[dict[str, Any]] = []
+
+        def _default_fake_fetch_actions(machine, *, token=None, timeout=15.0):
+            return "ok", []
+
+        def _fake_ack_action(action_id, *, status, result=None, error=None, token=None, timeout=15.0):
+            argo_acks.append({"action_id": action_id, "status": status, "result": result, "error": error})
+            return "ok"
+
+        triage._argo.fetch_actions = _default_fake_fetch_actions
+        triage._argo.ack_action = _fake_ack_action
+
         conn = triage.db_connect()
 
         class Ctx:
@@ -272,6 +292,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
                 self.updated = updated
                 self.tmp_dir = tmp_dir
                 self.argo_pushes = argo_pushes
+                self.argo_acks = argo_acks
 
             def total_calls(self) -> int:
                 return len(self.posted) + len(self.updated)
@@ -735,22 +756,6 @@ def test_max_open_investigations_cap():
         states = [r["state"] for r in conn.execute("SELECT state FROM triage_items ORDER BY event_id").fetchall()]
         assert states.count(triage.STATE_INVESTIGATING) == 1
         assert states.count(triage.STATE_NEW) == 1
-
-
-def test_daily_investigate_budget_cap():
-    triage.DAILY_INVESTIGATE_BUDGET = 1
-    with _triage_env() as (conn, ctx):
-        policy = dict(DEFAULT_POLICY, rules=[
-            {"match": "slack_alert:sig-budget-a", "repo": "demo-repo"},
-            {"match": "slack_alert:sig-budget-b", "repo": "other-repo"},
-        ])
-        _write_json(triage.POLICY_PATH, policy)
-        _insert_event(conn, source="slack_alert", external_id="sig-budget-a", title="A", first_seen=OLD)
-        _insert_event(conn, source="slack_alert", external_id="sig-budget-b", title="B", first_seen=OLD)
-        calls: list[dict[str, Any]] = []
-        triage._sideclaw.submit = _fake_submit(calls)
-        triage.run(conn, dry_run=False)
-        assert len(calls) == 1, f"DAILY_INVESTIGATE_BUDGET=1 must cap dispatches, got {len(calls)}"
 
 
 def test_denied_repo_never_dispatches():
@@ -1358,26 +1363,6 @@ def test_escalate_origin_items_overflow_waits_in_new_with_note():
             assert item["note"] and "MAX_OPEN_INVESTIGATIONS" in item["note"]
     finally:
         triage.MAX_OPEN_INVESTIGATIONS = saved_cap
-
-
-def test_escalate_origin_items_budget_refusal_waits_with_note():
-    with _triage_env() as (conn, ctx):
-        eid = triage.open_origin_item(
-            conn, origin="human", repo="demo-repo", brief="do the thing", max_tier="implement",
-            external_id="human:budget-1", title="ask", now=NOW,
-        )
-        calls: list[dict[str, Any]] = []
-        triage._sideclaw.submit = _fake_submit(calls)
-        os.environ["WARDEN_DAILY_BUDGET"] = "0"
-        try:
-            triage.escalate_origin_items(conn, NOW)
-        finally:
-            del os.environ["WARDEN_DAILY_BUDGET"]
-
-        assert calls == [], "an exhausted daily dispatch budget must refuse, not dispatch"
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_NEW
-        assert item["note"] and item["note"].startswith("deferred:")
 
 
 def test_escalate_origin_items_cas_claim_loses_to_a_concurrent_claim():
@@ -4623,10 +4608,239 @@ def test_propose_mappings_dry_run_makes_zero_calls():
         assert calls["n"] == 0, "--dry-run must never call the model"
 
 
+# --- Argo actions — owner-pulled implement/merge/dismiss/reinvestigate/note ---
+
+def _argo_action(action_id, event_id, verb, payload=None):
+    return {"id": action_id, "event_id": event_id, "verb": verb, "payload": payload or {}}
+
+
+def test_apply_argo_actions_dry_run_never_polls():
+    with _triage_env() as (conn, ctx):
+        called = {"n": 0}
+
+        def _fail_fetch(machine, **kw):
+            called["n"] += 1
+            return "ok", []
+
+        triage._argo.fetch_actions = _fail_fetch
+        triage.apply_argo_actions(conn, NOW, dry_run=True)
+        assert called["n"] == 0, "a --dry-run pass must never poll Argo for actions"
+
+
+def test_apply_argo_actions_unknown_verb_is_rejected_and_acked():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-argo-unknown-verb")
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "sabotage")]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        assert len(ctx.argo_acks) == 1, ctx.argo_acks
+        ack = ctx.argo_acks[0]
+        assert ack["action_id"] == "a1"
+        assert ack["status"] == "rejected"
+        assert "unknown verb" in (ack["error"] or "")
+
+
+def test_apply_argo_implement_on_verdict_item_opens_episode_and_sets_implement_job():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-argo-implement")
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "implement")]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        assert len(calls) == 1, "implement must open exactly one sideclaw episode"
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_IMPLEMENTING, item["state"]
+        assert item["implement_job"], "implement_job must be recorded"
+
+        assert len(ctx.argo_acks) == 1, ctx.argo_acks
+        ack = ctx.argo_acks[0]
+        assert ack["status"] == "applied", ack
+        assert ack["result"] and ack["result"].get("jobId") == item["implement_job"]
+
+
+def test_apply_argo_implement_on_wrong_state_item_is_rejected():
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-argo-implement-new",
+                             title="New item", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        item_before = triage._get_item(conn, eid)
+        assert item_before["state"] == triage.STATE_NEW
+
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "implement")]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        assert calls == [], "an item not in verdict/needs_human must never dispatch"
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEW, item["state"]
+
+        assert len(ctx.argo_acks) == 1, ctx.argo_acks
+        ack = ctx.argo_acks[0]
+        assert ack["status"] == "rejected", ack
+        assert "not verdict/needs_human" in (ack["error"] or "")
+
+
+def test_apply_argo_dismiss_with_no_reason_is_rejected():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-argo-dismiss-empty")
+        triage._set_state(conn, eid, triage.STATE_NEEDS_HUMAN, NOW, note="waiting on a human")
+        conn.commit()
+
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "dismiss")]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert len(ctx.argo_acks) == 1, ctx.argo_acks
+        ack = ctx.argo_acks[0]
+        assert ack["status"] == "rejected", ack
+        assert "requires a reason" in (ack["error"] or "")
+
+
+def test_apply_argo_dismiss_with_reason_on_needs_human_is_applied():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-argo-dismiss-ok")
+        triage._set_state(conn, eid, triage.STATE_NEEDS_HUMAN, NOW, note="waiting on a human")
+        conn.commit()
+
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "dismiss", {"reason": "not worth doing"})]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_DISMISSED, item["state"]
+        assert item["note"] == "not worth doing", item["note"]
+        assert len(ctx.argo_acks) == 1, ctx.argo_acks
+        assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks[0]
+
+
+def test_apply_argo_merge_on_non_merge_blocked_item_is_rejected():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-argo-merge-wrong-state")
+        merge_calls: list[Any] = []
+        triage._merge.plan_or_land = lambda *a, **kw: merge_calls.append(kw) or (_ for _ in ()).throw(
+            AssertionError("plan_or_land must never be called for a non-merge_blocked item"))
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "merge")]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        assert merge_calls == []
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERDICT, item["state"]
+        assert len(ctx.argo_acks) == 1, ctx.argo_acks
+        ack = ctx.argo_acks[0]
+        assert ack["status"] == "rejected", ack
+        assert "not merge_blocked" in (ack["error"] or "")
+
+
+def test_apply_argo_note_appends_rather_than_overwrites():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-argo-note")
+        triage._set_state(conn, eid, triage.STATE_NEEDS_HUMAN, NOW, note="original note")
+        conn.commit()
+
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "note", {"text": "owner adds context"})]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert item["note"].startswith("original note\n\n"), item["note"]
+        assert "owner adds context" in item["note"], item["note"]
+        assert len(ctx.argo_acks) == 1, ctx.argo_acks
+        assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks[0]
+
+
+def test_apply_argo_implement_on_needs_human_with_stale_implement_job_still_applies():
+    # poll_implement_jobs() lands a failed/human-routed prior attempt in
+    # needs_human WITHOUT ever clearing implement_job — a re-implement from
+    # Argo must not be permanently blocked by that stale column.
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-argo-implement-stale")
+        triage._set_state(conn, eid, triage.STATE_NEEDS_HUMAN, NOW, note="prior attempt needs a human")
+        conn.execute("UPDATE triage_items SET implement_job=? WHERE event_id=?", ("stale-job-1", eid))
+        conn.commit()
+
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "implement")]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        assert len(calls) == 1, "a stale implement_job must not block a re-implement from Argo"
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_IMPLEMENTING, item["state"]
+        assert item["implement_job"] != "stale-job-1", "the stale job id must be overwritten"
+        assert len(ctx.argo_acks) == 1 and ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
+
+
+def test_apply_argo_note_redelivery_is_idempotent_not_duplicated():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-argo-note-redelivery")
+        triage._set_state(conn, eid, triage.STATE_NEEDS_HUMAN, NOW, note="original note")
+        conn.commit()
+
+        triage._argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "note", {"text": "owner adds context"})]
+        )
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+        triage.apply_argo_actions(conn, NOW, dry_run=False)  # simulates a redelivered action a1
+
+        item = triage._get_item(conn, eid)
+        assert item["note"].count("owner adds context") == 1, (
+            f"a redelivered note action must not duplicate the text: {item['note']!r}")
+        assert len(ctx.argo_acks) == 2
+        assert all(a["status"] == "applied" for a in ctx.argo_acks), ctx.argo_acks
+
+
+def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
+    with _triage_env() as (conn, ctx):
+        eid1 = _seed_verdict_item(conn, external_id="sig-argo-raise", investigate_job="investigate-job-raise")
+        eid2 = _seed_verdict_item(conn, external_id="sig-argo-after-raise",
+                                   investigate_job="investigate-job-after-raise")
+        triage._set_state(conn, eid2, triage.STATE_NEEDS_HUMAN, NOW, note="waiting")
+        conn.commit()
+
+        real_get_item = triage._get_item
+
+        def _flaky_get_item(conn_, event_id):
+            if event_id == eid1:
+                raise RuntimeError("boom")
+            return real_get_item(conn_, event_id)
+
+        triage._get_item = _flaky_get_item
+        try:
+            triage._argo.fetch_actions = lambda machine, **kw: (
+                "ok", [_argo_action("a1", eid1, "dismiss", {"reason": "x"}),
+                       _argo_action("a2", eid2, "dismiss", {"reason": "y"})]
+            )
+            triage.apply_argo_actions(conn, NOW, dry_run=False)
+        finally:
+            triage._get_item = real_get_item
+
+        item2 = triage._get_item(conn, eid2)
+        assert item2["state"] == triage.STATE_DISMISSED, (
+            "a raising action must not stop the rest of the batch from being applied")
+
+
 # --- Argo push — the loop's own projection, pushed after every pass -----------
 
 _ARGO_SNAPSHOT_REQUIRED_KEYS = {
-    "machine", "generatedAt", "health", "metrics", "board", "budget",
+    "machine", "generatedAt", "health", "metrics", "board",
     "items", "itemsTruncated", "intents",
 }
 

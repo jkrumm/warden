@@ -19,6 +19,25 @@ shell-injectable deploy contract. Those are the two I would have shipped.
 | C5 | sideclaw's `POST /api/jobs` has **no auth and no repo allowlist**; `resolve_repo()` in `hermes-cc.sh` is the entire scope control, and v1 moved it to warden — leaving the executor with zero policy. | The allowlist and tier ceiling are re-asserted **inside sideclaw**, in Wave 0. Warden's copy is defence in depth. |
 | C6 | The quiet rule reproduces the original bug: an item in `needs_human` with a written fix goes terminal `quiet` when the fault clears on its own. Already live — grouped items in `needs_human` quiet-resolve at 2h, 90 min before the doc's own 4h SLA. | Observation status and remediation obligation separated as principle 5. Silence-resolve applies only to `new`. |
 
+**Disposition update, 2026-09-15 (owner decision, `docs/waves/PLAN.md` Wave 2 —
+see `docs/history/state-log.md` §71).** C1's own finding — no bearer token may
+mint a signature, because prompt injection produces words and words cannot
+sign — stands untouched: `require_signed_approval()`/`execute_approved()` still
+trust only a verified Ed25519 signature over `payload_hash`, never a caller's
+say-so. What changes is DESIGN.md § *The decision primitive*'s downstream
+corollary, "Argo shows the queue and records intents. It cannot approve.": the
+owner has decided that because Argo is reachable **only** over his own Tailscale
+network, an action clicked there already carries the property C1 protects for
+— it did not arrive as words an episode could forge, it arrived because he, and
+only he, is on that network. `apply_argo_actions()` (`scripts/triage.py`)
+therefore treats an action pulled from Argo's queue as authorization
+(`authorized_by="owner:argo"`) the same way a spent, signature-verified
+Slack approval is — not by adding a second signer, but because the tailnet
+boundary already supplies what a signature supplies elsewhere: proof the
+request came from him. No bearer token is introduced, no `POST /decide` is
+reopened, and Slack's signed-approval path is unchanged and still the only
+path for anything reachable off the tailnet.
+
 ## Major — accepted
 
 - **States with no exit.** `merge_blocked`, `merged`, `needs_human` were leaves

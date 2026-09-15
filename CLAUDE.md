@@ -85,7 +85,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **256/256**. Any other number is a
+`tests/test_triage.py` is the regression gate at **265/265**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -158,6 +158,14 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   to `needs_human` carrying `dispatches.error`, never into `verdict` — a
   verdict-less `verdict` row is the same invisibility in a different column
   (§64). It is never retried automatically.
+- **An action pulled from Argo's queue is the owner, full stop** (owner
+  decision, 2026-09-15 — DESIGN.md § *2026-09-15 override*, REVIEW.md's C1
+  disposition update, §71). `apply_argo_actions()` passes
+  `authorized_by="owner:argo"` into the same plain truthy-string gate a
+  signed Slack approval satisfies — no signing key touches Argo, and
+  `require_signed_approval()`/`execute_approved()` are unchanged and remain
+  the only path for anything reachable off the tailnet. This is not a second
+  signing oracle; it is because Argo is reachable only over his own tailnet.
 
 ## Cross-repo facts
 

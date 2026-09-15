@@ -86,11 +86,12 @@ Both non-alert origins insert their `triage_items` row through
 match reuses it, a terminal match opens nothing — a stale label after the
 work finished is not a new handover) and escalate as their OWN cluster of one
 through `escalate_origin_items()` — no `minOccurrences`/`minOpenMinutes`/
-`cooldownHours` gate (a human or a trusted label already decided), no
-`DAILY_INVESTIGATE_BUDGET` (that bounds the loop's own autonomous escalation
-of alert noise), but still bounded by `MAX_OPEN_INVESTIGATIONS` (overflow
-waits in `new`, never drops) and the same dispatch budget `warden dispatch`
-itself is bound by.
+`cooldownHours` gate (a human or a trusted label already decided), but still
+bounded by `MAX_OPEN_INVESTIGATIONS` (overflow waits in `new`, never drops).
+Every daily count ceiling that used to sit alongside this (`DAILY_INVESTIGATE_BUDGET`,
+and the `warden dispatch` budget this paragraph used to point at) was removed
+entirely 2026-09-15 (`docs/waves/PLAN.md` Wave 2, owner: "absurd friction") —
+`MAX_OPEN_INVESTIGATIONS` is the only ceiling left on autonomous spend.
 
 `max_tier='investigate'` is a hard ceiling, enforced twice: `maybe_auto_implement()`'s
 own eligibility query excludes it, and `lifecycle/policy.py`'s
@@ -271,9 +272,9 @@ secret-scan pattern and get withheld from the card, whereas `env-check`'s
 output reaching the card directly does not have that problem.
 
 `run_verbs()` applies the same `minOccurrences`/`minOpenMinutes` eligibility
-gate as an episode escalation, but NO concurrency/daily-budget cap (a verb is
-a bounded local probe, not a sideclaw episode, and doesn't compete for that
-budget) and NO cooldown tracking — a verb-routed item runs AT MOST ONCE,
+gate as an episode escalation, but NO concurrency cap (a verb is a bounded
+local probe, not a sideclaw episode, and doesn't compete with
+`MAX_OPEN_INVESTIGATIONS`) and NO cooldown tracking — a verb-routed item runs AT MOST ONCE,
 because its terminal state (`needs_human`) permanently falls out of the
 `state=new` candidate query. If the underlying condition later clears, the
 normal resolve path (`events.resolved_at`) closes the row out without
@@ -670,8 +671,8 @@ cluster the dissolve just split, which its own Slack notice promises won't
 happen: "Each will be re-evaluated individually"). Every eligible `split`
 candidate across EVERY repo is attempted before any `new` cluster in any
 repo — the ordering is global, not per-repo, so the shared
-`MAX_OPEN_INVESTIGATIONS`/`DAILY_INVESTIGATE_BUDGET` ceilings go to obligated
-items first. A `split` item still counts against its repo's
+`MAX_OPEN_INVESTIGATIONS` ceiling goes to obligated items first. A `split`
+item still counts against its repo's
 one-dispatch-per-run slot: a repo with an eligible `split` item
 spends this run's slot on it, and its `new` items wait for the next run
 (printed, never silently dropped). `STATE_DEADLINES` bounds it at 24h,
@@ -981,8 +982,7 @@ it explains the same contract from inside the file itself.
 
 | Constant | Default | Env override | Why |
 |-|-|-|-|
-| `MAX_OPEN_INVESTIGATIONS` | 3 | `TRIAGE_MAX_OPEN_INVESTIGATIONS` | Concurrency ceiling on open CLUSTERS (distinct `dispatch_job`s in `investigating`) — sideclaw's own concurrency is shared with every other dispatch source |
-| `DAILY_INVESTIGATE_BUDGET` | 8 | `TRIAGE_DAILY_INVESTIGATE_BUDGET` | Well under `WARDEN_DAILY_BUDGET`'s own 20/day (`lifecycle/policy.py`) so a triage storm can never starve interactive dispatch. Counts clusters, not member items |
+| `MAX_OPEN_INVESTIGATIONS` | 3 | `TRIAGE_MAX_OPEN_INVESTIGATIONS` | Concurrency ceiling on open CLUSTERS (distinct `dispatch_job`s in `investigating`) — sideclaw's own concurrency is shared with every other dispatch source. Since 2026-09-15 (Wave 2, "absurd friction") this is the ONLY ceiling left on autonomous spend — `DAILY_INVESTIGATE_BUDGET` and every `WARDEN_*_BUDGET` env var were removed entirely |
 | `MAX_CLUSTER_SIGNATURES` | 5 | — | Signatures riding in one cluster's brief; the rest wait for a later run |
 | `VERB_TIMEOUT` | 260s | — | `env-check` runs TWO sequential ssh probes, each individually bounded by hermes-ops.sh's own `SSH_TIMEOUT=120` — the outer bound has to clear 240s or it would kill a legitimately slow-but-healthy probe |
 | `MAX_BRIEF_CHARS` | 8000 | — | Mirrors `lifecycle/dispatch.py`'s own `MAX_BRIEF_CHARS`; enforced in Python (`_cap_brief()`) BEFORE `open_episode()` is ever called, so an oversize brief is capped, never refused |
@@ -991,18 +991,15 @@ it explains the same contract from inside the file itself.
 | `EVIDENCE_TOTAL_CAP_CHARS` | 3200 | — | Whole evidence block cap — well under `MAX_BRIEF_CHARS` so a 5-signature cluster (each pulling its own evidence) still leaves room for the rest of the brief |
 | `DEFAULT_QUIET_RESOLVE_HOURS` | 2h | policy `quietResolveHours` | Grouped-source (`slack_alert`/`hermes_log`) quiet-timer resolve — see *Grouped-source resolution* |
 
-`DAILY_INVESTIGATE_BUDGET` is counted from `dispatches.origin_event_id IS NOT
-NULL AND created_at >= <today, UTC>` — the same marker `escalate_cluster()`
-writes, so no separate accounting column is needed. Both caps are checked
-once per run and decremented as clusters open, so a later repo in the same
-run correctly sees an exhausted cap — including under `--dry-run`, where
-`escalate_cluster()` always returns `None` (it never calls sideclaw, GitHub
-or Slack — the `clients`/`lifecycle` modules are the boundary, and dry-run
-never crosses it), so the caps still advance on the dry-run path
-specifically so a multi-repo preview simulates what a real run would
-actually allow. A Slack or sideclaw failure for one cluster logs to stderr
-and returns without aborting the rest of the run — every DB write in the
-loop is per-cluster and independently committed.
+`MAX_OPEN_INVESTIGATIONS` is checked once per run and decremented as clusters
+open, so a later repo in the same run correctly sees an exhausted cap —
+including under `--dry-run`, where `escalate_cluster()` always returns `None`
+(it never calls sideclaw, GitHub or Slack — the `clients`/`lifecycle` modules
+are the boundary, and dry-run never crosses it), so the cap still advances on
+the dry-run path specifically so a multi-repo preview simulates what a real
+run would actually allow. A Slack or sideclaw failure for one cluster logs to
+stderr and returns without aborting the rest of the run — every DB write in
+the loop is per-cluster and independently committed.
 
 ## CLI verbs
 
@@ -1411,7 +1408,7 @@ routed to the `env-check` verb rather than an episode (both the dangling-item
 and the nothing-dangling shapes), an unknown verb key being rejected at
 `load_policy()` time, the shipped `config/triage-policy.json`'s `api-*`/
 `dashboard-*`/argo rules resolving to `vps` (not `argo`, not the service's
-own repo), the concurrency and daily budget caps (including their simulation
+own repo), the concurrency cap (including its simulation
 under `--dry-run` across multiple repos in one pass), a denied and an
 unmapped repo never dispatching, two eligible same-repo items clustering into
 exactly one dispatch/card with both edges written on every member and both

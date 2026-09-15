@@ -39,7 +39,6 @@ try:
 except ModuleNotFoundError:
     _stub = types.ModuleType("lifecycle.policy")
     for _name in ("resolve_repo", "tier_rank", "merge_precheck_repo", "triage_repo_entry",
-                  "budget_counts", "check_merge_budget", "limits_from_env",
                   "pr_required_path", "triage_policy_path"):
         def _unset(*_a, _n=_name, **_k):
             raise NotImplementedError(f"lifecycle.policy.{_n} stub called without a test override")
@@ -130,20 +129,6 @@ class _RepoTarget:
     sensitive: bool
 
 
-@dataclass
-class _BudgetCounts:
-    used_today: int
-    implement_today: int
-    merges_today: int
-
-
-@dataclass
-class _BudgetLimits:
-    daily: int
-    implement: int
-    merge: int
-
-
 @contextmanager
 def fakes(**overrides):
     """Patches every clients.github / clients.rollout / lifecycle.policy
@@ -163,8 +148,6 @@ def fakes(**overrides):
         "entry": {"autoMergePaths": ["**"], "noCiRequired": True},
         "max_tier": "implement",
         "precheck_error": None,
-        "counts": _BudgetCounts(0, 0, 0),
-        "limits": _BudgetLimits(10, 5, 3),
         "mark_ready_error": None,
         "mark_ready_fn": None,
         "merge_pr_error": None,
@@ -241,22 +224,6 @@ def fakes(**overrides):
         record("triage_repo_entry", repo)
         return dict(state["entry"])
 
-    def _budget_counts(conn, now):
-        record("budget_counts")
-        return state["counts"]
-
-    def _check_merge_budget(counts, limits):
-        record("check_merge_budget")
-        if counts.merges_today >= limits.merge:
-            raise PolicyError(
-                f"daily merge budget exhausted ({counts.merges_today}/{limits.merge} landed "
-                f"today, UTC — resets at 00:00 UTC). Raise it deliberately with "
-                f"WARDEN_MERGE_BUDGET=<n>."
-            )
-
-    def _limits_from_env():
-        return state["limits"]
-
     def _pr_required_path():
         return Path("/dev/null")
 
@@ -278,9 +245,6 @@ def fakes(**overrides):
         (lifecycle.policy, "tier_rank", _tier_rank),
         (lifecycle.policy, "merge_precheck_repo", _merge_precheck_repo),
         (lifecycle.policy, "triage_repo_entry", _triage_repo_entry),
-        (lifecycle.policy, "budget_counts", _budget_counts),
-        (lifecycle.policy, "check_merge_budget", _check_merge_budget),
-        (lifecycle.policy, "limits_from_env", _limits_from_env),
         (lifecycle.policy, "pr_required_path", _pr_required_path),
         (lifecycle.policy, "triage_policy_path", _triage_policy_path),
     ]
@@ -951,24 +915,6 @@ def test_mark_ready_for_review_remote_error_marks_op_failed():
         conn.close()
 
 
-# --- the merge budget -------------------------------------------------------------------
-
-def test_merge_budget_refusal():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(counts=_BudgetCounts(0, 0, 3), limits=_BudgetLimits(10, 5, 3)) as fx:
-            try:
-                _land(conn)
-            except PolicyError as e:
-                assert "WARDEN_MERGE_BUDGET" in str(e)
-            else:
-                raise AssertionError("expected PolicyError")
-        assert "read_pr" not in fx.calls
-    finally:
-        conn.close()
-
-
 # --- collect_expected_alerts, direct -----------------------------------------------------
 
 def test_collect_expected_alerts_empty_without_merge_sha():
@@ -1011,12 +957,11 @@ def test_collect_expected_alerts_ignores_non_alert_paths():
 def test_merge_plan_to_json_shape():
     plan = merge.MergePlan(needs_confirm=True, repo="jkrumm/gamma", pull_request=7, title="t",
                             head="dispatch/x", base="master", merge_method="squash",
-                            changed_files=2, changed_lines=8, merge_budget_used=0, merge_budget_max=3)
+                            changed_files=2, changed_lines=8)
     data = plan.to_json()
     assert data["dryRun"] is True
     assert data["needsConfirm"] is True
     assert data["mergeMethod"] == "squash"
-    assert data["mergeBudget"] == {"usedToday": 0, "max": 3}
     assert len(data["wouldDo"]) == 3
     assert len(data["wouldNeverDo"]) == 4
     assert "Re-invoke with --confirm" in data["note"]
@@ -1026,7 +971,7 @@ def test_merge_plan_to_json_shape():
 def test_merge_plan_to_json_note_stays_short_when_confirmed():
     plan = merge.MergePlan(needs_confirm=False, repo="jkrumm/gamma", pull_request=7, title="t",
                             head="dispatch/x", base="master", merge_method="squash",
-                            changed_files=2, changed_lines=8, merge_budget_used=0, merge_budget_max=3)
+                            changed_files=2, changed_lines=8)
     data = plan.to_json()
     assert data["note"] == "nothing was merged and nothing was un-drafted"
 
@@ -1036,7 +981,6 @@ def test_merge_result_to_json_shape():
         merged=True, repo_slug="jkrumm/gamma", pull_request=7, title="t", merge_method="squash",
         merge_commit="abc123", branch="dispatch/x", branch_deleted=True,
         deploy={"attempted": False, "reason": "x"}, merge_op_id="op-1", deploy_op_id=None,
-        merge_budget={"usedToday": 1, "max": 3, "remaining": 2},
     )
     data = result.to_json()
     assert data["merged"] is True

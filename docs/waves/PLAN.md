@@ -76,12 +76,12 @@ a search-index timeout — fixed in the same commit, with a regression test
 (`test_fold_dispatch_verdict_third_party_github_issue_lands_needs_human_not_closed`),
 recorded in STATE.md and CLAUDE.md.
 
-## Wave 2 — owner actions pulled from Argo            <!-- status: active -->
-- [ ] `scripts/clients/argo.py`: `fetch_actions(machine)` →
+## Wave 2 — owner actions pulled from Argo            <!-- status: done -->
+- [x] `scripts/clients/argo.py`: `fetch_actions(machine)` →
       `GET /warden/actions?machine=&status=pending` and
       `ack_action(id, {status, result, error})` → `POST /warden/actions/:id/ack`,
       same token and never-raises contract as `push_snapshot()`.
-- [ ] `scripts/triage.py` `apply_argo_actions()`, run each tick before
+- [x] `scripts/triage.py` `apply_argo_actions()`, run each tick before
       `push_argo_snapshot()`. Closed verb allowlist, code owns every
       transition: `implement` (item in `verdict`/`needs_human` → implement
       dispatch, `authorized_by="owner:argo"`), `merge` (item in
@@ -91,11 +91,11 @@ recorded in STATE.md and CLAUDE.md.
       DESIGN.md's designed-but-unbuilt `/items/:id/note`). Unknown verb or an
       item in the wrong state → ack `rejected` with the reason, never a
       silent drop. Idempotent on action id.
-- [ ] `scripts/lifecycle/policy.py`: `authorized_by="owner:argo"` satisfies
+- [x] `scripts/lifecycle/policy.py`: `authorized_by="owner:argo"` satisfies
       the implement/merge human gate the way a signed Slack approval does.
       The per-repo lock and the `investigate` cap on sideclaw/warden still
       apply.
-- [ ] **Remove every daily count budget** (owner, 2026-09-15: "absurd
+- [x] **Remove every daily count budget** (owner, 2026-09-15: "absurd
       friction"): `WARDEN_DAILY_BUDGET`, `WARDEN_IMPLEMENT_BUDGET`,
       `WARDEN_MERGE_BUDGET` (policy.py:268-275), `DAILY_INVESTIGATE_BUDGET`
       (triage.py:787) — the constants, the checks, the deferral notes, the
@@ -104,16 +104,32 @@ recorded in STATE.md and CLAUDE.md.
       waits, never drops) and the per-repo lock (two PRs on one repo is a
       correctness bug, not a budget). Record the removal in DESIGN.md and
       the state log; Wave 4's dashboard shows no budget.
-- [ ] Snapshot: each board item carries `availableActions` (computed from
-      state + max_tier) and, for `github_issue` origins, `issue: {repo,
+- [x] Snapshot: each board item carries `availableActions` (computed from
+      `state` alone — the item's own `max_tier` never blocks an owner
+      override, only the repo-level dispatch policy does, checked at apply
+      time) and, for `github_issue` origins, `issue: {repo,
       number, url, author, trusted, labels}`. Keep inside `MAX_BODY_BYTES`.
       Update docs/api.md § Argo push.
-- [ ] DESIGN.md + REVIEW.md: record the owner override (see top of this
-      plan). CLAUDE.md "Talking to sideclaw"/load-bearing section: adjust any
-      sentence that says Argo cannot approve. State-log §71.
-**Left behind:**
+- [x] DESIGN.md + REVIEW.md: record the owner override (see top of this
+      plan). CLAUDE.md load-bearing section: new bullet recording
+      `authorized_by="owner:argo"` (no sentence literally said "Argo cannot
+      approve" in this file to adjust). State-log §71.
+**Left behind:** `make check-policy` still fails on the same Wave-1-left-behind
+disagreement (sideclaw's own boundary still allows `implement` on
+`sideclaw`/`warden`) — unchanged by this wave, still a sideclaw-repo fix.
+`/review --deep` caught and fixed, same commit: a stale `implement_job`
+permanently blocking re-implement on a `needs_human` item (also fixes the
+reinvestigate→verdict→implement path since both share the claim CAS);
+`_apply_argo_note` had no CAS/dedup, contradicting its own idempotency
+contract (fixed with an action-id-tagged stamp); `_board_item_issue()`
+crashed on a non-dict-but-valid-JSON payload; `_apply_argo_reinvestigate()`
+never called `sync_card()`; `fetch_actions()` read an unbounded response
+body. Also caught: the implementer's own diff had drifted
+`scripts/clients/sideclaw.py`'s `DISPATCH_SCHEMA_VERSION` with no
+sideclaw-side source to justify it — reverted before commit. Test gate is
+now 265/265 (`test_clients.py` 105/105, `test_api.py` 42/42).
 
-## Wave 3 — argo API: the action queue            <!-- status: pending -->
+## Wave 3 — argo API: the action queue            <!-- status: active -->
 Work happens in `~/SourceRoot/argo` (its own CLAUDE.md and rules apply;
 direct-to-master). Contract is whatever Wave 2 shipped on the warden side —
 read `warden/docs/api.md` § Argo push first.

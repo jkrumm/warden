@@ -121,7 +121,9 @@ Same fresh-read-only-connection, 503-on-schema-mismatch contract as above.
     "pr_url": null, "dispatch_job": "j-abc", "implement_job": null,
     "validation_job": null, "occurrences": 3,
     "created_at": "2026-09-10T00:00:00+00:00", "updated_at": "2026-09-11T00:00:00+00:00",
-    "origin_channel": null, "origin_thread_ts": null
+    "origin_channel": null, "origin_thread_ts": null,
+    "availableActions": ["implement", "dismiss", "reinvestigate", "note"],
+    "issue": null
   } ],
   "terminal_24h": 4,
   "truncated": true
@@ -140,6 +142,18 @@ otherwise, never a fabricated `false`). `origin_channel`/`origin_thread_ts`
 read `null` on a row from before the migration that added them, rather than
 raising. `terminal_24h` counts items whose state is terminal (`ledger.
 TERMINAL_STATES`) and `updated_at` is within the last 24 hours.
+
+`availableActions` is zero or more of `implement`/`merge`/`dismiss`/
+`reinvestigate`/`note`, computed from `state` alone (never `max_tier` — the
+real per-repo/per-tier gate is enforced server-side, in `apply_argo_actions()`,
+when an action is actually applied, not here). This list is only what the UI
+offers to click; a `verdict` row, for example, carries
+`["implement", "dismiss", "reinvestigate", "note"]`. `issue` is `null` for
+every item except `origin: "github_issue"`, where it is `{"repo", "number",
+"url", "author", "trusted", "labels"}` sourced from the parent event's stored
+GitHub payload — `trusted` is `author == clients.github.GH_OWNER`. A
+`github_issue` item with a missing or unparsable payload still gets
+`issue: null` rather than a 500.
 
 ```bash
 curl -s http://127.0.0.1:7735/board | jq .
@@ -267,8 +281,7 @@ as the last step of every 10-minute pass (`push_argo_snapshot()`, after
 
 The pushed payload is `build_argo_snapshot()`'s output: `machine`,
 `generatedAt`, and this same module's `health_payload()`/`metrics_payload()`/
-`board_payload()` verbatim, plus `budget` (the same object `warden run`/`dispatch`/`list`
-report under `budget`), `items` (`item_payload()` detail for the first 50 board items,
+`board_payload()` verbatim, `items` (`item_payload()` detail for the first 50 board items,
 keyed by event_id as a string, each bounded to its newest 50 transitions/operations via
 `history_limit=ARGO_SNAPSHOT_HISTORY_LIMIT` — see `GET /items/<event_id>`'s own
 `history_limit` note above) with `itemsTruncated` alongside it, and
@@ -281,6 +294,12 @@ taking health/metrics/board down with it. An entry never carries `signature`/
 `nonce` (the fields that carry authority in an `approval_decision` intent),
 and a rejected entry carries `has_error: bool` only — never its `.err`
 sibling's text, which can itself embed the raw rejected signature/nonce).
+
+Every board item under `items`/`board.items` also carries `availableActions`
+— what the owner can click for this item, mirroring `apply_argo_actions()`'s
+closed verb allowlist (`implement`/`merge`/`dismiss`/`reinvestigate`/`note`) —
+and, for `github_issue`-origin items, an `issue` sub-object (`repo`/`number`/
+`url`/`author`/`trusted`/`labels`).
 
 Every push logs exactly one line to `warden-loop.err`. Every status the line
 can carry, and what an operator does about it:

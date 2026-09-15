@@ -7286,4 +7286,73 @@ and scoped out of this wave by the plan itself (sideclaw is a different repo);
 left for whoever picks up that side. `test_triage.py` 256/256, `test_clients.py`
 93/93, `make test` green, `make check-routing` green.
 
-`docs/waves/PLAN.md` Wave 2 (owner actions pulled from Argo) is active next.
+## 71. Owner actions pulled from Argo; every daily budget removed (2026-09-15)
+
+`docs/waves/PLAN.md` Wave 2. `scripts/clients/argo.py` grew `fetch_actions()`/
+`ack_action()` — `GET /warden/actions?machine=&status=pending` /
+`POST /warden/actions/:id/ack`, same never-raises, folded-status-string
+contract as `push_snapshot()`. `triage.py`'s `apply_argo_actions()` runs as
+step 9.5 of every tick, right before `push_argo_snapshot()`: pulls pending
+actions, dispatches each through the closed `ARGO_ACTION_VERBS` allowlist
+(`implement`/`merge`/`dismiss`/`reinvestigate`/`note`), acks every outcome —
+unknown verb, wrong state, or a real failure all ack `rejected`/`failed`,
+never a silent drop. `authorized_by="owner:argo"` satisfies the exact same
+plain truthy-string gate a signed Slack approval's `authorized_by=f"signed:
+{who}"` does (there was never a prefix allowlist, only a non-empty-string
+check in `dispatch.open_episode()`) — recorded as the owner's 2026-09-15
+override in DESIGN.md (new § *2026-09-15 override*), REVIEW.md (C1
+disposition update, history kept, not deleted) and this repo's own CLAUDE.md
+load-bearing list: Argo is reachable only over his own tailnet, so an action
+clicked there already carries what C1 required a signature for elsewhere.
+`scripts/api.py`'s `_board_item()` grew `availableActions` (computed from
+`state` alone, mirroring `apply_argo_actions()`'s per-verb allowed-state
+sets) and, for `github_issue`-origin rows, an `issue` sub-object sourced from
+the parent event's `payload_json`/`url`.
+
+Every daily count ceiling is gone (owner: "absurd friction") —
+`DAILY_INVESTIGATE_BUDGET`, `WARDEN_DAILY_BUDGET`, `WARDEN_IMPLEMENT_BUDGET`,
+`WARDEN_MERGE_BUDGET`: the constants, the checks, the CLI/Argo-snapshot
+`budget` output, and their tests, across `policy.py`, `approvals.py`,
+`merge.py`, `warden.py` and `triage.py`. `MAX_OPEN_INVESTIGATIONS`
+(concurrency) and `check_repo_not_in_flight()` (the per-repo lock) are
+untouched — a count ceiling and a concurrency/correctness bound were never
+the same thing. DESIGN.md's original § *Budgets* (v1 sketch) gets a dated
+disposition paragraph rather than a rewrite, same pattern as the Argo
+override; `docs/triage.md`'s several budget mentions were corrected in place.
+
+`/review --deep` (sideclaw `needs-human` + native high-effort) caught four
+real bugs beyond the brief, all fixed in the same commit: (1) the `implement`
+handler's claim CAS required `implement_job IS NULL`, which permanently
+blocked a re-implement from Argo on any `needs_human` item carrying a stale
+`implement_job` from a prior failed attempt (`poll_implement_jobs()` never
+clears that column on its own `needs_human` branches) — dropped the
+`expect_null`, which also incidentally fixes the adversary-flagged
+reinvestigate→verdict→implement stranding, since that path shares the same
+CAS; (2) `_apply_argo_note` had no CAS and no per-action dedup, contradicting
+its own documented idempotency contract — added `expect_state=` plus an
+action-id-tagged stamp so a redelivered note (an `ack_action()` POST that
+failed last tick) is detected and skipped rather than duplicated; (3)
+`_board_item_issue()` crashed on a `github_issue` row whose `payload_json`
+was valid JSON but not an object (`isinstance(payload, dict)` guard added,
+matching `_safe_json()`'s own pattern); (4) `_apply_argo_reinvestigate()`
+never called `sync_card()` on success, unlike every sibling handler, leaving
+a stale card for up to one tick. Also hardened on review: `fetch_actions()`
+now bounds its read at `MAX_BODY_BYTES` (the one inbound body read in a file
+whose other two functions only ever POST) instead of buffering an unbounded
+response. One separately caught, unrelated regression: the implementer's own
+diff had drifted `scripts/clients/sideclaw.py`'s `DISPATCH_SCHEMA_VERSION`
+2→3 and added an `applied_in_place` outcome with no sideclaw-side source to
+re-read against — reverted outright (that file's own docstring: "never guess
+a version or an outcome list") before it could break `check-schemas`/mask a
+real drift.
+
+`test_triage.py` 265/265 (recorded gate, up from 256 — net of ~15 budget
+tests removed and ~22 Argo-action/regression tests added), `test_clients.py`
+105/105, `test_api.py` 42/42, `make test` green, `make check-routing` and
+`make check-schemas` green. `make check-policy` still fails on the same
+Wave-1-left-behind disagreement (sideclaw's own boundary still allows
+`implement` on `sideclaw`/`warden`) — unchanged by this wave, still a
+sideclaw-repo fix.
+
+`docs/waves/PLAN.md` Wave 3 (argo API: the action queue, in `~/SourceRoot/argo`)
+is active next.

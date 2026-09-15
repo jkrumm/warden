@@ -82,6 +82,16 @@ assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
 _ledger = importlib.util.module_from_spec(_ledger_spec)
 _ledger_spec.loader.exec_module(_ledger)
 
+# scripts/ (this file's own directory) onto sys.path so `clients` is
+# importable as a real package — same reasoning as triage.py's own sys.path
+# insert: `clients` has internal `from clients import` statements that only
+# resolve through a normal import, not exec_module().
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from clients import github as _github  # noqa: E402
+
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 7735
 
@@ -130,6 +140,39 @@ CHAIN_STATES = (
     "new", "investigating", "verdict", "implementing", "validating", "merged",
     "liveness_pending", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", "split",
 )
+
+# --- /board's per-item `availableActions` ---------------------------------
+#
+# Mirrors triage.py's apply_argo_actions() per-verb allowed-state sets
+# (ARGO_ACTION_VERBS = {"implement", "merge", "dismiss", "reinvestigate",
+# "note"}) by literal state string, same reasoning as CHAIN_STATES/
+# DISPOSITION_STATES above: importing triage.py just for these sets would
+# pull in the whole 3400-line act-loop module. Must stay in sync by hand with
+# apply_argo_actions()'s handlers if either changes.
+_IMPLEMENT_STATES = ("verdict", _ledger.STATE_NEEDS_HUMAN)
+_MERGE_STATES = ("merge_blocked",)
+_DISMISS_STATES = ("new", "verdict", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", _ledger.STATE_QUIET, _ledger.STATE_NOTE)
+_REINVESTIGATE_STATES = ("verdict", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", _ledger.STATE_QUIET, _ledger.STATE_NOTE)
+
+
+def _available_actions(state: str) -> list[str]:
+    """Zero or more of `implement`/`merge`/`dismiss`/`reinvestigate`/`note` —
+    what the owner could click for a card in `state`, from state alone. The
+    real per-repo/per-tier gate runs server-side in triage.py's
+    apply_argo_actions() when an action is actually applied; this list is
+    only what the UI offers."""
+    actions: list[str] = []
+    if state in _IMPLEMENT_STATES:
+        actions.append("implement")
+    if state in _MERGE_STATES:
+        actions.append("merge")
+    if state in _DISMISS_STATES:
+        actions.append("dismiss")
+    if state in _REINVESTIGATE_STATES:
+        actions.append("reinvestigate")
+    if state not in _ledger.TERMINAL_STATES:
+        actions.append("note")
+    return actions
 
 # cursors key -> the LaunchAgent StartInterval it heartbeats against (seconds),
 # read straight from each plist template. Named individually, not folded into
@@ -604,7 +647,8 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
         counts[row["state"]] = row["n"]
 
     rows = conn.execute(
-        f"SELECT ti.*, e.title AS event_title FROM triage_items ti "
+        f"SELECT ti.*, e.title AS event_title, e.url AS event_url, "
+        f"e.payload_json AS event_payload_json FROM triage_items ti "
         f"JOIN events e ON e.id = ti.event_id "
         f"WHERE ti.state NOT IN ({terminal_placeholders}) "
         f"ORDER BY ti.updated_at DESC LIMIT ?",
@@ -632,6 +676,32 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     return payload
 
 
+def _board_item_issue(row: sqlite3.Row) -> dict[str, Any] | None:
+    """The `issue` sub-object for a `github_issue`-origin row, sourced from
+    the parent event's `payload_json` (written by triage.py's
+    ingest_github_issues()) and `url`. `None` for any other origin, and
+    `None` (never a raise) if the payload is missing or not valid JSON."""
+    if row["origin"] != "github_issue":
+        return None
+    raw = row["event_payload_json"]
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "repo": payload.get("repo"),
+        "number": payload.get("number"),
+        "url": row["event_url"],
+        "author": payload.get("author"),
+        "trusted": payload.get("author") == _github.GH_OWNER,
+        "labels": payload.get("labels"),
+    }
+
+
 def _board_item(row: sqlite3.Row) -> dict[str, Any]:
     """One `/board` item, in the exact shape the brief names — never a raw
     `dict(row)`, which would leak `card_hash`/`deploy_expect_json`/etc and
@@ -654,6 +724,8 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "updated_at": row["updated_at"],
         "origin_channel": row["origin_channel"],
         "origin_thread_ts": row["origin_thread_ts"],
+        "availableActions": _available_actions(row["state"]),
+        "issue": _board_item_issue(row),
     }
 
 

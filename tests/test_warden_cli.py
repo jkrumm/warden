@@ -418,16 +418,6 @@ def test_audit_log_records_refused_dispatch():
     assert "verb=dispatch" in line and "mode=refused" in line and "rc=4" in line, line
 
 
-# --- daily budget ------------------------------------------------------------------
-
-
-def test_daily_budget_zero_refuses_and_names_the_env_var():
-    h = Harness()
-    proc = h.run(["dispatch", "alpha", "--json"], env_extra={"WARDEN_DAILY_BUDGET": "0"}, stdin=VALID_BRIEF)
-    out = _json_or_fail(proc)
-    assert proc.returncode == 4 and "WARDEN_DAILY_BUDGET" in out["error"], out
-
-
 # --- recursion guard -----------------------------------------------------------------
 
 
@@ -621,15 +611,6 @@ def test_run_wait_folds_the_verdict_before_returning():
     conn.close()
     assert row["state"] == "closed", dict(row)
     assert row["note"].startswith("answered:"), dict(row)
-
-
-def test_run_reports_queued_true_when_budget_exhausted():
-    h = Harness()
-    proc = h.run(["run", "alpha", "--json"], env_extra={"WARDEN_DAILY_BUDGET": "0"}, stdin=VALID_BRIEF)
-    out = _json_or_fail(proc)
-    assert proc.returncode == 0, out
-    assert out["queued"] is True and out["jobId"] is None
-    assert out["note"] and "deferred" in out["note"]
 
 
 def test_status_unknown_job_is_usage_error():

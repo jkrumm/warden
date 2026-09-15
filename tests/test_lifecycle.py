@@ -450,99 +450,6 @@ def test_valid_origin_accepts_digit_string_event_id():
     policy.valid_origin(event_id="7")
 
 
-# --- policy: budgets ------------------------------------------------------------
-
-def test_limits_from_env_defaults_and_overrides():
-    limits = policy.limits_from_env()
-    assert (limits.daily, limits.implement, limits.merge) == (20, 5, 3)
-    with _env(WARDEN_DAILY_BUDGET="1", WARDEN_IMPLEMENT_BUDGET="2", WARDEN_MERGE_BUDGET="9"):
-        limits = policy.limits_from_env()
-        assert (limits.daily, limits.implement, limits.merge) == (1, 2, 9)
-
-
-def test_budget_counts_reads_todays_rows_only():
-    conn, _ = _fresh_ledger()
-    now = _now()
-    yesterday = (now - dt.timedelta(days=1)).isoformat()
-    _seed_dispatch(conn, "j-old", created_at=yesterday, tier="implement")
-    _seed_dispatch(conn, "j-new-invest", created_at=now.isoformat(), tier="investigate")
-    _seed_dispatch(conn, "j-new-impl", created_at=now.isoformat(), tier="implement")
-    counts = policy.budget_counts(conn, now)
-    assert counts.used_today == 2, counts
-    assert counts.implement_today == 1, counts
-
-
-def test_check_dispatch_budget_daily_exhausted():
-    counts = policy.BudgetCounts(used_today=20, implement_today=0, merges_today=0)
-    limits = policy.BudgetLimits(daily=20, implement=5, merge=3)
-    try:
-        policy.check_dispatch_budget(counts, "investigate", limits)
-    except PolicyError as e:
-        assert "daily dispatch budget exhausted" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_check_dispatch_budget_implement_exhausted():
-    counts = policy.BudgetCounts(used_today=1, implement_today=5, merges_today=0)
-    limits = policy.BudgetLimits(daily=20, implement=5, merge=3)
-    try:
-        policy.check_dispatch_budget(counts, "implement", limits)
-    except PolicyError as e:
-        assert "daily implement budget exhausted" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_check_dispatch_budget_ok_under_limits():
-    counts = policy.BudgetCounts(used_today=1, implement_today=1, merges_today=0)
-    limits = policy.BudgetLimits(daily=20, implement=5, merge=3)
-    policy.check_dispatch_budget(counts, "implement", limits)
-
-
-def test_check_merge_budget_exhausted():
-    counts = policy.BudgetCounts(used_today=0, implement_today=0, merges_today=3)
-    limits = policy.BudgetLimits(daily=20, implement=5, merge=3)
-    try:
-        policy.check_merge_budget(counts, limits)
-    except PolicyError as e:
-        assert "daily merge budget exhausted" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_budget_json_no_warning_when_plenty_remaining():
-    counts = policy.BudgetCounts(used_today=1, implement_today=0, merges_today=0)
-    limits = policy.BudgetLimits(daily=20, implement=5, merge=3)
-    out = policy.budget_json(counts, limits)
-    assert "warning" not in out, out
-    assert out == {
-        "usedToday": 1, "max": 20, "remaining": 19,
-        "implementToday": 0, "implementMax": 5, "implementRemaining": 5,
-    }, out
-
-
-def test_budget_json_warns_near_daily_ceiling():
-    counts = policy.BudgetCounts(used_today=18, implement_today=0, merges_today=0)
-    limits = policy.BudgetLimits(daily=20, implement=5, merge=3)
-    out = policy.budget_json(counts, limits)
-    assert "2 of 20" in out["warning"], out
-
-
-def test_budget_json_warns_and_says_refused_at_zero_remaining():
-    counts = policy.BudgetCounts(used_today=20, implement_today=0, merges_today=0)
-    limits = policy.BudgetLimits(daily=20, implement=5, merge=3)
-    out = policy.budget_json(counts, limits)
-    assert "REFUSED" in out["warning"], out
-
-
-def test_budget_json_warns_near_implement_ceiling():
-    counts = policy.BudgetCounts(used_today=1, implement_today=4, merges_today=0)
-    limits = policy.BudgetLimits(daily=20, implement=5, merge=3)
-    out = policy.budget_json(counts, limits)
-    assert "1 of 5 implement" in out["warning"], out
-
-
 # --- policy: require_auto_from_item() ------------------------------------------
 
 def test_require_auto_from_item_rejects_non_implement_tier():
@@ -1393,26 +1300,6 @@ def test_execute_approved_refuses_when_repo_in_flight():
         result = approvals.execute_approved(conn, "n-inflight")
     assert result.status == "refused", result
     assert "in flight" in result.reason
-
-
-def test_execute_approved_budget_refusal_leaves_unspent_and_retryable():
-    conn, _ = _fresh_ledger()
-    priv, pub_hex = _keypair()
-    root, policy_path = _dispatch_root_with_repo("warden", "implement")
-    _seed_signed_approval(conn, "n-budget", priv, pub_hex, params={"why": "w"})
-
-    with _env(WARDEN_APPROVAL_PUBKEY=str(_write_pubkey(pub_hex)), WARDEN_DISPATCH_REPOS=str(policy_path),
-              WARDEN_DAILY_BUDGET="0"):
-        first = approvals.execute_approved(conn, "n-budget")
-    assert first.status == "refused", first
-    row = conn.execute("SELECT * FROM dispatch_approvals WHERE nonce='n-budget'").fetchone()
-    assert row["spent_at"] is None
-    assert row["spend_error"]
-
-    with _env(WARDEN_APPROVAL_PUBKEY=str(_write_pubkey(pub_hex)), WARDEN_DISPATCH_REPOS=str(policy_path)), \
-         _patch(sideclaw, "submit", lambda **kw: {"id": "job-retry", "status": "running"}):
-        second = approvals.execute_approved(conn, "n-budget")
-    assert second.status == "opened", second
 
 
 def test_execute_approved_success_opens_episode_and_records_everything():
