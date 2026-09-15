@@ -319,7 +319,24 @@
     {"match": "slack_alert:homelab-5m-load-above-threshold", "repo": "homelab", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "HomeLab 5m load above threshold."},
     {"match": "slack_alert:homelab-cpu-above-threshold", "repo": "homelab", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "HomeLab CPU above threshold."},
     {"match": "slack_alert:homelab-disk-usage-above-threshold", "repo": "homelab", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "HomeLab disk usage above threshold."},
-    {"match": "uk:234", "repo": "warden", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Warden Backup monitor firing repeatedly; warden owns backups."}
+    {"match": "uk:234", "repo": "warden", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Warden Backup monitor firing repeatedly; warden owns backups."},
+    {"match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-1-persisting-past-the-2h-grace-window-locally-atrisk-1-we-are-actually-not-", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Torrent seeding obligation alert from homelab torrent stack."},
+    {"match": "slack_alert:local-red-circle-down-child-monitors-down-weatherorb-watchdog-push-channel", "repo": "weatherorb", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "WeatherOrb watchdog monitor down."},
+    {"match": "slack_alert:homelab-temperature-above-threshold", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "HomeLab temperature above threshold."},
+    {"match": "slack_alert:flaresolverr-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "FlareSolverr container down in homelab torrent stack."},
+    {"match": "slack_alert:gluetun-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Gluetun container down in homelab torrent stack."},
+    {"match": "slack_alert:prowlarr-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Prowlarr container down in homelab torrent stack."},
+    {"match": "slack_alert:qbittorrent-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "qBittorrent container down in homelab torrent stack."},
+    {"match": "slack_alert:torrent-app-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Torrent App container down in homelab torrent stack."},
+    {"match": "slack_alert:torrent-red-circle-down-child-monitors-down-gluetun-docker-qbittorrent-docker-prowlarr-docker-flaresolverr-docker-torren", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Torrent stack child monitors down in homelab."},
+    {"match": "slack_alert:local-red-circle-down-child-monitors-down-macmini-dev-host-push-channel", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "MacMini Dev Host down; homelab infrastructure."},
+    {"match": "slack_alert:local-red-circle-down-child-monitors-down-brain-sync-push-channel", "repo": "brain", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Brain Sync monitor down."},
+    {"match": "slack_alert:hermes-http-red-circle-down-request-failed-with-status-code-404", "repo": "hermes-agent", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Hermes HTTP endpoint down with 404."},
+    {"match": "slack_alert:new-incident-for-http-photos-jkrumm-com-photos-jkrumm-com", "repo": "jkrumm.com", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Incident for photos.jkrumm.com."},
+    {"match": "slack_alert:research-gateway-http-red-circle-down-200-ok-but-keyword-is-not-in-status-ok-lastrestartat-2026-09-08t06-5", "repo": "research-gateway", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Research Gateway HTTP health check failing."},
+    {"match": "slack_alert:homelab-5m-load-above-threshold", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "HomeLab 5m load above threshold."},
+    {"match": "slack_alert:homelab-cpu-above-threshold", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "HomeLab CPU above threshold."},
+    {"match": "uk:150", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "VPN Watchdog for homelab torrent VPN."}
   ],
   "ignore": [
     "docker_*:unhealthy:shelfmark",
@@ -341,6 +358,14 @@
     {"match": "slack_alert:vps-identity-test-this-app-now-posts-under-its-own-name-safe-to-delete", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Explicit vps identity test marked safe to delete."},
     {"match": "slack_alert:vps-webhook-test-hyperdx-alerts-will-arrive-under-this-name-safe-to-delete", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Explicit vps webhook test marked safe to delete."},
     {"match": "slack_alert:homelab-5m-load-below-threshold", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "5m load back below threshold; recovery."},
-    {"match": "slack_alert:homelab-cpu-below-threshold", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "CPU back below threshold; recovery."}
+    {"match": "slack_alert:homelab-cpu-below-threshold", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "CPU back below threshold; recovery."},
+    {"match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-1-persisting-past-the-2h-grace-window-locally-atrisk-0-mam-hasn-t-caught-up", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Locally atRisk=0; MAM hasn't caught up, not our issue."},
+    {"match": "slack_alert:homelab-temperature-below-threshold", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Temperature recovery below threshold."},
+    {"match": "slack_alert:argo-identity-test-this-app-now-posts-under-its-own-name-safe-to-delete", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Identity test message, safe to delete."},
+    {"match": "slack_alert:recycle-recovered-reply-the-gateway-restarted-during-delivery-so-this-may-be-a-duplicate-verstanden-die-vps-integration-", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Recovered duplicate reply after gateway restart."},
+    {"match": "slack_alert:vps-identity-test-this-app-now-posts-under-its-own-name-safe-to-delete", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Identity test message, safe to delete."},
+    {"match": "slack_alert:vps-webhook-test-hyperdx-alerts-will-arrive-under-this-name-safe-to-delete", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Webhook test message, safe to delete."},
+    {"match": "slack_alert:homelab-5m-load-below-threshold", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "5m load recovery below threshold."},
+    {"match": "slack_alert:homelab-cpu-below-threshold", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "CPU recovery below threshold."}
   ]
 }
