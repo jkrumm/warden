@@ -158,9 +158,12 @@ root with no rules at all** — every work repo under it is reachable at
 basename-keyed allowlist over two roots means. Naming them here so the next
 reader does not have to rediscover that "pinned" is narrower than it sounds.
 
-**And warden may never hold tier ≥ 1 on `sideclaw` or on `warden` itself.**
-sideclaw is a valid dispatch target today; auto-merging PRs against your own
-executor closes a loop that has no outside.
+**Warden's tier ceiling on `sideclaw` and `warden` is no longer pinned below
+`implement`** (owner decision, 2026-09-15) — both are `implement`-reachable
+like any other repo in `config/dispatch-repos.json`. sideclaw is a valid
+dispatch target today, and the auto-merge path lands here without a
+per-episode human gate exactly as it does for every other `implement`-tier
+repo whose validation comes back clean.
 
 ---
 
