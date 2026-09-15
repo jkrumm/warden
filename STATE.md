@@ -32,8 +32,9 @@ loop.
   `revert`) replaces the old bash verbs; the loop calls `scripts/lifecycle/`
   as functions, not shell scripts.
 - Every origin opens an item. `triage_items.origin` is one of `alert` (the
-  pollers), `github_issue` (the staleness poller and the `warden:go` label,
-  event source `github_go`), or `human` (`warden run`, typed in herdr or
+  pollers), `github_issue` (the `warden:go` label only, event source
+  `github_go` — the staleness poller's `github_issue` events are digest
+  lines and never open an item, §69), or `human` (`warden run`, typed in herdr or
   through Hermes's door with `--origin-channel`/`--origin-thread`). See
   `docs/history/state-log.md` §55.
 - Automatic investigate/implement dispatches pass `AUTO_DISPATCH_MODEL`

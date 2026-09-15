@@ -100,6 +100,11 @@ CH_UPDATES = "C0ARZJD824W"
 # the gateway to deliver its stdout.
 WATCHDOG_CHANNEL = os.environ.get("WATCHDOG_SLACK_CHANNEL", "C0ASRULFTSS")
 
+# Same env-first, absolute-default shape as triage.py's GH_BIN: launchd hands
+# this job PATH=/usr/bin:/bin, where a bare `gh` does not exist.
+_env_gh_bin = os.environ.get("GH_BIN")
+GH_BIN = Path(_env_gh_bin).expanduser() if _env_gh_bin else Path("/opt/homebrew/bin/gh")
+
 UK_DOWN_GATE_MIN = 30
 DOCKER_UNHEALTHY_GATE_MIN = 30
 GITHUB_STALE_DAYS = 3
@@ -512,8 +517,13 @@ def poll_docker(env: dict[str, str], host: str) -> list[dict[str, Any]]:
     return out
 
 
-def poll_github(env: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
-    out: dict[str, list[dict[str, Any]]] = {"github_pr": [], "github_issue": []}
+def poll_github(env: dict[str, str]) -> dict[str, list[dict[str, Any]] | None]:
+    """A kind maps to None when its search failed — never to `[]`, which
+    reconcile() reads as "every open item disappeared" and resolves them all.
+    That is what happened from 2026-09-09: launchd's PATH had no `gh`, every
+    search raised FileNotFoundError, and six still-open issues were resolved
+    on the first LaunchAgent run and never seen again."""
+    out: dict[str, list[dict[str, Any]] | None] = {"github_pr": None, "github_issue": None}
     gh_env = os.environ.copy()
     if env.get("GITHUB_TOKEN"):
         gh_env["GITHUB_TOKEN"] = env["GITHUB_TOKEN"]
@@ -526,16 +536,20 @@ def poll_github(env: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
     for kind, search, fields in queries:
         try:
             res = subprocess.run(
-                ["gh", "search", search, "--owner", GH_OWNER, "--state", "open",
+                [str(GH_BIN), "search", search, "--owner", GH_OWNER, "--state", "open",
                  "--json", fields, "--limit", "50"],
                 capture_output=True, text=True, timeout=30, env=gh_env,
             )
             if res.returncode != 0:
+                print(f"watchdog: gh search {search} exited {res.returncode}: {res.stderr.strip()[:200]}",
+                      file=sys.stderr)
                 continue
             items = json.loads(res.stdout or "[]")
-        except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+            print(f"watchdog: gh search {search} failed: {e!r}", file=sys.stderr)
             continue
 
+        out[kind] = []
         for it in items:
             if it.get("isDraft"):
                 continue
@@ -1396,6 +1410,10 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
 
     gh = poll_github(env)
     for kind in ("github_pr", "github_issue"):
+        if gh[kind] is None:
+            # Search failed this cycle — skip reconciling, same as an
+            # unreachable op_refs host: a blind poll must not resolve anything.
+            continue
         n, r, res = reconcile(conn, kind, gh[kind], now, 0, REM_HOURS[kind], deliver=deliver)
         all_new += n; all_rem += r; all_res += res
         conn.commit()

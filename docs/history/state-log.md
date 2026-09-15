@@ -7209,3 +7209,34 @@ work.
   the vps compose fallback, so vps `83c4bc6` removed the pin and ran
   `make argo-up` first, then the api deployed. `argo-api` healthy on
   `6765121`.
+
+## 69. The GitHub poll that resolved every open issue (2026-09-15)
+
+Asked why open GitHub issues never reached warden or Argo. Two findings.
+
+**By design:** only `warden:go`-labelled issues open an item
+(`ingest_github_go()`). The staleness poller's `github_issue` events are not
+in `INGEST_SOURCES`, so they are digest lines and nothing else — no dispatch,
+no comment, nothing on the board Argo is pushed. None of the 11 open issues
+across `jkrumm/*` carries the label; the only issue item ever opened is
+`dispatch-scratch#9`. STATE.md said the staleness poller opened items too; it
+does not, corrected.
+
+**A bug:** `com.jkrumm.warden-poll` runs with launchd's `PATH=/usr/bin:/bin`,
+where `gh` does not exist. `poll_github()` caught the `FileNotFoundError` and
+returned `[]` per kind, which `reconcile()` reads as "every open issue
+disappeared" — so the first LaunchAgent run (2026-09-09 12:05Z) resolved all
+six open `github_issue` events (`basalt-ui#51`, `#52`, `rollhook#21`,
+`dispatch-scratch#2`, `ntfy-mac#12`, `research-gateway#1`) and every run since
+was blind while exiting 0. Reproduced under an `env -i` launchd-shaped env.
+
+Fix: `GH_BIN` (env-first, `/opt/homebrew/bin/gh` default — the shape
+`triage.py` already had for the same reason), a non-zero exit or exception now
+logs a line to stderr and maps that kind to `None`, and `_run_poll` skips
+reconciling a `None` kind, same as an unreachable `op_refs` host. New
+`tests/test_watchdog_github_blindness.py`. `make test` green, `test_triage.py`
+255/255.
+
+Open: whether owner-authored issues should open items without the label, and
+how a third-party issue's assessment gets approved — a design question, not
+part of this fix.
