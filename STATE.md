@@ -6,8 +6,8 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-15 (§71) |
-| Current wave | GitHub-issues-in-warden chain (`docs/waves/PLAN.md`): Wave 1 done (§70), Wave 2 done (§71), Wave 3 active (argo API: the action queue, in `~/SourceRoot/argo`). Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
+| Last updated | 2026-09-15 (§72) |
+| Current wave | GitHub-issues-in-warden chain (`docs/waves/PLAN.md`): Wave 1 done (§70), Wave 2 done (§71), Wave 3 done (argo API: the action queue — no warden-repo state-log entry, see argo's own `docs/waves/PLAN.md`), Wave 4 done (§72, argo dashboard: issues + one-click triage), Wave 5 active (end to end on a real issue). Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
 | Tests | `tests/test_triage.py` 265/265 is the gate; `make test` runs all suites |
@@ -58,10 +58,11 @@ loop.
   `issue` sub-object. Every daily count budget (`WARDEN_DAILY_BUDGET`/
   `WARDEN_IMPLEMENT_BUDGET`/`WARDEN_MERGE_BUDGET`/`DAILY_INVESTIGATE_BUDGET`)
   is gone — `MAX_OPEN_INVESTIGATIONS` and the per-repo lock are the only
-  ceilings left on autonomous spend. Wave 3 (in `~/SourceRoot/argo`) is what
-  makes `GET /warden/actions`/`POST /warden/actions/:id/ack` real; until it
-  ships, `fetch_actions()` 404s the same non-event way `push_snapshot()` did
-  pre-Wave-1.
+  ceilings left on autonomous spend. `GET /warden/actions`/
+  `POST /warden/actions/:id/ack` are live (argo Wave 3, deployed to prod);
+  `fetch_actions()` no longer 404s. Argo's `/warden` page now has a GitHub-
+  issues section rendering `availableActions`/`issue` with one-click
+  implement/merge/dismiss/reinvestigate/note buttons (Wave 4, §72).
 - `maybe_auto_remediate()` runs between `run_verbs()` and
   `maybe_auto_implement()`: a `hostVerbs` policy match plus a folded verdict
   at or above `hostVerbMinConfidence` (medium) runs one `HOST_VERB_ALLOWLIST`
@@ -169,26 +170,36 @@ loop.
   verdicts land in `needs_human` — §70
 - GitHub issues in warden, Wave 2: owner actions pulled from Argo, every
   daily budget removed — §71
+- GitHub issues in warden, Wave 4: the dashboard's one-click triage section
+  (Wave 3, the argo action-queue API, has no warden-repo entry — it happened
+  entirely in argo) — §72
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
 
-Wave 3 of `docs/waves/PLAN.md` (argo API: the action queue) is next, and it
-runs in `~/SourceRoot/argo`, not here: `apps/api/src/db/schema.ts`'s
-`warden_actions` table + migration, `POST /warden/items/:eventId/actions` /
-`GET /warden/actions` / `POST /warden/actions/:id/ack` in
-`apps/api/src/routes/warden.ts` (validate the verb against the same closed
-list `apply_argo_actions()` enforces: `implement`/`merge`/`dismiss`/
-`reinvestigate`/`note`), tests, and an argo CLAUDE.md § Warden note on why
-the queue exists. Until it ships, warden's own `fetch_actions()` 404s every
-tick — a logged non-event, same posture `push_snapshot()` had pre-Wave-1.
+Wave 5 of `docs/waves/PLAN.md` (end to end on a real issue) is next: open an
+owner issue in `dispatch-scratch`, watch it become an item and get
+investigated, then approve/dismiss from the now-live Argo `/warden` GitHub-
+issues section and confirm the transition lands in both the ledger and the
+page. Also confirm the existing backlog (research-gateway #3–#7, basalt-ui
+#51/#52, rollhook #21, sideclaw #3/#4 → investigate-only, ntfy-mac #12
+third-party) shows correct assessments there — most of it already does, per
+§72's live chrome-devtools check. Once Wave 5 closes, rewrite this file's
+history section one more time and delete `docs/waves/PLAN.md`.
 
 Left behind by Wave 1, still unresolved: sideclaw's own dispatch-policy
 boundary still allows `implement` on `sideclaw`/`warden` — `make check-policy`
 disagrees until sideclaw's side is capped too (out of this plan's scope, a
 sideclaw-repo change).
+
+Left behind by Wave 4 (full detail in argo's `docs/waves/PLAN.md`): fallow's
+audit in argo never went fully green — confirmed pre-existing, unrelated
+dependency debt plus an architectural duplication call (`board-section.tsx`
+vs `issues-section.tsx`'s card/responsive-switch/empty-wrapper skeletons)
+the review itself flagged as needing a deliberate decision, not chased
+further this wave.
 
 §67/§68 closed the recurring-alert list: backup heartbeat, tier-cap flap
 (543 now `needs_human`), creation transitions, alert reminders on the event,
@@ -196,7 +207,8 @@ the snapshot bounded to 50 rows per item, `secrets-run`'s group relay
 (dotfiles `a9410e7`), the VPN Watchdog interval (homelab-private `a71ded1`).
 argo's item modal is live (`4213502`), its AI gateway on deepseek-v4.1-flash
 (`6765121`, vps `83c4bc6`). hermes-agent pushed, gateway restarted onto the
-start-grace/skill-hint/darwin-forensics patches; 543 closed. Unverified: the
-modal in a browser (Argo login). Still ahead from before: the first
-host-verb `fixed`, the ledger restore path, Wave 9 from
-`docs/handover-field-review.md`.
+start-grace/skill-hint/darwin-forensics patches; 543 closed. Argo's GitHub-
+issues dashboard section (§72) was verified live in a browser, replacing the
+"unverified: the modal in a browser" note that used to sit here. Still ahead
+from before: the first host-verb `fixed`, the ledger restore path, Wave 9
+from `docs/handover-field-review.md`.

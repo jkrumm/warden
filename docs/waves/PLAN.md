@@ -181,27 +181,68 @@ verified live: `GET /api/health` reports the pushed commit,
 `GET /api/warden/actions?machine=mini&status=pending` returns `[]`
 authenticated, 422 without `machine`.
 
-## Wave 4 — argo dashboard: issues and one-click triage   <!-- status: active -->
+## Wave 4 — argo dashboard: issues and one-click triage   <!-- status: done -->
 Work happens in `~/SourceRoot/argo/apps/dashboard` (basalt-ui, Mantine, no
 Tailwind, `--vx-*` tokens).
-- [ ] `features/warden/`: a GitHub issues section on `/warden` — repo#number
-      link, title, author with a third-party badge, item state, verdict
-      summary/recommendation/confidence, age. Grouped by state: needs you /
-      running / auto-implementing / done.
-- [ ] Action buttons from `availableActions` (Implement, Merge, Dismiss with
-      reason, Re-investigate, Note) on issue rows and in the existing item
-      modal; POST to the queue via `lib/queries/warden.ts` (TanStack Query
-      mutation), show "queued → applied/rejected" from the action status
-      until the next snapshot reflects the transition.
-- [ ] `model.ts` + `model.test.ts` for the grouping and the pending-action
-      reconciliation.
-- [ ] `/check` in argo, then deploy: push argo `master` (RollHook rolling
-      restart). Owner authorized every deploy in this chain (2026-09-15) — no
-      stop, no asking. Confirm the dashboard serves the new section, then
-      spawn Wave 5.
-**Left behind:**
+- [x] `features/warden/issues-section.tsx`: a GitHub issues section on
+      `/warden` — repo#number link, title, third-party badge, state, note
+      (verdict summary), age. Grouped by pipeline stage via
+      `groupIssueItems()`: needs you / running / auto-implementing / done.
+- [x] Action buttons from `availableActions` (Implement, Merge, Dismiss with
+      reason, Re-investigate, Note) on issue rows; POST to the queue via
+      `enqueueWardenAction()` (TanStack Query mutation in
+      `use-warden-actions.ts`), pending state shown as "Queued: <verb>"
+      until the next snapshot's `updated_at` moves past the queue moment (or
+      a 15-min timeout, reconciled every 30s).
+- [x] `model.ts` + `model.test.ts` for the grouping and the pending-action
+      reconciliation (`groupIssueItems`, `withPendingAction`,
+      `reconcilePendingActions`, `deriveWardenPage`).
+- [x] `/check` in argo, then deploy: pushed argo `master`
+      (`a85c6d3`) — GitHub Actions `Deploy` workflow (api + dashboard, both
+      via RollHook) succeeded, `/api/health` confirmed the new commit live.
+      Confirmed via an authenticated chrome-devtools session against
+      `https://argo.jkrumm.com/warden`: the section renders the real backlog
+      (6 needs-you, 1 auto-implementing, correct per-state action buttons),
+      zero console errors.
+**Left behind:** `apps/api/src/routes/warden.ts`'s `BoardItemSchema` was
+missing `availableActions`/`issue` entirely (present on the wire since Wave 2,
+never declared in Argo's own schema) — added, and deliberately typed
+`availableActions` as `z.array(z.string())` rather than a hard `z.enum`
+(caught by `/review`'s api-contract angle: a closed enum here would 422 the
+*entire* snapshot over one item carrying a verb the two repos haven't synced
+on). The dashboard's own `WardenActionVerb` is hand-declared and every read of
+`item.availableActions` is filtered through `isKnownActionVerb()` before
+render — an earlier pass had it silently derived from the (now-loosened) wire
+type, which collapsed to plain `string` and would have rendered an
+"undefined"-labelled button that still fired a real mutation; caught by a
+second `/review` pass, fixed same wave. Also fixed same wave from that first
+`/review`: `ActionPromptModal`'s shared form instance leaking stale
+dismiss/note text across items on close-without-submit; a keyboard
+Enter/Space on a nested Button/Anchor bubbling into the card's own
+`onKeyDown` and opening the wrong modal; pending actions never expiring when
+a poll returns a structurally-identical snapshot (React Query keeps the same
+array reference) — now also reconciled on a 30s timer, not only on reference
+change. And from the second `/review` pass: an `onError` race where a
+stale/late-failing action could clear a *newer* pending action queued for the
+same event (fixed by capturing `queuedAt` as mutation context and only
+clearing on a match). `fallow`'s audit never went fully green and was
+deliberately not chased further — `24 unused dependencies` is pre-existing,
+repo-wide debt confirmed unrelated to this diff (a stashed pre-Wave-4 check
+run was fallow-clean); the remaining ~3 duplicate-clone groups between
+`board-section.tsx` and `issues-section.tsx` (card skeleton, the responsive
+table/card switch, the top-level empty-state wrapper) is the same
+architectural call `/review`'s architect angle flagged explicitly as "worth a
+deliberate decision, not an auto-apply" (a generic `EntityListSection<T>`) —
+picked up only if a future wave touches this area again. Minor,
+non-blocking `/review` findings deferred as-is: no confirm-step before
+`merge` fires (reads as destructive in the UI even though warden gates it
+server-side), the dismiss/note `Textarea` has no accessible `label` (only a
+placeholder), no double-submit guard on the prompt modal, `ItemCard` in
+`board-section.tsx` has the same keyboard-double-fire shape as the new
+`IssueCard` but wasn't touched by this diff, OpenAPI `detail.description` for
+`GET /warden/snapshot` wasn't updated to mention the new fields.
 
-## Wave 5 — end to end on a real issue                <!-- status: pending -->
+## Wave 5 — end to end on a real issue                <!-- status: active -->
 - [ ] Open an owner issue in `dispatch-scratch`; watch it become an item,
       get investigated, and either auto-implement (draft PR) or land in
       `needs_human`. Approve from Argo; confirm the transition in the ledger

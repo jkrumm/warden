@@ -7356,3 +7356,94 @@ sideclaw-repo fix.
 
 `docs/waves/PLAN.md` Wave 3 (argo API: the action queue, in `~/SourceRoot/argo`)
 is active next.
+
+## 72. GitHub issues in warden, Wave 4: the dashboard's one-click triage section (2026-09-15)
+
+`docs/waves/PLAN.md` Wave 4, entirely in `~/SourceRoot/argo`. `Wave 3`'s own
+state-log entry was never written (that work happened in argo, not here) —
+its full account is in `argo/docs/waves/PLAN.md`'s own Wave 3 Left behind,
+not duplicated here.
+
+`apps/dashboard/src/features/warden/issues-section.tsx` (new) adds a
+GitHub-issues section to `/warden`, scoped to `origin: "github_issue"` items
+and grouped by pipeline stage (`groupIssueItems()` in `model.ts`: needs_you /
+running / auto_implementing / done — carved out of raw `state`, not warden's
+own board buckets) rather than the generic board's raw-state buckets. Each
+row: repo#number link (guarded by a new `isSafeHttpUrl()` — `issue.url` can
+be third-party-authored, so a non-http(s) scheme never renders as a
+clickable href), title, a third-party badge, state, note (the verdict
+summary), age, and one button per verb in `availableActions`
+(implement/merge/reinvestigate fire immediately, dismiss/note collect a
+short reason first). Buttons POST through `enqueueWardenAction()` to
+`POST /warden/items/:eventId/actions` (the queue Wave 3 built); a client-side
+`PendingActions` map shows "Queued: <verb>" until `reconcilePendingActions()`
+sees the item's `updated_at` move past the queue moment or a 15-minute
+timeout elapses — reconciled both on every fresh snapshot and on its own
+30-second timer (the timer exists because React Query's structural sharing
+keeps the same `items` array reference across a poll that comes back
+unchanged, which would otherwise leave a timed-out entry stuck forever).
+
+Two `/review` passes, both real findings, both fixed same wave. First pass
+(4 blocking): `ActionPromptModal`'s one shared `useForm` instance leaked a
+dismiss/note draft across items when closed without submitting — a second
+item's prompt opened pre-filled with the first item's already-valid text and
+would submit it against the wrong event if not re-cleared; fixed by
+resetting the form on every close path. A keyboard Enter/Space on a nested
+real control (the action Buttons, the issue Anchor) bubbled into the
+card's own `onKeyDown` and opened the timeline modal in addition to the
+control's own action — fixed with an `e.target !== e.currentTarget` guard.
+`apps/api/src/routes/warden.ts`'s `BoardItemSchema` (present since Wave 2 on
+the wire, never actually declared) got `availableActions`/`issue` added as a
+hard `z.enum`/required-fields schema, which directly contradicted the file's
+own stated "validated loosely so a new field never 422s the ingest" design —
+warden and Argo are separately deployed with this vocabulary manually
+mirrored, so one item carrying an unsynced verb would have 422'd the entire
+snapshot (health, metrics, budget, board, intents, all of it) until someone
+re-synced the two repos; loosened to `z.array(z.string())` plus optional
+`author`/`labels`. Pending actions never expired when a poll returned a
+structurally-identical board — the 30-second timer above is that fix.
+
+That schema loosening created a new bug the second `/review` pass caught:
+the dashboard's `WardenActionVerb` was derived from the wire type
+(`NonNullable<WardenBoardItem['availableActions']>[number]`), which
+collapsed to plain `string` the moment the enum was dropped — an
+unrecognized verb would have rendered a button labelled literal `"undefined"`
+that still submitted that verb to the action API, exactly contradicting the
+API route's own comment that "the dashboard already only renders buttons for
+verbs it recognizes." Fixed by hand-declaring `WardenActionVerb` as its own
+closed union in `lib/queries/warden.ts` and filtering every read of
+`item.availableActions` through a new `isKnownActionVerb()` before
+rendering. Same pass caught a race in the mutation's `onError`: it cleared
+`pending[eventId]` unconditionally, so a stale/late-failing action could wipe
+out a *newer* pending action queued for the same event — fixed by capturing
+`queuedAt` as mutation context in `onMutate` and only clearing on a match.
+
+Cheap fixes applied alongside: `use-warden-actions.ts` (new) pulls the
+mutation + pending-state + reconciliation out of `WardenPage`, mirroring
+`model.ts`'s ownership of every other board derivation and cutting the
+page's own complexity; `board-item-cells.tsx` (new) shares `StateBadge`/
+`AgeText` between `board-section.tsx` and `issues-section.tsx`'s table
+columns, the one duplication fix judged safe to auto-apply.
+`reconcilePendingActions()` now returns the same reference when nothing
+changed, and `deriveWardenPage()` falls back to a stable empty-array
+constant — both guard against a needless re-render/render-loop risk the
+second review flagged. `fallow`'s audit never went fully green and was
+deliberately not chased further: a stashed pre-Wave-4 check run proved its
+"24 unused dependencies" finding is pre-existing, repo-wide debt unrelated to
+this diff; the remaining ~3 duplicate-clone groups (the card skeleton, the
+responsive table/card switch, the top-level empty-state wrapper, shared
+between `board-section.tsx` and `issues-section.tsx`) is the same
+architectural call the review's architect angle explicitly flagged as
+"worth a deliberate decision, not an auto-apply" (a generic
+`EntityListSection<T>`) — full list of what's deferred and why is in
+`docs/waves/PLAN.md`'s Wave 4 Left behind, not repeated here.
+
+`/check` (argo): format/lint/typecheck/test all green (1034 API + 269
+dashboard tests). Pushed argo `master` at `a85c6d3` — GitHub Actions'
+`Deploy` workflow (api + dashboard, both via RollHook) succeeded in ~1
+minute; `/api/health` confirmed the new commit. Verified live via an
+authenticated chrome-devtools session against `https://argo.jkrumm.com/warden`:
+the section renders the real backlog (6 needs-you, 1 auto-implementing,
+correct per-state buttons), zero console errors.
+
+`docs/waves/PLAN.md` Wave 5 (end to end on a real issue) is active next.
