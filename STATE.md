@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-20 (§76) |
+| Last updated | 2026-09-20 (§77) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 273/273 is the gate; `make test` runs all suites (17 files, incl. the new `tests/test_reset_frozen_notes.py`) |
+| Tests | `tests/test_triage.py` 274/274 is the gate; `make test` runs all suites (17 files, incl. the new `tests/test_reset_frozen_notes.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -163,6 +163,9 @@ loop.
   still not built.
 - `#agents` is warden-only since 2026-09-11 (Hermes's narratives cron moved to
   `#hermes`); approval buttons still post to `#hermes`.
+- `config/triage-policy.json` carries 151 rule entries for 61 distinct match
+  values and 49 ignore entries for 12 (§77). §76's dedup stops the growth;
+  nothing has collapsed what accumulated. First match wins, so it is inert.
 - `_fetch_note_rows()` does not filter resolved events, so a `note` row whose
   incident has since resolved keeps appearing under the digest's "Unstructured
   notes" heading forever (§76). Digest-content call, not yet made.
@@ -214,11 +217,26 @@ loop.
   `slack_alert` rows in the terminal `note` state; rule matching now runs
   first, the proposal pass dedups against the policy file, and the frozen
   rows were revived once from a ledger snapshot — §76
+- The field look after ten unattended days (153 dispatches, 6 failed, 0
+  watchdog kills, 1 of 25 draft PRs merged); `classify()` re-froze an
+  already-mapped row in `note` on its second pass — §77
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
 
 ### Next action
+
+**§77, the field look (read it first).** The dispatch lane held up alone for
+ten days; the open work is the owner's, not the loop's: 24 draft PRs across
+nine repos are unreviewed, which is also the only way to learn whether
+`glm-5.3-flash`'s implement output is good — the ledger measures that it
+finished, not that it was right. Items waiting: 543 and 1133 (`dotfiles`,
+`needs_human`), 1062 (`rollhook`, `merge_blocked`, PR review required). 543 is
+the decision behind the loudest recurring alert (host health check grades
+memory-pressure level 2 as FAIL). Outside this repo: the gateway
+context-window table in dotfiles and sideclaw has one row, so any model other
+than `glm-5.3-flash` auto-compacts at 200k — add measured rows before trying
+another model, not after.
 
 No wave is active — the GitHub-issues-in-warden chain (`docs/waves/PLAN.md`,
 deleted this commit) is fully done across all five waves. Nothing queued

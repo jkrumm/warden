@@ -7695,3 +7695,61 @@ Residual, deliberately not changed here: `_fetch_note_rows()` does not filter
 resolved events, so the four rows above keep appearing under the digest's notes
 heading until someone decides that heading should drop resolution-closed notes.
 That is a digest-content decision, not part of this fix.
+
+## 77. The field look after ten unattended days, and the half §76 left open (2026-09-20)
+
+The owner was away from roughly 2026-09-08 and asked how the loop had done
+alone, with the suspicion that the cheap-model dispatch lane was the weak part.
+Measured from the ledger, read-only, 2026-09-08 → 2026-09-20:
+
+| | |
+|-|-|
+| Items opened | 178 (alert 120, human 39, github_issue 19) — 98 closed, 51 quiet, 16 ignored, 7 note, 1 fixed, 2 needs_human, 1 merge_blocked |
+| Dispatches | 153 — investigate 77 done / 3 failed / 16 cancelled, implement 35 / 3, review 19 / 0 |
+| Duration, median / p90 | investigate 7 / 23 min, implement 40 / 93 min, review 10 / 20 min |
+| Implement outcomes | 25 draft PRs, 7 `checks_failed` (→ `needs_human`, as designed), 3 `no_changes` |
+| Merged | 1 of 25 (argo#18) — the other 24 are the owner's review backlog |
+| Idle-watchdog kills, compaction failures | 0 |
+| `/metrics` `verified_fixes_vs_silence` | 0.077 — 1 verified fix against 97 silence-closes in the 7-day window |
+
+So the dispatch lane on `glm-5.3-flash` did not break; what is unmeasured is
+the *quality* of those 24 PRs, and the funnel still closes almost everything on
+silence rather than on a verified fix. The owner's two interactive failures
+were a different lane: `ca deepseek-v4-pro` auto-compacted constantly because
+`_ca_ctx` (dotfiles `config/zsh/iu-models.sh`) and its mirror
+`GATEWAY_CONTEXT_TOKENS` (sideclaw `server/mcp/session-runner.ts`) each carry
+exactly one row, `glm-5.3-flash`, and every other gateway id falls back to the
+200k budget Claude Code assumes over a custom base URL; and the `glm-5.3-flash`
+"hang" matches modelpick's measured 13.3 tok/s effective in-loop rate, which is
+a latency fact, not a fault. Neither is a warden change. sideclaw prunes
+terminal jobs after 24 h, so its side of any incident older than a day is
+unrecoverable — only this ledger kept the period.
+
+Two subagent findings were checked against the code and were already fixed:
+the 281 refused `implement` attempts on item 543 (2026-09-12 → 09-14) are the
+tier-cap flap §67 closed with the local `resolve_tier()` check, and
+`checks_failed` does fold to `needs_human`.
+
+**The bug this look did find.** Item 121 (`slack_alert:homelab-cpu-above-threshold`)
+went `quiet → new → note` at 07:53Z, six hours after §76's ordering fix, with
+`repo=homelab` intact. `classify()` only consults `rules` for a row with no
+repo/verb yet, and the block below it fell through to the prose filter for any
+row that matched no rule *this pass* — which includes every row mapped on an
+earlier pass: one still `new` because it waits on the threshold or the cluster
+cap, or one back in `new` because its signature recurred. §76's own comment
+described that fall-through as intended. It is not: a mapped signal is never
+the filter's to route. `classify()` now `continue`s on a row that already has a
+repo or verb, before the unmapped bookkeeping and the filter.
+`tests/test_triage.py` 273 → **274/274**
+(`test_mapped_row_survives_a_second_classify_pass`, written first and watched
+fail with `state='note'`); `make test` green across all suites. The loop runs
+from this working tree, so the fix was live on the next tick;
+`scripts/reset-frozen-notes.py --apply` was run once more for the three rows
+the bug had re-frozen (events 13, 120, 121).
+
+Noted, not changed: `config/triage-policy.json` still carries 151 rule entries
+for 61 distinct match values and 49 ignore entries for 12 — §76's dedup stops
+the growth, nothing has collapsed what already accumulated. The largest
+recurring alert by transition volume (`MacMini Dev Host - Push`, 571) is not a
+monitor-interval problem: the host health check grades memory-pressure level 2
+as FAIL, which is the decision item 543 is waiting on.

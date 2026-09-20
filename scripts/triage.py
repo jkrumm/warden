@@ -2464,9 +2464,7 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
         # Rules FIRST — a signature the policy already maps is a mapped
         # signal and must never be swallowed by the prose filter below. The
         # `repo`/`verb` guard is unchanged: a row whose mapping was resolved
-        # on an earlier pass matches no rule of its own, so it skips straight
-        # to the filter, which is what its ORIGINAL code did too (the filter
-        # used to run before this block entirely).
+        # on an earlier pass matches no rule of its own.
         rule: dict[str, Any] | None = None
         if row["repo"] is None and row["verb"] is None:
             rule = _match_rule(targets, policy["rules"])
@@ -2483,9 +2481,16 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
             )
             continue
 
+        # Mapped on an earlier pass — still `new` because it waits on the
+        # threshold or the cluster cap, or back in `new` because its signature
+        # recurred with its repo intact. A mapped signal is never the prose
+        # filter's to route: falling through froze item 121 in `note` again
+        # six hours after the ordering fix above landed (§77).
+        if row["repo"] is not None or row["verb"] is not None:
+            continue
+
         # No rule matched this row.
-        if row["repo"] is None and row["verb"] is None:
-            unmapped.add(row["signature"])
+        unmapped.add(row["signature"])
 
         if policy["ignoreUnstructuredSlackProse"] and event_row["source"] == "slack_alert" \
                 and not _looks_like_bot_alert(event_row["title"]):

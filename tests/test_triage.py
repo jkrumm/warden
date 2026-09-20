@@ -725,6 +725,35 @@ def test_rule_matching_runs_before_the_prose_filter():
             "as unmapped too is the double-report this ordering removes")
 
 
+def test_mapped_row_survives_a_second_classify_pass():
+    """The half §76 left open (item 121, 2026-09-20 07:53Z: quiet -> new ->
+    note with repo=homelab intact). classify() only consults `rules` for a row
+    with no repo/verb yet, so a row mapped on an EARLIER pass — still `new`
+    because it waits on the threshold or the cluster cap, or back in `new`
+    because its signature recurred — matched no rule of its own and fell
+    through to the prose filter, which froze it in the terminal STATE_NOTE.
+    A mapped signal is never the filter's to route, on any pass."""
+    policy = dict(
+        DEFAULT_POLICY,
+        ignoreUnstructuredSlackProse=True,
+        rules=[{"match": "slack_alert:homelab-cpu-above-threshold", "repo": "homelab"}],
+    )
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(
+            conn, source="slack_alert", external_id="homelab-cpu-above-threshold",
+            title="HomeLab CPU above threshold", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage.classify(conn, policy, NOW)
+        unmapped = triage.classify(conn, policy, NOW)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEW, (
+            "a row mapped on an earlier pass must stay `new` for the escalation pass, "
+            f"not be routed by the prose filter — got state={item['state']!r}")
+        assert item["repo"] == "homelab"
+        assert "slack_alert:homelab-cpu-above-threshold" not in unmapped
+
+
 def test_uk_maps_via_title_not_external_id():
     """The core fix for correction #1: uk's external_id is an opaque monitor
     id, unglobbable and unstable — only the title-derived match target makes
