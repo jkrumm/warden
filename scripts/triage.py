@@ -34,15 +34,18 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    close -> recur cycle, so this is a state fix-up, never a
                    new row).
   3. Classify     — fnmatch MULTIPLE targets per event (see MATCH TARGETS
-                   below) against config/triage-policy.json, in order: the
-                   explicit `ignore` list (genuine recoveries/known-benign —
-                   route to `ignored`, terminal, invisible), the structural
-                   `ignoreUnstructuredSlackProse` fallback (route to
-                   STATE_NOTE — terminal, but VISIBLE in the digest, see that
-                   state's own docstring for why), then `rules` (resolve
-                   EITHER `repo`, escalate to an episode, OR `verb`, run a
-                   declared local command — see VERB OUTCOMES below). Only
-                   ever touches a row still in state `new`.
+                    below) against config/triage-policy.json, in order: the
+                    explicit `ignore` list (genuine recoveries/known-benign —
+                    route to `ignored`, terminal, invisible), then `rules`
+                    (resolve EITHER `repo`, escalate to an episode, OR
+                    `verb`, run a declared local command — see VERB OUTCOMES
+                    below), and ONLY for a row no rule matched the structural
+                    `ignoreUnstructuredSlackProse` fallback (route to
+                    STATE_NOTE — terminal, but VISIBLE in the digest, see that
+                    state's own docstring for why). The prose filter runs LAST
+                    deliberately — see classify()'s own docstring for the
+                    family it froze when it ran first. Only ever touches a row
+                    still in state `new`.
   -1. Reconcile   — runs FIRST, before even Drain, over `operations` rows
                    with `outcome IS NULL` — an operation this process
                    recorded as STARTED (before the external call it covers:
@@ -2424,12 +2427,25 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
     _match_targets()) and apply, in order: the explicit `ignore` list (same
     targets — a deliberate human call that THIS signature is a genuine
     recovery or known-benign pattern, checked first so it always wins), then
-    the structural `ignoreUnstructuredSlackProse` fallback (routes to
-    STATE_NOTE, never STATE_IGNORED — see that state's own docstring for why
-    silently dropping unstructured #alerts prose would recreate the exact
-    bug this file exists to kill), then rule matching. Only ever touches a
-    row still in state `new`. Returns every signature that matched no rule
-    this run, for the once-a-day digest."""
+    rule matching, and only for a row no rule matched the structural
+    `ignoreUnstructuredSlackProse` fallback (routes to STATE_NOTE, never
+    STATE_IGNORED — see that state's own docstring for why silently dropping
+    unstructured #alerts prose would recreate the exact bug this file exists
+    to kill). Only ever touches a row still in state `new`. Returns every
+    signature that matched no rule this run, for the once-a-day digest.
+
+    **The prose filter runs LAST, and that order is load-bearing.** It is a
+    prefix test on the title (`_looks_like_bot_alert`), and a producer that
+    emits bare sentences — Beszel's `HomeLab CPU above threshold` — fails it
+    on every occurrence, however real the alert. Run first, it routed that
+    whole family to the terminal `note` state before rule matching was ever
+    consulted, so the ~15 rules `config/triage-policy.json` had accumulated
+    for exactly those signatures (appended by _propose_mapping_candidates()
+    on seven consecutive days) were dead on arrival: a rule added after a row
+    is `note` can never reach it, and a `note` row itself never escalates.
+    The documented purpose of the filter — an un-prefixed, rule-LESS Slack
+    diagnosis stays visible-but-quiet instead of being dropped — is
+    unchanged: that is exactly the `not rule_matched` case below."""
     rows = conn.execute(
         "SELECT event_id, signature, repo, verb FROM triage_items WHERE state=?", (STATE_NEW,)
     ).fetchall()
@@ -2445,25 +2461,43 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
             _set_state(conn, row["event_id"], STATE_IGNORED, now)
             continue
 
+        # Rules FIRST — a signature the policy already maps is a mapped
+        # signal and must never be swallowed by the prose filter below. The
+        # `repo`/`verb` guard is unchanged: a row whose mapping was resolved
+        # on an earlier pass matches no rule of its own, so it skips straight
+        # to the filter, which is what its ORIGINAL code did too (the filter
+        # used to run before this block entirely).
+        rule: dict[str, Any] | None = None
+        if row["repo"] is None and row["verb"] is None:
+            rule = _match_rule(targets, policy["rules"])
+        if rule is not None and rule.get("repo"):
+            conn.execute(
+                "UPDATE triage_items SET repo=?, updated_at=? WHERE event_id=?",
+                (rule["repo"], now_iso, row["event_id"]),
+            )
+            continue
+        if rule is not None and rule.get("verb"):
+            conn.execute(
+                "UPDATE triage_items SET verb=?, updated_at=? WHERE event_id=?",
+                (rule["verb"], now_iso, row["event_id"]),
+            )
+            continue
+
+        # No rule matched this row.
+        if row["repo"] is None and row["verb"] is None:
+            unmapped.add(row["signature"])
+
         if policy["ignoreUnstructuredSlackProse"] and event_row["source"] == "slack_alert" \
                 and not _looks_like_bot_alert(event_row["title"]):
             _set_state(conn, row["event_id"], STATE_NOTE, now)
+            # Not reported as unmapped: this row has its own digest section
+            # (see maybe_post_daily_digest()'s STATE_NOTE half), and listing
+            # the same signature under both headings is the noise this
+            # ordering exists to remove. Nothing is lost for the mapping pass
+            # either — _propose_mapping_candidates() reads the ledger, not
+            # this return value, and deliberately includes `note` rows.
+            unmapped.discard(row["signature"])
             continue
-
-        if row["repo"] is None and row["verb"] is None:
-            rule = _match_rule(targets, policy["rules"])
-            if rule is not None and rule.get("repo"):
-                conn.execute(
-                    "UPDATE triage_items SET repo=?, updated_at=? WHERE event_id=?",
-                    (rule["repo"], now_iso, row["event_id"]),
-                )
-            elif rule is not None and rule.get("verb"):
-                conn.execute(
-                    "UPDATE triage_items SET verb=?, updated_at=? WHERE event_id=?",
-                    (rule["verb"], now_iso, row["event_id"]),
-                )
-            else:
-                unmapped.add(row["signature"])
     conn.commit()
     return unmapped
 
@@ -5889,6 +5923,21 @@ def _propose_mapping_candidates(conn: sqlite3.Connection, policy: dict[str, Any]
     `unsure` about within PROPOSE_UNSURE_COOLDOWN_DAYS — oldest first, capped
     at PROPOSE_MAPPINGS_MAX_SIGNATURES.
 
+    **A signature the policy file already covers — in `rules` OR in
+    `ignore` — is never a candidate**, whatever its current state: what this
+    pass asks is "has this signature ever been mapped", and a rule or ignore
+    entry IS that mapping, so expecting the item's own lifecycle to show it
+    inverts the question. Without this the pass re-proposed the same
+    signatures every day, because no state-based exclusion can see a rule
+    classify() never had the chance to apply — the prose filter used to run
+    before rule matching (see classify()'s own docstring), so a
+    `note`-frozen signature looked permanently unmapped while 134 rule
+    entries piled up for 61 unique match values (41 ignore entries for 12).
+    The comparison runs through `_match_targets()` plus `_fnmatch_any()` —
+    the same two helpers classify() itself uses — so a title-derived match
+    (a `uk` monitor id, see the module docstring's MATCH TARGETS paragraph)
+    counts as covered too, not just the literal signature string.
+
     Deliberately NOT restricted to `state = new`. Keying the pool on current
     state made this whole pass inert: resolve_quiet_grouped() runs earlier in
     the same cycle, so a grouped `slack_alert` signature flips to `resolved` on
@@ -5896,13 +5945,11 @@ def _propose_mapping_candidates(conn: sqlite3.Connection, policy: dict[str, Any]
     live DB, 16 of 19 unmapped signatures vanished that way and the other 3
     were younger than the age floor — zero candidates, permanently.
 
-    The question this pass answers is "has this signature ever been mapped",
-    which is a property of the POLICY FILE, not of an item's lifecycle. A
-    signature that resolved quietly is still unmapped and will fire again; that
-    is precisely the case worth mapping. `ignored` is the one state excluded —
-    a human or a rule already decided it deliberately, and re-proposing it
-    would relitigate a settled call. Items are collapsed per signature, since
-    the same signature can own several rows over time."""
+    A signature that resolved quietly is still unmapped and will fire again;
+    that is precisely the case worth mapping. `ignored` is the one state
+    excluded — a human or a rule already decided it deliberately, and
+    re-proposing it would relitigate a settled call. Items are collapsed per
+    signature, since the same signature can own several rows over time."""
     age_days = policy["proposeMappingsAgeDays"]
     # Age alone is the wrong test on its own. The floor exists to avoid spending a
     # proposal on a one-off, but a signature that has already fired many times is
@@ -5912,15 +5959,29 @@ def _propose_mapping_candidates(conn: sqlite3.Connection, policy: dict[str, Any]
     # persistent, OR frequent enough to have proven the same thing faster.
     min_occurrences = PROPOSE_MAPPINGS_MIN_OCCURRENCES
     unsure_cutoff = now - dt.timedelta(days=PROPOSE_UNSURE_COOLDOWN_DAYS)
+    # Every `match` value the policy file already carries, in both halves —
+    # `rules` entries are validated {match, repo|verb} dicts, `ignore` is
+    # already flattened to plain patterns by load_policy(). Read with .get():
+    # tests call this function with a minimal {"proposeMappingsAgeDays": …}.
+    covered: list[str] = [
+        r["match"] for r in (policy.get("rules") or []) if isinstance(r.get("match"), str)
+    ] + [p for p in (policy.get("ignore") or []) if isinstance(p, str)]
     rows = conn.execute(
         "SELECT ti.event_id, ti.signature, ti.occurrences, ti.first_seen, ti.last_seen, "
-        "ti.propose_unsure_at, e.title, e.payload_json FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        "ti.propose_unsure_at, e.title, e.payload_json, e.source, e.external_id "
+        "FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         "WHERE ti.state != ? AND ti.repo IS NULL AND ti.verb IS NULL "
         "GROUP BY ti.signature ORDER BY MIN(ti.first_seen) ASC",
         (STATE_IGNORED,),
     ).fetchall()
     candidates: list[sqlite3.Row] = []
     for row in rows:
+        # `e.source`/`e.external_id` are in the SELECT for this one test:
+        # _match_targets() needs both, plus the title, and it is the same
+        # helper classify() matches rules with — so "already covered" here
+        # means exactly what it means there.
+        if _fnmatch_any(_match_targets(row), covered):
+            continue
         # Age must be measured from when the SIGNATURE was first seen, not from
         # when this row's current open period began. For a grouped source those
         # differ by months: `homelab-temperature-above-threshold` carries

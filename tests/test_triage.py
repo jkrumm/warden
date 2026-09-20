@@ -687,6 +687,44 @@ def test_unstructured_prose_lands_in_note_not_ignored():
         assert "1Password rate-limiting" in digest_text
 
 
+def test_rule_matching_runs_before_the_prose_filter():
+    """The ordering fix (items 1117/1118): a `slack_alert` that does not look
+    like a bot alert must still be matched against `rules` FIRST. Run the
+    other way round, the structural filter froze a whole producer family —
+    Beszel's bare-sentence `HomeLab CPU above threshold`, no prefix at all —
+    in the terminal STATE_NOTE before any rule was consulted, which is what
+    made the homelab rules already in the shipped policy file unreachable and
+    the daily digest print the same ten signatures for a week. The filter's
+    own documented contract is the other half of this test: an un-prefixed,
+    rule-LESS message still lands in STATE_NOTE, never `ignored`."""
+    policy = dict(
+        DEFAULT_POLICY,
+        ignoreUnstructuredSlackProse=True,
+        rules=[{"match": "slack_alert:homelab-cpu-above-threshold", "repo": "homelab"}],
+    )
+    with _triage_env(policy=policy) as (conn, ctx):
+        mapped_id = _insert_event(
+            conn, source="slack_alert", external_id="homelab-cpu-above-threshold",
+            title="HomeLab CPU above threshold", first_seen=OLD)
+        prose_id = _insert_event(
+            conn, source="slack_alert", external_id="unprefixed-no-rule",
+            title="HomeLab NVMe is running hot and no rule covers this yet", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        unmapped = triage.classify(conn, policy, NOW)
+
+        mapped = triage._get_item(conn, mapped_id)
+        assert mapped["repo"] == "homelab", (
+            "a rule-mapped signature must be resolved before the prose filter can "
+            f"route it to note — got repo={mapped['repo']!r} state={mapped['state']!r}")
+        assert mapped["state"] == triage.STATE_NEW, (
+            "classify() only resolves repo/verb — escalation is a later pass")
+        assert triage._get_item(conn, prose_id)["state"] == triage.STATE_NOTE, (
+            "an un-prefixed message with NO rule must still land in STATE_NOTE, not ignored")
+        assert "slack_alert:unprefixed-no-rule" not in unmapped, (
+            "a note row carries its own digest section; listing the same signature "
+            "as unmapped too is the double-report this ordering removes")
+
+
 def test_uk_maps_via_title_not_external_id():
     """The core fix for correction #1: uk's external_id is an opaque monitor
     id, unglobbable and unstable — only the title-derived match target makes
@@ -4561,6 +4599,47 @@ def test_propose_mappings_age_threshold_excludes_young_signatures():
         sigs = {c["signature"] for c in candidates}
         assert sigs == {"slack_alert:old-sig"}, (
             "a signature younger than proposeMappingsAgeDays must never be a candidate")
+
+
+def test_propose_mappings_skips_signatures_the_policy_already_covers():
+    """A signature that already has a rule — or an `ignore` entry — is mapped,
+    whatever state its row is in. Without this the pass re-proposed the same
+    family every day: a `note`-frozen signature never escalates, so classify()
+    never applies the rule, so it keeps looking unmapped and another duplicate
+    entry lands in the policy file (measured live: 134 rule entries for 61
+    unique match values, 41 ignore entries for 12)."""
+    with _triage_env() as (conn, ctx):
+        for ext in ("covered-by-rule", "covered-by-ignore", "genuinely-unmapped"):
+            _insert_event(conn, source="slack_alert", external_id=ext,
+                           title=f"HomeLab bare sentence {ext}", first_seen=VERY_OLD)
+        triage.ingest(conn, NOW)
+        policy = {
+            "proposeMappingsAgeDays": 7.0,
+            "rules": [{"match": "slack_alert:covered-by-rule", "repo": "homelab"}],
+            "ignore": ["slack_alert:covered-by-ignore"],
+        }
+        sigs = {c["signature"] for c in triage._propose_mapping_candidates(conn, policy, NOW)}
+        assert sigs == {"slack_alert:genuinely-unmapped"}, (
+            f"a signature the policy file already covers must never be re-proposed — got {sigs}")
+
+
+def test_propose_mappings_coverage_check_uses_the_title_target_too():
+    """`_match_targets()`'s second candidate is `source:normalize_title(title)`
+    — the only way a `uk` monitor id is matchable at all (see the module
+    docstring's MATCH TARGETS paragraph). The coverage check must run through
+    that same helper rather than comparing the literal signature, or a rule
+    written against the title counts as absent and gets proposed again."""
+    with _triage_env() as (conn, ctx):
+        _insert_event(conn, source="uk", external_id="204", title="MacMini Dev Host - Push",
+                       first_seen=VERY_OLD)
+        triage.ingest(conn, NOW)
+        policy = {
+            "proposeMappingsAgeDays": 7.0,
+            "rules": [{"match": "uk:macmini-dev-host-push", "repo": "dotfiles"}],
+            "ignore": [],
+        }
+        sigs = {c["signature"] for c in triage._propose_mapping_candidates(conn, policy, NOW)}
+        assert sigs == set(), f"a title-matched rule already covers this signature — got {sigs}"
 
 
 def test_propose_mappings_unparseable_response_is_non_fatal():

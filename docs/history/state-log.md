@@ -7626,3 +7626,72 @@ Not fixed here, and not this repo's: the underlying budget exhaustion is item
 homelab's own repo durability — the loop is carrying it. Item 1089 folded to
 `needs_human` because `hermes-agent` is capped at `investigate`, which is
 correct: this change landed by hand instead.
+
+## 76. classify() matched rules last, so a whole producer family froze in `note` (2026-09-20)
+
+Warden's own daily digest printed the same ten `slack_alert` signatures under
+"Unstructured notes in #alerts — possible root causes nobody actioned" for a
+week, and their ledger rows could never move: every one of them sat in `note`.
+The family is Beszel's homelab alerts (`HomeLab CPU above threshold`, …), which
+post bare sentences, so `_looks_like_bot_alert()` is False for every one of
+them — and `classify()` ran the structural `ignoreUnstructuredSlackProse` filter
+**before** rule matching. Two consequences, both measured: the ~15 rules
+`config/triage-policy.json` had accumulated for exactly those signatures were
+dead on arrival (`note` is terminal and `reopen_if_needed()` skips it), and
+`_propose_mapping_candidates()` — whose question is "has this signature ever
+been mapped", asked of the POLICY FILE — kept re-proposing them, seven days
+running, until the file carried 151 rule entries for 61 unique match values and
+49 ignore entries for 12. One frozen row was a genuinely live condition: the
+homelab `Disk` alert (threshold 70 %), `triggered=1` with no resolve row since
+2026-09-12. It has since resolved on the Beszel side (2026-09-19T09:09Z), which
+is why the one-time reset below skips resolved events rather than carding them.
+
+Item 1117's investigate episode (job `33d69619`) derived the fix and returned
+`nextAction: implement` at high confidence — but 1117 itself was dispatched at
+tier `investigate` and closed as `answered`, and 1118, its implement
+continuation, could not run at all: **this repo has no git remote** (§62), and
+sideclaw's `resolveRepoIdentity()` (`server/jobs/handlers/dispatch.ts` →
+`dispatch-git.ts:349`) requires a GitHub `origin` for every episode that is not
+`investigate` and not `worktree: in-place`. Job `a8850cc5` failed in 39 ms with
+`git remote get-url origin failed (2): Remote-Repository 'origin' nicht
+gefunden` and dropped item 1118 into `merge_blocked` with no artifact. So the
+change landed by hand, on the episode's verdict; the tier-vs-remote question it
+exposes is now an owner action in STATE.md, not a code fix here.
+
+Three changes, all in `scripts/triage.py`:
+
+1. `classify()` matches rules FIRST and applies the prose filter last, only to a
+   row no rule matched. The filter's documented purpose is unchanged — an
+   un-prefixed, rule-LESS message still lands in `note`, never `ignored` — and
+   the `repo`/`verb` guard is untouched. A row the filter claims is no longer
+   reported in the `unmapped` set either: it has its own digest heading, and
+   `_propose_mapping_candidates()` reads the ledger, not that return value.
+2. `_propose_mapping_candidates()` drops any signature the policy file already
+   covers in `rules` OR `ignore`, compared through the same `_match_targets()`
+   + `_fnmatch_any()` pair `classify()` itself uses — so a title-derived match
+   (a `uk` monitor id) counts as covered too. A/B against a snapshot of the live
+   ledger: 25 candidates → 11, the 14 covered signatures gone from the daily
+   re-proposal.
+3. `scripts/reset-frozen-notes.py` (new, one-time, idempotent): returns
+   `note`-state `slack_alert` rows whose event is NOT resolved to `new`,
+   carrying the reason on each row's own `note`, compare-and-set on
+   `state = note`. Read-only without `--apply`, so a dry run cannot write even
+   by accident.
+
+Verified on a `VACUUM INTO` copy of the live ledger, never the live file: the
+reset revived 6 of the 10 (4 skipped as resolved — events 105, 542, 918, 999)
+and one `classify()` pass then routed the above-threshold trio (events 13, 120,
+121) to `repo=homelab` for escalation, the below-threshold trio to `ignored`
+(their `ignore` entries were already in the file), returned **0** unmapped
+signatures, and left `note` rows 10 → 4. `tests/test_triage.py` 270 → **273/273**
+— the new cases are the ordering fix (rule-mapped bare-sentence alert reaches
+its repo, rule-less prose still reaches `note`) and both halves of the coverage
+check, including the title-target one — plus a new
+`tests/test_reset_frozen_notes.py` at 3/3. Every other suite unchanged
+(`test_warden_cli.py` 65/65, `test_lifecycle.py` 98/98, `test_clients.py`
+105/105, …).
+
+Residual, deliberately not changed here: `_fetch_note_rows()` does not filter
+resolved events, so the four rows above keep appearing under the digest's notes
+heading until someone decides that heading should drop resolution-closed notes.
+That is a digest-content decision, not part of this fix.

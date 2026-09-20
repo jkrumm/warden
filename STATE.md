@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-15 (§75) |
+| Last updated | 2026-09-20 (§76) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 270/270 is the gate; `make test` runs all suites |
+| Tests | `tests/test_triage.py` 273/273 is the gate; `make test` runs all suites (17 files, incl. the new `tests/test_reset_frozen_notes.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -135,6 +135,15 @@ loop.
   `Issues: Write` repo-wide (the "comment back on the owner's own issue"
   feature has silently 403'd since Wave 1). Grant both at
   github.com/settings/personal-access-tokens; neither blocks routing (§73).
+- **`warden` is `implement`-reachable in both policy copies (its own
+  `config/dispatch-repos.json` default, §74, and sideclaw's
+  `/api/dispatch-policy`) and has no git remote at all (§62) — so every
+  worktree-based `implement` episode on this repo dies in ~40 ms inside
+  `resolveRepoIdentity()` and lands the item `merge_blocked` with no artifact
+  (§76, job `a8850cc5`).** Pick one: add an `origin` (GitHub, private), route
+  warden's own fixes through a `workspace: "in-place"` episode, or cap warden
+  at `investigate` again — the current combination promises a draft PR and
+  cannot produce one. Until then, self-repo fixes land by hand.
 
 ## Carried debt
 
@@ -154,6 +163,9 @@ loop.
   still not built.
 - `#agents` is warden-only since 2026-09-11 (Hermes's narratives cron moved to
   `#hermes`); approval buttons still post to `#hermes`.
+- `_fetch_note_rows()` does not filter resolved events, so a `note` row whose
+  incident has since resolved keeps appearing under the digest's "Unstructured
+  notes" heading forever (§76). Digest-content call, not yet made.
 - No ledger restore path yet. The repo itself has no remote; since §62 the
   daily backup ships a `git bundle` of every ref next to the ledger snapshots.
 
@@ -198,6 +210,10 @@ loop.
   the loop stays open at merge — §74
 - env-check's second failure shape: a rate limit rendered as "likely
   transient"; the renderer now reads `error`, not just `danglingItems` — §75
+- `classify()` matched rules after the prose filter, freezing ten
+  `slack_alert` rows in the terminal `note` state; rule matching now runs
+  first, the proposal pass dedups against the policy file, and the frozen
+  rows were revived once from a ledger snapshot — §76
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
@@ -222,6 +238,16 @@ at `investigate`, so item 1089 folded to `needs_human` (correct — that cap is
 not a bug) and the change to `triage.py` was made directly. The underlying
 1Password budget exhaustion is item 1088, on `homelab`, and the loop is
 carrying it.
+
+§76 was the same shape for a different reason: `warden` is implement-reachable
+(§74) but has no remote, so item 1118's implement episode failed in 39 ms and
+the `classify()` change landed by hand, on that episode's verdict. The
+one-time revive (`scripts/reset-frozen-notes.py --apply`) was run against the
+live ledger in the same session, after the fixed `classify()` was live: 6 of
+the 10 frozen rows came back to `new`, the next 600 s pass routed the
+above-threshold homelab trio (`repo=homelab`) and `ignore`d the below-threshold
+trio. Item 1118 closed with the commit in `--why`. The tier-vs-remote decision
+is the first line of Open — owner actions above.
 
 Left behind by Wave 4 (full detail in argo's `docs/waves/PLAN.md`): fallow's
 audit in argo never went fully green — confirmed pre-existing, unrelated
