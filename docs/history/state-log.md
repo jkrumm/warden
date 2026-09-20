@@ -7753,3 +7753,57 @@ the growth, nothing has collapsed what already accumulated. The largest
 recurring alert by transition volume (`MacMini Dev Host - Push`, 571) is not a
 monitor-interval problem: the host health check grades memory-pressure level 2
 as FAIL, which is the decision item 543 is waiting on.
+
+## 78. The dispatch model, measured: DeepSeek-V4-Flash, and OpenCode as a second lane (2026-09-20)
+
+Follow-up to §77, same session. No warden code changed; this records the
+evidence the next routing decision rests on.
+
+**The 25 draft PRs, reviewed read-only by four subagents.** The real backlog is
+nine open PRs — the rest were already closed as superseded (glm closed its own
+intermediate drafts with ancestry checks) or merged. Verdicts: merge
+research-gateway #20 → #9 → reconcile #13/#15 (both edit `groundReport`),
+weatherorb #4, sideclaw #8; fix first sideclaw #6 (the CI-path guard is
+`.github/`-only, so the new GitLab write path has no block on `.gitlab-ci.yml`)
+and homelab #2 (docs contradict themselves on the cron mechanism); close
+dotfiles #5 (conflicts with a better fix already on master, salvage
+`scripts/lib/bun-bin.sh`); rollhook #26 works around sideclaw's 180 s `check`
+cap inside rollhook. `glm-5.3-flash` graded B-…A- on correctness, A- on scope
+and tests, C on validation evidence (self-reported; most repos have no test
+CI). Two recurring misses worth a brief-level fix: it acts on an inherited
+verdict without re-diffing the current default branch (dotfiles #5), and it
+gets third-party type hierarchies and aggregate counts right only on a second
+round (weatherorb #1→#4, research-gateway #16→#20: five dispatches for one
+feature).
+
+**modelpick ccbench on the gateway's Anthropic leg, corrected context env**
+(10 tasks, `MAX_THINKING_TOKENS=8192`, zero compactions in all 40 transcripts):
+
+| model | composite | wall | eff. tok/s | cost | tool err |
+|-|-|-|-|-|-|
+| DeepSeek-V4-Flash | 1.00 | 6m20s | 190 | $0.090 | 4% |
+| minimax-m3 | 0.96 | 6m08s | 114 | $0.198 | 2% |
+| kimi-k2.7-code | 0.95 | 5m59s | 58 | $0.303 | 3% |
+| DeepSeek-V4-Pro | 1.00 | 19m11s | 37 | $0.669 | 3%, one 5-min idle stall |
+| glm-5.3-flash (reference) | 0.81 | 38m24s | 13.3 | $0.035 | 0% |
+
+Context windows measured: 1M for both DeepSeeks and minimax-m3 (accepted at
+the 1.1M probe ceiling), 262,144 exact for kimi-k2.7-code. `kimi-k3` and
+`deepseek-v4.1-flash` 404 on the Anthropic leg (OpenAI route only). `glm-5.2`
+is dead under Claude Code 2.1.278 (the backend rejects the CLI's `verbosity`
+field; the gateway masks it as a 503). The rows are in dotfiles `_ca_ctx`
+(`41ab2e2`); **sideclaw's mirror `GATEWAY_CONTEXT_TOKENS` is not updated** —
+its working tree carried another session's uncommitted work, so it was left
+alone. Switching dispatch means three edits that must land together: that
+table, `routing.ts`'s AGENT route, and `AUTO_DISPATCH_MODEL` here
+(`make check-routing` fails until they agree).
+
+**OpenCode spike** (1.18.30, scratch dir, `kimi-k3` over the OpenAI route): one
+real headless episode, 149 s, 13 tool calls, 0 errors, 7/7 tests, ~22.6 tok/s.
+It loads `~/.claude/CLAUDE.md` and discovers `~/.claude/skills` natively;
+`rules/*.md` needs an `instructions` glob; PreToolUse hooks, `~/.claude/agents`
+and Claude-only skill syntax are lost; no JSON-schema flag on `opencode run`,
+so a verdict is fenced JSON the runner must strip and validate. Estimated 2–3
+days for a second runner behind sideclaw's same submit/get interface. Not
+needed to get off glm — DeepSeek-V4-Flash under Claude Code already is — but it
+is the only way to reach `kimi-k3`.

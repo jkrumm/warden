@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-20 (§77) |
+| Last updated | 2026-09-20 (§78) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
@@ -220,6 +220,9 @@ loop.
 - The field look after ten unattended days (153 dispatches, 6 failed, 0
   watchdog kills, 1 of 25 draft PRs merged); `classify()` re-froze an
   already-mapped row in `note` on its second pass — §77
+- The dispatch model measured (DeepSeek-V4-Flash 1.00 at 190 tok/s vs glm's
+  0.81 at 13.3), the nine open PRs reviewed, OpenCode proven as a possible
+  second lane — §78
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
@@ -237,6 +240,16 @@ memory-pressure level 2 as FAIL). Outside this repo: the gateway
 context-window table in dotfiles and sideclaw has one row, so any model other
 than `glm-5.3-flash` auto-compacts at 200k — add measured rows before trying
 another model, not after.
+
+**§78, the next routing change.** Evidence says move dispatch from
+`glm-5.3-flash` to `DeepSeek-V4-Flash` (same leg, same harness, ~14x the
+in-loop rate, $0.09 vs $0.035 per ccbench suite). It is three edits that land
+together — sideclaw `GATEWAY_CONTEXT_TOKENS` (1,000,000) and `routing.ts`
+AGENT, then `AUTO_DISPATCH_MODEL` here — and sideclaw's tree had another
+session's uncommitted work on 2026-09-20, so none of it was started. Gateway
+ids are case-sensitive. After the switch, watch `dispatches.error` and the
+idle watchdog for a week: one ccbench suite is thin next to 153 field
+dispatches. §78 also has the per-PR verdicts for the nine open PRs.
 
 No wave is active — the GitHub-issues-in-warden chain (`docs/waves/PLAN.md`,
 deleted this commit) is fully done across all five waves. Nothing queued
