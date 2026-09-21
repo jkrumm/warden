@@ -7807,3 +7807,58 @@ so a verdict is fenced JSON the runner must strip and validate. Estimated 2–3
 days for a second runner behind sideclaw's same submit/get interface. Not
 needed to get off glm — DeepSeek-V4-Flash under Claude Code already is — but it
 is the only way to reach `kimi-k3`.
+
+## 79. Dispatch moves to DeepSeek-V4-Flash, on a POC through this lane (2026-09-21)
+
+The owner's instinct after §78 was DeepSeek-V4-Pro ("Flash is too
+unintelligent", and it is the older V4 Flash — `deepseek-v4.1-flash` is
+OpenAI-route only). He asked for the external data to be refreshed first and
+for a POC that lets dispatched agents decide the open PRs. Both were done, and
+the evidence went the other way.
+
+**External indices, refreshed in modelpick 2026-09-20** (AA quality / AA coding
+index / terminal-bench v2.1): V4-Pro 36.0 / 68.8 / 0.787, V4-Flash 34.3 / 69.1 /
+0.787 — tied. `glm-5.3-flash` leads both (41.8 / 71.5 / 0.843); `kimi-k3`
+(43.6 / 76.2 / 0.850) and `deepseek-v4.1-flash` (39.5) are the smarter ones and
+both 404 on the Anthropic leg. On ccbench's hardest task the scorer saturates;
+read by hand, Flash's solution was the more rigorous of the two. Pro's one
+idle stall was structural: the CLI auto-backgrounded a Bash call at its 120 s
+foreground limit, the model emitted an empty turn and waited silently for the
+notification until the watchdog fired — in this lane that is a verdict-less
+kill folding to `needs_human`.
+
+**POC.** The same six read-only briefs ("decide this open PR: MERGE /
+FIX-THEN-MERGE / CLOSE") went through `warden dispatch --tier investigate
+--model …` on both models: 12/12 `done`, one attempt each, no stall, no
+compaction. sideclaw's own clock: Flash 0.7–2.9 min per episode, Pro 1.0–6.0
+(glm's field median for investigate was 7.1). Against the independent Sonnet
+reviews of §78:
+
+| PR | Sonnet | V4-Pro | V4-Flash |
+|-|-|-|-|
+| weatherorb #4 | merge | merge | fix-then-merge: the secrets-run smoke test does not traverse the uv hop it claims to (Pro listed it as a nit) |
+| rollhook #26 | fix in sideclaw instead | **merge** — missed it | fix in sideclaw instead, verified in sideclaw's `check.md`/`check.ts` |
+| homelab #2 | fix-then-merge | **merge**, nits only | fix-then-merge, plus a defect neither other reviewer found: `setup.sh` emits the cron line without the profile prefix the PR's own docs assert |
+| dotfiles #5 | close, salvage `bun-bin.sh` | close, salvage it; found the `shlock` guard never releases a dead pid's lock (verified live) | rebase and cut the hunks master already has; found the pinned-tailscale branch is now unconditionally true |
+| research-gateway #20 | merge after running tests | merge; title understates scope | fix-then-merge: a new unconditional per-job LLM call lands without re-measuring `docs/measurements.md` § Job duration, which that repo's CLAUDE.md requires |
+| usage-tracker #4 | reopen + merge | same | same; noted the attribution footer in the PR body breaks house rules |
+
+Flash agreed with the independent review wherever Pro was lenient, and read the
+target repos' own rules more closely. Six episodes is a small sample; the
+direction is not ambiguous.
+
+**The change.** `AUTO_DISPATCH_MODEL` defaults to `DeepSeek-V4-Flash`; sideclaw's
+AGENT route moves in the same sitting (its `GATEWAY_CONTEXT_TOKENS` row,
+1,000,000, landed the day before in `1d94541`), CLASSIFY stays on glm —
+untested there. `TRIAGE_AUTO_DISPATCH_MODEL` is the one-line way back.
+`tests/test_triage.py` 274/274. What to watch for a week: `dispatches.error`,
+idle-watchdog kills, and the tool-error rate (4% in ccbench against glm's 0%).
+
+**Found on the way, not fixed.** `dispatches.finished_at` is stamped with the
+time warden *observes* a terminal job, not the time sideclaw finished it: the
+twelve POC rows read 614–625 minutes because the polling shell was suspended
+overnight and `warden status` stamped them on resume, while `reported_at` (the
+sweep) had them at 5–20 minutes. It also explains why §77's implement
+durations cluster on multiples of ten minutes — they are tick-quantized. Every
+duration this ledger reports is an upper bound; sideclaw's `started_at` /
+`finished_at` are the real numbers, and it prunes them after 24 h.

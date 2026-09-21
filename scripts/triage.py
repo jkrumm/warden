@@ -1169,15 +1169,21 @@ PROPOSE_UNSURE_COOLDOWN_DAYS = 7.0
 PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "deepseek-v4.1-flash")
 
 # Automatic investigate/implement episodes (loop-driven, not human-typed) run
-# on the cheap IU tier: modelpick's 2026-08-31 bake-off scored glm-5.3-flash
-# 1.00 alongside Sonnet at ~32x lower cost. Passing any non-Claude model id
+# on the cheap IU tier. glm-5.3-flash until 2026-09-21 (modelpick's 2026-08-31
+# bake-off: 1.00 alongside Sonnet at ~32x lower cost); DeepSeek-V4-Flash since,
+# on speed — ccbench 2026-09-20 measured it at 1.00 / 6m20s / ~190 effective
+# in-loop tok/s against glm's 0.81 / 38m24s / 13.3, and six read-only episodes
+# through this very lane finished in 0.7–2.9 min each with no stall (§79).
+# DeepSeek-V4-Pro was measured alongside and rejected: tied with Flash on the
+# external indices, ~3x slower, and the one model that idle-stalled. Gateway
+# ids are case-sensitive. Passing any non-Claude model id
 # makes sideclaw's withModel() derive backend `iu` for the dispatch; passing
 # `None` instead would land it on sideclaw's own JUDGE route, which is Sonnet
 # over the owner's Claude Max subscription. Manual `warden run --model` calls
 # and Slack approval-click dispatches carry their own model and are
 # unaffected; step-7 review validation carries its own knob,
 # TRIAGE_VALIDATION_DISPATCH_MODEL below.
-AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL", "glm-5.3-flash")
+AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL", "DeepSeek-V4-Flash")
 if not AUTO_DISPATCH_MODEL or AUTO_DISPATCH_MODEL.startswith("claude"):
     # A Claude id (or an empty override) would route automatic episodes back
     # onto sideclaw's Max-backed JUDGE route — the cost regression §58 fixed.

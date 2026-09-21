@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-20 (§78) |
+| Last updated | 2026-09-21 (§79) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
@@ -39,8 +39,8 @@ loop.
   with `--origin-channel`/`--origin-thread`). See
   `docs/history/state-log.md` §55.
 - Automatic investigate/implement dispatches pass `AUTO_DISPATCH_MODEL`
-  (`glm-5.3-flash`, env `TRIAGE_AUTO_DISPATCH_MODEL`) and run on the IU
-  backend, never Max. Validation is a sideclaw `review` job on the pull
+  (`DeepSeek-V4-Flash` since §79, `glm-5.3-flash` before; env
+  `TRIAGE_AUTO_DISPATCH_MODEL`) and run on the IU backend, never Max. Validation is a sideclaw `review` job on the pull
   request; `TRIAGE_VALIDATION_DISPATCH_MODEL` can re-point it but defaults to
   `None`, i.e. sideclaw's JUDGE route — review is the one tool where the cheap
   tier has been measured failing (§64).
@@ -71,7 +71,8 @@ loop.
   `kuma-push-fresh`. First real run 11:36Z: `restart-hermes-gateway`, three
   items discharged (§59).
 - sideclaw's per-tool routing lives in `server/lib/routing.ts`, not its
-  `.env` (§64): `dispatch` on `glm-5.3-flash`/IU (the `AGENT` tier), `review`
+  `.env` (§64): `dispatch` on `DeepSeek-V4-Flash`/IU (the `AGENT` tier, §79;
+  `check`/`overview` stay on `glm-5.3-flash`), `review`
   and `otel` held on Sonnet/Max (`JUDGE`), `narrative`/`excalidraw` on
   Sonnet/Max (`PROSE`). Live table: `GET /api/routing`.
 - A sideclaw worker is killed by an idle watchdog (5 min with no stdout) and
@@ -223,6 +224,9 @@ loop.
 - The dispatch model measured (DeepSeek-V4-Flash 1.00 at 190 tok/s vs glm's
   0.81 at 13.3), the nine open PRs reviewed, OpenCode proven as a possible
   second lane — §78
+- Dispatch moves to `DeepSeek-V4-Flash` after a twelve-episode POC through
+  this lane; V4-Pro measured and rejected; `finished_at` is observation time,
+  not completion time — §79
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
@@ -240,6 +244,13 @@ memory-pressure level 2 as FAIL). Outside this repo: the gateway
 context-window table in dotfiles and sideclaw has one row, so any model other
 than `glm-5.3-flash` auto-compacts at 200k — add measured rows before trying
 another model, not after.
+
+**§79 made the routing change §78 describes** — dispatch now runs on
+`DeepSeek-V4-Flash` in both repos. Watch `dispatches.error`, idle-watchdog
+kills and tool errors for a week; `TRIAGE_AUTO_DISPATCH_MODEL=glm-5.3-flash`
+is the way back. Open from §79: `dispatches.finished_at` records when warden
+observed a job finishing, so every ledger duration is an upper bound. The
+paragraph below is kept for its reasoning.
 
 **§78, the next routing change.** Evidence says move dispatch from
 `glm-5.3-flash` to `DeepSeek-V4-Flash` (same leg, same harness, ~14x the

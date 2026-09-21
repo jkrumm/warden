@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Does the running sideclaw's live routing table still agree with the model
 warden pins for automatic episodes (`scripts/triage.py`'s
-`AUTO_DISPATCH_MODEL`, default `glm-5.3-flash`) and, when the operator has set
+`AUTO_DISPATCH_MODEL`, default `DeepSeek-V4-Flash`) and, when the operator has set
 one, for review validation (`TRIAGE_VALIDATION_DISPATCH_MODEL`)?
 
 sideclaw owns the routing table (`server/lib/routing.ts`) and publishes it
