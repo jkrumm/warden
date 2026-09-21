@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-21 (§79) |
+| Last updated | 2026-09-21 (§80) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
@@ -227,6 +227,9 @@ loop.
 - Dispatch moves to `DeepSeek-V4-Flash` after a twelve-episode POC through
   this lane; V4-Pro measured and rejected; `finished_at` is observation time,
   not completion time — §79
+- First full lifecycle on the new model: two draft PRs in 27 min, under nine
+  of them work — the 600 s tick is now an item's latency; a second operator
+  re-filed and deduped this session's items through Hermes's door — §80
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.

@@ -7862,3 +7862,36 @@ sweep) had them at 5–20 minutes. It also explains why §77's implement
 durations cluster on multiples of ten minutes — they are tick-quantized. Every
 duration this ledger reports is an upper bound; sideclaw's `started_at` /
 `finished_at` are the real numbers, and it prunes them after 24 h.
+
+## 80. The first full lifecycle on the new dispatch model (2026-09-21, 02:40Z → 03:07Z)
+
+Two `human`-origin items ran investigate → verdict → implement → step-7 review
+on `DeepSeek-V4-Flash`, review on sideclaw's JUDGE route as before:
+
+| item | repo | investigate | implement | review | outcome |
+|-|-|-|-|-|-|
+| 1142 | usage-tracker | 0.4 min | 2.0 min | 0.7 min, `confirmed` | draft PR #5, `merge_blocked` — no `autoMergePaths` (by design) |
+| 1143 | homelab | 1.3 min | 4.9 min | 1.8 min, `blocked` | draft PR #3, `merge_blocked` on a real review finding: the cron line now sources `/root/.profile`, but the install steps only tell the operator to fill the user's `.profile` |
+
+Durations are sideclaw's clock. glm's field medians were 7.1 and 40.1 minutes.
+**The lifecycle took 27 minutes of wall clock for under nine minutes of work** —
+every stage boundary waits for the next 600 s loop tick (`verdict` 02:41/02:46 →
+`implementing` 02:47:25 → `validating` 02:57:29 → `merge_blocked` 03:07:31).
+With a worker this fast the loop interval, not the model, is now the latency of
+an item; nothing was changed about it here.
+
+How the items came to exist is its own finding. This session opened 1140/1141
+with `warden run` and no `--tier implement`, so `max_tier` defaulted to
+`investigate` and both closed as `answered` on a high-confidence `implement`
+verdict — correct behaviour, wrong invocation. Its re-file (1144/1145) arrived
+70 seconds after a second operator had already re-filed the same briefs
+verbatim as 1142/1143 *with* an origin channel (Hermes's door), and that
+operator then aborted 1144 and closed 1145 as duplicates through the CLI with
+an exact `--why`. No other warden session was running on the host. The dedup
+was right and the ledger shows every step of it; who decided to re-file is not
+recorded anywhere but the CLI audit log's `why`.
+
+Also noted: sideclaw appends "Opened automatically by a bounded dispatch
+episode, from this brief: …" to every PR body. One of the §79 review episodes
+flagged it against the owner's global no-attribution rule. It is provenance,
+written by the tooling rather than the model, and it is sideclaw's to decide.
