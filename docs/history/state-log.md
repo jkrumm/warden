@@ -7977,3 +7977,21 @@ both `errors.log` and `gateway.error.log` and both reads increment one
 signature — and the store needs nothing repaired. The only real defect is
 severity (an expected skip logged at ERROR), and `hermes-agent` is
 investigate-capped, so that stays a report.
+
+## 83. `abort --dry-run` was the one verb where a dry run did the thing (2026-09-22)
+
+The global `--dry-run` flag is accepted on every verb, and `cmd_close`, `merge`
+and `dispatch` honour it (DESIGN.md's contract: nothing outward-facing, nothing
+written). `cmd_abort` never looked at it. `warden abort 1114 --why … --dry-run`
+cancelled job `6e53fcb4` on sideclaw and transitioned item 1114 to `closed`;
+the follow-up call *without* the flag then refused with "state 'closed', no
+in-flight episode". The audit log has it in two adjacent lines — `mode=aborted
+rc=0` for the "dry run", `mode=refused rc=4` for the real one: the preview was
+the effect.
+
+One early return now, mirroring `cmd_close`'s own: it names the state it would
+leave, the job it would cancel, and writes nothing.
+`test_abort_dry_run_cancels_nothing_and_writes_nothing` runs it with no stub
+server at all — a closed port, so any cancel attempt fails loudly — and asserts
+both items unchanged, the dispatch row still `running`, and zero transition
+rows. `tests/test_warden_cli.py` 68 → **69/69**.

@@ -746,6 +746,18 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
         )
     job_id = job_by_state[row["state"]]
 
+    if flags.dry_run:
+        # The global dry-run contract (DESIGN.md): nothing outward-facing, and
+        # nothing written. `abort` used to fall straight through and cancel the
+        # episode for real — the one verb where "--dry-run" meant "do it".
+        state.dry_run = True
+        return {
+            "verb": "abort", "ok": True, "dryRun": True, "eventId": event_id, "jobId": job_id,
+            "fromState": row["state"], "toState": ledger.STATE_CLOSED, "cancelled": False,
+            "discharged": [],
+            "note": "nothing written — no cancel, no transition row, no state change",
+        }
+
     cancelled = False
     if job_id:
         try:

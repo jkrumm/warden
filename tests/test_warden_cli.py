@@ -916,6 +916,28 @@ def test_abort_leaves_a_cluster_sibling_that_already_opened_a_pr_alone():
     conn.close()
 
 
+def test_abort_dry_run_cancels_nothing_and_writes_nothing():
+    """The global `--dry-run` contract: no outward call, no write. `abort` was
+    the one verb that fell straight through it and cancelled the episode for
+    real — observed live 2026-09-22, where the "dry run" is what actually
+    cancelled job 6e53fcb4 and closed item 1114."""
+    h = Harness()
+    db = h.new_db()
+    _seed_dispatch(db, "job-dry", tier="investigate", repo="gamma", status="running")
+    _seed_item(db, 51, state="investigating", repo="gamma", dispatch_job="job-dry")
+    _seed_item(db, 52, state="investigating", repo="gamma", dispatch_job="job-dry")
+    # No stub server at all: a closed port, so any cancel attempt fails loudly.
+    proc = h.run(["abort", "51", "--why", "preview", "--dry-run", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out.get("dryRun") is True and out["cancelled"] is False, out
+    conn, _ = _connect(db)
+    states = {r["event_id"]: r["state"] for r in conn.execute("SELECT event_id, state FROM triage_items").fetchall()}
+    assert states == {51: "investigating", 52: "investigating"}, states
+    assert _row(conn, "SELECT status FROM dispatches WHERE job_id='job-dry'")["status"] == "running"
+    assert _row(conn, "SELECT COUNT(*) AS n FROM item_transitions")["n"] == 0
+    conn.close()
+
+
 # --- revert --------------------------------------------------------------------------
 
 
