@@ -8022,3 +8022,21 @@ Also fixed the same day, in dotfiles (`f5b6ac0`): `_ca_ctx`/`_ca_thinking`
 match gateway ids case-insensitively — the 09-17 interactive session that
 compacted five times in an hour ran as lowercase `deepseek-v4-pro`, which the
 table did not know.
+
+## 85. Why Pro misses the cache: the boundary never advances (2026-09-22)
+
+modelpick measured it directly (`23f9c15`, `scripts/adhoc-cache-probe.ts`):
+72 streamed `/v1/messages` calls, a ~36k-token system prefix, all three models
+on the same Requesty-proxied backend. Pro caches the system block as well as
+the others (99.96% on a repeat, marker or not). The difference is a growing
+conversation: Flash's and glm's cached prefix extends into the appended turns,
+Pro's stays flat at the system block for all six turns. So every Pro turn
+re-processes the whole history after the system prompt, and
+`cache_read/total_input` decays toward `system / (system + history)` — the 9%
+and 26% seen in the transcripts. Nothing on our side fixes it; it is a
+question for the gateway team (does Pro's backend extend an existing cache
+past the marked block). Consequence for §84's split: an implement episode on
+Pro is priced on nearly full input from the second turn on, and the longer the
+loop the worse the ratio — Pro suits short, bounded hard work better than long
+implement loops. The split stands as the owner's call;
+`TRIAGE_AUTO_IMPLEMENT_MODEL=DeepSeek-V4-Flash` is the line back.
