@@ -7927,3 +7927,53 @@ the change is live on the next tick.
 Noted, unchanged: `config/triage-policy.json` still carries 151 rule entries
 for 61 distinct match values and 49 ignore entries for 12 (§77), and the 24
 unreviewed draft PRs across nine repos remain the owner's backlog (§78).
+
+## 82. `abort` left the rest of the cluster behind (2026-09-22)
+
+An alert batch files several items onto ONE `dispatch_job` — the `hermes_log`
+checkpoint family filed three for a single 15:13:07 batch (`rev-parse`,
+`ls-files -X exclude`, `add -A`) — and `fold_dispatch_verdict()` has always
+treated that job as the cluster's membership. `cmd_abort` did not. It stamped
+the shared `dispatches` row cancelled (cluster-wide) and `reported_at` with it,
+then transitioned only the item it was called on, so every sibling was left in
+an in-flight state with **no exit at all**: `close` refuses in-flight states by
+design, a second `abort` refused on sideclaw's 409 (`PolicyError: job already
+cancelled`, untolerated where the 404 `no job` case was), and the sweep only
+reads rows with `reported_at IS NULL` — the stamp the abort itself had just
+written. The one thing left for such a row was its deadline, which files a
+needs_human card for work a human has already decided against. Hit live: item
+1114 aborted on the checkpoint alert, sibling 1153 stranded `investigating`
+with a 2 h deadline.
+
+Two changes, both in `scripts/warden.py`. An already-terminal job (sideclaw's
+409) is now tolerated exactly as the 404 `no job` case already was — the
+abort's intent, "no episode is running against this cluster", already holds —
+and the abort discharges every other row sharing the job, in the same
+transition and with the same note. That set is deliberately narrower than
+`_CLOSE_INFLIGHT_STATES`: only the three states an episode puts a row in. A
+sibling that has moved past the episode (`pr_open`, `merge_blocked`,
+`needs_human`) carries work of its own — a PR a human must review — and is
+never closed behind their back by cancelling the job.
+
+Tests: `test_abort_discharges_every_member_of_the_cluster_sharing_the_job`,
+`test_abort_tolerates_an_already_terminal_job_and_still_discharges_the_cluster`,
+`test_abort_leaves_a_cluster_sibling_that_already_opened_a_pr_alone` —
+`tests/test_warden_cli.py` 65 → **68/68**, `make test` green across all 17
+suites (`test_triage.py` 276/276 unchanged). Measured against a `VACUUM INTO`
+copy of the live ledger: rows sharing an already-cancelled job and still in an
+episode state **1 → 0**. The one was 1153, discharged through the corrected
+verb — the CLI is invoked from this working tree, so the fix was live on the
+call that closed it.
+
+The alert that surfaced it, same session: items 1114/1152/1153 were one benign
+batch. A dispatch brief was written into the then-nonexistent
+`~/.hermes/workspace`, so the pre-write checkpoint resolved a workdir that did
+not exist yet and skipped `rev-parse`/`ls-files`/`add -A` with "working
+directory not found". The write created the directory, the next snapshot at
+15:13:49 committed the file (`refs/hermes/37e946ea139051c7`), and a live
+`CheckpointManager.ensure_checkpoint()` returns True with `git fsck` clean, 29
+refs, 420 of 500 MB. The card's ×N is double the real count — the poller tails
+both `errors.log` and `gateway.error.log` and both reads increment one
+signature — and the store needs nothing repaired. The only real defect is
+severity (an expected skip logged at ERROR), and `hermes-agent` is
+investigate-capped, so that stays a report.

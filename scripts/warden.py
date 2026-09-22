@@ -754,6 +754,15 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
         except RemoteError as exc:
             if "no job" not in str(exc).lower():
                 raise
+        except PolicyError:
+            # sideclaw's 409 — the job is already terminal (a sibling's abort,
+            # an idle-watchdog kill, a run that finished between our read and
+            # this call). The abort's own intent, "no episode is running
+            # against this cluster", already holds, so this is not a failure to
+            # report: refusing here would abandon the whole cluster, because
+            # `close` refuses every in-flight state and the sweep never folds a
+            # row whose `reported_at` is already stamped (as it is below).
+            pass
 
     now = dt.datetime.now(dt.timezone.utc)
     if job_id:
@@ -771,12 +780,34 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
         operations.complete(conn, op["op_id"], outcome="failed", receipt=json.dumps({"aborted": flags.why}))
 
     items.transition(conn, event_id, to_state=ledger.STATE_CLOSED, now=now, note=f"aborted: {flags.why}")
+
+    # A cluster shares ONE `dispatch_job` (the same membership rule
+    # `triage.fold_dispatch_verdict()` uses to fold a verdict onto every row),
+    # so cancelling that job ends the episode for every member — not just the
+    # one named here. Leaving the siblings in an in-flight state strands them
+    # with no exit at all: `close` refuses in-flight states by design, a second
+    # `abort` refuses because its job is already terminal, and the sweep only
+    # reads rows with `reported_at IS NULL`, which the stamp below clears. The
+    # only thing left for such a row is its deadline, which files a
+    # needs_human card for work a human has already decided against.
+    discharged: list[int] = []
+    if job_id:
+        for member in conn.execute(
+            "SELECT event_id, state FROM triage_items WHERE dispatch_job=? AND event_id<>? "
+            "ORDER BY event_id",
+            (job_id, event_id),
+        ).fetchall():
+            if member["state"] in _CLUSTER_ABORT_STATES:
+                items.transition(conn, member["event_id"], to_state=ledger.STATE_CLOSED, now=now,
+                                 note=f"aborted: {flags.why}")
+                discharged.append(member["event_id"])
+
     conn.commit()
     state.did_mutate = True
 
     return {
         "verb": "abort", "ok": True, "eventId": event_id, "jobId": job_id, "cancelled": cancelled,
-        "state": ledger.STATE_CLOSED,
+        "state": ledger.STATE_CLOSED, "discharged": discharged,
     }
 
 
@@ -845,6 +876,14 @@ _CLOSE_ALLOWED_STATES = (
 _CLOSE_INFLIGHT_STATES = (
     triage.STATE_INVESTIGATING, triage.STATE_IMPLEMENTING, triage.STATE_VALIDATING,
     triage.STATE_REMEDIATING, triage.STATE_LIVENESS_PENDING, triage.STATE_PR_OPEN,
+)
+# The narrower set `abort` discharges for the CLUSTER siblings sharing the
+# cancelled job: exactly the states an episode puts a row in. A sibling that
+# has already moved past the episode (`pr_open`, `merge_blocked`,
+# `needs_human`) carries work of its own — a PR a human must review — and is
+# never closed behind their back by cancelling the job.
+_CLUSTER_ABORT_STATES = (
+    triage.STATE_INVESTIGATING, triage.STATE_IMPLEMENTING, triage.STATE_VALIDATING,
 )
 # Already terminal — closing again is a no-op, not a refusal.
 _CLOSE_TERMINAL_STATES = (

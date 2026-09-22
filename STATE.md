@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-22 (§81) |
+| Last updated | 2026-09-22 (§82) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
@@ -94,6 +94,11 @@ loop.
 - `warden close <event-id> --why` resolves an open item from the terminal
   (§66); in-flight states refuse, `abort` is their verb. Run it with
   `env -u CLAUDECODE` from inside a session.
+- `warden abort <event-id> --why` cancels the episode **and discharges the
+  cluster**: every other row sharing that `dispatch_job` still in an episode
+  state (`investigating`/`implementing`/`validating`) closes with the same
+  note, and an already-terminal job (sideclaw's 409) is tolerated instead of
+  refused — a sibling left behind had no exit at all, only its deadline §82.
 - `make check-routing` is the third drift check next to `check-schemas` and
   `check-policy`: warden's dispatch/validation model pins against sideclaw's
   live `GET /api/routing` (§66).
@@ -234,6 +239,10 @@ loop.
 - The digest's "Unstructured notes" heading stops carrying rows whose incident
   already resolved: the four §76 left behind now filter out, so the digest is
   silent until a real unactioned note appears — §81
+- `abort` discharges the whole cluster, not one row: a sibling left in an
+  in-flight state had no exit (`close` refuses those, the sweep never re-reads
+  a reported row, a second abort hit sideclaw's 409), and an already-terminal
+  job is now tolerated — §82
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.

@@ -842,6 +842,80 @@ def test_abort_unknown_item_is_usage_error():
     assert proc.returncode == 64, out
 
 
+def test_abort_discharges_every_member_of_the_cluster_sharing_the_job():
+    """A batch files several items onto ONE dispatch_job (three signatures, one
+    investigation). Cancelling the job ends the episode for all of them, so the
+    siblings must not be left behind in an in-flight state: `close` refuses
+    them (in-flight states are abort's), and the sweep never folds a row it has
+    already reported — a stranded sibling can only expire to needs_human."""
+    h = Harness()
+    db = h.new_db()
+    _seed_dispatch(db, "job-cluster", tier="investigate", repo="gamma", status="running")
+    _seed_item(db, 21, state="investigating", repo="gamma", dispatch_job="job-cluster")
+    _seed_item(db, 22, state="investigating", repo="gamma", dispatch_job="job-cluster")
+    srv = stubs.StubServer({("POST", "/api/jobs/job-cluster/cancel"): (200, {"job": {"id": "job-cluster", "status": "cancelled"}})})
+    try:
+        proc = h.run(["abort", "21", "--why", "one batch, one cause", "--json"],
+                     env=h.base_env(db=db, sideclaw=srv.base))
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0, out
+    assert out.get("discharged") == [22], out
+    conn, _ = _connect(db)
+    states = {r["event_id"]: r["state"] for r in conn.execute("SELECT event_id, state FROM triage_items").fetchall()}
+    assert states == {21: "closed", 22: "closed"}, states
+    notes = {r["event_id"]: r["note"] for r in conn.execute("SELECT event_id, note FROM triage_items").fetchall()}
+    assert all("one batch, one cause" in (n or "") for n in notes.values()), notes
+    conn.close()
+
+
+def test_abort_tolerates_an_already_terminal_job_and_still_discharges_the_cluster():
+    """The sibling's abort is the second one against this job, so sideclaw
+    answers 409 'job already cancelled'. The abort's own intent — no episode
+    running — already holds, so it must proceed to the transition instead of
+    refusing and abandoning every member of the cluster."""
+    h = Harness()
+    db = h.new_db()
+    _seed_dispatch(db, "job-dead", tier="investigate", repo="gamma", status="cancelled")
+    _seed_item(db, 31, state="investigating", repo="gamma", dispatch_job="job-dead")
+    _seed_item(db, 32, state="investigating", repo="gamma", dispatch_job="job-dead")
+    srv = stubs.StubServer({("POST", "/api/jobs/job-dead/cancel"): (409, {"error": "job already cancelled"})})
+    try:
+        proc = h.run(["abort", "31", "--why", "already cancelled by the sibling", "--json"],
+                     env=h.base_env(db=db, sideclaw=srv.base))
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["cancelled"] is False, out
+    conn, _ = _connect(db)
+    states = {r["event_id"]: r["state"] for r in conn.execute("SELECT event_id, state FROM triage_items").fetchall()}
+    assert states == {31: "closed", 32: "closed"}, states
+    conn.close()
+
+
+def test_abort_leaves_a_cluster_sibling_that_already_opened_a_pr_alone():
+    """Discharging the cluster must stop at the episode: a sibling that has
+    moved on to `pr_open` carries a draft PR a human still has to review, and
+    cancelling the investigation job is not a reason to close it."""
+    h = Harness()
+    db = h.new_db()
+    _seed_dispatch(db, "job-pr", tier="investigate", repo="gamma", status="running")
+    _seed_item(db, 41, state="investigating", repo="gamma", dispatch_job="job-pr")
+    _seed_item(db, 42, state="pr_open", repo="gamma", dispatch_job="job-pr")
+    srv = stubs.StubServer({("POST", "/api/jobs/job-pr/cancel"): (200, {"job": {"id": "job-pr", "status": "cancelled"}})})
+    try:
+        proc = h.run(["abort", "41", "--why", "duplicate", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["discharged"] == [], out
+    conn, _ = _connect(db)
+    states = {r["event_id"]: r["state"] for r in conn.execute("SELECT event_id, state FROM triage_items").fetchall()}
+    assert states == {41: "closed", 42: "pr_open"}, states
+    conn.close()
+
+
 # --- revert --------------------------------------------------------------------------
 
 
