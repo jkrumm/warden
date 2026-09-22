@@ -7995,3 +7995,30 @@ leave, the job it would cancel, and writes nothing.
 server at all — a closed port, so any cancel attempt fails loudly — and asserts
 both items unchanged, the dispatch row still `running`, and zero transition
 rows. `tests/test_warden_cli.py` 68 → **69/69**.
+
+## 84. Two automatic models: investigate on Flash, implement on Pro (2026-09-22)
+
+The owner's split, after §79's field look: "DeepSeek V4 Pro for the hard
+stuff, V4 Flash for easy or faster work". `AUTO_DISPATCH_MODEL` (env
+`TRIAGE_AUTO_DISPATCH_MODEL`, `DeepSeek-V4-Flash`) now covers only the
+read-only investigate episodes and Argo's re-investigate; a new
+`AUTO_IMPLEMENT_MODEL` (env `TRIAGE_AUTO_IMPLEMENT_MODEL`, `DeepSeek-V4-Pro`)
+covers `maybe_auto_implement()` and Argo's implement click. Both carry the
+same Claude-id guard. `make check-routing` still compares only the investigate
+model against sideclaw's dispatch default — the implement model is passed
+explicitly per job and sideclaw's `GATEWAY_CONTEXT_TOKENS` has had its 1M row
+since `1d94541`. `tests/test_triage.py` 276/276 (§81–§83's tests plus the
+implement assertion re-pointed and a guard that the two knobs differ).
+
+Recorded against it, not as a veto: on this gateway Pro reuses the prompt
+cache poorly (transcripts since 09-13: 9% headless, 26% interactive, against
+94–97% for Flash and glm), so every Pro turn re-processes the 60–75k-token
+prefix; modelpick is measuring why (backend alternation vs `cache_control`
+ignored vs prefix not advancing) so the fix lands on the right side. Until
+that is known, an implement episode on Pro is correct, slower than Flash, and
+billed on nearly full input each turn.
+
+Also fixed the same day, in dotfiles (`f5b6ac0`): `_ca_ctx`/`_ca_thinking`
+match gateway ids case-insensitively — the 09-17 interactive session that
+compacted five times in an hour ran as lowercase `deepseek-v4-pro`, which the
+table did not know.

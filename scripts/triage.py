@@ -1168,8 +1168,8 @@ PROPOSE_UNSURE_COOLDOWN_DAYS = 7.0
 # below, not by temperature.
 PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "deepseek-v4.1-flash")
 
-# Automatic investigate/implement episodes (loop-driven, not human-typed) run
-# on the cheap IU tier. glm-5.3-flash until 2026-09-21 (modelpick's 2026-08-31
+# Automatic investigate episodes (loop-driven, not human-typed) run on the
+# cheap IU tier. glm-5.3-flash until 2026-09-21 (modelpick's 2026-08-31
 # bake-off: 1.00 alongside Sonnet at ~32x lower cost); DeepSeek-V4-Flash since,
 # on speed — ccbench 2026-09-20 measured it at 1.00 / 6m20s / ~190 effective
 # in-loop tok/s against glm's 0.81 / 38m24s / 13.3, and six read-only episodes
@@ -1184,12 +1184,23 @@ PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "deepseek-v4.1-f
 # unaffected; step-7 review validation carries its own knob,
 # TRIAGE_VALIDATION_DISPATCH_MODEL below.
 AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL", "DeepSeek-V4-Flash")
-if not AUTO_DISPATCH_MODEL or AUTO_DISPATCH_MODEL.startswith("claude"):
-    # A Claude id (or an empty override) would route automatic episodes back
-    # onto sideclaw's Max-backed JUDGE route — the cost regression §58 fixed.
-    # Loud, not fatal: the loop must keep ticking, the operator must notice.
-    print(f"triage: WARNING TRIAGE_AUTO_DISPATCH_MODEL={AUTO_DISPATCH_MODEL!r} routes automatic "
-          "dispatches onto Max — expected a non-Claude IU model id", file=sys.stderr)
+
+# Automatic implement episodes take the heavier sibling: the owner's split
+# (2026-09-22) is DeepSeek-V4-Flash for read-only and fast work, DeepSeek-V4-Pro
+# for the change itself. Measured the same on ccbench (both 1.00) and tied on the
+# external indices; Pro is ~3x slower per turn and, on this gateway, reuses the
+# prompt cache poorly (9–26% hit against Flash's 94%) — the cost of that is the
+# owner's call, the knob is here so it stays one line to revisit (§84). 
+AUTO_IMPLEMENT_MODEL = os.environ.get("TRIAGE_AUTO_IMPLEMENT_MODEL", "DeepSeek-V4-Pro")
+
+for _knob, _model in (("TRIAGE_AUTO_DISPATCH_MODEL", AUTO_DISPATCH_MODEL),
+                      ("TRIAGE_AUTO_IMPLEMENT_MODEL", AUTO_IMPLEMENT_MODEL)):
+    if not _model or _model.startswith("claude"):
+        # A Claude id (or an empty override) would route automatic episodes back
+        # onto sideclaw's Max-backed JUDGE route — the cost regression §58 fixed.
+        # Loud, not fatal: the loop must keep ticking, the operator must notice.
+        print(f"triage: WARNING {_knob}={_model!r} routes automatic "
+              "dispatches onto Max — expected a non-Claude IU model id", file=sys.stderr)
 
 # Step-7 review validation (_open_validation_dispatch() below) had no model knob
 # at all and always took sideclaw's own JUDGE route. It now has one — but it
@@ -5043,7 +5054,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 conn, target=target, tier="implement", brief=brief,
                 context=_verdict_as_context(item["dispatch_job"], verdict),
                 why="triage auto-implement: investigation concluded implement at high confidence",
-                model=AUTO_DISPATCH_MODEL, origin=_dispatch.Origin(event_id=item["event_id"]),
+                model=AUTO_IMPLEMENT_MODEL, origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
             )
         except RemoteError as exc:
@@ -6597,7 +6608,7 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
     try:
         opened = _dispatch.open_episode(
             conn, target=target, tier="implement", brief=brief, context=context,
-            why="argo owner action: implement", model=AUTO_DISPATCH_MODEL,
+            why="argo owner action: implement", model=AUTO_IMPLEMENT_MODEL,
             origin=_dispatch.Origin(event_id=event_id), authorized_by="owner:argo",
         )
     except RemoteError as exc:

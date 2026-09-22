@@ -3179,9 +3179,12 @@ def test_auto_implement_fires_only_at_high_confidence():
         triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert len(calls) == 1, f"expected exactly the high-confidence item, got {len(calls)} submit call(s)"
-        assert calls[0]["model"] == triage.AUTO_DISPATCH_MODEL, (
-            "auto-implement must dispatch on the cheap IU model, not the owner's Max "
-            f"subscription — got {calls[0]['model']!r}"
+        assert calls[0]["model"] == triage.AUTO_IMPLEMENT_MODEL, (
+            "auto-implement must dispatch on the implement-tier IU model, not the owner's "
+            f"Max subscription — got {calls[0]['model']!r}"
+        )
+        assert triage.AUTO_IMPLEMENT_MODEL != triage.AUTO_DISPATCH_MODEL, (
+            "the owner's split (§84): investigate on the fast model, implement on the heavier one"
         )
         item_hi = triage._get_item(conn, eid_hi)
         assert item_hi["state"] == triage.STATE_IMPLEMENTING

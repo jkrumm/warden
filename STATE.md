@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-22 (§83) |
+| Last updated | 2026-09-22 (§84) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
@@ -38,9 +38,11 @@ loop.
   intake), or `human` (`warden run`, typed in herdr or through Hermes's door
   with `--origin-channel`/`--origin-thread`). See
   `docs/history/state-log.md` §55.
-- Automatic investigate/implement dispatches pass `AUTO_DISPATCH_MODEL`
+- Automatic investigate dispatches pass `AUTO_DISPATCH_MODEL`
   (`DeepSeek-V4-Flash` since §79, `glm-5.3-flash` before; env
-  `TRIAGE_AUTO_DISPATCH_MODEL`) and run on the IU backend, never Max. Validation is a sideclaw `review` job on the pull
+  `TRIAGE_AUTO_DISPATCH_MODEL`); automatic implement dispatches pass
+  `AUTO_IMPLEMENT_MODEL` (`DeepSeek-V4-Pro`, env `TRIAGE_AUTO_IMPLEMENT_MODEL`,
+  §84). Both run on the IU backend, never Max. Validation is a sideclaw `review` job on the pull
   request; `TRIAGE_VALIDATION_DISPATCH_MODEL` can re-point it but defaults to
   `None`, i.e. sideclaw's JUDGE route — review is the one tool where the cheap
   tier has been measured failing (§64).
@@ -250,6 +252,8 @@ loop.
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.
+- The automatic model split: investigate on Flash, implement on Pro; Pro's
+  poor cache reuse on this gateway recorded and under measurement — §84
 
 ### Next action
 
