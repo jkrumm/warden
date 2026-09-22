@@ -687,6 +687,76 @@ def test_unstructured_prose_lands_in_note_not_ignored():
         assert "1Password rate-limiting" in digest_text
 
 
+def _seed_note_row(conn: sqlite3.Connection, event_id: int, signature: str) -> None:
+    """A `note`-state triage row over an already-inserted event — the shape
+    the digest reads. The rows here are seeded directly rather than reached
+    through `classify()`: the case these tests pin is a row created while its
+    event was live and resolved afterwards, which no single `run()` pass can
+    produce (see the digest tests below)."""
+    conn.execute(
+        "INSERT INTO triage_items(event_id, signature, state, occurrences, first_seen, "
+        "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        (event_id, signature, triage.STATE_NOTE, 1, OLD.isoformat(), OLD.isoformat(),
+         OLD.isoformat(), OLD.isoformat()),
+    )
+    conn.commit()
+
+
+def test_digest_drops_note_rows_whose_event_already_resolved():
+    """§76/§77's residual, made: the notes heading reads "possible root
+    causes nobody actioned", so a `note` row whose event has since resolved
+    must not appear under it. The four rows §76's revive deliberately skipped
+    because they were already resolved (events 105, 542, 918, 999 — the
+    homelab disk alert among them, resolved on the Beszel side
+    2026-09-19T09:09Z) printed there every day afterwards, and the daily
+    digest is the only place these rows are ever visible."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        live = _insert_event(conn, source="slack_alert", external_id="live-prose-note",
+                              title="HomeLab CPU above threshold", first_seen=OLD)
+        dead = _insert_event(conn, source="slack_alert", external_id="resolved-prose-note",
+                              title="HomeLab disk usage above threshold", first_seen=OLD,
+                              resolved_at=(OLD + dt.timedelta(days=5)).isoformat())
+        _seed_note_row(conn, live, "slack_alert:live-prose-note")
+        _seed_note_row(conn, dead, "slack_alert:resolved-prose-note")
+
+        triage.maybe_post_daily_digest(conn, policy, set(), dt.datetime.now(dt.timezone.utc),
+                                       dry_run=False)
+
+        digests = [p for p in ctx.posted if "Unstructured notes" in p["text"]]
+        assert len(digests) == 1, "the still-open note row must keep being reported"
+        digest_text = digests[0]["text"]
+        assert "slack_alert:live-prose-note" in digest_text
+        assert "slack_alert:resolved-prose-note" not in digest_text, (
+            "a note row whose incident has resolved is not an unactioned root cause, and the "
+            "row stays in `note` either way — only its appearance in the digest changed"
+        )
+
+
+def test_digest_is_silent_when_every_note_row_has_resolved():
+    """The other half: with no unresolved note, no unmapped signature and no
+    auto-proposal, the digest sends nothing at all. A heading whose every
+    entry is resolution-closed is noise, and this is the loop that exists to
+    remove it."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        dead = _insert_event(conn, source="slack_alert", external_id="only-resolved-note",
+                              title="HomeLab disk usage above threshold", first_seen=OLD,
+                              resolved_at=(OLD + dt.timedelta(days=5)).isoformat())
+        _seed_note_row(conn, dead, "slack_alert:only-resolved-note")
+
+        triage.maybe_post_daily_digest(conn, policy, set(), dt.datetime.now(dt.timezone.utc),
+                                       dry_run=False)
+
+        assert ctx.posted == [], "a digest with nothing to report must not be posted"
+        row = conn.execute("SELECT value FROM cursors WHERE key=?",
+                           (triage.DAILY_DIGEST_CURSOR_KEY,)).fetchone()
+        assert row is None, (
+            "and it must not burn the day's cursor either — a later real note has to be able "
+            "to reach today's digest"
+        )
+
+
 def test_rule_matching_runs_before_the_prose_filter():
     """The ordering fix (items 1117/1118): a `slack_alert` that does not look
     like a bot alert must still be matched against `rules` FIRST. Run the

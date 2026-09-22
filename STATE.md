@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-21 (§80) |
+| Last updated | 2026-09-22 (§81) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 274/274 is the gate; `make test` runs all suites (17 files, incl. the new `tests/test_reset_frozen_notes.py`) |
+| Tests | `tests/test_triage.py` 276/276 is the gate; `make test` runs all suites (17 files, incl. `tests/test_reset_frozen_notes.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -167,9 +167,10 @@ loop.
 - `config/triage-policy.json` carries 151 rule entries for 61 distinct match
   values and 49 ignore entries for 12 (§77). §76's dedup stops the growth;
   nothing has collapsed what accumulated. First match wins, so it is inert.
-- `_fetch_note_rows()` does not filter resolved events, so a `note` row whose
-  incident has since resolved keeps appearing under the digest's "Unstructured
-  notes" heading forever (§76). Digest-content call, not yet made.
+- `_fetch_note_rows()` excludes rows whose event has resolved, so the digest's
+  "Unstructured notes" heading only ever carries a still-open incident (§81).
+  The four resolution-closed `slack_alert` rows §76's revive skipped (105, 542,
+  918, 999) stop printing there; they stay in terminal `note`.
 - No ledger restore path yet. The repo itself has no remote; since §62 the
   daily backup ships a `git bundle` of every ref next to the ledger snapshots.
 
@@ -230,6 +231,9 @@ loop.
 - First full lifecycle on the new model: two draft PRs in 27 min, under nine
   of them work — the 600 s tick is now an item's latency; a second operator
   re-filed and deduped this session's items through Hermes's door — §80
+- The digest's "Unstructured notes" heading stops carrying rows whose incident
+  already resolved: the four §76 left behind now filter out, so the digest is
+  silent until a real unactioned note appears — §81
 
 Every wave appends a § to the log and rewrites this file; never edit the
 log's past sections.

@@ -7895,3 +7895,35 @@ Also noted: sideclaw appends "Opened automatically by a bounded dispatch
 episode, from this brief: …" to every PR body. One of the §79 review episodes
 flagged it against the owner's global no-attribution rule. It is provenance,
 written by the tooling rather than the model, and it is sideclaw's to decide.
+
+## 81. The digest's notes heading drops what has already resolved (2026-09-22)
+
+The loop kept printing the same four `slack_alert` signatures under
+"Unstructured notes in #alerts — possible root causes nobody actioned" after
+§76 unfroze the family and §77 closed the re-freeze, because those four were
+exactly the rows §76's revive had to skip: their events were already resolved
+when it ran (105 photos incident, 542 homelab disk, 918 recovered reply, 999
+VPN self-heal — resolved 2026-09-14 → 2026-09-19). `_fetch_note_rows()`
+selected on `ti.state = note` alone, so a resolution-closed row printed under
+that heading every day regardless. §77 left this as "a digest-content decision,
+not part of this fix"; this makes the decision.
+
+The change is one predicate, `AND e.resolved_at IS NULL`. The heading claims an
+unactioned root cause, and a resolved event is the producer saying the condition
+is over: the row is still terminal `note`, as designed, it simply has nothing
+left to report. `classify()` and `scripts/reset-frozen-notes.py` are untouched —
+`note` stays terminal for unresolved prose, and those four rows stay where they
+are.
+
+Measured against the live ledger: `note` rows 4 → 0, all four resolution-closed,
+so with no unmapped signatures and nothing auto-proposed the digest is now
+silent until a real unactioned note appears. `tests/test_triage.py` 274 →
+**276/276** (`test_digest_drops_note_rows_whose_event_already_resolved` and
+`test_digest_is_silent_when_every_note_row_has_resolved`, asserted on the
+digest's own payload and on the day cursor not being burned by an empty one);
+`make test` green across all suites. The loop runs from this working tree, so
+the change is live on the next tick.
+
+Noted, unchanged: `config/triage-policy.json` still carries 151 rule entries
+for 61 distinct match values and 49 ignore entries for 12 (§77), and the 24
+unreviewed draft PRs across nine repos remain the owner's backlog (§78).

@@ -6348,9 +6348,20 @@ def propose_mappings(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.d
 # --- unmapped-signature digest -------------------------------------------------
 
 def _fetch_note_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The digest's `note` rows: unstructured #alerts prose that might be an
+    unactioned root cause — so only rows whose event is still OPEN.
+
+    A `note` row whose event has since resolved is excluded. The heading it
+    prints under claims an unactioned root cause, and a resolution-closed
+    event is the producer saying the condition is over; the row stays in
+    `note` (terminal, as designed) but has nothing left to report. Four such
+    rows — events 105, 542, 918, 999, left behind by §76's one-time revive
+    precisely because their events had resolved — printed here every day
+    against resolutions that had landed days earlier (§77 left this as a
+    digest-content decision; it is made here)."""
     return conn.execute(
         "SELECT ti.signature, e.title FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state=? ORDER BY ti.updated_at DESC",
+        "WHERE ti.state=? AND e.resolved_at IS NULL ORDER BY ti.updated_at DESC",
         (STATE_NOTE,),
     ).fetchall()
 
