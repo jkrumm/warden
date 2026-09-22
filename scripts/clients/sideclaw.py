@@ -11,6 +11,7 @@ it.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
@@ -275,6 +276,22 @@ def assert_outcome(job: dict[str, Any], outcomes: tuple[str, ...], tool: str) ->
         raise RemoteError(
             f"sideclaw {tool} result outcome {outcome!r}, warden expects one of {outcomes} — refusing to parse"
         )
+
+
+def finished_at_iso(job: dict[str, Any], *, fallback: dt.datetime) -> str:
+    """The ledger's `finished_at` should read when sideclaw itself finished
+    the job (`JobView.finishedAt`, epoch ms — server/jobs/types.ts), not when
+    this process happened to poll it. Every terminal poll response already
+    carries this field; warden used to discard it and stamp its own wall
+    clock instead, which is why a poll suspended overnight recorded a
+    614-minute dispatch that actually took 20 (docs/history/state-log.md
+    §79). Falls back to `fallback` (the caller's own `now`) only when
+    sideclaw's value is missing or not a number — every real terminal job
+    carries one, but a fallback is cheaper than a caller-side branch."""
+    raw = job.get("finishedAt")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return dt.datetime.fromtimestamp(raw / 1000, tz=dt.timezone.utc).isoformat()
+    return fallback.isoformat()
 
 
 def check_schema_versions() -> dict[str, dict[str, Any]]:

@@ -8069,3 +8069,118 @@ multi-paragraph briefs in a row never started a daemon. The brief is staged
 in a host file now. And the auto-mode classifier refused to launch the seven
 colleague sessions this session tried to open for the PR backlog; the briefs
 are in `/tmp/warden-poc/briefs/` for the owner to launch.
+
+## 87. Advance on completion: the 600s tick was an item's latency, not the model's (2026-09-22)
+
+§80 measured a full lifecycle — verdict → implementing → validating →
+merge_blocked — at 27 minutes of wall clock for under 9 minutes of real
+dispatch work, because every one of those three stage boundaries only ever
+advances inside `triage.run()`, the loop's own 600s tick. dispatch-sweep.py
+already polls every open dispatch on its own 300s cadence and already folds
+an INVESTIGATE job's terminal verdict onto its triage_items row the moment
+it sees one (`fold_dispatch_verdict()`, keyed on `dispatch_job` — the
+column only the first, investigate dispatch of a cluster ever populates).
+But that fold never propagated further: `maybe_auto_implement()`,
+`poll_implement_jobs()` and `poll_validation_jobs()` — the functions that
+actually walk verdict → implementing → validating → merge/merge_blocked —
+lived only in `run()`, so a verdict folded by the sweep at, say, 300s past
+the hour still sat idle until the loop's own tick at 600s before anything
+looked at it again, and the same 600s gap repeated at every later boundary.
+
+**The fix reuses the loop's own functions, not a second implementation of
+them.** `triage.py` gets one new function, `advance_implement_chain()`,
+which is exactly the three calls `run()` used to make inline
+(`maybe_auto_implement`, `poll_implement_jobs`, `poll_validation_jobs`, in
+that order — the order that already let an item crossing a stage earlier in
+the same run get picked up by the next stage without waiting a further
+tick). `run()` now calls this one function instead of the three; behaviour
+is unchanged there (it is a pure extraction — the full 276/276 suite passes
+byte-for-byte with no test edits needed at all). `dispatch-sweep.py` calls
+the *exact same function*, once, unconditionally, at the end of every 300s
+pass — after its own per-row poll loop, so a verdict this same pass just
+folded is already visible to `maybe_auto_implement()` before the pass ends.
+
+**Why this is safe with no new lock, and why it is not a second loop.**
+Every step inside the chain already re-derives its own eligibility from the
+ledger on each call and is CAS-guarded end to end:
+`maybe_auto_implement()`'s claim is `UPDATE ... WHERE state='verdict' AND
+implement_job IS NULL` (wins once, ever); `poll_implement_jobs()` and
+`poll_validation_jobs()` each do their own fresh sideclaw poll per row
+before touching a state, and a `done` job stays `done` no matter which of
+two processes reads it first. Two cron processes calling this chain is
+exactly as safe as the loop calling it twice in a row already was, which it
+always tolerated (a slow tick immediately followed by a fast one on
+restart). DESIGN.md's "no second loop" is about a SECOND SCHEDULE deciding
+state — this adds no schedule at all: dispatch-sweep.py already existed,
+already runs every 300s, and is already the one process watching sideclaw
+for exactly the signal ("a job just went terminal") that makes this chain
+worth re-running. The alternative — dropping the loop's own `StartInterval`
+so `run()` itself ticks faster — was rejected: `run()` also does GitHub
+issue ingest, `classify()`, the `propose_mappings()` LLM call, the digest
+and the Argo snapshot push, none of which have a latency complaint against
+them and none of which benefit from running every 300s or less; shortening
+the loop's tick would pay that cost on every one of those steps for a
+benefit only the three-function chain needs, and the sweep already sits at
+300s — there is no latency left to buy by going below the cadence the
+process already watching for the trigger runs at. `maybe_check_liveness()`
+(step 10, the post-merge deploy-verification poll) stays on the loop's own
+600s tick alone: its window is `LIVENESS_WINDOW_HOURS`, not seconds, so
+300s buys it nothing.
+
+**`dispatches.finished_at` was the poll's own wall clock, not sideclaw's**
+(§79's open item). Every terminal fold — `lifecycle/dispatch.py`'s
+`sync_record()` (called by `poll_implement_jobs()`/`poll_validation_jobs()`/
+`warden status`) and dispatch-sweep.py's own per-row fold — stamped
+`finished_at` with `now`, the moment THIS process happened to observe the
+job terminal, not the moment sideclaw itself finished it. §79's own
+12-episode POC already proved the gap: twelve rows read 614–625 minutes
+because the polling shell was suspended overnight. sideclaw's job envelope
+(`GET /api/jobs/:id`, `JobView.finishedAt` — server/jobs/types.ts) already
+carries this as an epoch-ms field on every terminal job; warden received it
+on every poll and discarded it. `clients/sideclaw.py` gets one new
+function, `finished_at_iso(job, fallback=now)`, converting that field to an
+ISO UTC string when present and falling back to the caller's own `now`
+only for the rare terminal job that carries none (there never was a
+"pruned" job's envelope to read — `dispatch-sweep.py`'s `_mark_pruned()`
+path is unchanged, correctly, since there sideclaw's own value could never
+exist). Both fold sites now call it. `dispatches.finished_at` is now
+sideclaw's own ground truth, not an upper bound.
+
+**Tests.** `tests/test_triage.py` stays **276/276** — `advance_implement_chain()`
+is a pure extraction, exercised by every existing test that calls
+`triage.run()`, with no test edits needed to keep it green. Ten new tests,
+none touching that gate: `test_clients.py` 105 → **107/107**
+(`finished_at_iso()`'s own two cases — prefers sideclaw's timestamp, falls
+back on a missing/non-numeric/boolean value); `test_lifecycle.py` 98 →
+**100/100** (`sync_record()` end to end — a job finished hours before an
+overnight-suspended poll observes it must not stamp the late observation
+time); a new file, `tests/test_dispatch_sweep_pipeline.py` (6/6) — pins
+that `main()` calls `advance_implement_chain()` exactly once per pass
+regardless of whether there was anything to report, threads `--dry-run`
+through correctly, survives a raised exception inside the chain without
+failing the sweep itself, and — the one that pins the actual fix — that an
+item this same pass's row loop just folded to `verdict` is visible to
+`advance_implement_chain()` before the pass ends, not the next one.
+`make test`: 18 suites, all green.
+
+**Not yet measured against a real item.** This landed from a background
+session working in an isolated worktree (`docs/history/state-log.md`'s own
+convention plus this session's own isolation policy) — the five
+LaunchAgents run `scripts/{triage,dispatch-sweep}.py` straight out of the
+main checkout's working tree, never a worktree, so a live `dispatch-scratch`
+`warden run --tier implement` only exercises this fix once these commits are
+on `master` there. Left as the owner's own next step (`warden run
+dispatch-scratch --tier implement` with a trivial brief is the safe target,
+per this task's own brief): compare the new lifecycle's stage-boundary
+timestamps against §80's four (verdict → implementing 02:47:25 →
+validating 02:57:29 → merge_blocked 03:07:31, each a ~10-minute jump) —
+the expected shape now is each boundary landing within roughly one 300s
+sweep pass of the prior stage's own completion, not on the next 600s
+multiple.
+
+No LaunchAgent plist changed — no `StartInterval` moved, no new agent
+added — so this needs no `make setup` and no reload; `make status` still
+shows the same five agents. The sweep and the loop are already separate
+processes spawned fresh by cron each tick, so the new code takes effect on
+each script's very next scheduled invocation once these commits reach
+`master`, with nothing to restart.

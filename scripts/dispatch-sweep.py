@@ -33,6 +33,20 @@ into) can never be delivered anywhere, so it is closed with a sentinel
 instead of accumulating as a permanent debt — see UNDELIVERABLE_SENTINEL
 below.
 
+ADVANCE ON COMPLETION (docs/history/state-log.md §87). After that per-row
+pass, every pass also calls `triage.advance_implement_chain()` — the same
+verdict -> implementing -> validating -> merge/merge_blocked code
+`triage.run()` calls on its own 600s tick. Before this, an item that just
+crossed a stage boundary (its verdict folded above, or the row loop
+noticing an implement/review job go terminal) waited for the loop's next
+tick regardless — measured at a full lifecycle costing 27 minutes of wall
+clock for under 9 minutes of real work (§80), because every stage boundary
+was gated on the same 600s clock. Calling the identical, already
+CAS-guarded functions from here too halves that worst case to this
+script's own 300s cadence at no extra risk — see
+`advance_implement_chain()`'s own docstring for why two cron processes
+calling it is safe with no new lock.
+
 TWO COLUMNS, NOT ONE OVERLOADED ONE. `reported_at` used to double as a
 status field: a real timestamp meant delivered, and the string
 UNDELIVERABLE_SENTINEL sitting in that same TEXT column meant "closed,
@@ -662,7 +676,14 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
     # Fold the terminal outcome back into the row and commit it BEFORE any
     # delivery attempt — see the module docstring's crash-safety contract.
     if not dry_run:
-        now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+        now = dt.datetime.now(dt.timezone.utc)
+        # sideclaw's own `finishedAt` (when it stamped the job terminal), not
+        # this poll's wall clock — a sweep that finds a job late (an
+        # unloaded LaunchAgent, a suspended host) must not misreport how
+        # long the episode actually ran (docs/history/state-log.md §79: a
+        # poll suspended overnight recorded a 614-minute dispatch that took
+        # 20). `now` is still the fallback for the rare job with no such field.
+        finished_at = _sideclaw.finished_at_iso(job, fallback=now)
         # `artifact_url` is denormalized out of the verdict into its own column so the
         # GitHub projection is a column read, not a JSON parse — the briefing and the
         # watchdog both want "what did this dispatch produce" without unpacking a blob.
@@ -673,7 +694,7 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
                 status,
                 json.dumps(result) if result is not None else None,
                 artifact_url,
-                now_iso,
+                finished_at,
                 error_text,
                 job_id,
             ),
@@ -824,6 +845,26 @@ def main(argv: list[str] | None = None) -> int:
                     f"raised: {e} — skipping, next sweep retries",
                     file=sys.stderr,
                 )
+
+        # ADVANCE ON COMPLETION (docs/history/state-log.md §87). The verdict
+        # this pass just folded above (fold_dispatch_verdict(), inside
+        # process_dispatch()) can make an item eligible for its next
+        # deterministic transition RIGHT NOW rather than at the loop's next
+        # 600s tick — triage.advance_implement_chain() is the exact same
+        # verdict -> implementing -> validating -> merge/merge_blocked code
+        # run() itself calls, see that function's own docstring for why
+        # calling it from here, on this 300s cadence, needs no new lock and
+        # is not a second loop. Runs unconditionally, once per pass, exactly
+        # like run() does — every step re-derives its own eligibility from
+        # the DB, so an empty ledger costs one cheap SELECT per step.
+        try:
+            _triage.advance_implement_chain(conn, _triage.load_policy(),
+                                             dt.datetime.now(dt.timezone.utc), dry_run=dry_run)
+        except Exception as e:  # this chain must never take the sweep itself down
+            errors += 1
+            print(f"dispatch-sweep: advance_implement_chain raised: {e} — the loop's own "
+                  f"600s tick still covers it", file=sys.stderr)
+
         if not dry_run:
             record_heartbeat(conn, considered=len(rows), errors=errors)
     finally:

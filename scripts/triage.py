@@ -5539,6 +5539,45 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 
+def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                             *, dry_run: bool) -> None:
+    """Steps 6-8 — verdict -> implementing -> validating -> merge/merge_blocked
+    — as one callable unit, so `run()`'s own 600s tick and
+    dispatch-sweep.py's 300s pass advance an item through EXACTLY the same
+    code, not two copies that can drift.
+
+    Why this is safe to call from two independent cron processes racing the
+    same ledger, with no new lock: every step here already re-derives its
+    own eligibility from the DB on each call and is CAS-guarded end to end —
+    `maybe_auto_implement()`'s claim-before-dispatch UPDATE only ever wins
+    once (`AND state='verdict' AND implement_job IS NULL`), and
+    `poll_implement_jobs()`/`poll_validation_jobs()` each do their own fresh
+    sideclaw poll per row before touching a state. A second call landing on
+    a row the other process already advanced changes zero rows and moves on
+    — indistinguishable from the loop calling this twice in a row, which it
+    already tolerated before dispatch-sweep.py called it too.
+
+    Why the sweep, not a shorter loop interval: everything else in `run()`
+    (GitHub ingest, `classify()`, `propose_mappings()`'s LLM call, the digest,
+    the Argo snapshot) has no latency complaint against it and gains nothing
+    from running every 300s instead of 600s — shortening the loop's own
+    tick would pay that cost on every step for a benefit only this chain
+    needs. dispatch-sweep.py is already the thing observing a dispatch go
+    terminal, on its own 300s cadence, so calling this from there advances
+    an item to its next deterministic state without a new poller, a new
+    schedule, or a second loop (DESIGN.md's own prohibition) — it is the
+    same three functions, called once more often, from the one process
+    already watching for exactly this signal.
+
+    `maybe_check_liveness()` (step 10) is deliberately NOT part of this
+    chain: its own window is hours (LIVENESS_WINDOW_HOURS), not seconds, so
+    the 600s tick already covers it with room to spare — see docs/history/state-log.md
+    §87 for the measurement this rests on."""
+    maybe_auto_implement(conn, policy, now, dry_run=dry_run)
+    poll_implement_jobs(conn, policy, now, dry_run=dry_run)
+    poll_validation_jobs(conn, policy, now, dry_run=dry_run)
+
+
 def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step 10. The item must not close because the alert went quiet — a
@@ -6936,10 +6975,10 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # that crossed a stage earlier THIS SAME RUN also be picked up by the
     # next stage rather than waiting a full 10 minutes — never required for
     # correctness (each stage re-derives its own eligibility from the DB
-    # every run regardless), just fewer idle cycles.
-    maybe_auto_implement(conn, policy, now, dry_run=dry_run)
-    poll_implement_jobs(conn, policy, now, dry_run=dry_run)
-    poll_validation_jobs(conn, policy, now, dry_run=dry_run)
+    # every run regardless), just fewer idle cycles. Steps 6-8 are also
+    # dispatch-sweep.py's own 300s call, via advance_implement_chain() — see
+    # that function's docstring for why the same code runs from both places.
+    advance_implement_chain(conn, policy, now, dry_run=dry_run)
     maybe_check_liveness(conn, policy, now, dry_run=dry_run)
 
     # After every poller above, before the cards below — see sweep_deadlines()'s

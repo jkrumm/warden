@@ -231,9 +231,16 @@ def open_review(
 def sync_record(conn: sqlite3.Connection, job: dict, *, reported: bool, now: dt.datetime | None = None) -> None:
     """Fold a terminal job's outcome back into its dispatch row — the Python
     port of the retired bash CLI's `sync_record` (1470-1498), schema-6
-    `delivery_status` included."""
+    `delivery_status` included.
+
+    `finished_at` is sideclaw's own `job["finishedAt"]` (see
+    `clients.sideclaw.finished_at_iso()`), not `now` — `now` is only the
+    fallback for the rare terminal job that carries no such field, and it is
+    still used for `reported_at`/`delivery_status`, which genuinely are
+    stamped at THIS moment (this call is the report)."""
     now = now or dt.datetime.now(dt.timezone.utc)
     now_iso = now.isoformat()
+    finished_at = sideclaw.finished_at_iso(job, fallback=now)
     result = job.get("result")
     artifact = (result.get("artifactUrl") or None) if isinstance(result, dict) else None
     reported_at = now_iso if reported else None
@@ -246,7 +253,7 @@ def sync_record(conn: sqlite3.Connection, job: dict, *, reported: bool, now: dt.
             job.get("status"),
             json.dumps(result) if result is not None else None,
             artifact,
-            now_iso,
+            finished_at,
             reported_at,
             reported_at,
             "delivered",

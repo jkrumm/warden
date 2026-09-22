@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-22 (§86) |
+| Last updated | 2026-09-22 (§87) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 276/276 is the gate; `make test` runs all suites (17 files, incl. `tests/test_reset_frozen_notes.py`) |
+| Tests | `tests/test_triage.py` 276/276 is the gate; `make test` runs all suites (18 files, incl. `tests/test_dispatch_sweep_pipeline.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -134,6 +134,20 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
+- **Advance on completion (§87).** `triage.advance_implement_chain()` —
+  `maybe_auto_implement` → `poll_implement_jobs` → `poll_validation_jobs`,
+  the exact code `run()`'s own 600s tick calls — is now ALSO called,
+  unconditionally, once per pass, at the end of dispatch-sweep.py's `main()`
+  (300s), right after that pass's own per-row fold. An item no longer waits
+  for the loop's own tick to cross verdict → implementing → validating →
+  merge/merge_blocked; it advances on whichever of the two cron processes
+  next observes the ledger in the eligible state, safely, with no new lock
+  (every step is already CAS-guarded and re-derives its own eligibility
+  every call) and no second loop (no new schedule was added — the sweep
+  already ran every 300s). `dispatches.finished_at` now reads sideclaw's own
+  `finishedAt` (`clients.sideclaw.finished_at_iso()`), not the wall clock of
+  whichever process happened to observe the job terminal — §79's upper-bound
+  problem is fixed, not just documented. No LaunchAgent plist changed.
 
 ## Open — owner actions
 
@@ -256,8 +270,24 @@ log's past sections.
   poor cache reuse on this gateway recorded and under measurement — §84
 - §85's cache diagnosis withdrawn on a proper probe: Pro's cache advances like
   Flash's; the real-episode gap is reproduced but unexplained — §86
+- Advance on completion: dispatch-sweep.py's 300s pass now also runs the
+  verdict → implementing → validating → merge chain, and `finished_at` reads
+  sideclaw's own timestamp instead of the poll's — §87
 
 ### Next action
+
+**§87 just landed** (advance on completion — verdict → implementing →
+validating → merge/merge_blocked no longer waits for the loop's 600s tick;
+`finished_at` is sideclaw's own timestamp), but only on the
+`worktree-advance-on-completion` branch — it built and tested green from an
+isolated background session and has not been merged to `master` yet, so the
+five live LaunchAgents are still running the pre-§87 code. Merge it
+(fast-forward, this repo's own direct-to-master convention), then watch a
+real lifecycle (`warden run dispatch-scratch --tier implement` with a
+trivial brief is the safe target) for stage boundaries landing within one
+300s sweep pass of each other instead of on the next 600s multiple — see
+§87's own "not yet measured" paragraph for the exact comparison. No plist
+changed, nothing to reload.
 
 **§77, the field look (read it first).** The dispatch lane held up alone for
 ten days; the open work is the owner's, not the loop's: 24 draft PRs across

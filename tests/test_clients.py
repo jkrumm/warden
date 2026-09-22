@@ -14,6 +14,7 @@ Run: .venv/bin/python3 tests/test_clients.py
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -372,6 +373,22 @@ def test_assert_outcome_raises_on_missing_outcome():
         assert "None" in str(e) and "refusing to parse" in str(e), e
     else:
         raise AssertionError("expected RemoteError")
+
+
+def test_finished_at_iso_prefers_sideclaws_own_timestamp():
+    fallback = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    finished = dt.datetime(2026, 1, 1, 0, 5, tzinfo=dt.timezone.utc)
+    job = {"status": "done", "finishedAt": int(finished.timestamp() * 1000)}
+    assert sideclaw.finished_at_iso(job, fallback=fallback) == finished.isoformat()
+
+
+def test_finished_at_iso_falls_back_when_missing_or_not_a_number():
+    fallback = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    assert sideclaw.finished_at_iso({"status": "failed"}, fallback=fallback) == fallback.isoformat()
+    assert sideclaw.finished_at_iso({"finishedAt": None}, fallback=fallback) == fallback.isoformat()
+    assert sideclaw.finished_at_iso({"finishedAt": "not-a-number"}, fallback=fallback) == fallback.isoformat()
+    # bool is an int subclass in Python — must not be read as an epoch-ms timestamp.
+    assert sideclaw.finished_at_iso({"finishedAt": True}, fallback=fallback) == fallback.isoformat()
 
 
 def test_assert_outcome_skips_non_done_jobs():

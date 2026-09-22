@@ -934,6 +934,36 @@ def test_sync_record_not_reported_leaves_reported_at_null():
     assert row["delivery_status"] is None
 
 
+def test_sync_record_finished_at_uses_sideclaws_own_timestamp():
+    """docs/history/state-log.md §87: `finished_at` must read when sideclaw
+    itself finished the job (`job["finishedAt"]`, epoch ms), not when this
+    process happened to poll it — a poll suspended for hours must not
+    misreport how long the episode actually ran (§79's 614-minute dispatch
+    that took 20)."""
+    conn, _ = _fresh_ledger()
+    _seed_dispatch(conn, "job-finished-at")
+    observed_late = _now() + dt.timedelta(hours=10)
+    finished_epoch_ms = int((_now() + dt.timedelta(minutes=5)).timestamp() * 1000)
+    job = {"id": "job-finished-at", "status": "done", "result": None, "finishedAt": finished_epoch_ms}
+    dispatch.sync_record(conn, job, reported=False, now=observed_late)
+    row = conn.execute("SELECT finished_at FROM dispatches WHERE job_id='job-finished-at'").fetchone()
+    recorded = dt.datetime.fromisoformat(row["finished_at"])
+    expected = dt.datetime.fromtimestamp(finished_epoch_ms / 1000, tz=dt.timezone.utc)
+    assert abs((recorded - expected).total_seconds()) < 1, row["finished_at"]
+    assert recorded < observed_late - dt.timedelta(hours=1), (
+        "finished_at must not fall back to the late observation time when sideclaw's own value is present")
+
+
+def test_sync_record_finished_at_falls_back_to_now_when_sideclaw_omits_it():
+    conn, _ = _fresh_ledger()
+    _seed_dispatch(conn, "job-no-finished-at")
+    now = _now()
+    job = {"id": "job-no-finished-at", "status": "failed", "result": None}
+    dispatch.sync_record(conn, job, reported=False, now=now)
+    row = conn.execute("SELECT finished_at FROM dispatches WHERE job_id='job-no-finished-at'").fetchone()
+    assert row["finished_at"] == now.isoformat(), row["finished_at"]
+
+
 def test_list_dispatches_unknown_scope_raises():
     conn, _ = _fresh_ledger()
     try:
