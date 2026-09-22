@@ -8040,3 +8040,32 @@ Pro is priced on nearly full input from the second turn on, and the longer the
 loop the worse the ratio — Pro suits short, bounded hard work better than long
 implement loops. The split stands as the owner's call;
 `TRIAGE_AUTO_IMPLEMENT_MODEL=DeepSeek-V4-Flash` is the line back.
+
+## 86. §85 withdrawn: Pro's cache advances like everyone else's (2026-09-22)
+
+The owner did not believe §85 and was right. The probe behind it appended
+17–147 tokens per turn — under DeepSeek's 64-token cache chunk and Anthropic's
+1024-token minimum block — so it could never show a cache advancing. Re-run
+with 2–4k-token tool-result-shaped turns and a sliding `cache_control`, three
+runs per model (modelpick `0c0bb08`, `db65a39`): DeepSeek-V4-Pro's
+`cache_read` grows in lockstep with the conversation at ~0.90 of input, 18/18
+turns, indistinguishable from Flash and glm. So Pro is not "priced on full
+input from the second turn"; §84's split stands without that caveat.
+
+What is still true and still unexplained: two real Pro dispatch episodes from
+2026-09-20 show `cache_read` flat around 5k while input climbs past 88k, with
+7–135 s between turns (well inside any TTL). The controlled probe does not
+reproduce it. Candidates not yet measured: the `thinking` block Pro emits
+every turn, or real `tool_use`/`tool_result` blocks, sitting between the
+breakpoint and the new content. No config change is recommended on a guess —
+that is how §85 happened. The two interactive symptoms the owner hit are
+explained without it: glm's 13–35 tok/s is the model, and the 09-17 Pro
+session ran as lowercase `deepseek-v4-pro`, which the context table did not
+know (dotfiles `f5b6ac0` matches case-insensitively now).
+
+Also today, dotfiles `290a1f1`: `rd bg` typed its base64 brief into the
+pane's tty, and macOS truncates canonical input at 1024 bytes — eight
+multi-paragraph briefs in a row never started a daemon. The brief is staged
+in a host file now. And the auto-mode classifier refused to launch the seven
+colleague sessions this session tried to open for the PR backlog; the briefs
+are in `/tmp/warden-poc/briefs/` for the owner to launch.
