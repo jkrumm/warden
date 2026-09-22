@@ -149,7 +149,7 @@ should have expired to `needs_human`, not sat deferred forever).
 Honestly: there is no join today. Two sides exist, unwired: **ledger side** —
 `dispatches.job_id`/`tier`/`repo`/`status`/`created_at`/`finished_at`;
 **usage side** — sideclaw's usage-tracker records lanes `sideclaw:dispatch`
-and `sideclaw:review` (`CLAUDE.md` § Talking to sideclaw, `docs/history/state-log.md` §56's
+and `sideclaw:review` (`AGENTS.md` § Talking to sideclaw, `docs/history/state-log.md` §56's
 "Warden requests no model" note) but has no column keyed on `job_id`. Wave 9
 decides whether building that join (usage row → job id → `dispatches` →
 `triage_items`) is worth it before answering "what did this fix cost."
@@ -253,7 +253,7 @@ dated `§` with a header table, then the findings:
 
 **2. A brain Inbox note**, `Inbox/Warden Field Review <date>.md` — Inbox's
 capture schema is `title`, `date`, `tags` only, no MOC discipline
-(`brain/CLAUDE.md`).
+(`brain/AGENTS.md`).
 
 **3. A proposed next `PLAN.md`**, in the `/wave` skill's format
 (`~/.claude/skills/wave/SKILL.md`): numbered `## Wave N — <name>` sections

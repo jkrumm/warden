@@ -263,7 +263,7 @@ local probe instead of an episode.
 Seeded with exactly one: `env-check` (`hermes-ops.sh env-check --json`, two
 sequential ssh probes of homelab/vps's shared `.env.tpl`), which
 `op_refs_homelab`/`op_refs_vps` route to. A dead 1Password ref blocks every
-future reseal of the mini's offline secrets cache (`dotfiles/CLAUDE.md`
+future reseal of the mini's offline secrets cache (`dotfiles/AGENTS.md`
 §Secrets) — it is a deterministic, already-diagnosed condition the moment
 `env-check` runs, so dispatching a sideclaw episode to "investigate" it would
 be both slower and actively worse: a bare 1Password item name in a
@@ -1473,7 +1473,7 @@ carries a pending change, and `--dry-run` making zero model calls.
 **The current total is 107.** Every figure above (30 / 42 / 54 / 64 / 96 / 102)
 is the running tally *as each group of cases landed*, not the count today —
 they are kept because each paragraph describes what its own group covers. The
-number that governs is the one in `CLAUDE.md`: the regression gate, at
+number that governs is the one in `AGENTS.md`: the regression gate, at
 **148/148**, and any other number is a finding rather than a count to edit.
 The 32 cases past 64 are Wave 1's: the quiet rule (silence-resolve restricted
 to `new`), the intent queue's loop drain, and the deadline table. The 6 past

@@ -8184,3 +8184,18 @@ shows the same five agents. The sweep and the loop are already separate
 processes spawned fresh by cron each tick, so the new code takes effect on
 each script's very next scheduled invocation once these commits reach
 `master`, with nothing to restart.
+
+## 88. Agent instructions live in AGENTS.md (2026-09-23)
+
+Estate-wide migration per `dotfiles/docs/agents-md.md`: the repo's instructions
+moved verbatim to `AGENTS.md`; `CLAUDE.md` is now exactly `@AGENTS.md`, the
+only shape that loads on every Claude lane (a cold `CLAUDE_CONFIG_DIR` over the
+IU endpoint drops a bare AGENTS.md) while OpenCode and Codex read `AGENTS.md`
+natively. No `@import` lines to relocate. Pointers that meant *this repo's*
+instructions (`§The ledger`, `§Talking to sideclaw`, the regression gate, the
+closed allowlists) now name `AGENTS.md`, as do the cross-repo ones into
+dotfiles and brain, which migrate the same way. Pointers into hermes-agent's
+and the global `~/.claude/CLAUDE.md` are unchanged. No warden code reads a
+repo's instruction file — dispatched episodes get the target repo's context
+from sideclaw's `claude` invocation, which follows the shim — so there is no
+code path to switch. `requirements.txt` (`cryptography==50.0.0`) left pinned.

@@ -517,7 +517,7 @@ ALTER TABLE triage_items ADD COLUMN last_reminder_at TEXT;
 #     already document for their own no-backfill tables).
 #
 # A COLUMN, not a field folded into `verdict_json`: that column is sideclaw's
-# own PUBLISHED verdict schema (see CLAUDE.md § Talking to sideclaw — "the
+# own PUBLISHED verdict schema (see AGENTS.md § Talking to sideclaw — "the
 # verdict schema is published by sideclaw, not copied here"), and a failed
 # dispatch has no verdict at all to carry a field on. The reason needs
 # somewhere of its own that is not shaped like an answer to a question

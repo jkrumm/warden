@@ -365,7 +365,7 @@ POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
 # governance-cadence, not the reactive-alert-channel firehose this exists to
 # stop. op_refs_homelab/op_refs_vps ARE included: a dead 1Password ref blocks
 # every future reseal of the mini's offline secrets cache (dotfiles' own
-# CLAUDE.md §Secrets) — it must reach at least the unmapped digest, and
+# AGENTS.md §Secrets) — it must reach at least the unmapped digest, and
 # routes to the `env-check` VERB (see VERB_ALLOWLIST below), never an
 # episode. See docs/triage.md.
 #
@@ -1062,7 +1062,7 @@ def _gather_argo_commit_live(expected: list[dict[str, Any]]) -> tuple[bool, str]
     never as "not sure".
 
     THE URL LIVES HERE, NOT IN THE POLICY FILE. DESIGN.md principle 4 (the
-    four closed allowlists — see this repo's own CLAUDE.md): a policy file
+    four closed allowlists — see this repo's own AGENTS.md): a policy file
     may name and parameterise a behaviour, never express one.
     LIVENESS_ALLOWLIST names a KEY ("argo-commit-live"); this function owns
     argo's endpoint the same way _gather_hyperdx_alert_state() above owns

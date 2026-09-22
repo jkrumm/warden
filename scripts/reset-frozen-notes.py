@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     apply_changes = "--apply" in argv
     triage._apply_db_override(argv)
-    # assert_schema_version() only — the loop owns migration (CLAUDE.md §The
+    # assert_schema_version() only — the loop owns migration (AGENTS.md §The
     # ledger). And read-only unless we are actually writing.
     conn = triage._ledger.connect(triage.DB_PATH, readonly=not apply_changes)
     try:

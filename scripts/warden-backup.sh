@@ -122,7 +122,7 @@ conn.close()
   # moment the directory reached $KEEP. Measured that day: the freshest surviving
   # snapshot was 2 days old and every run since had silently destroyed its own
   # output, leaving the rsynced live `warden.db` + `-wal` pair (captured at two
-  # different instants — the exact thing CLAUDE.md's § The ledger forbids relying
+  # different instants — the exact thing AGENTS.md's § The ledger forbids relying
   # on) as the only current copy on homelab.
   for old in "$SNAP_DIR"/warden-*.db(Nom[$((KEEP + 1)),-1]); do
     rm -f "$old"
