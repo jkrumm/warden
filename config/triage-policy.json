@@ -396,7 +396,10 @@
     {"match": "slack_alert:torrent-app-docker-red-circle-down-container-state-is-exited", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Torrent app container is part of homelab Docker stack."},
     {"match": "slack_alert:photos-http-red-circle-down-read-econnreset", "repo": "image-share", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Photos HTTP service corresponds to image-share."},
     {"match": "slack_alert:weatherorb-http-red-circle-down-read-econnreset", "repo": "weatherorb", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "WeatherOrb HTTP service belongs to weatherorb."},
-    {"match": "slack_alert:mam-account-monitoring-is-blind-mam-account-json-is-stale-seed-obligation-risk-can-no-longer-be-assessed-this-is-a-monit", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "MAM seed-obligation monitoring is part of homelab torrent stack."}
+    {"match": "slack_alert:mam-account-monitoring-is-blind-mam-account-json-is-stale-seed-obligation-risk-can-no-longer-be-assessed-this-is-a-monit", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "MAM seed-obligation monitoring is part of homelab torrent stack."},
+    {"match": "slack_alert:research-gateway-job-error-1-15m", "repo": "research-gateway", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "Job error alert for research-gateway service."},
+    {"match": "uk:226", "repo": "warden", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "MyAnonamouse session maintenance is managed by warden."},
+    {"match": "uk:211", "repo": "warden", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "Garmin auto-relogin is managed by warden."}
   ],
   "ignore": [
     "docker_*:unhealthy:shelfmark",
