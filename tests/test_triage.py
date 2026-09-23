@@ -1257,9 +1257,9 @@ def test_dispatch_brief_on_stdin_and_capped():
             f"brief was {len(brief)} chars, over the {triage.MAX_BRIEF_CHARS} cap"
         )
         assert brief, "brief was empty"
-        assert calls[0]["model"] == triage.AUTO_DISPATCH_MODEL, (
-            "auto-investigate must dispatch on the cheap IU model, not the owner's Max "
-            f"subscription — got {calls[0]['model']!r}"
+        assert calls[0]["model"] is None, (
+            "auto-investigate must send no model override by default, so sideclaw "
+            f"routes the tier itself — got {calls[0]['model']!r}"
         )
 
         item = triage._get_item(conn, eid)
@@ -3183,18 +3183,57 @@ def test_auto_implement_fires_only_at_high_confidence():
         triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert len(calls) == 1, f"expected exactly the high-confidence item, got {len(calls)} submit call(s)"
-        assert calls[0]["model"] == triage.AUTO_IMPLEMENT_MODEL, (
-            "auto-implement must dispatch on the implement-tier IU model, not the owner's "
-            f"Max subscription — got {calls[0]['model']!r}"
-        )
-        assert triage.AUTO_IMPLEMENT_MODEL != triage.AUTO_DISPATCH_MODEL, (
-            "the owner's split (§84): investigate on the fast model, implement on the heavier one"
+        assert calls[0]["model"] is None, (
+            "auto-implement must send no model override by default, so sideclaw "
+            f"routes the implement tier itself — got {calls[0]['model']!r}"
         )
         item_hi = triage._get_item(conn, eid_hi)
         assert item_hi["state"] == triage.STATE_IMPLEMENTING
         assert item_hi["implement_job"] is not None
         item_med = triage._get_item(conn, eid_med)
         assert item_med["state"] == triage.STATE_VERDICT, "a medium-confidence verdict must never auto-implement"
+
+
+def test_auto_dispatch_model_env_override():
+    """Setting the TRIAGE_AUTO_DISPATCH_MODEL knob restores a per-tier override
+    on the step-4 investigate dispatch — the default is None, "sideclaw routes
+    the tier", so the model must only be sent when an operator pins one."""
+    original = triage.AUTO_DISPATCH_MODEL
+    try:
+        triage.AUTO_DISPATCH_MODEL = "test-dispatch-model"
+        with _triage_env() as (conn, ctx):
+            _insert_event(conn, source="slack_alert", external_id="sig-override",
+                          title="override item", first_seen=OLD)
+            calls: list[dict[str, Any]] = []
+            triage._sideclaw.submit = _fake_submit(calls)
+            triage.run(conn, dry_run=False)
+            assert len(calls) == 1, f"expected one dispatch, got {len(calls)}"
+            assert calls[0]["model"] == "test-dispatch-model", (
+                f"the override must reach sideclaw.submit — got {calls[0]['model']!r}"
+            )
+    finally:
+        triage.AUTO_DISPATCH_MODEL = original
+
+
+def test_auto_implement_model_env_override():
+    """Setting TRIAGE_AUTO_IMPLEMENT_MODEL restores a per-tier override on the
+    step-6 implement dispatch — the default is None, "sideclaw routes the
+    tier", so the model must only be sent when an operator pins one."""
+    original = triage.AUTO_IMPLEMENT_MODEL
+    try:
+        triage.AUTO_IMPLEMENT_MODEL = "test-implement-model"
+        with _triage_env() as (conn, ctx):
+            _seed_verdict_item(conn, external_id="sig-imp-override", confidence="high",
+                               investigate_job="investigate-imp-override")
+            calls: list[dict[str, Any]] = []
+            triage._sideclaw.submit = _fake_submit(calls)
+            triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            assert len(calls) == 1, f"expected one implement dispatch, got {len(calls)}"
+            assert calls[0]["model"] == "test-implement-model", (
+                f"the override must reach sideclaw.submit — got {calls[0]['model']!r}"
+            )
+    finally:
+        triage.AUTO_IMPLEMENT_MODEL = original
 
 
 def test_auto_implement_claims_the_item_before_dispatching():

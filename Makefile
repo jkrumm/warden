@@ -152,11 +152,10 @@ check-schemas:
 	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
 	@"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py"
 
-# The model warden pins for automatic dispatch/review (triage.py's
-# AUTO_DISPATCH_MODEL / TRIAGE_VALIDATION_DISPATCH_MODEL) against what
-# sideclaw's live routing table (server/lib/routing.ts, GET /api/routing)
-# actually routes those tools to — the third copy-with-no-drift-check
-# alongside check-policy and check-schemas, same mould, same honesty rule:
+# Any operator-set model override (triage.py's AUTO_DISPATCH_MODEL /
+# TRIAGE_VALIDATION_DISPATCH_MODEL — both default to None, "sideclaw routes
+# the tier") against what sideclaw's live routing table (server/lib/routing.ts,
+# GET /api/routing) actually routes those tools to — same honesty rule:
 # unreachable is not a failure, a genuine model mismatch is.
 .PHONY: check-routing
 check-routing:

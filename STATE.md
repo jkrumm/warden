@@ -38,14 +38,16 @@ loop.
   intake), or `human` (`warden run`, typed in herdr or through Hermes's door
   with `--origin-channel`/`--origin-thread`). See
   `docs/history/state-log.md` §55.
-- Automatic investigate dispatches pass `AUTO_DISPATCH_MODEL`
-  (`DeepSeek-V4-Flash` since §79, `glm-5.3-flash` before; env
-  `TRIAGE_AUTO_DISPATCH_MODEL`); automatic implement dispatches pass
-  `AUTO_IMPLEMENT_MODEL` (`DeepSeek-V4-Pro`, env `TRIAGE_AUTO_IMPLEMENT_MODEL`,
-  §84). Both run on the IU backend, never Max. Validation is a sideclaw `review` job on the pull
-  request; `TRIAGE_VALIDATION_DISPATCH_MODEL` can re-point it but defaults to
-  `None`, i.e. sideclaw's JUDGE route — review is the one tool where the cheap
-  tier has been measured failing (§64).
+- Automatic dispatches send no model id: `AUTO_DISPATCH_MODEL` /
+  `AUTO_IMPLEMENT_MODEL` both default to `None`, so sideclaw routes each tier
+  per its own table (`GET /api/routing` — investigate/author on
+  DeepSeek-V4-Flash, implement on DeepSeek-V4-Pro). The env vars
+  `TRIAGE_AUTO_DISPATCH_MODEL` / `TRIAGE_AUTO_IMPLEMENT_MODEL` are the
+  operator's escape hatch; both run on the IU backend, never Max. Validation
+  is a sideclaw `review` job on the pull request;
+  `TRIAGE_VALIDATION_DISPATCH_MODEL` can re-point it but defaults to `None`,
+  i.e. sideclaw's JUDGE route — review is the one tool where the cheap tier
+  has been measured failing (§64).
 - `needs_human` / `merge_blocked` cards carry an `Action required` section:
   `Do this: <note>` plus a day-granularity auto-dismiss countdown.
 - `push_argo_snapshot()` runs as step 10 of `run()`, after every tick; argo
@@ -104,8 +106,9 @@ loop.
   It honours `--dry-run` like every other verb since §83 (until then the
   preview was the effect: it cancelled and transitioned for real).
 - `make check-routing` is the third drift check next to `check-schemas` and
-  `check-policy`: warden's dispatch/validation model pins against sideclaw's
-  live `GET /api/routing` (§66).
+  `check-policy`: any operator-set dispatch/validation model override against
+  sideclaw's live `GET /api/routing`; with nothing pinned it reports
+  "nothing pinned" and exits 0 (§66).
 - A ledger stamped *behind* the process (the window between a schema bump
   landing and the loop's next tick) raises `ledger.LedgerBehind`; poll and
   sweep skip the pass with one stderr line and exit 0, the poll still pushing

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Does the running sideclaw's live routing table still agree with the model
-warden pins for automatic episodes (`scripts/triage.py`'s
-`AUTO_DISPATCH_MODEL`, default `DeepSeek-V4-Flash`) and, when the operator has set
-one, for review validation (`TRIAGE_VALIDATION_DISPATCH_MODEL`)?
+"""Does any operator-set model override still agree with the route it
+overrides? Warden no longer pins a model by default — `scripts/triage.py`'s
+`AUTO_DISPATCH_MODEL` / `AUTO_IMPLEMENT_MODEL` and
+`TRIAGE_VALIDATION_DISPATCH_MODEL` all default to `None` ("sideclaw routes the
+tier per its own table"), so only a set override is a model id to compare.
 
 sideclaw owns the routing table (`server/lib/routing.ts`) and publishes it
-live at `GET /api/routing`. This is the third cross-repo copy with no drift
-check, built in the same mould as `check-schema-versions.py` (the verdict
-schema) and `check-dispatch-policy.py` (the repo allowlist): sideclaw being
-unreachable is not this script's problem to fail loudly over — only a genuine
-MODEL mismatch is.
+live at `GET /api/routing`. This is the drift check for that fact, built in
+the same mould as `check-schema-versions.py` (the verdict schema) and
+`check-dispatch-policy.py` (the repo allowlist): sideclaw being unreachable
+is not this script's problem to fail loudly over — only a genuine MODEL
+mismatch is.
 
 Exit 0 = warden's pinned model(s) agree with sideclaw's live route(s).
 Exit 1 = a genuine mismatch.
@@ -58,11 +59,14 @@ def fetch_routing() -> dict[str, Any]:
 
 
 def _checks() -> list[tuple[str, str]]:
-    """(sideclaw route key, warden-pinned model) pairs to compare. `review` is
-    only in scope once the operator has actually set
-    TRIAGE_VALIDATION_DISPATCH_MODEL — its default (None) means "take
-    sideclaw's own JUDGE route", which is not a model id to compare against."""
-    checks = [("dispatch", triage.AUTO_DISPATCH_MODEL)]
+    """(sideclaw route key, warden override) pairs to compare. Every knob
+    defaults to None — "take sideclaw's own route", not a model id — so a
+    knob only enters scope once the operator has actually set it."""
+    checks: list[tuple[str, str]] = []
+    if triage.AUTO_DISPATCH_MODEL:
+        checks.append(("dispatch", triage.AUTO_DISPATCH_MODEL))
+    if triage.AUTO_IMPLEMENT_MODEL:
+        checks.append(("dispatch_implement", triage.AUTO_IMPLEMENT_MODEL))
     if triage.TRIAGE_VALIDATION_DISPATCH_MODEL:
         checks.append(("review", triage.TRIAGE_VALIDATION_DISPATCH_MODEL))
     return checks
@@ -82,6 +86,15 @@ def main(argv: list[str]) -> int:
 
     routes: dict[str, Any] = routing.get("routes", {})
     checks = _checks()
+
+    if not checks:
+        # Nothing pinned — no model id to compare against, so there is no
+        # drift to detect. Not a mismatch and not a failure.
+        if as_json:
+            print(json.dumps({"reachable": True, "ok": True, "rows": []}, indent=2))
+        else:
+            print("routing ✓ nothing pinned — sideclaw routes per tier")
+        return 0
 
     rows = []
     mismatched = []

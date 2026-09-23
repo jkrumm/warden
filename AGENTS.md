@@ -128,10 +128,14 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   copy is defence in depth; sideclaw's is the boundary. If the two disagree, the
   boundary is quietly allowing something the control plane forbids — they must be
   checked against each other, not assumed to agree.
-- **The dispatch model warden pins (`triage.py`'s `AUTO_DISPATCH_MODEL`) is a
-  third such copy** of a fact sideclaw owns (`server/lib/routing.ts`, `GET
-  /api/routing`) — `make check-routing` catches drift the same way
-  `check-schema-versions.py`/`check-dispatch-policy.py` do for the verdict
+- **Warden no longer picks the worker model.** `triage.py`'s `AUTO_DISPATCH_MODEL` /
+  `AUTO_IMPLEMENT_MODEL` default to `None` — no `model` key is sent, and sideclaw
+  routes each tier per its own table (`server/lib/routing.ts`, live at
+  `GET /api/routing`): investigate/author to DeepSeek-V4-Flash, implement to
+  DeepSeek-V4-Pro. The env vars (`TRIAGE_AUTO_DISPATCH_MODEL`,
+  `TRIAGE_AUTO_IMPLEMENT_MODEL`) are the operator's escape hatch, and
+  `make check-routing` verifies any such override against the live table the same
+  way `check-schema-versions.py`/`check-dispatch-policy.py` do for the verdict
   schema and the allowlist.
 - **Warden may never auto-merge on `sideclaw`, `warden` or `dotfiles`.**
   Implement is allowed (a draft PR), but neither repo ever gets

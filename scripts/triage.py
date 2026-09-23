@@ -1168,44 +1168,43 @@ PROPOSE_UNSURE_COOLDOWN_DAYS = 7.0
 # below, not by temperature.
 PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "deepseek-v4.1-flash")
 
-# Automatic investigate episodes (loop-driven, not human-typed) run on the
-# cheap IU tier. glm-5.3-flash until 2026-09-21 (modelpick's 2026-08-31
-# bake-off: 1.00 alongside Sonnet at ~32x lower cost); DeepSeek-V4-Flash since,
-# on speed — ccbench 2026-09-20 measured it at 1.00 / 6m20s / ~190 effective
-# in-loop tok/s against glm's 0.81 / 38m24s / 13.3, and six read-only episodes
-# through this very lane finished in 0.7–2.9 min each with no stall (§79).
-# DeepSeek-V4-Pro was measured alongside and rejected: tied with Flash on the
-# external indices, ~3x slower, and the one model that idle-stalled. Gateway
-# ids are case-sensitive. Passing any non-Claude model id
-# makes sideclaw's withModel() derive backend `iu` for the dispatch; passing
-# `None` instead would land it on sideclaw's own JUDGE route, which is Sonnet
-# over the owner's Claude Max subscription. Manual `warden run --model` calls
-# and Slack approval-click dispatches carry their own model and are
-# unaffected; step-7 review validation carries its own knob,
-# TRIAGE_VALIDATION_DISPATCH_MODEL below.
-AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL", "DeepSeek-V4-Flash")
+# Automatic investigate episodes (loop-driven, not human-typed) send no model
+# id by default. Both knobs below default to None, so sideclaw routes the tier
+# per its own table (server/lib/routing.ts, live at GET /api/routing):
+# investigate/author to DeepSeek-V4-Flash, implement to DeepSeek-V4-Pro.
+# Warden used to hardcode exactly those ids here — a third copy of a fact
+# sideclaw owns — so the next time sideclaw re-routed a tier, warden would
+# silently pin the old model. Setting the env var (the operator escape hatch)
+# restores a per-tier override; a Claude id would land the episode on
+# sideclaw's Max-backed JUDGE route, caught loudly by the loop below. Manual
+# `warden run --model` calls and Slack approval-click dispatches carry their
+# own model and are unaffected; step-7 review validation carries its own
+# knob, TRIAGE_VALIDATION_DISPATCH_MODEL below.
+AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL") or None
 
-# Automatic implement episodes take the heavier sibling: the owner's split
-# (2026-09-22) is DeepSeek-V4-Flash for read-only and fast work, DeepSeek-V4-Pro
-# for the change itself. Measured the same on ccbench (both 1.00) and tied on the
-# external indices; Pro is ~3x slower per turn and, on this gateway, reuses the
-# prompt cache poorly (9–26% hit against Flash's 94%) — the cost of that is the
-# owner's call, the knob is here so it stays one line to revisit (§84). 
-AUTO_IMPLEMENT_MODEL = os.environ.get("TRIAGE_AUTO_IMPLEMENT_MODEL", "DeepSeek-V4-Pro")
+# The implement-tier counterpart to AUTO_DISPATCH_MODEL above: same default-
+# to-None shape, same env-var escape hatch. sideclaw routes implement on
+# DeepSeek-V4-Pro (`dispatch_implement` in routing.ts) unless the operator
+# pins TRIAGE_AUTO_IMPLEMENT_MODEL.
+AUTO_IMPLEMENT_MODEL = os.environ.get("TRIAGE_AUTO_IMPLEMENT_MODEL") or None
 
+# Both knobs default to None ("sideclaw routes the tier" — the healthy, silent
+# case), so this loop is warning-only: it stays quiet unless the operator sets
+# a Claude id, which would route automatic episodes back onto sideclaw's
+# Max-backed JUDGE route.
 for _knob, _model in (("TRIAGE_AUTO_DISPATCH_MODEL", AUTO_DISPATCH_MODEL),
                       ("TRIAGE_AUTO_IMPLEMENT_MODEL", AUTO_IMPLEMENT_MODEL)):
-    if not _model or _model.startswith("claude"):
-        # A Claude id (or an empty override) would route automatic episodes back
-        # onto sideclaw's Max-backed JUDGE route — the cost regression §58 fixed.
-        # Loud, not fatal: the loop must keep ticking, the operator must notice.
+    if _model and _model.startswith("claude"):
+        # A Claude id would route automatic episodes back onto sideclaw's
+        # Max-backed JUDGE route — the cost regression §58 fixed. Loud, not
+        # fatal: the loop must keep ticking, the operator must notice.
         print(f"triage: WARNING {_knob}={_model!r} routes automatic "
               "dispatches onto Max — expected a non-Claude IU model id", file=sys.stderr)
 
 # Step-7 review validation (_open_validation_dispatch() below) had no model knob
 # at all and always took sideclaw's own JUDGE route. It now has one — but it
 # deliberately defaults to `None`, i.e. that same JUDGE route, rather than to
-# the cheap tier AUTO_DISPATCH_MODEL uses.
+# the cheap IU tier sideclaw routes investigate/implement on.
 #
 # Why review is the exception, and it is NOT the same call as implement /
 # investigate: measured 2026-09-11 on this machine, with

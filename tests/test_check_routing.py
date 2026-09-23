@@ -44,27 +44,91 @@ def _run(argv: list[str] | None = None) -> tuple[int, str]:
     return code, buf.getvalue()
 
 
+def test_nothing_pinned_exits_zero_and_says_so():
+    """With no overrides set (both knobs default None), there is no model id
+    to compare — the check is vacuous and must report that honestly (exit 0),
+    never fabricate a mismatch against sideclaw's own default routes."""
+    original_dispatch = triage.AUTO_DISPATCH_MODEL
+    original_review = triage.TRIAGE_VALIDATION_DISPATCH_MODEL
+    try:
+        triage.AUTO_DISPATCH_MODEL = None
+        triage.TRIAGE_VALIDATION_DISPATCH_MODEL = None
+        check_routing.fetch_routing = lambda: {
+            "routes": {"dispatch": {"model": "DeepSeek-V4-Flash"}}
+        }
+        code, out = _run()
+        assert code == 0, out
+        assert "nothing pinned" in out, out
+    finally:
+        triage.AUTO_DISPATCH_MODEL = original_dispatch
+        triage.TRIAGE_VALIDATION_DISPATCH_MODEL = original_review
+
+
 def test_agreement_exits_zero_and_prints_check():
-    """Live route matches warden's pinned AUTO_DISPATCH_MODEL — the exact
-    shape `make check-routing` prints against the real daemon."""
-    check_routing.fetch_routing = lambda: {
-        "routes": {"dispatch": {"model": triage.AUTO_DISPATCH_MODEL}}
-    }
-    code, out = _run()
-    assert code == 0, out
-    assert out.strip() == f"routing ✓ dispatch={triage.AUTO_DISPATCH_MODEL} (both)", out
+    """Live route matches an operator-set AUTO_DISPATCH_MODEL override — the
+    exact shape `make check-routing` prints against the real daemon."""
+    original = triage.AUTO_DISPATCH_MODEL
+    try:
+        triage.AUTO_DISPATCH_MODEL = "DeepSeek-V4-Flash"
+        check_routing.fetch_routing = lambda: {
+            "routes": {"dispatch": {"model": "DeepSeek-V4-Flash"}}
+        }
+        code, out = _run()
+        assert code == 0, out
+        assert out.strip() == "routing ✓ dispatch=DeepSeek-V4-Flash (both)", out
+    finally:
+        triage.AUTO_DISPATCH_MODEL = original
 
 
 def test_drift_exits_one_and_names_both_models():
-    """sideclaw routes dispatch somewhere warden does not expect — loud, exit 1."""
-    check_routing.fetch_routing = lambda: {
-        "routes": {"dispatch": {"model": "some-other-model"}}
-    }
-    code, out = _run()
-    assert code == 1, out
-    assert "✗" in out
-    assert triage.AUTO_DISPATCH_MODEL in out
-    assert "some-other-model" in out
+    """sideclaw routes dispatch somewhere the override does not expect — loud, exit 1."""
+    original = triage.AUTO_DISPATCH_MODEL
+    try:
+        triage.AUTO_DISPATCH_MODEL = "DeepSeek-V4-Flash"
+        check_routing.fetch_routing = lambda: {
+            "routes": {"dispatch": {"model": "some-other-model"}}
+        }
+        code, out = _run()
+        assert code == 1, out
+        assert "✗" in out
+        assert "DeepSeek-V4-Flash" in out
+        assert "some-other-model" in out
+    finally:
+        triage.AUTO_DISPATCH_MODEL = original
+
+
+def test_implement_override_checked_against_dispatch_implement_route():
+    """AUTO_IMPLEMENT_MODEL defaults to None (sideclaw routes implement), so it
+    only enters scope once set — then it is compared against sideclaw's
+    `dispatch_implement` route, not the investigate `dispatch` route."""
+    original_dispatch = triage.AUTO_DISPATCH_MODEL
+    original_implement = triage.AUTO_IMPLEMENT_MODEL
+    try:
+        triage.AUTO_DISPATCH_MODEL = None
+        triage.AUTO_IMPLEMENT_MODEL = "DeepSeek-V4-Pro"
+        check_routing.fetch_routing = lambda: {
+            "routes": {
+                "dispatch": {"model": "DeepSeek-V4-Flash"},
+                "dispatch_implement": {"model": "DeepSeek-V4-Pro"},
+            }
+        }
+        code, out = _run()
+        assert code == 0, out
+        assert "dispatch_implement=DeepSeek-V4-Pro" in out, out
+        assert "dispatch=" not in out, out  # investigate stays out of scope while None
+
+        check_routing.fetch_routing = lambda: {
+            "routes": {
+                "dispatch": {"model": "DeepSeek-V4-Flash"},
+                "dispatch_implement": {"model": "some-other-implement"},
+            }
+        }
+        code, out = _run()
+        assert code == 1, out
+        assert "dispatch_implement" in out and "✗" in out, out
+    finally:
+        triage.AUTO_DISPATCH_MODEL = original_dispatch
+        triage.AUTO_IMPLEMENT_MODEL = original_implement
 
 
 def test_unreachable_exits_two_never_fabricates_ok():
@@ -89,7 +153,7 @@ def test_review_checked_only_when_validation_model_set():
         triage.TRIAGE_VALIDATION_DISPATCH_MODEL = None
         check_routing.fetch_routing = lambda: {
             "routes": {
-                "dispatch": {"model": triage.AUTO_DISPATCH_MODEL},
+                "dispatch": {"model": "DeepSeek-V4-Flash"},
                 "review": {"model": "claude-sonnet-5[1m]"},
             }
         }
