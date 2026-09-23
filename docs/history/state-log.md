@@ -8199,3 +8199,28 @@ and the global `~/.claude/CLAUDE.md` are unchanged. No warden code reads a
 repo's instruction file — dispatched episodes get the target repo's context
 from sideclaw's `claude` invocation, which follows the shim — so there is no
 code path to switch. `requirements.txt` (`cryptography==50.0.0`) left pinned.
+
+## 89. The deliberate fallback probe stops minting a card (2026-09-23)
+
+A post-rollout check validates the brain's fallback chain by overriding the
+model to a sentinel id ending in `-does-not-exist`, so the IU endpoint is
+*guaranteed* to 404 — the 404 is the probe's expected result, and the fallback
+then serves the turn (`Fallback activated: <sentinel> -> gpt-6-luna`, then
+`API call #1` at 1.7s). Hermes retries `api_max_retries` times, so **one probe
+writes exactly three ERROR lines** to `logs/errors.log` and lands squarely on
+`minOccurrences: 3`: a Slack card, a triage item and a queued investigate
+episode per probe run. Item 676 on 2026-09-23 was exactly that — one probe run
+2m41s after the gateway restart that made the `gpt-6-luna` fallback live, and
+the episode could only restate what `agent.log` already said.
+
+`poll_hermes_logs()` now skips any line naming a sentinel id
+(`PROBE_SENTINEL_RE`). Two deliberate choices: it is a **content** filter in the
+poller, not an entry in `triage-policy.json`'s `ignore`, because that list keys
+on `external_id` and the signature is truncated at 120 chars of `module: msg` —
+*before* the model id — so an ignore entry would have suppressed a genuine
+`No suitable backend server found` for the real brain model as well, which is
+the one 404 here worth alerting on. And it filters the line rather than
+downgrading the probe's log level, which is Hermes's side of the fence.
+Regression guard: `tests/test_watchdog_hermes_log_probe.py` — sentinel dropped,
+a real 404 and an ordinary ERROR still reported, a mixed batch yielding exactly
+the real signature. `make test` 19 suites green.

@@ -163,6 +163,12 @@ LOG_PARSE_RE = re.compile(r"^\S+\s+\S+\s+(ERROR|CRITICAL)\s+(?:\[[^\]]*\]\s+)?([
 LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 LOG_RECENT_HOURS = 6  # log lines older than this are ignored even on first run
 
+# The sentinel model id a *deliberate* fallback probe sends (see
+# hermes-agent's skills/hermes-gateway/SKILL.md): a post-rollout check overrides
+# the model to `…-does-not-exist` so the endpoint is guaranteed to 404, proving
+# the fallback chain engages. Matched on the raw log line — see poll_hermes_logs().
+PROBE_SENTINEL_RE = re.compile(r"model\s+'[^']*-does-not-exist'")
+
 QUIET_START_H = 0
 QUIET_END_H = 7
 
@@ -665,6 +671,15 @@ def poll_hermes_logs(conn: sqlite3.Connection, now: dt.datetime, now_iso: str) -
         cursor_set(conn, cur_key, str(size), now_iso)
         for line in new_text.splitlines():
             if not LOG_LEVEL_RE.search(line):
+                continue
+            # A deliberate fallback probe's 404 is the probe's expected result, not a
+            # fault (the fallback then serves the turn — see PROBE_SENTINEL_RE). Hermes
+            # retries `api_max_retries` times, so one probe writes exactly three ERROR
+            # lines and lands on minOccurrences: a card per probe run. Filtered here
+            # rather than in triage-policy.json's `ignore`, which keys on external_id —
+            # the signature is truncated before the model id, so an ignore entry cannot
+            # separate the sentinel from a genuine 404 for the real brain model.
+            if PROBE_SENTINEL_RE.search(line):
                 continue
             ts_m = LOG_TS_RE.match(line)
             if ts_m:
