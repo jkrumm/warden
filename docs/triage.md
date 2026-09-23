@@ -522,6 +522,7 @@ implementing ──(outcome=pr_opened)──────────────
              └──(no_changes / diff_refused / etc.)──────> merge_blocked
 
 validating ──(review outcome=clean, or actionable+no blocking; merge lands)──> merged | liveness_pending (step 8/9)
+           └──(same, but repo is `merge_approval`-gated)──────────────────────> needs_human (owner approves the merge)
            └──(blocking findings / merge refused)────────────────────────────> merge_blocked
            └──(review outcome=needs-human)─────────────────────────────────────> needs_human
 
@@ -1238,7 +1239,7 @@ prose:
 
 | review `result` | `dispatches.validation_status` | item state |
 |-|-|-|
-| `outcome == "clean"`, or `"actionable"` with `blocking` EMPTY | `confirmed` | calls `merge` |
+| `outcome == "clean"`, or `"actionable"` with `blocking` EMPTY | `confirmed` | calls `merge` — unless the repo is in `config/dispatch-repos.json`'s `merge_approval`, in which case `needs_human` (PR + the `warden merge` call the owner runs) |
 | `blocking` non-empty (any outcome) | `blocked` | `merge_blocked` — note is the first three findings as `file:line — message`, ≤600 chars |
 | `outcome == "needs-human"` | `needs_human` | `needs_human` — note is the review's own summary |
 | FAILED / ERRORED / CANCELLED | `error` | `merge_blocked` |
@@ -1246,10 +1247,15 @@ prose:
 `result.schemaVersion` is asserted against `REVIEW_SCHEMA_VERSION` first — a
 mismatch is a loud `needs_human`, never a best-effort parse, same rule as
 step 6→7. Only `confirmed` calls `plan_or_land(confirm=True, dry_run=False)`
-in-process. `confirm=True` is instruction-level, not signed (owner decision —
-confirming the implement WAS the approval, landing it finishes the thing
-already said yes to), so this call is not itself a trust boundary — the real
-bounds are inside `plan_or_land()`/`merge_gate_check()` itself, re-keyed off
+in-process — and it does NOT do so on a `merge_approval`-gated repo
+(`sideclaw`/`warden`/`dotfiles`): there the item routes to `needs_human`
+carrying the repo, the PR URL and the `warden merge` call, with
+`validation_status` already `confirmed` so the owner's land re-checks the
+merge gate, never re-runs the review. `confirm=True` is instruction-level,
+not signed (owner decision — confirming the implement WAS the approval,
+landing it finishes the thing already said yes to), so this call is not
+itself a trust boundary — the real bounds are inside
+`plan_or_land()`/`merge_gate_check()` itself, re-keyed off
 **declared path scope**: see that module's own docstring for the full gate
 (`autoMergePaths`, `noCiRequired`, the step-7 `validation_status` check).
 `plan_or_land()` owns its own `merge` operation end to end (recorded before

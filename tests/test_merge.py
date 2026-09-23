@@ -503,6 +503,29 @@ def test_happy_path_merges():
         conn.close()
 
 
+def test_owner_cli_confirm_lands_a_merge_approval_gated_repo_without_revalidating():
+    """The owner's manual land path (`warden merge <job> --why --confirm`, i.e.
+    `plan_or_land(authorized_by="cli:confirm")`) lands a dispatch whose
+    `validation_status` is already `confirmed` — the exact state the
+    merge-approval gate leaves a gated repo in. It re-checks the merge gate
+    (which reads the stored `validation_status`) and never re-opens a review,
+    and the merge operation records `authorized_by="cli:confirm"`."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, validation_status="confirmed")
+        with fakes() as fx:
+            result = _land(conn, why="owner approved the merge", authorized_by="cli:confirm")
+        assert isinstance(result, merge.MergeResult)
+        assert result.merged is True
+        assert _merged_at(conn) is not None
+        assert fx.calls.get("check_runs"), "the merge gate re-checks the stored confirmation"
+        row = _op_row(conn)
+        assert row["outcome"] == "done"
+        assert row["authorized_by"] == "cli:confirm", row["authorized_by"]
+    finally:
+        conn.close()
+
+
 def test_delete_branch_remote_error_does_not_fail_the_merge():
     """Cleanup, allowed to fail: a merged commit with a leftover branch is
     untidy, not a reason to raise out of an otherwise-successful merge."""

@@ -101,7 +101,7 @@ def load_dispatch_policy(path: Path | None = None) -> dict[str, Any]:
     checks the retired bash CLI's embedded `resolve_repo` python ran inline — see
     that block's own comments for why each one refuses rather than picks a
     winner. Returns a normalized dict: `root` (resolved Path), `default_tier`,
-    `deny`/`sensitive` (sets), `overrides` (name -> tier)."""
+    `deny`/`sensitive`/`merge_approval` (sets), `overrides` (name -> tier)."""
     p = path or dispatch_policy_path()
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
@@ -112,6 +112,16 @@ def load_dispatch_policy(path: Path | None = None) -> dict[str, Any]:
     default_tier = raw.get("defaultTier", "investigate")
     deny = set(raw.get("deny") or [])
     sensitive = set(raw.get("sensitive") or [])
+
+    merge_approval_raw = raw.get("merge_approval")
+    if merge_approval_raw is not None and not (
+        isinstance(merge_approval_raw, list)
+        and all(isinstance(r, str) for r in merge_approval_raw)
+    ):
+        raise PreconditionError(
+            f"dispatch policy at {p}: `merge_approval` is not a list of repo names"
+        )
+    merge_approval = set(merge_approval_raw or [])
 
     overrides: dict[str, str] = {}
     for tier, names in (raw.get("tiers") or {}).items():
@@ -152,8 +162,19 @@ def load_dispatch_policy(path: Path | None = None) -> dict[str, Any]:
         "default_tier": default_tier,
         "deny": deny,
         "sensitive": sensitive,
+        "merge_approval": merge_approval,
         "overrides": overrides,
     }
+
+
+def merge_needs_approval(policy: dict[str, Any], repo: str) -> bool:
+    """True when `repo` is in the dispatch policy's `merge_approval` set — an
+    implement episode may run against it and open a draft PR, but the merge
+    into it is never self-authorized: the owner approves (see
+    config/dispatch-repos.json's own prose). Unknown repo -> False, because a
+    repo nobody listed is not gated, and the caller only ever asks about a
+    repo that has already been implemented."""
+    return repo in policy.get("merge_approval", set())
 
 
 _NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")

@@ -161,9 +161,18 @@ reader does not have to rediscover that "pinned" is narrower than it sounds.
 **Warden's tier ceiling on `sideclaw` and `warden` is no longer pinned below
 `implement`** (owner decision, 2026-09-15) — both are `implement`-reachable
 like any other repo in `config/dispatch-repos.json`. sideclaw is a valid
-dispatch target today, and the auto-merge path lands here without a
-per-episode human gate exactly as it does for every other `implement`-tier
-repo whose validation comes back clean.
+dispatch target today.
+
+**The merge into the automation itself is gated (2026-09-23).** The
+implement tier is unchanged, but the LAND step is not self-authorized for
+the three repos that ARE the automation: `config/dispatch-repos.json` now
+carries `merge_approval: ["sideclaw", "warden", "dotfiles"]`. An implement
+episode may still run against them and open a draft PR, but a clean step-7
+validation routes the item to `needs_human` — carrying the repo, the PR URL
+and the `warden merge` call — instead of calling `plan_or_land()`. The owner
+lands it with `warden merge <job> --why --confirm`, which re-checks the merge
+gate against the already-`confirmed` `validation_status` rather than
+re-running the review.
 
 ---
 

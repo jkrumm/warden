@@ -1619,6 +1619,22 @@ def _denied_repos() -> set[str]:
     return set(policy["deny"])
 
 
+def _merge_needs_approval(repo: str) -> bool:
+    """The dispatch bridge's own `merge_approval` list (config/dispatch-repos.json)
+    — a repo that may be implemented automatically but whose merge is never
+    self-authorized, so a clean step-7 validation routes to `needs_human`
+    instead of calling `plan_or_land()` (the owner lands it with `warden
+    merge`). Read through `lifecycle.policy.load_dispatch_policy()` — one
+    parser/validator for this file, not two. False on an unreadable policy:
+    the refusal that matters is `plan_or_land()`'s own `resolve_repo()`, and
+    False here only skips the gate, never opens one."""
+    try:
+        policy = _policy.load_dispatch_policy(DISPATCH_REPOS_JSON)
+    except WardenError:
+        return False
+    return _policy.merge_needs_approval(policy, repo)
+
+
 def _match_targets(event_row: sqlite3.Row) -> list[str]:
     """Two candidate strings a policy rule can match against, in order: the
     raw `source:external_id` (works for grouped/self-describing sources), and
@@ -5344,7 +5360,12 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     `"actionable"` with an EMPTY `blocking` list, confirms and calls `merge`
     (via lifecycle/merge.py's `plan_or_land()`, which owns its own
     `merge`/`deploy` operations and receipts end to end); its own outcome
-    (landed, or refused by the merge gate) decides the next state. ANY
+    (landed, or refused by the merge gate) decides the next state. ONE
+    exception: a repo in config/dispatch-repos.json's `merge_approval`
+    (`sideclaw`/`warden`/`dotfiles`) does NOT auto-merge — `confirmed` still
+    lands in `dispatches.validation_status`, but the item routes to
+    `needs_human` carrying the PR and the `warden merge` call the owner runs
+    to approve it. ANY
     non-empty `blocking` list refuses the merge outright — never read as a
     pass, the brief's own words — and `"needs-human"` routes to a human
     rather than either. A FAILED, ERRORED or CANCELLED review job blocks the
@@ -5450,6 +5471,20 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             conn.commit()
         elif _already_merged(conn, item["implement_job"]):
             _land_already_merged_item(conn, policy, item, now)
+        elif _merge_needs_approval(item["repo"]):
+            # The repo is merge-approval-gated (config/dispatch-repos.json's
+            # `merge_approval`): validation confirmed and the PR would land,
+            # but a merge into the executor, the control plane or the
+            # machine-wide agent config is never self-authorized. Route to a
+            # human exactly like every other needs_human item; `warden merge`
+            # is how the owner lands it from here (validation_status is
+            # already `confirmed`, so that path re-checks, never re-validates).
+            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=(
+                f"step-7 validation confirmed on {item['repo']} ({item['pr_url']}), but this repo "
+                f"is merge-approval gated — approve the merge with "
+                f"`warden merge {item['implement_job']} --why \"<reason>\" --confirm`"
+            ))
+            conn.commit()
         else:
             # Belt-and-suspenders on top of the sync above (which folds only
             # THIS poll's own review job): `plan_or_land()` is about to read

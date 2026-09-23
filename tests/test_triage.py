@@ -141,7 +141,8 @@ _RECURSION_MARKERS = ("CLAUDE_CODE_SESSION", "CLAUDECODE", "CLAUDE_SESSION_ID", 
 
 
 @contextlib.contextmanager
-def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None = None):
+def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None = None,
+                merge_approval: list[str] | None = None):
     """Stand up a throwaway watchdog.db + policy + dispatch-repos.json fixture,
     point scripts/triage.py's module globals at them, stub Slack (post_blocks/
     update_blocks/resolve_slack_token) to record calls with no network, fake
@@ -213,7 +214,10 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage.POLICY_PATH = tmp_dir / "triage-policy.json"
         triage.DISPATCH_REPOS_JSON = tmp_dir / "dispatch-repos.json"
         _write_json(triage.POLICY_PATH, policy if policy is not None else DEFAULT_POLICY)
-        _write_json(triage.DISPATCH_REPOS_JSON, {"root": "~/SourceRoot", "deny": deny or []})
+        _dispatch_repos = {"root": "~/SourceRoot", "deny": deny or []}
+        if merge_approval:
+            _dispatch_repos["merge_approval"] = merge_approval
+        _write_json(triage.DISPATCH_REPOS_JSON, _dispatch_repos)
         _RESOLVE_REPO_DENY["deny"] = list(deny or [])
 
         triage._sideclaw.submit = _default_fake_submit
@@ -3797,6 +3801,117 @@ def test_validation_actionable_with_empty_blocking_confirms():
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
                          ("implement-job-actionable",)).fetchone()
         assert d["validation_status"] == "confirmed"
+
+
+def test_confirmed_validation_on_merge_approval_repo_routes_to_needs_human():
+    """A clean step-7 validation on a repo in config/dispatch-repos.json's
+    `merge_approval` must NOT auto-merge: the item routes to `needs_human`
+    carrying the repo, the PR URL and the `warden merge` the owner runs, and
+    `plan_or_land()` is never called. `validation_status` still lands
+    `confirmed` so the owner's `warden merge` re-checks, never re-validates."""
+    with _triage_env(merge_approval=["warden"]) as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-val-gated", repo="warden")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-gated", "validation-job-gated",
+             "https://github.com/jkrumm/warden/pull/40", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-gated", repo="warden")
+
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result("clean", summary="looks right."),
+        }
+        merge_calls: list[int] = []
+
+        def _unexpected_merge(*a, **kw):
+            merge_calls.append(1)
+            raise AssertionError("a merge-approval repo must never auto-merge")
+
+        triage._merge.plan_or_land = _unexpected_merge
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert merge_calls == [], "a merge-approval repo must never call merge"
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "warden" in item["note"], item["note"]
+        assert "https://github.com/jkrumm/warden/pull/40" in item["note"], item["note"]
+        assert "warden merge" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-gated",)).fetchone()
+        assert d["validation_status"] == "confirmed", d["validation_status"]
+
+
+def test_confirmed_validation_on_ordinary_repo_still_auto_lands_with_gate_present():
+    """The gate is per-repo: with `merge_approval` naming a DIFFERENT repo, a
+    clean validation on an ordinary repo still calls `plan_or_land()` as
+    today — the gate must not widen to 'any repo needs approval'."""
+    with _triage_env(merge_approval=["sideclaw"]) as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-val-ungated")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-ungated", "validation-job-ungated",
+             "https://github.com/jkrumm/demo-repo/pull/41", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-ungated")
+
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result("clean", summary="looks right."),
+        }
+        merges: list[Any] = []
+        fake_merged = types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo",
+                                             pull_request=41)
+        with _patched(triage._merge, plan_or_land=lambda *a, **kw: merges.append(kw) or fake_merged):
+            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert len(merges) == 1, "an ordinary repo must still auto-land when the gate names another repo"
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-ungated",)).fetchone()
+        assert d["validation_status"] == "confirmed"
+
+
+def test_blocking_validation_on_merge_approval_repo_still_blocks():
+    """A non-empty `blocking` list refuses the merge on a merge-approval repo
+    exactly as on any other — the gate is a confirmed-only path; a blocking
+    review must never be turned into an approval ask."""
+    with _triage_env(merge_approval=["warden"]) as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-val-gated-block", repo="warden")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-gated-block", "validation-job-gated-block",
+             "https://github.com/jkrumm/warden/pull/42", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-gated-block", repo="warden")
+
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result(
+                "actionable",
+                blocking=[{"file": "scripts/x.py", "line": 3, "message": "broken", "angle": "senior-dev"}],
+                summary="1 blocking finding.",
+            ),
+        }
+        merge_calls: list[int] = []
+
+        def _unexpected_merge(*a, **kw):
+            merge_calls.append(1)
+            raise AssertionError("a blocking validation must never call merge")
+
+        triage._merge.plan_or_land = _unexpected_merge
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert merge_calls == []
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGE_BLOCKED, item["state"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-gated-block",)).fetchone()
+        assert d["validation_status"] == "blocked"
 
 
 def test_validation_unknown_outcome_is_needs_human_never_merged():

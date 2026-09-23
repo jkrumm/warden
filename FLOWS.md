@@ -5,8 +5,12 @@ the operator sees in Slack and Argo, where a decision is genuinely needed, and
 where the friction is.
 
 **The default is no approval.** A gate appears only under one of the four
-human-essential cases in `DESIGN.md`. If a flow below asks for a decision, the
-case number is named. If it doesn't, that is deliberate.
+human-essential cases in `DESIGN.md`, plus one structural exception: the
+`merge_approval` list in `config/dispatch-repos.json` (`sideclaw`, `warden`,
+`dotfiles`). On those repos a clean step-7 validation routes the item to
+`needs_human` instead of auto-merging — the owner lands it with
+`warden merge`. If a flow below asks for a decision, the case number is
+named. If it doesn't, that is deliberate.
 
 Legend: **W** warden · **S** sideclaw episode · **You** the operator.
 

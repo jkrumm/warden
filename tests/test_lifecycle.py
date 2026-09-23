@@ -267,6 +267,58 @@ def test_load_dispatch_policy_unparseable_json_says_could_not_parse():
         raise AssertionError("expected PreconditionError")
 
 
+def test_load_dispatch_policy_merge_approval_non_list_rejects():
+    p = _write_json({"root": "/tmp", "merge_approval": "warden"})
+    try:
+        policy.load_dispatch_policy(p)
+    except PreconditionError as e:
+        assert "`merge_approval` is not a list of repo names" in str(e), e
+    else:
+        raise AssertionError("expected PreconditionError")
+
+
+def test_load_dispatch_policy_merge_approval_non_string_entry_rejects():
+    p = _write_json({"root": "/tmp", "merge_approval": ["warden", 3]})
+    try:
+        policy.load_dispatch_policy(p)
+    except PreconditionError as e:
+        assert "`merge_approval` is not a list of repo names" in str(e), e
+    else:
+        raise AssertionError("expected PreconditionError")
+
+
+def test_load_dispatch_policy_merge_approval_parses_into_set():
+    p = _write_json({"root": "/tmp", "merge_approval": ["sideclaw", "warden", "dotfiles"]})
+    pol = policy.load_dispatch_policy(p)
+    assert pol["merge_approval"] == {"sideclaw", "warden", "dotfiles"}, pol["merge_approval"]
+
+
+def test_load_dispatch_policy_merge_approval_in_deny_is_not_a_contradiction():
+    """A repo named in BOTH `merge_approval` and `deny`/`tiers` is allowed —
+    the two lists answer different questions (what tier an episode runs at vs
+    whether the LAND step is self-authorized). Only a malformed value refuses."""
+    p = _write_json({"root": "/tmp", "deny": ["dotfiles"], "merge_approval": ["dotfiles"]})
+    pol = policy.load_dispatch_policy(p)
+    assert "dotfiles" in pol["merge_approval"] and "dotfiles" in pol["deny"]
+
+
+def test_merge_needs_approval_listed_repo_is_true_unknown_is_false():
+    pol = policy.load_dispatch_policy(
+        _write_json({"root": "/tmp", "merge_approval": ["sideclaw", "warden", "dotfiles"]})
+    )
+    assert policy.merge_needs_approval(pol, "warden") is True
+    assert policy.merge_needs_approval(pol, "sideclaw") is True
+    assert policy.merge_needs_approval(pol, "some-other-repo") is False
+
+
+def test_merge_needs_approval_handles_policy_without_the_key():
+    """A hand-built policy dict (no `merge_approval` key at all) must read as
+    'not gated', not raise."""
+    empty = {"root": Path("/tmp"), "default_tier": "investigate", "deny": set(),
+             "sensitive": set(), "overrides": {}}
+    assert policy.merge_needs_approval(empty, "warden") is False
+
+
 # --- policy: resolve_repo() / resolve_tier() -----------------------------------
 
 def test_resolve_repo_discovers_undeclared_repo_with_default_tier():
