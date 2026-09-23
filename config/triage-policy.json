@@ -398,8 +398,8 @@
     {"match": "slack_alert:weatherorb-http-red-circle-down-read-econnreset", "repo": "weatherorb", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "WeatherOrb HTTP service belongs to weatherorb."},
     {"match": "slack_alert:mam-account-monitoring-is-blind-mam-account-json-is-stale-seed-obligation-risk-can-no-longer-be-assessed-this-is-a-monit", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "MAM seed-obligation monitoring is part of homelab torrent stack."},
     {"match": "slack_alert:research-gateway-job-error-1-15m", "repo": "research-gateway", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "Job error alert for research-gateway service."},
-    {"match": "uk:226", "repo": "warden", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "MyAnonamouse session maintenance is managed by warden."},
-    {"match": "uk:211", "repo": "warden", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "Garmin auto-relogin is managed by warden."}
+    {"match": "uk:226", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): the MAM session is homelab-side — mam-account-sync.sh / mam-seedbox-sync.sh live in homelab-private and push the monitor, and nothing in warden touches it. Routing it to warden sent item 843 into an implement episode that died pre-flight (warden's checkout has no origin remote), so the alert never reached the repo that owns the fix."},
+    {"match": "uk:211", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): Garmin auto-relogin is homelab's (garmin-collector + scripts/garmin-auto-relogin.sh); warden implements none of it."}
   ],
   "ignore": [
     "docker_*:unhealthy:shelfmark",
