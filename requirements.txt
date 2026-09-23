@@ -6,5 +6,6 @@
 # comes across with the CLI's approval half: it checks the signature on a human
 # decision, and the signing key it verifies against lives only in the gateway's RAM.
 #
-# 50.0.0 is the version the hermes venv already runs the same verifier on.
-cryptography==50.0.0
+# 50.0.1 is a wheel-only patch over 50.0.0 (the version the hermes venv runs the
+# same verifier on): OpenSSL 4.0.2 in the bundled wheels, no API change.
+cryptography==50.0.1
