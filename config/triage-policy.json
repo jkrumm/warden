@@ -398,8 +398,10 @@
     {"match": "slack_alert:weatherorb-http-red-circle-down-read-econnreset", "repo": "weatherorb", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "WeatherOrb HTTP service belongs to weatherorb."},
     {"match": "slack_alert:mam-account-monitoring-is-blind-mam-account-json-is-stale-seed-obligation-risk-can-no-longer-be-assessed-this-is-a-monit", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "MAM seed-obligation monitoring is part of homelab torrent stack."},
     {"match": "slack_alert:research-gateway-job-error-1-15m", "repo": "research-gateway", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "Job error alert for research-gateway service."},
-    {"match": "uk:226", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): the MAM session is homelab-side — mam-account-sync.sh / mam-seedbox-sync.sh live in homelab-private and push the monitor, and nothing in warden touches it. Routing it to warden sent item 843 into an implement episode that died pre-flight (warden's checkout has no origin remote), so the alert never reached the repo that owns the fix."},
-    {"match": "uk:211", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): Garmin auto-relogin is homelab's (garmin-collector + scripts/garmin-auto-relogin.sh); warden implements none of it."}
+    {"match": "uk:226", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): the MAM session is homelab-side \u2014 mam-account-sync.sh / mam-seedbox-sync.sh live in homelab-private and push the monitor, and nothing in warden touches it. Routing it to warden sent item 843 into an implement episode that died pre-flight (warden's checkout has no origin remote), so the alert never reached the repo that owns the fix."},
+    {"match": "uk:211", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): Garmin auto-relogin is homelab's (garmin-collector + scripts/garmin-auto-relogin.sh); warden implements none of it."},
+    {"match": "uk:212", "repo": "kobo-mods", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "KoInsight is a KOReader/Kobo statistics service; repo kobo-mods owns it."},
+    {"match": "uk:213", "repo": "rollhook", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "Auto-Update push monitor belongs to the rollhook auto-update service."}
   ],
   "ignore": [
     "docker_*:unhealthy:shelfmark",
@@ -452,6 +454,7 @@
     {"match": "slack_alert:homelab-5m-load-below-threshold", "proposedAt": "2026-09-19T23:51:31.618074+00:00", "proposedBy": "triage-auto", "reason": "Load recovery/normal state."},
     {"match": "slack_alert:homelab-cpu-below-threshold", "proposedAt": "2026-09-19T23:51:31.618074+00:00", "proposedBy": "triage-auto", "reason": "CPU recovery/normal state."},
     {"match": "slack_alert:canary-research-gateway-alert-pipeline-test-delete-me", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Canary test alert marked delete me; benign."},
-    {"match": "slack_alert:self-healing-success-vpn-stack-restored-after-gluetun-was-offline", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Genuine recovery notice; VPN stack already restored."}
+    {"match": "slack_alert:self-healing-success-vpn-stack-restored-after-gluetun-was-offline", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Genuine recovery notice; VPN stack already restored."},
+    {"match": "slack_alert:homelab-disk-usage-below-threshold", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "Disk usage below threshold is a recovery/benign state."}
   ]
 }
