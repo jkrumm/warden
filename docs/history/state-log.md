@@ -8224,3 +8224,46 @@ downgrading the probe's log level, which is Hermes's side of the fence.
 Regression guard: `tests/test_watchdog_hermes_log_probe.py` — sentinel dropped,
 a real 404 and an ordinary ERROR still reported, a mixed batch yielding exactly
 the real signature. `make test` 19 suites green.
+
+## 90. A re-fired `note` row returns to the digest (2026-09-26)
+
+The 2026-09-26 digest's "Unstructured notes in #alerts" heading carried exactly
+one line — `slack_alert:self-healing-success-vpn-stack-restored-after-gluetun-was-offline`
+("*Self-Healing Success*: VPN stack restored after gluetun was offline"). It is
+an `ignore`d recovery notice, so it should not have been there: the entry
+covering it was appended by `propose_mappings()` on 2026-09-20 with the reason
+"Genuine recovery notice; VPN stack already restored."
+
+It printed anyway, and the mechanism is the half §81's STATE bullet got wrong.
+Its row (event 999) was frozen in the terminal `note` state on 2026-09-12, and
+`classify()` only ever touches `new` — so the entry that landed eight days later
+can never reach it. `_fetch_note_rows()` filters on `events.resolved_at IS NULL`,
+and a `slack_alert` signature that **re-fires** has its `resolved_at` cleared
+back to NULL: `watchdog-poll.py`'s `reconcile()` writes
+`resolved_at=NULL, first_seen=<now>` for any resolved event it observes again
+(lines 970-976), which is why this row's `first_seen` reads 2026-09-26 04:30 for
+a row that is 14 days old. It re-fired when the VPN stack self-healed at 04:10
+UTC — the same event that reopened items 1000-1004 out of `quiet`. A
+covered-but-frozen row therefore returns to the heading on every recurrence,
+immune to the policy that now covers it.
+
+Measured: three `note` rows in the live ledger, 1 revivable and 2 resolved (105,
+918) and correctly skipped. Rehearsed on a `VACUUM INTO` snapshot first
+(`reset-frozen-notes.py --db <snap>`, then `classify()` called by hand against
+that same snapshot): `note -> new -> ignored`, and `_fetch_note_rows()` empty.
+Applied live; the 04:42:16 tick took it `new -> ignored` with no card and no
+traceback, and the heading is silent again. The daily digest cursor means no
+second digest today.
+
+This is a **standing repair, not a one-time run**, so `reset-frozen-notes.py`'s
+docstring ("only needs to run ONCE", "a second run reports zero") is corrected in
+this commit, and STATE.md's carried-debt bullet is rewritten in its place: three
+rows stay silent while their events stay resolved, and a recurrence is what
+brings one back.
+
+The underlying incident is a different item's story, and this row was never its
+vehicle: the five gluetun-cascade signatures (1000-1004) were closed by hand at
+04:35 the same morning with the verified cause — an unattended-upgrades kernel
+reboot at 04:00:36 UTC (6.8.0-139 -> 6.8.0-142), `gluetun` `restart: "no"` by
+design so its four `network_mode: service:gluetun` dependents exited with it, and
+`vpn-cycle.sh` self-healing the stack at 04:10:40. Watchtower was ruled out.

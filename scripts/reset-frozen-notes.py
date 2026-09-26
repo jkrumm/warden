@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One-time revive of the `note`-frozen `slack_alert` rows (items 1117/1118).
+"""Revive of the `note`-frozen `slack_alert` rows (written for items 1117/1118;
+the standing repair after a re-fire since §90).
 
 WHY THIS EXISTS. `classify()` used to run the structural
 `ignoreUnstructuredSlackProse` filter BEFORE matching `config/triage-policy.json`'s
@@ -17,8 +18,14 @@ before any rule was ever consulted. Two consequences, both measured live:
 
 `classify()` itself now matches rules first (the filter runs last, only for a
 row no rule matched — see its own docstring). This script is the other half of
-that fix, and only needs to run ONCE: the frozen rows predate the reorder, so
-they have to be handed back to `new` for a classify() pass.
+that fix, and it is **not a one-time run**. The rows it was written for predate
+the reorder, so they had to be handed back to `new` for a classify() pass —
+but a `slack_alert` signature that *re-fires* clears `events.resolved_at` back
+to NULL, which puts its row back in the digest's "Unstructured notes" heading
+while `classify()` (only ever touches `new`) and `reopen_if_needed()` (skips
+`note`) both leave it alone. The row is then stale *and* immune to the policy
+entry that now covers it. Run this again after any such re-fire — that is the
+standing repair, measured live on event 999 (§90).
 
 WHAT IT TOUCHES. Rows in state `note` only, whose event `source` is
 `slack_alert`, and whose event is NOT resolved. A resolved event is skipped on
@@ -26,11 +33,13 @@ purpose: reviving it would produce a card for a condition that is already over
 (the live example at the time of writing: the homelab disk alert, resolved
 before this ran). Each revived row carries the reason in its own `note`.
 
-Idempotent: after a run there are no `note` rows left to select, so a second run
-reports zero and writes nothing. Writes only with `--apply`; without it (or with
-`--dry-run`) it prints the plan over a READ-ONLY connection, so a dry run cannot
-write even by accident. `--db PATH` points it at a throwaway copy of the ledger
-for exactly that kind of inspection.
+Idempotent in the narrow sense that it only ever selects rows still in state
+`note` whose event is unresolved, so a second immediate run reports zero and
+writes nothing. It is **not** a one-time script: a later re-fire of a covered
+signature selects its row again (§90). Writes only with `--apply`; without it
+(or with `--dry-run`) it prints the plan over a READ-ONLY connection, so a dry
+run cannot write even by accident. `--db PATH` points it at a throwaway copy of
+the ledger for exactly that kind of inspection.
 
 Nothing here shells out or touches Slack — the next 600 s `--run` pass does the
 classifying, which is where the effect should be watched.

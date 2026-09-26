@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-23 (§89 — the deliberate fallback probe's 404 is dropped at ingest, not turned into a card) |
+| Last updated | 2026-09-26 (§90 — a re-fired `note` row returns to the digest and is immune to the policy entry that now covers it; `reset-frozen-notes.py` is a standing repair, not a one-time run) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
@@ -193,10 +193,18 @@ loop.
 - `config/triage-policy.json` carries 151 rule entries for 61 distinct match
   values and 49 ignore entries for 12 (§77). §76's dedup stops the growth;
   nothing has collapsed what accumulated. First match wins, so it is inert.
-- `_fetch_note_rows()` excludes rows whose event has resolved, so the digest's
-  "Unstructured notes" heading only ever carries a still-open incident (§81).
-  The four resolution-closed `slack_alert` rows §76's revive skipped (105, 542,
-  918, 999) stop printing there; they stay in terminal `note`.
+- `_fetch_note_rows()` excludes rows whose event has resolved and has no age
+  filter, so the digest's "Unstructured notes" heading carries a still-open
+  incident and reprints it every UTC day (§81, §90). The rows §76's revive
+  skipped because their events had resolved (105, 542, 918) stay terminal
+  `note` and are silent while that holds. **A `slack_alert` signature that
+  re-fires clears `events.resolved_at` back to NULL, and the row re-enters the
+  heading — immune to any `ignore`/`rules` entry added since, because
+  `classify()` only ever touches `new` and `reopen_if_needed()` skips `note`.**
+  Event 999 (the VPN self-healing notice) did exactly that on 2026-09-26, eight
+  days after the `ignore` entry covering it landed. `scripts/reset-frozen-notes.py`
+  is the standing repair, re-runnable by design (§90; its docstring said
+  "one-time" before that).
 - No ledger restore path yet. The repo itself has no remote; since §62 the
   daily backup ships a `git bundle` of every ref next to the ledger snapshots.
 
@@ -283,6 +291,10 @@ log's past sections.
   `ignore` entry — that key truncates the model id, so it would have suppressed
   a real brain 404 too. One probe wrote exactly three ERROR lines and landed on
   `minOccurrences` — §89
+- A re-fired `note` row returns to the digest: the recurrence clears
+  `events.resolved_at`, the row is immune to the `ignore` entry that now covers
+  it, and `reset-frozen-notes.py` is recorded as the standing repair rather than
+  a one-time run — §90
 
 ### Next action
 
