@@ -8473,5 +8473,68 @@ def test_argo_merge_of_a_gated_needs_human_item_merges_and_routes_like_auto():
         assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGED
 
 
+# --- live read-only evidence (§95) --------------------------------------------
+
+def _fake_run(stdout: str, returncode: int = 0):
+    return lambda argv, **kw: types.SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
+
+
+def test_beszel_gatherer_renders_rules_firings_and_temps():
+    out = (
+        "rule|Temperature|90|15|2026-09-26 11:31:14.336Z\n"
+        "fired|Temperature|90|2026-09-26 11:28:14.318Z|2026-09-26 11:31:14.336Z\n"
+        'stats|2026-09-28 10:13:16Z|{"cpu":7.4,"la":[0.4,0.8,0.8],"dp":32.2,"t":{"cpu_thermal":91.5,"nvme":48}}\n'
+    )
+    with _patched(triage.subprocess, run=_fake_run(out)):
+        text = triage._gather_beszel_alerts([])
+    assert "rule Temperature: > 90 for 15 min" in text
+    assert "fired Temperature at 2026-09-26 11:28" in text and "resolved 2026-09-26 11:31" in text
+    assert "cpu_thermal=91.5" in text
+
+
+def test_beszel_gatherer_reports_a_failed_read_instead_of_raising():
+    with _patched(triage.subprocess, run=_fake_run("", returncode=255)):
+        assert triage._gather_beszel_alerts([]).startswith("beszel read failed (exit 255)")
+
+
+def test_launchd_gatherer_lists_only_nonzero_jobs():
+    listing = "PID\tStatus\tLabel\n-\t0\tcom.jkrumm.warden-loop\n-\t1\tcom.jkrumm.drift-check\n" \
+              "123\t-15\tcom.jkrumm.warden-api\n-\t0\tcom.apple.x\n"
+    with _patched(triage.subprocess, run=_fake_run(listing)), \
+            _patched(triage, DEVHOST_MARKER_DIR=Path(tempfile.mkdtemp()),
+                     RESEARCH_GATEWAY_DEPLOY_LOG=Path("/nonexistent/rg.log")):
+        text = triage._gather_launchd_restarts([])
+    assert "com.jkrumm.drift-check pid=- last_status=1" in text
+    assert "warden-loop" not in text and "warden-api" not in text
+
+
+def test_kuma_monitor_config_reads_the_public_block_and_heartbeats():
+    yaml = Path(tempfile.mkdtemp()) / "monitors.yaml"
+    yaml.write_text("groups:\n  - name: Local\n    monitors:\n      - name: Brain Sync - Push\n"
+                    "        type: push\n        interval: 600 # ten\n        maxretries: 0\n"
+                    "      - name: Other\n        type: http\n")
+
+    def _verb(argv, *, timeout):
+        if argv[1] == "monitors":
+            return {"monitors": [{"id": 7, "name": "Brain Sync - Push"}]}
+        return {"rows": "7  2026-09-28 10:00:00  1\n7  2026-09-28 10:05:00  0\n7  2026-09-28 10:10:00  1\n"}
+
+    with _patched(triage, HOMELAB_MONITORS_YAML=yaml, _run_verb=_verb):
+        text = triage._gather_kuma_monitor_config([{"source": "uk", "title": "Brain Sync - Push"}])
+    assert "type: push | interval: 600 # ten | maxretries: 0" in text and "Other" not in text
+    assert "last 3 heartbeats: 1 down, 2 up, longest gap 300s" in text
+
+
+def test_new_evidence_keys_are_allowlisted_and_wired():
+    for key in ("launchd-restarts", "beszel-alerts", "kuma-monitor-config"):
+        assert key in triage.EVIDENCE_ALLOWLIST and key in triage._EVIDENCE_GATHERERS
+    rules = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
+    first = {}
+    for r in rules:
+        first.setdefault(r["match"], r)
+    assert "launchd-restarts" in first["uk:macmini-dev-host-push"]["evidence"]
+    assert "beszel-alerts" in first["slack_alert:homelab-temperature-above-threshold"]["evidence"]
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -967,7 +967,8 @@ if _missing_liveness_monitor:
 # argv has no way to carry. The closed-key-set contract itself — a policy
 # file can only ever select one of these four, never invent a fifth — is
 # still enforced the same way, at load_policy() time (see _valid_rule()).
-EVIDENCE_ALLOWLIST: tuple[str, ...] = ("weatherorb-health", "gateway-starts", "hermes-log-tail", "kuma-push-last")
+EVIDENCE_ALLOWLIST: tuple[str, ...] = ("weatherorb-health", "gateway-starts", "hermes-log-tail", "kuma-push-last",
+                                       "launchd-restarts", "beszel-alerts", "kuma-monitor-config")
 
 WEATHERORB_HEALTH_PATH = Path.home() / "SourceRoot" / "weatherorb" / "var" / "health.json"
 GATEWAY_STARTS_LOG = HERMES_HOME / "gateway-starts.log"
@@ -3092,7 +3093,149 @@ def _kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
     return None
 
 
+# --- live read-only evidence, §95 --------------------------------------------
+#
+# 21 of 36 alert verdicts before §95 were nextAction=human, most of them "the
+# state lives outside this checkout": the Beszel threshold, launchctl, the
+# Kuma monitor definition. Each gatherer below reads exactly one such source,
+# read-only, bounded by EVIDENCE_TIMEOUT through _run_bounded(), and never
+# raises — a failed read is a line saying so, which is itself evidence.
+
+DEVHOST_MARKER_DIR = Path.home() / ".local" / "state" / "devhost" / "deliberate-restart"
+RESEARCH_GATEWAY_DEPLOY_LOG = Path.home() / "Library" / "Logs" / "research-gateway-deploy.log"
+
+
+def _gather_launchd_restarts(_event_rows: list[sqlite3.Row]) -> str:
+    """The mini's own LaunchAgents as launchd sees them — every com.jkrumm.*
+    job not running cleanly (no PID or non-zero last status) — plus the
+    deliberate-restart markers written in the last 24h (dotfiles
+    lib/launchd-restarts.sh contract) and the research-gateway deploy log's
+    tail: together they answer "crash or deploy?" for a Dev Host restart FAIL."""
+    lines: list[str] = []
+    try:
+        proc = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=EVIDENCE_TIMEOUT)
+        for row in proc.stdout.splitlines()[1:]:
+            parts = row.split("\t")
+            # A periodic job between runs has no PID by design; only a non-zero
+            # last status says anything (-15 is a deliberate SIGTERM).
+            if len(parts) == 3 and parts[2].startswith("com.jkrumm.") and parts[1] not in ("0", "-15"):
+                lines.append(f"launchd: {parts[2]} pid={parts[0]} last_status={parts[1]}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        lines.append(f"launchctl list failed: {e}")
+    if not lines:
+        lines.append("launchd: no com.jkrumm.* job has a non-zero last status")
+    cutoff = dt.datetime.now(dt.timezone.utc).timestamp() - 86400
+    try:
+        for f in sorted(DEVHOST_MARKER_DIR.iterdir()):
+            stamps = [float(x) for x in f.read_text().split() if x.strip().replace(".", "", 1).isdigit()]
+            recent = [x for x in stamps if x >= cutoff]
+            if recent:
+                last = dt.datetime.fromtimestamp(max(recent), tz=dt.timezone.utc)
+                lines.append(f"deliberate-restart marker: {f.name} ×{len(recent)} in 24h, last {_fmt_ts(last.isoformat())}")
+    except OSError:
+        lines.append(f"no deliberate-restart markers at {DEVHOST_MARKER_DIR}")
+    try:
+        tail = RESEARCH_GATEWAY_DEPLOY_LOG.read_text(errors="replace").splitlines()[-4:]
+        lines.extend(f"rg-deploy: {t[:200]}" for t in tail)
+    except OSError:
+        pass
+    return "\n".join(lines)
+
+
+_BESZEL_SQL = (
+    "select 'rule', name, value, min, updated from alerts; "
+    "select 'fired', name, value, created, resolved from alerts_history order by created desc limit 6; "
+    "select 'stats', created, stats from system_stats where type='1m' order by created desc limit 1;"
+)
+
+
+def _gather_beszel_alerts(_event_rows: list[sqlite3.Row]) -> str:
+    """homelab's Beszel alert rules (threshold `value`, `min` minutes over it),
+    its last six firings with resolve times, and the latest 1-minute sample's
+    CPU/load/disk/temperatures — read-only from /mnt/hdd/beszel/data.db over
+    `ssh homelab`. These thresholds are UI state, not code, so before §95 no
+    episode could see what "above threshold" meant (item 13)."""
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "homelab",
+             f"sqlite3 -readonly 'file:/mnt/hdd/beszel/data.db?mode=ro' \"{_BESZEL_SQL}\""],
+            capture_output=True, text=True, timeout=EVIDENCE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"beszel read failed: {e}"
+    if proc.returncode != 0:
+        return f"beszel read failed (exit {proc.returncode}): {proc.stderr.strip()[:300]}"
+    out: list[str] = []
+    for row in proc.stdout.splitlines():
+        parts = row.split("|", 2 if row.startswith("stats|") else 4)
+        if parts[0] == "rule" and len(parts) == 5:
+            out.append(f"rule {parts[1]}: > {parts[2]} for {parts[3]} min (updated {parts[4][:16]})")
+        elif parts[0] == "fired" and len(parts) == 5:
+            out.append(f"fired {parts[1]} at {parts[3][:16]} (threshold {parts[2]}), resolved {parts[4][:16] or 'open'}")
+        elif parts[0] == "stats" and len(parts) == 3:
+            try:
+                st = json.loads(parts[2])
+            except ValueError:
+                continue
+            temps = st.get("t") or {}
+            hot = sorted(temps.items(), key=lambda kv: -float(kv[1]))[:4] if isinstance(temps, dict) else []
+            out.append(f"now ({parts[1][:16]}): cpu {st.get('cpu')}% load {st.get('la')} disk {st.get('dp')}% "
+                       f"temps {', '.join(f'{k}={v}' for k, v in hot) or 'n/a'}")
+    return "\n".join(out) or "beszel returned no rows"
+
+
+HOMELAB_MONITORS_YAML = Path.home() / "SourceRoot" / "homelab" / "uptime-kuma" / "monitors.yaml"
+
+
+def _gather_kuma_monitor_config(event_rows: list[sqlite3.Row]) -> str:
+    """The Uptime Kuma monitor's own definition (interval, retries, type,
+    target) from homelab's public monitors.yaml, and its last 25 heartbeats
+    (down/up counts and the longest gap), so a flapping push monitor can be
+    judged against its own window — Brain Sync recovering in two minutes and
+    Home Line flapping for hours were never investigated against either.
+    homelab-private's monitors are deliberately never read: that repo's
+    details must not travel into another repo's brief."""
+    title = next((t for t in (_kuma_monitor_title(e) for e in event_rows if e is not None) if t), None)
+    if title is None:
+        return "no Uptime Kuma monitor among this cluster's signals"
+    out: list[str] = []
+    try:
+        lines = HOMELAB_MONITORS_YAML.read_text().splitlines()
+    except OSError as e:
+        lines = []
+        out.append(f"could not read {HOMELAB_MONITORS_YAML}: {e}")
+    for i, line in enumerate(lines):
+        if line.strip() == f"- name: {title}":
+            indent = len(line) - len(line.lstrip())
+            block = [line.strip()]
+            for nxt in lines[i + 1:]:
+                if nxt.strip() and (len(nxt) - len(nxt.lstrip())) <= indent:
+                    break
+                if nxt.strip() and not nxt.strip().startswith("#"):
+                    block.append(nxt.strip())
+            out.append("monitors.yaml: " + " | ".join(block[:12]))
+            break
+    else:
+        if lines:
+            out.append(f"{title!r} is not in homelab's public monitors.yaml (private or UI-only)")
+    monitors = _run_verb([str(_HERMES_OPS_BIN), "monitors", "--json"], timeout=EVIDENCE_TIMEOUT)
+    monitor_id = next((m.get("id") for m in (monitors.get("monitors") or [])
+                       if isinstance(m, dict) and m.get("name") == title), None)
+    if monitor_id is not None:
+        beats = _run_verb([str(_HERMES_OPS_BIN), "kuma-db", "heartbeats", str(monitor_id), "--json"],
+                          timeout=EVIDENCE_TIMEOUT)
+        rows = _parse_kuma_heartbeat_rows(beats.get("rows") or "") if isinstance(beats.get("rows"), str) else []
+        if rows:
+            rows.sort()
+            gaps = [(b[0] - a[0]).total_seconds() for a, b in zip(rows, rows[1:])]
+            down = sum(1 for _, st in rows if st == 0)
+            out.append(f"last {len(rows)} heartbeats: {down} down, {len(rows) - down} up, "
+                       f"longest gap {int(max(gaps)) if gaps else 0}s, last {_fmt_ts(rows[-1][0].isoformat())}")
+    return "\n".join(out)
+
 _EVIDENCE_GATHERERS = {
+    "launchd-restarts": _gather_launchd_restarts,
+    "beszel-alerts": _gather_beszel_alerts,
+    "kuma-monitor-config": _gather_kuma_monitor_config,
     "weatherorb-health": _gather_weatherorb_health,
     "gateway-starts": _gather_gateway_starts,
     "hermes-log-tail": _gather_hermes_log_tail,

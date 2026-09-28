@@ -8451,3 +8451,35 @@ plus research-gateway#8 and weatherorb#5, which no ledger row owns (opened by
 another lane) and so appear in no list — named here instead.
 
 Tests: `test_triage.py` 308/308 (+3), `test_merge.py` 64/64 (+1).
+
+Argo side of §94: argo `b138ce1` — `board.awaiting_owner` accepted by the
+snapshot schema (loose, optional: an older snapshot never 422s) and rendered
+first on `/warden` as "Waiting on you" (age, stale ≥ 3 d, reason, recurrences,
+revisions, PR link, the same action buttons). Dashboard 277 tests, typecheck and
+lint green; deployed (`Deploy` run success, `/api/health` reports `b138ce1`).
+
+## 95. Episodes see the live state the verdicts kept asking a human for (2026-09-28)
+
+21 of 36 alert verdicts before today were `nextAction=human`, most of them
+"the state lives outside this checkout". Three read-only gatherers join
+`EVIDENCE_ALLOWLIST`, each bounded by `EVIDENCE_TIMEOUT` and returning a line
+instead of raising, prioritised by the loudest families:
+
+| Key | Reads | Wired to |
+|-|-|-|
+| `launchd-restarts` | `launchctl list` (only com.jkrumm.* jobs with a non-zero last status; -15 is deliberate), deliberate-restart markers of the last 24 h (dotfiles `lib/launchd-restarts.sh` contract), research-gateway deploy log tail | `uk:macmini-dev-host-push` |
+| `beszel-alerts` | homelab `/mnt/hdd/beszel/data.db` read-only over `ssh homelab`: rules (threshold, minutes), last six firings, latest 1 m sample incl. temperatures | homelab temperature / CPU / 5 m load / disk |
+| `kuma-monitor-config` | the monitor's block in homelab's **public** `monitors.yaml` + its last 25 heartbeats (down/up, longest gap) | `uk:macmini-*`, Dev Host, Brain Sync, Home Line (`uk:207`) |
+
+homelab-private's monitors are deliberately never read — its details must not
+travel into another repo's brief. Exercised live: Beszel shows Temperature
+`> 90 for 15 min` fired twice on 09-26 for three minutes each; Brain Sync's and
+Home Line's last 25 beats are all up; Dev Host's single recent DOWN (09:35Z)
+predates the marker fix and carries no FAIL text.
+
+Not built, named: a HyperDX/ClickHouse window gatherer (the vps investigations
+already query ClickHouse themselves, 847's did), docker state on homelab/vps
+(raw `docker` from warden is against the house rule; a read-only Makefile
+target would be the way).
+
+Tests: `test_triage.py` 313/313 (+5).
