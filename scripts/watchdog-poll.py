@@ -460,6 +460,10 @@ def poll_uk(env: dict[str, str]) -> list[dict[str, Any]]:
         # anything actionable.
         if m.get("type") == "group":
             continue
+        # triage.py's synthetic trip (§103) makes shadow monitors go DOWN on
+        # purpose; they carry no notification and must never become an event.
+        if str(m.get("name") or "").startswith("warden-trip:"):
+            continue
         status = m.get("status")
         is_down = (isinstance(status, str) and status.lower() == "down") or status == 0 or status is False
         if not is_down:

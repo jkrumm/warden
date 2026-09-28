@@ -8692,3 +8692,61 @@ covers any unmet required review or check, classic protection included.
 
 Tests: `test_triage.py` 325 → 327, `test_merge.py` 69 → 72. Numbered cases
 842 → 847.
+
+## 103. The synthetic trip: a fixed Kuma push monitor must prove it can still go DOWN (2026-09-28)
+
+The last gap named in §§93–102. A fix that *silently removes* detection (a push
+window stretched past any real outage, a watchdog that stops pushing on failure)
+passes review, comes back UP, and is never heard from again — no recurrence, so
+`reopen_if_needed()` has nothing to see. DESIGN.md's C3 mitigation required a
+synthetic trip; it did not exist.
+
+**How it works.** A Kuma-verified deploy (homelab, weatherorb) now enters
+`liveness_pending` with `{"trip": {"status": "pending"}}`. When the item's own
+monitor confirms UP, `_advance_trip()` runs instead of setting `fixed`:
+`scripts/kuma-trip.py` (warden-owned, piped over `ssh homelab` into
+`uptime-kuma/.venv/bin/python -` inside homelab's `op run`, the `uk-sync` door)
+clones the monitor's **live** detection config — interval, retry interval,
+retries — into a shadow `warden-trip:<event>` push monitor with
+`notificationIDList=[]`, re-reads it and deletes it unarmed if any provider stuck,
+then arms it with one UP push and leaves it silent. Each loop pass checks it:
+DOWN inside `interval + retries × retryInterval + 180 s` → shadow deleted, item
+`fixed` with "detection still fires"; no DOWN in the window → shadow deleted, item
+back to `new` with `detection no longer fires: …` and the PR — a finding, not a
+fix. A read error retries until the item's own liveness deadline (Kuma's socket
+API timed out once during the proof). Non-push types return a named gap and the
+item reaches `fixed` with the gap on its note.
+
+**Never pages, leaves nothing.** The productive monitor is never touched. The
+shadow has no provider — checked, because "Slack - Alerts" is `isDefault=True`
+(API-created monitors do not inherit it; verified). `watchdog-poll.py`'s
+`poll_uk()` drops `warden-trip:` names, so a DOWN shadow never becomes an event.
+`sweep_trip_residue()` deletes, hourly, every shadow no armed trip owns.
+
+**Proven live, twice-and-a-half.** (1) A 20 s prototype: DOWN after 30 s,
+deleted, zero #alerts messages. (2) Through warden's own `_kuma_trip()`, a
+shadow of the live `Brain Sync - Push` (interval 600, retries 0): DOWN after
+≤ 626 s, `stop` → removed, `sweep` → nothing left, 0 messages in #alerts since
+arming, 0 events for any shadow. The first attempt of (2), shadow 238, was
+deleted 2 s after arming by the residue sweep — run for real by a test pass that
+had started *before* `_triage_env()` faked `_kuma_trip`. The sweep works; and
+that test run reaching production is exactly what the fake (added in this
+commit, with a module-level `ORIGINAL_KUMA_TRIP` only the argument-validation
+test calls) now prevents. The live sweep cursor was held for the proof window by
+one cursor upsert.
+
+**Named gaps.** Non-push Kuma types (HTTP, keyword, docker, ping): a
+residue-free violation needs a controlled failing target, which would test the
+retry window but not the status/keyword matching a fix actually changes — a
+proof of the wrong thing. HyperDX alerts: evaluated inside HyperDX over
+production ClickStack data, delivered by a webhook bound to #alerts; a violation
+means writing synthetic telemetry into the production store and either paging
+#alerts or re-pointing the alert, itself a production change. For both, `fixed`
+still rests on review (`VALIDATION_GATE_QUESTIONS`), liveness and recurrence, and
+the item's note says so.
+
+Tests: `test_triage.py` 327 → 338 (armed on deploy; arms instead of fixing;
+DOWN fixes; waits in window; never-DOWN reopens as a finding; gap; unarmed
+waits; read errors retry to the liveness deadline; sweep keeps armed shadows;
+argument validation before any ssh; the poller never ingests a shadow).
+Numbered cases 847 → 858.

@@ -133,6 +133,13 @@ _RESOLVE_REPO_DENY: dict[str, list[str]] = {"deny": []}
 _RECURSION_MARKERS = ("CLAUDE_CODE_SESSION", "CLAUDECODE", "CLAUDE_SESSION_ID", "CLAUDE_ENTRYPOINT")
 
 
+# The real `_kuma_trip`, for the argument-validation test (it returns before
+# any ssh on a refused argument). Every other test gets a fake.
+ORIGINAL_KUMA_TRIP = triage._kuma_trip
+
+# Every synthetic-trip call a test made — reset per _triage_env().
+TRIP_CALLS: list[tuple[str, tuple[str, ...]]] = []
+
 # Every PR a test's revision closed — reset per _triage_env().
 CLOSED_PRS: list[tuple[str, str, int, str | None]] = []
 
@@ -168,6 +175,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         "HERMES_ERROR_LOG": triage.HERMES_ERROR_LOG,
         "TRIAGE_REPO_DIR": triage.TRIAGE_REPO_DIR,
         "_call_propose_mappings_model": triage._call_propose_mappings_model,
+        "_kuma_trip": triage._kuma_trip,
         "_resolve_openai_base_url": triage._resolve_openai_base_url,
         "_resolve_openai_api_key": triage._resolve_openai_api_key,
     }
@@ -242,6 +250,11 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
         triage._github.branch_rules = lambda owner, repo, branch: []
+        # The synthetic trip's only door to the real Kuma (§103): never reached
+        # from a test. A trip test registers its own fake.
+        TRIP_CALLS.clear()
+        triage._kuma_trip = lambda verb, *args: TRIP_CALLS.append((verb, args)) or {
+            "ok": False, "error": "test: no fake kuma trip registered"}
         # Every GitHub WRITE a merge path can reach defaults to a loud throw: a
         # test that lands a merge must fake it explicitly (§99 — one test reached
         # the real API with a fake node id when a gate it relied on moved).
@@ -8733,6 +8746,165 @@ def test_warden_self_events_route_to_warden_by_the_real_policy():
     assert hit is not None and hit["repo"] == "warden"
     assert "warden_self" in triage.INGEST_SOURCES
     assert set(triage.INVARIANTS) >= triage.REPORT_ONLY_INVARIANTS
+
+
+
+# --- the synthetic trip (§103) ------------------------------------------------
+
+def _seed_trip_item(conn, *, external_id: str, trip: dict[str, Any]) -> int:
+    eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
+    conn.execute(
+        "UPDATE triage_items SET state=?, pr_url=?, liveness_deadline=?, deploy_expect_json=? WHERE event_id=?",
+        (triage.STATE_LIVENESS_PENDING, "https://github.com/jkrumm/homelab/pull/20",
+         (NOW + dt.timedelta(hours=2)).isoformat(),
+         json.dumps([{"monitorTitle": "Brain Sync - Push", "since": NOW.isoformat(), "trip": trip}]), eid))
+    conn.commit()
+    return eid
+
+
+def _trip_fake(results: dict[str, dict[str, Any]]):
+    def fake(verb, *args):
+        TRIP_CALLS.append((verb, args))
+        return results.get(verb, {"ok": True})
+    return fake
+
+
+_LIVE_POLICY = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "stub-live"}})
+
+
+def _trip(conn, eid) -> dict[str, Any]:
+    return json.loads(triage._get_item(conn, eid)["deploy_expect_json"])[0]["trip"]
+
+
+def test_a_kuma_verified_deploy_is_armed_for_a_trip():
+    policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "kuma-push-fresh", "autoDeploy": True,
+                                                        "deploy": "uk-sync"}})
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _seed_validating(conn, external_id="222")
+        _confirm_and_merge(conn, triage.load_policy(), {"attempted": True, "ok": True, "key": "uk-sync"})
+        assert _trip(conn, eid) == {"status": triage.TRIP_PENDING}
+
+
+def test_liveness_ok_arms_the_trip_instead_of_fixing():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_trip_item(conn, external_id="trip-arm", trip={"status": "pending"})
+        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
+        triage._kuma_trip = _trip_fake({"start": {"ok": True, "shadowId": 901, "interval": 600,
+                                                   "retryInterval": 600, "maxretries": 0, "armedAt": 0}})
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_LIVENESS_PENDING
+        assert TRIP_CALLS[0] == ("start", ("Brain Sync - Push", str(eid)))
+        trip = _trip(conn, eid)
+        assert trip["status"] == "armed" and trip["shadowId"] == 901
+        assert trip["window"] == 600 + triage.TRIP_SLACK_S
+
+
+def test_a_shadow_that_goes_down_proves_detection_and_fixes_the_item():
+    with _triage_env() as (conn, ctx):
+        armed = {"status": "armed", "shadowId": 902, "window": 780, "armedAt": NOW.isoformat(),
+                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
+        eid = _seed_trip_item(conn, external_id="trip-down", trip=armed)
+        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
+        triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": True, "down": True}})
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=650), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FIXED
+        assert "went DOWN within 650s" in item["note"] and "detection still fires" in item["note"]
+        assert ("stop", ("902",)) in TRIP_CALLS, "the shadow is removed the moment the trip ends"
+
+
+def test_a_shadow_inside_its_window_waits():
+    with _triage_env() as (conn, ctx):
+        armed = {"status": "armed", "shadowId": 903, "window": 780, "armedAt": NOW.isoformat(),
+                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
+        eid = _seed_trip_item(conn, external_id="trip-wait", trip=armed)
+        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
+        triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": True, "down": False}})
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=100), dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_LIVENESS_PENDING
+        assert not any(v == "stop" for v, _ in TRIP_CALLS)
+
+
+def test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding():
+    """The whole point: a fix that removed detection comes back UP and is
+    never heard from again. It must not reach `fixed`."""
+    with _triage_env() as (conn, ctx):
+        armed = {"status": "armed", "shadowId": 904, "window": 780, "armedAt": NOW.isoformat(),
+                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
+        eid = _seed_trip_item(conn, external_id="trip-silent", trip=armed)
+        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
+        triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": True, "down": False}})
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=900), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEW
+        assert triage.TRIP_FAILED_NOTE_PREFIX in item["note"] and "homelab/pull/20" in item["note"]
+        assert ("stop", ("904",)) in TRIP_CALLS
+
+
+def test_a_monitor_type_without_a_residue_free_trip_is_a_named_gap_not_a_block():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_trip_item(conn, external_id="trip-gap", trip={"status": "pending"})
+        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
+        triage._kuma_trip = _trip_fake({"start": {"ok": False, "gap": "monitor type 'http': push only"}})
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FIXED and "named gap: monitor type 'http'" in item["note"]
+
+
+def test_a_trip_that_cannot_be_armed_waits_and_never_claims_fixed():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_trip_item(conn, external_id="trip-err", trip={"status": "pending"})
+        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
+        triage._kuma_trip = _trip_fake({"start": {"ok": False, "error": "ssh homelab failed"}})
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_LIVENESS_PENDING
+        assert _trip(conn, eid)["lastError"] == "ssh homelab failed"
+
+
+def test_the_residue_sweep_keeps_only_armed_shadows():
+    with _triage_env() as (conn, ctx):
+        _seed_trip_item(conn, external_id="trip-keep", trip={"status": "armed", "shadowId": 905})
+        triage._kuma_trip = _trip_fake({"sweep": {"ok": True, "removed": [777]}})
+        triage.sweep_trip_residue(conn, NOW, dry_run=False)
+        assert TRIP_CALLS == [("sweep", ("905",))]
+        triage.sweep_trip_residue(conn, NOW + dt.timedelta(minutes=5), dry_run=False)
+        assert len(TRIP_CALLS) == 1, "hourly, not every pass"
+
+
+def test_kuma_trip_refuses_unvalidated_arguments_before_any_ssh():
+    real = ORIGINAL_KUMA_TRIP
+    assert "unvalidated" in real("start", "x; rm -rf /", "1")["error"]
+    assert "integer" in real("check", "1 && echo")["error"]
+    assert "integer" in real("sweep", "1", "x")["error"]
+
+
+def test_the_poller_never_turns_a_trip_shadow_into_an_event():
+    wp = triage._wp_module()
+    saved = wp.http_get
+    wp.http_get = lambda url, headers: [{"id": 9, "name": "warden-trip:543", "type": "push", "status": 0},
+                                        {"id": 10, "name": "Brain Sync - Push", "type": "push", "status": 0}]
+    try:
+        out = wp.poll_uk({"HOMELAB_API_KEY": "k"})
+    finally:
+        wp.http_get = saved
+    assert [o["title"] for o in out] == ["Brain Sync - Push"]
+
+
+
+def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline():
+    with _triage_env() as (conn, ctx):
+        armed = {"status": "armed", "shadowId": 906, "window": 780, "armedAt": NOW.isoformat(),
+                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
+        eid = _seed_trip_item(conn, external_id="trip-flaky", trip=armed)
+        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
+        triage._kuma_trip = _trip_fake({"check": {"ok": False, "error": "TimeoutError: "}})
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=900), dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_LIVENESS_PENDING
+        assert not any(v == "stop" for v, _ in TRIP_CALLS), "the shadow stays while its answer is still readable"
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(hours=3), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEW and "unproven, not fixed" in item["note"]
+        assert ("stop", ("906",)) in TRIP_CALLS
 
 
 if __name__ == "__main__":

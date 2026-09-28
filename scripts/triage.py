@@ -5945,7 +5945,7 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
         elif deploy.get("attempted") and deploy.get("ok"):
             deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
             expected = (deploy.get("expectedAlerts") or []) if kuma_title is None else [
-                {"monitorTitle": kuma_title, "since": _now_iso(now)}]
+                {"monitorTitle": kuma_title, "since": _now_iso(now), "trip": {"status": TRIP_PENDING}}]
             _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
                        liveness_deadline=deadline,
                        deploy_expect_json=json.dumps(expected), note=None)
@@ -6506,6 +6506,131 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     poll_validation_jobs(conn, policy, now, dry_run=dry_run)
 
 
+# --- the synthetic trip (§103) -------------------------------------------------
+#
+# A liveness probe proves the fixed thing is up again. It cannot prove the
+# monitor could still go DOWN: a fix that silently removes detection (a push
+# window stretched past any real outage, a watchdog that no longer pushes on
+# failure) comes back UP and then never fires again — no recurrence, so
+# reopen_if_needed() never sees it. The trip closes that: after a Kuma-verified
+# deploy, a SHADOW copy of the monitor's live detection config (interval, retry
+# interval, retries) is armed with one UP push and left silent; it must go DOWN
+# inside its own window. Only then is the item `fixed`. The productive monitor
+# is never touched and the shadow carries no notification provider, so nothing
+# can page; the shadow is deleted when the trip ends and swept hourly otherwise.
+
+TRIP_PENDING, TRIP_ARMED, TRIP_TRIPPED, TRIP_GAP = "pending", "armed", "tripped", "gap"
+TRIP_SLACK_S = 180           # Kuma evaluates push monitors on its own tick
+TRIP_SSH_TIMEOUT = 90        # one bounded CLI call to a non-LLM helper
+TRIP_SWEEP_CURSOR_KEY = "kuma_trip_sweep"
+TRIP_SWEEP_INTERVAL_S = 3600
+KUMA_TRIP_SCRIPT = Path(__file__).resolve().parent / "kuma-trip.py"
+_KUMA_NAME_RE = re.compile(r"^[A-Za-z0-9 ._()/:+\-]{1,120}$")
+TRIP_FAILED_NOTE_PREFIX = "detection no longer fires: "
+
+
+def _kuma_trip(verb: str, *args: str) -> dict[str, Any]:
+    """One call to scripts/kuma-trip.py on the homelab server. Arguments are
+    validated here and shell-quoted: ssh joins the remote command into a
+    string. Never raises — a failed call is `{"ok": False, "error": ...}`."""
+    import shlex
+    if verb == "start" and not (len(args) == 2 and _KUMA_NAME_RE.match(args[0]) and args[1].isdigit()):
+        return {"ok": False, "error": f"refusing to trip an unvalidated monitor name {args[:1]!r}"}
+    if verb in ("check", "stop") and not (len(args) == 1 and args[0].isdigit()):
+        return {"ok": False, "error": "shadow id must be an integer"}
+    if verb == "sweep" and not all(a.isdigit() for a in args):
+        return {"ok": False, "error": "keep ids must be integers"}
+    remote = ("cd ~/homelab && op run --env-file=.env.tpl -- uptime-kuma/.venv/bin/python - "
+              + " ".join(shlex.quote(a) for a in (verb, *args)))
+    try:
+        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "homelab", remote],
+                              input=KUMA_TRIP_SCRIPT.read_text(), capture_output=True, text=True,
+                              timeout=TRIP_SSH_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"ok": False, "error": f"ssh homelab failed: {e}"}
+    line = next((ln for ln in reversed(proc.stdout.splitlines()) if ln.strip().startswith("{")), "")
+    try:
+        return json.loads(line)
+    except ValueError:
+        return {"ok": False, "error": f"no result (exit {proc.returncode}): {proc.stderr.strip()[-300:]}"}
+
+
+def _advance_trip(item: sqlite3.Row, expected: list[dict[str, Any]], now: dt.datetime) -> tuple[str, str]:
+    """One step of the trip for an item whose liveness just confirmed.
+    Mutates `expected[0]["trip"]` in place and returns (verdict, detail):
+    `fixed` (the shadow went DOWN, or the monitor type is a named gap),
+    `wait` (armed, still inside its window, or a transient failure), or
+    `reopen` (no DOWN inside the window — the fix removed detection)."""
+    rec = expected[0]
+    trip = rec.setdefault("trip", {"status": TRIP_PENDING})
+    status = trip.get("status")
+    if status == TRIP_PENDING:
+        res = _kuma_trip("start", rec["monitorTitle"], str(item["event_id"]))
+        if res.get("gap"):
+            trip.update(status=TRIP_GAP, gap=res["gap"])
+            return "fixed", f"no synthetic trip — named gap: {res['gap']}"
+        if not res.get("ok"):
+            trip["lastError"] = res.get("error")
+            return "wait", f"trip not armed yet: {res.get('error')}"
+        window = res["interval"] + res["retryInterval"] * res["maxretries"] + TRIP_SLACK_S
+        trip.update(status=TRIP_ARMED, shadowId=res["shadowId"], window=window,
+                    armedAt=now.isoformat(), deadline=(now + dt.timedelta(seconds=window)).isoformat())
+        return "wait", f"trip armed on a shadow of {rec['monitorTitle']} (window {window}s)"
+    if status == TRIP_ARMED:
+        res = _kuma_trip("check", str(trip["shadowId"]))
+        overdue = now >= (_parse_ts(trip.get("deadline")) or now)
+        if res.get("ok") and res.get("down"):
+            _kuma_trip("stop", str(trip["shadowId"]))
+            took = int((now - (_parse_ts(trip.get("armedAt")) or now)).total_seconds())
+            trip.update(status=TRIP_TRIPPED, trippedAfterS=took)
+            return "fixed", (f"synthetic trip: a silent shadow of {rec['monitorTitle']} went DOWN within "
+                             f"{took}s (window {trip['window']}s) — detection still fires")
+        if not overdue:
+            return "wait", "trip armed, window still open"
+        if not res.get("ok"):
+            # A read error is not an answer (Kuma's socket API times out now and
+            # then — seen live during the §103 proof). Retry until the item's own
+            # liveness window closes; only then is "could not read" the verdict.
+            if now < (_parse_ts(item["liveness_deadline"]) or now):
+                trip["lastError"] = res.get("error")
+                return "wait", f"trip check failed, retrying: {res.get('error')}"
+            _kuma_trip("stop", str(trip["shadowId"]))
+            return "reopen", (f"{TRIP_FAILED_NOTE_PREFIX}could not read the shadow of {rec['monitorTitle']} "
+                              f"before the liveness window closed ({res.get('error')}) — unproven, not fixed")
+        _kuma_trip("stop", str(trip["shadowId"]))
+        return "reopen", (f"{TRIP_FAILED_NOTE_PREFIX}a silent shadow of {rec['monitorTitle']} with the deployed "
+                          f"config did not go DOWN within {trip['window']}s. The fix is a finding: whatever it "
+                          f"changed, this monitor no longer detects the failure it exists for.")
+    return "fixed", f"synthetic trip already {status}"
+
+
+def sweep_trip_residue(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
+    """Hourly: delete every `warden-trip:` shadow in Kuma that no pending trip
+    still owns — a crash between arm and stop must not leave one behind."""
+    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (TRIP_SWEEP_CURSOR_KEY,)).fetchone()
+    last = _parse_ts(row["updated_at"]) if row else None
+    if dry_run or (last is not None and (now - last).total_seconds() < TRIP_SWEEP_INTERVAL_S):
+        return
+    keep = []
+    for r in conn.execute("SELECT deploy_expect_json FROM triage_items WHERE state=?", (STATE_LIVENESS_PENDING,)):
+        for rec in _safe_json_list(r["deploy_expect_json"]):
+            trip = rec.get("trip") or {}
+            if trip.get("status") == TRIP_ARMED and isinstance(trip.get("shadowId"), int):
+                keep.append(str(trip["shadowId"]))
+    res = _kuma_trip("sweep", *keep)
+    if not res.get("ok"):
+        print(f"triage: trip residue sweep failed: {res.get('error')}", file=sys.stderr)
+        return
+    if res.get("removed"):
+        print(f"triage: removed orphaned trip shadow(s) {res['removed']}", file=sys.stderr)
+    conn.execute(
+        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (TRIP_SWEEP_CURSOR_KEY, json.dumps(res), _now_iso(now)),
+    )
+    conn.commit()
+
+
 def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step 10. The item must not close because the alert went quiet — a
@@ -6540,6 +6665,19 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             if dry_run:
                 print(f"[dry-run] would resolve {item['signature']} on confirmed liveness: {detail}")
                 continue
+            if expected and isinstance(expected[0], dict) and "trip" in expected[0]:
+                verdict, trip_detail = _advance_trip(item, expected, now)
+                conn.execute("UPDATE triage_items SET deploy_expect_json=?, updated_at=? WHERE event_id=?",
+                             (json.dumps(expected), now_iso, item["event_id"]))
+                conn.commit()
+                if verdict == "wait":
+                    continue
+                if verdict == "reopen":
+                    _set_state(conn, item["event_id"], STATE_NEW, now,
+                               note=f"PR: {item['pr_url'] or '(none)'} — {trip_detail}")
+                    conn.commit()
+                    continue
+                detail = f"{detail}; {trip_detail}"
             note = f"{LIVENESS_CONFIRMED_NOTE_PREFIX}{detail}"
             # -> STATE_FIXED, the only producer of it in this file: a change
             # landed (merged + deployed) AND a live probe confirmed it, the
@@ -7976,6 +8114,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # that function's docstring for why the same code runs from both places.
     advance_implement_chain(conn, policy, now, dry_run=dry_run)
     maybe_check_liveness(conn, policy, now, dry_run=dry_run)
+    sweep_trip_residue(conn, now, dry_run=dry_run)
 
     # After every poller above, before the cards below — see sweep_deadlines()'s
     # own docstring: a poller that can still advance an item this pass gets its

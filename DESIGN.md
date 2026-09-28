@@ -346,6 +346,22 @@ Mitigations, all required together:
 - Case 4 above: monitoring config never goes above tier 2.
 - `fixed` for monitoring config requires a **synthetic trip** proving the alert
   still fires, not that the config landed.
+  *Built 2026-09-28 for Uptime Kuma push monitors (state-log §103):* after a
+  Kuma-verified deploy and a positive liveness, a shadow copy of the monitor's
+  **live** detection config (interval, retry interval, retries), with no
+  notification provider, is armed with one UP push and left silent. It must go
+  DOWN inside `interval + retries × retryInterval + 180 s`, or the item reopens
+  with `detection no longer fires:` instead of reaching `fixed`. The productive
+  monitor is never touched; the shadow is deleted when the trip ends and an
+  hourly sweep removes any orphan. **Named gaps:** non-push Kuma monitors (HTTP,
+  keyword, docker, ping — a residue-free violation needs a controlled failing
+  target, which would test the retry window but not the status/keyword matching
+  a fix actually changes) and HyperDX alerts (evaluated inside HyperDX over
+  production ClickStack data and delivered by a webhook bound to #alerts: a
+  violation means writing synthetic telemetry into the production store and
+  either paging #alerts or re-pointing the alert's channel, itself a production
+  change). For those, `fixed` still rests on review, liveness and recurrence,
+  and the note says so.
 - A deploy target's own definition — `Makefile`, `scripts/**`, `.github/**` — is
   permanently outside every `autoMergePaths`. Otherwise warden can write the code
   it then executes.
@@ -752,6 +768,7 @@ they flag is already exactly one entry in the owner's list.
 | INV-5-card | a card posted but never rendered | `test_inv5_a_card_that_was_never_rendered` |
 | INV-6-dead-draft | a PR outliving its item > 3 days (report only) | `test_inv6_and_inv7_report_but_never_become_work` |
 | INV-7-owner-queue | anything waiting on the owner > 3 days (report only) | same |
+| TRIP (§103) | a Kuma push monitor marked `fixed` without proof it can still go DOWN | `test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding` |
 
 The self-audit adds four findings about the loop's own answers:
 `review-always-blocks-<repo>`, `liveness-never-confirms-<repo>`,
