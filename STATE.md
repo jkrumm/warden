@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§96 — review fixes: only the Argo click is the owner; merge outcomes explicit; no clobbering; owner bypass narrowed to scope + zero-CI) |
+| Last updated | 2026-09-28 (§97–§99 — GitHub's rules are the review gate; default unattended scope with `NEVER_AUTO_MERGE` in code; the executor gate fails closed) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -137,6 +137,11 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
+- **Default unattended merge scope (§99).** A repo with no `autoMergePaths` of
+  its own and not merge-approval gated merges anything `NEVER_AUTO_MERGE`
+  (merge.py: CI, Makefiles, scripts, launchd, Docker/compose, manifests,
+  lockfiles, env templates) does not name; gated repos and an unreadable
+  dispatch policy fail closed. Review gate = GitHub's branch rules (§97).
 - **Live evidence in briefs (§95).** `launchd-restarts` (Dev Host),
   `beszel-alerts` (homelab temp/CPU/load/disk thresholds + firings),
   `kuma-monitor-config` (public monitors.yaml block + last 25 heartbeats).
@@ -335,6 +340,8 @@ log's past sections.
 - `awaiting_owner` incl. stranded PRs; a gated merge is one working click — §94
 - Live read-only evidence for the families verdicts kept handing to a human — §95
 - Review of §91–§95: three blocking merge-sharing defects fixed — §96
+- GitHub's rules, not a local list, decide review gates; policy dedup; default
+  unattended scope with `NEVER_AUTO_MERGE` in code — §97–§99
 
 ### Next action
 

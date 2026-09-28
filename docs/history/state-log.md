@@ -8565,3 +8565,40 @@ merge commit under linear history). Numbered cases 825 → 826.
   checked against sideclaw by `make check-policy`. No property depended on it.
 - The merged `.claude/worktrees/advance-on-completion` worktree and its branch
   removed — a full second copy of every script that every grep hit.
+
+## 99. Most fixes merge unattended; what never may is a list in code (2026-09-28)
+
+The owner, twice today: most fixes should be reviewed, merged, deployed and
+verified without him. Before this, an unattended merge needed an explicit
+`autoMergePaths` per repo — three repos had one — so every other correct fix
+parked as a draft PR.
+
+- **Default scope.** `merge.effective_repo_entry()`: a repo whose triage-policy
+  entry declares no `autoMergePaths` and that is not merge-approval gated gets
+  `DEFAULT_REPO_ENTRY = {"autoMergePaths": ["**"], "noCiRequired": True}`. Explicit
+  entries win unchanged (argo keeps its one-file canary scope, vps its
+  `observability/**`). The gate for everything else: the step-7 review with the
+  goal and gate questions (§93), the implement tier's pre-push checks, CI where a
+  repo runs PR checks, GitHub's own rules (§97), mergeability — then deploy and
+  liveness where declared, else `merged`, and a recurrence reopens the item.
+- **`NEVER_AUTO_MERGE` — DESIGN.md § Self-concealing change made executable.**
+  "Deploy-target definitions stay outside every `autoMergePaths`" was a
+  convention the policy file could break. It is now a tuple in `merge.py` checked
+  by `merge_gate_check()` for every unattended merge whatever the scope says:
+  `.github/**`, Makefiles, `scripts/**`, launchd/plists, Dockerfiles, compose
+  files, package manifests and lockfiles, `.env*`/`*.tpl`. Only the owner's Argo
+  merge passes it.
+- **"The loop never merges its own executor" moved into the merge itself.**
+  Before, only triage's routing kept `warden`/`sideclaw`/`dotfiles` from an
+  unattended merge, and `_merge_needs_approval()` failed *open* on an unreadable
+  `dispatch-repos.json`. `effective_repo_entry()` fails closed: a gated repo, or
+  an unreadable policy, gets no default scope, so the gate refuses there too.
+- **Test harness.** One triage test reached the real GitHub API (a
+  `markPullRequestReadyForReview` with a fake node id, refused NOT_FOUND) the
+  moment the gate it relied on moved. `_triage_env()` now fakes every GitHub
+  write a merge can reach (`mark_ready_for_review`, `merge_pr`,
+  `delete_branch`) with a loud throw.
+
+Tests: `test_merge.py` 65 → 69 (gated repo refuses; unreadable policy fails
+closed; ungated repo gets the default; eight NEVER paths refuse inside `**`;
+the owner passes). Numbered cases 826 → 830.

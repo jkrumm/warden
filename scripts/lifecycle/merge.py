@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from clients import github, rollout, sideclaw
-from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError
+from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError, WardenError
 from lifecycle import chaos, operations, policy
 
 MAX_MERGE_FILES = 40
@@ -156,6 +156,49 @@ class MergeResult:
 # gets an implicit allow by omission. `noCiRequired` is an explicit per-repo
 # acknowledgement that a repo has zero PR-time checks, so their absence is a
 # known condition rather than a silently-passed test.
+# Paths no UNATTENDED merge may ever touch, in any repo, whatever its
+# `autoMergePaths` says (§99) — DESIGN.md § Self-concealing change made
+# executable: warden must not write the code it then runs (deploy targets,
+# service definitions, CI), nor change what gets installed (manifests,
+# lockfiles — rules/dependency-hygiene). Code, not policy: a policy file may
+# name and parameterise, never widen this. The owner's Argo merge is the one
+# path past it.
+NEVER_AUTO_MERGE: tuple[str, ...] = (
+    ".github/*", ".github/**", "Makefile", "*/Makefile", "**/Makefile", "*.mk", "scripts/**",
+    "launchd/**", "*.plist", "**/*.plist", "Dockerfile", "**/Dockerfile", "compose*.y*ml",
+    "**/compose*.y*ml", "docker-compose*.y*ml", "**/docker-compose*.y*ml",
+    "package.json", "**/package.json", "bun.lock", "**/bun.lock", "*.lock", "**/*.lock",
+    "package-lock.json", "pnpm-lock.yaml", "pyproject.toml", "uv.lock", "requirements*.txt",
+    ".env*", "**/.env*", "*.tpl", "**/*.tpl",
+)
+
+# What an unattended merge may touch in a repo whose policy entry declares no
+# `autoMergePaths` of its own and is not merge-approval gated (§99): anything
+# NEVER_AUTO_MERGE does not name. The owner, twice on 2026-09-28: most fixes
+# should be reviewed, merged, deployed and verified without him. The gate is
+# the independent step-7 review with the goal in hand, the implement tier's
+# own pre-push checks, CI where the repo has PR checks, and GitHub's rules.
+DEFAULT_REPO_ENTRY: dict[str, Any] = {"autoMergePaths": ["**"], "noCiRequired": True}
+
+
+def effective_repo_entry(repo: str) -> dict[str, Any]:
+    """The triage-policy entry a merge is judged against. Fails CLOSED on
+    the one fact that must never be guessed: a repo in `merge_approval`
+    (the loop's own executor — warden, sideclaw, dotfiles), or an unreadable
+    dispatch policy, gets NO default scope, so an unattended merge there is
+    refused by `merge_gate_check()` itself rather than only by triage's
+    routing (before §99 that routing was the only thing in the way, and it
+    failed open on an unreadable policy)."""
+    entry = policy.triage_repo_entry(repo)
+    if entry.get("autoMergePaths"):
+        return entry
+    try:
+        gated = policy.merge_needs_approval(policy.load_dispatch_policy(), repo)
+    except WardenError:
+        gated = True
+    return entry if gated else {**DEFAULT_REPO_ENTRY, **entry}
+
+
 # The authorizer that is Johannes himself: an Argo click (tailnet-only —
 # DESIGN.md § 2026-09-15 override). NOT `cli:confirm`: an episode's Bash can
 # run `warden merge --confirm` too — `require_no_recursion()`'s env markers are
@@ -189,6 +232,13 @@ def merge_gate_check(
             raise PolicyError(
                 f"{repo}'s pull request touches path(s) outside the auto-merge scope: "
                 f"{', '.join(bad)}."
+            )
+        never = [fn for fn in filenames if any(fnmatch.fnmatch(fn, p) for p in NEVER_AUTO_MERGE)]
+        if never:
+            raise PolicyError(
+                f"{repo}'s pull request touches path(s) no unattended merge may land "
+                f"(deploy definitions, CI, dependencies — NEVER_AUTO_MERGE): {', '.join(never)}. "
+                f"The owner's Argo merge is the path for this one."
             )
 
     if not check_runs:
@@ -482,7 +532,7 @@ def plan_or_land(
 
     runs = github.check_runs(owner, repo, pr_head_sha)
     merge_gate_check(
-        repo=repo, entry=policy.triage_repo_entry(repo), files=files,
+        repo=repo, entry=effective_repo_entry(repo), files=files,
         check_runs=runs, validation=validation_status,
         owner_approved=authorized_by in OWNER_AUTHORIZERS,
     )

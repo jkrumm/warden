@@ -349,6 +349,8 @@ Mitigations, all required together:
 - A deploy target's own definition — `Makefile`, `scripts/**`, `.github/**` — is
   permanently outside every `autoMergePaths`. Otherwise warden can write the code
   it then executes.
+  *Executable since 2026-09-28:* `NEVER_AUTO_MERGE` in `scripts/lifecycle/merge.py`,
+  checked on every unattended merge whatever the scope says (state-log §99).
 
 ### Promotion and demotion
 

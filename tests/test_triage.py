@@ -188,6 +188,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         ("_github", "close_pr"): triage._github.close_pr,
         ("_github", "read_pr"): triage._github.read_pr,
         ("_github", "branch_rules"): triage._github.branch_rules,
+        ("_github", "mark_ready_for_review"): triage._github.mark_ready_for_review,
+        ("_github", "merge_pr"): triage._github.merge_pr,
+        ("_github", "delete_branch"): triage._github.delete_branch,
         ("_merge", "plan_or_land"): triage._merge.plan_or_land,
         ("_approvals", "execute_approved"): triage._approvals.execute_approved,
         ("_argo", "push_snapshot"): triage._argo.push_snapshot,
@@ -239,6 +242,15 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
         triage._github.branch_rules = lambda owner, repo, branch: []
+        # Every GitHub WRITE a merge path can reach defaults to a loud throw: a
+        # test that lands a merge must fake it explicitly (§99 — one test reached
+        # the real API with a fake node id when a gate it relied on moved).
+        triage._github.mark_ready_for_review = lambda node_id: (_ for _ in ()).throw(
+            triage.RemoteError("test: no fake mark_ready_for_review registered"))
+        triage._github.merge_pr = lambda owner, repo, number, *, sha, method: (_ for _ in ()).throw(
+            triage.RemoteError("test: no fake merge_pr registered"))
+        triage._github.delete_branch = lambda owner, repo, branch: (_ for _ in ()).throw(
+            triage.RemoteError("test: no fake delete_branch registered"))
         triage._github.read_pr = lambda owner, repo, number: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake read_pr registered"))
         CLOSED_PRS.clear()
@@ -4446,8 +4458,8 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
     `validating` (sweep never ran, or a residual pre-fix row) whose implement
     dispatch row still reads `status='running'` — even though the review job
     the merge gate is about to act on comes back `clean`. The merge attempt
-    may still be refused for a real policy reason (no `autoMergePaths` under
-    DEFAULT_POLICY), but never for the stale-status reason that was false."""
+    may still be refused for a real policy reason (here: the PR touches a
+    NEVER_AUTO_MERGE path), but never for the stale-status reason that was false."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-stale-impl-row")
         conn.execute(
@@ -4478,17 +4490,17 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
                 triage._github,
                 read_pr=lambda owner, repo, number: pr,
                 read_repo=lambda owner, repo: _fake_repo_json(),
-                pr_files=lambda owner, repo, number: [{"filename": "src/x.py"}],
+                pr_files=lambda owner, repo, number: [{"filename": "Makefile"}],
                 check_runs=lambda owner, repo, sha: [],
             ):
                 triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] != triage.STATE_MERGED, (
-            "DEFAULT_POLICY declares no autoMergePaths for demo-repo — a real merge must not land")
+            "the PR touches a NEVER_AUTO_MERGE path — a real merge must not land")
         assert item["note"] is not None
         assert "finished as 'running'" not in item["note"], item["note"]
-        assert "no autoMergePaths declared" in item["note"], (
+        assert "NEVER_AUTO_MERGE" in item["note"], (
             f"expected the real path-scope refusal, got: {item['note']!r}")
 
 

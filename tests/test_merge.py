@@ -38,7 +38,8 @@ try:
     import lifecycle.policy  # noqa: F401, E402
 except ModuleNotFoundError:
     _stub = types.ModuleType("lifecycle.policy")
-    for _name in ("resolve_repo", "tier_rank", "triage_repo_entry", "triage_policy_path"):
+    for _name in ("resolve_repo", "tier_rank", "triage_repo_entry", "triage_policy_path",
+                  "load_dispatch_policy", "merge_needs_approval"):
         def _unset(*_a, _n=_name, **_k):
             raise NotImplementedError(f"lifecycle.policy.{_n} stub called without a test override")
         setattr(_stub, _name, _unset)
@@ -147,6 +148,8 @@ def fakes(**overrides):
         "entry": {"autoMergePaths": ["**"], "noCiRequired": True},
         "max_tier": "implement",
         "branch_rules": [],
+        "gated": False,
+        "dispatch_policy_error": None,
         "mark_ready_error": None,
         "mark_ready_fn": None,
         "merge_pr_error": None,
@@ -218,6 +221,14 @@ def fakes(**overrides):
         record("branch_rules", owner, repo, branch)
         return list(state["branch_rules"])
 
+    def _load_dispatch_policy(path=None):
+        if state["dispatch_policy_error"]:
+            raise state["dispatch_policy_error"]
+        return {"merge_approval": {"gamma"} if state["gated"] else set()}
+
+    def _merge_needs_approval(pol, repo):
+        return repo in pol.get("merge_approval", set())
+
     def _triage_repo_entry(repo):
         record("triage_repo_entry", repo)
         return dict(state["entry"])
@@ -240,6 +251,8 @@ def fakes(**overrides):
         (lifecycle.policy, "tier_rank", _tier_rank),
         (github, "branch_rules", _branch_rules),
         (lifecycle.policy, "triage_repo_entry", _triage_repo_entry),
+        (lifecycle.policy, "load_dispatch_policy", _load_dispatch_policy),
+        (lifecycle.policy, "merge_needs_approval", _merge_needs_approval),
         (lifecycle.policy, "triage_policy_path", _triage_policy_path),
     ]
     saved = [(m, n, getattr(m, n)) for m, n, _ in patches]
@@ -646,7 +659,35 @@ def test_gate_refuses_validation_missing():
 # --- the gate, wired through plan_or_land -------------------------------------------
 
 def test_plan_or_land_refuses_no_autoMergePaths():
-    _assert_refuses(exc_type=PolicyError, msg="no autoMergePaths declared", fake={"entry": {}})
+    """A merge-approval repo (the loop's own executor) never gets the default
+    scope, so an unattended merge there is refused by the gate itself (§99)."""
+    _assert_refuses(exc_type=PolicyError, msg="no autoMergePaths declared", fake={"entry": {}, "gated": True})
+
+
+def test_unreadable_dispatch_policy_fails_closed():
+    _assert_refuses(exc_type=PolicyError, msg="no autoMergePaths declared",
+                     fake={"entry": {}, "dispatch_policy_error": PreconditionError("unreadable")})
+
+
+def test_ungated_repo_without_an_entry_gets_the_default_scope():
+    conn = _fresh_ledger()
+    _seed_pr_dispatch(conn, validation_status="confirmed")
+    with fakes(entry={}, files=[{"filename": "src/x.py"}]):
+        result = _land(conn, why="w", authorized_by="auto-from-item")
+    assert result.merged
+
+
+def test_never_auto_merge_paths_refuse_even_inside_an_explicit_scope():
+    for path in ("Makefile", "scripts/deploy.sh", "package.json", "bun.lock", "launchd/x.plist",
+                 "compose.yml", "apps/api/Dockerfile", ".env.tpl"):
+        _assert_refuses(exc_type=PolicyError, msg="NEVER_AUTO_MERGE",
+                         fake={"entry": {"autoMergePaths": ["**"], "noCiRequired": True},
+                               "files": [{"filename": path}]})
+
+
+def test_owner_merge_passes_never_auto_merge_paths():
+    merge.merge_gate_check(repo="gamma", entry={}, files=[{"filename": "Makefile"}], check_runs=[],
+                           validation="confirmed", owner_approved=True)
 
 
 def test_plan_or_land_refuses_path_outside_scope():
