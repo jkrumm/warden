@@ -8615,10 +8615,38 @@ def test_inv2_parked_without_a_reason():
 
 
 def test_inv3_in_flight_without_an_episode():
+    settled = (NOW - dt.timedelta(hours=1)).isoformat()
     with _triage_env() as (conn, ctx):
         eid = _seed_state(conn, external_id="no-episode", state=triage.STATE_VALIDATING, validation_job=None,
-                          state_deadline=(NOW + dt.timedelta(hours=1)).isoformat())
-        assert ("INV-3-episode", eid) in _ids(triage.check_invariants(conn, NOW))
+                          state_deadline=(NOW + dt.timedelta(hours=1)).isoformat(), updated_at=settled)
+        impl = _seed_state(conn, external_id="no-impl-job", state=triage.STATE_IMPLEMENTING, implement_job=None,
+                           state_deadline=(NOW + dt.timedelta(hours=1)).isoformat(), updated_at=settled)
+        fresh = _seed_state(conn, external_id="just-claimed", state=triage.STATE_IMPLEMENTING, implement_job=None,
+                            state_deadline=(NOW + dt.timedelta(hours=1)).isoformat(), updated_at=NOW.isoformat())
+        ids = _ids(triage.check_invariants(conn, NOW))
+        assert ("INV-3-episode", eid) in ids and ("INV-3-episode", impl) in ids
+        assert ("INV-3-episode", fresh) not in ids, "a claim a moment before its job id is written is not a violation"
+
+
+def test_a_failing_self_audit_never_takes_the_pass_down():
+    with _triage_env() as (conn, ctx):
+        with _patched(triage, run_self_audit=lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))):
+            assert triage.run(conn, dry_run=False) == 0
+
+
+def test_self_audit_never_audits_its_own_items():
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="warden_self", external_id="inv-1-clock", title="x", first_seen=OLD)
+        conn.execute("INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+                     "last_seen, created_at, updated_at, revision_count, note) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     (eid, "warden_self:inv-1-clock", "warden", triage.STATE_MERGE_BLOCKED, 1, OLD.isoformat(),
+                      OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), 9, "blocked"))
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
+                     (eid, "liveness_pending", "new", NOW.isoformat()))
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
+                     (eid, "liveness_pending", "new", NOW.isoformat()))
+        conn.commit()
+        assert triage.self_audit_findings(conn, NOW, triage.load_policy()) == []
 
 
 def test_inv4_a_finished_investigation_without_effect():

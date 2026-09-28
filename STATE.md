@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§101 — approval buttons post as Hermes (clickable again); Hermes skills aligned; dead cron removed) |
+| Last updated | 2026-09-28 (§102 — review fixes: executor gate first, NEVER_AUTO_MERGE complete, INV-3 implement leg, guarded self-audit, GitHub `blocked` refuses) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 325/325 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 327/327 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -350,6 +350,7 @@ log's past sections.
   unattended scope with `NEVER_AUTO_MERGE` in code — §97–§99
 - Named executable invariants and a self-audit that makes its own gaps work — §100
 - Approval buttons clickable again (posted as Hermes); Hermes skills aligned — §101
+- Review of §97–§101: five blocking findings fixed — §102
 
 ### Next action
 

@@ -8661,3 +8661,34 @@ left as a named candidate, with the path now at least working.
 
 Measured and left alone: the poller's #watchdog digest posted **0** messages in
 the last 7 days, so it duplicates nothing in practice.
+
+## 102. The review of §97–§101 (2026-09-28)
+
+A second multi-angle review (job `d8f90a15`; concurrency and backend found
+nothing, the adversary and OCR passes each caught a real issue) returned five
+blocking findings, all fixed:
+
+- **Executor gate ordering.** `effective_repo_entry()` returned an entry with
+  its own `autoMergePaths` before asking `merge_needs_approval()` — safe today only
+  because no gated repo has one. The gate is now checked first and
+  unconditionally; a gated repo's `autoMergePaths` is stripped.
+- **`NEVER_AUTO_MERGE` gaps and dead entries.** `Dockerfile.dev`, `go.mod`/`go.sum`
+  etc. passed; half the list were `**/` forms that `fnmatch` (whose `*` spans `/`)
+  already covered. Rewritten as `*X` = "X at any depth", plus Containerfile, Cargo,
+  pnpm/yarn/npm lockfiles, Gemfile/gemspec.
+- **INV-3 missed the `implementing` leg** (with 10 min of grace for the
+  claim-before-dispatch window).
+- **An unguarded self-audit could take the loop dark.** `run()` now wraps
+  `run_self_audit()` like every other tick-critical step: rollback, one stderr
+  line, the pass continues.
+- **Two self-audit queries lacked the self-source filter**, so a `warden_self`
+  item could have spawned findings about itself. Both now exclude it; the
+  revision threshold reads `revisionMaxAttempts` from the policy.
+
+The open question — does `GET /rules/branches/{b}` report classic branch
+protection? — is answered by not depending on it: after ready-for-review,
+`plan_or_land()` now refuses on GitHub's own `mergeable_state == "blocked"`, which
+covers any unmet required review or check, classic protection included.
+
+Tests: `test_triage.py` 325 → 327, `test_merge.py` 69 → 72. Numbered cases
+842 → 847.

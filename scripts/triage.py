@@ -6158,8 +6158,12 @@ def check_invariants(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[st
                         "detail": f"`{state}` with no {rule.deadline_column if rule else 'deadline rule'}"})
         if state in PARKED_STATES and not (it["note"] or "").strip():
             out.append({"id": "INV-2-reason", "event_id": eid, "detail": f"`{state}` with no note"})
-        job_col = {STATE_INVESTIGATING: "dispatch_job", STATE_VALIDATING: "validation_job"}.get(state)
-        if job_col and not it[job_col]:
+        job_col = {STATE_INVESTIGATING: "dispatch_job", STATE_IMPLEMENTING: "implement_job",
+                   STATE_VALIDATING: "validation_job"}.get(state)
+        # 10 min of grace: implementing is claimed a moment before its job id
+        # is written (maybe_auto_implement's claim-before-dispatch).
+        settled = (_parse_ts(it["updated_at"]) or now) < now - dt.timedelta(minutes=10)
+        if job_col and not it[job_col] and settled:
             out.append({"id": "INV-3-episode", "event_id": eid, "detail": f"`{state}` with no {job_col}"})
         if state == STATE_INVESTIGATING and it["dispatch_job"]:
             d = conn.execute("SELECT status, finished_at FROM dispatches WHERE job_id=?",
@@ -6195,7 +6199,8 @@ def _safe_json_list(raw: str | None) -> list[dict[str, Any]]:
     return [v for v in val if isinstance(v, dict)] if isinstance(val, list) else []
 
 
-def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str, Any]]:
+def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
+                        policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Gaps the loop can see in its own behaviour, each keyed so one finding
     is one event: a review gate that blocks every PR in a repo, a liveness
     probe that never confirms, a `fixed` that reopened (the verdict or the
@@ -6214,7 +6219,9 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime) -> list[dict
     for r in conn.execute(
         "SELECT ti.repo, SUM(t.to_state='new') AS reopened, SUM(t.to_state='fixed') AS fixed "
         "FROM item_transitions t JOIN triage_items ti ON ti.event_id = t.event_id "
-        "WHERE t.from_state='liveness_pending' AND t.at >= ? GROUP BY ti.repo", (since,),
+        "JOIN events e ON e.id = t.event_id "
+        "WHERE t.from_state='liveness_pending' AND t.at >= ? AND e.source != ? GROUP BY ti.repo",
+        (since, SELF_SOURCE),
     ):
         if (r["reopened"] or 0) >= 2 and not r["fixed"]:
             out.append({"key": f"liveness-never-confirms-{r['repo']}",
@@ -6228,10 +6235,11 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime) -> list[dict
         out.append({"key": f"fixed-reopened-{r['event_id']}",
                     "title": f"{r['signature']} came back after warden marked it fixed",
                     "detail": f"the verdict or the fix in {r['repo']} was wrong — event {r['event_id']}"})
-    max_rev = DEFAULT_REVISION_MAX_ATTEMPTS
+    max_rev = int((policy or {}).get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
     for r in conn.execute(
-        f"SELECT event_id, signature, repo FROM triage_items WHERE revision_count >= ? "
-        f"AND state IN ({','.join('?' * len(PARKED_STATES))})", (max_rev, *PARKED_STATES),
+        f"SELECT ti.event_id, ti.signature, ti.repo FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"WHERE ti.revision_count >= ? AND e.source != ? "
+        f"AND ti.state IN ({','.join('?' * len(PARKED_STATES))})", (max_rev, SELF_SOURCE, *PARKED_STATES),
     ):
         out.append({"key": f"revisions-exhausted-{r['event_id']}",
                     "title": f"{r['signature']} still blocked after {max_rev} revisions",
@@ -6252,7 +6260,7 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     if last is not None and (now - last).total_seconds() < SELF_AUDIT_INTERVAL_S:
         return
     violations = check_invariants(conn, now)
-    findings = self_audit_findings(conn, now)
+    findings = self_audit_findings(conn, now, policy)
     by_inv: dict[str, list[dict[str, Any]]] = {}
     for v in violations:
         by_inv.setdefault(v["id"], []).append(v)
@@ -7929,7 +7937,13 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     reconcile_operations(conn, policy, now, dry_run=dry_run)
 
     drain_intents(conn, now, dry_run=dry_run)
-    run_self_audit(conn, policy, now, dry_run=dry_run)
+    # Never takes the tick down: the audit reports on the loop, it must not
+    # be able to stop it (§102).
+    try:
+        run_self_audit(conn, policy, now, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001 — a report must not kill the pass it reports on
+        conn.rollback()
+        print(f"triage: self-audit failed, pass continues: {type(e).__name__}: {e}", file=sys.stderr)
     ingest(conn, now)
     ingest_github_issues(conn, now)
     reopen_if_needed(conn, now)

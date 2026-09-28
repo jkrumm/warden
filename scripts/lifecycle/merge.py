@@ -164,12 +164,12 @@ class MergeResult:
 # name and parameterise, never widen this. The owner's Argo merge is the one
 # path past it.
 NEVER_AUTO_MERGE: tuple[str, ...] = (
-    ".github/*", ".github/**", "Makefile", "*/Makefile", "**/Makefile", "*.mk", "scripts/**",
-    "launchd/**", "*.plist", "**/*.plist", "Dockerfile", "**/Dockerfile", "compose*.y*ml",
-    "**/compose*.y*ml", "docker-compose*.y*ml", "**/docker-compose*.y*ml",
-    "package.json", "**/package.json", "bun.lock", "**/bun.lock", "*.lock", "**/*.lock",
-    "package-lock.json", "pnpm-lock.yaml", "pyproject.toml", "uv.lock", "requirements*.txt",
-    ".env*", "**/.env*", "*.tpl", "**/*.tpl",
+    # fnmatch's `*` spans `/`, so `*X` means "X at any depth" — no `**/` forms.
+    ".github/*", "*Makefile", "*.mk", "scripts/*", "launchd/*", "*.plist",
+    "*Dockerfile*", "*Containerfile*", "*compose*.y*ml",
+    "*package.json", "*.lock", "*-lock.json", "*-lock.yaml", "*go.mod", "*go.sum",
+    "*Cargo.toml", "*pyproject.toml", "*requirements*.txt", "*Gemfile", "*.gemspec",
+    ".env*", "*/.env*", "*.tpl",
 )
 
 # What an unattended merge may touch in a repo whose policy entry declares no
@@ -190,13 +190,15 @@ def effective_repo_entry(repo: str) -> dict[str, Any]:
     routing (before §99 that routing was the only thing in the way, and it
     failed open on an unreadable policy)."""
     entry = policy.triage_repo_entry(repo)
-    if entry.get("autoMergePaths"):
-        return entry
     try:
         gated = policy.merge_needs_approval(policy.load_dispatch_policy(), repo)
     except WardenError:
         gated = True
-    return entry if gated else {**DEFAULT_REPO_ENTRY, **entry}
+    if gated:
+        # Checked FIRST and unconditionally: an `autoMergePaths` someone adds
+        # for a gated repo later must not open the loop's own executor (§102).
+        return {k: v for k, v in entry.items() if k != "autoMergePaths"}
+    return entry if entry.get("autoMergePaths") else {**DEFAULT_REPO_ENTRY, **entry}
 
 
 # The authorizer that is Johannes himself: an Argo click (tailnet-only —
@@ -635,6 +637,16 @@ def plan_or_land(
         raise PolicyError(
             f"{owner}/{repo}#{pr_number} is not mergeable (state: {state_now}) — usually "
             f"a conflict with {default_branch}."
+        )
+    if state_now == "blocked":
+        # GitHub's own verdict on every protection that applies, classic
+        # branch protection included — which the rulesets endpoint read above
+        # does not report (§102). A required review or check that is unmet
+        # shows here, whatever produced it.
+        operations.complete(conn, merge_op, outcome="failed")
+        raise PolicyError(
+            f"{owner}/{repo}#{pr_number} is blocked by GitHub (mergeable_state=blocked): a required "
+            f"review or status check is unmet. Read from GitHub, not assumed."
         )
 
     # The head SHA is pinned: every check above was made against it, so a

@@ -1129,5 +1129,39 @@ def test_owner_approved_merge_skips_only_scope_and_zero_ci():
     assert merge.OWNER_AUTHORIZERS == ("owner:argo",), (
         "only the Argo click is the owner: an episode can run `warden merge --confirm` itself")
 
+
+def test_gated_repo_with_an_explicit_scope_still_refuses_unattended():
+    """§102: the executor gate is checked before any autoMergePaths."""
+    _assert_refuses(exc_type=PolicyError, msg="no autoMergePaths declared",
+                     fake={"entry": {"autoMergePaths": ["**"], "noCiRequired": True}, "gated": True})
+
+
+def test_github_blocked_state_refuses_whatever_produced_it():
+    """Classic branch protection is not in the rulesets endpoint; GitHub's
+    mergeable_state=blocked is, and it refuses the land."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        with fakes(pr={**_DEFAULT_PR, "mergeable": True, "mergeable_state": "blocked"}) as fx:
+            try:
+                _land(conn)
+            except PolicyError as e:
+                assert "mergeable_state=blocked" in str(e), str(e)
+            else:
+                raise AssertionError("a blocked PR must not merge")
+            # A draft only reports `blocked` once it is ready for review, so the
+            # check runs after that mutation — and before any merge.
+            assert "merge_pr" not in fx.calls
+    finally:
+        conn.close()
+
+
+def test_never_auto_merge_covers_variants_and_other_ecosystems():
+    for path in ("Dockerfile.dev", "docker/Containerfile", "go.mod", "svc/go.sum", "Cargo.toml",
+                 "pnpm-lock.yaml", "yarn.lock", "apps/web/package-lock.json", ".github/workflows/ci.yml"):
+        assert any(merge.fnmatch.fnmatch(path, p) for p in merge.NEVER_AUTO_MERGE), path
+    for path in ("src/app.ts", "docs/readme.md", "uptime-kuma/monitors.yaml"):
+        assert not any(merge.fnmatch.fnmatch(path, p) for p in merge.NEVER_AUTO_MERGE), path
+
 if __name__ == "__main__":
     sys.exit(main())
