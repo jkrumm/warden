@@ -8370,3 +8370,45 @@ in this repo "uncommitted" is not "undeployed".
 
 Tests: `test_triage.py` 297/297 (+5 revision, +3 parked), `test_api.py` 42/42
 (board item shape), `test_ledger.py` 28/28 (adoption column set).
+
+## 93. The last mile: homelab, weatherorb and research-gateway merge, deploy and verify (2026-09-28)
+
+Before this, only `vps/observability/**` could go review → merge → deploy →
+verify. Every other alert fix ended as a draft PR plus `needs_human` —
+homelab#9 (item 1170) even passed review and was refused for "no
+autoMergePaths declared for 'homelab'". The owner's call (REVIEW.md C3
+disposition update, DESIGN.md case 4 narrowed): reviewed, merged, deployed and
+verified without him, except where the loop would merge its own executor.
+
+| Repo | Scope (`autoMergePaths`) | Deploy | Liveness (`fixed` needs) |
+|-|-|-|-|
+| homelab | `uptime-kuma/monitors.yaml` | `uk-sync` — `ssh homelab`, `git pull --ff-only`, `op run … sync.py` on the server (argv verified headless with `--dry-run`, exit 0) | `kuma-push-fresh`: the item's own monitor UP after the deploy |
+| weatherorb | `src/weatherorb/watchdog/**`, `tests/**`, `docs/**` | `weatherorb-pull` — `git -C ~/SourceRoot/weatherorb pull --ff-only` (periodic LaunchAgents exec the checkout) | `kuma-push-fresh` |
+| research-gateway | `src/**`, `bin/**`, `docs/**`, `evals/**`, `README.md`, `AGENTS.md` | `deployByPoller` — merge is deploy via the CI-gated mini poller | `mini-checkout-live`: `~/.research-gateway/app` contains the merge sha and `:7780/health` says ok |
+
+Deploy definitions (`sync.py`, `Makefile`, `scripts/**`, `launchd/**`) and
+dependency files stay outside every scope — warden must not write what it runs.
+A Kuma-liveness repo whose item did not come from a Kuma monitor (e.g. a GitHub
+issue) lands `merged` after a good deploy instead of a window that can only
+time out. A liveness that never confirms reopens the item to `new` with the PR
+in its history — the loop keeps going until the fault is actually gone.
+
+**The review is now a gate, not a code read.** `_open_validation_dispatch()`
+passed `context=None`: the reviewer never saw the goal. It now gets
+`_validation_context()` — the investigation's recommendation plus
+`VALIDATION_GATE_QUESTIONS` (goal met, safe, and for monitor/threshold changes:
+evidence the old setting misfired, else blocking). Reviewer and implementer are
+different families (`GET /api/routing`: review `claude-sonnet-5[1m]` + adversary
+`gpt-5.6-terra`; dispatch `deepseek-v4.1-flash`). Caveat: dispatch's fallback is
+Sonnet on Max, so a fallback-run implement shares a family with its reviewer.
+
+**Policy-refused merges retry once per policy change**
+(`retry_policy_refused_merges()`): a `merge_blocked` item parked on `merge
+refused:` with a confirmed, unmerged PR is re-attempted when
+`config/triage-policy.json` is newer than the item — `_merge_and_rollout()` is
+the old tail of `poll_validation_jobs()`, extracted so both share it.
+
+Tests: `test_triage.py` 305/305 (+8). An edit briefly left `triage.py` with an
+IndentationError for about a minute; no agent ran in that window (all five
+`.err` logs clean) — edits to live scripts now go through a backup-and-parse
+guard.

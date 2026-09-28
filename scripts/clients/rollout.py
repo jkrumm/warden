@@ -11,12 +11,25 @@ key; this module owns the argv.
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 from typing import Callable, NamedTuple
 
 from .errors import PolicyError
 
 ROLLOUTS: dict[str, tuple[str, ...]] = {
     "hyperdx-apply": ("ssh", "vps", "cd ~/vps && make hyperdx-apply ENV=prod"),
+    # homelab's `make uk-sync`, spelled out: the Makefile is a deploy-target
+    # definition and so outside every autoMergePaths — warden must not be able
+    # to write the code it then runs (DESIGN.md § Self-concealing change). op
+    # runs ON the homelab server (its own service account), never on the mini.
+    # No --delete-orphans: without a TTY sync.py only lists orphans.
+    "uk-sync": ("ssh", "homelab",
+                "cd ~/homelab && git pull --ff-only && op run --env-file=.env.tpl -- "
+                "uptime-kuma/.venv/bin/python uptime-kuma/sync.py "
+                "--extra-config ../homelab-private/uptime-kuma/monitors.yaml"),
+    # weatherorb's periodic LaunchAgents (watchdog, sync, obs, ...) exec the
+    # live checkout on every run, so a fast-forward IS the rollout for them.
+    "weatherorb-pull": ("git", "-C", str(Path.home() / "SourceRoot" / "weatherorb"), "pull", "--ff-only"),
 }
 
 

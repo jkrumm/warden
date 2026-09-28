@@ -93,6 +93,28 @@ failed to record its own merge.
   because it will be tempting: verification is the only thing separating `fixed`
   from `quiet`, which is the entire point.
 
+**Disposition update, 2026-09-28 (owner decision — C3; `docs/history/state-log.md`
+§93).** New evidence, not a re-litigation: the owner has said in as many words
+that monitor, watchdog and Kuma adjustments should be reviewed, merged, deployed
+and verified without him, and that a human gate added for its own sake is the
+friction that lets the same alerts recur for weeks (the §91 ledger read: 0
+verified fixes, 40 hand-closes, a correct fix parked five days). C3's finding
+stands: auto-merged monitoring config can hide a fault and score it as a fix.
+What changes is the mitigation. Case 4 is no longer "never automatic" for
+monitor config outside the loop's own repos; instead, all four hold together:
+the step-7 review is a real gate with the goal in hand and an explicit
+detection question (`VALIDATION_GATE_QUESTIONS` — loosening detection without
+evidence the old setting misfired is a *blocking* finding) on a different model
+family than the implementer; deploy-target definitions (`sync.py`,
+`Makefile`, `scripts/**`) stay outside every `autoMergePaths`; `fixed` needs
+the item's own monitor to report UP after the deploy, not the config to be
+live; and a reopen after `fixed` is tracked (`reopen_if_needed()`, §91's
+chronic rule, §92's parked-recurrence count). The synthetic trip C3 asked for
+is still not built — that gap is named here, not papered over. The hard human
+gate stays exactly where the loop would otherwise close on itself:
+`warden`, `sideclaw`, `dotfiles` (`merge_approval`), and warden's own policy
+files.
+
 ## Accepted with the operator's framing preserved
 
 The out-of-family review recommended cutting new origins and generic SSH deploy

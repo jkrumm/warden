@@ -8275,5 +8275,119 @@ def test_card_shows_recurrences_since_parked():
         triage.STATE_MERGE_BLOCKED, "merge by hand", None)["text"]["text"]
 
 
+# --- the last mile: deploy + liveness for more repos (§93) --------------------
+
+def _seed_validating(conn, *, external_id: str, source: str = "uk", title: str = "WeatherOrb Watchdog - Push") -> int:
+    eid = _seed_verdict_item(conn, event_id_source=source, external_id=external_id)
+    conn.execute("UPDATE events SET title=? WHERE id=?", (title, eid))
+    conn.execute(
+        "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+        (triage.STATE_VALIDATING, f"impl-{external_id}", f"val-{external_id}",
+         "https://github.com/jkrumm/demo-repo/pull/31", eid))
+    conn.commit()
+    _seed_implement_dispatch(conn, f"impl-{external_id}")
+    return eid
+
+
+def _confirm_and_merge(conn, policy, deploy: dict, merge_commit: str | None = None) -> None:
+    triage._sideclaw.get = lambda job_id: {"status": "done", "result": _review_result("clean", blocking=[])}
+    fake = types.SimpleNamespace(deploy=deploy, merge_commit=merge_commit, repo_slug="jkrumm/demo-repo",
+                                 pull_request=31)
+    with _patched(triage._merge, plan_or_land=lambda *a, **kw: fake):
+        triage.poll_validation_jobs(conn, policy, NOW, dry_run=False)
+
+
+def test_kuma_repo_deploy_waits_on_the_items_own_monitor():
+    policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "kuma-push-fresh", "autoDeploy": True,
+                                                        "deploy": "weatherorb-pull"}})
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _seed_validating(conn, external_id="220")
+        _confirm_and_merge(conn, triage.load_policy(), {"attempted": True, "ok": True, "key": "weatherorb-pull"})
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_LIVENESS_PENDING
+        expected = json.loads(item["deploy_expect_json"])
+        assert expected[0]["monitorTitle"] == "WeatherOrb Watchdog - Push" and expected[0]["since"]
+
+
+def test_kuma_repo_deploy_without_a_monitor_of_its_own_is_merged_not_pending():
+    policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "kuma-push-fresh", "autoDeploy": True,
+                                                        "deploy": "uk-sync"}})
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _seed_validating(conn, external_id="sig-nomon", source="github_go", title="issue: tidy docs")
+        _confirm_and_merge(conn, triage.load_policy(), {"attempted": True, "ok": True, "key": "uk-sync"})
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGED
+        assert "no Kuma monitor" in item["note"]
+
+
+def test_poller_deployed_repo_waits_on_its_checkout():
+    policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"deployByPoller": True, "liveness": "mini-checkout-live"}})
+    sha = "a" * 40
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _seed_validating(conn, external_id="sig-rg", source="slack_alert", title="🚨 rg")
+        _confirm_and_merge(conn, triage.load_policy(), {"attempted": False, "reason": "autoDeploy is false"},
+                           merge_commit=sha)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_LIVENESS_PENDING
+        assert json.loads(item["deploy_expect_json"]) == [{"commit": sha, "repo": "demo-repo"}]
+
+
+def test_mini_checkout_live_refuses_without_a_known_checkout_or_full_sha():
+    ok, detail = triage._gather_mini_checkout_live([{"commit": "a" * 40, "repo": "nope"}])
+    assert not ok and "no mini deploy checkout" in detail
+    ok, detail = triage._gather_mini_checkout_live([{"commit": "abc", "repo": "research-gateway"}])
+    assert not ok and "no full merge sha" in detail
+    assert "mini-checkout-live" in triage.LIVENESS_ALLOWLIST
+
+
+def test_kuma_monitor_title_from_uk_and_slack_alert():
+    uk = {"source": "uk", "title": "MacMini Dev Host - Push (×3 in batch)"}
+    sa = {"source": "slack_alert", "title": "[Brain Sync - Push] [:red_circle: Down] No heartbeat"}
+    other = {"source": "hermes_log", "title": "[x] y"}
+    assert triage._kuma_monitor_title(uk) == "MacMini Dev Host - Push"
+    assert triage._kuma_monitor_title(sa) == "Brain Sync - Push"
+    assert triage._kuma_monitor_title(other) is None
+
+
+def test_new_rollout_keys_are_closed_argv():
+    for key in ("uk-sync", "weatherorb-pull"):
+        argv = triage._merge.rollout.argv_for(key)
+        assert argv and isinstance(argv, tuple) and all(isinstance(a, str) for a in argv)
+    assert triage._merge.rollout.argv_for("uk-sync")[:2] == ("ssh", "homelab")
+    assert "--delete-orphans" not in " ".join(triage._merge.rollout.argv_for("uk-sync"))
+
+
+def test_validation_review_gets_the_goal_and_the_gate_questions():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-ctx")
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id='investigate-job'",
+                     (json.dumps({"summary": "s", "recommendation": "raise the push window to 10m"}),))
+        conn.commit()
+        ctx_text = triage._validation_context(conn, triage._get_item(conn, eid))
+        assert "raise the push window to 10m" in ctx_text
+        assert "Loosening detection without that evidence is a blocking finding" in ctx_text
+
+
+def test_policy_refused_merge_is_retried_once_the_policy_changes():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-refused-merge")
+        old = (NOW - dt.timedelta(days=2)).isoformat()
+        conn.execute("UPDATE triage_items SET state=?, implement_job='impl-rm', pr_url=?, note=?, updated_at=? "
+                     "WHERE event_id=?", (triage.STATE_MERGE_BLOCKED, "https://github.com/jkrumm/demo-repo/pull/9",
+                                          "merge refused: no autoMergePaths declared for 'demo-repo'", old, eid))
+        conn.commit()
+        _seed_implement_dispatch(conn, "impl-rm")
+        conn.execute("UPDATE dispatches SET validation_status='confirmed' WHERE job_id='impl-rm'")
+        conn.commit()
+        calls: list[Any] = []
+        fake = types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo", pull_request=9)
+        with _patched(triage._merge, plan_or_land=lambda *a, **kw: calls.append(kw) or fake):
+            triage.retry_policy_refused_merges(conn, triage.load_policy(), NOW, dry_run=False)
+            assert len(calls) == 1
+            assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGED
+            triage.retry_policy_refused_merges(conn, triage.load_policy(), NOW, dry_run=False)
+            assert len(calls) == 1, "no second attempt without a newer policy file"
+
+
 if __name__ == "__main__":
     sys.exit(main())

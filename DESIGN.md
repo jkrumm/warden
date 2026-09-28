@@ -282,6 +282,13 @@ Four cases. Everything else runs unattended.
 4. **The change alters the system's ability to observe itself** — monitoring
    config, alert thresholds, log levels, the health check, warden's own policy
    files. **This case is never promotable to automatic.**
+   *Narrowed 2026-09-28 (owner decision, REVIEW.md C3 disposition update,
+   state-log §93):* monitor config in a repo that is not the loop's own
+   (Kuma `monitors.yaml`, HyperDX alert JSON, a service's watchdog) runs
+   unattended behind a real step-7 review gate that blocks unevidenced
+   loosening, with its own monitor UP as the only `fixed`. Warden's own policy
+   files and the `merge_approval` repos (`warden`, `sideclaw`, `dotfiles`)
+   remain this case, unchanged.
 
 ### The host-verb carve-out — why a restart is not case 2
 
@@ -540,6 +547,15 @@ arguments, so there is nothing to validate and no friction to remove.
 Even with perfect quoting, a Make target executes repo code, so *who may modify
 the target* matters more than *who may name it* — hence the `Makefile`/`scripts/**`
 exclusion above.
+
+**Seeded 2026-09-28 (§93):** `uk-sync` (homelab, `ssh homelab` + `op run` on the
+server, `monitors.yaml` only), `weatherorb-pull` (`git pull --ff-only` of the
+live checkout the periodic LaunchAgents exec), and a third shape beside
+`autoDeploy`/`deployOnMerge` — `deployByPoller` for research-gateway, whose
+CI-gated mini poller makes merge the deploy; its liveness key
+`mini-checkout-live` confirms the poller's checkout carries the merge commit
+and `/health` answers ok. Kuma-monitored repos confirm with `kuma-push-fresh`
+against the item's own monitor.
 
 Prefer not needing this at all: `weatherorb`, `research-gateway` and `argo` deploy via
 GitHub Actions → RollHook, so merge *is* deploy. **`image-share` does not** — it

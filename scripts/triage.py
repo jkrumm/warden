@@ -3037,6 +3037,61 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
 LIVENESS_ALLOWLIST["kuma-push-fresh"] = _gather_kuma_push_fresh
 
 
+# `mini-checkout-live`: for a repo whose merge IS its deploy through a
+# mini-side poller (research-gateway's mini-deploy.sh, CI-gated, idle-gated),
+# the deploy is confirmed when the poller's own checkout contains the merge
+# commit AND the service answers healthy. Closed map, same principle as every
+# allowlist here: the policy names the repo, code owns the path and the URL.
+MINI_DEPLOYED_CHECKOUTS: dict[str, tuple[Path, str]] = {
+    "research-gateway": (Path.home() / ".research-gateway" / "app", "http://127.0.0.1:7780/health"),
+}
+
+
+def _gather_mini_checkout_live(expected: list[dict[str, Any]]) -> tuple[bool, str]:
+    rec = expected[0] if expected else {}
+    commit, repo = rec.get("commit"), rec.get("repo")
+    entry = MINI_DEPLOYED_CHECKOUTS.get(repo or "")
+    if entry is None:
+        return False, f"no mini deploy checkout is known for {repo!r}"
+    if not isinstance(commit, str) or not _FULL_SHA_RE.match(commit):
+        return False, f"no full merge sha recorded ({commit!r})"
+    checkout, health_url = entry
+    try:
+        proc = subprocess.run(["git", "-C", str(checkout), "merge-base", "--is-ancestor", commit, "HEAD"],
+                              capture_output=True, text=True, timeout=EVIDENCE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"could not read {checkout}: {e}"
+    if proc.returncode != 0:
+        return False, f"{repo}'s deploy checkout does not contain {commit[:7]} yet"
+    try:
+        with urllib.request.urlopen(health_url, timeout=EVIDENCE_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return False, f"{repo} contains {commit[:7]} but {health_url} did not answer: {e}"
+    if body.get("status") != "ok":
+        return False, f"{repo} contains {commit[:7]} but health says {body.get('status')!r}"
+    return True, f"{repo} deployed {commit[:7]} and answers healthy"
+
+
+LIVENESS_ALLOWLIST["mini-checkout-live"] = _gather_mini_checkout_live
+
+
+def _kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
+    """The Uptime Kuma monitor an item's own signal came from, or None: a `uk`
+    event's title IS the monitor name; a Kuma message in #alerts carries it
+    as its leading `[Name]`. What `kuma-push-fresh` confirms after a monitor
+    or watchdog fix deploys — the item's own monitor reporting UP again."""
+    if event_row is None:
+        return None
+    title = (event_row["title"] or "").strip()
+    if event_row["source"] == "uk":
+        return re.sub(r"\s*\(×\d+ in batch\)$", "", title) or None
+    if event_row["source"] == "slack_alert":
+        m = _BRACKET_PREFIX_RE.match(title)
+        return m.group(1).strip() if m else None
+    return None
+
+
 _EVIDENCE_GATHERERS = {
     "weatherorb-health": _gather_weatherorb_health,
     "gateway-starts": _gather_gateway_starts,
@@ -5254,8 +5309,39 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 
+VALIDATION_GATE_QUESTIONS = (
+    "You are the merge gate: if you do not block this, it is merged, deployed and verified with no "
+    "human in between. Block (a `blocking` finding) when any of these fails:\n"
+    "1. Goal — does the diff actually achieve the goal stated below, not a neighbouring one?\n"
+    "2. Safety — could it break a running service, lose data, leak a secret, or widen access?\n"
+    "3. Detection — if it touches a monitor, alert, threshold, health check or watchdog: does it fix "
+    "a miscalibration with evidence that the old setting misfired, rather than silencing a real "
+    "fault? Loosening detection without that evidence is a blocking finding.\n"
+    "Style and nits are improvements, never blocking."
+)
+
+
+def _validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
+    """What the reviewer needs to judge the PR against its goal: the gate
+    questions and the investigation's own conclusion. Before §93 the review
+    ran with no context at all, so "does it do what it should" was
+    unanswerable and the gate was only ever a code read."""
+    parts = [VALIDATION_GATE_QUESTIONS]
+    if item["dispatch_job"]:
+        inv = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
+                           (item["dispatch_job"],)).fetchone()
+        verdict = _safe_json(inv["verdict_json"] if inv else None)
+        goal = verdict.get("recommendation") or verdict.get("summary")
+        if goal:
+            parts.append(f"Goal (from the investigation that led to this PR): {goal}")
+    elif item["brief"]:
+        parts.append(f"Goal (the owner's brief): {item['brief']}")
+    return "\n\n".join(parts)[: _dispatch.MAX_CONTEXT_CHARS]
+
+
 def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: int,
-                               implement_job: str, pr_url: str) -> tuple[str | None, str | None]:
+                               implement_job: str, pr_url: str,
+                               context: str | None = None) -> tuple[str | None, str | None]:
     """Step 7 — sideclaw's own `review` job against the pull request itself
     (server/jobs/handlers/review.ts), reading its actual diff against the
     repo through a multi-angle synthesis and returning a TYPED verdict
@@ -5281,7 +5367,7 @@ def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: 
     try:
         target = _policy.resolve_repo(repo)
         opened = _dispatch.open_review(
-            conn, target=target, pr=pr_number, context=None,
+            conn, target=target, pr=pr_number, context=context,
             origin=_dispatch.Origin(event_id=event_id),
             model=TRIAGE_VALIDATION_DISPATCH_MODEL,
         )
@@ -5405,7 +5491,8 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=f"implement {job_id}: {summary}")
         elif outcome == "pr_opened" and artifact_url:
             val_job, val_err = _open_validation_dispatch(conn, repo=item["repo"], event_id=item["event_id"],
-                                                           implement_job=job_id, pr_url=artifact_url)
+                                                           implement_job=job_id, pr_url=artifact_url,
+                                                           context=_validation_context(conn, item))
             if val_job is None:
                 _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
                            note=val_err or "could not open the step-7 validation episode", pr_url=artifact_url)
@@ -5627,93 +5714,161 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             ))
             conn.commit()
         else:
-            # Belt-and-suspenders on top of the sync above (which folds only
-            # THIS poll's own review job): `plan_or_land()` is about to read
-            # the IMPLEMENT job's dispatches row and refuse if `status` isn't
-            # 'done' — a row this function does not own but is seconds away
-            # from depending on. A confirmed validation only ever exists once
-            # the implement job itself finished 'done' (that is what opened
-            # this validation in the first place), so re-reading it here is
-            # cheap insurance against exactly the staleness this whole fix is
-            # about, for any row that reached `validating` before this file
-            # carried the fix above. Never blocks the merge attempt on a
-            # failed re-read — plan_or_land()'s own precheck still fails
-            # closed against whatever the row already says.
-            try:
-                impl_resp = _sideclaw.get(item["implement_job"])
-            except RemoteError as e:
-                print(f"triage: could not refresh implement dispatch {item['implement_job']} "
-                      f"before merge for {item['signature']}: {e}", file=sys.stderr)
-            else:
-                if impl_resp is not None:
-                    _dispatch.sync_record(conn, impl_resp, reported=False, now=now)
-                    conn.commit()
-            _chaos.crash_point("before-merge")
-            try:
-                result = _merge.plan_or_land(
-                    conn, job_id=item["implement_job"],
-                    why="triage auto-merge: step-7 validation confirmed",
-                    confirm=True, dry_run=False, authorized_by="auto-from-item", now=now,
-                )
-            except PolicyError as e:
-                _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"merge refused: {e}")
-                conn.commit()
-            except RemoteError as e:
-                if e.maybe_mutated:
-                    # The merge (and its bundled deploy) may already have
-                    # happened. Leave the item in `validating`:
-                    # reconcile_operations() asks GitHub directly on the very
-                    # next pass, BEFORE this function gets another chance to
-                    # re-attempt the merge. Setting STATE_MERGE_BLOCKED here
-                    # would be exactly DESIGN.md § Crash recovery's "silently
-                    # read as failure".
-                    print(f"triage: merge for {item['signature']} may have reached GitHub "
-                          f"({e}) — left unresolved for reconcile_operations()", file=sys.stderr)
-                else:
-                    _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                               note=f"merge refused: {e}")
-                    conn.commit()
-            except PreconditionError as e:
-                _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"merge refused: {e}")
-                conn.commit()
-            else:
-                # plan_or_land() with confirm=True, dry_run=False always
-                # returns a MergeResult (never a MergePlan) on success — the
-                # operation and its receipt are already recorded, inside
-                # lifecycle/merge.py, by the time control returns here.
-                deploy = result.deploy or {}
-                repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
-                _chaos.crash_point("after-merge-before-state")
-                if deploy.get("attempted") and deploy.get("ok"):
-                    deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-                    _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
-                               liveness_deadline=deadline,
-                               deploy_expect_json=json.dumps(deploy.get("expectedAlerts") or []), note=None)
-                elif (repo_entry.get("deployOnMerge") and isinstance(result.merge_commit, str)
-                      and _FULL_SHA_RE.match(result.merge_commit)):
-                    # The Actions run identity is already on the `deploy`
-                    # operation lifecycle/merge.py just recorded — no second
-                    # `_run_gh_run_list()` read needed here.
-                    deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-                    _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
-                               liveness_deadline=deadline,
-                               deploy_expect_json=json.dumps([{"commit": result.merge_commit}]), note=None)
-                elif deploy.get("attempted") and not deploy.get("ok"):
-                    # autoDeploy ran and failed — this must never read as a
-                    # clean merge. A merged PR with a failed rollout is a
-                    # human-needed state, not `merged`.
-                    output_tail = (deploy.get("output") or "")[-300:]
-                    note = (f"merged {result.repo_slug}#{result.pull_request} but the deploy failed "
-                            f"(exit {deploy.get('exitCode')}): {output_tail}")
-                    _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
-                else:
-                    reason = deploy.get("reason") or "merged; no deploy configured for this repo"
-                    _set_state(conn, item["event_id"], STATE_MERGED, now, note=reason)
-                conn.commit()
+            _merge_and_rollout(conn, policy, item, now)
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
         if fresh_item is not None and fresh_event is not None:
             sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
+
+def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                      now: dt.datetime) -> None:
+    """Land a validation-confirmed PR and route the item on the merge/deploy
+    outcome — the tail of poll_validation_jobs(), shared with
+    retry_policy_refused_merges() so a merge refused only by the policy
+    file lands the moment the policy covers it (§93)."""
+    # Belt-and-suspenders on top of the sync above (which folds only
+    # THIS poll's own review job): `plan_or_land()` is about to read
+    # the IMPLEMENT job's dispatches row and refuse if `status` isn't
+    # 'done' — a row this function does not own but is seconds away
+    # from depending on. A confirmed validation only ever exists once
+    # the implement job itself finished 'done' (that is what opened
+    # this validation in the first place), so re-reading it here is
+    # cheap insurance against exactly the staleness this whole fix is
+    # about, for any row that reached `validating` before this file
+    # carried the fix above. Never blocks the merge attempt on a
+    # failed re-read — plan_or_land()'s own precheck still fails
+    # closed against whatever the row already says.
+    try:
+        impl_resp = _sideclaw.get(item["implement_job"])
+    except RemoteError as e:
+        print(f"triage: could not refresh implement dispatch {item['implement_job']} "
+              f"before merge for {item['signature']}: {e}", file=sys.stderr)
+    else:
+        if impl_resp is not None:
+            _dispatch.sync_record(conn, impl_resp, reported=False, now=now)
+            conn.commit()
+    _chaos.crash_point("before-merge")
+    try:
+        result = _merge.plan_or_land(
+            conn, job_id=item["implement_job"],
+            why="triage auto-merge: step-7 validation confirmed",
+            confirm=True, dry_run=False, authorized_by="auto-from-item", now=now,
+        )
+    except PolicyError as e:
+        _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"merge refused: {e}")
+        conn.commit()
+    except RemoteError as e:
+        if e.maybe_mutated:
+            # The merge (and its bundled deploy) may already have
+            # happened. Leave the item in `validating`:
+            # reconcile_operations() asks GitHub directly on the very
+            # next pass, BEFORE this function gets another chance to
+            # re-attempt the merge. Setting STATE_MERGE_BLOCKED here
+            # would be exactly DESIGN.md § Crash recovery's "silently
+            # read as failure".
+            print(f"triage: merge for {item['signature']} may have reached GitHub "
+                  f"({e}) — left unresolved for reconcile_operations()", file=sys.stderr)
+        else:
+            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
+                       note=f"merge refused: {e}")
+            conn.commit()
+    except PreconditionError as e:
+        _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"merge refused: {e}")
+        conn.commit()
+    else:
+        # plan_or_land() with confirm=True, dry_run=False always
+        # returns a MergeResult (never a MergePlan) on success — the
+        # operation and its receipt are already recorded, inside
+        # lifecycle/merge.py, by the time control returns here.
+        deploy = result.deploy or {}
+        repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
+        _chaos.crash_point("after-merge-before-state")
+        kuma_title = (_kuma_monitor_title(_get_event(conn, item["event_id"]))
+                      if repo_entry.get("liveness") == "kuma-push-fresh" else None)
+        if deploy.get("attempted") and deploy.get("ok") and repo_entry.get("liveness") == "kuma-push-fresh" \
+                and kuma_title is None:
+            # Deployed, but this item did not come from a Kuma monitor, so there
+            # is no monitor of its own to confirm against — `merged`, not a
+            # liveness window that can only time out and reopen.
+            _set_state(conn, item["event_id"], STATE_MERGED, now,
+                       note=f"merged and deployed ({deploy.get('key')}); no Kuma monitor of its own to verify")
+        elif deploy.get("attempted") and deploy.get("ok"):
+            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
+            expected = (deploy.get("expectedAlerts") or []) if kuma_title is None else [
+                {"monitorTitle": kuma_title, "since": _now_iso(now)}]
+            _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+                       liveness_deadline=deadline,
+                       deploy_expect_json=json.dumps(expected), note=None)
+        elif (repo_entry.get("deployByPoller") and isinstance(result.merge_commit, str)
+              and _FULL_SHA_RE.match(result.merge_commit)):
+            # Merge IS deploy through a mini-side poller (research-gateway):
+            # nothing to run, the liveness probe reads the poller's checkout.
+            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
+            _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+                       liveness_deadline=deadline,
+                       deploy_expect_json=json.dumps([{"commit": result.merge_commit, "repo": item["repo"]}]),
+                       note=None)
+        elif (repo_entry.get("deployOnMerge") and isinstance(result.merge_commit, str)
+              and _FULL_SHA_RE.match(result.merge_commit)):
+            # The Actions run identity is already on the `deploy`
+            # operation lifecycle/merge.py just recorded — no second
+            # `_run_gh_run_list()` read needed here.
+            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
+            _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+                       liveness_deadline=deadline,
+                       deploy_expect_json=json.dumps([{"commit": result.merge_commit}]), note=None)
+        elif deploy.get("attempted") and not deploy.get("ok"):
+            # autoDeploy ran and failed — this must never read as a
+            # clean merge. A merged PR with a failed rollout is a
+            # human-needed state, not `merged`.
+            output_tail = (deploy.get("output") or "")[-300:]
+            note = (f"merged {result.repo_slug}#{result.pull_request} but the deploy failed "
+                    f"(exit {deploy.get('exitCode')}): {output_tail}")
+            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
+        else:
+            reason = deploy.get("reason") or "merged; no deploy configured for this repo"
+            _set_state(conn, item["event_id"], STATE_MERGED, now, note=reason)
+        conn.commit()
+
+
+MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
+
+
+def retry_policy_refused_merges(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                                *, dry_run: bool) -> None:
+    """A PR the review confirmed but the merge gate refused sits in
+    `merge_blocked` forever — even after the policy file grows the scope that
+    would admit it (homelab#9, item 1170: refused for "no autoMergePaths
+    declared for 'homelab'"). Re-attempt the merge once per policy-file
+    change: eligible when the item parked on a `merge refused:` note, its
+    implement dispatch is `confirmed` and unmerged, and the policy file is
+    newer than the item's last update. A refusal the new policy still makes
+    lands the same note again with a fresh `updated_at`, so it waits for the
+    next policy change instead of retrying every pass."""
+    try:
+        policy_mtime = dt.datetime.fromtimestamp(POLICY_PATH.stat().st_mtime, tz=dt.timezone.utc)
+    except OSError:
+        return
+    rows = conn.execute(
+        "SELECT ti.* FROM triage_items ti JOIN dispatches d ON d.job_id = ti.implement_job "
+        "WHERE ti.state=? AND ti.note LIKE ? AND d.validation_status='confirmed' AND d.merged_at IS NULL",
+        (STATE_MERGE_BLOCKED, MERGE_REFUSED_NOTE_PREFIX + "%"),
+    ).fetchall()
+    for item in rows:
+        updated = _parse_ts(item["updated_at"])
+        if updated is None or policy_mtime <= updated:
+            continue
+        if _merge_needs_approval(item["repo"]):
+            continue
+        if dry_run:
+            print(f"[dry-run] would retry the merge of {item['pr_url']} ({item['signature']}) — policy changed")
+            continue
+        _merge_and_rollout(conn, policy, item, now)
+        conn.execute("UPDATE triage_items SET updated_at=? WHERE event_id=?", (_now_iso(now), item["event_id"]))
+        conn.commit()
+        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
+        if fresh_item is not None and fresh_event is not None:
+            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 REVISION_NOTE_PREFIX = "revision "
 
@@ -5910,6 +6065,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     the 600s tick already covers it with room to spare — see docs/history/state-log.md
     §87 for the measurement this rests on."""
     maybe_revise_blocked(conn, policy, now, dry_run=dry_run)
+    retry_policy_refused_merges(conn, policy, now, dry_run=dry_run)
     maybe_auto_implement(conn, policy, now, dry_run=dry_run)
     poll_implement_jobs(conn, policy, now, dry_run=dry_run)
     poll_validation_jobs(conn, policy, now, dry_run=dry_run)
