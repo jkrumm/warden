@@ -7962,5 +7962,156 @@ def test_needs_human_reminder_hours_rejects_zero_and_negative():
             assert str(bad_value) in buf.getvalue(), buf.getvalue()
 
 
+# --- chronic recurrence (§91) -------------------------------------------------
+
+def _seed_reopens(conn, event_id: int, n: int, *, days_ago: float = 1.0) -> None:
+    """`n` terminal -> `new` transitions inside the chronic window — the rows
+    reopen_if_needed() leaves behind on every recurrence."""
+    for i in range(n):
+        at = (NOW - dt.timedelta(days=days_ago, minutes=i)).isoformat()
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at, note) "
+                     "VALUES (?,?,?,?,NULL)", (event_id, triage.STATE_QUIET, triage.STATE_NEW, at))
+    conn.commit()
+
+
+def _seed_recovered_alert(conn, *, external_id: str, repo: str | None) -> int:
+    eid = _insert_event(conn, source="slack_alert", external_id=external_id,
+                         title=f"🚨 {external_id}", first_seen=OLD)
+    conn.execute(
+        "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+        "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (eid, f"slack_alert:{external_id}", repo, triage.STATE_NEW, 1,
+         OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+    )
+    conn.commit()
+    return eid
+
+
+def test_chronic_signature_escalates_instead_of_recovery_resolving():
+    """Item 847's shape: every occurrence has already cleared (the ✅ is the
+    latest #alerts message) by the pass that reopens it. Before §91 the
+    recovery pairing took it back to `quiet` before escalate() ran, 22 times."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_recovered_alert(conn, external_id="sig-chronic-p95", repo="demo-repo")
+        _seed_reopens(conn, eid, 3)
+        triage._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", "✅ sig-chronic-p95")])
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+
+        triage.run(conn, dry_run=False)
+
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_INVESTIGATING
+        assert len(calls) == 1, calls
+        assert "CHRONIC: cleared on its own and came back 3 times" in calls[0]["brief"]
+        assert "The recurrence is the defect" in calls[0]["brief"]
+
+
+def test_below_chronic_threshold_still_recovery_resolves():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_recovered_alert(conn, external_id="sig-twice", repo="demo-repo")
+        _seed_reopens(conn, eid, 2)
+        triage._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", "✅ sig-twice")])
+        triage.run(conn, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_QUIET
+
+
+def test_reopens_outside_the_chronic_window_do_not_count():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_recovered_alert(conn, external_id="sig-old-flaps", repo="demo-repo")
+        _seed_reopens(conn, eid, 5, days_ago=triage.DEFAULT_CHRONIC_WINDOW_DAYS + 1)
+        triage._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", "✅ sig-old-flaps")])
+        triage.run(conn, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_QUIET
+
+
+def test_unmapped_chronic_signature_still_goes_quiet():
+    """Nothing can escalate an unmapped row, so holding it out of `quiet`
+    would only park it in `new`."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_recovered_alert(conn, external_id="unmapped-chronic", repo=None)
+        _seed_reopens(conn, eid, 4)
+        policy = triage.load_policy()
+        assert not triage._is_chronic(conn, eid, None, policy, NOW)
+
+
+def test_chronic_state_source_is_not_disappearance_resolved():
+    """The Kuma push shape (`uk`, a state source): the monitor is back up, so
+    watchdog-poll.py already stamped resolved_at — apply_resolutions() must
+    leave a chronic mapped row in `new` for escalate()."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="uk", external_id="204", title="MacMini Dev Host - Push",
+                             first_seen=OLD, resolved_at=NOW.isoformat())
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+            "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (eid, "uk:204", "demo-repo", triage.STATE_NEW, 1, OLD.isoformat(), NOW.isoformat(),
+             NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+        _seed_reopens(conn, eid, 3)
+        triage.apply_resolutions(conn, NOW, triage.load_policy())
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW
+        triage.apply_resolutions(conn, NOW)  # no policy: defaults apply, still chronic
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW
+
+
+def test_quiet_timer_reads_a_suppressed_occurrences_ts_last():
+    """Item 1135: a cooldown-suppressed occurrence moves only ts_last. The
+    quiet timer read the stale ISO clocks and called a row that fired minutes
+    ago "signal quiet since" two days earlier."""
+    policy = dict(DEFAULT_POLICY, quietResolveHours=2, minOccurrences=999, minOpenMinutes=999999)
+    with _triage_env(policy=policy) as (conn, ctx):
+        triage._watchdog_poll = _fake_wp_module([], homelab_key="")
+        stale = NOW - dt.timedelta(days=2)
+        fresh_ts = f"{(NOW - dt.timedelta(minutes=10)).timestamp():.6f}"
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-suppressed", title="🚨 x",
+                             first_seen=stale, payload={"ts_last": fresh_ts})
+        conn.execute("UPDATE events SET notified_at=? WHERE id=?", (stale.isoformat(), eid))
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+            "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (eid, "slack_alert:sig-suppressed", "demo-repo", triage.STATE_NEW, 1, stale.isoformat(),
+             stale.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+        triage.resolve_quiet_grouped(conn, triage.load_policy(), NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW
+
+        later = NOW + dt.timedelta(hours=3)
+        triage.resolve_quiet_grouped(conn, triage.load_policy(), later)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_QUIET
+        assert triage._fmt_ts(stale.isoformat()) not in item["note"], item["note"]
+
+
+def test_chronic_signature_investigated_once_per_window():
+    """A chronic row whose episode already ran inside the window silence-
+    resolves as before — no re-dispatch every cooldownHours while its fix is
+    parked somewhere else."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_recovered_alert(conn, external_id="sig-chronic-done", repo="demo-repo")
+        _seed_reopens(conn, eid, 5)
+        conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id) "
+                     "VALUES ('job-chronic-1','investigate','demo-repo','b','done',?,?)",
+                     ((NOW - dt.timedelta(days=2)).isoformat(), eid))
+        conn.execute("UPDATE triage_items SET dispatch_job='job-chronic-1' WHERE event_id=?", (eid,))
+        conn.commit()
+        triage._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", "✅ sig-chronic-done")])
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.run(conn, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_QUIET
+        assert calls == []
+
+
+def test_quiet_anchor_takes_the_latest_iso_clock():
+    """A stale last_reminder_at must not shadow a fresher notified_at."""
+    row = {"last_reminder_at": (NOW - dt.timedelta(days=3)).isoformat(),
+           "notified_at": (NOW - dt.timedelta(minutes=5)).isoformat(),
+           "first_seen": (NOW - dt.timedelta(days=4)).isoformat(), "payload_json": "{}"}
+    anchor, _raw = triage._quiet_anchor(row)
+    assert abs((anchor - (NOW - dt.timedelta(minutes=5))).total_seconds()) < 1
+
+
 if __name__ == "__main__":
     sys.exit(main())

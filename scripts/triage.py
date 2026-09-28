@@ -746,6 +746,18 @@ DEFAULT_COOLDOWN_HOURS = 6
 # open for a week. See resolve_quiet_grouped().
 DEFAULT_QUIET_RESOLVE_HOURS = 2.0
 
+# A signature that reopened this many times inside the window is CHRONIC: each
+# occurrence clears on its own, so every silence path used to take it back to
+# `quiet` in the same pass that reopened it, and escalate() — which runs after
+# them — never saw it. Measured 2026-09-28 (§91): `VPS edge p95` reopened 22
+# times, `research-gateway job.reaped` 10 and the Kuma `Research Gateway` pair
+# 7 and 5, with zero investigations between them. A self-clearing alert that
+# keeps coming back is itself the defect (a real fault or a miscalibrated
+# monitor), so a chronic, mapped `new` row is exempt from silence-resolve and
+# escalates like any other. See _is_chronic().
+DEFAULT_CHRONIC_RECURRENCES = 3
+DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
+
 # maybe_auto_remediate()'s own cooldown/attempt-cap defaults — same shape as
 # DEFAULT_COOLDOWN_HOURS above but against `operations`, not `dispatches`
 # (see _host_verb_cooldown_ok()): a flapping signal must not restart a live
@@ -1553,6 +1565,8 @@ def load_policy() -> dict[str, Any]:
         "minOpenMinutes": int(data.get("minOpenMinutes") or DEFAULT_MIN_OPEN_MINUTES),
         "cooldownHours": int(data.get("cooldownHours") or DEFAULT_COOLDOWN_HOURS),
         "quietResolveHours": float(data.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS),
+        "chronicRecurrences": int(data.get("chronicRecurrences") or DEFAULT_CHRONIC_RECURRENCES),
+        "chronicWindowDays": float(data.get("chronicWindowDays") or DEFAULT_CHRONIC_WINDOW_DAYS),
         "rules": [r for r in (data.get("rules") or []) if _valid_rule(r)],
         # The fifth closed allowlist's own rule set (HOST_VERB_ALLOWLIST) —
         # same match-target/first-match-wins shape as `rules` above (see
@@ -2234,7 +2248,8 @@ def unsnooze_if_expired(conn: sqlite3.Connection, now: dt.datetime) -> None:
     conn.commit()
 
 
-def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime) -> None:
+def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime,
+                      policy: dict[str, Any] | None = None) -> None:
     # `events.resolved_at` is set only by disappearance-from-observation
     # (watchdog-poll.py's own ingest sweep) or its 7-idle-day housekeeping —
     # never by a human decision. So this is a SILENCE path, and only `new` is
@@ -2248,11 +2263,13 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime) -> None:
     # STATE_QUIET's own comment).
     placeholders = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
     rows = conn.execute(
-        f"SELECT ti.event_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"SELECT ti.event_id, ti.repo FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         f"WHERE e.resolved_at IS NOT NULL AND ti.state IN ({placeholders})",
         _SILENCE_RESOLVE_ELIGIBLE_STATES,
     ).fetchall()
     for row in rows:
+        if _is_chronic(conn, row["event_id"], row["repo"], policy or {}, now):
+            continue
         # note=NULL is safe BECAUSE the row is `new`: a `new` row carries no
         # obligation and therefore no prior-phase text worth keeping (a
         # needs_human blocker, an env-check remediation, ...) — those states
@@ -2268,6 +2285,83 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime) -> None:
 
 def _quiet_resolve_hours(policy: dict[str, Any]) -> float:
     return float(policy.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS)
+
+
+def _recurrence_count(conn: sqlite3.Connection, event_id: int, now: dt.datetime,
+                      window_days: float) -> int:
+    """How often this row reopened (terminal -> `new`, reopen_if_needed()'s
+    one transition) inside the window. `occurrences` cannot answer this: it is
+    the LAST poll's batch count, so a signature that fires once per day for a
+    week reads `1` every time."""
+    since = (now - dt.timedelta(days=window_days)).isoformat()
+    return conn.execute(
+        "SELECT COUNT(*) FROM item_transitions WHERE event_id=? AND to_state=? "
+        "AND from_state IN (?, ?, ?, ?) AND at >= ?",
+        (event_id, STATE_NEW, STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_DISMISSED, since),
+    ).fetchone()[0]
+
+
+def _chronic_policy(policy: dict[str, Any]) -> tuple[float, int]:
+    return (float(policy.get("chronicWindowDays") or DEFAULT_CHRONIC_WINDOW_DAYS),
+            int(policy.get("chronicRecurrences") or DEFAULT_CHRONIC_RECURRENCES))
+
+
+def _chronic_recurrences(conn: sqlite3.Connection, event_id: int, repo: str | None,
+                         policy: dict[str, Any], now: dt.datetime) -> int:
+    """The reopen count when this row is chronic, else 0 — see
+    DEFAULT_CHRONIC_RECURRENCES. Unmapped rows are never chronic: nothing could
+    escalate them, so holding them out of `quiet` would only park them in `new`.
+
+    Nor is a row already investigated inside the window: one episode per
+    chronic signature per window. Without this a signature whose fix is parked
+    elsewhere (a draft PR, an owner decision) would re-dispatch every
+    cooldownHours for as long as it keeps flapping — ~28 identical episodes a
+    week at today's rates. Inside that window the row silence-resolves exactly
+    as it did before §91."""
+    if repo is None:
+        return 0
+    window, threshold = _chronic_policy(policy)
+    since = (now - dt.timedelta(days=window)).isoformat()
+    investigated = conn.execute(
+        "SELECT 1 FROM triage_items ti JOIN dispatches d ON d.job_id = ti.dispatch_job "
+        "WHERE ti.event_id=? AND d.created_at >= ?", (event_id, since),
+    ).fetchone()
+    if investigated:
+        return 0
+    n = _recurrence_count(conn, event_id, now, window)
+    return n if n >= threshold else 0
+
+
+def _is_chronic(conn: sqlite3.Connection, event_id: int, repo: str | None,
+                policy: dict[str, Any], now: dt.datetime) -> bool:
+    return _chronic_recurrences(conn, event_id, repo, policy, now) > 0
+
+
+def _slack_ts_to_dt(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _quiet_anchor(row: sqlite3.Row) -> tuple[dt.datetime | None, str | None]:
+    """The last time a grouped event was actually observed. The ISO clocks
+    (`last_reminder_at`/`notified_at`/`first_seen`) move only when
+    watchdog-poll.py's upsert_grouped() EMITS; a cooldown-suppressed occurrence
+    moves `payload_json.ts_last` alone (see _occurrence_mark()). Reading only
+    the ISO clocks reopened a row on the fresh ts_last and quiet-resolved it
+    again in the same pass as "signal quiet since" a days-old time (item 1135,
+    six times on 2026-09-22/23). Returns (anchor, raw value for the note)."""
+    candidates = [(t, r) for r in (row["last_reminder_at"], row["notified_at"], row["first_seen"])
+                  if r and (t := _parse_ts(r)) is not None]
+    ts_last = _slack_ts_to_dt(_safe_json(row["payload_json"]).get("ts_last"))
+    if ts_last is not None:
+        candidates.append((ts_last, ts_last.isoformat()))
+    if not candidates:
+        return None, None
+    return max(candidates, key=lambda c: c[0])
 
 
 # The only state a SILENCE path may resolve — DESIGN.md § "The quiet rule,
@@ -2376,13 +2470,15 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
 
     placeholders = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
     rows = conn.execute(
-        f"SELECT ti.event_id, e.external_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"SELECT ti.event_id, ti.repo, e.external_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         f"WHERE e.source='slack_alert' AND e.resolved_at IS NULL AND ti.state IN ({placeholders})",
         _SILENCE_RESOLVE_ELIGIBLE_STATES,
     ).fetchall()
     for row in rows:
         match = latest_by_key.get(row["external_id"])
         if match is None:
+            continue
+        if _is_chronic(conn, row["event_id"], row["repo"], policy, now):
             continue
         _ts, text = match
         if not text.lstrip().startswith("✅"):
@@ -2434,18 +2530,19 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     placeholders_sources = ",".join("?" * len(GROUPED_TRIAGE_SOURCES))
     placeholders_states = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
     rows = conn.execute(
-        f"SELECT ti.event_id, e.last_reminder_at, e.notified_at, e.first_seen "
+        f"SELECT ti.event_id, ti.repo, e.last_reminder_at, e.notified_at, e.first_seen, e.payload_json "
         f"FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         f"WHERE e.source IN ({placeholders_sources}) AND e.resolved_at IS NULL "
         f"AND ti.state IN ({placeholders_states})",
         (*GROUPED_TRIAGE_SOURCES, *_SILENCE_RESOLVE_ELIGIBLE_STATES),
     ).fetchall()
     for row in rows:
-        anchor_raw = row["last_reminder_at"] or row["notified_at"] or row["first_seen"]
-        quiet_since = _parse_ts(anchor_raw)
+        quiet_since, anchor_raw = _quiet_anchor(row)
         if quiet_since is None:
             continue
         if (now - quiet_since).total_seconds() < quiet_hours * 3600:
+            continue
+        if _is_chronic(conn, row["event_id"], row["repo"], policy, now):
             continue
         note = (f"{QUIET_RESOLVE_NOTE_PREFIX}{_fmt_ts(anchor_raw)} — no new occurrence for "
                 f"{quiet_hours:g}h. This closes the item on silence alone; it is NOT a confirmed "
@@ -2990,7 +3087,9 @@ def _build_evidence_block(keys: list[str], event_rows_by_id: dict[int, sqlite3.R
 
 
 def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by_id: dict[int, sqlite3.Row],
-                          sibling_events: list[dict[str, str]], evidence_keys: list[str] | None = None) -> str:
+                          sibling_events: list[dict[str, str]], evidence_keys: list[str] | None = None,
+                          chronic: dict[int, int] | None = None, chronic_window_days: float = 0.0) -> str:
+    chronic = chronic or {}
     lines = [f"Repo: {repo}"]
     if len(members) == 1:
         lines.append("Alert:")
@@ -3002,6 +3101,9 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
                       f"(last {_fmt_ts(m['last_seen'])}) — {er['title']}")
         for t in _recent_raw_texts(er)[:2]:
             lines.append(f"    raw: {t}")
+        if m["event_id"] in chronic:
+            lines.append(f"    CHRONIC: cleared on its own and came back {chronic[m['event_id']]} times "
+                          f"in the last {chronic_window_days:g} days")
         if m["artifact_url"]:
             lines.append(f"    already-linked artifact from a prior investigation of this EXACT "
                           f"signature: {m['artifact_url']} — check whether it already fixes this "
@@ -3019,6 +3121,16 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
             "assertion — confirm or split it. If they do NOT share a root cause, say so explicitly "
             f"in your summary or recommendation using the exact phrase '{DISSOLVE_MARKER}' so they "
             "can be re-triaged individually."
+        )
+    if chronic:
+        closing_lines.append(
+            "A CHRONIC signature is one whose every occurrence self-clears, so no single occurrence "
+            "looks worth fixing. The recurrence is the defect. Find why it keeps firing: a real "
+            "intermittent fault, or a miscalibrated monitor (threshold, window, check interval, "
+            "grace period, a deliberate restart or deploy graded as a failure, a probe counting "
+            "traffic it should not). If the monitor is wrong, the fix is its config in the repo "
+            "that owns it (alert JSON, Uptime Kuma monitor definition, health-check script), not "
+            "silence. 'It recovered' is not a verdict for a chronic signature."
         )
     closing_lines.append(
         "This alert reached the auto-triage escalation threshold (repeat occurrences or stayed open "
@@ -3208,8 +3320,13 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
     exclude_ids = [m["event_id"] for m in members]
     sibling_events = _sibling_open_items(conn, repo, exclude_ids)
     evidence_keys = _evidence_keys_for_members(members, event_rows_by_id, policy)
+    window, _threshold = _chronic_policy(policy)
+    recurrences = {m["event_id"]: _chronic_recurrences(conn, m["event_id"], m["repo"], policy, now)
+                   for m in members}
+    chronic = {eid: n for eid, n in recurrences.items() if n}
     brief = _build_cluster_brief(repo=repo, members=members, event_rows_by_id=event_rows_by_id,
-                                  sibling_events=sibling_events, evidence_keys=evidence_keys)
+                                  sibling_events=sibling_events, evidence_keys=evidence_keys,
+                                  chronic=chronic, chronic_window_days=window)
     return _dispatch_investigate_and_advance(conn, repo=repo, brief=brief, members=members, now=now,
                                               policy=policy, dry_run=False)
 
@@ -6987,7 +7104,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     reopen_if_needed(conn, now)
     unsnooze_if_expired(conn, now)
     unmapped = classify(conn, policy, now)
-    apply_resolutions(conn, now)
+    apply_resolutions(conn, now, policy)
     resolve_recovery_paired(conn, policy, now, dry_run=dry_run)
     resolve_quiet_grouped(conn, policy, now)
     maybe_dissolve_clusters(conn, now, dry_run=dry_run)

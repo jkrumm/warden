@@ -551,7 +551,7 @@ nobody looked at again.
 
 | State | Poller | Deadline | On expiry |
 |-|-|-|-|
-| `new` | `resolve_quiet_grouped` / `apply_resolutions` | — | bounded by `quietResolveHours`, not by a clock |
+| `new` | `resolve_quiet_grouped` / `apply_resolutions` | — | bounded by `quietResolveHours`, not by a clock — except a chronic row (≥`chronicRecurrences` reopens in `chronicWindowDays`, mapped, not yet investigated in that window), which is held out of silence-resolve so `escalate()` sees it (state-log §91) |
 | `investigating` | `dispatch-sweep.py` | 2h | `needs_human` |
 | `verdict` | `maybe_auto_implement` | 24h | `needs_human` |
 | `implementing` | `poll_implement_jobs` | 2h | `merge_blocked` |
@@ -991,6 +991,8 @@ it explains the same contract from inside the file itself.
 | `EVIDENCE_CAP_CHARS` | 1200 | — | Per-key cap on rendered evidence text, before the whole-block cap below |
 | `EVIDENCE_TOTAL_CAP_CHARS` | 3200 | — | Whole evidence block cap — well under `MAX_BRIEF_CHARS` so a 5-signature cluster (each pulling its own evidence) still leaves room for the rest of the brief |
 | `DEFAULT_QUIET_RESOLVE_HOURS` | 2h | policy `quietResolveHours` | Grouped-source (`slack_alert`/`hermes_log`) quiet-timer resolve — see *Grouped-source resolution* |
+| `DEFAULT_CHRONIC_RECURRENCES` | 3 | policy `chronicRecurrences` | Reopens that make a mapped `new` row chronic — exempt from all three silence paths, one investigation per window (state-log §91) |
+| `DEFAULT_CHRONIC_WINDOW_DAYS` | 7d | policy `chronicWindowDays` | Window for the reopen count and for the once-per-window investigation |
 
 `MAX_OPEN_INVESTIGATIONS` is checked once per run and decremented as clusters
 open, so a later repo in the same run correctly sees an exhausted cap —

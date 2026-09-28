@@ -8267,3 +8267,59 @@ vehicle: the five gluetun-cascade signatures (1000-1004) were closed by hand at
 reboot at 04:00:36 UTC (6.8.0-139 -> 6.8.0-142), `gluetun` `restart: "no"` by
 design so its four `network_mode: service:gluetun` dependents exited with it, and
 `vpn-cycle.sh` self-healing the stack at 04:10:40. Watchtower was ruled out.
+
+## 91. A chronic signature escalates instead of going quiet (2026-09-28)
+
+The owner asked why the same alerts keep coming back and warden does not
+self-heal them. A read of the ledger against 14 days of `#alerts` (264 messages,
+40 families) found one structural reason in the loop itself, plus one bug.
+
+**Every self-clearing alert was structurally uninvestigable.** `run()` executes
+`reopen_if_needed()` → `apply_resolutions()` → `resolve_recovery_paired()` →
+`resolve_quiet_grouped()` → `escalate()`, in that order, and the poll runs every
+1800 s. A HyperDX alert that fires and clears inside 5–20 minutes has already
+posted its ✅ by the time the poll sees it, so the pass that reopens the row to
+`new` recovery-resolves it back to `quiet` before `escalate()` runs. The
+transition log shows `quiet → new → quiet` pairs stamped with the same
+microsecond: item 847 (`VPS edge p95`) 22 times, 932 (`job.reaped`) 10, 846
+(`edge 5xx`) 8, the Kuma `Research Gateway` pair 6 and 4 — 0 dispatches between
+932, 1135 and 1136. `occurrences` could not catch it either: it is the last
+poll's batch count, so each of those rows read `1` throughout. DESIGN.md's rule
+("silence may cancel the need to *start* work") is right for a one-off and wrong
+for a signature that keeps coming back; the recurrence is the need.
+
+Fix: `_is_chronic()` — a mapped row with ≥ `chronicRecurrences` (3) terminal →
+`new` transitions in `chronicWindowDays` (7) is exempt from all three silence
+paths, so `escalate()` sees it. Its brief says `CHRONIC: cleared on its own and
+came back N times` and that a miscalibrated monitor is fixed in the repo that
+owns its config, not silenced. Unmapped rows are never chronic (nothing could
+escalate them). One investigation per chronic signature per window: a row whose `dispatch_job`
+was created inside the window silence-resolves as before, so a signature whose
+fix is parked elsewhere does not re-dispatch every `cooldownHours` (review
+finding: ~28 identical episodes a week otherwise). Nothing is narrowed: the silence rule still applies only to `new`, and
+a chronic row is simply held out of it.
+
+**The quiet timer read the wrong clock.** `resolve_quiet_grouped()` anchored on
+`last_reminder_at`/`notified_at`/`first_seen`, which move only when
+`upsert_grouped()` *emits*; a cooldown-suppressed occurrence moves only
+`payload_json.ts_last` — the same slot `_occurrence_mark()` already reads to
+reopen the row. So the row reopened on the fresh `ts_last` and was quiet-resolved
+in the same pass "since 2026-09-20 14:17" on 09-22 and 09-23 (item 1135, six
+times). `_quiet_anchor()` now takes the latest of all three ISO clocks and `ts_last`.
+`watchdog-poll.py`'s `sweep_stale_grouped()` has the same blind spot on its 7-day
+TTL and is left alone here (the owner of that column; recorded, not fixed).
+
+Snapshot check (`VACUUM INTO`, `--dry-run`): clean pass. Chronic by today's
+ledger: 846 and 932 (`vps`, 7 reopens each in 7 d) — both escalate on their
+next recurrence; 1135/1136 are unmapped and stay digest-only until mapped.
+
+Tests: `tests/test_triage.py` 289/289 (eight new: investigated once per window; the quiet anchor takes the latest ISO clock; chronic escalates with the
+brief line; two reopens still quiet; reopens outside the window ignored;
+unmapped never chronic; a chronic `uk` row survives `apply_resolutions()`; the
+quiet timer honours `ts_last`).
+
+What this does **not** fix, and the owner's full review is in the session's
+report: the loudest family (`MacMini Dev Host`, 87 of 264) is research-gateway's
+own mini deploys (`launchctl` restart, exit 0) graded as crashes by
+`devhost-health-check.sh`; its fix is dotfiles PR #7, parked `merge_blocked` on
+a review finding since 09-23 with every recurrence folding silently into item 543.

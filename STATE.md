@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-26 (§90 — a re-fired `note` row returns to the digest and is immune to the policy entry that now covers it; `reset-frozen-notes.py` is a standing repair, not a one-time run) |
+| Last updated | 2026-09-28 (§91 — a chronic signature (≥3 reopens in 7 d, mapped) is exempt from silence-resolve and escalates; the quiet timer reads `ts_last`) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 281/281 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 289/289 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -137,6 +137,13 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
+- **Chronic signatures escalate (§91).** A mapped row that reopened ≥
+  `chronicRecurrences` (3) times in `chronicWindowDays` (7) is held out of all
+  three silence paths, so a self-clearing alert that keeps returning reaches
+  `escalate()` instead of cycling `new → quiet` in one pass; its brief carries
+  a `CHRONIC:` line. `resolve_quiet_grouped()` anchors on the later of the ISO
+  clocks and `payload_json.ts_last`, so a cooldown-suppressed occurrence no
+  longer reads as hours of silence.
 - **Advance on completion (§87).** `triage.advance_implement_chain()` —
   `maybe_auto_implement` → `poll_implement_jobs` → `poll_validation_jobs`,
   the exact code `run()`'s own 600s tick calls — is now ALSO called,
@@ -295,6 +302,8 @@ log's past sections.
   `events.resolved_at`, the row is immune to the `ignore` entry that now covers
   it, and `reset-frozen-notes.py` is recorded as the standing repair rather than
   a one-time run — §90
+- Chronic signatures escalate instead of recovery-resolving in the pass that
+  reopened them; the quiet timer reads `ts_last` — §91
 
 ### Next action
 

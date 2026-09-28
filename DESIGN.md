@@ -239,6 +239,11 @@ got dropped.
 **Rule:** silence-resolve applies only to `new`. Every other state carries an
 obligation and exits only through its own transition or its deadline.
 
+**And not to a chronic `new`** (2026-09-28, state-log §91): a mapped signature
+that reopened ≥3 times in 7 days is held out of silence-resolve, because each
+occurrence clearing on its own is exactly why no single one got investigated —
+the recurrence is the obligation.
+
 ### Deadlines
 
 Every non-terminal state gets a `state_deadline` and a named poller. Today only
