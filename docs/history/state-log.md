@@ -8483,3 +8483,44 @@ already query ClickHouse themselves, 847's did), docker state on homelab/vps
 target would be the way).
 
 Tests: `test_triage.py` 313/313 (+5).
+
+## 96. The review of §91–§95, and what it changed (2026-09-28)
+
+A multi-angle sideclaw review of `16aab36..1927d8c` (security, concurrency,
+resilience, backend; job `2c7fe918`) returned three blocking findings, all real,
+all in the merge sharing §93/§94 introduced, plus a fourth this session found
+first:
+
+- **`cli:confirm` is not the owner.** §94 counted `warden merge --confirm` as an
+  owner merge. An episode's Bash can run that command — `require_no_recursion()`
+  checks env markers an `env -u` removes, and AGENTS.md already says an episode is
+  not contained — so a prompt-injected episode could have merged any open dispatch
+  PR, the gated repos included. `OWNER_AUTHORIZERS = ("owner:argo",)`: only the
+  tailnet-bounded Argo click (the owner's 2026-09-15 decision) skips the unattended
+  gate; gated cards now say "click Merge in Argo".
+- **An ambiguous Argo merge was reported refused.** `_merge_and_rollout()` now
+  returns `merged | refused | ambiguous`; `_apply_argo_merge()` acks an ambiguous
+  outcome `applied` with the reconcile note, as the pre-§94 handler did.
+- **A losing concurrent merge could clobber the winner.** Every refusal write in
+  `_merge_and_rollout()` carries `expect_state=<the state the caller found>`, and
+  `retry_policy_refused_merges()` claims the row (CAS on `updated_at`) before the
+  slow merge — the 300 s sweep and 600 s loop both reach it.
+- **The owner bypass was wider than stated.** It now skips exactly the path scope
+  and the zero-CI acknowledgement. A confirmed step-7 review is required of the
+  owner too, and a failing check refuses him. (The review's claim that CI-definition
+  paths and size ceilings were bypassed does not hold: `plan_or_land()` enforces
+  both before `merge_gate_check()` runs.) Argo offers Merge on a `needs_human` item
+  only when its PR's review confirmed.
+
+Also taken: `awaiting_owner` sorts an unknown age last instead of as newest;
+`reconcile_stranded_prs()` joins on the item's *current* `implement_job`, so a PR
+a revision superseded is not re-read hourly; a stale comment; a nested generator.
+Not taken, named: `_apply_argo_merge()` still loads the policy itself; retry
+eligibility keys off the `merge refused:` note prefix (now a shared constant, not
+a structured column); a failed `close_pr()` on a superseded PR is stderr-only;
+revision briefs carry reviewer text unsanitised (bounded by the 2-attempt cap and
+the same step-7 review); `triage.py` is ~8k lines — extracting the revision and
+reconcile code into `scripts/lifecycle/` is a deliberate next-wave call.
+
+Tests: `test_triage.py` 315/315 (+2: ambiguous Argo merge; the loser never
+clobbers), `test_merge.py` 64/64 (owner gate rewritten to the narrowed rule).

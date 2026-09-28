@@ -113,7 +113,8 @@ chronic rule, §92's parked-recurrence count). The synthetic trip C3 asked for
 is still not built — that gap is named here, not papered over. The hard human
 gate stays exactly where the loop would otherwise close on itself:
 `warden`, `sideclaw`, `dotfiles` (`merge_approval`), and warden's own policy
-files.
+files — landed only by the owner's Argo click, never by a CLI `--confirm` an
+episode could type (§96).
 
 ## Accepted with the operator's framing preserved
 

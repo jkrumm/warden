@@ -156,50 +156,43 @@ class MergeResult:
 # gets an implicit allow by omission. `noCiRequired` is an explicit per-repo
 # acknowledgement that a repo has zero PR-time checks, so their absence is a
 # known condition rather than a silently-passed test.
-# The authorizers that are Johannes himself: an Argo click (tailnet-only —
-# DESIGN.md § 2026-09-15 override) or `warden merge --confirm` at his TTY.
-OWNER_AUTHORIZERS = ("owner:argo", "cli:confirm")
+# The authorizer that is Johannes himself: an Argo click (tailnet-only —
+# DESIGN.md § 2026-09-15 override). NOT `cli:confirm`: an episode's Bash can
+# run `warden merge --confirm` too — `require_no_recursion()`'s env markers are
+# one `env -u` away (AGENTS.md: "an episode is not contained") — so a CLI
+# confirmation is never allowed to skip the unattended gate.
+OWNER_AUTHORIZERS = ("owner:argo",)
 
 
 def merge_gate_check(
     *, repo: str, entry: dict[str, Any], files: list[dict[str, Any]],
     check_runs: list[dict[str, Any]], validation: str | None, owner_approved: bool = False,
 ) -> None:
-    """`owner_approved` (§94): the owner merging is the gate `autoMergePaths`
-    and a confirmed step-7 review stand in for when nobody is watching, so an
-    owner merge skips exactly those two — and the "zero check-runs needs
-    noCiRequired" rule, which exists to stop an UNATTENDED merge reading a
-    missing CI as a pass. A failing check still refuses him: that is a fact
-    about the code, not a missing authorization. Before §94 this made the
-    documented approval path for the merge-approval repos (`warden merge …
-    --confirm`, Argo's Merge) refuse every time: none of them declares an
-    auto-merge scope, by design."""
-    if owner_approved:
-        bad_runs = [
-            str(r.get("name")) for r in check_runs
-            if r.get("status") != "completed"
-            or r.get("conclusion") not in ("success", "neutral", "skipped")
-        ]
-        if bad_runs:
-            raise PolicyError(f"{repo}'s CI has not passed cleanly on the head commit: {', '.join(bad_runs)}.")
-        return
+    """`owner_approved` (§94): the owner merging stands in for the unattended
+    path scope (`autoMergePaths`) and the "zero check-runs needs
+    noCiRequired" acknowledgement — nothing else. A confirmed step-7 review
+    is still required of him, a failing check still refuses him, and the
+    CI-definition-path and size ceilings are enforced by plan_or_land()
+    before this function runs. Before §94 the documented approval path for
+    the merge-approval repos refused every time: none declares a scope."""
     paths = entry.get("autoMergePaths")
-    if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
-        raise PolicyError(
-            f"no autoMergePaths declared for '{repo}' — path scope is the primary "
-            f"merge gate now; nothing merges without an explicit declared scope."
-        )
+    if not owner_approved:
+        if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
+            raise PolicyError(
+                f"no autoMergePaths declared for '{repo}' — path scope is the primary "
+                f"merge gate now; nothing merges without an explicit declared scope."
+            )
 
-    filenames = [f.get("filename") for f in files if f.get("filename")]
-    bad = [fn for fn in filenames if not any(fnmatch.fnmatch(fn, p) for p in paths)]
-    if bad:
-        raise PolicyError(
-            f"{repo}'s pull request touches path(s) outside the auto-merge scope: "
-            f"{', '.join(bad)}."
-        )
+        filenames = [f.get("filename") for f in files if f.get("filename")]
+        bad = [fn for fn in filenames if not any(fnmatch.fnmatch(fn, p) for p in paths)]
+        if bad:
+            raise PolicyError(
+                f"{repo}'s pull request touches path(s) outside the auto-merge scope: "
+                f"{', '.join(bad)}."
+            )
 
     if not check_runs:
-        if not entry.get("noCiRequired"):
+        if not entry.get("noCiRequired") and not owner_approved:
             raise PolicyError(
                 f"{repo}'s head commit has zero CI check-runs and '{repo}' has no "
                 f"noCiRequired acknowledgement in the triage policy. A repo with no "

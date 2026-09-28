@@ -1054,22 +1054,32 @@ def main() -> int:
 
 
 
-def test_owner_approved_merge_skips_scope_and_review_but_not_failing_ci():
-    """§94: `warden merge --confirm` / Argo's Merge on a merge-approval repo
-    (no autoMergePaths by design) used to refuse every time."""
+def test_owner_approved_merge_skips_only_scope_and_zero_ci():
+    """§94, narrowed on review: the owner stands in for the auto-merge scope
+    and the zero-CI acknowledgement — never for the step-7 review or a failing
+    check. Before §94 a merge-approval repo (no scope by design) refused every
+    owner merge."""
     merge.merge_gate_check(repo="dotfiles", entry={}, files=[{"filename": "scripts/x.sh"}],
-                           check_runs=[], validation="blocked", owner_approved=True)
+                           check_runs=[], validation="confirmed", owner_approved=True)
+    for runs, validation, needle in (
+        ([], "blocked", "validation has not confirmed"),
+        ([{"name": "ci", "status": "completed", "conclusion": "failure"}], "confirmed", "CI has not passed"),
+    ):
+        try:
+            merge.merge_gate_check(repo="dotfiles", entry={}, files=[], check_runs=runs,
+                                   validation=validation, owner_approved=True)
+        except PolicyError as e:
+            assert needle in str(e), str(e)
+        else:
+            raise AssertionError(f"owner merge must still refuse: {needle}")
     try:
-        merge.merge_gate_check(repo="dotfiles", entry={}, files=[],
-                               check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}],
-                               validation="confirmed", owner_approved=True)
+        merge.merge_gate_check(repo="dotfiles", entry={}, files=[], check_runs=[], validation="confirmed")
     except PolicyError as e:
-        assert "CI has not passed" in str(e)
+        assert "no autoMergePaths" in str(e)
     else:
-        raise AssertionError("a failing check must refuse even the owner")
-    assert "owner:argo" in merge.OWNER_AUTHORIZERS and "cli:confirm" in merge.OWNER_AUTHORIZERS
-    assert "auto-from-item" not in merge.OWNER_AUTHORIZERS
-
+        raise AssertionError("an unattended merge without scope must refuse")
+    assert merge.OWNER_AUTHORIZERS == ("owner:argo",), (
+        "only the Argo click is the owner: an episode can run `warden merge --confirm` itself")
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -155,7 +155,7 @@ _DISMISS_STATES = ("new", "verdict", _ledger.STATE_NEEDS_HUMAN, "merge_blocked",
 _REINVESTIGATE_STATES = ("verdict", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", _ledger.STATE_QUIET, _ledger.STATE_NOTE)
 
 
-def _available_actions(state: str, has_pr: bool = False) -> list[str]:
+def _available_actions(state: str, mergeable: bool = False) -> list[str]:
     """Zero or more of `implement`/`merge`/`dismiss`/`reinvestigate`/`note` —
     what the owner could click for a card in `state`, from state alone. The
     real per-repo/per-tier gate runs server-side in triage.py's
@@ -164,7 +164,9 @@ def _available_actions(state: str, has_pr: bool = False) -> list[str]:
     actions: list[str] = []
     if state in _IMPLEMENT_STATES:
         actions.append("implement")
-    if state in _MERGE_STATES or (has_pr and state == _ledger.STATE_NEEDS_HUMAN):
+    # `mergeable`: a PR whose step-7 review confirmed — the one needs_human
+    # shape an owner merge can land (a merge-approval repo's fix).
+    if state in _MERGE_STATES or (mergeable and state == _ledger.STATE_NEEDS_HUMAN):
         actions.append("merge")
     if state in _DISMISS_STATES:
         actions.append("dismiss")
@@ -648,6 +650,7 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
 
     rows = conn.execute(
         f"SELECT ti.*, e.title AS event_title, e.url AS event_url, "
+        f"(SELECT d.validation_status FROM dispatches d WHERE d.job_id = ti.implement_job) AS validation_status, "
         f"e.payload_json AS event_payload_json FROM triage_items ti "
         f"JOIN events e ON e.id = ti.event_id "
         f"WHERE ti.state NOT IN ({terminal_placeholders}) "
@@ -704,7 +707,8 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
     out: list[dict[str, Any]] = []
     for row in conn.execute(
         f"SELECT ti.event_id, ti.repo, ti.state, ti.note, ti.pr_url, ti.parked_recurrences, ti.revision_count, "
-        f"e.title, (SELECT MAX(at) FROM item_transitions t WHERE t.event_id = ti.event_id "
+        f"e.title, (SELECT d.validation_status FROM dispatches d WHERE d.job_id = ti.implement_job) "
+        f"AS validation_status, (SELECT MAX(at) FROM item_transitions t WHERE t.event_id = ti.event_id "
         f"AND t.to_state = ti.state) AS entered_at FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         f"WHERE ti.state IN ({placeholders})",
         AWAITING_OWNER_STATES,
@@ -714,7 +718,8 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
             "state": row["state"], "pr_url": row["pr_url"], "age_days": _age_days(row["entered_at"], now),
             "reason": row["note"], "parked_recurrences": row["parked_recurrences"],
             "revision_count": row["revision_count"],
-            "availableActions": _available_actions(row["state"], bool(row["pr_url"])),
+            "availableActions": _available_actions(
+                row["state"], bool(row["pr_url"]) and row["validation_status"] == "confirmed"),
         })
     cursor = conn.execute("SELECT value FROM cursors WHERE key='stranded_prs'").fetchone()
     try:
@@ -730,7 +735,7 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
             "age_days": _age_days(pr.get("opened_at"), now), "reason": pr.get("reason"),
             "parked_recurrences": 0, "revision_count": 0, "availableActions": [],
         })
-    out.sort(key=lambda x: -(x["age_days"] or 0))
+    out.sort(key=lambda x: (x["age_days"] is None, -(x["age_days"] or 0)))
     return out
 
 
@@ -784,7 +789,8 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "updated_at": row["updated_at"],
         "origin_channel": row["origin_channel"],
         "origin_thread_ts": row["origin_thread_ts"],
-        "availableActions": _available_actions(row["state"], bool(row["pr_url"])),
+        "availableActions": _available_actions(
+            row["state"], bool(row["pr_url"]) and row["validation_status"] == "confirmed"),
         "issue": _board_item_issue(row),
     }
 

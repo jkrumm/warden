@@ -3194,7 +3194,8 @@ def _gather_kuma_monitor_config(event_rows: list[sqlite3.Row]) -> str:
     Home Line flapping for hours were never investigated against either.
     homelab-private's monitors are deliberately never read: that repo's
     details must not travel into another repo's brief."""
-    title = next((t for t in (_kuma_monitor_title(e) for e in event_rows if e is not None) if t), None)
+    titles = [_kuma_monitor_title(e) for e in event_rows if e is not None]
+    title = next((t for t in titles if t), None)
     if title is None:
         return "no Uptime Kuma monitor among this cluster's signals"
     out: list[str] = []
@@ -5852,8 +5853,8 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # already `confirmed`, so that path re-checks, never re-validates).
             _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=(
                 f"step-7 review confirmed {item['pr_url']}; {item['repo']} is merge-approval gated "
-                f"(warden never merges its own executor) — click Merge in Argo, or "
-                f"`warden merge {item['implement_job']} --why \"<reason>\" --confirm`"
+                f"(warden never merges its own executor) — click Merge in Argo "
+                f"(job {item['implement_job']})"
             ))
             conn.commit()
         else:
@@ -5865,11 +5866,17 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
 def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                       now: dt.datetime, *, authorized_by: str = "auto-from-item",
-                      why: str = "triage auto-merge: step-7 validation confirmed") -> None:
+                      why: str = "triage auto-merge: step-7 validation confirmed") -> str:
     """Land a validation-confirmed PR and route the item on the merge/deploy
     outcome — the tail of poll_validation_jobs(), shared with
     retry_policy_refused_merges() so a merge refused only by the policy
-    file lands the moment the policy covers it (§93)."""
+    file lands the moment the policy covers it (§93).
+
+    Returns "merged", "refused" or "ambiguous" — callers starting from a
+    parked state cannot read the outcome off the item's state (§96).
+    Every refusal writes its note only if the item is still in the state the
+    caller found it in: a concurrent pass that already landed this PR must
+    never be clobbered back to `merge_blocked` by the loser's refusal."""
     # Belt-and-suspenders on top of the sync above (which folds only
     # THIS poll's own review job): `plan_or_land()` is about to read
     # the IMPLEMENT job's dispatches row and refuse if `status` isn't
@@ -5897,13 +5904,15 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
             conn, job_id=item["implement_job"], why=why,
             confirm=True, dry_run=False, authorized_by=authorized_by, now=now,
         )
-    except PolicyError as e:
-        _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"merge refused: {e}")
+    except (PolicyError, PreconditionError) as e:
+        _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}",
+                   expect_state=item["state"])
         conn.commit()
+        return "refused"
     except RemoteError as e:
         if e.maybe_mutated:
             # The merge (and its bundled deploy) may already have
-            # happened. Leave the item in `validating`:
+            # happened. Leave the state as the caller found it:
             # reconcile_operations() asks GitHub directly on the very
             # next pass, BEFORE this function gets another chance to
             # re-attempt the merge. Setting STATE_MERGE_BLOCKED here
@@ -5911,13 +5920,11 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
             # read as failure".
             print(f"triage: merge for {item['signature']} may have reached GitHub "
                   f"({e}) — left unresolved for reconcile_operations()", file=sys.stderr)
-        else:
-            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                       note=f"merge refused: {e}")
-            conn.commit()
-    except PreconditionError as e:
-        _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"merge refused: {e}")
+            return "ambiguous"
+        _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}",
+                   expect_state=item["state"])
         conn.commit()
+        return "refused"
     else:
         # plan_or_land() with confirm=True, dry_run=False always
         # returns a MergeResult (never a MergePlan) on success — the
@@ -5972,7 +5979,7 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
             reason = deploy.get("reason") or "merged; no deploy configured for this repo"
             _set_state(conn, item["event_id"], STATE_MERGED, now, note=reason)
         conn.commit()
-
+    return "merged"
 
 MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
 
@@ -6006,9 +6013,16 @@ def retry_policy_refused_merges(conn: sqlite3.Connection, policy: dict[str, Any]
         if dry_run:
             print(f"[dry-run] would retry the merge of {item['pr_url']} ({item['signature']}) — policy changed")
             continue
-        _merge_and_rollout(conn, policy, item, now)
-        conn.execute("UPDATE triage_items SET updated_at=? WHERE event_id=?", (_now_iso(now), item["event_id"]))
+        # Claim before the slow merge: the 300 s sweep and the 600 s loop both
+        # reach this, and only the pass that moves updated_at owns the attempt.
+        claimed = conn.execute(
+            "UPDATE triage_items SET updated_at=? WHERE event_id=? AND state=? AND updated_at=?",
+            (_now_iso(now), item["event_id"], STATE_MERGE_BLOCKED, item["updated_at"]),
+        ).rowcount
         conn.commit()
+        if not claimed:
+            continue
+        _merge_and_rollout(conn, policy, item, now)
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
         if fresh_item is not None and fresh_event is not None:
             sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
@@ -6045,7 +6059,7 @@ def reconcile_stranded_prs(conn: sqlite3.Connection, policy: dict[str, Any], now
     rows = conn.execute(
         f"SELECT d.job_id, d.repo, d.artifact_url, d.created_at, d.validation_status, d.origin_event_id, "
         f"ti.state, ti.note, e.title FROM dispatches d "
-        f"JOIN triage_items ti ON ti.event_id = d.origin_event_id JOIN events e ON e.id = d.origin_event_id "
+        f"JOIN triage_items ti ON ti.implement_job = d.job_id JOIN events e ON e.id = ti.event_id "
         f"WHERE d.tier='implement' AND d.merged_at IS NULL AND d.artifact_url LIKE '%/pull/%' "
         f"AND d.created_at >= ? AND ti.state IN ({placeholders}) ORDER BY d.created_at",
         (since, *_PR_PARKED_OR_TERMINAL),
@@ -7470,14 +7484,12 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
     if not item["implement_job"] or not item["pr_url"]:
         return "rejected", None, "no pull request on this item to merge"
 
-    _merge_and_rollout(conn, load_policy(), item, now, authorized_by="owner:argo",
-                       why="owner approved via Argo")
+    outcome = _merge_and_rollout(conn, load_policy(), item, now, authorized_by="owner:argo",
+                                 why="owner approved via Argo")
     fresh = _get_item(conn, event_id)
-    merged = conn.execute("SELECT merged_at FROM dispatches WHERE job_id=?",
-                          (item["implement_job"],)).fetchone()
-    if merged is not None and merged["merged_at"]:
+    if outcome == "merged":
         return "applied", {"merged": True, "state": fresh["state"] if fresh else None}, None
-    if fresh is not None and fresh["state"] == STATE_VALIDATING:
+    if outcome == "ambiguous":
         return "applied", {"note": "merge may have reached GitHub, outcome ambiguous — left for "
                                    "reconcile_operations()"}, None
     return "rejected", None, (fresh["note"] if fresh is not None else None) or "merge refused"

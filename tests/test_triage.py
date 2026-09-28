@@ -3888,7 +3888,9 @@ def test_confirmed_validation_on_merge_approval_repo_routes_to_needs_human():
         assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
         assert "warden" in item["note"], item["note"]
         assert "https://github.com/jkrumm/warden/pull/40" in item["note"], item["note"]
-        assert "warden merge" in item["note"], item["note"]
+        # §94: the instruction is the path that works — `warden merge` refuses a
+        # merge-approval repo (no autoMergePaths, and a CLI confirm is not the owner).
+        assert "Merge in Argo" in item["note"] and "implement-job-gated" in item["note"], item["note"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
                          ("implement-job-gated",)).fetchone()
         assert d["validation_status"] == "confirmed", d["validation_status"]
@@ -8535,6 +8537,40 @@ def test_new_evidence_keys_are_allowlisted_and_wired():
     assert "launchd-restarts" in first["uk:macmini-dev-host-push"]["evidence"]
     assert "beszel-alerts" in first["slack_alert:homelab-temperature-above-threshold"]["evidence"]
 
+
+
+def test_argo_merge_that_may_have_reached_github_is_not_reported_refused():
+    with _triage_env(merge_approval=["dotfiles"]) as (conn, ctx):
+        eid = _seed_pr_item(conn, external_id="sig-ambiguous", state=triage.STATE_NEEDS_HUMAN, pr=12)
+
+        def _lost(conn_, **kw):
+            raise triage.RemoteError("connection reset after PUT", maybe_mutated=True)
+
+        triage._merge.plan_or_land = _lost
+        triage._argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("m2", eid, "merge")])
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+        assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
+        assert "ambiguous" in ctx.argo_acks[0]["result"]["note"]
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_HUMAN
+
+
+def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
+    """Sweep and loop race the same row: the winner lands it, the loser's
+    plan_or_land() refuses — and must not write merge_blocked over `merged`."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_pr_item(conn, external_id="sig-race", state=triage.STATE_MERGE_BLOCKED, pr=13)
+        item = triage._get_item(conn, eid)
+        triage._set_state(conn, eid, triage.STATE_MERGED, NOW, note="landed by the other pass")
+        conn.commit()
+
+        def _refuse(conn_, **kw):
+            raise triage.PolicyError("dispatch was already merged")
+
+        with _patched(triage._merge, plan_or_land=_refuse):
+            outcome = triage._merge_and_rollout(conn, triage.load_policy(), item, NOW)
+        assert outcome == "refused"
+        fresh = triage._get_item(conn, eid)
+        assert fresh["state"] == triage.STATE_MERGED and fresh["note"] == "landed by the other pass"
 
 if __name__ == "__main__":
     sys.exit(main())
