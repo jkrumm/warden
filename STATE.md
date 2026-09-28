@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§100 — named executable invariants + self-audit; the loop's own gaps become `warden_self` items) |
+| Last updated | 2026-09-28 (§101 — approval buttons post as Hermes (clickable again); Hermes skills aligned; dead cron removed) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -202,6 +202,9 @@ loop.
   `Issues: Write` repo-wide (the "comment back on the owner's own issue"
   feature has silently 403'd since Wave 1). Grant both at
   github.com/settings/personal-access-tokens; neither blocks routing (§73).
+- **Stale since 2026-09-27: warden now has a GitHub remote** (`jkrumm/warden`,
+  public). The bullet below predates it; implement episodes on warden work from
+  `origin/master`, so the remote must be kept pushed.
 - **`warden` is `implement`-reachable in both policy copies (its own
   `config/dispatch-repos.json` default, §74, and sideclaw's
   `/api/dispatch-policy`) and has no git remote at all (§62) — so every
@@ -346,6 +349,7 @@ log's past sections.
 - GitHub's rules, not a local list, decide review gates; policy dedup; default
   unattended scope with `NEVER_AUTO_MERGE` in code — §97–§99
 - Named executable invariants and a self-audit that makes its own gaps work — §100
+- Approval buttons clickable again (posted as Hermes); Hermes skills aligned — §101
 
 ### Next action
 

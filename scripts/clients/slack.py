@@ -93,6 +93,16 @@ def resolve_slack_token() -> str:
     return token
 
 
+def resolve_interactive_token() -> str:
+    """The identity for a message whose BUTTONS must work: Hermes's bot. Only
+    the Hermes app has socket mode and interactivity, and its gateway plugin
+    (hermes-agent `plugins/dispatch-approval/`) is what turns a click into a
+    signature. Warden's own app is `chat:write` only — buttons it posts go
+    nowhere, which is exactly what happened to every approval request from
+    2026-09-11 (Warden app live) to §101: posted, unclickable, expired."""
+    return resolve_secret("SLACK_BOT_TOKEN", _SLACK_TOKEN_REF)
+
+
 def slack_raw_post(url: str, payload: dict[str, Any], token: str, *,
                     timeout: int = 15) -> dict[str, Any] | None:
     """The bare `chat.*` POST that `scripts/triage.py`'s and

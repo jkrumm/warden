@@ -64,7 +64,7 @@ def post_buttons(*, nonce: str, verb: str, repo: str, tier: str, channel: str | 
     if not channel:
         print("note: no --origin-channel, so no buttons could be posted", file=sys.stderr)
         return
-    token = slack.resolve_slack_token()
+    token = slack.resolve_interactive_token()
     if not token:
         print("note: no SLACK_BOT_TOKEN, so no buttons could be posted", file=sys.stderr)
         return

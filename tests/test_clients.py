@@ -1596,5 +1596,19 @@ def main() -> int:
     return 0
 
 
+
+def test_interactive_token_is_hermes_never_the_chat_write_only_warden_app():
+    """§101: buttons posted under the Warden app (chat:write only, no
+    interactivity) could never be clicked through to Hermes's plugin."""
+    calls: list[tuple[str, str]] = []
+    saved = clients_slack.resolve_secret
+    clients_slack.resolve_secret = lambda env_var, ref: calls.append((env_var, ref)) or "hermes-token"
+    try:
+        assert clients_slack.resolve_interactive_token() == "hermes-token"
+    finally:
+        clients_slack.resolve_secret = saved
+    assert calls == [("SLACK_BOT_TOKEN", "op://hermes/slack/bot-token")]
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -8624,3 +8624,40 @@ entry for one thing that needs him. The dry run on a live snapshot found exactly
 that one violation, and it is what drew the line.
 
 Tests: `test_triage.py` 315 → 325, `test_api.py` 42 → 43. Numbered cases 830 → 841.
+
+## 101. The approval buttons nobody could click, and the Hermes side of the integration (2026-09-28)
+
+**A dead end since 2026-09-11, verified in source.** `warden dispatch --tier
+implement` (no item) mints an approval and posts Approve/Deny buttons.
+`approvals.post_buttons()` resolved `slack.resolve_slack_token()` — Warden's own
+app since §61/§63 (`slack/app-manifest.json`: `chat:write` only, no socket mode,
+no interactivity). A click on a message that app posted cannot reach Hermes's
+`plugins/dispatch-approval/`, the only thing that turns a click into a
+signature. The ledger agrees: 6 approval rows ever, the last (2026-09-20,
+weatherorb) never decided. Fix: `slack.resolve_interactive_token()` — Hermes's
+token, the app that owns interactivity — for buttons only; cards, receipts and
+reminders stay under Warden. Test: `test_interactive_token_is_hermes_never_the_chat_write_only_warden_app`.
+
+Considered and not done: deleting the signed-approval path (plugin 763 lines,
+`approvals.py`/`intents.py`/`signer.py`/`approval-spec.json` ~920 lines). `run
+--tier implement` and Argo's actions cover what it serves, but deleting it takes
+~90 numbered test cases with it and needs a change in the live Hermes gateway —
+left as a named candidate, with the path now at least working.
+
+**Hermes side (hermes-agent `6db191b`, plus two uncommitted-by-design edits):**
+- `skills/warden/SKILL.md` claimed `POST /items/:id/intent` and `/note` exist;
+  they never did — owner actions go through Argo's queue. It now points at
+  `/board.awaiting_owner` and `/health.self_audit`.
+- `skills/claude-dispatch/SKILL.md` still taught the daily budgets removed on
+  2026-09-15 and a "3/day" merge cap; "fix it" now routes to `run --tier
+  implement` (tracked in Argo), and the merge section names the two real refusals
+  (merge-approval repos → Argo click; GitHub rules requiring a review).
+- `skills/devops/warden-hand-fixes/SKILL.md` (not tracked in git; live via
+  `external_dirs`) opened the ledger read-write for `VACUUM INTO`, breaking the
+  one-writer rule — now `mode=ro`.
+- Hermes cron `fd2fa108e0cc` (homelab PR #6 watcher) removed with `hermes cron
+  remove`: PR #6 merged 2026-09-23, the follow-up it existed for ran once (item
+  1169); its monitor script `scripts/homelab-pr6-state.sh` deleted.
+
+Measured and left alone: the poller's #watchdog digest posted **0** messages in
+the last 7 days, so it duplicates nothing in practice.
