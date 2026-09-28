@@ -8809,10 +8809,17 @@ cases 858 → 871.
 
 ## 105. weatherorb fully unattended; the NEVER_AUTO_MERGE widening prepared, not landed (2026-09-28)
 
-The owner, after the WeatherOrb podcast, in words: the limits on what warden may
-change, implement and merge — the manual merges, the issue tiers — are invented
-friction; weatherorb is private, only he files its issues, and warden should fix,
-review, merge, deploy and verify there without a click, "auch für die Makefiles".
+The owner's words, as the episode recorded them out of the weatherorb-podcast
+conversation: the limits on what warden may change, implement and merge — the
+manual merges, the issue tiers — are invented friction; weatherorb is private,
+only he files its issues, and warden should fix, review, merge, deploy and verify
+there without a click, "auch für die Makefiles". **Carried as the episode's
+record, not as a verified quote:** Hermes searched its own store (every user
+message in `state.db`, plus this pane's transcript) and cannot re-find that
+conversation, so the `autoMergePaths: ["**"]` landing below rests on the owner's
+standing 2026-09-28 directive (everything "automatisch reviewed, automatisch
+gemerged, deployt und verifiziert") — which is unambiguous — while the Makefile
+half still waits for one word.
 
 **What was actually in the way, verified in the checkout, not believed.** The
 brief named four suspects; one was real.
@@ -8900,3 +8907,35 @@ untouched). `test_triage.py` stays at the §104 count, 340/340. Files changed:
 `config/triage-policy.json`, `scripts/clients/rollout.py`,
 `tests/test_clients.py`, `docs/never-auto-merge-widening.md` (new), this log,
 `STATE.md`. Nothing in the parallel session's files.
+
+## 106. A vanished trip shadow is unproven, never a finding (2026-09-28)
+
+Found while re-running §105's proof by hand, in the window between that section's
+arm (14:36:50Z) and its verdict: a second shadow was armed through the same
+`kuma-trip.py` door and reported `{"ok": true, "exists": true, "down": false,
+"beats": 1}` for 11 minutes, then `{"ok": true, "exists": false, "down": false}` at
+701 s. It had been deleted — the hourly residue sweep removes every `warden-trip:`
+monitor no `liveness_pending` item owns, and a shadow built by hand is owned by
+nothing. §105's own shadow (240) tripped at 2113 s; a third arm (242) tripped at
+2109 s, so the proof itself stands.
+
+**The defect was not the sweep.** `_advance_trip`'s `armed` branch fell through to
+its last line — "a silent shadow did not go DOWN within the window" → `reopen`
+with `TRIP_FAILED_NOTE_PREFIX` ("detection no longer fires"). A shadow that has
+been *deleted* is not a shadow that stayed up: that reading would have accused the
+fix, in the strongest wording this system has, while the probe itself was gone.
+It is the same class as the §64 verdict-less verdict — our own instrument's
+silence rendered as a fact about the world.
+
+**Fix.** An explicit branch for `exists is False`, placed before the read-error
+branch: retry until the item's own `liveness_deadline`, then `reopen` with the
+shadow-missing reason and "unproven, not fixed". The wording never claims detection
+stopped firing, because that was never observed. For a real item the sweep keeps
+its shadow (it reads `liveness_pending` items with an armed trip), so this door is
+reached when the shadow disappears some other way — a manual sweep, a hand in the
+Kuma UI, a restore.
+
+Tests: `tests/test_triage.py` 340 → 341 (the vanished-shadow case: retried, never
+`fixed`, note carries "gone before" + "unproven, not fixed"). Numbered cases
+871 → 872. `make test` green. Files changed: `scripts/triage.py`,
+`tests/test_triage.py`, this log, `STATE.md`.

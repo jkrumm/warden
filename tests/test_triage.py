@@ -8847,6 +8847,29 @@ def test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding():
         assert ("stop", ("904",)) in TRIP_CALLS
 
 
+def test_a_shadow_that_vanishes_after_the_window_is_unproven_not_a_finding():
+    """A shadow can be deleted before its window closes (the hourly residue
+    sweep, a hand in the Kuma UI, a restore). That is our probe missing, not
+    the fix's behaviour — it must never read as "detection no longer fires",
+    and it must never reach `fixed`. Seen live: a manual trip's shadow was
+    swept between arm and check and `check` came back `exists: false`."""
+    with _triage_env() as (conn, ctx):
+        armed = {"status": "armed", "shadowId": 907, "window": 780, "armedAt": NOW.isoformat(),
+                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
+        eid = _seed_trip_item(conn, external_id="trip-swept", trip=armed)
+        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
+        triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": False, "down": False}})
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=900), dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_LIVENESS_PENDING
+        assert "gone" in (_trip(conn, eid).get("lastError") or ""), "recorded as a probe failure, not a verdict"
+        assert not any(v == "stop" for v, _ in TRIP_CALLS), "the shadow stays while its answer is still readable"
+        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(hours=3), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEW and "unproven, not fixed" in item["note"]
+        assert "gone before" in item["note"], "the note says WHY it is unproven"
+        assert (("stop", ("907",)) in TRIP_CALLS)
+
+
 def test_a_monitor_type_without_a_residue_free_trip_is_a_named_gap_not_a_block():
     with _triage_env() as (conn, ctx):
         eid = _seed_trip_item(conn, external_id="trip-gap", trip={"status": "pending"})

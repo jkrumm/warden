@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§105 — weatherorb fully unattended: `autoMergePaths: ["**"]`, landed on the owner's standing directive that every PR be auto-reviewed, merged, deployed and verified; `weatherorb-pull` restarts tileserver/sync, liveness + synthetic trip proven on its live monitor; the NEVER_AUTO_MERGE widening is prepared in `docs/never-auto-merge-widening.md`, one owner word) |
+| Last updated | 2026-09-28 (§106 — a trip shadow that has been deleted is unproven, never "detection no longer fires"; §105's weatherorb proof stands, its trip re-verified by hand) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -382,6 +382,7 @@ log's past sections.
 - Synthetic trip for Kuma push monitors, proven live — §103
 - The ledger restore, drilled and self-checking — §104
 - weatherorb fully unattended; the NEVER_AUTO_MERGE widening prepared, not landed — §105
+- A vanished trip shadow is unproven, never a finding — §106
 
 ### Next action
 

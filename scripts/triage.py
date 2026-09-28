@@ -6616,6 +6616,19 @@ def _advance_trip(item: sqlite3.Row, expected: list[dict[str, Any]], now: dt.dat
                              f"{took}s (window {trip['window']}s) — detection still fires")
         if not overdue:
             return "wait", "trip armed, window still open"
+        if res.get("ok") and res.get("exists") is False:
+            # A shadow that is GONE is not a shadow that stayed up. The residue
+            # sweep, a hand in the Kuma UI or a restore can delete it, and none
+            # of those is an observation of the deployed detection config — so
+            # this must never read as "detection no longer fires". Same door as
+            # a read error: retry until the item's own liveness window closes,
+            # and only then "unproven, not fixed".
+            if now < (_parse_ts(item["liveness_deadline"]) or now):
+                trip["lastError"] = "shadow gone (deleted or swept) before its window closed"
+                return "wait", "trip shadow gone, retrying"
+            _kuma_trip("stop", str(trip["shadowId"]))
+            return "reopen", (f"{TRIP_FAILED_NOTE_PREFIX}the shadow of {rec['monitorTitle']} was gone before "
+                              f"its window closed (deleted or swept) — unproven, not fixed")
         if not res.get("ok"):
             # A read error is not an answer (Kuma's socket API times out now and
             # then — seen live during the §103 proof). Retry until the item's own
