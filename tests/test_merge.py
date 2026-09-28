@@ -38,8 +38,7 @@ try:
     import lifecycle.policy  # noqa: F401, E402
 except ModuleNotFoundError:
     _stub = types.ModuleType("lifecycle.policy")
-    for _name in ("resolve_repo", "tier_rank", "merge_precheck_repo", "triage_repo_entry",
-                  "pr_required_path", "triage_policy_path"):
+    for _name in ("resolve_repo", "tier_rank", "triage_repo_entry", "triage_policy_path"):
         def _unset(*_a, _n=_name, **_k):
             raise NotImplementedError(f"lifecycle.policy.{_n} stub called without a test override")
         setattr(_stub, _name, _unset)
@@ -147,7 +146,7 @@ def fakes(**overrides):
         "actions_runs_error": None,
         "entry": {"autoMergePaths": ["**"], "noCiRequired": True},
         "max_tier": "implement",
-        "precheck_error": None,
+        "branch_rules": [],
         "mark_ready_error": None,
         "mark_ready_fn": None,
         "merge_pr_error": None,
@@ -215,17 +214,13 @@ def fakes(**overrides):
     def _tier_rank(name):
         return _TIER_RANK.get(name, -1)
 
-    def _merge_precheck_repo(repo):
-        record("merge_precheck_repo", repo)
-        if state["precheck_error"]:
-            raise state["precheck_error"]
+    def _branch_rules(owner, repo, branch):
+        record("branch_rules", owner, repo, branch)
+        return list(state["branch_rules"])
 
     def _triage_repo_entry(repo):
         record("triage_repo_entry", repo)
         return dict(state["entry"])
-
-    def _pr_required_path():
-        return Path("/dev/null")
 
     def _triage_policy_path():
         return Path("/dev/null")
@@ -243,9 +238,8 @@ def fakes(**overrides):
         (rollout, "run", _rollout_run),
         (lifecycle.policy, "resolve_repo", _resolve_repo),
         (lifecycle.policy, "tier_rank", _tier_rank),
-        (lifecycle.policy, "merge_precheck_repo", _merge_precheck_repo),
+        (github, "branch_rules", _branch_rules),
         (lifecycle.policy, "triage_repo_entry", _triage_repo_entry),
-        (lifecycle.policy, "pr_required_path", _pr_required_path),
         (lifecycle.policy, "triage_policy_path", _triage_policy_path),
     ]
     saved = [(m, n, getattr(m, n)) for m, n, _ in patches]
@@ -318,9 +312,22 @@ def test_repo_ceiling_below_implement_refuses():
     _assert_refuses(exc_type=PolicyError, msg="ceiling is now", fake={"max_tier": "investigate"})
 
 
-def test_merge_precheck_refusal_propagates():
-    _assert_refuses(exc_type=PolicyError, msg="human pull-request review",
-                     fake={"precheck_error": PolicyError("gamma requires human pull-request review")})
+def test_github_ruleset_requiring_a_review_refuses():
+    rules = [{"type": "pull_request", "parameters": {"required_approving_review_count": 1}}]
+    _assert_refuses(exc_type=PolicyError, msg="require 1 approving review", fake={"branch_rules": rules})
+
+
+def test_github_ruleset_requiring_zero_reviews_is_not_a_human_gate():
+    """rollhook#26 (§97): PR-required by a local list, zero approvals by the
+    real ruleset — mergeable, not a question for a human."""
+    rules = [{"type": "pull_request", "parameters": {"required_approving_review_count": 0}},
+             {"type": "required_linear_history", "parameters": None}]
+    conn = _fresh_ledger()
+    _seed_pr_dispatch(conn, validation_status="confirmed")
+    with fakes(branch_rules=rules, repo={**_DEFAULT_REPO, "allow_merge_commit": True}) as fx:
+        result = _land(conn, why="w", authorized_by="auto-from-item")
+    assert result.merged
+    assert fx.calls["merge_pr"][0][1]["method"] != "merge", "linear history rules out a merge commit"
 
 
 def test_pull_request_closed_refuses():

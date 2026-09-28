@@ -686,31 +686,7 @@ def test_check_repo_not_in_flight_ignores_completed_operation():
     policy.check_repo_not_in_flight(conn, repo="warden")
 
 
-# --- policy: merge_precheck_repo() / triage_repo_entry() -----------------------
-
-def test_merge_precheck_repo_refuses_listed_repo():
-    p = _write_json({"repos": ["basalt-ui"]})
-    try:
-        policy.merge_precheck_repo("basalt-ui", p)
-    except PolicyError as e:
-        assert "human pull-request review" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_merge_precheck_repo_allows_unlisted_repo():
-    p = _write_json({"repos": ["basalt-ui"]})
-    policy.merge_precheck_repo("warden", p)
-
-
-def test_merge_precheck_repo_missing_file_raises_precondition():
-    missing = _tmp_dir("lifecycle-missing-") / "nope.json"
-    _expect(PreconditionError, policy.merge_precheck_repo, "warden", missing)
-
-
-def test_merge_precheck_repo_malformed_repos_key_raises_precondition():
-    p = _write_json({"repos": "not-a-list"})
-    _expect(PreconditionError, policy.merge_precheck_repo, "warden", p)
+# --- policy: triage_repo_entry() ---------------------------------------------
 
 
 def test_triage_repo_entry_returns_entry():

@@ -99,8 +99,8 @@ class MergePlan:
             ],
             "wouldNeverDo": [
                 "never merge a pull request this bridge did not open",
-                "never merge where a human review is required (derived from "
-                "pr-required-repos.json)",
+                "never merge where GitHub's own branch rules require an "
+                "approving review",
                 "never merge a fork branch, a retargeted base, or a change "
                 "touching .github/workflows",
                 "never override a failing check or a branch protection rule",
@@ -393,7 +393,6 @@ def plan_or_land(
             f"produced this pull request. The policy changed after the episode ran; that "
             f"is a refusal, not a stale record."
         )
-    policy.merge_precheck_repo(repo)
 
     pr = github.read_pr(owner, repo, pr_number)
     repo_json = github.read_repo(owner, repo)
@@ -422,6 +421,18 @@ def plan_or_land(
     default_branch = repo_json.get("default_branch")
     if default_branch is None:
         raise RemoteError(f"GitHub's repo response for {owner}/{repo} has no default branch")
+
+    # A gate is what GitHub enforces, not what a list or a verdict says it
+    # does (§97). pr-required-repos.json means "no direct push to master" —
+    # a PR is exactly that workflow — and was read here as "a human must
+    # approve", parking rollhook#26 on a ruleset requiring zero approvals.
+    rules = github.branch_rules(owner, repo, default_branch)
+    reviews_needed = github.required_approving_reviews(rules)
+    if reviews_needed > 0:
+        raise PolicyError(
+            f"GitHub's rules on {owner}/{repo}:{default_branch} require {reviews_needed} approving "
+            f"review(s) — read from the ruleset, not assumed. A human approves this one on GitHub."
+        )
 
     if pr_merged:
         raise PolicyError(f"{owner}/{repo}#{pr_number} is already merged.")
@@ -476,7 +487,7 @@ def plan_or_land(
         owner_approved=authorized_by in OWNER_AUTHORIZERS,
     )
 
-    method = github.pick_merge_method(repo_json)
+    method = github.pick_merge_method(repo_json, rules)
     if method is None:
         raise PolicyError(
             f"{owner}/{repo} allows no merge method this verb can use (squash, rebase, "

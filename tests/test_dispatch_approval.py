@@ -220,7 +220,6 @@ def _plugin_env(h: "Harness", db: Path, pubkey: Path, *, sideclaw: str | None = 
         "WARDEN_APPROVAL_PUBKEY": str(pubkey),
         "WARDEN_DISPATCH_REPOS": str(h.repos_json),
         "WARDEN_TRIAGE_POLICY": str(h.triage_policy_json),
-        "WARDEN_PR_REQUIRED_JSON": str(h.pr_required_json),
         "WARDEN_SECRETS_RUN": str(h.secrets_run),
         "SECRETS_BACKEND_FILE": str(h.backend_file),
         "SLACK_BOT_TOKEN": "xoxb-stub",

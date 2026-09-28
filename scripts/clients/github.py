@@ -365,16 +365,42 @@ def create_issue_comment(repo_full: str, number: int, body: str) -> dict[str, An
     return resp
 
 
-def pick_merge_method(repo_json: dict[str, Any]) -> str | None:
+def branch_rules(owner: str, repo: str, branch: str) -> list[dict[str, Any]]:
+    """Every ruleset rule GitHub itself enforces on `branch` — the source of
+    truth for "does a human have to approve this", read instead of assumed
+    (§97: a local list saying a repo is PR-required was read as "needs human
+    review" while the ruleset required zero approvals)."""
+    status, body = api("GET", f"/repos/{owner}/{repo}/rules/branches/{branch}")
+    if status != 200 or not isinstance(body, list):
+        raise RemoteError(f"GitHub returned HTTP {status} reading the rules on {owner}/{repo}:{branch}")
+    return body
+
+
+def required_approving_reviews(rules: list[dict[str, Any]]) -> int:
+    counts = [
+        int((r.get("parameters") or {}).get("required_approving_review_count") or 0)
+        for r in rules if r.get("type") == "pull_request"
+    ]
+    return max(counts, default=0)
+
+
+def pick_merge_method(repo_json: dict[str, Any], rules: list[dict[str, Any]] | None = None) -> str | None:
     """Squash first: a dispatch branch is one unit of work by construction.
-    Rebase next, merge commit last — a merge commit on a linear-history repo
-    is refused by GitHub anyway."""
-    if repo_json.get("allow_squash_merge"):
-        return "squash"
-    if repo_json.get("allow_rebase_merge"):
-        return "rebase"
-    if repo_json.get("allow_merge_commit"):
-        return "merge"
+    Rebase next, merge commit last. The branch's rules narrow the choice:
+    `required_linear_history` rules out a merge commit, and a pull_request
+    rule's `allowed_merge_methods` is the list GitHub will actually accept."""
+    rules = rules or []
+    allowed = {"squash", "rebase", "merge"}
+    for r in rules:
+        if r.get("type") == "required_linear_history":
+            allowed.discard("merge")
+        methods = (r.get("parameters") or {}).get("allowed_merge_methods") if r.get("type") == "pull_request" else None
+        if isinstance(methods, list) and methods:
+            allowed &= set(methods)
+    for method, flag in (("squash", "allow_squash_merge"), ("rebase", "allow_rebase_merge"),
+                         ("merge", "allow_merge_commit")):
+        if method in allowed and repo_json.get(flag):
+            return method
     return None
 
 

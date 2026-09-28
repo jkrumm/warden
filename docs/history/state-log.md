@@ -8524,3 +8524,30 @@ reconcile code into `scripts/lifecycle/` is a deliberate next-wave call.
 
 Tests: `test_triage.py` 315/315 (+2: ambiguous Argo merge; the loser never
 clobbers), `test_merge.py` 64/64 (owner gate rewritten to the narrowed rule).
+
+## 97. A gate is what GitHub enforces, not what a list says (2026-09-28)
+
+The owner found it: §94's report put rollhook#26 on his "waiting on you" list as
+"needs a human review on GitHub". The repository ruleset `protect-default-branch`
+requires **0** approving reviews; the PR was `MERGEABLE`/`CLEAN` with green CI and
+merged with one command. The claim came from warden's own code:
+`plan_or_land()` called `policy.merge_precheck_repo()`, which refused any repo in
+`~/.claude/pr-required-repos.json` "because it requires a human pull-request
+review". That file means something else — Claude may not *push* to master there
+(the `protect-branches` hook) — and a dispatch PR is exactly the workflow it asks
+for. Invented friction, parked on the human.
+
+Now `plan_or_land()` reads GitHub itself: `github.branch_rules()`
+(`GET /repos/{o}/{r}/rules/branches/{default}`) → `required_approving_reviews()`;
+a refusal names the count *read from the ruleset*. `pick_merge_method()` honours
+the same rules (`required_linear_history` rules out a merge commit;
+`allowed_merge_methods` narrows the choice) instead of discovering it as a
+GitHub 405. `merge_precheck_repo()`/`pr_required_path()` are deleted — the
+property they claimed to serve ("never merge where a human review is
+required") is now served by the thing that actually enforces it. Mergeability
+and CI were already read live (`mergeable`/`mergeable_state`, check-runs).
+
+Tests: the four list-precheck tests (`test_lifecycle.py`) became four real-rule
+tests (`test_clients.py`: review count, linear history, allowed methods, a
+non-200 raises); `test_merge.py` +1 (a zero-review ruleset merges, and never by
+merge commit under linear history). Numbered cases 825 → 826.

@@ -61,13 +61,6 @@ assert _wp_spec is not None and _wp_spec.loader is not None
 watchdog_poll = importlib.util.module_from_spec(_wp_spec)
 _wp_spec.loader.exec_module(watchdog_poll)
 
-# A `{"repos": []}` fixture for WARDEN_PR_REQUIRED_JSON — the three real-
-# merge-path tests point lifecycle/merge.py's `merge_precheck_repo()` at
-# this instead of the real `~/.claude/pr-required-repos.json`, which would
-# otherwise make "does this repo require human review" depend on this
-# machine's own file.
-_PR_REQUIRED_EMPTY = Path(tempfile.mkdtemp(prefix="triage-test-pr-required-")) / "pr-required-repos.json"
-_PR_REQUIRED_EMPTY.write_text(json.dumps({"repos": []}))
 
 
 # --- fixtures ------------------------------------------------------------------
@@ -194,6 +187,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         ("_github", "create_issue_comment"): triage._github.create_issue_comment,
         ("_github", "close_pr"): triage._github.close_pr,
         ("_github", "read_pr"): triage._github.read_pr,
+        ("_github", "branch_rules"): triage._github.branch_rules,
         ("_merge", "plan_or_land"): triage._merge.plan_or_land,
         ("_approvals", "execute_approved"): triage._approvals.execute_approved,
         ("_argo", "push_snapshot"): triage._argo.push_snapshot,
@@ -244,6 +238,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage._github.search_issues = lambda *, owner, skip_label: []
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
+        triage._github.branch_rules = lambda owner, repo, branch: []
         triage._github.read_pr = lambda owner, repo, number: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake read_pr registered"))
         CLOSED_PRS.clear()
@@ -4187,7 +4182,7 @@ def test_confirmed_validation_merges_real_path_no_deploy():
         merge_sha = "a" * 40
         pr = _fake_pr(number=30, head_sha="b" * 40, repo="demo-repo")
 
-        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH), WARDEN_PR_REQUIRED_JSON=str(_PR_REQUIRED_EMPTY)):
+        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
             with _patched(
                 triage._github,
                 read_pr=lambda owner, repo, number: pr,
@@ -4228,7 +4223,7 @@ def test_confirmed_validation_merges_real_path_auto_deploy_ok():
         merge_sha = "c" * 40
         pr = _fake_pr(number=31, head_sha="d" * 40, repo="vps")
 
-        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH), WARDEN_PR_REQUIRED_JSON=str(_PR_REQUIRED_EMPTY)):
+        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
             with _patched(
                 triage._github,
                 read_pr=lambda owner, repo, number: pr,
@@ -4271,7 +4266,7 @@ def test_confirmed_validation_merges_real_path_auto_deploy_failure_needs_human()
         merge_sha = "c" * 40
         pr = _fake_pr(number=31, head_sha="d" * 40, repo="vps")
 
-        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH), WARDEN_PR_REQUIRED_JSON=str(_PR_REQUIRED_EMPTY)):
+        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
             with _patched(
                 triage._github,
                 read_pr=lambda owner, repo, number: pr,
@@ -4315,7 +4310,7 @@ def test_confirmed_validation_merges_real_path_deploy_on_merge():
         merge_sha = "e" * 40
         pr = _fake_pr(number=32, head_sha="f" * 40, repo="argo")
 
-        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH), WARDEN_PR_REQUIRED_JSON=str(_PR_REQUIRED_EMPTY)):
+        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
             with _patched(
                 triage._github,
                 read_pr=lambda owner, repo, number: pr,
@@ -4478,7 +4473,7 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
         triage._sideclaw.get = _fake_get
 
         pr = _fake_pr(number=62, head_sha="c" * 40, repo="demo-repo")
-        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH), WARDEN_PR_REQUIRED_JSON=str(_PR_REQUIRED_EMPTY)):
+        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
             with _patched(
                 triage._github,
                 read_pr=lambda owner, repo, number: pr,

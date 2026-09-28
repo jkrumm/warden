@@ -2,7 +2,7 @@
 
 The Python port of the retired bash CLI's `resolve_repo` (457-583), `resolve_tier`
 (589-606), `tier_rank` (624-631), `require_auto_from_item` (639-705),
-`valid_origin` (745-766), `merge_precheck_repo` (1659-1682) and the
+`valid_origin` (745-766) and the
 `repos.<repo>` half of `config/triage-policy.json` that
 `run_deploy_if_enabled` reads (1842-1856). The bash CLI's `budget_counts`/
 `check_budget`/`budget_json` (849-915) were ported too, then deleted
@@ -80,12 +80,6 @@ def triage_policy_path() -> Path:
     if os.environ.get("WARDEN_TRIAGE_POLICY"):
         return Path(os.environ["WARDEN_TRIAGE_POLICY"]).expanduser()
     return REPO / "config" / "triage-policy.json"
-
-
-def pr_required_path() -> Path:
-    if os.environ.get("WARDEN_PR_REQUIRED_JSON"):
-        return Path(os.environ["WARDEN_PR_REQUIRED_JSON"]).expanduser()
-    return Path.home() / ".claude" / "pr-required-repos.json"
 
 
 @dataclass(frozen=True)
@@ -404,28 +398,6 @@ def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
         raise PolicyError(
             f"repo '{repo}' already has an implement episode in flight (operation {ops[0]['op_id']}) — "
             "one at a time per repo"
-        )
-
-
-def merge_precheck_repo(repo: str, path: Path | None = None) -> None:
-    p = path or pr_required_path()
-    if not p.is_file():
-        raise PreconditionError(
-            f"cannot verify merge eligibility: {p} is missing. That file decides which repos require a "
-            "human review, so an unreadable one is a refusal, never an assumption."
-        )
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as err:
-        raise PreconditionError(f"could not read {p}: {err}")
-    repos = data.get("repos")
-    if not isinstance(repos, list) or not all(isinstance(r, str) for r in repos):
-        raise PreconditionError(f"could not read merge eligibility from {p}: `repos` is not a list of strings")
-    if repo in repos:
-        raise PolicyError(
-            f"{repo} requires a human pull-request review (it is listed in {p}, the same file the "
-            "branch-protection hook enforces). This verb will not merge there — say the PR is ready "
-            "and let Johannes merge it."
         )
 
 

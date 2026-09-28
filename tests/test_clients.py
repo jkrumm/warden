@@ -984,6 +984,40 @@ def test_parse_pr_url_good_and_bad():
     assert github.parse_pr_url("not a url") is None
 
 
+def test_required_approving_reviews_reads_the_ruleset():
+    assert github.required_approving_reviews([]) == 0
+    assert github.required_approving_reviews(
+        [{"type": "pull_request", "parameters": {"required_approving_review_count": 0}}]) == 0
+    assert github.required_approving_reviews(
+        [{"type": "deletion", "parameters": None},
+         {"type": "pull_request", "parameters": {"required_approving_review_count": 2}}]) == 2
+
+
+def test_pick_merge_method_honours_linear_history():
+    repo = {"allow_merge_commit": True}
+    assert github.pick_merge_method(repo) == "merge"
+    assert github.pick_merge_method(repo, [{"type": "required_linear_history", "parameters": None}]) is None
+
+
+def test_pick_merge_method_honours_allowed_merge_methods():
+    repo = {"allow_squash_merge": True, "allow_rebase_merge": True}
+    rules = [{"type": "pull_request", "parameters": {"allowed_merge_methods": ["rebase"]}}]
+    assert github.pick_merge_method(repo, rules) == "rebase"
+
+
+def test_branch_rules_non_200_raises():
+    saved = github.api
+    github.api = lambda method, path, body=None: (404, {"message": "Not Found"})
+    try:
+        github.branch_rules("jkrumm", "gamma", "master")
+    except RemoteError as e:
+        assert "404" in str(e)
+    else:
+        raise AssertionError("expected RemoteError")
+    finally:
+        github.api = saved
+
+
 def test_pick_merge_method_order():
     assert github.pick_merge_method({"allow_squash_merge": True, "allow_rebase_merge": True}) == "squash"
     assert github.pick_merge_method({"allow_squash_merge": False, "allow_rebase_merge": True}) == "rebase"

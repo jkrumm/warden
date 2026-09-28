@@ -141,7 +141,6 @@ class Harness:
             "WARDEN_DB": str(db or self.new_db()),
             "WARDEN_DISPATCH_REPOS": str(self.repos_json),
             "WARDEN_TRIAGE_POLICY": str(self.triage_policy_json),
-            "WARDEN_PR_REQUIRED_JSON": str(self.pr_required_json),
             "WARDEN_CLI_LOG": str(log or self.new_log("audit")),
             "WARDEN_SECRETS_RUN": str(self.secrets_run),
             "SECRETS_BACKEND_FILE": str(self.backend_file),
@@ -751,6 +750,7 @@ def _merge_stub() -> stubs.StubServer:
     return stubs.StubServer({
         ("GET", "/repos/jkrumm/gamma/pulls/9"): (200, _MERGE_PR_BODY),
         ("GET", "/repos/jkrumm/gamma"): (200, {"default_branch": "master", "allow_squash_merge": True}),
+        ("GET", "/repos/jkrumm/gamma/rules/branches/master"): (200, []),
         ("GET", "/repos/jkrumm/gamma/pulls/9/files?per_page=100"): (200, [{"filename": "a.py"}]),
         ("GET", f"/repos/jkrumm/gamma/commits/{'deadbeef' * 5}/check-runs"): (200, {"check_runs": []}),
         ("POST", "/graphql"): (200, {"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}}}),
