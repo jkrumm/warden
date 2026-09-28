@@ -11,7 +11,6 @@ key; this module owns the argv.
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 from typing import Callable, NamedTuple
 
 from .errors import PolicyError
@@ -27,9 +26,20 @@ ROLLOUTS: dict[str, tuple[str, ...]] = {
                 "cd ~/homelab && git pull --ff-only && op run --env-file=.env.tpl -- "
                 "uptime-kuma/.venv/bin/python uptime-kuma/sync.py "
                 "--extra-config ../homelab-private/uptime-kuma/monitors.yaml"),
-    # weatherorb's periodic LaunchAgents (watchdog, sync, obs, ...) exec the
-    # live checkout on every run, so a fast-forward IS the rollout for them.
-    "weatherorb-pull": ("git", "-C", str(Path.home() / "SourceRoot" / "weatherorb"), "pull", "--ff-only"),
+    # weatherorb's periodic LaunchAgents (watchdog, obs, fcstlog, backfill,
+    # blendfield) exec the live checkout on every run, so a fast-forward alone
+    # rolls them out. tileserver (uvicorn over src/) and sync (ops/run-sync.sh)
+    # are KeepAlive daemons that keep their loaded process, so they are
+    # kickstarted after the pull (§105) — without that a merged tileserver fix
+    # would read `fixed` against a watchdog that never ran it. serve is the
+    # vendored open-meteo binary: nothing a merge can change without a rebuild,
+    # so it is left alone. `kickstart -k` never re-reads a plist; ops/*.plist
+    # is NEVER_AUTO_MERGE anyway. A failed kickstart fails the deploy — a merged
+    # PR with a daemon still on the old code is `needs_human`, never `merged`.
+    "weatherorb-pull": ("/bin/sh", "-c",
+                        'git -C "$HOME/SourceRoot/weatherorb" pull --ff-only'
+                        ' && for job in tileserver sync; do'
+                        ' launchctl kickstart -k "gui/$(id -u)/com.jkrumm.weatherorb.$job" || exit 1; done'),
 }
 
 

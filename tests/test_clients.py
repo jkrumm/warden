@@ -1041,6 +1041,26 @@ def test_rollout_known_key_argv():
     assert rollout.argv_for("unknown") is None
 
 
+def test_rollout_weatherorb_pull_restarts_the_daemons_that_keep_their_process():
+    """§105: a fast-forward rolls out the periodic jobs; tileserver and sync
+    are KeepAlive daemons and keep their loaded process until kickstarted, so
+    a merged tileserver fix would otherwise read `fixed` against a watchdog
+    that never ran it. Closed argv: one /bin/sh -c string, the pull first and
+    every kickstart chained after it, never a plist reload (bootout/bootstrap
+    re-read ops/*.plist, which is NEVER_AUTO_MERGE), and serve — the vendored
+    binary a merge cannot change — is not touched."""
+    argv = rollout.argv_for("weatherorb-pull")
+    assert argv[:2] == ("/bin/sh", "-c") and len(argv) == 3
+    script = argv[2]
+    assert "pull --ff-only" in script and "kickstart -k" in script
+    assert script.index("pull --ff-only") < script.index("kickstart -k")
+    assert " && " in script and "|| exit 1" in script
+    for job in ("tileserver", "sync"):
+        assert job in script, job
+    assert "serve" not in script.replace("tileserver", "")
+    assert "bootstrap" not in script and "bootout" not in script
+
+
 def test_rollout_run_success():
     def fake_runner(argv, **kwargs):
         assert argv == list(rollout.ROLLOUTS["hyperdx-apply"])

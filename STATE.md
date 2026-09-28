@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§104 — the ledger restore is drilled: `make restore-drill`, monthly agent, a failed or stale drill becomes a warden item) |
+| Last updated | 2026-09-28 (§105 — weatherorb fully unattended: `autoMergePaths: ["**"]`, landed on the owner's standing directive that every PR be auto-reviewed, merged, deployed and verified; `weatherorb-pull` restarts tileserver/sync, liveness + synthetic trip proven on its live monitor; the NEVER_AUTO_MERGE widening is prepared in `docs/never-auto-merge-widening.md`, one owner word) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -138,6 +138,18 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
+- **weatherorb is fully unattended (§105).** `autoMergePaths: ["**"]` — the
+  default unattended scope, declared explicitly; only `NEVER_AUTO_MERGE`
+  (merge.py) still stops a weatherorb PR at a draft. `weatherorb-pull` now
+  fast-forwards AND kickstarts tileserver/sync (`serve` is the vendored
+  binary, untouched), so a merge is the rollout for the long-running code too.
+  Liveness for a merge repo needs no host-verb path: `_kuma_monitor_title()`
+  reads the item's own `uk`/`[Name]` event, `_gather_kuma_push_fresh()` confirmed
+  live against `WeatherOrb Watchdog - Push`, and the synthetic trip on a shadow
+  of that monitor went DOWN in its window (§105). An issue-origin item has no
+  monitor of its own and lands `merged`, said so on its note. Widening
+  `NEVER_AUTO_MERGE` for weatherorb (Makefile, CI, plists, manifests) is written
+  up as a diff in `docs/never-auto-merge-widening.md`, not landed.
 - **Restore drill (§104).** `scripts/warden-restore.sh` restores the newest
   off-box snapshot into a temp dir and verifies integrity, schema via the
   migrator, data plausibility, a loop dry-run and a repo-bundle clone; it cannot
@@ -167,7 +179,7 @@ loop.
   PR offers Merge.
 - **The last mile reaches three more repos (§93).** homelab
   (`uptime-kuma/monitors.yaml` → `uk-sync` → `kuma-push-fresh`), weatherorb
-  (watchdog/tests/docs → `weatherorb-pull` → `kuma-push-fresh`),
+  (`**` since §105 → `weatherorb-pull` → `kuma-push-fresh` + trip),
   research-gateway (`src/**` etc. → `deployByPoller` → `mini-checkout-live`).
   The step-7 review gets the goal and `VALIDATION_GATE_QUESTIONS`; a
   policy-refused merge retries once the policy file changes. Hard human gate
@@ -204,6 +216,11 @@ loop.
 
 ## Open — owner actions
 
+- **One word on `docs/never-auto-merge-widening.md` (§105):** weatherorb (only)
+  out of `NEVER_AUTO_MERGE` entirely — Makefile, `.github/workflows`,
+  `ops/*.plist`, `package.json`/`bun.lock`/`uv.lock`/`pyproject.toml` — yes,
+  no, or Makefile only. The diff and its consequences are in the file; until
+  then those paths stop at a draft PR and the Argo Merge click.
 - The §55 4.3 "human types in Slack" acceptance is still open.
 - `warden-api`'s "LAST EXIT -15" is the §55 kickstart; cosmetic.
 - `op://mini/github/token` (fine-grained PAT) is missing `Issues: Read` on
@@ -364,6 +381,7 @@ log's past sections.
 - Review of §97–§101: five blocking findings fixed — §102
 - Synthetic trip for Kuma push monitors, proven live — §103
 - The ledger restore, drilled and self-checking — §104
+- weatherorb fully unattended; the NEVER_AUTO_MERGE widening prepared, not landed — §105
 
 ### Next action
 

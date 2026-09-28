@@ -8806,3 +8806,97 @@ Tests: new `tests/test_restore.py` 11/11 (guard ×4, a good snapshot, a real
 schema-(N-1) snapshot migrated, corrupt, newer schema, stale data, empty, missing);
 `test_triage.py` 338 → 340 (failed drill → item; stale/missing/fresh). Numbered
 cases 858 → 871.
+
+## 105. weatherorb fully unattended; the NEVER_AUTO_MERGE widening prepared, not landed (2026-09-28)
+
+The owner, after the WeatherOrb podcast, in words: the limits on what warden may
+change, implement and merge — the manual merges, the issue tiers — are invented
+friction; weatherorb is private, only he files its issues, and warden should fix,
+review, merge, deploy and verify there without a click, "auch für die Makefiles".
+
+**What was actually in the way, verified in the checkout, not believed.** The
+brief named four suspects; one was real.
+
+1. `config/triage-policy.json` `repos.weatherorb.autoMergePaths` was
+   `["src/weatherorb/watchdog/**", "tests/**", "docs/**"]` (§93). Because the
+   entry *declared* a scope, `effective_repo_entry()` never fell through to
+   §99's `DEFAULT_REPO_ENTRY` (`["**"]`) — weatherorb was **narrower** than a
+   repo with no entry at all. Every fix outside watchdog/tests/docs ended as a
+   draft PR. **Real. Fixed:** the entry now declares `["**"]` explicitly rather
+   than dropping the key — the two are equivalent today, but a declared scope
+   says so in the file the operator reads and cannot be narrowed by a later
+   change to the default. `retry_policy_refused_merges()` re-attempts any
+   `merge refused:` item on the policy file's mtime, so nothing parked on the
+   old scope needs a hand.
+2. `NEVER_AUTO_MERGE` (`scripts/lifecycle/merge.py`, code): Makefile, `.mk`,
+   `.github/*`, `scripts/*`, `launchd/*`, plists, Dockerfiles, compose, manifests,
+   lockfiles, `.env*`, `.tpl`. Still stops a weatherorb PR touching those at a
+   draft. **Deliberately not changed** — it is the "warden must not write the
+   code it then runs" invariant, and the owner's "auch für die Makefiles" is a
+   widening of it. The diff, what each path class actually executes in
+   weatherorb (no LaunchAgent runs `make`; plists are inert until
+   `make launchd-install`; `deploy-edge.yml` is the one path that runs on the
+   merge itself; lockfiles install on the next `uv run`), the tests it needs and
+   the one question are in `docs/never-auto-merge-widening.md`. Recommended shape:
+   a code-level `FULL_AUTONOMY_REPOS = {"weatherorb"}` exemption, never a
+   narrower global tuple — that keeps `test_never_auto_merge_covers_variants…`
+   byte-identical and the executor repos untouched. Found on the way:
+   `ops/run-sync.sh`/`ops/run-blendfield.sh` are exec'd by launchd and were never
+   in the tuple (`scripts/*` does not match `ops/`), so for weatherorb the
+   invariant already reads "CI, service definitions, manifests", not "anything
+   launchd runs".
+3. Liveness (the brief's M9: `kuma-push-fresh` reads a `monitorTitle` only the
+   host-verb path writes). **Stale since §93/§103.** `_confirm_and_merge()`
+   derives the title from the item's own event — `_kuma_monitor_title()` takes a
+   `uk` event's title verbatim (batch suffix stripped) or a `[Name]` prefix from
+   `slack_alert` — and enters `liveness_pending` with `{"trip": "pending"}`; an
+   item with no monitor of its own (a GitHub issue) lands `merged` saying so.
+   Nothing in `triage.py` needed changing, which mattered: that file was dirty in
+   a parallel session (§104) and was not touched.
+4. Issue tier by authorship: `ingest_github_issues()` gives `implement` to
+   `_github.GH_OWNER`'s issues and caps everyone else at `investigate`. The mini's
+   GitHub identity IS the owner's fine-grained PAT (`gh api user` → the owner),
+   so an issue an `author`-tier episode files is owner-authored and reaches
+   `implement` with no click. **No cap to lift.** Third-party bodies are fenced
+   (`_UNTRUSTED_BLOCK_*`) and capped inside the fence; owner bodies are trusted
+   verbatim under `MAX_BRIEF_CHARS`. weatherorb is private (`gh api repos …` →
+   `private`), so GitHub rulesets — the §97 review gate — cannot apply to it.
+
+**"Merge is deploy" was half true.** `weatherorb-pull` was `git pull --ff-only`.
+The periodic jobs (`watchdog`, `obs`, `fcstlog`, `backfill`, `blendfield`) exec
+the checkout on every run, so a pull rolls them out; `tileserver` (uvicorn over
+`src/`) and `sync` (`ops/run-sync.sh`) are `KeepAlive` daemons that keep their
+loaded process. Under the old scope that was fine — `src/weatherorb/tileserver`
+was outside it. Under `**` it is a fabricated `fixed`: a merged tileserver fix
+would confirm against a watchdog push that never ran the new code. The verb
+(`scripts/clients/rollout.py`, code owns the argv) now pulls and then
+`launchctl kickstart -k`s tileserver and sync, `|| exit 1` — a daemon left on
+old code is a failed deploy and the item is `needs_human`, never `merged`.
+`serve` is the vendored open-meteo binary: nothing a merge changes without a
+Swift rebuild, so it is not bounced. `kickstart -k` never re-reads a plist;
+`ops/*.plist` is `NEVER_AUTO_MERGE` anyway. The web side (`apps/web/**`,
+`packages/**`) deploys itself: `deploy-edge.yml` runs on the merge to master.
+
+**Liveness proven on weatherorb's own monitor, live.** Read-only first:
+`_gather_kuma_push_fresh([{"monitorTitle": "WeatherOrb Watchdog - Push",
+"since": now-2h}])` → `(True, "WeatherOrb Watchdog - Push heartbeat OK at
+2026-09-28 14:33 UTC (> since 12:36 UTC)")`, and `_kuma_monitor_title()` on a
+`uk` row titled `WeatherOrb Watchdog - Push (×3 in batch)` → the bare title.
+Then the synthetic trip through warden's own `_kuma_trip()`: shadow 240 of the
+live monitor (interval 2100, retries 0, so a 2280 s window) armed at 14:36:50Z
+with one UP beat and no notification provider; the hourly residue sweep's cursor
+was held for the window by one upsert (as in §103).
+Result: `check` at 15:10:56Z still UP (1 beat); at **15:12:03Z `down: true`**
+(2 beats), 2113 s after arming, inside the window that closed at 15:14:50Z;
+`stop` → `removed: true`; Kuma lists no `warden-trip:` monitor afterwards; 0
+events ingested for the shadow or for `WeatherOrb Watchdog - Push` since arming.
+The monitor weatherorb's fixes are verified against can still go DOWN, and the
+whole chain — title from the item's own event, UP read through hermes-ops,
+shadow trip, cleanup — ran on the live monitor with no code change.
+
+Tests: `test_clients.py` 112 → 113 (the closed `weatherorb-pull` argv: pull
+first, both kickstarts chained after it, no bootout/bootstrap, `serve`
+untouched). `test_triage.py` stays at the §104 count, 340/340. Files changed:
+`config/triage-policy.json`, `scripts/clients/rollout.py`,
+`tests/test_clients.py`, `docs/never-auto-merge-widening.md` (new), this log,
+`STATE.md`. Nothing in the parallel session's files.
