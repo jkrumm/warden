@@ -395,7 +395,11 @@
     {"match": "uk:226", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): the MAM session is homelab-side \u2014 mam-account-sync.sh / mam-seedbox-sync.sh live in homelab-private and push the monitor, and nothing in warden touches it. Routing it to warden sent item 843 into an implement episode that died pre-flight (warden's checkout has no origin remote), so the alert never reached the repo that owns the fix."},
     {"match": "uk:211", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): Garmin auto-relogin is homelab's (garmin-collector + scripts/garmin-auto-relogin.sh); warden implements none of it."},
     {"match": "uk:212", "repo": "kobo-mods", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "KoInsight is a KOReader/Kobo statistics service; repo kobo-mods owns it."},
-    {"match": "uk:213", "repo": "rollhook", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "Auto-Update push monitor belongs to the rollhook auto-update service."}
+    {"match": "uk:213", "repo": "rollhook", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "Auto-Update push monitor belongs to the rollhook auto-update service."},
+    {"match": "slack_alert:public-files-http-red-circle-down-read-econnreset", "repo": "image-share", "proposedAt": "2026-09-28T00:29:42.370225+00:00", "proposedBy": "triage-auto", "reason": "Public Files service likely owned by image-share repo"},
+    {"match": "uk:207", "repo": "linewatch", "proposedAt": "2026-09-28T00:29:42.370225+00:00", "proposedBy": "triage-auto", "reason": "Home Line monitor matches linewatch repo"},
+    {"match": "slack_alert:research-gateway-http-red-circle-down-request-failed-with-status-code-404", "repo": "research-gateway", "proposedAt": "2026-09-28T00:29:42.370225+00:00", "proposedBy": "triage-auto", "reason": "Service name matches research-gateway repo"},
+    {"match": "slack_alert:research-gateway-renderer-http-red-circle-down-request-failed-with-status-code-404", "repo": "research-gateway", "proposedAt": "2026-09-28T00:29:42.370225+00:00", "proposedBy": "triage-auto", "reason": "Renderer is part of research-gateway service"}
   ],
   "ignore": [
     "docker_*:unhealthy:shelfmark",
