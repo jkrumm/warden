@@ -8551,3 +8551,17 @@ Tests: the four list-precheck tests (`test_lifecycle.py`) became four real-rule
 tests (`test_clients.py`: review count, linear history, allowed methods, a
 non-200 raises); `test_merge.py` +1 (a zero-review ruleset merges, and never by
 merge commit under linear history). Numbered cases 825 → 826.
+
+## 98. Less surface, same behaviour: policy dedup, a dead script, a stale worktree (2026-09-28)
+
+- `config/triage-policy.json`: 166 rules → 76, 52 ignore entries → 15 (367 lines,
+  −127). Only later duplicates of an already-listed `match` were dropped; first
+  match wins, so they were inert. Proven, not assumed: every one of the 1263
+  events in the live ledger classifies identically (rule and ignore) under the
+  old and new file — 0 differences. §76's proposal dedup keeps it from regrowing.
+- `scripts/validate-dispatch-policy.py` deleted (90 lines): no Makefile target or
+  script calls it since `make status` dropped it; `dispatch-repos.json` is
+  validated where it is used (`policy.resolve_repo()`/`resolve_tier()`) and
+  checked against sideclaw by `make check-policy`. No property depended on it.
+- The merged `.claude/worktrees/advance-on-completion` worktree and its branch
+  removed — a full second copy of every script that every grep hit.

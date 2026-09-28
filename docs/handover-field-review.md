@@ -217,7 +217,7 @@ Each as a question, the evidence, and where the knob lives:
 
 | Question | Evidence | Knob |
 |-|-|-|
-| Widen `autoMergePaths` beyond the current canary scope? | (b),(d),(g), FLOWS.md flow 1/2 friction | `config/triage-policy.json` per-repo `autoMergePaths`, validated by `scripts/validate-dispatch-policy.py`, enforced by `scripts/lifecycle/merge.py`'s `merge_gate_check()` |
+| Widen `autoMergePaths` beyond the current canary scope? | (b),(d),(g), FLOWS.md flow 1/2 friction | `config/triage-policy.json` per-repo `autoMergePaths`, enforced by `scripts/lifecycle/merge.py`'s `merge_gate_check()` |
 | Promote or demote a tier ceiling per origin? | (g), FLOWS.md's third-party-issues rule | `config/dispatch-repos.json` per-repo `maxTier`/`defaultTier`, `triage_items.max_tier` |
 | Retire a surface (Slack cards, overview block, Argo board)? | "Where was the friction" above — the digest was already retired this way in Wave 7 (`docs/history/state-log.md` §56), it read sideclaw, never the ledger | the surface's own LaunchAgent/cron entry |
 | Change `quietResolveHours` or a state deadline? | (b),(c),(d) | `config/triage-policy.json`'s `quietResolveHours`, or `scripts/triage.py`'s `STATE_DEADLINES` |

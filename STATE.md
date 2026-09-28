@@ -222,9 +222,8 @@ loop.
   still not built.
 - `#agents` is warden-only since 2026-09-11 (Hermes's narratives cron moved to
   `#hermes`); approval buttons still post to `#hermes`.
-- `config/triage-policy.json` carries 151 rule entries for 61 distinct match
-  values and 49 ignore entries for 12 (§77). §76's dedup stops the growth;
-  nothing has collapsed what accumulated. First match wins, so it is inert.
+- `config/triage-policy.json` deduplicated to 76 rules / 15 ignores (§98),
+  proven identical on all live events; §76's dedup stops regrowth.
 - `_fetch_note_rows()` excludes rows whose event has resolved and has no age
   filter, so the digest's "Unstructured notes" heading carries a still-open
   incident and reprints it every UTC day (§81, §90). The rows §76's revive
