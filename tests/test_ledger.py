@@ -286,6 +286,7 @@ def test_migrate_adopts_pre_versioned_database():
     assert post_cols["triage_items"] - pre_cols["triage_items"] == {
         "state_deadline", "occurrence_mark", "revert_pr", "origin", "max_tier", "brief",
         "origin_channel", "origin_thread_ts", "reminder_count", "last_reminder_at",
+        "revision_count", "parked_mark", "parked_recurrences", "recurrence_reminded_at",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")

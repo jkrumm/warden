@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
 # verdict schemas and are asserted per job by assert_result_schema and by
 # `make check-schemas` — two independent pins that must never be conflated.
-LEDGER_SCHEMA_VERSION = 10
+LEDGER_SCHEMA_VERSION = 11
 
 
 class LedgerBehind(RuntimeError):
@@ -524,6 +524,28 @@ ALTER TABLE triage_items ADD COLUMN last_reminder_at TEXT;
 # nobody answered.
 _MIGRATION_10 = """ALTER TABLE dispatches ADD COLUMN error TEXT;"""
 
+# Version 11 — the chain stops ending in a parked item (2026-09-28, state-log
+# §92). Four columns, all additive, all correct as their DEFAULT on every
+# pre-existing row:
+#
+#   triage_items.revision_count      how many times maybe_revise_blocked() sent
+#     a blocked implementation back to a fresh implement episode with the
+#     reviewer's findings. 0 on every existing row: no revision ever ran.
+#   triage_items.parked_mark          the event's _occurrence_mark() when the
+#     item was last seen parked (needs_human / merge_blocked) — the baseline
+#     track_parked_recurrences() compares against. NULL until first seen parked.
+#   triage_items.parked_recurrences   occurrences observed while parked. A
+#     parked row absorbs every recurrence of its signal (reopen_if_needed()
+#     never touches it), so without this nothing shows the fix is overdue.
+#   triage_items.recurrence_reminded_at  when the N-recurrences reminder
+#     posted, so it posts once per parking, independent of reminder_count.
+_MIGRATION_11 = """
+ALTER TABLE triage_items ADD COLUMN revision_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE triage_items ADD COLUMN parked_mark TEXT;
+ALTER TABLE triage_items ADD COLUMN parked_recurrences INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE triage_items ADD COLUMN recurrence_reminded_at TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -535,6 +557,7 @@ MIGRATIONS: dict[int, str] = {
     8: _MIGRATION_8,
     9: _MIGRATION_9,
     10: _MIGRATION_10,
+    11: _MIGRATION_11,
 }
 
 # The five tables BASE_SCHEMA declares, i.e. what "this is the live

@@ -8323,3 +8323,50 @@ report: the loudest family (`MacMini Dev Host`, 87 of 264) is research-gateway's
 own mini deploys (`launchctl` restart, exit 0) graded as crashes by
 `devhost-health-check.sh`; its fix is dotfiles PR #7, parked `merge_blocked` on
 a review finding since 09-23 with every recurrence folding silently into item 543.
+
+## 92. A blocked fix goes back to the implementer; a parked item counts its recurrences (2026-09-28)
+
+The owner, on this morning's report: fixes rot in draft PRs nobody hears about,
+and the chain has to run through review → merge → deploy → verify on its own.
+Two of the gaps it named are closed here; the last mile is §93.
+
+**Revision (`maybe_revise_blocked()`).** `poll_validation_jobs()` sent any
+blocking review finding straight to `merge_blocked`, where it waited for a human
+— dotfiles#7 sat five days on one concrete finding while its alert paged 16
+times. Now the first step of `advance_implement_chain()` (so both the 600 s loop
+and the 300 s sweep run it) picks up a `merge_blocked`/`needs_human` item with a
+*revisable* reason — the independent review blocked it (`validation_status =
+'blocked'`, findings from the review job's own verdict) or the repo's checks
+failed before push (`checks_failed`) — and opens a fresh implement episode:
+start from the previous branch, fix every finding, keep scope. Claim is a
+compare-and-set into `implementing` with `revision_count+1` before the dispatch;
+a submit that definitely failed hands the item back unchanged. The superseded
+PR is closed with a pointer, so revisions do not leave dead drafts. Cap:
+`revisionMaxAttempts` (2) per item — an attempt count, like
+`hostVerbMaxAttempts`, never a turn or time limit on the episode. A needs-human
+review, a merge-gate refusal or a failed deploy is a question, not a finding,
+and still goes to a human.
+
+**Parked recurrences (`track_parked_recurrences()`).** A parked row absorbs its
+signal's recurrences (`reopen_if_needed()` only touches terminal rows). Each pass
+now compares the event's `_occurrence_mark()` to the one seen last pass and
+counts the moves per parking; the card's *Action required* block says
+`Recurred N× since it parked here`, `/board` (and so Argo's snapshot) carries
+`parked_recurrences` and `revision_count`, and at `parkedRecurrenceReminder` (5)
+one reminder threads under the card regardless of `REMINDER_MAX_COUNT`. Leaving
+the parked states resets the count.
+
+Schema 11 (`ledger.py` migration 11): `triage_items.revision_count`,
+`parked_mark`, `parked_recurrences`, `recurrence_reminded_at`, all additive.
+
+**It went live before the commit.** The LaunchAgents run this working tree, so
+the 09:51 UTC sweep ran the new code: it migrated the live ledger to 11 and
+revised item 543 for real (job `fc480bd3`, PR dotfiles#7 closed with the
+superseded note). The episode found master already carrying another session's
+marker-based fix (dotfiles `0fcf58d`/`668c47c`, research-gateway `0cab0ed`),
+changed nothing and said so — the right answer; 543 closed with those commits.
+`warden-api` was kickstarted onto schema 11 (`/health` ok). Lesson recorded:
+in this repo "uncommitted" is not "undeployed".
+
+Tests: `test_triage.py` 297/297 (+5 revision, +3 parked), `test_api.py` 42/42
+(board item shape), `test_ledger.py` 28/28 (adoption column set).

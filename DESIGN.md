@@ -206,6 +206,8 @@ new -> investigating -> verdict -+-> implementing -> validating -+-> merged -> d
 split -> investigating   (individual re-evaluation, singleton)
 split -> needs_human     (deadline, verdict carried in `note`)
 new -> ignored | note | snoozed -> new
+merge_blocked | needs_human -> implementing   (revision: a blocking review finding or
+                                          failed checks, ≤ revisionMaxAttempts — §92)
 terminal: fixed | quiet | closed | dismissed | ignored | note
 ```
 

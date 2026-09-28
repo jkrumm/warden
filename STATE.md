@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§91 — a chronic signature (≥3 reopens in 7 d, mapped) is exempt from silence-resolve and escalates; the quiet timer reads `ts_last`) |
+| Last updated | 2026-09-28 (§92 — blocked fixes are revised with the reviewer's findings, parked items count their recurrences; schema 11) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
-| Ledger | `~/.warden/warden.db`, schema 10 |
-| Tests | `tests/test_triage.py` 289/289 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Ledger | `~/.warden/warden.db`, schema 11 |
+| Tests | `tests/test_triage.py` 297/297 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -137,6 +137,14 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
+- **Blocked fixes are revised (§92).** `maybe_revise_blocked()` (first step of
+  `advance_implement_chain()`) sends a `merge_blocked`/`needs_human` item whose
+  review blocked it, or whose checks failed before push, back to a fresh
+  implement episode with the findings, from the previous branch; the old PR is
+  closed with a pointer. `revisionMaxAttempts` (2) per item.
+- **Parked items count recurrences (§92).** `track_parked_recurrences()`: card
+  line `Recurred N× since it parked here`, `parked_recurrences`/`revision_count`
+  on `/board`, one extra reminder at `parkedRecurrenceReminder` (5).
 - **Chronic signatures escalate (§91).** A mapped row that reopened ≥
   `chronicRecurrences` (3) times in `chronicWindowDays` (7) is held out of all
   three silence paths, so a self-clearing alert that keeps returning reaches
@@ -304,6 +312,8 @@ log's past sections.
   a one-time run — §90
 - Chronic signatures escalate instead of recovery-resolving in the pass that
   reopened them; the quiet timer reads `ts_last` — §91
+- Blocked fixes revised with the reviewer's findings; parked items count their
+  recurrences; schema 11 — §92
 
 ### Next action
 

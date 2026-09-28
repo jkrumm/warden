@@ -758,6 +758,19 @@ DEFAULT_QUIET_RESOLVE_HOURS = 2.0
 DEFAULT_CHRONIC_RECURRENCES = 3
 DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 
+# maybe_revise_blocked()'s attempt cap — how many times a blocked
+# implementation goes back to a fresh implement episode carrying the
+# reviewer's findings before it parks for a human. An attempt count per item,
+# the same shape as hostVerbMaxAttempts, never a turn or time limit on the
+# episode itself (rules/agent-limits.md).
+DEFAULT_REVISION_MAX_ATTEMPTS = 2
+
+# track_parked_recurrences(): the recurrence count at which a parked item
+# posts one extra reminder, independent of REMINDER_MAX_COUNT — a signal that
+# keeps firing while its fix waits is new information every time.
+DEFAULT_PARKED_RECURRENCE_REMINDER = 5
+PARKED_STATES = ("needs_human", "merge_blocked")
+
 # maybe_auto_remediate()'s own cooldown/attempt-cap defaults — same shape as
 # DEFAULT_COOLDOWN_HOURS above but against `operations`, not `dispatches`
 # (see _host_verb_cooldown_ok()): a flapping signal must not restart a live
@@ -1567,6 +1580,12 @@ def load_policy() -> dict[str, Any]:
         "quietResolveHours": float(data.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS),
         "chronicRecurrences": int(data.get("chronicRecurrences") or DEFAULT_CHRONIC_RECURRENCES),
         "chronicWindowDays": float(data.get("chronicWindowDays") or DEFAULT_CHRONIC_WINDOW_DAYS),
+        "parkedRecurrenceReminder": _valid_host_verb_positive_number(
+            data.get("parkedRecurrenceReminder"), key="parkedRecurrenceReminder",
+            default=DEFAULT_PARKED_RECURRENCE_REMINDER, cast=int),
+        "revisionMaxAttempts": _valid_host_verb_positive_number(
+            data.get("revisionMaxAttempts"), key="revisionMaxAttempts",
+            default=DEFAULT_REVISION_MAX_ATTEMPTS, cast=int),
         "rules": [r for r in (data.get("rules") or []) if _valid_rule(r)],
         # The fifth closed allowlist's own rule set (HOST_VERB_ALLOWLIST) —
         # same match-target/first-match-wins shape as `rules` above (see
@@ -3951,7 +3970,8 @@ _ACTION_REQUIRED: dict[str, _ActionRequired] = {
 }
 
 
-def _action_required_block(state: str, note: str | None, state_deadline: str | None) -> dict[str, Any]:
+def _action_required_block(state: str, note: str | None, state_deadline: str | None,
+                           recurrences: int = 0) -> dict[str, Any]:
     """The `needs_human` / `merge_blocked` card body: a `section` block (not
     `context`) so it reads as an instruction, not a footnote. The countdown is
     deliberately day-granularity only (see sync_card()'s card_hash
@@ -3962,6 +3982,8 @@ def _action_required_block(state: str, note: str | None, state_deadline: str | N
     never push the countdown off the card."""
     copy = _ACTION_REQUIRED[state]
     lines = [copy.heading]
+    if recurrences:
+        lines.append(f"Recurred {recurrences}× since it parked here — the underlying fault is still live.")
     tail: list[str] = []
     deadline = _parse_ts(state_deadline)
     if deadline is not None:
@@ -4028,12 +4050,14 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
         if artifact_url:
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Artifact:* <{artifact_url}>"}})
         if state == STATE_NEEDS_HUMAN:
-            blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
+            blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"],
+                                                 primary["parked_recurrences"] or 0))
     elif state == STATE_NEEDS_HUMAN:
         # A verb outcome (run_verbs()) — no dispatch_job at all, since no
         # sideclaw episode was ever opened. The note IS the whole verdict: a
         # deterministic local probe's output, not an episode's.
-        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
+        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"],
+                                                 primary["parked_recurrences"] or 0))
     elif state == STATE_SNOOZED:
         blocks.append({
             "type": "context",
@@ -4084,7 +4108,8 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
             text += f"\nPull request: <{primary['pr_url']}>"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}})
     elif state == STATE_MERGE_BLOCKED:
-        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
+        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"],
+                                                 primary["parked_recurrences"] or 0))
     elif state == STATE_MERGED:
         text = f"Merged: <{primary['pr_url']}>" if primary["pr_url"] else "Merged"
         if primary["note"]:
@@ -5690,6 +5715,166 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 
+REVISION_NOTE_PREFIX = "revision "
+
+
+def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | None:
+    """What the next implement episode must fix, or None when this parked
+    item is not a revisable one. Two shapes qualify, both a concrete defect in
+    code the loop wrote itself: the independent review blocked the PR
+    (`validation_status='blocked'`, findings from the review job's own
+    verdict), or the repo's own checks failed before push (`checks_failed`).
+    Everything else parked — a needs-human review, a merge-gate refusal, a
+    failed deploy — is a question, not a finding, and stays with a human."""
+    impl = conn.execute("SELECT verdict_json, validation_status FROM dispatches WHERE job_id=?",
+                        (item["implement_job"],)).fetchone()
+    if impl is None:
+        return None
+    if impl["validation_status"] == "blocked" and item["validation_job"]:
+        rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
+                           (item["validation_job"],)).fetchone()
+        verdict = _safe_json(rev["verdict_json"] if rev else None)
+        blocking = verdict.get("blocking") or []
+        if not blocking:
+            return None
+        lines = []
+        for f in blocking:
+            loc = f.get("file") or "?"
+            if f.get("line") is not None:
+                loc = f"{loc}:{f.get('line')}"
+            lines.append(f"- {loc} — {f.get('message') or '?'}")
+        return "The independent review BLOCKED the previous attempt:\n" + "\n".join(lines)
+    result = _safe_json(impl["verdict_json"])
+    if result.get("outcome") == "checks_failed":
+        return ("The repo's own checks FAILED on the previous attempt before it could be pushed:\n"
+                f"{result.get('summary') or 'no further detail'}")
+    return None
+
+
+def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                         *, dry_run: bool) -> None:
+    """A blocked implementation goes back to a fresh implement episode with
+    the reviewer's findings, instead of parking in `merge_blocked` until a
+    human happens to look (2026-09-28, state-log §92 — dotfiles#7 sat five
+    days on one concrete, fixable finding while its alert paged 16 times).
+
+    Eligible: `merge_blocked`/`needs_human`, an implement job on record,
+    `max_tier='implement'`, a revisable reason (_revision_findings()), and
+    `revision_count < revisionMaxAttempts`. The claim is a compare-and-set
+    into `implementing` with `revision_count+1`, before the dispatch — the
+    same claim-before-dispatch shape maybe_auto_implement() uses. The new
+    episode is told to start from the previous branch and fix every finding;
+    its PR goes through the same step-7 review as the first one. The superseded
+    PR is closed with a pointer, so dead drafts do not accumulate. Past the cap
+    the item stays parked, visibly, with the attempt count on its note."""
+    max_attempts = int(policy.get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
+    candidates = conn.execute(
+        "SELECT * FROM triage_items WHERE state IN (?, ?) AND implement_job IS NOT NULL "
+        "AND max_tier='implement' AND revision_count < ? ORDER BY event_id",
+        (STATE_MERGE_BLOCKED, STATE_NEEDS_HUMAN, max_attempts),
+    ).fetchall()
+    for item in candidates:
+        if item["repo"] is None:
+            continue
+        findings = _revision_findings(conn, item)
+        if findings is None:
+            continue
+        attempt = item["revision_count"] + 1
+        if dry_run:
+            print(f"[dry-run] would revise {item['signature']} in {item['repo']} "
+                  f"(attempt {attempt}/{max_attempts})")
+            continue
+        try:
+            target = _policy.resolve_repo(item["repo"])
+            _policy.resolve_tier("implement", target)
+            _policy.check_repo_not_in_flight(conn, repo=item["repo"], exclude_event_id=item["event_id"])
+        except (PolicyError, PreconditionError, UsageError) as e:
+            print(f"triage: revision of {item['signature']} deferred: {e}", file=sys.stderr)
+            continue
+
+        prior = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
+                             (item["implement_job"],)).fetchone()
+        prior_result = _safe_json(prior["verdict_json"] if prior else None)
+        prior_pr = item["pr_url"] or prior_result.get("artifactUrl")
+        prior_branch = prior_result.get("branch")
+        start = (f"Start from the previous attempt, do not rewrite it: `git fetch origin {prior_branch}` "
+                 f"and bring its change into your worktree (`git diff HEAD...FETCH_HEAD | git apply "
+                 f"--index`), then fix what is listed below."
+                 if prior_branch else "The previous attempt's branch is not on record; re-derive the "
+                 "fix from the investigation below and avoid what is listed.")
+        brief = (
+            f"Revision {attempt} of {max_attempts} of a fix the alert triage loop already implemented"
+            f"{f' as {prior_pr}' if prior_pr else ''}. {start}\n\n{findings}\n\n"
+            "Address every finding. Keep what the previous attempt got right and do not widen scope. "
+            "If a finding is wrong, keep the code and explain why in your verdict — the same "
+            "independent review reads your PR next. If the finding cannot be fixed inside this repo, "
+            "say so and stop."
+        )
+        inv = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
+                           (item["dispatch_job"],)).fetchone() if item["dispatch_job"] else None
+        context = (_verdict_as_context(item["dispatch_job"], _safe_json(inv["verdict_json"]))
+                   if inv is not None else None)
+
+        claimed = _set_state(conn, item["event_id"], STATE_IMPLEMENTING, now, expect_state=item["state"],
+                             note=f"{REVISION_NOTE_PREFIX}{attempt}/{max_attempts}: {findings[:300]}",
+                             implement_job=None, validation_job=None, pr_url=None)
+        if not claimed:
+            conn.commit()
+            continue
+        conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?", (attempt, item["event_id"]))
+        conn.commit()
+
+        try:
+            opened = _dispatch.open_episode(
+                conn, target=target, tier="implement", brief=brief, context=context,
+                why=f"triage revision {attempt}: the step-7 review blocked the previous attempt",
+                model=AUTO_IMPLEMENT_MODEL, origin=_dispatch.Origin(event_id=item["event_id"]),
+                authorized_by="auto-from-item",
+            )
+        except RemoteError as exc:
+            if exc.maybe_mutated:
+                # Same as maybe_auto_implement(): the job may exist; the
+                # `implementing` deadline moves the item on if none appears.
+                print(f"triage: revision for {item['signature']} may have reached sideclaw ({exc})",
+                      file=sys.stderr)
+                continue
+            _set_state(conn, item["event_id"], item["state"], now, expect_state=STATE_IMPLEMENTING,
+                       note=f"revision {attempt} could not start: {exc}",
+                       implement_job=item["implement_job"], validation_job=item["validation_job"],
+                       pr_url=item["pr_url"])
+            conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?",
+                         (item["revision_count"], item["event_id"]))
+            conn.commit()
+            continue
+        except (PolicyError, PreconditionError, UsageError) as e:
+            _set_state(conn, item["event_id"], item["state"], now, expect_state=STATE_IMPLEMENTING,
+                       note=f"revision {attempt} could not start: {e}",
+                       implement_job=item["implement_job"], validation_job=item["validation_job"],
+                       pr_url=item["pr_url"])
+            conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?",
+                         (item["revision_count"], item["event_id"]))
+            conn.commit()
+            continue
+
+        conn.execute("UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
+                     (opened.job_id, _now_iso(now), item["event_id"]))
+        conn.commit()
+
+        parsed = _github.parse_pr_url(prior_pr) if prior_pr else None
+        if parsed is not None:
+            owner, repo_name, number = parsed
+            try:
+                _github.close_pr(owner, repo_name, number, comment=(
+                    f"Superseded: the step-7 review blocked this; warden opened revision {attempt} "
+                    f"(job {opened.job_id}) from this branch with the findings."))
+            except RemoteError as e:
+                print(f"triage: could not close superseded {prior_pr}: {e}", file=sys.stderr)
+
+        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
+        if fresh_item is not None and fresh_event is not None:
+            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+
+
 def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                              *, dry_run: bool) -> None:
     """Steps 6-8 — verdict -> implementing -> validating -> merge/merge_blocked
@@ -5724,6 +5909,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     chain: its own window is hours (LIVENESS_WINDOW_HOURS), not seconds, so
     the 600s tick already covers it with room to spare — see docs/history/state-log.md
     §87 for the measurement this rests on."""
+    maybe_revise_blocked(conn, policy, now, dry_run=dry_run)
     maybe_auto_implement(conn, policy, now, dry_run=dry_run)
     poll_implement_jobs(conn, policy, now, dry_run=dry_run)
     poll_validation_jobs(conn, policy, now, dry_run=dry_run)
@@ -5958,6 +6144,72 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
 # expire should be reminded right up to the moment it is.
 
 _CANARY_SIGNATURE_PREFIX = "warden_canary:"
+
+
+def track_parked_recurrences(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                             *, dry_run: bool) -> None:
+    """A parked item (`needs_human`/`merge_blocked`) absorbs every recurrence
+    of its signal: reopen_if_needed() only touches terminal rows, so the alert
+    keeps paging #alerts while the card says nothing new (item 543: 16 Dev Host
+    pages in three days, all folded silently into a draft PR, §92).
+
+    Counts observed recurrences per parking — every pass whose event
+    _occurrence_mark() moved since the last one — onto the card and the board,
+    and posts one reminder under the card when the count reaches
+    `parkedRecurrenceReminder`, regardless of REMINDER_MAX_COUNT. Leaving the
+    parked states resets the count, so the next parking starts from zero.
+    Local bookkeeping runs under --dry-run; only the Slack post does not."""
+    conn.execute(
+        f"UPDATE triage_items SET parked_mark=NULL, parked_recurrences=0, recurrence_reminded_at=NULL "
+        f"WHERE state NOT IN ({','.join('?' * len(PARKED_STATES))}) "
+        f"AND (parked_mark IS NOT NULL OR parked_recurrences != 0 OR recurrence_reminded_at IS NOT NULL)",
+        PARKED_STATES,
+    )
+    rows = conn.execute(
+        f"SELECT ti.event_id, ti.parked_mark, ti.parked_recurrences, e.* FROM triage_items ti "
+        f"JOIN events e ON e.id = ti.event_id WHERE ti.state IN ({','.join('?' * len(PARKED_STATES))})",
+        PARKED_STATES,
+    ).fetchall()
+    for row in rows:
+        mark = _occurrence_mark(row)
+        if row["parked_mark"] is None:
+            conn.execute("UPDATE triage_items SET parked_mark=? WHERE event_id=?", (mark, row["event_id"]))
+        elif mark != row["parked_mark"]:
+            conn.execute("UPDATE triage_items SET parked_mark=?, parked_recurrences=parked_recurrences+1 "
+                         "WHERE event_id=?", (mark, row["event_id"]))
+    conn.commit()
+
+    threshold = int(policy.get("parkedRecurrenceReminder") or DEFAULT_PARKED_RECURRENCE_REMINDER)
+    due = conn.execute(
+        f"SELECT * FROM triage_items WHERE state IN ({','.join('?' * len(PARKED_STATES))}) "
+        f"AND parked_recurrences >= ? AND recurrence_reminded_at IS NULL",
+        (*PARKED_STATES, threshold),
+    ).fetchall()
+    token: str | None = None
+    for row in due:
+        if not row["card_ts"]:
+            continue
+        text = (f"This signal fired again {row['parked_recurrences']}× while this item waited in "
+                f"`{row['state']}` — the fault is still live. "
+                f"{_escape((row['note'] or '').strip())[:300]}")
+        if dry_run:
+            print(f"[dry-run] would post a recurrence reminder for {row['signature']}")
+            continue
+        if token is None:
+            token = resolve_slack_token() or ""
+        if not token:
+            print(f"triage: no Slack token, cannot post recurrence reminder for {row['signature']}",
+                  file=sys.stderr)
+            continue
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}}]
+        ok, result = post_blocks(row["card_channel"] or _card_channel(policy), blocks, text, token,
+                                  thread_ts=row["card_ts"])
+        if not ok:
+            print(f"triage: recurrence reminder failed for {row['signature']}: {result}", file=sys.stderr)
+            continue
+        conn.execute("UPDATE triage_items SET recurrence_reminded_at=? WHERE event_id=?",
+                     (_now_iso(now), row["event_id"]))
+        conn.commit()
 
 
 def remind_needs_human(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
@@ -7143,6 +7395,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # get a reminder threaded under a card that no longer describes its
     # current state.
     remind_needs_human(conn, policy, now, dry_run=dry_run)
+    track_parked_recurrences(conn, policy, now, dry_run=dry_run)
 
     for _key, members in _cluster_groups(conn).items():
         members = sorted(members, key=lambda r: r["event_id"])

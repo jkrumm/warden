@@ -566,7 +566,7 @@ def test_board_counts_items_shape_ordering_and_terminal_24h():
     assert set(one.keys()) == {
         "event_id", "origin", "repo", "state", "state_deadline", "max_tier", "title", "note",
         "pr_url", "dispatch_job", "implement_job", "validation_job", "occurrences",
-        "created_at", "updated_at", "origin_channel", "origin_thread_ts",
+        "parked_recurrences", "revision_count", "created_at", "updated_at", "origin_channel", "origin_thread_ts",
         "availableActions", "issue",
     }
     assert one["title"] == "title1"

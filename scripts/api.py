@@ -720,6 +720,8 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "implement_job": row["implement_job"],
         "validation_job": row["validation_job"],
         "occurrences": row["occurrences"],
+        "parked_recurrences": row["parked_recurrences"],
+        "revision_count": row["revision_count"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "origin_channel": row["origin_channel"],

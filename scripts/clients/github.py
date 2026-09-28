@@ -185,6 +185,20 @@ def merge_pr(owner: str, repo: str, number: int, *, sha: str, method: str) -> di
     )
 
 
+def close_pr(owner: str, repo: str, number: int, *, comment: str | None = None) -> None:
+    """Close a pull request this bridge opened, optionally saying why first.
+    The comment is best-effort (a 403 on Issues: Write must not keep a
+    superseded PR open); the close itself raises on failure."""
+    if comment:
+        try:
+            api("POST", f"/repos/{owner}/{repo}/issues/{number}/comments", {"body": comment})
+        except RemoteError:
+            pass
+    status, body = api("PATCH", f"/repos/{owner}/{repo}/pulls/{number}", {"state": "closed"})
+    if status != 200:
+        raise RemoteError(f"closing {owner}/{repo}#{number} returned HTTP {status}: {str(body)[:200]}")
+
+
 def delete_branch(owner: str, repo: str, branch: str) -> bool:
     # `safe="/"`, not `""` — a dispatch branch is `dispatch/<repo>-<n>`, one
     # legitimate embedded slash, exactly like contents()'s path below.

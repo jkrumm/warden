@@ -140,6 +140,10 @@ _RESOLVE_REPO_DENY: dict[str, list[str]] = {"deny": []}
 _RECURSION_MARKERS = ("CLAUDE_CODE_SESSION", "CLAUDECODE", "CLAUDE_SESSION_ID", "CLAUDE_ENTRYPOINT")
 
 
+# Every PR a test's revision closed — reset per _triage_env().
+CLOSED_PRS: list[tuple[str, str, int, str | None]] = []
+
+
 @contextlib.contextmanager
 def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None = None,
                 merge_approval: list[str] | None = None):
@@ -188,6 +192,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         ("_github", "actions_runs"): triage._github.actions_runs,
         ("_github", "search_issues"): triage._github.search_issues,
         ("_github", "create_issue_comment"): triage._github.create_issue_comment,
+        ("_github", "close_pr"): triage._github.close_pr,
         ("_merge", "plan_or_land"): triage._merge.plan_or_land,
         ("_approvals", "execute_approved"): triage._approvals.execute_approved,
         ("_argo", "push_snapshot"): triage._argo.push_snapshot,
@@ -238,6 +243,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage._github.search_issues = lambda *, owner, skip_label: []
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
+        CLOSED_PRS.clear()
+        triage._github.close_pr = lambda owner, repo, number, *, comment=None: CLOSED_PRS.append(
+            (owner, repo, number, comment))
 
         posted: list[dict[str, Any]] = []
         updated: list[dict[str, Any]] = []
@@ -8111,6 +8119,160 @@ def test_quiet_anchor_takes_the_latest_iso_clock():
            "first_seen": (NOW - dt.timedelta(days=4)).isoformat(), "payload_json": "{}"}
     anchor, _raw = triage._quiet_anchor(row)
     assert abs((anchor - (NOW - dt.timedelta(minutes=5))).total_seconds()) < 1
+
+
+# --- revision of a blocked implementation (§92) -------------------------------
+
+def _seed_blocked_item(conn, *, external_id: str, blocking: list[dict[str, Any]] | None = None,
+                       revision_count: int = 0) -> int:
+    eid = _seed_verdict_item(conn, external_id=external_id)
+    conn.execute(
+        "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=?, revision_count=? "
+        "WHERE event_id=?",
+        (triage.STATE_MERGE_BLOCKED, f"impl-{external_id}", f"val-{external_id}",
+         "https://github.com/jkrumm/demo-repo/pull/7", revision_count, eid),
+    )
+    _seed_implement_dispatch(conn, f"impl-{external_id}")
+    conn.execute("UPDATE dispatches SET validation_status='blocked', verdict_json=? WHERE job_id=?",
+                 (json.dumps({"outcome": "pr_opened", "branch": "dispatch/prior-branch",
+                              "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/7"}),
+                  f"impl-{external_id}"))
+    conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, verdict_json) "
+                 "VALUES (?,?,?,?,?,?,?)",
+                 (f"val-{external_id}", "review", "demo-repo", "review PR #7", "done", NOW.isoformat(),
+                  json.dumps({"outcome": "actionable", "blocking": blocking if blocking is not None else [
+                      {"file": "scripts/check.sh", "line": 808, "message": "exit 0 fails open on crash loops"}]})))
+    conn.commit()
+    return eid
+
+
+def test_blocked_implementation_goes_back_to_the_implementer_with_findings():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-revise")
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_IMPLEMENTING
+        assert item["revision_count"] == 1
+        assert item["implement_job"] and item["implement_job"] != "impl-sig-revise"
+        assert item["validation_job"] is None and item["pr_url"] is None
+        assert len(calls) == 1 and calls[0]["tier"] == "implement"
+        brief = calls[0]["brief"]
+        assert "scripts/check.sh:808" in brief and "fails open on crash loops" in brief
+        assert "git fetch origin dispatch/prior-branch" in brief
+        assert CLOSED_PRS and CLOSED_PRS[0][:3] == ("jkrumm", "demo-repo", 7)
+
+
+def test_revision_stops_at_the_attempt_cap():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-capped",
+                                 revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGE_BLOCKED
+        assert calls == []
+
+
+def test_non_finding_blocks_are_not_revised():
+    """A merge-gate refusal or a needs-human review is a question, not a
+    finding — it stays with a human."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-nofinding", blocking=[])
+        conn.execute("UPDATE dispatches SET validation_status='needs_human' WHERE job_id=?",
+                     ("impl-sig-nofinding",))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGE_BLOCKED
+        assert calls == []
+
+
+def test_checks_failed_before_push_is_revised():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-redchecks")
+        conn.execute("UPDATE triage_items SET state=?, validation_job=NULL WHERE event_id=?",
+                     (triage.STATE_NEEDS_HUMAN, eid))
+        conn.execute("UPDATE dispatches SET validation_status=NULL, verdict_json=? WHERE job_id=?",
+                     (json.dumps({"outcome": "checks_failed", "summary": "bun test: 2 failing",
+                                  "branch": "dispatch/red"}), "impl-sig-redchecks"))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_IMPLEMENTING
+        assert "bun test: 2 failing" in calls[0]["brief"]
+
+
+def test_revision_that_cannot_start_hands_the_item_back():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-refused")
+        triage._sideclaw.submit = _fake_submit([], ok=False)
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGE_BLOCKED
+        assert item["revision_count"] == 0
+        assert item["implement_job"] == "impl-sig-refused" and item["pr_url"]
+        assert "could not start" in item["note"]
+        assert CLOSED_PRS == []
+
+
+# --- recurrences while parked (§92) -------------------------------------------
+
+def _seed_parked(conn, *, external_id: str, state: str = "merge_blocked") -> int:
+    eid = _seed_verdict_item(conn, external_id=external_id)
+    conn.execute("UPDATE triage_items SET state=?, card_channel='C0TESTCHAN01', card_ts='1000.000001', "
+                 "note='merge by hand' WHERE event_id=?", (state, eid))
+    conn.commit()
+    return eid
+
+
+def _recur(conn, eid: int, n: int) -> None:
+    conn.execute("UPDATE events SET payload_json=? WHERE id=?",
+                 (json.dumps({"ts_last": f"17000{n:05d}.000001"}), eid))
+    conn.commit()
+
+
+def test_parked_item_counts_recurrences_and_reminds_once_at_threshold():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_parked(conn, external_id="sig-parked")
+        policy = triage.load_policy()
+        triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)  # baseline
+        assert triage._get_item(conn, eid)["parked_recurrences"] == 0
+        for n in range(1, triage.DEFAULT_PARKED_RECURRENCE_REMINDER + 2):
+            _recur(conn, eid, n)
+            triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["parked_recurrences"] == triage.DEFAULT_PARKED_RECURRENCE_REMINDER + 1
+        reminders = [p for p in ctx.posted if p["thread_ts"] == "1000.000001"]
+        assert len(reminders) == 1, reminders
+        assert "fired again 5×" in reminders[0]["text"]
+
+
+def test_parked_recurrence_count_resets_when_the_item_moves_on():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_parked(conn, external_id="sig-moves")
+        policy = triage.load_policy()
+        triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)
+        _recur(conn, eid, 1)
+        triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["parked_recurrences"] == 1
+        triage._set_state(conn, eid, triage.STATE_CLOSED, NOW, note="done")
+        conn.commit()
+        triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["parked_recurrences"] == 0 and item["parked_mark"] is None
+
+
+def test_card_shows_recurrences_since_parked():
+    block = triage._action_required_block(triage.STATE_MERGE_BLOCKED, "merge by hand", None, 7)
+    assert "Recurred 7× since it parked here" in block["text"]["text"]
+    assert "Recurred" not in triage._action_required_block(
+        triage.STATE_MERGE_BLOCKED, "merge by hand", None)["text"]["text"]
 
 
 if __name__ == "__main__":
