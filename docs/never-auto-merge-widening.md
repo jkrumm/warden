@@ -1,6 +1,33 @@
-# Prepared, not landed: NEVER_AUTO_MERGE for weatherorb
+# Landed: NEVER_AUTO_MERGE withdrawn (§107)
 
-Written 2026-09-28 (state-log §105). One owner word lands it; nothing here is live.
+Prepared 2026-09-28 (§105) as a per-repo question; answered and landed
+2026-09-29. The owner, in words: "mach es. Es soll effektiv sein, es soll
+funktionieren." — everything that stops a fix at a draft PR goes, Makefiles,
+`ops/`, `.github/`, plists, manifests, lockfiles, `pyproject.toml` included; the
+one exception he did not withdraw is his own executor: `warden`, `sideclaw`,
+`dotfiles`.
+
+**What landed is broader than the diff below proposed**, and the reason is his
+wording: the answer was not "weatherorb", it was "everything but the executor".
+So instead of a `FULL_AUTONOMY_REPOS` exemption the tuple itself is gone from
+`scripts/lifecycle/merge.py`, and the part he kept moved into code as
+`EXECUTOR_REPOS = {"warden", "sideclaw", "dotfiles"}` — gated there even if
+`merge_approval` in the dispatch policy were emptied, no scope ever, and the
+CI-definition refusal (`.github/workflows`, `.github/actions`) now applies to
+those three only, still on the owner's Argo click too. The four tests that
+pinned the old rule were re-pinned to the new one, not weakened: the paths that
+used to refuse now assert a merge, and a new test asserts the executor gate
+holds with the policy file gating nothing.
+
+`weatherorb-pull` grew a `make launchd-install` between the pull and the
+kickstarts, because a merged `ops/*.plist` that nothing reloads is "merged, not
+deployed" — and the repo's own target renders and bootstraps only a changed
+plist.
+
+The analysis below is kept as written on 2026-09-28; its "one question" is
+answered above.
+
+---
 
 ## Where the line is today
 

@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§106 — a trip shadow that has been deleted is unproven, never "detection no longer fires"; §105's weatherorb proof stands, its trip re-verified by hand) |
+| Last updated | 2026-09-29 (§107 — NEVER_AUTO_MERGE withdrawn on the owner's word: Makefiles, CI, plists, manifests, lockfiles merge unattended everywhere except the executor repos, which are now gated in code (`EXECUTOR_REPOS`); `weatherorb-pull` also runs `make launchd-install`) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -138,18 +138,29 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
-- **weatherorb is fully unattended (§105).** `autoMergePaths: ["**"]` — the
-  default unattended scope, declared explicitly; only `NEVER_AUTO_MERGE`
-  (merge.py) still stops a weatherorb PR at a draft. `weatherorb-pull` now
-  fast-forwards AND kickstarts tileserver/sync (`serve` is the vendored
-  binary, untouched), so a merge is the rollout for the long-running code too.
+- **NEVER_AUTO_MERGE is gone (§107).** Owner, 2026-09-29: "mach es. Es soll
+  effektiv sein, es soll funktionieren." No path class stops an unattended
+  merge any more — Makefile, `.github/workflows`, `scripts/`, `launchd/`,
+  plists, Docker/compose, `package.json`, lockfiles, `pyproject.toml`, `.env*`
+  merge like any other file in any repo that is not the loop's own executor.
+  What he kept: `warden`, `sideclaw`, `dotfiles` — now `EXECUTOR_REPOS` in
+  `merge.py` (code, gated even if `merge_approval` in the dispatch policy were
+  emptied), no scope ever, CI-definition changes refused there even on his
+  Argo click. The gate for everything else is the step-7 review with the goal,
+  the implement tier's pre-push checks, CI where it exists, GitHub's rules,
+  liveness and the synthetic trip.
+- **weatherorb is fully unattended (§105, §107).** `autoMergePaths: ["**"]` —
+  the default unattended scope, declared explicitly. `weatherorb-pull` now
+  fast-forwards, runs the repo's own idempotent `make launchd-install` (a merged
+  `ops/*.plist` is reloaded, unchanged ones untouched) and kickstarts
+  tileserver/sync (`serve` is the vendored binary, untouched), so a merge is
+  the rollout for the long-running code and the service definitions too.
   Liveness for a merge repo needs no host-verb path: `_kuma_monitor_title()`
   reads the item's own `uk`/`[Name]` event, `_gather_kuma_push_fresh()` confirmed
   live against `WeatherOrb Watchdog - Push`, and the synthetic trip on a shadow
   of that monitor went DOWN in its window (§105). An issue-origin item has no
-  monitor of its own and lands `merged`, said so on its note. Widening
-  `NEVER_AUTO_MERGE` for weatherorb (Makefile, CI, plists, manifests) is written
-  up as a diff in `docs/never-auto-merge-widening.md`, not landed.
+  monitor of its own and lands `merged`, said so on its note.
+  `docs/never-auto-merge-widening.md` records the widening as landed (§107).
 - **Restore drill (§104).** `scripts/warden-restore.sh` restores the newest
   off-box snapshot into a temp dir and verifies integrity, schema via the
   migrator, data plausibility, a loop dry-run and a repo-bundle clone; it cannot
@@ -162,11 +173,11 @@ loop.
 - **Self-audit (§100).** Hourly `check_invariants()` (INV-1…7, DESIGN.md §
   Executable invariants) + `self_audit_findings()`; findings become
   `warden_self` events → repo `warden` → ordinary items; `/health.self_audit`.
-- **Default unattended merge scope (§99).** A repo with no `autoMergePaths` of
-  its own and not merge-approval gated merges anything `NEVER_AUTO_MERGE`
-  (merge.py: CI, Makefiles, scripts, launchd, Docker/compose, manifests,
-  lockfiles, env templates) does not name; gated repos and an unreadable
-  dispatch policy fail closed. Review gate = GitHub's branch rules (§97).
+- **Default unattended merge scope (§99, widened §107).** A repo with no
+  `autoMergePaths` of its own and not merge-approval gated merges any path;
+  gated repos (`EXECUTOR_REPOS` in code, plus `merge_approval`) and an
+  unreadable dispatch policy fail closed. Review gate = GitHub's branch rules
+  (§97).
 - **Live evidence in briefs (§95).** `launchd-restarts` (Dev Host),
   `beszel-alerts` (homelab temp/CPU/load/disk thresholds + firings),
   `kuma-monitor-config` (public monitors.yaml block + last 25 heartbeats).
@@ -216,11 +227,6 @@ loop.
 
 ## Open — owner actions
 
-- **One word on `docs/never-auto-merge-widening.md` (§105):** weatherorb (only)
-  out of `NEVER_AUTO_MERGE` entirely — Makefile, `.github/workflows`,
-  `ops/*.plist`, `package.json`/`bun.lock`/`uv.lock`/`pyproject.toml` — yes,
-  no, or Makefile only. The diff and its consequences are in the file; until
-  then those paths stop at a draft PR and the Argo Merge click.
 - The §55 4.3 "human types in Slack" acceptance is still open.
 - `warden-api`'s "LAST EXIT -15" is the §55 kickstart; cosmetic.
 - `op://mini/github/token` (fine-grained PAT) is missing `Issues: Read` on
@@ -383,6 +389,7 @@ log's past sections.
 - The ledger restore, drilled and self-checking — §104
 - weatherorb fully unattended; the NEVER_AUTO_MERGE widening prepared, not landed — §105
 - A vanished trip shadow is unproven, never a finding — §106
+- NEVER_AUTO_MERGE withdrawn on the owner's word; the executor gate moves into code — §107
 
 ### Next action
 

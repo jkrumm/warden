@@ -4477,8 +4477,9 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
     `validating` (sweep never ran, or a residual pre-fix row) whose implement
     dispatch row still reads `status='running'` — even though the review job
     the merge gate is about to act on comes back `clean`. The merge attempt
-    may still be refused for a real policy reason (here: the PR touches a
-    NEVER_AUTO_MERGE path), but never for the stale-status reason that was false."""
+    may still be refused for a real policy reason (here: the head commit's CI
+    has not passed — until §107 it was a Makefile path, a class that now merges),
+    but never for the stale-status reason that was false."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-stale-impl-row")
         conn.execute(
@@ -4510,17 +4511,18 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
                 read_pr=lambda owner, repo, number: pr,
                 read_repo=lambda owner, repo: _fake_repo_json(),
                 pr_files=lambda owner, repo, number: [{"filename": "Makefile"}],
-                check_runs=lambda owner, repo, sha: [],
+                check_runs=lambda owner, repo, sha: [
+                    {"name": "ci", "status": "completed", "conclusion": "failure"}],
             ):
                 triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] != triage.STATE_MERGED, (
-            "the PR touches a NEVER_AUTO_MERGE path — a real merge must not land")
+            "the head commit's CI failed — a real merge must not land")
         assert item["note"] is not None
         assert "finished as 'running'" not in item["note"], item["note"]
-        assert "NEVER_AUTO_MERGE" in item["note"], (
-            f"expected the real path-scope refusal, got: {item['note']!r}")
+        assert "has not passed cleanly" in item["note"], (
+            f"expected the real CI refusal, got: {item['note']!r}")
 
 
 def test_liveness_confirmed_resolves_the_item():

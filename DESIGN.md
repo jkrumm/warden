@@ -362,11 +362,16 @@ Mitigations, all required together:
   either paging #alerts or re-pointing the alert's channel, itself a production
   change). For those, `fixed` still rests on review, liveness and recurrence,
   and the note says so.
-- A deploy target's own definition — `Makefile`, `scripts/**`, `.github/**` — is
+- ~~A deploy target's own definition — `Makefile`, `scripts/**`, `.github/**` — is
   permanently outside every `autoMergePaths`. Otherwise warden can write the code
-  it then executes.
-  *Executable since 2026-09-28:* `NEVER_AUTO_MERGE` in `scripts/lifecycle/merge.py`,
-  checked on every unattended merge whatever the scope says (state-log §99).
+  it then executes.~~ *Executable 2026-09-28 as `NEVER_AUTO_MERGE` (§99);
+  **withdrawn by the owner 2026-09-29 (§107)** for every repo but the loop's own
+  executor: "es soll effektiv sein, es soll funktionieren" — a fix that stops at
+  a draft PR because it touched a Makefile is not a fix. What remains of this
+  mitigation is `EXECUTOR_REPOS` (`warden`, `sideclaw`, `dotfiles`) in code: no
+  scope, no unattended merge, no CI-definition change even on the Argo click.
+  Everywhere else the self-concealing risk is carried by the two bullets above
+  and by `reopen_if_needed()`, not by a path list.
 
 ### Promotion and demotion
 
@@ -786,9 +791,10 @@ they flag is already exactly one entry in the owner's list.
 The self-audit adds four findings about the loop's own answers:
 `review-always-blocks-<repo>`, `liveness-never-confirms-<repo>`,
 `fixed-reopened-<event>` (a verdict or fix proven wrong), and
-`revisions-exhausted-<event>`. Enforced elsewhere, by name: `NEVER_AUTO_MERGE`
-and the fail-closed executor gate (`merge.py`, §99), GitHub's rules as the only
-review gate (§97), `OWNER_AUTHORIZERS = ("owner:argo",)` (§96).
+`revisions-exhausted-<event>`. Enforced elsewhere, by name: the fail-closed
+executor gate (`EXECUTOR_REPOS` in `merge.py`, §99/§107 — `NEVER_AUTO_MERGE`
+itself was withdrawn in §107), GitHub's rules as the only review gate (§97),
+`OWNER_AUTHORIZERS = ("owner:argo",)` (§96).
 
 ## What must not be lost
 

@@ -376,9 +376,24 @@ def test_over_line_ceiling_refuses():
     _assert_refuses(exc_type=PolicyError, msg="over the", fake={"pr": {**_DEFAULT_PR, "additions": 4000}})
 
 
-def test_touches_ci_definitions_refuses():
-    _assert_refuses(exc_type=PolicyError, msg="CI definitions",
-                     fake={"files": [{"filename": ".github/workflows/ci.yml"}]})
+def test_touches_ci_definitions_refuses_only_for_the_executor_repos():
+    """§107: a workflow change merges in any other repo (the owner withdrew the
+    CI-path rule with NEVER_AUTO_MERGE); in warden/sideclaw/dotfiles it still
+    refuses, and refuses the owner's own click too — that part he kept."""
+    for repo in sorted(merge.EXECUTOR_REPOS):
+        pr = {**_DEFAULT_PR, "head": {**_DEFAULT_PR["head"], "repo": {"full_name": f"jkrumm/{repo}"}}}
+        _assert_refuses(exc_type=PolicyError, msg="CI definitions",
+                         seed={"repo": repo, "artifact": f"https://github.com/jkrumm/{repo}/pull/7"},
+                         fake={"pr": pr, "files": [{"filename": ".github/workflows/ci.yml"}],
+                               "gated": True})
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, validation_status="confirmed")
+        with fakes(files=[{"filename": ".github/workflows/ci.yml"}]) as fx:
+            assert _land(conn, why="w", authorized_by="auto-from-item").merged
+        assert "merge_pr" in fx.calls
+    finally:
+        conn.close()
 
 
 def test_no_merge_method_allowed_refuses():
@@ -677,15 +692,28 @@ def test_ungated_repo_without_an_entry_gets_the_default_scope():
     assert result.merged
 
 
-def test_never_auto_merge_paths_refuse_even_inside_an_explicit_scope():
+def test_deploy_definitions_merge_unattended_in_an_ungated_repo():
+    """§107 — the owner withdrew NEVER_AUTO_MERGE on 2026-09-29: a Makefile,
+    a CI workflow, a plist, a lockfile or a manifest is a fix like any other
+    in a repo that is not the loop's own executor. Until then every one of
+    these paths refused with 'NEVER_AUTO_MERGE' inside an explicit `**` scope;
+    that expectation is the old rule, not a weakened test."""
     for path in ("Makefile", "scripts/deploy.sh", "package.json", "bun.lock", "launchd/x.plist",
-                 "compose.yml", "apps/api/Dockerfile", ".env.tpl"):
-        _assert_refuses(exc_type=PolicyError, msg="NEVER_AUTO_MERGE",
-                         fake={"entry": {"autoMergePaths": ["**"], "noCiRequired": True},
-                               "files": [{"filename": path}]})
+                 "compose.yml", "apps/api/Dockerfile", ".env.tpl", ".github/workflows/ci.yml",
+                 "pyproject.toml", "ops/com.example.job.plist"):
+        conn = _fresh_ledger()
+        try:
+            _seed_pr_dispatch(conn, validation_status="confirmed")
+            with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True},
+                       files=[{"filename": path}]) as fx:
+                result = _land(conn, why="w", authorized_by="auto-from-item")
+            assert result.merged, path
+            assert "merge_pr" in fx.calls, path
+        finally:
+            conn.close()
 
 
-def test_owner_merge_passes_never_auto_merge_paths():
+def test_owner_merge_passes_any_path():
     merge.merge_gate_check(repo="gamma", entry={}, files=[{"filename": "Makefile"}], check_runs=[],
                            validation="confirmed", owner_approved=True)
 
@@ -1156,12 +1184,25 @@ def test_github_blocked_state_refuses_whatever_produced_it():
         conn.close()
 
 
-def test_never_auto_merge_covers_variants_and_other_ecosystems():
-    for path in ("Dockerfile.dev", "docker/Containerfile", "go.mod", "svc/go.sum", "Cargo.toml",
-                 "pnpm-lock.yaml", "yarn.lock", "apps/web/package-lock.json", ".github/workflows/ci.yml"):
-        assert any(merge.fnmatch.fnmatch(path, p) for p in merge.NEVER_AUTO_MERGE), path
-    for path in ("src/app.ts", "docs/readme.md", "uptime-kuma/monitors.yaml"):
-        assert not any(merge.fnmatch.fnmatch(path, p) for p in merge.NEVER_AUTO_MERGE), path
+def test_executor_repos_are_gated_in_code_not_only_in_the_dispatch_policy():
+    """§107: with NEVER_AUTO_MERGE gone, the executor gate is the one invariant
+    left, and it must not depend on `merge_approval` in a policy file staying
+    intact. Even when the dispatch policy gates nothing, warden, sideclaw and
+    dotfiles get no scope — an explicit `**` in their triage entry included."""
+    assert merge.EXECUTOR_REPOS == frozenset({"warden", "sideclaw", "dotfiles"})
+    for repo in sorted(merge.EXECUTOR_REPOS):
+        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True}, gated=False):
+            entry = merge.effective_repo_entry(repo)
+        assert "autoMergePaths" not in entry, repo
+        try:
+            merge.merge_gate_check(repo=repo, entry=entry, files=[{"filename": "README.md"}],
+                                   check_runs=[], validation="confirmed")
+        except PolicyError as e:
+            assert "no autoMergePaths" in str(e), str(e)
+        else:
+            raise AssertionError(f"{repo} must never merge unattended")
+    with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True}, gated=False):
+        assert merge.effective_repo_entry("gamma").get("autoMergePaths") == ["**"]
 
 if __name__ == "__main__":
     sys.exit(main())

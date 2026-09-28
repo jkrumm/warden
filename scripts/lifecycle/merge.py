@@ -156,28 +156,26 @@ class MergeResult:
 # gets an implicit allow by omission. `noCiRequired` is an explicit per-repo
 # acknowledgement that a repo has zero PR-time checks, so their absence is a
 # known condition rather than a silently-passed test.
-# Paths no UNATTENDED merge may ever touch, in any repo, whatever its
-# `autoMergePaths` says (§99) — DESIGN.md § Self-concealing change made
-# executable: warden must not write the code it then runs (deploy targets,
-# service definitions, CI), nor change what gets installed (manifests,
-# lockfiles — rules/dependency-hygiene). Code, not policy: a policy file may
-# name and parameterise, never widen this. The owner's Argo merge is the one
-# path past it.
-NEVER_AUTO_MERGE: tuple[str, ...] = (
-    # fnmatch's `*` spans `/`, so `*X` means "X at any depth" — no `**/` forms.
-    ".github/*", "*Makefile", "*.mk", "scripts/*", "launchd/*", "*.plist",
-    "*Dockerfile*", "*Containerfile*", "*compose*.y*ml",
-    "*package.json", "*.lock", "*-lock.json", "*-lock.yaml", "*go.mod", "*go.sum",
-    "*Cargo.toml", "*pyproject.toml", "*requirements*.txt", "*Gemfile", "*.gemspec",
-    ".env*", "*/.env*", "*.tpl",
-)
+#
+# There is no path class an unattended merge may never touch any more. §99's
+# NEVER_AUTO_MERGE (Makefiles, CI, scripts, launchd, plists, Docker/compose,
+# manifests, lockfiles, env templates — "warden must not write the code it
+# then runs") was withdrawn by the owner on 2026-09-29, in words: the merge
+# must be effective, and a fix that stops at a draft PR because it touched a
+# Makefile is not (state-log §107). What is left of that invariant is the
+# one part he did not withdraw: the loop's own executor. `EXECUTOR_REPOS` is
+# code, not policy — an edit to `merge_approval` in the dispatch policy can
+# add a gated repo, never remove one of these three — and a gated repo gets
+# no scope at all, so nothing unattended ever lands there, whatever the path.
+EXECUTOR_REPOS: frozenset[str] = frozenset({"warden", "sideclaw", "dotfiles"})
 
 # What an unattended merge may touch in a repo whose policy entry declares no
-# `autoMergePaths` of its own and is not merge-approval gated (§99): anything
-# NEVER_AUTO_MERGE does not name. The owner, twice on 2026-09-28: most fixes
-# should be reviewed, merged, deployed and verified without him. The gate is
-# the independent step-7 review with the goal in hand, the implement tier's
-# own pre-push checks, CI where the repo has PR checks, and GitHub's rules.
+# `autoMergePaths` of its own and is not merge-approval gated (§99): anything.
+# The owner, twice on 2026-09-28 and again on 2026-09-29: fixes are reviewed,
+# merged, deployed and verified without him. The gate is the independent
+# step-7 review with the goal in hand, the implement tier's own pre-push
+# checks, CI where the repo has PR checks, GitHub's rules, and the liveness
+# probe plus synthetic trip after the deploy.
 DEFAULT_REPO_ENTRY: dict[str, Any] = {"autoMergePaths": ["**"], "noCiRequired": True}
 
 
@@ -190,10 +188,13 @@ def effective_repo_entry(repo: str) -> dict[str, Any]:
     routing (before §99 that routing was the only thing in the way, and it
     failed open on an unreadable policy)."""
     entry = policy.triage_repo_entry(repo)
-    try:
-        gated = policy.merge_needs_approval(policy.load_dispatch_policy(), repo)
-    except WardenError:
+    if repo in EXECUTOR_REPOS:
         gated = True
+    else:
+        try:
+            gated = policy.merge_needs_approval(policy.load_dispatch_policy(), repo)
+        except WardenError:
+            gated = True
     if gated:
         # Checked FIRST and unconditionally: an `autoMergePaths` someone adds
         # for a gated repo later must not open the loop's own executor (§102).
@@ -235,14 +236,6 @@ def merge_gate_check(
                 f"{repo}'s pull request touches path(s) outside the auto-merge scope: "
                 f"{', '.join(bad)}."
             )
-        never = [fn for fn in filenames if any(fnmatch.fnmatch(fn, p) for p in NEVER_AUTO_MERGE)]
-        if never:
-            raise PolicyError(
-                f"{repo}'s pull request touches path(s) no unattended merge may land "
-                f"(deploy definitions, CI, dependencies — NEVER_AUTO_MERGE): {', '.join(never)}. "
-                f"The owner's Argo merge is the path for this one."
-            )
-
     if not check_runs:
         if not entry.get("noCiRequired") and not owner_approved:
             raise PolicyError(
@@ -521,9 +514,12 @@ def plan_or_land(
         )
 
     files = github.pr_files(owner, repo, pr_number)
+    # CI definitions: refused for the loop's own executor even on the owner's
+    # click (an Actions change there is a change to what runs warden's own
+    # code); everywhere else a workflow is a fix like any other since §107.
     forbidden = [
         f.get("filename") for f in files
-        if f.get("filename") and _FORBIDDEN_PATH_RE.match(f["filename"])
+        if repo in EXECUTOR_REPOS and f.get("filename") and _FORBIDDEN_PATH_RE.match(f["filename"])
     ]
     if forbidden:
         raise PolicyError(

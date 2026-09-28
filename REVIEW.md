@@ -106,7 +106,10 @@ the step-7 review is a real gate with the goal in hand and an explicit
 detection question (`VALIDATION_GATE_QUESTIONS` — loosening detection without
 evidence the old setting misfired is a *blocking* finding) on a different model
 family than the implementer; deploy-target definitions (`sync.py`,
-`Makefile`, `scripts/**`) stay outside every `autoMergePaths`; `fixed` needs
+`Makefile`, `scripts/**`) stayed outside every `autoMergePaths` until the owner
+withdrew that rule for every repo but his own executor (§107, 2026-09-29 —
+the C3 mitigation now rests on the review, the trip and the reopen tracking,
+not on a path list); `fixed` needs
 the item's own monitor to report UP after the deploy, not the config to be
 live; and a reopen after `fixed` is tracked (`reopen_if_needed()`, §91's
 chronic rule, §92's parked-recurrence count). The synthetic trip C3 asked for

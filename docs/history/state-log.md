@@ -8939,3 +8939,76 @@ Tests: `tests/test_triage.py` 340 → 341 (the vanished-shadow case: retried, ne
 `fixed`, note carries "gone before" + "unproven, not fixed"). Numbered cases
 871 → 872. `make test` green. Files changed: `scripts/triage.py`,
 `tests/test_triage.py`, this log, `STATE.md`.
+
+## 107. NEVER_AUTO_MERGE withdrawn on the owner's word; the executor gate moves into code (2026-09-29)
+
+§105 prepared the widening and asked one question. The answer, relayed in the
+owner's words: "mach es. Es soll effektiv sein, es soll funktionieren." —
+Makefiles, `ops/`, `.github/`, plists, manifests, lockfiles, `pyproject.toml`,
+everything that stops a fix at a draft PR, with one exception he named and did
+not withdraw: `warden`, `sideclaw` and `dotfiles`, the loop's own executor.
+
+**What changed.** `NEVER_AUTO_MERGE` (§99) is deleted from
+`scripts/lifecycle/merge.py`, and with it the path-class refusal in
+`merge_gate_check()`. The default unattended scope is now literally any path.
+The CI-definition refusal in `plan_or_land()` (`.github/workflows`,
+`.github/actions`, older than §99 and applied even to the owner's click) is kept
+for the executor repos only. What he kept is now code, not policy:
+`EXECUTOR_REPOS = frozenset({"warden", "sideclaw", "dotfiles"})`, checked in
+`effective_repo_entry()` before the dispatch policy's `merge_approval` is even
+read — an edit to that policy file can add a gated repo, never remove one of
+these three. A gated repo gets no scope, so nothing unattended lands there
+whatever the path.
+
+**Why global, not weatherorb-only.** §105's diff proposed a per-repo exemption
+to keep the tuple and its pin test intact. The owner's answer was not "yes for
+weatherorb", it was "everything but the executor", so a tuple that applies to
+no repo would have been dead code guarding nothing. The one thing it protected
+that he did not withdraw — the executor — is what stayed, and it stayed in a
+stronger form (code, independent of the policy file).
+
+**Tests re-pinned, not weakened.** `test_never_auto_merge_paths_refuse_even_inside_an_explicit_scope`
+→ `test_deploy_definitions_merge_unattended_in_an_ungated_repo`: the same eight
+paths plus `.github/workflows/ci.yml`, `pyproject.toml` and an `ops/*.plist`
+now assert a landed merge with `merge_pr` called.
+`test_never_auto_merge_covers_variants_and_other_ecosystems` →
+`test_executor_repos_are_gated_in_code_not_only_in_the_dispatch_policy`: with
+the fake dispatch policy gating nothing and an explicit `**` in the triage
+entry, each of the three still gets no scope and refuses; `gamma` gets `**`.
+`test_touches_ci_definitions_refuses` → `…_only_for_the_executor_repos`: refuses
+for each of the three, merges for `gamma`. `test_owner_merge_passes_never_auto_merge_paths`
+→ `test_owner_merge_passes_any_path` (unchanged body). In `test_triage.py`,
+`test_merge_precheck_no_longer_refuses_on_a_stale_implement_row` needed a real
+refusal that was not the stale-status one; it used a `Makefile` path, which now
+merges, so it uses a failed check-run instead — its point (refused for the real
+reason, never the false one) is intact. `test_clients.py`'s `weatherorb-pull`
+test asserts the new order pull → `launchd-install` → kickstarts and that
+`FORCE` is never passed (only a changed plist reloads).
+
+**`weatherorb-pull` runs the Makefile it may now merge.** That is the point:
+a merged `ops/*.plist` that nothing reloads would sit "merged, not deployed"
+while the watchdog push confirmed liveness of the old definition. The repo's
+own `make launchd-install` renders all eight plists and bootout+bootstraps only
+the ones whose rendered form changed (byte-identical + loaded → left alone),
+which is also the one reload that re-reads a plist; `kickstart -k` for
+tileserver/sync follows as in §105. Verified `make -n launchd-install` under a
+launchd-shaped `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) resolves `make`,
+`plutil`, `launchctl`, `cmp`. Not run for real: a live `launchd-install` with
+nothing changed is a no-op by construction, and one with a change is the
+deploy itself — the next merged plist is its proof.
+
+**What still stops at a draft PR, everywhere.** `warden`, `sideclaw`,
+`dotfiles` (no scope, Argo click only, CI definitions refused even then); a PR
+over `MAX_MERGE_FILES` (40) or `MAX_MERGE_LINES` (2000); a failed or missing
+check-run without `noCiRequired`; a step-7 review that did not confirm; a
+GitHub ruleset the token cannot satisfy; a repo whose declared `autoMergePaths`
+is narrower than `**` (homelab: `uptime-kuma/monitors.yaml`; vps:
+`observability/**`; argo: the one canary file; research-gateway: its list) —
+those scopes are the repos' own entries and were not touched here.
+
+Docs: DESIGN.md § Self-concealing change (the path-list bullet struck through
+with the withdrawal recorded), § Executable invariants; REVIEW.md C3's
+disposition paragraph; `config/triage-policy.json` weatherorb note;
+`docs/never-auto-merge-widening.md` now headed "Landed". Tests: `make test`
+green — `test_merge.py` 72/72 (three tests replaced, one added, one renamed),
+`test_clients.py` 113/113, `test_triage.py` at §106's count, 341/341.
