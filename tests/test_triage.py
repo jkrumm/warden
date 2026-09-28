@@ -176,6 +176,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         "TRIAGE_REPO_DIR": triage.TRIAGE_REPO_DIR,
         "_call_propose_mappings_model": triage._call_propose_mappings_model,
         "_kuma_trip": triage._kuma_trip,
+        "RESTORE_DRILL_FILE": triage.RESTORE_DRILL_FILE,
         "_resolve_openai_base_url": triage._resolve_openai_base_url,
         "_resolve_openai_api_key": triage._resolve_openai_api_key,
     }
@@ -250,6 +251,11 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
         triage._github.branch_rules = lambda owner, repo, branch: []
+        # A fresh, passing restore drill (§104) unless a test says otherwise —
+        # never the real ~/.warden/restore-drill.json.
+        triage.RESTORE_DRILL_FILE = tmp_dir / "restore-drill.json"
+        triage.RESTORE_DRILL_FILE.write_text(json.dumps({"ok": True, "at": NOW.isoformat(),
+                                                         "snapshot": "test-snapshot"}))
         # The synthetic trip's only door to the real Kuma (§103): never reached
         # from a test. A trip test registers its own fake.
         TRIP_CALLS.clear()
@@ -8905,6 +8911,31 @@ def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline(
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEW and "unproven, not fixed" in item["note"]
         assert ("stop", ("906",)) in TRIP_CALLS
+
+
+
+# --- the restore drill as a self-audit input (§104) ---------------------------
+
+def test_a_failed_restore_drill_becomes_a_warden_item():
+    with _triage_env() as (conn, ctx):
+        triage.RESTORE_DRILL_FILE.write_text(json.dumps({
+            "ok": False, "at": NOW.isoformat(), "snapshot": "homelab:/mnt/hdd/backups/warden/backups/w.db",
+            "error": "AssertionError: integrity_check: row 7 missing from index"}))
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        ev = conn.execute("SELECT * FROM events WHERE source='warden_self' AND external_id='restore-drill-failed'"
+                          ).fetchone()
+        assert ev is not None and "FAILED" in ev["title"]
+        text = json.loads(ev["payload_json"])["first_text"]
+        assert "integrity_check" in text and "homelab:/mnt/hdd/backups/warden/backups/w.db" in text
+
+
+def test_a_stale_or_missing_restore_drill_is_a_finding_and_a_fresh_pass_is_not():
+    with _triage_env() as (conn, ctx):
+        assert triage._restore_drill_findings(NOW) == []
+        triage.RESTORE_DRILL_FILE.write_text(json.dumps({"ok": True, "at": (NOW - dt.timedelta(days=40)).isoformat()}))
+        assert [f["key"] for f in triage._restore_drill_findings(NOW)] == ["restore-drill-stale"]
+        triage.RESTORE_DRILL_FILE.unlink()
+        assert [f["key"] for f in triage._restore_drill_findings(NOW)] == ["restore-drill-missing"]
 
 
 if __name__ == "__main__":

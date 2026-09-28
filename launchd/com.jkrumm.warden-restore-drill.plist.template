@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jkrumm.warden-restore-drill</string>
+  <!-- The restore drill (scripts/warden-restore.sh, state-log §104): fetch the
+       newest OFF-BOX ledger snapshot from homelab, restore it into a temp dir,
+       verify integrity, schema-through-the-migrator, data plausibility, one loop
+       dry-run pass and the repo bundle, clean up. It writes
+       ~/.warden/restore-drill.json, which the loop's hourly self-audit reads: a
+       failed drill, or none successful for 35 days, becomes a warden_self item.
+
+       Monthly, on the 1st at 04:10: after warden-backup (03:10) and homelab's
+       restic sweep (03:30), so it restores the snapshot that just went off-box.
+       Monthly and not daily because what it proves — the snapshot format, the
+       transport, the migrator's path from an older schema — changes rarely,
+       while the daily backup's own health already has its Kuma push. 35 days of
+       staleness is one missed run plus slack. Run it by hand after any schema
+       bump: `make restore-drill`. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>__HOME__/SourceRoot/warden/scripts/warden-restore.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key><integer>1</integer>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>10</integer>
+  </dict>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/warden-restore-drill.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/warden-restore-drill.err</string>
+</dict>
+</plist>

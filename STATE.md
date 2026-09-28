@@ -6,18 +6,18 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§103 — synthetic trip: a fixed Kuma push monitor's shadow must go DOWN in its live window before `fixed`; proven live; HyperDX and non-push Kuma are named gaps) |
+| Last updated | 2026-09-28 (§104 — the ledger restore is drilled: `make restore-drill`, monthly agent, a failed or stale drill becomes a warden item) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
-| Repo state | `master`, five LaunchAgents on the mini |
+| Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 338/338 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 340/340 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
 
 ## What is live
 
-Five LaunchAgents run the whole control plane; no `hermes cron` job is in the
+Six LaunchAgents run the whole control plane; no `hermes cron` job is in the
 loop.
 
 | Agent | Runs | Interval |
@@ -26,6 +26,7 @@ loop.
 | `com.jkrumm.warden-poll` | ingest | 1800s |
 | `com.jkrumm.warden-sweep` | `scripts/dispatch-sweep.py` | 300s |
 | `com.jkrumm.warden-backup` | `scripts/warden-backup.sh` | daily 03:10 |
+| `com.jkrumm.warden-restore-drill` | `scripts/warden-restore.sh` | monthly, 1st 04:10 |
 | `com.jkrumm.warden-api` | `scripts/api.py --serve` (GET /metrics, /health) on `127.0.0.1:7735` | long-running, `KeepAlive` |
 
 - The `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`,
@@ -137,6 +138,10 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
+- **Restore drill (§104).** `scripts/warden-restore.sh` restores the newest
+  off-box snapshot into a temp dir and verifies integrity, schema via the
+  migrator, data plausibility, a loop dry-run and a repo-bundle clone; it cannot
+  write the live ledger. Monthly agent; self-audit makes a failure an item.
 - **Synthetic trip (§103).** After a Kuma-verified deploy and positive
   liveness, a notification-free shadow of the monitor's live push config must go
   DOWN within its window (`scripts/kuma-trip.py` over `ssh homelab`); otherwise
@@ -252,8 +257,9 @@ loop.
   days after the `ignore` entry covering it landed. `scripts/reset-frozen-notes.py`
   is the standing repair, re-runnable by design (§90; its docstring said
   "one-time" before that).
-- No ledger restore path yet. The repo itself has no remote; since §62 the
-  daily backup ships a `git bundle` of every ref next to the ledger snapshots.
+- The restore is drilled (§104), but retrieval from B2 itself is not: the drill
+  proves homelab's off-box copy, not restic's. Putting a snapshot back over a lost
+  ledger stays a human step.
 
 ## History
 
@@ -357,6 +363,7 @@ log's past sections.
 - Approval buttons clickable again (posted as Hermes); Hermes skills aligned — §101
 - Review of §97–§101: five blocking findings fixed — §102
 - Synthetic trip for Kuma push monitors, proven live — §103
+- The ledger restore, drilled and self-checking — §104
 
 ### Next action
 

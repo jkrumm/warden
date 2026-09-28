@@ -718,8 +718,21 @@ write path, caused by a dashboard read.
 - **One migrator** plus a `schema_version` table; migrations run only by the loop
   at boot; the API refuses to start on mismatch.
 - **Backup.** `VACUUM INTO` on every heartbeat, rotated, shipped to homelab's
-  existing restic → B2 path (see *Observability*). There is no restore path today,
-  on a machine with FileVault off, auto-login on and unattended reboots.
+  existing restic → B2 path (see *Observability*).
+- **Restore, drilled (2026-09-28, state-log §104).** `scripts/warden-restore.sh`
+  fetches the newest *off-box* snapshot from homelab, restores it into a fresh
+  temp dir and proves a warden could come back from it: `integrity_check`, schema
+  through the one migrator, data plausibility (events and dispatches present;
+  newest write ≤ 2 h before the snapshot and not after it), one real loop
+  `--dry-run` pass on the copy, and a clone of the repo bundle that yields the
+  loop's own code. It cannot write the live ledger — `assert_safe_target()`
+  refuses any resolved path in `~/.warden/` on every write, with a test. The
+  `com.jkrumm.warden-restore-drill` LaunchAgent runs it monthly (1st, 04:10) and
+  the self-audit turns a failed drill, or none successful in 35 days, into a
+  `warden_self` item. Putting a verified snapshot back over a lost ledger is
+  deliberately a human step (`make unload`, copy, `make setup`). **Not drilled:**
+  retrieval from Backblaze B2 itself — the drill proves homelab's copy, not
+  restic's.
 - After extraction, the Slack approval plugin must stop writing this file
   directly, or the "control plane inside the thing it supervises" coupling
   silently returns.

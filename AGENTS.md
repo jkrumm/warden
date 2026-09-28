@@ -19,7 +19,7 @@ warden is a deterministic control plane over one SQLite ledger. **No LLM call
 decides a state transition** — the dispatched episodes each run one, the loop
 never does. Pollers feed it, sideclaw executes for it, Slack and Argo render it.
 
-Five LaunchAgents, never `hermes cron` jobs, and that is the whole reason this
+Six LaunchAgents, never `hermes cron` jobs, and that is the whole reason this
 repo is separate from `hermes-agent`: a gateway cron job runs *inside* the
 `ai.hermes.gateway` process, so the loop whose job is noticing Hermes is broken
 cannot run when Hermes is down. That was measured, not theorized — the gateway
@@ -32,6 +32,7 @@ against a ledger that had stopped receiving signals.
 | `com.jkrumm.warden-poll` | ingest | 1800s |
 | `com.jkrumm.warden-sweep` | `scripts/dispatch-sweep.py` | 300s |
 | `com.jkrumm.warden-backup` | `scripts/warden-backup.sh` | daily 03:10 |
+| `com.jkrumm.warden-restore-drill` | `scripts/warden-restore.sh` (restore the newest off-box snapshot into a temp dir, verify, clean up) | monthly, 1st 04:10 |
 | `com.jkrumm.warden-api` | `scripts/api.py --serve` (GET /metrics, /health) | long-running, `KeepAlive` |
 
 `warden-api` is the odd shape: a long-running server, not a periodic job — see
@@ -54,6 +55,7 @@ see `slack/README.md` for creating and seeding it.
 make setup     # venv + plists + load the agents
 make test      # every tests/*.py
 make status    # what is loaded, what ran last, is the ledger reachable
+make restore-drill  # restore the newest off-box snapshot into a temp dir, verify, clean up
 make unload    # stop the agents
 ```
 
@@ -85,7 +87,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **338/338**. Any other number is a
+`tests/test_triage.py` is the regression gate at **340/340**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -110,7 +112,10 @@ truth; Slack cards and Argo pages are projections.
   that captures the main file and its `-wal` at different instants and restores
   as either stale or corrupt with nothing saying which), shipped to
   `homelab:/mnt/hdd/backups/warden/`, which the existing restic container already
-  walks on its way to B2. There is **no restore path yet**.
+  walks on its way to B2. The restore is **drilled, not assumed**:
+  `make restore-drill` (and monthly, `com.jkrumm.warden-restore-drill`) restores
+  the newest off-box snapshot into a temp dir and verifies it; it can never write
+  `~/.warden/warden.db`. A failed drill becomes a `warden_self` item (§104).
 
 ## Talking to sideclaw
 

@@ -6120,6 +6120,11 @@ SELF_AUDIT_CURSOR_KEY = "self_audit"
 SELF_AUDIT_INTERVAL_S = 3600
 OWNER_QUEUE_STALE_DAYS = 3.0
 SELF_AUDIT_WINDOW_DAYS = 14
+# scripts/restore.py's drill result (§104) — the self-audit's only input from
+# outside the ledger. A failed drill, or none successful in this many days, is
+# a finding: a backup that has not been restored from is an assumption.
+RESTORE_DRILL_FILE = WARDEN_HOME / "restore-drill.json"
+RESTORE_DRILL_STALE_DAYS = 35
 
 INVARIANTS: dict[str, str] = {
     "INV-1-clock": "every non-terminal state past `new` carries the clock its STATE_DEADLINES rule names",
@@ -6199,6 +6204,29 @@ def _safe_json_list(raw: str | None) -> list[dict[str, Any]]:
     return [v for v in val if isinstance(v, dict)] if isinstance(val, list) else []
 
 
+def _restore_drill_findings(now: dt.datetime) -> list[dict[str, Any]]:
+    """The restore drill's last result as a finding, or none. Missing counts:
+    a ledger that has never been restored from is exactly the blind spot."""
+    try:
+        rec = json.loads(RESTORE_DRILL_FILE.read_text())
+    except (OSError, ValueError):
+        return [{"key": "restore-drill-missing",
+                 "title": "the ledger backup has never been restore-drilled",
+                 "detail": f"no result at {RESTORE_DRILL_FILE} — run `make restore-drill`"}]
+    if not rec.get("ok"):
+        return [{"key": "restore-drill-failed",
+                 "title": f"the ledger restore drill FAILED on {rec.get('snapshot') or rec.get('source')}",
+                 "detail": f"{rec.get('error')} (at {rec.get('at')}); snapshot {rec.get('snapshot')} — "
+                           f"the backup may not restore; re-run `make restore-drill` after fixing"}]
+    at = _parse_ts(rec.get("at"))
+    if at is None or now - at > dt.timedelta(days=RESTORE_DRILL_STALE_DAYS):
+        return [{"key": "restore-drill-stale",
+                 "title": f"no successful restore drill for {RESTORE_DRILL_STALE_DAYS}+ days",
+                 "detail": f"last success {rec.get('at')} on {rec.get('snapshot')} — is "
+                           f"com.jkrumm.warden-restore-drill loaded?"}]
+    return []
+
+
 def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
                         policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Gaps the loop can see in its own behaviour, each keyed so one finding
@@ -6235,6 +6263,7 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
         out.append({"key": f"fixed-reopened-{r['event_id']}",
                     "title": f"{r['signature']} came back after warden marked it fixed",
                     "detail": f"the verdict or the fix in {r['repo']} was wrong — event {r['event_id']}"})
+    out.extend(_restore_drill_findings(now))
     max_rev = int((policy or {}).get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
     for r in conn.execute(
         f"SELECT ti.event_id, ti.signature, ti.repo FROM triage_items ti JOIN events e ON e.id = ti.event_id "

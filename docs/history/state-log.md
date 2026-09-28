@@ -8750,3 +8750,59 @@ DOWN fixes; waits in window; never-DOWN reopens as a finding; gap; unarmed
 waits; read errors retry to the liveness deadline; sweep keeps armed shadows;
 argument validation before any ssh; the poller never ingests a shadow).
 Numbered cases 847 → 858.
+
+## 104. The ledger's way back, drilled instead of assumed (2026-09-28)
+
+DESIGN.md said it plainly: backups ship nightly (`VACUUM INTO` →
+`homelab:/mnt/hdd/backups/warden/` → restic → B2) and "there is no restore path
+today". A backup nobody has restored from is an assumption — and warden is the
+machine that watches everything else.
+
+**`scripts/warden-restore.sh` → `scripts/restore.py`.** Source `latest` (default)
+is the newest snapshot on homelab — the off-box copy, what is left if the mini is
+gone; `local-latest` and a path also work. It copies the snapshot and the repo
+bundle into a fresh `mktemp` dir and proves: `PRAGMA integrity_check` is ok; the
+stamped schema is ≤ this warden's and the one migrator brings the copy to current;
+events and dispatches are present and the newest write is ≤ 2 h before the
+snapshot's own timestamp and not after it; the real loop runs one `--dry-run`
+pass on the copy; and the repo bundle clones into a tree that contains
+`scripts/triage.py` and `scripts/ledger.py`. The temp dir is removed on every
+path. One line on stdout, exit 0/1, and `~/.warden/restore-drill.json`.
+
+**It cannot touch the live ledger.** `assert_safe_target()` resolves every path
+it writes (symlinks followed) and raises `UnsafeTarget` for the live `WARDEN_DB`,
+its `-wal`/`-shm` siblings, or anything under `WARDEN_HOME` — a refusal, not a
+warning, checked per write. Tests prove the live file, its siblings, the home,
+a symlink to the live file and a symlinked directory into the home are all
+refused, and that a drill pointed straight at the live ledger as its *source*
+leaves its bytes identical.
+
+**Self-checking.** `com.jkrumm.warden-restore-drill`, monthly on the 1st at 04:10
+(after backup 03:10 and restic 03:30, so it restores what just went off-box;
+monthly because the format, transport and migration path it proves change
+rarely, while the daily backup already has its own Kuma push). The self-audit
+reads the result file: a failed drill → `restore-drill-failed`, none successful
+for 35 days → `restore-drill-stale`, no result at all → `restore-drill-missing`,
+each a `warden_self` item routed to warden like any alert. Proven on a copy of
+the live ledger: a failure record became the item "the ledger restore drill
+FAILED on homelab:…", repo `warden`, state `new`.
+
+**It found its own bug on the first agent run.** Interactively the drill passed;
+under launchd it failed with `git bundle verify failed: … ein Repository
+benötigt` — `bundle verify` needs a repository as its cwd, and launchd's is `/`.
+That is what a drill is for. It now *clones* the bundle instead, the stronger
+claim anyway. Real outputs:
+
+    restore-drill: OK homelab:/mnt/hdd/backups/warden/backups/warden-20260928T011005Z.db integrity=ok schema=10->11 events=1255 dispatches=249 write_lag=4.3m loop_dry_run=ok repo_bundle=ok@721eb45 cleaned_up=True 24.4s
+
+**Not proven, named:** retrieval from Backblaze B2 through restic (the drill
+restores homelab's copy; a restic restore needs the B2 credentials held in the
+homelab container and writes a full repository snapshot — its own drill);
+putting a snapshot back over a lost live ledger (a deliberate human step:
+`make unload`, copy, `make setup`); the loop's *outbound* behaviour on a restored
+ledger (the dry-run makes no Slack/sideclaw/Argo writes by contract).
+
+Tests: new `tests/test_restore.py` 11/11 (guard ×4, a good snapshot, a real
+schema-(N-1) snapshot migrated, corrupt, newer schema, stale data, empty, missing);
+`test_triage.py` 338 → 340 (failed drill → item; stale/missing/fresh). Numbered
+cases 858 → 871.

@@ -21,7 +21,7 @@ BASE_PY     := python3.11
 
 WARDEN_PLISTS := com.jkrumm.warden-loop com.jkrumm.warden-poll \
                  com.jkrumm.warden-sweep com.jkrumm.warden-backup \
-                 com.jkrumm.warden-api
+                 com.jkrumm.warden-api com.jkrumm.warden-restore-drill
 
 .DEFAULT_GOAL := help
 
@@ -29,6 +29,7 @@ WARDEN_PLISTS := com.jkrumm.warden-loop com.jkrumm.warden-poll \
 help:
 	@echo "warden"
 	@echo "  make setup     venv + plists + load the agents"
+	@echo "  make restore-drill [SNAPSHOT=latest|local-latest|<path>]  prove a backup restores"
 	@echo "  make venv      create .venv from $(BASE_PY) and install requirements"
 	@echo "  make test      run every tests/*.py (hand-rolled runners, not pytest)"
 	@echo "  make status    what is loaded, what ran last, is the ledger reachable"
@@ -121,6 +122,12 @@ agents: render-plists
 			&& echo "  ✓ $$name loaded" \
 			|| echo "  ✗ $$name [bootstrap failed]"; \
 	done
+
+# The restore drill by hand (the LaunchAgent runs it monthly): newest off-box
+# snapshot -> temp dir -> verified -> removed. Never touches ~/.warden/warden.db.
+.PHONY: restore-drill
+restore-drill:
+	@env -u CLAUDECODE "$(WARDEN_REPO)/scripts/warden-restore.sh" $(SNAPSHOT)
 
 .PHONY: unload
 unload:
