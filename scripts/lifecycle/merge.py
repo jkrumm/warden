@@ -156,10 +156,33 @@ class MergeResult:
 # gets an implicit allow by omission. `noCiRequired` is an explicit per-repo
 # acknowledgement that a repo has zero PR-time checks, so their absence is a
 # known condition rather than a silently-passed test.
+# The authorizers that are Johannes himself: an Argo click (tailnet-only —
+# DESIGN.md § 2026-09-15 override) or `warden merge --confirm` at his TTY.
+OWNER_AUTHORIZERS = ("owner:argo", "cli:confirm")
+
+
 def merge_gate_check(
     *, repo: str, entry: dict[str, Any], files: list[dict[str, Any]],
-    check_runs: list[dict[str, Any]], validation: str | None,
+    check_runs: list[dict[str, Any]], validation: str | None, owner_approved: bool = False,
 ) -> None:
+    """`owner_approved` (§94): the owner merging is the gate `autoMergePaths`
+    and a confirmed step-7 review stand in for when nobody is watching, so an
+    owner merge skips exactly those two — and the "zero check-runs needs
+    noCiRequired" rule, which exists to stop an UNATTENDED merge reading a
+    missing CI as a pass. A failing check still refuses him: that is a fact
+    about the code, not a missing authorization. Before §94 this made the
+    documented approval path for the merge-approval repos (`warden merge …
+    --confirm`, Argo's Merge) refuse every time: none of them declares an
+    auto-merge scope, by design."""
+    if owner_approved:
+        bad_runs = [
+            str(r.get("name")) for r in check_runs
+            if r.get("status") != "completed"
+            or r.get("conclusion") not in ("success", "neutral", "skipped")
+        ]
+        if bad_runs:
+            raise PolicyError(f"{repo}'s CI has not passed cleanly on the head commit: {', '.join(bad_runs)}.")
+        return
     paths = entry.get("autoMergePaths")
     if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
         raise PolicyError(
@@ -457,6 +480,7 @@ def plan_or_land(
     merge_gate_check(
         repo=repo, entry=policy.triage_repo_entry(repo), files=files,
         check_runs=runs, validation=validation_status,
+        owner_approved=authorized_by in OWNER_AUTHORIZERS,
     )
 
     method = github.pick_merge_method(repo_json)

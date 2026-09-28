@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§93 — homelab/weatherorb/research-gateway merge, deploy and verify unattended; the review gets the goal and a detection question) |
+| Last updated | 2026-09-28 (§94 — `awaiting_owner` list incl. stranded PRs; owner merges on gated repos actually work, one click in Argo) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 305/305 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 308/308 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -137,6 +137,11 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
+- **Waiting on the owner is one list (§94).** `/board.awaiting_owner`: parked
+  items (age, reason, recurrences, revisions, actions) + stranded PRs
+  (`reconcile_stranded_prs()`, hourly, also lands PRs merged by hand). An owner
+  merge (`owner:argo`, `cli:confirm`) skips the unattended stand-ins only, so
+  the gated repos' Merge click works; `needs_human` with a PR offers Merge.
 - **The last mile reaches three more repos (§93).** homelab
   (`uptime-kuma/monitors.yaml` → `uk-sync` → `kuma-push-fresh`), weatherorb
   (watchdog/tests/docs → `weatherorb-pull` → `kuma-push-fresh`),
@@ -323,6 +328,7 @@ log's past sections.
   recurrences; schema 11 — §92
 - The last mile: homelab, weatherorb, research-gateway review → merge → deploy →
   verify unattended; C3 disposition updated — §93
+- `awaiting_owner` incl. stranded PRs; a gated merge is one working click — §94
 
 ### Next action
 

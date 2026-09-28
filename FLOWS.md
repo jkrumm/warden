@@ -290,3 +290,15 @@ Four places, all deliberate, none accidental:
 
 Everything else — alert to verified fix, PR review, storm handling, dismissal of
 a verdict that concludes nothing-to-do — runs with no human in it at all.
+
+## Update 2026-09-28 (§91–§94): where a flow used to stop
+
+- A self-clearing alert that keeps returning escalates as **chronic** instead of
+  going `quiet` in the pass that reopened it (§91).
+- A blocked PR goes back to the implementer with the findings (≤2 revisions)
+  instead of `merge_blocked` (§92).
+- homelab Kuma monitors, the weatherorb watchdog and research-gateway merge,
+  deploy and verify unattended (§93); `vps/observability/**` already did.
+- What still needs the owner — a gated repo's confirmed fix, a PR-required
+  repo, a stranded PR — is in `/board.awaiting_owner` with its age, and a
+  gated merge is one Argo click (§94).

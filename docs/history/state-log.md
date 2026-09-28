@@ -8412,3 +8412,42 @@ Tests: `test_triage.py` 305/305 (+8). An edit briefly left `triage.py` with an
 IndentationError for about a minute; no agent ran in that window (all five
 `.err` logs clean) — edits to live scripts now go through a backup-and-parse
 guard.
+
+## 94. What waits on the owner is one list, and a gated merge is one click (2026-09-28)
+
+**The approval path for the gated repos never worked.** `plan_or_land()` runs
+`merge_gate_check()`, which refuses any repo without `autoMergePaths` — and
+`warden`, `sideclaw`, `dotfiles` have none by design. So the `warden merge …
+--confirm` every gated card told the owner to run, and Argo's Merge, refused
+every time; and a gated fix waited in `needs_human`, where Argo offered no Merge
+button at all. Now: `OWNER_AUTHORIZERS = ("owner:argo", "cli:confirm")` —
+an owner merge skips exactly the unattended stand-ins (path scope, confirmed
+review, zero-CI acknowledgement); a failing check, CI-definition paths, the
+size ceilings, forks and PR-required repos still refuse him. `_apply_argo_merge()`
+accepts `needs_human` with a PR and goes through `_merge_and_rollout()`, so an
+owner merge deploys and verifies like an automatic one (a successful Argo
+merge used to leave the item sitting in `merge_blocked`). `availableActions`
+offers `merge` on a `needs_human` item that carries a PR. The hard gate on the
+loop's own repos is unchanged — it is still his click; it is now a click that
+works.
+
+**`awaiting_owner` on `/board`** (and so in every Argo snapshot): every parked
+item with `age_days` in its state, the reason (its note), `parked_recurrences`,
+`revision_count` and its actions, plus every **stranded PR** — a PR warden
+opened whose item ended while the PR stayed open — oldest first.
+`reconcile_stranded_prs()` (loop, at most hourly, one GitHub read per unmerged
+implement PR of the last 60 days whose item is parked or terminal) writes the
+stranded ones to the `stranded_prs` cursor, and records a PR merged by hand:
+`dispatches.merged_at` stamped, a parked item moved to `merged` ("merged
+outside the loop" — item 1170, homelab#9, parked on "already merged").
+Nothing is auto-closed: dotfiles#6's item was closed by hand around a PR that
+is exactly the fix still wanted. Argo renders the list at the top of
+`/warden` (argo commit in the next §/STATE).
+
+Found open today: rollhook#26 (review confirmed; rollhook is PR-required —
+branch protection, a human merges), dotfiles#6 (finding fixed by hand on the
+branch; gated), research-gateway#27 (its item closed "rejected/superseded"),
+plus research-gateway#8 and weatherorb#5, which no ledger row owns (opened by
+another lane) and so appear in no list — named here instead.
+
+Tests: `test_triage.py` 308/308 (+3), `test_merge.py` 64/64 (+1).

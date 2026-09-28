@@ -155,7 +155,7 @@ _DISMISS_STATES = ("new", "verdict", _ledger.STATE_NEEDS_HUMAN, "merge_blocked",
 _REINVESTIGATE_STATES = ("verdict", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", _ledger.STATE_QUIET, _ledger.STATE_NOTE)
 
 
-def _available_actions(state: str) -> list[str]:
+def _available_actions(state: str, has_pr: bool = False) -> list[str]:
     """Zero or more of `implement`/`merge`/`dismiss`/`reinvestigate`/`note` —
     what the owner could click for a card in `state`, from state alone. The
     real per-repo/per-tier gate runs server-side in triage.py's
@@ -164,7 +164,7 @@ def _available_actions(state: str) -> list[str]:
     actions: list[str] = []
     if state in _IMPLEMENT_STATES:
         actions.append("implement")
-    if state in _MERGE_STATES:
+    if state in _MERGE_STATES or (has_pr and state == _ledger.STATE_NEEDS_HUMAN):
         actions.append("merge")
     if state in _DISMISS_STATES:
         actions.append("dismiss")
@@ -670,10 +670,68 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
         "counts": counts,
         "items": items,
         "terminal_24h": terminal_24h,
+        "awaiting_owner": awaiting_owner(conn, now),
     }
     if truncated:
         payload["truncated"] = True
     return payload
+
+
+AWAITING_OWNER_STATES = (_ledger.STATE_NEEDS_HUMAN, "merge_blocked")
+
+
+def _age_days(since: str | None, now: dt.datetime) -> float | None:
+    if not since:
+        return None
+    try:
+        then = dt.datetime.fromisoformat(since.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=dt.timezone.utc)
+    return round((now - then).total_seconds() / 86400, 1)
+
+
+def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str, Any]]:
+    """Everything that is waiting on Johannes and nothing else, oldest first:
+    every parked item (`needs_human`/`merge_blocked`) with how long it has sat
+    there, why, and how often its signal fired since — plus every PR warden
+    opened whose item ended while the PR stayed open (triage.py's
+    reconcile_stranded_prs() writes those to the `stranded_prs` cursor; this
+    process never calls GitHub). Before §94 the second kind existed nowhere
+    but GitHub's own PR list."""
+    placeholders = ",".join("?" for _ in AWAITING_OWNER_STATES)
+    out: list[dict[str, Any]] = []
+    for row in conn.execute(
+        f"SELECT ti.event_id, ti.repo, ti.state, ti.note, ti.pr_url, ti.parked_recurrences, ti.revision_count, "
+        f"e.title, (SELECT MAX(at) FROM item_transitions t WHERE t.event_id = ti.event_id "
+        f"AND t.to_state = ti.state) AS entered_at FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"WHERE ti.state IN ({placeholders})",
+        AWAITING_OWNER_STATES,
+    ):
+        out.append({
+            "kind": "item", "event_id": row["event_id"], "repo": row["repo"], "title": row["title"],
+            "state": row["state"], "pr_url": row["pr_url"], "age_days": _age_days(row["entered_at"], now),
+            "reason": row["note"], "parked_recurrences": row["parked_recurrences"],
+            "revision_count": row["revision_count"],
+            "availableActions": _available_actions(row["state"], bool(row["pr_url"])),
+        })
+    cursor = conn.execute("SELECT value FROM cursors WHERE key='stranded_prs'").fetchone()
+    try:
+        stranded = json.loads(cursor["value"]) if cursor else []
+    except (TypeError, ValueError):
+        stranded = []
+    for pr in stranded if isinstance(stranded, list) else []:
+        if not isinstance(pr, dict):
+            continue
+        out.append({
+            "kind": "stranded_pr", "event_id": pr.get("event_id"), "repo": pr.get("repo"),
+            "title": pr.get("title"), "state": pr.get("item_state"), "pr_url": pr.get("pr_url"),
+            "age_days": _age_days(pr.get("opened_at"), now), "reason": pr.get("reason"),
+            "parked_recurrences": 0, "revision_count": 0, "availableActions": [],
+        })
+    out.sort(key=lambda x: -(x["age_days"] or 0))
+    return out
 
 
 def _board_item_issue(row: sqlite3.Row) -> dict[str, Any] | None:
@@ -726,7 +784,7 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "updated_at": row["updated_at"],
         "origin_channel": row["origin_channel"],
         "origin_thread_ts": row["origin_thread_ts"],
-        "availableActions": _available_actions(row["state"]),
+        "availableActions": _available_actions(row["state"], bool(row["pr_url"])),
         "issue": _board_item_issue(row),
     }
 

@@ -1053,5 +1053,23 @@ def main() -> int:
     return 0
 
 
+
+def test_owner_approved_merge_skips_scope_and_review_but_not_failing_ci():
+    """§94: `warden merge --confirm` / Argo's Merge on a merge-approval repo
+    (no autoMergePaths by design) used to refuse every time."""
+    merge.merge_gate_check(repo="dotfiles", entry={}, files=[{"filename": "scripts/x.sh"}],
+                           check_runs=[], validation="blocked", owner_approved=True)
+    try:
+        merge.merge_gate_check(repo="dotfiles", entry={}, files=[],
+                               check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}],
+                               validation="confirmed", owner_approved=True)
+    except PolicyError as e:
+        assert "CI has not passed" in str(e)
+    else:
+        raise AssertionError("a failing check must refuse even the owner")
+    assert "owner:argo" in merge.OWNER_AUTHORIZERS and "cli:confirm" in merge.OWNER_AUTHORIZERS
+    assert "auto-from-item" not in merge.OWNER_AUTHORIZERS
+
+
 if __name__ == "__main__":
     sys.exit(main())

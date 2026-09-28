@@ -193,6 +193,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         ("_github", "search_issues"): triage._github.search_issues,
         ("_github", "create_issue_comment"): triage._github.create_issue_comment,
         ("_github", "close_pr"): triage._github.close_pr,
+        ("_github", "read_pr"): triage._github.read_pr,
         ("_merge", "plan_or_land"): triage._merge.plan_or_land,
         ("_approvals", "execute_approved"): triage._approvals.execute_approved,
         ("_argo", "push_snapshot"): triage._argo.push_snapshot,
@@ -243,6 +244,8 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         triage._github.search_issues = lambda *, owner, skip_label: []
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
+        triage._github.read_pr = lambda owner, repo, number: (_ for _ in ()).throw(
+            triage.RemoteError("test: no fake read_pr registered"))
         CLOSED_PRS.clear()
         triage._github.close_pr = lambda owner, repo, number, *, comment=None: CLOSED_PRS.append(
             (owner, repo, number, comment))
@@ -8387,6 +8390,87 @@ def test_policy_refused_merge_is_retried_once_the_policy_changes():
             assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGED
             triage.retry_policy_refused_merges(conn, triage.load_policy(), NOW, dry_run=False)
             assert len(calls) == 1, "no second attempt without a newer policy file"
+
+
+# --- what waits on the owner (§94) --------------------------------------------
+
+def _seed_pr_item(conn, *, external_id: str, state: str, pr: int, note: str = "n") -> int:
+    eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
+    conn.execute("UPDATE triage_items SET state=?, implement_job=?, pr_url=?, note=? WHERE event_id=?",
+                 (state, f"impl-{external_id}", f"https://github.com/jkrumm/demo-repo/pull/{pr}", note, eid))
+    conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id, "
+                 "artifact_url, validation_status) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (f"impl-{external_id}", "implement", "demo-repo", "b", "done", NOW.isoformat(), eid,
+                  f"https://github.com/jkrumm/demo-repo/pull/{pr}", "confirmed"))
+    conn.commit()
+    return eid
+
+
+def test_stranded_pr_reconciler_lands_outside_merges_and_lists_open_orphans():
+    with _triage_env() as (conn, ctx):
+        merged = _seed_pr_item(conn, external_id="sig-merged-by-hand", state=triage.STATE_MERGE_BLOCKED, pr=9)
+        orphan = _seed_pr_item(conn, external_id="sig-orphan", state=triage.STATE_DISMISSED, pr=26,
+                               note="deadline expired")
+        prs = {9: {"merged": True, "merged_at": "2026-09-27T10:00:00Z", "state": "closed"},
+               26: {"merged": False, "state": "open", "title": "fix(e2e): bump traefik",
+                    "created_at": "2026-09-15T12:08:29Z"}}
+        triage._github.read_pr = lambda owner, repo, number: prs[number]
+
+        triage.reconcile_stranded_prs(conn, triage.load_policy(), NOW, dry_run=False)
+
+        assert triage._get_item(conn, merged)["state"] == triage.STATE_MERGED
+        assert conn.execute("SELECT merged_at FROM dispatches WHERE job_id='impl-sig-merged-by-hand'"
+                            ).fetchone()[0] == "2026-09-27T10:00:00Z"
+        cur = json.loads(conn.execute("SELECT value FROM cursors WHERE key='stranded_prs'").fetchone()[0])
+        assert [c["event_id"] for c in cur] == [orphan]
+        assert "ended `dismissed`" in cur[0]["reason"]
+
+        prs[26]["state"] = "closed"
+        triage.reconcile_stranded_prs(conn, triage.load_policy(), NOW + dt.timedelta(minutes=5), dry_run=False)
+        cur = json.loads(conn.execute("SELECT value FROM cursors WHERE key='stranded_prs'").fetchone()[0])
+        assert len(cur) == 1, "throttled: no second GitHub pass inside the hour"
+
+
+def test_awaiting_owner_lists_parked_items_and_stranded_prs_oldest_first():
+    with _triage_env() as (conn, ctx):
+        parked = _seed_pr_item(conn, external_id="sig-waiting", state=triage.STATE_NEEDS_HUMAN, pr=3,
+                               note="approve the merge")
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
+                     (parked, "validating", "needs_human", (NOW - dt.timedelta(days=2)).isoformat()))
+        conn.execute("INSERT INTO cursors(key, value, updated_at) VALUES ('stranded_prs', ?, ?)",
+                     (json.dumps([{"event_id": 99, "repo": "rollhook", "pr_url": "https://x/pull/26",
+                                   "title": "t", "opened_at": (NOW - dt.timedelta(days=13)).isoformat(),
+                                   "item_state": "dismissed", "reason": "ended"}]), NOW.isoformat()))
+        conn.commit()
+        rows = triage._api.awaiting_owner(conn, NOW)
+        assert [r["kind"] for r in rows] == ["stranded_pr", "item"]
+        assert rows[0]["age_days"] == 13.0 and rows[1]["age_days"] == 2.0
+        assert rows[1]["reason"] == "approve the merge"
+        assert "merge" in rows[1]["availableActions"], "a parked item with a PR is one click from merged"
+
+
+
+def test_argo_merge_of_a_gated_needs_human_item_merges_and_routes_like_auto():
+    """A merge-approval repo's confirmed fix waits in `needs_human` with its
+    PR; the owner's Argo click lands it through the same post-merge routing
+    (here: no deploy configured → `merged`), authorized as the owner."""
+    with _triage_env(merge_approval=["dotfiles"]) as (conn, ctx):
+        eid = _seed_pr_item(conn, external_id="sig-gated-click", state=triage.STATE_NEEDS_HUMAN, pr=11)
+        seen: list[dict[str, Any]] = []
+
+        def _land(conn_, **kw):
+            seen.append(kw)
+            conn_.execute("UPDATE dispatches SET merged_at=? WHERE job_id=?", (NOW.isoformat(), kw["job_id"]))
+            conn_.commit()
+            return types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/dotfiles", pull_request=11)
+
+        triage._merge.plan_or_land = _land
+        triage._argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("m1", eid, "merge")])
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+
+        assert seen and seen[0]["authorized_by"] == "owner:argo"
+        assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGED
 
 
 if __name__ == "__main__":

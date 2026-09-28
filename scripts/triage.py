@@ -5708,8 +5708,8 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # is how the owner lands it from here (validation_status is
             # already `confirmed`, so that path re-checks, never re-validates).
             _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=(
-                f"step-7 validation confirmed on {item['repo']} ({item['pr_url']}), but this repo "
-                f"is merge-approval gated — approve the merge with "
+                f"step-7 review confirmed {item['pr_url']}; {item['repo']} is merge-approval gated "
+                f"(warden never merges its own executor) — click Merge in Argo, or "
                 f"`warden merge {item['implement_job']} --why \"<reason>\" --confirm`"
             ))
             conn.commit()
@@ -5721,7 +5721,8 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
 
 def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
-                      now: dt.datetime) -> None:
+                      now: dt.datetime, *, authorized_by: str = "auto-from-item",
+                      why: str = "triage auto-merge: step-7 validation confirmed") -> None:
     """Land a validation-confirmed PR and route the item on the merge/deploy
     outcome — the tail of poll_validation_jobs(), shared with
     retry_policy_refused_merges() so a merge refused only by the policy
@@ -5750,9 +5751,8 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     _chaos.crash_point("before-merge")
     try:
         result = _merge.plan_or_land(
-            conn, job_id=item["implement_job"],
-            why="triage auto-merge: step-7 validation confirmed",
-            confirm=True, dry_run=False, authorized_by="auto-from-item", now=now,
+            conn, job_id=item["implement_job"], why=why,
+            confirm=True, dry_run=False, authorized_by=authorized_by, now=now,
         )
     except PolicyError as e:
         _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"merge refused: {e}")
@@ -5869,6 +5869,83 @@ def retry_policy_refused_merges(conn: sqlite3.Connection, policy: dict[str, Any]
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
         if fresh_item is not None and fresh_event is not None:
             sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+
+STRANDED_PRS_CURSOR_KEY = "stranded_prs"
+STRANDED_PRS_INTERVAL_S = 3600
+STRANDED_PRS_LOOKBACK_DAYS = 60
+_PR_PARKED_OR_TERMINAL = (*PARKED_STATES, *TERMINAL_STATES)
+
+
+def reconcile_stranded_prs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                           *, dry_run: bool) -> None:
+    """Every pull request warden opened that is neither merged nor moving:
+    the draft that outlived its item (the 7-day `needs_human` deadline
+    dismissed rollhook#26's item while the confirmed PR stayed open) and the PR
+    someone merged by hand while its item still sat parked (homelab#9, item
+    1170). At most once an hour, one GitHub read per unmerged implement PR of
+    the last 60 days whose item is parked or terminal:
+
+    - merged on GitHub → stamp `dispatches.merged_at`; a parked item moves to
+      `merged` ("merged outside the loop") instead of waiting on a merge that
+      already happened.
+    - still open while its item is terminal → recorded in the
+      `stranded_prs` cursor, which `/board`'s `awaiting_owner` list (and so
+      Argo) shows with its age and the reason its item ended. Nothing is
+      closed automatically: an open PR a human closed the item around may be
+      exactly the fix he still wants (dotfiles#6)."""
+    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (STRANDED_PRS_CURSOR_KEY,)).fetchone()
+    last = _parse_ts(row["updated_at"]) if row else None
+    if last is not None and (now - last).total_seconds() < STRANDED_PRS_INTERVAL_S:
+        return
+    since = (now - dt.timedelta(days=STRANDED_PRS_LOOKBACK_DAYS)).isoformat()
+    placeholders = ",".join("?" * len(_PR_PARKED_OR_TERMINAL))
+    rows = conn.execute(
+        f"SELECT d.job_id, d.repo, d.artifact_url, d.created_at, d.validation_status, d.origin_event_id, "
+        f"ti.state, ti.note, e.title FROM dispatches d "
+        f"JOIN triage_items ti ON ti.event_id = d.origin_event_id JOIN events e ON e.id = d.origin_event_id "
+        f"WHERE d.tier='implement' AND d.merged_at IS NULL AND d.artifact_url LIKE '%/pull/%' "
+        f"AND d.created_at >= ? AND ti.state IN ({placeholders}) ORDER BY d.created_at",
+        (since, *_PR_PARKED_OR_TERMINAL),
+    ).fetchall()
+    stranded: list[dict[str, Any]] = []
+    for r in rows:
+        parsed = _github.parse_pr_url(r["artifact_url"])
+        if parsed is None:
+            continue
+        owner, repo_name, number = parsed
+        try:
+            pr = _github.read_pr(owner, repo_name, number)
+        except RemoteError as e:
+            print(f"triage: stranded-PR check could not read {r['artifact_url']}: {e}", file=sys.stderr)
+            continue
+        if pr.get("merged"):
+            if dry_run:
+                print(f"[dry-run] would record {r['artifact_url']} as merged outside the loop")
+                continue
+            conn.execute("UPDATE dispatches SET merged_at=? WHERE job_id=?",
+                         (pr.get("merged_at") or _now_iso(now), r["job_id"]))
+            if r["state"] in PARKED_STATES:
+                _set_state(conn, r["origin_event_id"], STATE_MERGED, now, expect_state=r["state"],
+                           note=f"merged outside the loop: {r['artifact_url']}")
+            conn.commit()
+            continue
+        if pr.get("state") != "open" or r["state"] in PARKED_STATES:
+            continue
+        stranded.append({
+            "event_id": r["origin_event_id"], "repo": r["repo"], "pr_url": r["artifact_url"],
+            "title": pr.get("title") or r["title"], "opened_at": pr.get("created_at") or r["created_at"],
+            "validation_status": r["validation_status"], "item_state": r["state"],
+            "reason": f"its item ended `{r['state']}` while the PR stayed open: {(r['note'] or '')[:240]}",
+        })
+    if dry_run:
+        print(f"[dry-run] would record {len(stranded)} stranded PR(s)")
+        return
+    conn.execute(
+        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (STRANDED_PRS_CURSOR_KEY, json.dumps(stranded), _now_iso(now)),
+    )
+    conn.commit()
 
 REVISION_NOTE_PREFIX = "revision "
 
@@ -7239,31 +7316,28 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
 
 def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                        now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
-    if item["state"] != STATE_MERGE_BLOCKED:
-        return "rejected", None, f"item is in state {item['state']!r}, not merge_blocked"
-    job_id = item["implement_job"]
-    if not job_id:
-        return "rejected", None, "no implement_job on this item to merge"
+    """The owner's one-click merge. Accepted from `merge_blocked` and — since
+    §94 — from `needs_human` carrying a PR, which is where a merge-approval
+    repo's confirmed fix waits. Goes through _merge_and_rollout() with
+    `authorized_by="owner:argo"`, so an owner merge deploys and verifies
+    exactly like an automatic one (before §94 a successful Argo merge left the
+    item sitting in `merge_blocked`)."""
+    if item["state"] not in (STATE_MERGE_BLOCKED, STATE_NEEDS_HUMAN):
+        return "rejected", None, f"item is in state {item['state']!r}, not merge_blocked/needs_human"
+    if not item["implement_job"] or not item["pr_url"]:
+        return "rejected", None, "no pull request on this item to merge"
 
-    try:
-        result = _merge.plan_or_land(
-            conn, job_id=job_id, why="owner approved via Argo",
-            confirm=True, dry_run=False, authorized_by="owner:argo", now=now,
-        )
-    except (PolicyError, PreconditionError) as e:
-        # The item is already `merge_blocked`, which is correct — do not
-        # re-set the state a second time.
-        return "rejected", None, f"merge refused: {e}"
-    except RemoteError as e:
-        if e.maybe_mutated:
-            print(f"triage: argo merge for event {event_id} may have reached GitHub "
-                  f"({e}) — left unresolved for reconcile_operations()", file=sys.stderr)
-            return "applied", {
-                "note": "merge may have reached GitHub, outcome ambiguous — left for reconcile_operations()"
-            }, None
-        return "rejected", None, f"merge refused: {e}"
-
-    return "applied", {"merged": True, **result.to_json()}, None
+    _merge_and_rollout(conn, load_policy(), item, now, authorized_by="owner:argo",
+                       why="owner approved via Argo")
+    fresh = _get_item(conn, event_id)
+    merged = conn.execute("SELECT merged_at FROM dispatches WHERE job_id=?",
+                          (item["implement_job"],)).fetchone()
+    if merged is not None and merged["merged_at"]:
+        return "applied", {"merged": True, "state": fresh["state"] if fresh else None}, None
+    if fresh is not None and fresh["state"] == STATE_VALIDATING:
+        return "applied", {"note": "merge may have reached GitHub, outcome ambiguous — left for "
+                                   "reconcile_operations()"}, None
+    return "rejected", None, (fresh["note"] if fresh is not None else None) or "merge refused"
 
 
 def _apply_argo_dismiss(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int, now: dt.datetime,
@@ -7552,6 +7626,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # current state.
     remind_needs_human(conn, policy, now, dry_run=dry_run)
     track_parked_recurrences(conn, policy, now, dry_run=dry_run)
+    reconcile_stranded_prs(conn, policy, now, dry_run=dry_run)
 
     for _key, members in _cluster_groups(conn).items():
         members = sorted(members, key=lambda r: r["event_id"])
