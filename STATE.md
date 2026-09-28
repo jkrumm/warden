@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-28 (§97–§99 — GitHub's rules are the review gate; default unattended scope with `NEVER_AUTO_MERGE` in code; the executor gate fails closed) |
+| Last updated | 2026-09-28 (§100 — named executable invariants + self-audit; the loop's own gaps become `warden_self` items) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, five LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 315/315 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 325/325 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -137,6 +137,9 @@ loop.
   just `danglingItems`: an `ok: false` with an empty dangling list (rate
   limit, network, expired token) now renders the host's raw `error` text —
   the transient wording is reserved for a genuine clean pass (§75).
+- **Self-audit (§100).** Hourly `check_invariants()` (INV-1…7, DESIGN.md §
+  Executable invariants) + `self_audit_findings()`; findings become
+  `warden_self` events → repo `warden` → ordinary items; `/health.self_audit`.
 - **Default unattended merge scope (§99).** A repo with no `autoMergePaths` of
   its own and not merge-approval gated merges anything `NEVER_AUTO_MERGE`
   (merge.py: CI, Makefiles, scripts, launchd, Docker/compose, manifests,
@@ -342,6 +345,7 @@ log's past sections.
 - Review of §91–§95: three blocking merge-sharing defects fixed — §96
 - GitHub's rules, not a local list, decide review gates; policy dedup; default
   unattended scope with `NEVER_AUTO_MERGE` in code — §97–§99
+- Named executable invariants and a self-audit that makes its own gaps work — §100
 
 ### Next action
 

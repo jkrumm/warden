@@ -8579,5 +8579,133 @@ def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
         fresh = triage._get_item(conn, eid)
         assert fresh["state"] == triage.STATE_MERGED and fresh["note"] == "landed by the other pass"
 
+
+# --- executable invariants and the self-audit (§100) --------------------------
+
+def _seed_state(conn, *, external_id: str, state: str, **cols) -> int:
+    eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
+    sets = ", ".join(f"{k}=?" for k in ("state", *cols))
+    conn.execute(f"UPDATE triage_items SET {sets} WHERE event_id=?", (state, *cols.values(), eid))
+    conn.commit()
+    return eid
+
+
+def _ids(violations):
+    return {(v["id"], v["event_id"]) for v in violations}
+
+
+def test_invariants_clean_ledger_has_no_violations():
+    with _triage_env() as (conn, ctx):
+        _seed_state(conn, external_id="ok-parked", state=triage.STATE_NEEDS_HUMAN, note="approve it",
+                    state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
+        assert triage.check_invariants(conn, NOW) == []
+
+
+def test_inv1_a_state_without_its_clock():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="no-clock", state=triage.STATE_VERDICT, state_deadline=None)
+        assert ("INV-1-clock", eid) in _ids(triage.check_invariants(conn, NOW))
+
+
+def test_inv2_parked_without_a_reason():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="no-reason", state=triage.STATE_MERGE_BLOCKED, note="  ",
+                          state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
+        assert ("INV-2-reason", eid) in _ids(triage.check_invariants(conn, NOW))
+
+
+def test_inv3_in_flight_without_an_episode():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="no-episode", state=triage.STATE_VALIDATING, validation_job=None,
+                          state_deadline=(NOW + dt.timedelta(hours=1)).isoformat())
+        assert ("INV-3-episode", eid) in _ids(triage.check_invariants(conn, NOW))
+
+
+def test_inv4_a_finished_investigation_without_effect():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="no-effect", state=triage.STATE_INVESTIGATING,
+                          dispatch_job="inv-no-effect", state_deadline=(NOW + dt.timedelta(hours=1)).isoformat())
+        conn.execute("UPDATE dispatches SET finished_at=? WHERE job_id='inv-no-effect'",
+                     ((NOW - dt.timedelta(hours=2)).isoformat(),))
+        conn.commit()
+        assert ("INV-4-verdict-effect", eid) in _ids(triage.check_invariants(conn, NOW))
+
+
+def test_inv5_a_card_that_was_never_rendered():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="no-render", state=triage.STATE_NEEDS_HUMAN, note="n",
+                          card_ts="1000.1", card_hash=None,
+                          state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
+        assert ("INV-5-card", eid) in _ids(triage.check_invariants(conn, NOW))
+
+
+def test_inv6_and_inv7_report_but_never_become_work():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="old-parked", state=triage.STATE_NEEDS_HUMAN, note="restart window",
+                          state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
+                     (eid, "verdict", "needs_human", (NOW - dt.timedelta(days=4)).isoformat()))
+        conn.execute("INSERT INTO cursors(key, value, updated_at) VALUES ('stranded_prs', ?, ?)",
+                     (json.dumps([{"event_id": 9, "pr_url": "https://x/pull/1",
+                                   "opened_at": (NOW - dt.timedelta(days=5)).isoformat()}]), NOW.isoformat()))
+        conn.commit()
+        ids = {v["id"] for v in triage.check_invariants(conn, NOW)}
+        assert {"INV-6-dead-draft", "INV-7-owner-queue"} <= ids
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE source='warden_self'").fetchone()[0] == 0
+        audit = json.loads(conn.execute("SELECT value FROM cursors WHERE key='self_audit'").fetchone()[0])
+        assert {"id": "INV-7-owner-queue", "count": 1} in audit["violations"]
+
+
+def test_self_audit_turns_a_violation_into_one_event_and_resolves_it():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="audit-me", state=triage.STATE_VERDICT, state_deadline=None)
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        ev = conn.execute("SELECT * FROM events WHERE source='warden_self'").fetchone()
+        assert ev["external_id"] == "inv-1-clock" and ev["resolved_at"] is None
+        assert f"event {eid}" in json.loads(ev["payload_json"])["first_text"]
+
+        triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(minutes=10), dry_run=False)
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE source='warden_self'").fetchone()[0] == 1
+
+        conn.execute("UPDATE triage_items SET state_deadline=? WHERE event_id=?",
+                     ((NOW + dt.timedelta(days=1)).isoformat(), eid))
+        conn.commit()
+        later = NOW + dt.timedelta(hours=2)
+        triage.run_self_audit(conn, triage.load_policy(), later, dry_run=False)
+        assert conn.execute("SELECT resolved_at FROM events WHERE source='warden_self'").fetchone()[0]
+
+        conn.execute("UPDATE triage_items SET state_deadline=NULL WHERE event_id=?", (eid,))
+        conn.commit()
+        triage.run_self_audit(conn, triage.load_policy(), later + dt.timedelta(hours=2), dry_run=False)
+        assert conn.execute("SELECT resolved_at FROM events WHERE source='warden_self'").fetchone()[0] is None
+
+
+def test_self_audit_findings_catch_its_own_wrong_answers():
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, validation_status) "
+                         "VALUES (?,?,?,?,?,?,?)", (f"blk-{i}", "implement", "demo-repo", "b", "done",
+                                                    NOW.isoformat(), "blocked"))
+        fixed = _seed_state(conn, external_id="came-back", state=triage.STATE_NEW)
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
+                     (fixed, "fixed", "new", NOW.isoformat()))
+        _seed_state(conn, external_id="out-of-revisions", state=triage.STATE_MERGE_BLOCKED, note="blocked",
+                    revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
+        conn.commit()
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        assert "review-always-blocks-demo-repo" in keys
+        assert f"fixed-reopened-{fixed}" in keys
+        assert any(k.startswith("revisions-exhausted-") for k in keys)
+
+
+def test_warden_self_events_route_to_warden_by_the_real_policy():
+    rules = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
+    hit = triage._match_rule(["warden_self:inv-1-clock"], rules)
+    assert hit is not None and hit["repo"] == "warden"
+    assert "warden_self" in triage.INGEST_SOURCES
+    assert set(triage.INVARIANTS) >= triage.REPORT_ONLY_INVARIANTS
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -1148,5 +1148,15 @@ def main() -> int:
     return 0
 
 
+
+def test_health_carries_the_self_audit_summary_and_null_before_the_first_audit():
+    conn, _path = _fresh_conn()
+    assert api.health_payload(conn)["self_audit"] is None
+    summary = {"checked_at": "2026-09-28T12:00:00+00:00", "violations": [{"id": "INV-1-clock", "count": 2}],
+               "findings": ["inv-1-clock"]}
+    _cursor(conn, "self_audit", dt.datetime(2026, 9, 28, 12, tzinfo=dt.timezone.utc), json.dumps(summary))
+    assert api.health_payload(conn)["self_audit"] == summary
+
+
 if __name__ == "__main__":
     sys.exit(main())

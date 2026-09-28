@@ -734,6 +734,32 @@ write path, caused by a dashboard read.
 
 ---
 
+## Executable invariants (2026-09-28, state-log §100)
+
+A rule that lives only in a paragraph gets broken quietly. Each of these is
+named, checked hourly by `check_invariants()` (`scripts/triage.py`), published
+on `/health.self_audit`, and pinned by a test. A violation of INV-1…5 becomes a
+`warden_self` event, mapped to `warden`, and is worked like any alert
+(investigate → implement → the owner's Argo merge). INV-6/7 only report: what
+they flag is already exactly one entry in the owner's list.
+
+| Id | The state nobody should be in | Test |
+|-|-|-|
+| INV-1-clock | a non-terminal state past `new` without the clock its `STATE_DEADLINES` rule names | `test_inv1_a_state_without_its_clock` |
+| INV-2-reason | waiting on the owner with no reason | `test_inv2_parked_without_a_reason` |
+| INV-3-episode | in flight without the episode it waits on | `test_inv3_in_flight_without_an_episode` |
+| INV-4-verdict-effect | an investigation finished > 1 h ago, item still `investigating` | `test_inv4_a_finished_investigation_without_effect` |
+| INV-5-card | a card posted but never rendered | `test_inv5_a_card_that_was_never_rendered` |
+| INV-6-dead-draft | a PR outliving its item > 3 days (report only) | `test_inv6_and_inv7_report_but_never_become_work` |
+| INV-7-owner-queue | anything waiting on the owner > 3 days (report only) | same |
+
+The self-audit adds four findings about the loop's own answers:
+`review-always-blocks-<repo>`, `liveness-never-confirms-<repo>`,
+`fixed-reopened-<event>` (a verdict or fix proven wrong), and
+`revisions-exhausted-<event>`. Enforced elsewhere, by name: `NEVER_AUTO_MERGE`
+and the fail-closed executor gate (`merge.py`, §99), GitHub's rules as the only
+review gate (§97), `OWNER_AUTHORIZERS = ("owner:argo",)` (§96).
+
 ## What must not be lost
 
 Details in the current implementation that read like accidents and are not.

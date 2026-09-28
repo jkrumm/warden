@@ -377,7 +377,7 @@ POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
 # alert-source door, and both new origins insert their `triage_items` row
 # directly.
 INGEST_SOURCES = ("slack_alert", "uk", "docker_homelab", "docker_vps", "hermes_log",
-                   "op_refs_homelab", "op_refs_vps")
+                   "op_refs_homelab", "op_refs_vps", "warden_self")
 
 # The two INGEST_SOURCES that are grouped (upsert_grouped()-based, append-only)
 # rather than state (reconcile()-based, disappearance-resolved) — mirrors
@@ -6104,6 +6104,199 @@ def reconcile_stranded_prs(conn: sqlite3.Connection, policy: dict[str, Any], now
     )
     conn.commit()
 
+
+# --- executable invariants and the self-audit (§100) --------------------------
+#
+# The class of failure the owner names first: a state in which nobody knows
+# what happens next. Each invariant below is one such state, named, checked
+# every hour against the live ledger, published on /health, and — together
+# with the self-audit findings — turned into work: one `warden_self` event
+# per finding, mapped to repo `warden` by the policy, escalated like any alert
+# (investigate → implement → the owner's Argo merge, since warden is
+# merge-approval gated). A finding that stops holding resolves its event.
+
+SELF_SOURCE = "warden_self"
+SELF_AUDIT_CURSOR_KEY = "self_audit"
+SELF_AUDIT_INTERVAL_S = 3600
+OWNER_QUEUE_STALE_DAYS = 3.0
+SELF_AUDIT_WINDOW_DAYS = 14
+
+INVARIANTS: dict[str, str] = {
+    "INV-1-clock": "every non-terminal state past `new` carries the clock its STATE_DEADLINES rule names",
+    "INV-2-reason": "every item waiting on the owner carries a reason (a non-empty note)",
+    "INV-3-episode": "every in-flight state names the episode it is waiting on",
+    "INV-4-verdict-effect": "a finished investigation never leaves its item in `investigating` past an hour",
+    "INV-5-card": "every carded item's card was rendered (card_ts implies card_hash)",
+    "INV-6-dead-draft": f"no PR outlives its item for more than {OWNER_QUEUE_STALE_DAYS:g} days",
+    "INV-7-owner-queue": f"nothing waits on the owner for more than {OWNER_QUEUE_STALE_DAYS:g} days",
+}
+
+# Invariants that report but never become a `warden_self` item: what they
+# flag is already exactly one entry in the owner's list (a stranded PR, a
+# parked item), and a second item about the first would break "one entry
+# per thing that needs him". /health and Argo's stale highlight carry them.
+REPORT_ONLY_INVARIANTS = frozenset({"INV-6-dead-draft", "INV-7-owner-queue"})
+
+
+def check_invariants(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str, Any]]:
+    """Every violation of INVARIANTS in the live ledger, as
+    `{"id", "event_id", "detail"}`. Pure read. `warden_self` rows are left
+    out so a finding about the audit can never feed the audit."""
+    out: list[dict[str, Any]] = []
+    rows = conn.execute(
+        "SELECT ti.* FROM triage_items ti JOIN events e ON e.id = ti.event_id WHERE e.source != ?",
+        (SELF_SOURCE,),
+    ).fetchall()
+    stale_before = now - dt.timedelta(days=OWNER_QUEUE_STALE_DAYS)
+    for it in rows:
+        state, eid = it["state"], it["event_id"]
+        if state in TERMINAL_STATES:
+            continue
+        rule = STATE_DEADLINES.get(state)
+        if state != STATE_NEW and (rule is None or (rule.deadline_column and not it[rule.deadline_column])):
+            out.append({"id": "INV-1-clock", "event_id": eid,
+                        "detail": f"`{state}` with no {rule.deadline_column if rule else 'deadline rule'}"})
+        if state in PARKED_STATES and not (it["note"] or "").strip():
+            out.append({"id": "INV-2-reason", "event_id": eid, "detail": f"`{state}` with no note"})
+        job_col = {STATE_INVESTIGATING: "dispatch_job", STATE_VALIDATING: "validation_job"}.get(state)
+        if job_col and not it[job_col]:
+            out.append({"id": "INV-3-episode", "event_id": eid, "detail": f"`{state}` with no {job_col}"})
+        if state == STATE_INVESTIGATING and it["dispatch_job"]:
+            d = conn.execute("SELECT status, finished_at FROM dispatches WHERE job_id=?",
+                             (it["dispatch_job"],)).fetchone()
+            fin = _parse_ts(d["finished_at"]) if d else None
+            if d and d["status"] in ("done", "failed", "cancelled", "interrupted") and fin \
+                    and (now - fin).total_seconds() > 3600:
+                out.append({"id": "INV-4-verdict-effect", "event_id": eid,
+                            "detail": f"episode {it['dispatch_job'][:8]} finished {d['status']} {_fmt_ts(d['finished_at'])}"})
+        if state in CARDED_STATES and it["card_ts"] and not it["card_hash"]:
+            out.append({"id": "INV-5-card", "event_id": eid, "detail": f"card {it['card_ts']} never rendered"})
+        if state in PARKED_STATES:
+            entered = conn.execute("SELECT MAX(at) AS at FROM item_transitions WHERE event_id=? AND to_state=?",
+                                   (eid, state)).fetchone()
+            since = _parse_ts(entered["at"]) if entered else None
+            if since is not None and since < stale_before:
+                out.append({"id": "INV-7-owner-queue", "event_id": eid,
+                            "detail": f"`{state}` since {_fmt_ts(entered['at'])}: {(it['note'] or '')[:160]}"})
+    cursor = conn.execute("SELECT value FROM cursors WHERE key=?", (STRANDED_PRS_CURSOR_KEY,)).fetchone()
+    for pr in _safe_json_list(cursor["value"] if cursor else None):
+        opened = _parse_ts(pr.get("opened_at"))
+        if opened is not None and opened < stale_before:
+            out.append({"id": "INV-6-dead-draft", "event_id": pr.get("event_id"),
+                        "detail": f"{pr.get('pr_url')} open since {_fmt_ts(pr.get('opened_at'))}"})
+    return out
+
+
+def _safe_json_list(raw: str | None) -> list[dict[str, Any]]:
+    try:
+        val = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return [v for v in val if isinstance(v, dict)] if isinstance(val, list) else []
+
+
+def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str, Any]]:
+    """Gaps the loop can see in its own behaviour, each keyed so one finding
+    is one event: a review gate that blocks every PR in a repo, a liveness
+    probe that never confirms, a `fixed` that reopened (the verdict or the
+    fix was wrong), and a revision budget used up."""
+    since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
+    out: list[dict[str, Any]] = []
+    for r in conn.execute(
+        "SELECT repo, COUNT(*) AS n, SUM(validation_status='blocked') AS blocked FROM dispatches "
+        "WHERE tier='implement' AND validation_status IS NOT NULL AND created_at >= ? GROUP BY repo", (since,),
+    ):
+        if r["n"] >= 3 and r["blocked"] == r["n"]:
+            out.append({"key": f"review-always-blocks-{r['repo']}",
+                        "title": f"the step-7 review blocked all {r['n']} {r['repo']} PRs in {SELF_AUDIT_WINDOW_DAYS} days",
+                        "detail": "either the implement briefs for this repo miss something the review keeps "
+                                  "finding, or the review gate is miscalibrated for it"})
+    for r in conn.execute(
+        "SELECT ti.repo, SUM(t.to_state='new') AS reopened, SUM(t.to_state='fixed') AS fixed "
+        "FROM item_transitions t JOIN triage_items ti ON ti.event_id = t.event_id "
+        "WHERE t.from_state='liveness_pending' AND t.at >= ? GROUP BY ti.repo", (since,),
+    ):
+        if (r["reopened"] or 0) >= 2 and not r["fixed"]:
+            out.append({"key": f"liveness-never-confirms-{r['repo']}",
+                        "title": f"{r['repo']}'s liveness probe timed out {r['reopened']}× and never confirmed a fix",
+                        "detail": "the probe may be checking the wrong thing, or the deploy never lands"})
+    for r in conn.execute(
+        "SELECT DISTINCT t.event_id, ti.signature, ti.repo FROM item_transitions t "
+        "JOIN triage_items ti ON ti.event_id = t.event_id JOIN events e ON e.id = t.event_id "
+        "WHERE t.from_state='fixed' AND t.to_state='new' AND t.at >= ? AND e.source != ?", (since, SELF_SOURCE),
+    ):
+        out.append({"key": f"fixed-reopened-{r['event_id']}",
+                    "title": f"{r['signature']} came back after warden marked it fixed",
+                    "detail": f"the verdict or the fix in {r['repo']} was wrong — event {r['event_id']}"})
+    max_rev = DEFAULT_REVISION_MAX_ATTEMPTS
+    for r in conn.execute(
+        f"SELECT event_id, signature, repo FROM triage_items WHERE revision_count >= ? "
+        f"AND state IN ({','.join('?' * len(PARKED_STATES))})", (max_rev, *PARKED_STATES),
+    ):
+        out.append({"key": f"revisions-exhausted-{r['event_id']}",
+                    "title": f"{r['signature']} still blocked after {max_rev} revisions",
+                    "detail": f"the implementer cannot satisfy the review in {r['repo']}; the brief or the gate is wrong"})
+    return out
+
+
+def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                   *, dry_run: bool) -> None:
+    """Hourly: check INVARIANTS and self_audit_findings(), publish the result
+    in the `self_audit` cursor (read by /health), and keep one `warden_self`
+    event per finding in step with it — inserted or re-opened while the
+    finding holds, resolved the pass it stops holding (a state source, so the
+    ordinary silence path closes a still-`new` item and reopen_if_needed()
+    reopens a closed one on recurrence)."""
+    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (SELF_AUDIT_CURSOR_KEY,)).fetchone()
+    last = _parse_ts(row["updated_at"]) if row else None
+    if last is not None and (now - last).total_seconds() < SELF_AUDIT_INTERVAL_S:
+        return
+    violations = check_invariants(conn, now)
+    findings = self_audit_findings(conn, now)
+    by_inv: dict[str, list[dict[str, Any]]] = {}
+    for v in violations:
+        by_inv.setdefault(v["id"], []).append(v)
+    for inv_id, vs in by_inv.items():
+        if inv_id in REPORT_ONLY_INVARIANTS:
+            continue
+        findings.append({
+            "key": inv_id.lower(),
+            "title": f"invariant {inv_id} violated by {len(vs)} item(s): {INVARIANTS[inv_id]}",
+            "detail": "; ".join(f"event {v['event_id']}: {v['detail']}" for v in vs[:8]),
+        })
+    if dry_run:
+        print(f"[dry-run] self-audit: {len(violations)} invariant violation(s), {len(findings)} finding(s): "
+              f"{[f['key'] for f in findings]}")
+        return
+    now_iso = _now_iso(now)
+    live_keys = {f["key"] for f in findings}
+    for f in findings:
+        payload = json.dumps({"first_text": f"{f['title']} — {f['detail']}"[:1500]})
+        ev = conn.execute("SELECT id, resolved_at FROM events WHERE source=? AND external_id=?",
+                          (SELF_SOURCE, f["key"])).fetchone()
+        if ev is None:
+            conn.execute("INSERT INTO events(source, external_id, title, url, payload_json, first_seen) "
+                         "VALUES (?,?,?,?,?,?)", (SELF_SOURCE, f["key"], f["title"][:300], "", payload, now_iso))
+        elif ev["resolved_at"] is not None:
+            conn.execute("UPDATE events SET resolved_at=NULL, first_seen=?, notified_at=NULL, "
+                         "last_reminder_at=NULL, reminder_count=0, title=?, payload_json=? WHERE id=?",
+                         (now_iso, f["title"][:300], payload, ev["id"]))
+        else:
+            conn.execute("UPDATE events SET title=?, payload_json=? WHERE id=?", (f["title"][:300], payload, ev["id"]))
+    for ev in conn.execute("SELECT id, external_id FROM events WHERE source=? AND resolved_at IS NULL",
+                           (SELF_SOURCE,)).fetchall():
+        if ev["external_id"] not in live_keys:
+            conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
+    summary = {"checked_at": now_iso, "invariants": sorted(INVARIANTS),
+               "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
+               "findings": sorted(live_keys)}
+    conn.execute(
+        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (SELF_AUDIT_CURSOR_KEY, json.dumps(summary), now_iso),
+    )
+    conn.commit()
+
 REVISION_NOTE_PREFIX = "revision "
 
 
@@ -7736,6 +7929,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     reconcile_operations(conn, policy, now, dry_run=dry_run)
 
     drain_intents(conn, now, dry_run=dry_run)
+    run_self_audit(conn, policy, now, dry_run=dry_run)
     ingest(conn, now)
     ingest_github_issues(conn, now)
     reopen_if_needed(conn, now)

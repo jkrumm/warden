@@ -270,6 +270,7 @@
     {"match": "hermes_log:*session-is-closed*", "verb": "restart-hermes-gateway"}
   ],
   "rules": [
+    {"match": "warden_self:*", "repo": "warden", "_note": "\u00a7100 \u2014 the self-audit's findings are warden's own defects: investigated and implemented like any alert, merged only by the owner's Argo click (merge_approval)."},
     {"match": "docker_*:unhealthy:garmin-*", "repo": "homelab"},
     {"match": "docker_*:restart:garmin-*", "repo": "homelab"},
     {"match": "docker_*:unhealthy:audio-gateway*", "repo": "audio-gateway"},

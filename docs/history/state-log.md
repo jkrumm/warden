@@ -8602,3 +8602,25 @@ parked as a draft PR.
 Tests: `test_merge.py` 65 → 69 (gated repo refuses; unreadable policy fails
 closed; ungated repo gets the default; eight NEVER paths refuse inside `**`;
 the owner passes). Numbered cases 826 → 830.
+
+## 100. The loop audits itself: named invariants, and its own wrong answers become work (2026-09-28)
+
+The owner: the loop should notice its own gaps and make work of them, and every
+rule should be readable somewhere by name. `run_self_audit()` (first step of
+`run()` after the intent drain, at most hourly) runs `check_invariants()` — seven
+named invariants (DESIGN.md § Executable invariants, one test each) — and
+`self_audit_findings()`: a review that blocks every PR in a repo, a liveness
+probe that never confirms, a `fixed` that reopened, a revision budget used up.
+Each finding is one `warden_self` event (a new `INGEST_SOURCE`), kept in step
+with the finding — inserted or re-opened while it holds, resolved the pass it
+stops holding — and routed by `warden_self:*` → `warden` (first rule in the
+policy). From there it is an ordinary item: investigate, implement, and the
+owner's Argo merge (warden is merge-approval gated; the loop never merges its
+own executor). The summary is `/health.self_audit` (null before the first run).
+
+INV-6 (dead draft) and INV-7 (owner queue > 3 d) report only: a self-item about
+item 750 (the macOS update only the owner can apply) would have been a second
+entry for one thing that needs him. The dry run on a live snapshot found exactly
+that one violation, and it is what drew the line.
+
+Tests: `test_triage.py` 315 → 325, `test_api.py` 42 → 43. Numbered cases 830 → 841.

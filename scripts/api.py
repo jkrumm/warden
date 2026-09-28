@@ -610,7 +610,13 @@ def health_payload(conn: sqlite3.Connection) -> dict[str, Any]:
             "threshold_minutes": threshold_minutes, "ok": ok,
         }
 
+    audit_row = conn.execute("SELECT value FROM cursors WHERE key='self_audit'").fetchone()
+    try:
+        self_audit = json.loads(audit_row["value"]) if audit_row else None
+    except (TypeError, ValueError):
+        self_audit = None
     return {
+        "self_audit": self_audit,
         "ok": schema_ok and all_pollers_ok,
         "schema_version": version,
         "schema_version_expected": _ledger.LEDGER_SCHEMA_VERSION,
