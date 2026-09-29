@@ -6247,6 +6247,31 @@ def _restore_drill_findings(now: dt.datetime) -> list[dict[str, Any]]:
     return []
 
 
+def _revision_exhaustion_detail(state: str, note: str | None, repo: str) -> str:
+    """Why an item with its revisions spent is parked — from its own park note,
+    never assumed (§111).
+
+    This finding keys on `revision_count` plus a parked state alone, and it used
+    to hardcode "the implementer cannot satisfy the review". For the two items it
+    fired on that sentence was false: 1276/1277 had each cleared step-7 review
+    (`actionable` with an empty `blocking` list is `confirmed`) and parked on a
+    merge-time 403 reading branch rules, and the card sent its reader after a
+    review failure that did not exist. A finding that names the wrong mechanism
+    is worse than a vague one — it is read as evidence."""
+    text = (note or "").strip()
+    if text.startswith("step-7 validation (blocked):"):
+        return f"the implementer cannot satisfy the review in {repo}; the brief or the gate is wrong"
+    if text.startswith(MERGE_REFUSED_NOTE_PREFIX):
+        return (f"{repo}'s merge gate refused the confirmed PR — "
+                f"{text[len(MERGE_REFUSED_NOTE_PREFIX):].strip()}; "
+                f"revisions cannot change that, the gate is the blocker")
+    if text.startswith("step-7 validation (needs-human):"):
+        return (f"the step-7 review ran but produced no usable verdict in {repo} "
+                f"({text}); the review pipeline, not the implementer, is the blocker")
+    return (f"{repo} parked in '{state}' with its revisions spent and no review block "
+            f"recorded{' — ' + text if text else ''}; read the park note before blaming the review")
+
+
 def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
                         policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Gaps the loop can see in its own behaviour, each keyed so one finding
@@ -6286,13 +6311,14 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     out.extend(_restore_drill_findings(now))
     max_rev = int((policy or {}).get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
     for r in conn.execute(
-        f"SELECT ti.event_id, ti.signature, ti.repo FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"SELECT ti.event_id, ti.signature, ti.repo, ti.state, ti.note FROM triage_items ti "
+        f"JOIN events e ON e.id = ti.event_id "
         f"WHERE ti.revision_count >= ? AND e.source != ? "
         f"AND ti.state IN ({','.join('?' * len(PARKED_STATES))})", (max_rev, SELF_SOURCE, *PARKED_STATES),
     ):
         out.append({"key": f"revisions-exhausted-{r['event_id']}",
                     "title": f"{r['signature']} still blocked after {max_rev} revisions",
-                    "detail": f"the implementer cannot satisfy the review in {r['repo']}; the brief or the gate is wrong"})
+                    "detail": _revision_exhaustion_detail(r["state"], r["note"], r["repo"])})
     return out
 
 

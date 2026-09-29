@@ -8798,6 +8798,36 @@ def test_self_audit_findings_catch_its_own_wrong_answers():
         assert any(k.startswith("revisions-exhausted-") for k in keys)
 
 
+def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review():
+    """§111 — the finding keyed only on `revision_count` plus a parked state and
+    hardcoded "the implementer cannot satisfy the review". For 1276/1277 that was
+    false: both had cleared review (`actionable`, empty `blocking`) and parked on
+    a merge-time 403, so the card sent its reader after a review failure that did
+    not exist. The detail now comes from the item's own park note."""
+    with _triage_env() as (conn, ctx):
+        on_the_gate = _seed_state(conn, external_id="parked-on-the-gate",
+                                  state=triage.STATE_MERGE_BLOCKED,
+                                  note="merge refused: GitHub returned HTTP 403 reading check-runs for "
+                                       "jkrumm/demo-repo@abc",
+                                  revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
+        on_the_review = _seed_state(conn, external_id="parked-on-the-review",
+                                    state=triage.STATE_MERGE_BLOCKED,
+                                    note="step-7 validation (blocked): src/x.ts:12 — the guard is gone",
+                                    revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
+        on_the_pipeline = _seed_state(conn, external_id="parked-on-the-pipeline",
+                                      state=triage.STATE_NEEDS_HUMAN,
+                                      note="step-7 validation (needs-human): synthesis failed to "
+                                           "serialize a structured verdict",
+                                      revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
+        conn.commit()
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        gate_detail = details[f"revisions-exhausted-{on_the_gate}"]
+        assert "merge gate" in gate_detail and "403" in gate_detail
+        assert "cannot satisfy the review" not in gate_detail
+        assert "cannot satisfy the review" in details[f"revisions-exhausted-{on_the_review}"]
+        assert "review pipeline" in details[f"revisions-exhausted-{on_the_pipeline}"]
+
+
 def test_warden_self_events_route_to_warden_by_the_real_policy():
     rules = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
     hit = triage._match_rule(["warden_self:inv-1-clock"], rules)

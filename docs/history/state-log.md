@@ -9130,3 +9130,26 @@ marked ready (74/74). `make test` green — `test_triage.py` 343/343,
 `test_lifecycle.py` 102/102. The four `noCiRequired` repos in the policy
 (weatherorb, homelab, vps, research-gateway) are the only ones this can affect,
 and only weatherorb is private, so nothing public changes behaviour.
+
+## 111. The revisions-exhausted finding reads the park note instead of blaming the review (2026-09-29)
+
+The card that started this session said `github_go:jkrumm/weatherorb#7 still
+blocked after 2 revisions`, with the detail *"the implementer cannot satisfy the
+review in weatherorb; the brief or the gate is wrong"*. Both halves were
+wrong: #7's second revision had cleared step-7 review (`actionable` with an empty
+`blocking` list folds to `confirmed`), and the item was parked on a merge-time
+403. The finding keys on `revision_count >= revisionMaxAttempts` plus a parked
+state and hardcoded that sentence without ever reading why the item parked — so
+it read as evidence of a review failure that did not exist.
+
+**The change.** `_revision_exhaustion_detail(state, note, repo)` — the detail is
+now derived from the item's own park note: a `step-7 validation (blocked):` park
+keeps the review wording (that is the case it was written for), a
+`merge refused:` park says the merge gate refused the confirmed PR and that
+revisions cannot change that, a `step-7 validation (needs-human):` park names the
+review pipeline, and anything else says which state it parked in and to read the
+note. The title is unchanged.
+
+**Verified.** `test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review`
+covers the three note shapes (written first, RED on the old code). `make test`
+green — `test_triage.py` 344/344, everything else at §110's counts.

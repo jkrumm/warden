@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-29 (§110 — an unreadable CI read is the credential's limit: the loop's PAT has no `Checks: read`, so check-runs 403 on the private `weatherorb`; `CheckRunsUnreadable` now lets `plan_or_land()` waive the gate *only* where the policy declares `noCiRequired`, recorded in the merge receipt) |
+| Last updated | 2026-09-29 (§111 — the `revisions-exhausted` finding reads the item's own park note instead of hardcoding "the implementer cannot satisfy the review", which was false for the two weatherorb items it fired on) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -173,6 +173,9 @@ loop.
 - **Self-audit (§100).** Hourly `check_invariants()` (INV-1…7, DESIGN.md §
   Executable invariants) + `self_audit_findings()`; findings become
   `warden_self` events → repo `warden` → ordinary items; `/health.self_audit`.
+  A finding's detail is derived from the state it describes, never hardcoded —
+  `revisions-exhausted` reads the park note (§111), because a card that names
+  the wrong mechanism is read as evidence.
 - **A plan-gated rules read is "no rules" (§108).** `branch_rules()` returns
   `[]` for the 403 GitHub answers with on a private repo whose plan carries no
   rulesets ("Upgrade to GitHub Pro or make this repository public") — that repo
@@ -425,6 +428,8 @@ log's past sections.
   file did — §109
 - An unreadable CI read is the credential's limit; only `noCiRequired` waives
   it — §110
+- The `revisions-exhausted` finding reads the park note instead of blaming the
+  review — §111
 
 ### Next action
 
