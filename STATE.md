@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-29 (§111 — the `revisions-exhausted` finding reads the item's own park note instead of hardcoding "the implementer cannot satisfy the review", which was false for the two weatherorb items it fired on) |
+| Last updated | 2026-09-29 (§112 — the op-refs probe ran without `. ~/.profile`, so it missed the `OP_SOCK` daemon cache, spent budget, and reported its own 429 as "1Password refs unresolved" on a host whose six crons were all green) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |

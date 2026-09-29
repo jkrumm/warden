@@ -182,10 +182,25 @@ QUIET_END_H = 7
 # Mirrors scripts/hermes-ops.sh's `env-check` verb (same `op run -- true` probe,
 # same stderr parse) but is reimplemented here rather than shelled out to, so the
 # watchdog stays a self-contained script with no dependency on that file's shape.
+#
+# Each command sources the host profile FIRST, behind the `[ -r ]` guard, because
+# the crons it stands in for do: every op-wrapped homelab cron line begins
+# `. /home/jkrumm/.profile;`, and that is where `OP_SOCK` is pinned. Skipping it
+# leaves `op` without the daemon socket, so the client dials an absent path, the
+# cache never engages, and the probe spends network requests — which is how a
+# host whose six crons were all green got reported as "1Password refs unresolved
+# on homelab" with the shared budget's `[ERROR] Too many requests` as the cause
+# (2026-09-29). A probe that tests an environment no cron uses answers a
+# different question than the one it was built for. The `[ -r ]` guard is
+# load-bearing, not decoration: `.` is a POSIX special builtin, so dash aborts
+# the ENTIRE command line when the name cannot be opened, and an absent profile
+# would then cost every poll rather than the credential alone (homelab
+# docs/decisions.md -> 1Password CLI in cron shells).
+OP_REF_PROFILE = "[ -r ~/.profile ] && . ~/.profile; "
 OP_REF_SSH_TIMEOUT = 20  # seconds; the remote command is a no-op ("-- true")
 OP_REF_HOSTS: dict[str, str] = {
-    "homelab": "cd ~/homelab && op run --env-file=.env.tpl -- true",
-    "vps": "cd ~/vps && op run --env-file=.env.tpl -- true",
+    "homelab": OP_REF_PROFILE + "cd ~/homelab && op run --env-file=.env.tpl -- true",
+    "vps": OP_REF_PROFILE + "cd ~/vps && op run --env-file=.env.tpl -- true",
 }
 # `op run` prints "could not find item <name> in vault <id>" or "could not resolve
 # item UUID for item <name>: ...". Only the item name is ever extracted — the

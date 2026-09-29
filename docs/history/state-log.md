@@ -9153,3 +9153,47 @@ note. The title is unchanged.
 **Verified.** `test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review`
 covers the three note shapes (written first, RED on the old code). `make test`
 green — `test_triage.py` 344/344, everything else at §110's counts.
+
+
+## 112. The op-refs probe ran in an environment no cron uses (2026-09-29)
+
+`op_refs_homelab:raw:error-too-many-requests-…` paged as *"1Password refs
+unresolved on homelab (.env.tpl)"* while **all six op-wrapped crons on that host
+were green** — vpn-watchdog, auto-update, garmin-auto-relogin,
+koinsight-stats-push, mam-seedbox-sync, mam-account-sync, wishlist-sync, last
+runs minutes earlier. `OP_REF_HOSTS` sent
+
+    cd ~/homelab && op run --env-file=.env.tpl -- true
+
+over ssh without the `. ~/.profile;` every op-wrapped crontab line begins with,
+and `OP_SOCK` is pinned in that profile. Unpinned, the client derived its socket
+from an unset `XDG_RUNTIME_DIR`, dialled `/var/run/user/1000/op-daemon.sock`
+(absent — the daemon listens at `~/.config/op/`), missed the daemon cache, and
+spent network requests, then reported the shared service-account budget's `Too
+many requests` as a broken template. The probe was answering a different
+question than the one it was built for: *would the crons survive this template?*
+
+Measured A/B, 2026-09-29: the unfaithful command returns 429; the profile-sourced
+one returns 0 having made no network requests; `OP_SOCK` alone reproduces the
+pass, so the socket pin is the whole difference.
+
+Fix: `OP_REF_PROFILE = "[ -r ~/.profile ] && . ~/.profile; "`, prefixed to both
+hosts. The `[ -r ]` guard is load-bearing, not decoration (`docs/decisions.md`:
+`.` is a POSIX special builtin, so dash aborts the whole line on an absent
+profile). Faithfulness costs no verdict — a missing item is still named.
+
+Warden's own `triage.py` trip path had it too, and that one runs from the 600s
+loop: an unprofiled call burned the budget ~144 times a day and printed its own
+429 as `trip residue sweep failed` in `warden-loop.err`. So did
+`hermes-ops.sh`'s `env-check` — the verb this card ran to confirm the failure —
+with the uk-sync and both deploy paths. One profile-source constant now serves
+each repo. `hermes-agent` has no implement lane (`investigate` ceiling), so that
+half landed by hand, as §75's did.
+
+**Verified.** `tests/test_watchdog_op_refs_env.py` written first: 5 assertions
+RED on the unfixed probe (both hosts' guard + order, the argv ssh actually
+receives, and the trip path's argv), green after; the missing-item case is green
+throughout, which is what shows the fix does not cost detection. `make test` green — `test_triage.py`
+344/344 unchanged, every other suite at §110/§111 counts. Live, through the
+shipped `poll_op_refs`: both hosts `reachable=True` with **0 events**, where the
+unprofiled command still 429s.

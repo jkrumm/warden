@@ -6604,6 +6604,17 @@ _KUMA_NAME_RE = re.compile(r"^[A-Za-z0-9 ._()/:+\-]{1,120}$")
 TRIP_FAILED_NOTE_PREFIX = "detection no longer fires: "
 
 
+# Same prefix as watchdog-poll.py's OP_REF_PROFILE, and for the same reason: the
+# op-wrapped crons source the profile before `op run` because OP_SOCK is pinned
+# there. A remote `op run` without it has no daemon socket, misses the cache, and
+# spends the shared account budget on every call — this trip path runs from the
+# 600s loop, so an unprofiled call burns it ~144 times a day and reports its own
+# 429 as a failed trip (seen in warden-loop.err, 2026-09-29). The [ -r ] guard is
+# load-bearing: `.` is a POSIX special builtin, so dash aborts the whole line on
+# an absent profile.
+OP_PROFILE_SRC = "[ -r ~/.profile ] && . ~/.profile; "
+
+
 def _kuma_trip(verb: str, *args: str) -> dict[str, Any]:
     """One call to scripts/kuma-trip.py on the homelab server. Arguments are
     validated here and shell-quoted: ssh joins the remote command into a
@@ -6615,7 +6626,7 @@ def _kuma_trip(verb: str, *args: str) -> dict[str, Any]:
         return {"ok": False, "error": "shadow id must be an integer"}
     if verb == "sweep" and not all(a.isdigit() for a in args):
         return {"ok": False, "error": "keep ids must be integers"}
-    remote = ("cd ~/homelab && op run --env-file=.env.tpl -- uptime-kuma/.venv/bin/python - "
+    remote = (OP_PROFILE_SRC + "cd ~/homelab && op run --env-file=.env.tpl -- uptime-kuma/.venv/bin/python - "
               + " ".join(shlex.quote(a) for a in (verb, *args)))
     try:
         proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "homelab", remote],
