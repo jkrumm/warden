@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-29 (§108 — a plan-gated rules read is "no rules", not a refusal: `weatherorb` is private and rulesets are a paid feature there, so the 403 GitHub answers with made every weatherorb merge impossible by construction while its policy said `autoMergePaths: ["**"]`; items 1276/1277 were parked on it with confirmed reviews) |
+| Last updated | 2026-09-29 (§109 — a refused merge is retried when the *gate* changed, not only when the policy file did: the reference now spans `POLICY_PATH` + `lifecycle/merge.py` + `clients/github.py`, so a code fix unsticks a parked PR without a policy edit; §108 had left two confirmed weatherorb PRs parked on a fixed defect) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -181,6 +181,11 @@ loop.
   `plan_or_land()`'s `mergeable_state == "blocked"` (§102) and the pinned head
   SHA. Before this, `weatherorb` (private, `autoMergePaths: ["**"]`,
   `autoDeploy`) could not merge at all.
+- **A refused merge retries when the gate changed (§109).**
+  `retry_policy_refused_merges()`'s reference is `_merge_gate_mtime()` — the
+  newest of `POLICY_PATH`, `lifecycle/merge.py`, `clients/github.py` — so a
+  *code* fix to the merge path unsticks a parked PR with no policy edit, while
+  nothing retries on a timer.
 - **Default unattended merge scope (§99, widened §107).** A repo with no
   `autoMergePaths` of its own and not merge-approval gated merges any path;
   gated repos (`EXECUTOR_REPOS` in code, plus `merge_approval`) and an
@@ -400,6 +405,8 @@ log's past sections.
 - NEVER_AUTO_MERGE withdrawn on the owner's word; the executor gate moves into code — §107
 - A plan-gated rules read is "no rules": weatherorb is private and could not
   merge by construction — §108
+- A refused merge is retried when the gate changed, not only when the policy
+  file did — §109
 
 ### Next action
 

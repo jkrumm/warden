@@ -9058,6 +9058,39 @@ credential: `branch_rules("jkrumm", "weatherorb", "master") == []` →
 `required_approving_reviews == 0`, `pick_merge_method` → `rebase`; the public
 control `jkrumm/warden` still returns its three ruleset rules
 (`non_fast_forward`, `deletion`, `required_linear_history`), so the exemption
-hides nothing that exists. The two parked items were then re-driven by hand
-(`warden merge`, validator `confirmed`), each merge attempt going through this
-same gate.
+hides nothing that exists. The two parked items were re-driven straight after
+this commit, each attempt going through this same gate — through the loop's own
+retry rather than `warden merge`, for the reason §109 records.
+
+## 109. A refused merge is retried when the *gate* changed, not only when the policy file did (2026-09-29)
+
+§108 fixed the rules read and, on its own, unblocked nothing.
+`retry_policy_refused_merges()` compares the policy file's mtime against the
+item's `updated_at` (§93) — the reference was the file, not the gate — so "two
+confirmed PRs, one fixed defect, no pending policy edit" is precisely the state
+that never retries. The fix sat in the checkout while items 1276 and 1277 stayed
+parked.
+
+**The change.** `_merge_gate_mtime()`: the newest mtime among `POLICY_PATH`,
+`lifecycle/merge.py` and `clients/github.py`. The eligibility rule is otherwise
+untouched (`merge_blocked` state, a `merge refused:` note, an implement dispatch
+`confirmed` and unmerged, `_merge_needs_approval()` false, CAS-claimed before the
+slow merge). Deliberately **not** a timer: a refusal the changed gate still makes
+re-lands the same note with a fresh `updated_at`, so an item whose scope never
+arrives (homelab before §93's policy entry) still waits for a real change instead
+of re-attempting on every 300 s pass — the property the original design chose
+over a retry loop, kept.
+
+**Verified.** Two tests.
+`test_merge_gate_mtime_reads_the_gate_modules_not_only_the_policy_file` points
+`_merge.__file__` at a tmp file stamped newer than a back-dated policy file and
+asserts the module is the reference (no real file's mtime is touched).
+`test_a_refused_merge_retries_when_the_gate_changed_and_never_on_a_timer`:
+gate older than the refusal → no attempt and the item stays `merge_blocked`,
+however long it has parked; gate newer → exactly one attempt, item `merged`.
+`make test` green — `test_triage.py` 343/343, every other suite at §108's counts.
+Live, nothing is asserted yet: the next pass after this commit is the test, and
+1276/1277's refusals are 11 h and 1 h older than this fix, so the first sweep
+after it is expected to re-attempt both through the ordinary loop path (`warden
+merge` by hand was deliberately not used — it lands the PR without moving the
+item, leaving a merged PR behind a stale `merge_blocked` card).

@@ -8419,7 +8419,57 @@ def test_policy_refused_merge_is_retried_once_the_policy_changes():
             assert len(calls) == 1
             assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGED
             triage.retry_policy_refused_merges(conn, triage.load_policy(), NOW, dry_run=False)
-            assert len(calls) == 1, "no second attempt without a newer policy file"
+            assert len(calls) == 1, "no second attempt: the item already moved off merge_blocked"
+
+
+def test_merge_gate_mtime_reads_the_gate_modules_not_only_the_policy_file():
+    """§109 — the retry's reference is "the thing that refused changed", so it
+    must cover the gate's own code, not only the policy file. Keeping the
+    policy file as the sole reference meant the §108 rules fix could not unstick
+    anything until someone happened to edit the policy — two confirmed
+    weatherorb PRs parked on a defect that was already fixed."""
+    with _triage_env() as (conn, ctx):
+        gate_module = Path(triage.POLICY_PATH.parent / "fake-merge-gate.py")
+        gate_module.write_text("# the gate\n")
+        past = (NOW - dt.timedelta(days=3)).timestamp()
+        os.utime(triage.POLICY_PATH, (past, past))
+        stamp = NOW.timestamp() + 5
+        os.utime(gate_module, (stamp, stamp))
+        with _patched(triage, _merge=types.SimpleNamespace(__file__=str(gate_module))):
+            gate = triage._merge_gate_mtime()
+        assert gate is not None
+        assert abs((gate - dt.datetime.fromtimestamp(stamp, tz=dt.timezone.utc)).total_seconds()) < 1, (
+            "the gate module's own mtime must be the reference when it is the newest"
+        )
+
+
+def test_a_refused_merge_retries_when_the_gate_changed_and_never_on_a_timer():
+    """§109 — the eligibility rule reads the gate clock, and nothing else: a
+    gate changed after the refusal retries it; a gate older than the refusal
+    does not, however long the item has been parked."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-gate-changed")
+        refused_at = (NOW - dt.timedelta(hours=1)).isoformat()
+        conn.execute("UPDATE triage_items SET state=?, implement_job='impl-gc', pr_url=?, note=?, updated_at=? "
+                     "WHERE event_id=?", (triage.STATE_MERGE_BLOCKED, "https://github.com/jkrumm/demo-repo/pull/9",
+                                          "merge refused: GitHub returned HTTP 403 reading the rules on "
+                                          "jkrumm/demo-repo:master", refused_at, eid))
+        conn.commit()
+        _seed_implement_dispatch(conn, "impl-gc")
+        conn.execute("UPDATE dispatches SET validation_status='confirmed' WHERE job_id='impl-gc'")
+        conn.commit()
+        calls: list[Any] = []
+        fake = types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo", pull_request=9)
+        land = lambda *a, **kw: calls.append(kw) or fake  # noqa: E731
+        with _patched(triage, _merge_gate_mtime=lambda: NOW - dt.timedelta(days=4)), \
+                _patched(triage._merge, plan_or_land=land):
+            triage.retry_policy_refused_merges(conn, triage.load_policy(), NOW, dry_run=False)
+            assert calls == [], "a gate unchanged since the refusal is not a reason to retry"
+            assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGE_BLOCKED
+        with _patched(triage, _merge_gate_mtime=lambda: NOW), _patched(triage._merge, plan_or_land=land):
+            triage.retry_policy_refused_merges(conn, triage.load_policy(), NOW, dry_run=False)
+        assert len(calls) == 1
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGED
 
 
 # --- what waits on the owner (§94) --------------------------------------------

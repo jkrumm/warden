@@ -5984,20 +5984,40 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
 MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
 
 
+def _merge_gate_mtime() -> dt.datetime | None:
+    """The newest mtime among the things that decide a merge: the policy file
+    and the two modules carrying the gate (`lifecycle/merge.py`,
+    `clients/github.py`).
+
+    §109: the retry below watched the policy file alone, so a *code* fix to the
+    gate took effect only at the next policy edit — two confirmed weatherorb
+    PRs sat in `merge_blocked` from the §108 defect after it was fixed, which is
+    the same "settled forever" shape the retry exists to prevent. The property
+    kept: an item is retried when the thing that refused it has changed, never
+    on a timer."""
+    stamps: list[dt.datetime] = []
+    for path in (POLICY_PATH, Path(_merge.__file__ or ""), Path(_github.__file__ or "")):
+        try:
+            stamps.append(dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc))
+        except OSError:
+            continue
+    return max(stamps) if stamps else None
+
+
 def retry_policy_refused_merges(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                                 *, dry_run: bool) -> None:
     """A PR the review confirmed but the merge gate refused sits in
     `merge_blocked` forever — even after the policy file grows the scope that
     would admit it (homelab#9, item 1170: refused for "no autoMergePaths
-    declared for 'homelab'"). Re-attempt the merge once per policy-file
-    change: eligible when the item parked on a `merge refused:` note, its
-    implement dispatch is `confirmed` and unmerged, and the policy file is
-    newer than the item's last update. A refusal the new policy still makes
+    declared for 'homelab'"). Re-attempt the merge once per change to the thing
+    that refused: eligible when the item parked on a `merge refused:` note, its
+    implement dispatch is `confirmed` and unmerged, and the gate
+    (`_merge_gate_mtime()` — the policy file *or* the gate's own code, §109) is
+    newer than the item's last update. A refusal the changed gate still makes
     lands the same note again with a fresh `updated_at`, so it waits for the
-    next policy change instead of retrying every pass."""
-    try:
-        policy_mtime = dt.datetime.fromtimestamp(POLICY_PATH.stat().st_mtime, tz=dt.timezone.utc)
-    except OSError:
+    next change instead of retrying every pass."""
+    gate_mtime = _merge_gate_mtime()
+    if gate_mtime is None:
         return
     rows = conn.execute(
         "SELECT ti.* FROM triage_items ti JOIN dispatches d ON d.job_id = ti.implement_job "
@@ -6006,7 +6026,7 @@ def retry_policy_refused_merges(conn: sqlite3.Connection, policy: dict[str, Any]
     ).fetchall()
     for item in rows:
         updated = _parse_ts(item["updated_at"])
-        if updated is None or policy_mtime <= updated:
+        if updated is None or gate_mtime <= updated:
             continue
         if _merge_needs_approval(item["repo"]):
             continue
