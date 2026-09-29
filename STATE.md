@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-29 (§107 — NEVER_AUTO_MERGE withdrawn on the owner's word: Makefiles, CI, plists, manifests, lockfiles merge unattended everywhere except the executor repos, which are now gated in code (`EXECUTOR_REPOS`); `weatherorb-pull` also runs `make launchd-install`) |
+| Last updated | 2026-09-29 (§108 — a plan-gated rules read is "no rules", not a refusal: `weatherorb` is private and rulesets are a paid feature there, so the 403 GitHub answers with made every weatherorb merge impossible by construction while its policy said `autoMergePaths: ["**"]`; items 1276/1277 were parked on it with confirmed reviews) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 340/340 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 341/341 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -173,11 +173,19 @@ loop.
 - **Self-audit (§100).** Hourly `check_invariants()` (INV-1…7, DESIGN.md §
   Executable invariants) + `self_audit_findings()`; findings become
   `warden_self` events → repo `warden` → ordinary items; `/health.self_audit`.
+- **A plan-gated rules read is "no rules" (§108).** `branch_rules()` returns
+  `[]` for the 403 GitHub answers with on a private repo whose plan carries no
+  rulesets ("Upgrade to GitHub Pro or make this repository public") — that repo
+  cannot have one, so `[]` is the truth. Every other non-200 stays a refusal; a
+  classic protection the endpoint cannot report is still caught by
+  `plan_or_land()`'s `mergeable_state == "blocked"` (§102) and the pinned head
+  SHA. Before this, `weatherorb` (private, `autoMergePaths: ["**"]`,
+  `autoDeploy`) could not merge at all.
 - **Default unattended merge scope (§99, widened §107).** A repo with no
   `autoMergePaths` of its own and not merge-approval gated merges any path;
   gated repos (`EXECUTOR_REPOS` in code, plus `merge_approval`) and an
   unreadable dispatch policy fail closed. Review gate = GitHub's branch rules
-  (§97).
+  (§97, and §108 for a repo the rulesets endpoint cannot answer for).
 - **Live evidence in briefs (§95).** `launchd-restarts` (Dev Host),
   `beszel-alerts` (homelab temp/CPU/load/disk thresholds + firings),
   `kuma-monitor-config` (public monitors.yaml block + last 25 heartbeats).
@@ -390,6 +398,8 @@ log's past sections.
 - weatherorb fully unattended; the NEVER_AUTO_MERGE widening prepared, not landed — §105
 - A vanished trip shadow is unproven, never a finding — §106
 - NEVER_AUTO_MERGE withdrawn on the owner's word; the executor gate moves into code — §107
+- A plan-gated rules read is "no rules": weatherorb is private and could not
+  merge by construction — §108
 
 ### Next action
 

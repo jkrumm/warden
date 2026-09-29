@@ -38,6 +38,12 @@ _PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]
 # 40-hex is a defect worth a loud refusal, not a value worth escaping.
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
+# GitHub's own text on `GET /repos/{o}/{r}/rules/branches/{b}` when the
+# repository is private and the plan carries no rulesets (a paid feature
+# there). Matched literally, and only on a 403: this is "the feature does not
+# exist for this repo", never "you may not look" (§108).
+_RULESETS_UNAVAILABLE_RE = re.compile(r"Upgrade to GitHub Pro or make this repository public")
+
 _token_cache: str | None = None
 
 
@@ -369,8 +375,22 @@ def branch_rules(owner: str, repo: str, branch: str) -> list[dict[str, Any]]:
     """Every ruleset rule GitHub itself enforces on `branch` — the source of
     truth for "does a human have to approve this", read instead of assumed
     (§97: a local list saying a repo is PR-required was read as "needs human
-    review" while the ruleset required zero approvals)."""
+    review" while the ruleset required zero approvals).
+
+    A `403` whose own text says the feature needs GitHub Pro on a private
+    repository is not a refusal to read: rulesets are a paid feature there, so
+    such a repo cannot have one and `[]` is the true answer, not a guess
+    (§108). Raising instead made `weatherorb` — private, `autoMergePaths:
+    ["**"]`, `autoDeploy` — permanently unmergeable: items 1276 and 1277
+    parked on this 403 while their step-7 reviews had already confirmed.
+    Every other non-200 stays a loud refusal (a token that cannot read a
+    repository's rules must never read as "no rules"), and an unreadable
+    *classic* protection still cannot be ridden: `merge.plan_or_land()`
+    refuses `mergeable_state == "blocked"` and pins the head SHA on the merge
+    call, both read from GitHub's own verdict rather than this list."""
     status, body = api("GET", f"/repos/{owner}/{repo}/rules/branches/{branch}")
+    if status == 403 and isinstance(body, dict) and _RULESETS_UNAVAILABLE_RE.search(body.get("message") or ""):
+        return []
     if status != 200 or not isinstance(body, list):
         raise RemoteError(f"GitHub returned HTTP {status} reading the rules on {owner}/{repo}:{branch}")
     return body

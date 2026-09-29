@@ -1018,6 +1018,37 @@ def test_branch_rules_non_200_raises():
         github.api = saved
 
 
+def test_branch_rules_plan_gated_403_is_no_rules_not_a_refusal():
+    """§108 — rulesets are a paid feature on private repositories, so GitHub
+    answers the rules read with 403 "Upgrade to GitHub Pro or make this
+    repository public to enable this feature." on a private repo on a plan
+    without them. The repo then cannot have a ruleset at all: `[]` is the
+    true answer, and refusing made weatherorb (private, `autoMergePaths:
+    ["**"]`, `autoDeploy`) permanently unmergeable — items 1276 and 1277
+    parked on this 403 while their reviews had confirmed. GitHub's own
+    `mergeable_state == "blocked"` and the merge call stay the enforcement
+    point, so an unreadable-but-real protection still cannot be ridden."""
+    saved = github.api
+    try:
+        github.api = lambda method, path, body=None: (
+            403,
+            {"message": "Upgrade to GitHub Pro or make this repository public to enable this feature."},
+        )
+        assert github.branch_rules("jkrumm", "weatherorb", "master") == []
+
+        github.api = lambda method, path, body=None: (
+            403, {"message": "Resource not accessible by personal access token"},
+        )
+        try:
+            github.branch_rules("jkrumm", "weatherorb", "master")
+        except RemoteError as e:
+            assert "403" in str(e)
+        else:
+            raise AssertionError("a 403 that is not the plan gate must stay a refusal")
+    finally:
+        github.api = saved
+
+
 def test_pick_merge_method_order():
     assert github.pick_merge_method({"allow_squash_merge": True, "allow_rebase_merge": True}) == "squash"
     assert github.pick_merge_method({"allow_squash_merge": False, "allow_rebase_merge": True}) == "rebase"

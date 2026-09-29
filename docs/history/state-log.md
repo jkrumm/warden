@@ -9012,3 +9012,52 @@ disposition paragraph; `config/triage-policy.json` weatherorb note;
 `docs/never-auto-merge-widening.md` now headed "Landed". Tests: `make test`
 green — `test_merge.py` 72/72 (three tests replaced, one added, one renamed),
 `test_clients.py` 113/113, `test_triage.py` at §106's count, 341/341.
+
+## 108. A plan-gated rules read is "no rules", not a refusal — weatherorb could not merge by construction (2026-09-29)
+
+The `revisions-exhausted-1277` self-audit card said weatherorb#7's implementer
+"cannot satisfy the review". That was false, and the truth was one HTTP body
+away. Items 1276 (PR #11) and 1277 (PR #14) both parked in `merge_blocked` with
+the note `merge refused: GitHub returned HTTP 403 reading the rules on
+jkrumm/weatherorb:master` — *after* their step-7 reviews had confirmed
+(`actionable` with an empty `blocking` list maps to `confirmed`; that is
+`poll_validation_jobs()`'s own table). Nothing was wrong with either diff.
+
+**The mechanism.** `lifecycle/merge.py`'s `plan_or_land()` reads GitHub's own
+rules first (§97) and refuses before any other merge check when that read
+fails; `clients/github.py`'s `branch_rules()` raised on any non-200 without
+capturing the body, so the reason never reached the note. The body is:
+
+    {"message": "Upgrade to GitHub Pro or make this repository public to enable this feature."}
+
+`weatherorb` is private (§105's own policy note says so) and **rulesets are a
+paid feature on private repositories**, so this repo cannot carry one: `[]` is
+the true answer, and no token grant changes it. The investigation's
+recommendation — grant the fine-grained PAT the rules read — would have bought
+nothing. Raising instead made every weatherorb merge impossible by
+construction, in the one repo whose own entry declares `autoMergePaths: ["**"]`,
+`noCiRequired: true`, `autoDeploy: true`: the fully unattended repo was the one
+that could never merge.
+
+**The change.** `branch_rules()` returns `[]` for exactly that 403, matched on
+GitHub's own sentence, only on a 403. Every other non-200 stays a loud
+`RemoteError` — a token that cannot read a repository's rules must never read as
+"no rules" — and an unreadable *classic* protection still cannot be ridden,
+because the enforcement point was never this list: `plan_or_land()` refuses
+`mergeable_state == "blocked"`, GitHub's own verdict, added in §102 precisely
+for the protections the rulesets endpoint does not report, and the merge call
+pins the head SHA.
+
+**Verified.** `test_clients.py` gains
+`test_branch_rules_plan_gated_403_is_no_rules_not_a_refusal` (written first, RED
+on the old code: `RemoteError: GitHub returned HTTP 403 reading the rules on
+jkrumm/weatherorb:master`); `make test` green — `test_clients.py` 114/114,
+`test_triage.py` 341/341, `test_merge.py` 72/72, `test_lifecycle.py` 102/102.
+Live through this repo's venv against the real API with the loop's own
+credential: `branch_rules("jkrumm", "weatherorb", "master") == []` →
+`required_approving_reviews == 0`, `pick_merge_method` → `rebase`; the public
+control `jkrumm/warden` still returns its three ruleset rules
+(`non_fast_forward`, `deletion`, `required_linear_history`), so the exemption
+hides nothing that exists. The two parked items were then re-driven by hand
+(`warden merge`, validator `confirmed`), each merge attempt going through this
+same gate.
