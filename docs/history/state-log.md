@@ -9372,3 +9372,36 @@ for 24h. The control plane's own repo is merge-approval-gated and this is the ha
 lane — a saved edit to `scripts/triage.py` *is* the next tick's behaviour — so the
 change lands here, direct to `master`, and #1 is closed as superseded. Item 1294
 closes with it.
+
+## 116. A `uk` monitor id never reaches the mapping proposer (2026-09-29)
+
+§113 made a *corrected* rule heal the alert row it already mapped. It did not
+stop the proposer inventing an owner in the first place: `_propose_mapping_
+candidates()` offered every signature with no rule/ignore coverage to the
+mapping model, and for a `uk` monitor the signature is `uk:<opaque numeric id>`
+— `uk:226`, `uk:211`. `_write_policy_additions()` writes the signature it was
+handed as the rule's `match`, so for this one source the proposer can only ever
+emit the bare numeric id the policy file's own convention forbids ("never the
+bare numeric id"): unglobbable, and broken the moment the monitor is recreated.
+The model cannot know the owner from an id, and it got one wrong that way —
+`uk:226` was auto-proposed to `warden` (nothing in warden implements the MAM
+session), corrected by hand to `homelab` on 2026-09-23. The title-derived
+target (`uk:macmini-dev-host-push`) is what makes the source mappable at all,
+and only a human rule uses it.
+
+`_propose_mapping_candidates()` now excludes `OPAQUE_MONITOR_SOURCE` (`uk`) in
+its own SQL, before the coverage check or the age floor, so no `uk` row is ever
+offered whatever its state. A `uk` monitor that wants mapping gets a curated
+rule written against its title target; until then it stays in the daily digest's
+unmapped list, which is where the human who can name the owner sees it. No
+prompt change and no edit to `config/triage-policy.json` — the historical
+numeric-id rules it already carries (95, 144, 150, 207, 211, 212, 213, 226, 234,
+4) stay as they are, since each is a live, resolved mapping that works until its
+monitor is next recreated.
+
+**Verified.** `test_propose_mappings_never_offers_an_opaque_uk_monitor` written
+first — RED on the unfixed query (`{'uk:226', 'slack_alert:readable-sig'}`),
+green after; `test_propose_mappings_coverage_check_uses_the_title_target_too`
+was moved from `uk` to `docker_homelab` so the title-derived coverage check it
+exercises stays reachable (the `uk` shape now short-circuits before it). `make
+test` green: 353/353 in `test_triage.py`, every other suite unchanged.

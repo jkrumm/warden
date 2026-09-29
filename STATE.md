@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-30 (§115 — a step-7 review that says `needs-human` is a question about the review, not a finding, so it never spends a revision even when it carries findings; those findings now ride the card, because a human is the reader. §114's wrapper class and §92's revisable set are unchanged; the disjoint-set guard stays rejected, on §114's evidence) |
+| Last updated | 2026-09-30 (§116 — a `uk` monitor id never reaches the mapping proposer: `_propose_mapping_candidates()` excludes the opaque `uk` source, so the proposer can no longer invent an owner for a bare numeric monitor id; §113 only healed the correction after the fact) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 352/352 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 353/353 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -205,6 +205,17 @@ loop.
   item 843). A `human` row keeps the repo its caller chose and a
   `github_issue` row the issue's own; a rule that still says what the row
   already carries is not a rewrite.
+- **A `uk` monitor id never reaches the mapping proposer (§116).**
+  `_propose_mapping_candidates()` excludes the opaque `uk` source in its own
+  SQL, before the coverage check or the age floor: a `uk` signature is a bare
+  numeric monitor id, and the proposer keys a rule by the raw signature, so for
+  this source it could only ever write the numeric-id match the policy's own
+  convention forbids — which is how `uk:226` was auto-proposed to `warden`
+  (corrected by hand to `homelab`; §113 heals the correction, this stops the
+  next wrong one). A `uk` monitor needs a human rule against its title-derived
+  target; it stays in the daily digest's unmapped list. No prompt or policy
+  change — the historical numeric-id rules stay, since each works until its
+  monitor is recreated.
 - **Default unattended merge scope (§99, widened §107).** A repo with no
   `autoMergePaths` of its own and not merge-approval gated merges any path;
   gated repos (`EXECUTOR_REPOS` in code, plus `merge_approval`) and an
@@ -454,6 +465,7 @@ log's past sections.
 - A PR-wrapper finding is not a revision's job; revision briefs carry the
   closing instruction — §114
 - A needs-human review never spends a revision, and its findings ride the card — §115
+- A `uk` monitor id never reaches the mapping proposer — §116
 
 ### Next action
 

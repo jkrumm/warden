@@ -385,6 +385,18 @@ INGEST_SOURCES = ("slack_alert", "uk", "docker_homelab", "docker_vps", "hermes_l
 # never ingests. See resolve_quiet_grouped()/resolve_recovery_paired().
 GROUPED_TRIAGE_SOURCES = ("slack_alert", "hermes_log")
 
+# The one state source whose external_id is opaque — a bare UptimeKuma monitor
+# id ("226"), not a readable name — so its raw `source:external_id` signature is
+# unglobbable and unstable across a monitor recreate; the title-derived target
+# is the only mappable form (see the module docstring's MATCH TARGETS
+# paragraph). That makes it the one source `_propose_mapping_candidates()` must
+# refuse: the proposer keys a rule by the raw signature, so for this source it
+# can only ever write a numeric-id match the policy file's own convention
+# forbids ("never the bare numeric id") — and the model cannot know the owner
+# from an id, which is how `uk:226` was auto-proposed to `warden` on
+# 2026-09-23 and had to be corrected to `homelab` by hand.
+OPAQUE_MONITOR_SOURCE = "uk"
+
 STATE_NEW = "new"
 STATE_INVESTIGATING = "investigating"
 STATE_VERDICT = "verdict"
@@ -7432,7 +7444,18 @@ def _propose_mapping_candidates(conn: sqlite3.Connection, policy: dict[str, Any]
     that is precisely the case worth mapping. `ignored` is the one state
     excluded — a human or a rule already decided it deliberately, and
     re-proposing it would relitigate a settled call. Items are collapsed per
-    signature, since the same signature can own several rows over time."""
+    signature, since the same signature can own several rows over time.
+
+    **An `OPAQUE_MONITOR_SOURCE` (`uk`) row is never a candidate either**,
+    whatever its state or age. The proposer's rule match IS the signature it
+    is handed, so for this source it can only ever emit `uk:<numeric id>` —
+    the one target the policy file's own convention tells authors never to
+    write, because it breaks the moment the monitor is recreated. The model
+    cannot know the owner from an opaque id, and it got one wrong this way:
+    `uk:226` was auto-proposed to `warden` (nothing in warden implements the
+    MAM session) and had to be corrected to `homelab` by hand. A `uk` monitor
+    needs a human rule written against its title-derived target; it stays in
+    the daily digest's unmapped list, which is where that human sees it."""
     age_days = policy["proposeMappingsAgeDays"]
     # Age alone is the wrong test on its own. The floor exists to avoid spending a
     # proposal on a one-off, but a signature that has already fired many times is
@@ -7453,9 +7476,9 @@ def _propose_mapping_candidates(conn: sqlite3.Connection, policy: dict[str, Any]
         "SELECT ti.event_id, ti.signature, ti.occurrences, ti.first_seen, ti.last_seen, "
         "ti.propose_unsure_at, e.title, e.payload_json, e.source, e.external_id "
         "FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state != ? AND ti.repo IS NULL AND ti.verb IS NULL "
+        "WHERE ti.state != ? AND ti.repo IS NULL AND ti.verb IS NULL AND e.source != ? "
         "GROUP BY ti.signature ORDER BY MIN(ti.first_seen) ASC",
-        (STATE_IGNORED,),
+        (STATE_IGNORED, OPAQUE_MONITOR_SOURCE),
     ).fetchall()
     candidates: list[sqlite3.Row] = []
     for row in rows:
