@@ -9197,3 +9197,45 @@ throughout, which is what shows the fix does not cost detection. `make test` gre
 344/344 unchanged, every other suite at §110/§111 counts. Live, through the
 shipped `poll_op_refs`: both hosts `reachable=True` with **0 events**, where the
 unprofiled command still 429s.
+
+## 113. A corrected rule heals the alert row it already mapped (2026-09-29)
+
+`uk:226` (MyAnonamouse Session - Push) was auto-proposed to `warden` by
+`_propose_mapping_candidates()` on an earlier day. Nothing in `warden`
+implements the MAM session — the sync scripts and the account state live in
+`homelab-private` — so the rule was corrected to `homelab` and committed on
+2026-09-23. On 2026-09-29 the monitor fired again, `reopen_if_needed()` moved
+the *same* row back to `new` with `repo='warden'` intact, `classify()` skipped
+rule matching for any row that already carried a mapping, and the item
+escalated to `warden` a second time: the episode ran in a checkout that cannot
+see the MAM code by construction and folded a `medium` verdict guessing at an
+expired session cookie. The correction was not late — it was inert, for
+exactly the signature it was written for.
+
+The guard exists to keep a *mapped* row out of the prose filter, and that
+purpose is unchanged; what it also did, silently, was make the policy's own
+corrections unreachable for every recurring signature. `classify()` now asks
+the rules again for a row in `new` that already carries a mapping **when
+`origin='alert'`**: that repo is a rule outcome, so the policy owns it. A
+`human` row keeps the repo its caller chose and a `github_issue` row the
+issue's own — neither is a rule outcome, and neither is re-resolved. A rule
+that still says what the row already carries is not a rewrite (no `updated_at`
+churn), and a rule that now names a `verb` clears `repo` (and vice versa), so a
+correction can move a signature between the two lanes, not only between two
+repos.
+
+Item 843's implement lane was closed to the loop for a second reason: its
+first round's failed implement episode (2026-09-23, `warden` had no `origin`
+then) left `implement_job` set, and `maybe_auto_implement()` requires NULL, so
+no second round could fire on the corrected verdict. The change landed by hand
+on the live checkout, the §76 shape, rather than unsticking the row.
+
+**Verified.** `tests/test_triage.py::test_corrected_rule_re_maps_a_reopened_alert_row_only`
+written first — RED on the unfixed `classify()` with the row stuck at `warden`,
+green after; it pins the heal, the `human` row that must NOT move, the
+unchanged-rule no-op (a later `now` must not restamp `updated_at`), and
+`state='new'` — a re-map is not an escalation. `make test` green, 345/345 in
+`test_triage.py`. On a copy of the live ledger (`VACUUM INTO`), reopening every
+mapped alert row — 81 of them — and running the fixed `classify()` re-points
+**exactly one**: item 843, `uk:226`, `warden` → `homelab`. No collateral
+re-points is the number that shows the guard is narrow.

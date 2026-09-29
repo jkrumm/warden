@@ -2596,7 +2596,8 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
     diagnosis stays visible-but-quiet instead of being dropped — is
     unchanged: that is exactly the `not rule_matched` case below."""
     rows = conn.execute(
-        "SELECT event_id, signature, repo, verb FROM triage_items WHERE state=?", (STATE_NEW,)
+        "SELECT event_id, signature, repo, verb, origin FROM triage_items WHERE state=?",
+        (STATE_NEW,),
     ).fetchall()
     unmapped: set[str] = set()
     now_iso = _now_iso(now)
@@ -2611,21 +2612,38 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
             continue
 
         # Rules FIRST — a signature the policy already maps is a mapped
-        # signal and must never be swallowed by the prose filter below. The
-        # `repo`/`verb` guard is unchanged: a row whose mapping was resolved
-        # on an earlier pass matches no rule of its own.
+        # signal and must never be swallowed by the prose filter below. A row
+        # with no mapping yet is what rules are for; a row that already
+        # carries one is asked again only when it is an ALERT row, because
+        # that repo is a rule outcome and a corrected rule has to be able to
+        # heal it. Without that, a correction is inert for the signature
+        # forever: `uk:226` was auto-proposed to `warden` (nothing in warden
+        # implements it — the MAM scripts are homelab-side), the rule was
+        # corrected to `homelab` (item 843), and the recurrence reopened the
+        # very same row with `warden` intact, so matching no rule of its own sent
+        # the alert to `warden` a second time. `human` and `github_issue` rows
+        # are never re-resolved — their repo is the caller's or the issue's,
+        # not the policy's — and a rule that still says what the row already
+        # carries is not a rewrite (no churn in `updated_at`).
         rule: dict[str, Any] | None = None
         if row["repo"] is None and row["verb"] is None:
             rule = _match_rule(targets, policy["rules"])
+        elif row["origin"] == "alert":
+            candidate = _match_rule(targets, policy["rules"])
+            if candidate is not None and not (
+                (candidate.get("repo") is not None and candidate["repo"] == row["repo"])
+                or (candidate.get("verb") is not None and candidate["verb"] == row["verb"])
+            ):
+                rule = candidate
         if rule is not None and rule.get("repo"):
             conn.execute(
-                "UPDATE triage_items SET repo=?, updated_at=? WHERE event_id=?",
+                "UPDATE triage_items SET repo=?, verb=NULL, updated_at=? WHERE event_id=?",
                 (rule["repo"], now_iso, row["event_id"]),
             )
             continue
         if rule is not None and rule.get("verb"):
             conn.execute(
-                "UPDATE triage_items SET verb=?, updated_at=? WHERE event_id=?",
+                "UPDATE triage_items SET verb=?, repo=NULL, updated_at=? WHERE event_id=?",
                 (rule["verb"], now_iso, row["event_id"]),
             )
             continue
