@@ -5737,18 +5737,20 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     (`sideclaw`/`warden`/`dotfiles`) does NOT auto-merge — `confirmed` still
     lands in `dispatches.validation_status`, but the item routes to
     `needs_human` carrying the PR and the `warden merge` call the owner runs
-    to approve it. ANY
-    non-empty `blocking` list refuses the merge outright — never read as a
-    pass, the brief's own words — and `"needs-human"` routes to a human
-    rather than either. A FAILED, ERRORED or CANCELLED review job blocks the
-    merge the same way. `dispatches.validation_status` lands one of
+    to approve it. A non-empty `blocking` list refuses the merge outright —
+    never read as a pass, the brief's own words — and `"needs-human"` routes
+    to a human even when it carries one: a needs-human review is a question,
+    not a finding (§92), so its `blocking` list is the reasons a human must
+    look, never a work order for the implementer. A FAILED, ERRORED or
+    CANCELLED review job blocks the merge the same way.
+    `dispatches.validation_status` lands one of
     `confirmed | blocked | needs_human | error`.
 
     Fail-closed, the same shape `poll_implement_jobs()` uses for its own
     outcome switch: `"clean"` confirms; `"actionable"` with nothing in
-    `blocking` confirms; ANY non-empty `blocking` blocks, regardless of
-    `outcome`; `"needs-human"` (with nothing in `blocking`) routes to a
-    human; anything else — missing, or an outcome value this switch does
+    `blocking` confirms; `"needs-human"` routes to a human regardless of
+    `blocking` (§92); any other non-empty `blocking` blocks, regardless of
+    `outcome`; anything else — missing, or an outcome value this switch does
     not otherwise recognise — is ALSO a human, never a silent confirm.
     `assert_outcome()` above is the first line of defence (a value outside
     `REVIEW_OUTCOMES` entirely is a loud `RemoteError` before this switch
@@ -5818,10 +5820,16 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             validation_status = "confirmed"
         elif outcome == "actionable" and not blocking:
             validation_status = "confirmed"
+        elif outcome == "needs-human":
+            # A needs-human review is a question, not a finding (§92): it stays
+            # with a human even when it carries `blocking` findings — those are
+            # the reasons a human must look, never a work order for the
+            # implementer. Checked BEFORE the `blocking` branch, or a non-empty
+            # list folds it to the revisable `blocked` and `_revision_findings()`
+            # sends it straight back to the implementer instead.
+            validation_status = "needs_human"
         elif blocking:
             validation_status = "blocked"
-        elif outcome == "needs-human":
-            validation_status = "needs_human"
         else:
             # Missing, or an outcome value REVIEW_OUTCOMES carries but this
             # switch does not otherwise handle (there is none today — this
