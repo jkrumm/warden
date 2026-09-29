@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-29 (§112 — the op-refs probe ran without `. ~/.profile`, so it missed the `OP_SOCK` daemon cache, spent budget, and reported its own 429 as "1Password refs unresolved" on a host whose six crons were all green) |
+| Last updated | 2026-09-29 (§113 — a corrected rule now heals the alert row it already mapped: `classify()` re-asks the rules for an `origin='alert'` row in `new`, so `uk:226`'s correction to `homelab` reaches the row that a recurrence reopens; `human`/`github_issue` rows are never re-resolved) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 341/341 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 345/345 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -196,6 +196,14 @@ loop.
   policy declares `noCiRequired`, recording `checkRunsUnreadable` in the merge
   receipt; everywhere else it refuses as before, and `mergeable_state ==
   "blocked"` still catches an unmet required check.
+- **A corrected rule heals the alert row it already mapped (§113).**
+  `classify()` asks the rules again for a row in `new` that already carries a
+  mapping **when `origin='alert'`** — without that, a correction is inert for
+  its own signature forever, because a recurrence reopens the same row with the
+  old repo (`uk:226` went back to `warden` after being corrected to `homelab`,
+  item 843). A `human` row keeps the repo its caller chose and a
+  `github_issue` row the issue's own; a rule that still says what the row
+  already carries is not a rewrite.
 - **Default unattended merge scope (§99, widened §107).** A repo with no
   `autoMergePaths` of its own and not merge-approval gated merges any path;
   gated repos (`EXECUTOR_REPOS` in code, plus `merge_approval`) and an
@@ -430,6 +438,10 @@ log's past sections.
   it — §110
 - The `revisions-exhausted` finding reads the park note instead of blaming the
   review — §111
+- The op-refs probe ran without `. ~/.profile` and reported its own 429 as
+  "1Password refs unresolved" — §112
+- A corrected rule heals the alert row it already mapped; a hand-opened item
+  keeps its repo — §113
 
 ### Next action
 

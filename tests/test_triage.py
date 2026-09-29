@@ -865,6 +865,51 @@ def test_mapped_row_survives_a_second_classify_pass():
         assert "slack_alert:homelab-cpu-above-threshold" not in unmapped
 
 
+def test_corrected_rule_re_maps_a_reopened_alert_row_only():
+    """A rule corrected AFTER its signature was first mapped must be able to
+    heal that row. `uk:226` (MyAnonamouse Session - Push) was auto-proposed to
+    `warden` — nothing in warden implements it, the MAM scripts are
+    homelab-side — and the rule was corrected to `homelab`. The recurrence
+    reopened the SAME row, whose repo is pinned at first mapping, and
+    classify() skipped rule matching for any row that already carried one:
+    the correction was inert and the alert escalated to `warden` again.
+    Alert rows are the policy's to re-resolve. A `human` row keeps the repo
+    its caller chose and a `github_issue` row the issue's own — neither is a
+    rule outcome — and a rule that still says what the row already carries is
+    not a rewrite."""
+    stale_rule = [{"match": "uk:226", "repo": "warden"}]
+    corrected_rule = [{"match": "uk:226", "repo": "homelab"},
+                      {"match": "human:*", "repo": "homelab"}]
+    with _triage_env(policy=dict(DEFAULT_POLICY, rules=stale_rule)) as (conn, ctx):
+        alert_id = _insert_event(conn, source="uk", external_id="226",
+                                  title="MyAnonamouse Session - Push", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage.classify(conn, dict(DEFAULT_POLICY, rules=stale_rule), NOW)
+        assert triage._get_item(conn, alert_id)["repo"] == "warden"
+
+        hand_id = triage.open_origin_item(
+            conn, origin="human", repo="warden", brief="hand-filed", max_tier="investigate",
+            external_id="hand-1", title="hand-filed item", now=OLD)
+
+        corrected = dict(DEFAULT_POLICY, rules=corrected_rule)
+        triage.classify(conn, corrected, NOW)
+
+        healed = triage._get_item(conn, alert_id)
+        assert healed["repo"] == "homelab", (
+            "a corrected rule must heal the row it already mapped, or the correction can "
+            f"never take effect for a recurring signature — got {healed['repo']!r}")
+        assert healed["state"] == triage.STATE_NEW, (
+            f"re-mapping is not escalation — got state={healed['state']!r}")
+        assert triage._get_item(conn, hand_id)["repo"] == "warden", (
+            "a hand-opened item keeps the repo its caller chose; the policy is not its to "
+            "overwrite")
+
+        stamped = healed["updated_at"]
+        triage.classify(conn, corrected, NOW + dt.timedelta(minutes=1))
+        assert triage._get_item(conn, alert_id)["updated_at"] == stamped, (
+            "a rule that still says what the row already carries must not rewrite the row")
+
+
 def test_uk_maps_via_title_not_external_id():
     """The core fix for correction #1: uk's external_id is an opaque monitor
     id, unglobbable and unstable — only the title-derived match target makes
