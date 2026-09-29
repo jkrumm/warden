@@ -48,6 +48,20 @@ class RemoteError(WardenError):
         self.maybe_mutated = maybe_mutated
 
 
+class CheckRunsUnreadable(RemoteError):
+    """The credential may not read a commit's check-runs — a fine-grained PAT
+    without `Checks: read`, which only bites on a private repository (§110:
+    `GET …/commits/<sha>/check-runs` → 403 "Resource not accessible by personal
+    access token", `x-accepted-github-permissions: checks=read`, on
+    `weatherorb`).
+
+    Its own class because this is a fact about the token, not about the commit,
+    and the *caller* owns the answer: only a repo whose own policy declares
+    `noCiRequired` may read an unreadable CI read as "there is no CI gate here"
+    (`lifecycle/merge.py`). Everywhere else it refuses exactly like any other
+    non-200."""
+
+
 class PolicyError(WardenError):
     """Refused by policy/budget/gate — the remote call either never happened
     or happened and was correctly rejected by the far side; either way

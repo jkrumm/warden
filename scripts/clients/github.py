@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .errors import PolicyError, PreconditionError, RemoteError
+from .errors import CheckRunsUnreadable, PolicyError, PreconditionError, RemoteError
 
 GH_OWNER = "jkrumm"
 _GH_TOKEN_REF = "op://mini/github/token"
@@ -43,6 +43,11 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # there). Matched literally, and only on a 403: this is "the feature does not
 # exist for this repo", never "you may not look" (§108).
 _RULESETS_UNAVAILABLE_RE = re.compile(r"Upgrade to GitHub Pro or make this repository public")
+
+# GitHub's own text for "this credential may not make that request" — the
+# fine-grained-PAT permission gap (§110), as opposed to a resource that does
+# not exist (404) or a repository-level refusal.
+_TOKEN_CANNOT_READ_RE = re.compile(r"Resource not accessible by personal access token")
 
 _token_cache: str | None = None
 
@@ -138,9 +143,22 @@ def pr_files(owner: str, repo: str, number: int) -> list[dict[str, Any]]:
 
 
 def check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
+    """Every check-run GitHub recorded for `sha`.
+
+    A 403 carrying GitHub's own "Resource not accessible by personal access
+    token" is raised as `CheckRunsUnreadable`, not a plain RemoteError: it means
+    the credential lacks `Checks: read` (only reachable on a private repo), so
+    the caller — which is the only place that knows whether the repo's policy
+    declares `noCiRequired` — decides (§110). Every other non-200 stays a loud
+    refusal, and a token that cannot read checks must never read as green."""
     if not _SHA_RE.match(sha):
         raise PreconditionError(f"{sha!r} is not a 40-hex commit sha — refusing before the request")
     status, body = api("GET", f"/repos/{owner}/{repo}/commits/{sha}/check-runs")
+    if status == 403 and isinstance(body, dict) and _TOKEN_CANNOT_READ_RE.search(body.get("message") or ""):
+        raise CheckRunsUnreadable(
+            f"GitHub returned HTTP 403 reading check-runs for {owner}/{repo}@{sha} — the token may "
+            f"not read checks (Checks: read): {body.get('message')}"
+        )
     if status != 200:
         raise RemoteError(f"GitHub returned HTTP {status} reading check-runs for {owner}/{repo}@{sha}")
     if not isinstance(body, dict):

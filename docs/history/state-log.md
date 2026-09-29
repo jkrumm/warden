@@ -9094,3 +9094,39 @@ Live, nothing is asserted yet: the next pass after this commit is the test, and
 after it is expected to re-attempt both through the ordinary loop path (`warden
 merge` by hand was deliberately not used — it lands the PR without moving the
 item, leaving a merged PR behind a stale `merge_blocked` card).
+
+## 110. An unreadable CI read is the credential's limit, and only `noCiRequired` may waive it (2026-09-29)
+
+§108 and §109 got the retry through the rules read and onto the next gate, which
+refused differently: `merge refused: GitHub returned HTTP 403 reading check-runs
+for jkrumm/weatherorb@ffdd22ef…`. Probed directly, with the loop's own
+credential:
+
+    GET /repos/jkrumm/weatherorb/commits/<sha>/check-runs
+    403  x-accepted-github-permissions: checks=read
+         {"message": "Resource not accessible by personal access token"}
+
+The PAT has `admin` on the repo — it is granted on `weatherorb` — and simply
+carries no `Checks: read`. That gap only bites on a private repository: the same
+call on the public `jkrumm/warden` returns 200. It is the second half of §73's
+recorded PAT gap ("it still 403s on Checks and Actions read"), and it closed the
+owner's own Argo Merge click too.
+
+**The change.** `check_runs()` raises a typed `CheckRunsUnreadable` for exactly
+that body — a fact about the credential, not about the commit — and
+`plan_or_land()` catches it in one place: the read degrades to `[]` **only when
+the repo's own policy declares `noCiRequired`**, and otherwise re-raises
+unchanged. So the decision stays with the repo's declaration rather than the
+token's convenience, a private repo that does have a CI gate still refuses
+loudly, GitHub's own `mergeable_state == "blocked"` still refuses an unmet
+required check (it is read a few lines below the gate), and the fact that the
+gate was waived is written into the merge operation's receipt as
+`checkRunsUnreadable` — a skipped gate is recorded, never silent.
+
+**Verified.** `test_clients.py`: the 403 is `CheckRunsUnreadable`, a 404 is not
+(115/115). `test_merge.py`: with `noCiRequired` declared the merge lands and the
+receipt carries the reason; without it the same error refuses and nothing is
+marked ready (74/74). `make test` green — `test_triage.py` 343/343,
+`test_lifecycle.py` 102/102. The four `noCiRequired` repos in the policy
+(weatherorb, homelab, vps, research-gateway) are the only ones this can affect,
+and only weatherorb is private, so nothing public changes behaviour.

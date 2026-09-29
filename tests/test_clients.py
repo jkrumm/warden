@@ -1049,6 +1049,37 @@ def test_branch_rules_plan_gated_403_is_no_rules_not_a_refusal():
         github.api = saved
 
 
+def test_check_runs_token_403_is_its_own_refusal():
+    """§110 — a fine-grained PAT without `Checks: read` 403s this read on a
+    private repository ("Resource not accessible by personal access token";
+    the response's `x-accepted-github-permissions: checks=read`), which is a
+    fact about the credential, not about the commit. It is its own exception
+    so the *caller* can weigh the repo's own `noCiRequired`; every other
+    non-200 — and any 403 that is not this one — stays a plain RemoteError."""
+    saved = github.api
+    try:
+        github.api = lambda method, path, body=None: (
+            403, {"message": "Resource not accessible by personal access token"})
+        try:
+            github.check_runs("jkrumm", "weatherorb", "a" * 40)
+        except github.CheckRunsUnreadable as e:
+            assert "403" in str(e)
+        else:
+            raise AssertionError("expected CheckRunsUnreadable")
+
+        github.api = lambda method, path, body=None: (404, {"message": "Not Found"})
+        try:
+            github.check_runs("jkrumm", "weatherorb", "a" * 40)
+        except github.CheckRunsUnreadable:
+            raise AssertionError("a 404 is not the token's permission gap")
+        except RemoteError:
+            pass
+        else:
+            raise AssertionError("expected RemoteError")
+    finally:
+        github.api = saved
+
+
 def test_pick_merge_method_order():
     assert github.pick_merge_method({"allow_squash_merge": True, "allow_rebase_merge": True}) == "squash"
     assert github.pick_merge_method({"allow_squash_merge": False, "allow_rebase_merge": True}) == "rebase"

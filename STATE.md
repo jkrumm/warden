@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-29 (§109 — a refused merge is retried when the *gate* changed, not only when the policy file did: the reference now spans `POLICY_PATH` + `lifecycle/merge.py` + `clients/github.py`, so a code fix unsticks a parked PR without a policy edit; §108 had left two confirmed weatherorb PRs parked on a fixed defect) |
+| Last updated | 2026-09-29 (§110 — an unreadable CI read is the credential's limit: the loop's PAT has no `Checks: read`, so check-runs 403 on the private `weatherorb`; `CheckRunsUnreadable` now lets `plan_or_land()` waive the gate *only* where the policy declares `noCiRequired`, recorded in the merge receipt) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -186,6 +186,13 @@ loop.
   newest of `POLICY_PATH`, `lifecycle/merge.py`, `clients/github.py` — so a
   *code* fix to the merge path unsticks a parked PR with no policy edit, while
   nothing retries on a timer.
+- **An unreadable CI read waives nothing by itself (§110).** The loop's PAT
+  carries no `Checks: read`, so `check_runs()` 403s on a private repo
+  (`weatherorb`; public repos read fine). It raises `CheckRunsUnreadable`, and
+  `plan_or_land()` degrades it to no check-runs **only** where the repo's
+  policy declares `noCiRequired`, recording `checkRunsUnreadable` in the merge
+  receipt; everywhere else it refuses as before, and `mergeable_state ==
+  "blocked"` still catches an unmet required check.
 - **Default unattended merge scope (§99, widened §107).** A repo with no
   `autoMergePaths` of its own and not merge-approval gated merges any path;
   gated repos (`EXECUTOR_REPOS` in code, plus `merge_approval`) and an
@@ -248,6 +255,15 @@ loop.
   `Issues: Write` repo-wide (the "comment back on the owner's own issue"
   feature has silently 403'd since Wave 1). Grant both at
   github.com/settings/personal-access-tokens; neither blocks routing (§73).
+- **The same PAT carries no `Checks: read`, which only bites on a private
+  repository (§110, measured 2026-09-29):** `GET
+  /repos/jkrumm/weatherorb/commits/<sha>/check-runs` → 403
+  `x-accepted-github-permissions: checks=read` ("Resource not accessible by
+  personal access token"), while the identical call on the public `jkrumm/warden`
+  → 200 with 0 runs. The PAT does have `admin` on weatherorb, so it is the scope,
+  not the repo selection. Grant `Checks: Read` (+ `Actions: Read` for the same
+  reason) there and the §110 tolerance stops being needed at all — until then it
+  is what lets a `noCiRequired` repo merge on GitHub's own `mergeable_state`.
 - **Stale since 2026-09-27: warden now has a GitHub remote** (`jkrumm/warden`,
   public). The bullet below predates it; implement episodes on warden work from
   `origin/master`, so the remote must be kept pushed.
@@ -407,6 +423,8 @@ log's past sections.
   merge by construction — §108
 - A refused merge is retried when the gate changed, not only when the policy
   file did — §109
+- An unreadable CI read is the credential's limit; only `noCiRequired` waives
+  it — §110
 
 ### Next action
 

@@ -140,6 +140,7 @@ def fakes(**overrides):
         "repo": dict(_DEFAULT_REPO),
         "files": [],
         "check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}],
+        "check_runs_error": None,
         "merge_resp": {"sha": "mergedsha001"},
         "delete_ok": True,
         "contents": {},
@@ -175,6 +176,8 @@ def fakes(**overrides):
 
     def _check_runs(owner, repo, sha):
         record("check_runs", owner, repo, sha)
+        if state["check_runs_error"]:
+            raise state["check_runs_error"]
         return list(state["check_runs"])
 
     def _mark_ready(node_id):
@@ -341,6 +344,36 @@ def test_github_ruleset_requiring_zero_reviews_is_not_a_human_gate():
         result = _land(conn, why="w", authorized_by="auto-from-item")
     assert result.merged
     assert fx.calls["merge_pr"][0][1]["method"] != "merge", "linear history rules out a merge commit"
+
+
+def test_unreadable_check_runs_merges_when_the_repo_declares_no_ci():
+    """§110 — `weatherorb` is private and the loop's fine-grained PAT carries no
+    `Checks: read`, so the read 403s for a reason that belongs to the credential,
+    not to the diff. Where the repo's own policy declares `noCiRequired` the CI
+    gate is GitHub's own `mergeable_state` (still enforced below), so the merge
+    proceeds — and the operations receipt records that the read was unavailable,
+    because a gate that was skipped must never look like one that passed."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, validation_status="confirmed")
+        with fakes(check_runs_error=github.CheckRunsUnreadable("GitHub returned HTTP 403 reading check-runs"),
+                   entry={"autoMergePaths": ["**"], "noCiRequired": True}) as fx:
+            result = _land(conn, why="w", authorized_by="owner:argo")
+        assert result.merged
+        assert fx.calls["merge_pr"]
+        receipt = json.loads(_op_row(conn)["receipt_json"] or "{}")
+        assert receipt.get("checkRunsUnreadable"), "the audit trail must record the unreadable read"
+    finally:
+        conn.close()
+
+
+def test_unreadable_check_runs_refuses_without_a_no_ci_acknowledgement():
+    """§110 — the tolerance is the repo's own declaration, never the token's
+    convenience: without `noCiRequired` an unreadable CI read refuses exactly as
+    a generic remote failure would, and nothing is marked ready or merged."""
+    _assert_refuses(exc_type=github.CheckRunsUnreadable, msg="403",
+                    fake={"check_runs_error": github.CheckRunsUnreadable("GitHub returned HTTP 403"),
+                          "entry": {"autoMergePaths": ["**"]}})
 
 
 def test_pull_request_closed_refuses():

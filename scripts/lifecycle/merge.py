@@ -31,7 +31,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from clients import github, rollout, sideclaw
-from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError, WardenError
+from clients.errors import (
+    CheckRunsUnreadable, PolicyError, PreconditionError, RemoteError, UsageError, WardenError,
+)
 from lifecycle import chaos, operations, policy
 
 MAX_MERGE_FILES = 40
@@ -528,7 +530,22 @@ def plan_or_land(
             f"would launder exactly that."
         )
 
-    runs = github.check_runs(owner, repo, pr_head_sha)
+    try:
+        runs = github.check_runs(owner, repo, pr_head_sha)
+    except CheckRunsUnreadable as e:
+        # A fine-grained PAT without `Checks: read` cannot read a private
+        # repository's check-runs at all (§110: `weatherorb`), so this is the
+        # credential's limit, not a verdict on the diff. Only the repo's own
+        # `noCiRequired` acknowledgement may read it as "no CI gate here" —
+        # without that declaration the refusal stands exactly as before — and
+        # GitHub's own `mergeable_state == "blocked"` below still catches a
+        # required check that is unmet, which is why this cannot ride one.
+        if not effective_repo_entry(repo).get("noCiRequired"):
+            raise
+        runs = []
+        checks_unreadable = str(e)
+    else:
+        checks_unreadable = None
     merge_gate_check(
         repo=repo, entry=effective_repo_entry(repo), files=files,
         check_runs=runs, validation=validation_status,
@@ -686,6 +703,10 @@ def plan_or_land(
     operations.complete(conn, merge_op, outcome="done", receipt=json.dumps({
         "pullRequest": pr_number, "mergeCommit": merge_sha, "branch": pr_head,
         "branchDeleted": deleted, "mergeMethod": method, "title": pr_title,
+        # Only set when the checks read was refused by the credential and the
+        # repo's own `noCiRequired` carried the gate (§110). A skipped gate is
+        # recorded, never silent.
+        "checkRunsUnreadable": checks_unreadable,
     }))
 
     deploy, deploy_op = rollout_after_merge(
