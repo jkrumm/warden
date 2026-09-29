@@ -321,14 +321,20 @@ loop.
   filter, so the digest's "Unstructured notes" heading carries a still-open
   incident and reprints it every UTC day (§81, §90). The rows §76's revive
   skipped because their events had resolved (105, 542, 918) stay terminal
-  `note` and are silent while that holds. **A `slack_alert` signature that
-  re-fires clears `events.resolved_at` back to NULL, and the row re-enters the
-  heading — immune to any `ignore`/`rules` entry added since, because
-  `classify()` only ever touches `new` and `reopen_if_needed()` skips `note`.**
-  Event 999 (the VPN self-healing notice) did exactly that on 2026-09-26, eight
-  days after the `ignore` entry covering it landed. `scripts/reset-frozen-notes.py`
-  is the standing repair, re-runnable by design (§90; its docstring said
-  "one-time" before that).
+  `note` and are silent while that holds. A `slack_alert` signature that
+  re-fires clears `events.resolved_at` back to NULL and the row re-enters the
+  heading — but no longer for ever: `reclassify_frozen_notes()` runs in the loop
+  before `classify()` and hands back every still-unresolved row that
+  `_parks_in_note()` (the same predicate `classify()` routes with, `ignore`
+  list included) would no longer park, so a rule, an `ignore` entry or a
+  `_looks_like_bot_alert()` shape that lands late still reaches the row — §116.
+  The pass is bounded (25 rows/pass, the rest named on stderr) and `--dry-run`
+  prints what it would revive instead of writing. Event 999 (the VPN
+  self-healing notice) was the case that had no answer: it re-fired on
+  2026-09-26, eight days after the `ignore` entry covering it landed.
+  `scripts/reset-frozen-notes.py` remains for what the predicate deliberately
+  will not move (a resolved event, an owner's one-off), re-runnable by design
+  (§90; its docstring said "one-time" before that).
 - The restore is drilled (§104), but retrieval from B2 itself is not: the drill
   proves homelab's off-box copy, not restic's. Putting a snapshot back over a lost
   ledger stays a human step.
@@ -454,6 +460,8 @@ log's past sections.
 - A PR-wrapper finding is not a revision's job; revision briefs carry the
   closing instruction — §114
 - A needs-human review never spends a revision, and its findings ride the card — §115
+- The frozen-note revive shares `classify()`'s parking predicate, is bounded per
+  pass, and previews under `--dry-run` — §116
 
 ### Next action
 

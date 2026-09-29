@@ -43,6 +43,17 @@ the ledger for exactly that kind of inspection.
 
 Nothing here shells out or touches Slack — the next 600 s `--run` pass does the
 classifying, which is where the effect should be watched.
+
+**SUPERSEDED for the re-fire class (§116).** The loop now runs the same revive
+itself, before `classify()` on every pass: `reclassify_frozen_notes()` in
+`scripts/triage.py` hands every unresolved `note` row back to `new` when
+classify()'s own parking predicate (`_parks_in_note()`, which this file's
+selection mirrors — `note` state, `slack_alert` source, event unresolved) would
+no longer park it. So a re-fired covered signature no longer needs a human to
+run this script: the next tick revives it, bounded per pass and previewable
+under `--dry-run`. What is left for this script is what the loop's predicate
+deliberately will not move — an event that has since resolved, and a one-off
+revival the owner wants for a reason the policy does not express.
 """
 
 from __future__ import annotations

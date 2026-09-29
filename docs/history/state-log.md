@@ -9372,3 +9372,58 @@ for 24h. The control plane's own repo is merge-approval-gated and this is the ha
 lane — a saved edit to `scripts/triage.py` *is* the next tick's behaviour — so the
 change lands here, direct to `master`, and #1 is closed as superseded. Item 1294
 closes with it.
+
+## 116. The frozen-note revive is classify()'s own decision, bounded, and previewable (2026-09-30)
+
+The revive itself arrived with this section and had two defects and one open
+question, all three from item 1298's step-7 review (`0` blocking, `1` discussion, `2`
+improvements — a reviewer's `improvements[]` are not findings that block, but
+these three were cheap and on the lines §112 had just written).
+
+**The real one: the predicate was a hand-copy of `classify()`'s parking
+decision, and the copy was not parity.** It omitted the `_fnmatch_any(targets,
+policy["ignore"])` check that `classify()` runs FIRST, so a `note` row a later
+`ignore` entry covers stayed frozen for ever — the same "policy entry added
+after the row parked can never reach it" bug the pass exists to close for
+`rules`, re-created one clause over. Both callers now ask one function,
+`_parks_in_note(row, targets, policy, event_row)`: ignore list first (that
+route is `ignored`, never `note`), then the `repo`/`verb` guard, then `rules`,
+then the structural `ignoreUnstructuredSlackProse` fallback on the title. The
+docstring's claim ("revive iff a current classify() pass would no longer park
+the row") is true by construction now instead of by review.
+
+**The batch is bounded and previewable.** This is the one pass in `run()` whose
+effect is a batch over historical rows, so it revives at most
+`FROZEN_NOTE_REVIVE_MAX_PER_PASS` (25) per pass, oldest first, and names the
+remainder on stderr — those stay in `note` (overflow waits, never drops) and
+drain on a later tick. Under `dry_run` nothing is written at all: the rows that
+would revive are printed, which answers the review's decision item ("merging
+this triggers an unreviewed mass-revive of historical frozen notes … worth a
+conscious call") with a preview the owner can run himself instead of a sentence
+promising him one.
+
+**Measured, not argued.** The shipped pass run against a `VACUUM INTO` copy of
+the live ledger: **3 `note` rows, 1 unresolved, 1 revived** — event 1297, the
+`*🚨 MAM session dead*` row this whole thread started from — and one `classify()`
+pass routes it to `repo=homelab`. Zero rows today would be revived by the newly
+added `ignore` branch, which is why the parity gap was latent rather than live.
+There is no mass revive to be afraid of at the current volume; the bound and the
+preview are what keep it that way if the backlog grows.
+
+**Verified.** Test first, RED for the stated reason on §112's head: the parity
+test failed with "a note row a current `ignore` entry covers must not stay
+frozen in `note`", the dry-run and bound tests failed on the missing keyword and
+constant. Green after: `make test` green with `test_triage.py` at **364/364**
+(361 before, +3).
+
+**The artifact.** This arrived as item 1298's draft PR (jkrumm/warden#5) and sat
+in `needs_human` for 24h. Two things were wrong with the carrier, neither in the
+code: the PR was `CONFLICTING` against `master` (only `STATE.md` and this log
+conflicted — `scripts/triage.py` and `tests/test_triage.py` auto-merged, because
+the six commits that landed meanwhile were elsewhere in the file), and the
+review's three items were open. So the commit lands **post-review** on that
+branch: rebased onto `master`, items folded, and the owner's merge click is
+still the gate — `warden` is merge-approval-gated by design, and a control plane
+that merges its own executor's PRs has no outside. `scripts/reset-frozen-notes.py`
+is superseded for the re-fire class (its docstring now says so); what is left for
+it is a resolved event and an owner's one-off.

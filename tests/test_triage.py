@@ -728,6 +728,60 @@ def test_unstructured_prose_lands_in_note_not_ignored():
         assert "1Password rate-limiting" in digest_text
 
 
+def test_bold_wrapped_siren_is_a_bot_alert_not_prose():
+    """The `*🚨 …*` shape is a bot alert, not unstructured prose. HyperDX
+    renders a siren alert wrapped in Slack mrkdwn emphasis on some messages
+    (live: item 1297, `*🚨 MAM session dead*: …`), and the old prefix test
+    compared the raw title — a leading `*` survived `.lstrip()`, so the whole
+    class failed `_looks_like_bot_alert()` and fell to the prose fallback."""
+    assert triage._looks_like_bot_alert("*🚨 MAM session dead*: jsonLoad.php rejected the session")
+    assert triage._looks_like_bot_alert("_🚨 italic siren_")
+    assert triage._looks_like_bot_alert("*⚠️ bold warning*")
+    assert triage._looks_like_bot_alert("🚨 bare siren")
+    assert triage._looks_like_bot_alert("[API - HTTP] [:red_circle: Down] timeout")
+    # ...and the strip does not make an un-prefixed sentence look like one.
+    assert not triage._looks_like_bot_alert("*a bold human sentence with no glyph*")
+    assert not triage._looks_like_bot_alert("1Password rate-limiting. Der Cronjob ruft `op run` auf.")
+
+
+def test_bold_wrapped_siren_without_a_rule_stays_new_not_note():
+    """A rule-less `*🚨 …*` alert must stay `new` (visible to the mapping
+    pass), while un-prefixed prose still lands in terminal `note`. This is
+    the half the prefix test controls: `classify()` matches rules BEFORE the
+    prose filter, so only a rule-less bold siren can distinguish the two."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        # Deliberately NOT starting with "sig-" — DEFAULT_POLICY's one rule
+        # matches that prefix, and a mapped row never reaches the prose
+        # filter. external_id == normalize_title(title) for a grouped source.
+        _insert_event(conn, source="slack_alert", external_id="mam-session-dead-x",
+                       title="*🚨 MAM session dead*: jsonLoad.php rejected the session",
+                       first_seen=OLD)
+        _insert_event(conn, source="slack_alert", external_id="human-prose-note",
+                       title="the 1Password root cause is X, the two-line fix is Y", first_seen=OLD)
+        triage.run(conn, dry_run=False)
+
+        states = {r["signature"]: r["state"] for r in
+                  conn.execute("SELECT signature, state FROM triage_items").fetchall()}
+        assert states["slack_alert:mam-session-dead-x"] == triage.STATE_NEW, (
+            "a bold-wrapped siren alert must not be parked in terminal `note`"
+        )
+        assert states["slack_alert:human-prose-note"] == triage.STATE_NOTE
+
+
+def test_the_mam_session_dead_rule_maps_the_bold_siren_signature():
+    """The real policy carries the rule §116 added: the MAM session-dead
+    family (the bold-siren class of item 1297) maps to homelab. The glob is
+    deliberate — the normalized title embeds the rejecting IP/ASN (redacted
+    here, per the repo's own no-real-addresses rule), so the signature changes
+    on every occurrence."""
+    rules = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
+    signature = ("slack_alert:mam-session-dead-jsonload-php-rejected-the-session-from-"
+                 "redacted-as10101-eu-so-seed-obligation-monitor")
+    hit = triage._match_rule([signature], rules)
+    assert hit is not None and hit["repo"] == "homelab", hit
+
+
 def _seed_note_row(conn: sqlite3.Connection, event_id: int, signature: str) -> None:
     """A `note`-state triage row over an already-inserted event — the shape
     the digest reads. The rows here are seeded directly rather than reached
@@ -796,6 +850,197 @@ def test_digest_is_silent_when_every_note_row_has_resolved():
             "and it must not burn the day's cursor either — a later real note has to be able "
             "to reach today's digest"
         )
+
+
+def test_frozen_note_matching_a_new_rule_is_revived_and_mapped():
+    """The live half of §116: event 1297's row was already sitting in terminal
+    `note` before the bold-siren fix and the `mam-session-dead-*` rule landed,
+    and `classify()` only ever touches `new` — so recognising the shape and
+    adding the rule changes nothing for the incident that already exists.
+    `reclassify_frozen_notes()` hands exactly that row back to `new` and the
+    same pass's `classify()` maps it, which is what makes it reach homelab."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True,
+                  rules=[{"match": "slack_alert:mam-session-dead-*", "repo": "homelab"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(
+            conn, source="slack_alert", external_id="mam-session-dead-x",
+            title="*🚨 MAM session dead*: jsonLoad.php rejected the session", first_seen=OLD)
+        _seed_note_row(conn, eid, "slack_alert:mam-session-dead-x")
+
+        triage.reclassify_frozen_notes(conn, policy, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW, (
+            "a note row a current rule matches must go back to `new` for one classify() pass"
+        )
+        triage.classify(conn, policy, NOW)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEW and item["repo"] == "homelab", (
+            f"the revived row must be routed to the rule's repo, got repo={item['repo']!r} "
+            f"state={item['state']!r}"
+        )
+
+
+def test_frozen_note_whose_title_now_reads_as_a_bot_alert_is_revived():
+    """The other half of the parking decision: no rule matches, but the title
+    now passes `_looks_like_bot_alert()` where it used to fail, so a fresh
+    classify() would leave it `new` instead of re-parking it. The row must be
+    handed back too, or the fix only helps alert classes that also happen to
+    have a rule."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(
+            conn, source="slack_alert", external_id="bold-siren-no-rule",
+            title="*🚨 HyperDX is blind*", first_seen=OLD)
+        _seed_note_row(conn, eid, "slack_alert:bold-siren-no-rule")
+
+        triage.reclassify_frozen_notes(conn, policy, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW
+
+
+def test_frozen_note_that_is_still_prose_is_left_alone():
+    """The predicate is the parking decision, not a blanket revive: an
+    un-prefixed, rule-less Slack diagnosis is still exactly what `note` is
+    for, and reclassify() must not drag it out."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(
+            conn, source="slack_alert", external_id="still-prose-note",
+            title="the 1Password root cause is X, the two-line fix is Y", first_seen=OLD)
+        _seed_note_row(conn, eid, "slack_alert:still-prose-note")
+
+        triage.reclassify_frozen_notes(conn, policy, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NOTE
+
+
+def test_frozen_note_that_was_already_mapped_is_revived():
+    """The §77 shape: a row that had already been mapped to a repo could still
+    be re-frozen in `note` by a later classify() pass. classify() would never
+    park a mapped row, so reclassify() must hand it back rather than leave a
+    routed signal invisible."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(
+            conn, source="slack_alert", external_id="mapped-prose-note",
+            title="HomeLab CPU above threshold", first_seen=OLD)
+        _seed_note_row(conn, eid, "slack_alert:mapped-prose-note")
+        conn.execute("UPDATE triage_items SET repo=? WHERE event_id=?", ("homelab", eid))
+        conn.commit()
+
+        triage.reclassify_frozen_notes(conn, policy, NOW)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEW and item["repo"] == "homelab"
+
+
+def test_frozen_note_whose_event_already_resolved_is_left_alone():
+    """A revive would enter `new` and then be quiet-resolved by the same pass,
+    carding a condition that is already over — the line
+    scripts/reset-frozen-notes.py draws as well. A resolved event's note row
+    stays put."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True,
+                  rules=[{"match": "slack_alert:mam-session-dead-*", "repo": "homelab"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(
+            conn, source="slack_alert", external_id="mam-session-dead-gone",
+            title="*🚨 MAM session dead*: …", first_seen=OLD,
+            resolved_at=(OLD + dt.timedelta(minutes=30)).isoformat())
+        _seed_note_row(conn, eid, "slack_alert:mam-session-dead-gone")
+
+        triage.reclassify_frozen_notes(conn, policy, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NOTE
+
+
+def test_run_revives_a_frozen_mam_session_dead_note_to_homelab():
+    """End to end through the loop's own `run()`: the frozen note row for the
+    triggering alert is revived, mapped and escalated in one pass, so the
+    already-detected MAM session-dead incident actually reaches homelab
+    rather than reprinting in the digest."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True,
+                  rules=[{"match": "slack_alert:mam-session-dead-*", "repo": "homelab"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(
+            conn, source="slack_alert", external_id="mam-session-dead-live",
+            title="*🚨 MAM session dead*: jsonLoad.php rejected the session", first_seen=OLD)
+        _seed_note_row(conn, eid, "slack_alert:mam-session-dead-live")
+        triage._call_propose_mappings_model = lambda _prompt: None
+
+        triage.run(conn, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["repo"] == "homelab", f"expected homelab, got repo={item['repo']!r}"
+        assert item["state"] == triage.STATE_INVESTIGATING, (
+            f"the frozen note must leave `note`, map to homelab and escalate in one pass, "
+            f"got state={item['state']!r}"
+        )
+
+
+def test_frozen_note_a_new_ignore_entry_covers_is_revived_to_ignored():
+    """The parity gap the review found in §116's first cut: the revive predicate
+    hand-copied classify()'s parking decision and omitted its `ignore` check, so
+    a `note` row a later-added ignore entry covers stayed frozen for ever — the
+    same "policy entry added after the row parked can never reach it" bug the
+    pass exists to close for `rules`. classify() routes an ignored signature to
+    `ignored`, so the row is not parked and must be handed back. Both callers
+    now ask `_parks_in_note()`, so this cannot drift again."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="ignoreme-later-entry",
+                            title="Un-prefixed prose about something now benign",
+                            first_seen=OLD)
+        _seed_note_row(conn, eid, "slack_alert:ignoreme-later-entry")
+
+        triage.reclassify_frozen_notes(conn, policy, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEW, (
+            "a note row a current `ignore` entry covers must not stay frozen in `note`"
+        )
+        triage.classify(conn, policy, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_IGNORED
+
+
+def test_frozen_note_revive_dry_run_previews_and_writes_nothing():
+    """The review's decision item: the revive is a batch state change over
+    historical rows on the LIVE ledger, so it has to be previewable before it
+    runs. Under `dry_run` the rows that would revive are printed and none is
+    written — the pass is the only one in run() whose effect is a batch."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="bold-siren-preview",
+                            title="*🚨 HyperDX is blind*", first_seen=OLD)
+        _seed_note_row(conn, eid, "slack_alert:bold-siren-preview")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            triage.reclassify_frozen_notes(conn, policy, NOW, dry_run=True)
+
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NOTE, (
+            "a dry run must not move a live `note` row"
+        )
+        out = buf.getvalue()
+        assert "would revive" in out and str(eid) in out, out
+
+
+def test_frozen_note_revive_bound_defers_the_overflow_visibly():
+    """A cold policy change must not put an unbounded batch of items on the
+    board in one tick. Past FROZEN_NOTE_REVIVE_MAX_PER_PASS the rows stay in
+    `note` — overflow waits, never drops — and the remainder is named on
+    stderr so the deferral is visible, the same rule the budget hits follow."""
+    bound = triage.FROZEN_NOTE_REVIVE_MAX_PER_PASS
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        eids = []
+        for i in range(bound + 2):
+            eid = _insert_event(conn, source="slack_alert",
+                                external_id=f"bold-siren-batch-{i}",
+                                title=f"*🚨 HyperDX is blind ({i})*", first_seen=OLD)
+            _seed_note_row(conn, eid, f"slack_alert:bold-siren-batch-{i}")
+            eids.append(eid)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            triage.reclassify_frozen_notes(conn, policy, NOW)
+
+        states = [triage._get_item(conn, e)["state"] for e in eids]
+        assert states.count(triage.STATE_NEW) == bound, states
+        assert states.count(triage.STATE_NOTE) == 2, states
+        assert f"{2} row(s) stay in `note` for a later pass" in err.getvalue(), err.getvalue()
 
 
 def test_rule_matching_runs_before_the_prose_filter():
