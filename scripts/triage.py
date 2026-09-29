@@ -1702,12 +1702,21 @@ def _match_rule(targets: list[str], rules: list[dict[str, Any]]) -> dict[str, An
 
 
 # `[`  — UptimeKuma's own bracketed monitor-name format: "[X] [:red_circle: Down] ..."
-# emoji — HyperDX/argo-alert style: "🚨 ...", "✅ ...", "⚠️ ...", "*⚠️ ..." (bold mrkdwn)
-_BOT_ALERT_PREFIXES = ("[", "\U0001F6A8", "✅", "⚠️", "*⚠️")
+# emoji — HyperDX/argo-alert style: "🚨 ...", "✅ ...", "⚠️ ..."
+_BOT_ALERT_PREFIXES = ("[", "\U0001F6A8", "✅", "⚠️")
+
+# Slack mrkdwn emphasis can wrap the leading glyph — HyperDX renders a siren
+# alert as `*🚨 …*`, not `🚨 …`. Strip any leading emphasis run before the
+# prefix test so the wrapper is not mistaken for an un-prefixed human sentence
+# and parked in terminal `note` (live: item 1297's `*🚨 MAM session dead*`
+# title, which could then neither silence-resolve nor reopen). The tuple used
+# to carry `*⚠️` — that was this same miss patched for one glyph; the strip
+# covers the wrapper instead.
+_BOT_ALERT_EMPHASIS = "*_~"
 
 
 def _looks_like_bot_alert(title: str) -> bool:
-    return (title or "").lstrip().startswith(_BOT_ALERT_PREFIXES)
+    return (title or "").lstrip().lstrip(_BOT_ALERT_EMPHASIS).startswith(_BOT_ALERT_PREFIXES)
 
 
 # --- small helpers -------------------------------------------------------------

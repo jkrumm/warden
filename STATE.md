@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-29 (§111 — the `revisions-exhausted` finding reads the item's own park note instead of hardcoding "the implementer cannot satisfy the review", which was false for the two weatherorb items it fired on) |
+| Last updated | 2026-09-29 (§112 — a bold-wrapped siren alert (`*🚨 …*`) is a bot alert, not prose: `_looks_like_bot_alert()` now strips a leading mrkdwn emphasis run before its prefix test, and a `slack_alert:mam-session-dead-*` rule maps the family to homelab) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 341/341 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 347/347 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -298,7 +298,7 @@ loop.
   still not built.
 - `#agents` is warden-only since 2026-09-11 (Hermes's narratives cron moved to
   `#hermes`); approval buttons still post to `#hermes`.
-- `config/triage-policy.json` deduplicated to 76 rules / 15 ignores (§98),
+- `config/triage-policy.json` deduplicated to 78 rules / 15 ignores (§98),
   proven identical on all live events; §76's dedup stops regrowth.
 - `_fetch_note_rows()` excludes rows whose event has resolved and has no age
   filter, so the digest's "Unstructured notes" heading carries a still-open
@@ -430,6 +430,8 @@ log's past sections.
   it — §110
 - The `revisions-exhausted` finding reads the park note instead of blaming the
   review — §111
+- A bold-wrapped siren alert is a bot alert, not prose: the prefix test strips a
+  leading mrkdwn emphasis run, and the MAM session-dead family maps — §112
 
 ### Next action
 

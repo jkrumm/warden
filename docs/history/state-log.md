@@ -9153,3 +9153,39 @@ note. The title is unchanged.
 **Verified.** `test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review`
 covers the three note shapes (written first, RED on the old code). `make test`
 green — `test_triage.py` 344/344, everything else at §110's counts.
+
+## 112. A bold-wrapped siren alert is a bot alert, not prose (2026-09-29)
+
+Item 1297 — `*🚨 MAM session dead*: jsonLoad.php rejected the session …` — sat in
+terminal `note` instead of escalating. `_BOT_ALERT_PREFIXES` (triage.py) listed
+`[`, `🚨`, `✅`, `⚠️` and the bold-wrapped `*⚠️`, but not `*🚨`.
+`_looks_like_bot_alert()` ran `startswith()` on the raw title and `.lstrip()`
+strips whitespace only, so the leading `*` survived and the whole bold-siren
+class failed the test, hit the `ignoreUnstructuredSlackProse` fallback and was
+parked in `note`. A `note` row can neither silence-resolve (§81) nor reopen
+(§76/§77), so it reprinted in the daily digest and nothing else.
+
+**The change.** `_looks_like_bot_alert()` strips a leading Slack mrkdwn emphasis
+run (`*`, `_`, `~`) before the prefix test; `*⚠️` leaves the tuple because the
+strip covers the wrapper generally — that tuple entry was this same miss patched
+one glyph at a time. `config/triage-policy.json` gains a
+`slack_alert:mam-session-dead-*` rule mapped to `homelab`, mirroring the
+mam-account-monitoring rule. The glob, not the exact signature, is deliberate:
+the normalized title embeds the rejecting IP/ASN, so it changes every
+occurrence. The prefix fix alone only moves a rule-less row from `note` to a
+silent `new`; the rule is what makes the family escalate.
+
+**Not changed.** Event 1297's own row is already `note`, and `classify()` only
+ever touches `new` — so this prevents the class recurring into `note` and maps
+future occurrences, but the live row stays terminal until the standing
+`reset-frozen-notes.py` repair or a recurrence clears its event. No revive was
+run; the work was the code path, not this one row.
+
+**Verified.** `test_triage.py` 347/347 (+3):
+`test_bold_wrapped_siren_is_a_bot_alert_not_prose` (the old tuple's predicate
+returns False for `*🚨 …*`, checked directly),
+`test_bold_wrapped_siren_without_a_rule_stays_new_not_note` (the rule-less
+bold-siren row is routed to `note` by the old predicate, which classify() turns
+into STATE_NOTE), and `test_the_mam_session_dead_rule_maps_the_bold_siren_signature`
+against the real policy file. `make test` green — `test_triage.py` 347/347, every
+other suite at §110's counts; `make check-policy` agrees on all 31 repos.

@@ -237,8 +237,10 @@ never becomes an episode — deliberately NOT the same state:
   never carded, never in the digest.
 - **`STATE_NOTE`** — the structural `ignoreUnstructuredSlackProse` fallback.
   A title that doesn't start with a recognized bot-alert shape (`[`, siren,
-  checkmark, warning). Visible: named (signature + a truncated title) under
-  its own heading in the daily digest, though never carded or escalated.
+  checkmark, warning — optionally wrapped in Slack mrkdwn emphasis, e.g. the
+  bold `*🚨 …*` a HyperDX siren alert can render as). Visible: named
+  (signature + a truncated title) under its own heading in the daily digest,
+  though never carded or escalated.
 
 The split exists because `watchdog.db` genuinely contains rows like a human
 Slack message diagnosing the exact 1Password rate-limit root cause with a
