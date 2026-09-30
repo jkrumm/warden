@@ -1702,12 +1702,21 @@ def _match_rule(targets: list[str], rules: list[dict[str, Any]]) -> dict[str, An
 
 
 # `[`  — UptimeKuma's own bracketed monitor-name format: "[X] [:red_circle: Down] ..."
-# emoji — HyperDX/argo-alert style: "🚨 ...", "✅ ...", "⚠️ ...", "*⚠️ ..." (bold mrkdwn)
-_BOT_ALERT_PREFIXES = ("[", "\U0001F6A8", "✅", "⚠️", "*⚠️")
+# emoji — HyperDX/argo-alert style: "🚨 ...", "✅ ...", "⚠️ ..."
+_BOT_ALERT_PREFIXES = ("[", "\U0001F6A8", "✅", "⚠️")
+
+# Slack mrkdwn emphasis can wrap the leading glyph — HyperDX renders a siren
+# alert as `*🚨 …*`, not `🚨 …`. Strip any leading emphasis run before the
+# prefix test so the wrapper is not mistaken for an un-prefixed human sentence
+# and parked in terminal `note` (live: item 1297's `*🚨 MAM session dead*`
+# title, which could then neither silence-resolve nor reopen). The tuple used
+# to carry `*⚠️` — that was this same miss patched for one glyph; the strip
+# covers the wrapper instead.
+_BOT_ALERT_EMPHASIS = "*_~"
 
 
 def _looks_like_bot_alert(title: str) -> bool:
-    return (title or "").lstrip().startswith(_BOT_ALERT_PREFIXES)
+    return (title or "").lstrip().lstrip(_BOT_ALERT_EMPHASIS).startswith(_BOT_ALERT_PREFIXES)
 
 
 # --- small helpers -------------------------------------------------------------
@@ -2571,6 +2580,120 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     conn.commit()
 
 
+def _parks_in_note(row: sqlite3.Row, targets: list[str], policy: dict[str, Any],
+                   event_row: sqlite3.Row) -> bool:
+    """`classify()`'s parking decision, in its own order, as ONE predicate.
+
+    True iff a classify() pass over this row would leave it in the terminal
+    `note` state: the explicit `ignore` list does not match it (that routes to
+    `ignored`, is checked first, and so always wins), it carries no
+    `repo`/`verb`, no `rules` entry maps it, and the structural
+    `ignoreUnstructuredSlackProse` fallback applies — the source is
+    `slack_alert` and the title does not read as a bot alert.
+
+    Shared, never re-derived. classify() calls it for the routing decision and
+    reclassify_frozen_notes() calls it to ask whether a parked row is still
+    parked, so the two agree by construction: a hand-copy of this test that
+    omits one clause silently freezes rows the policy has since mapped, which
+    is exactly what the first cut of §116's revive did with the `ignore`
+    check."""
+    if _fnmatch_any(targets, policy["ignore"]):
+        return False
+    if row["repo"] is not None or row["verb"] is not None:
+        return False
+    rule = _match_rule(targets, policy["rules"])
+    if rule is not None and (rule.get("repo") or rule.get("verb")):
+        return False
+    if not policy["ignoreUnstructuredSlackProse"]:
+        return False
+    if event_row["source"] != "slack_alert":
+        return False
+    return not _looks_like_bot_alert(event_row["title"])
+
+
+FROZEN_NOTE_REVIVE_MAX_PER_PASS = 25
+
+FROZEN_NOTE_REVIVE_REASON = (
+    "revived by reclassify_frozen_notes(): this row was parked in terminal `note` "
+    "under an earlier policy/code state that no longer applies — a rule now matches "
+    "its signature, or its title now reads as a bot alert — so it goes back to `new` "
+    "for one more classify() pass."
+)
+
+
+def reclassify_frozen_notes(conn: sqlite3.Connection, policy: dict[str, Any],
+                            now: dt.datetime, *, dry_run: bool = False) -> None:
+    """A `note` row is only terminal while the decision that parked it still
+    holds. `classify()` routes to STATE_NOTE when a `slack_alert` matches no
+    rule AND its title does not read as a bot alert — so a parked row can be
+    invalidated by a later change on either side of that test: `_looks_like_
+    bot_alert()` learning a shape it used to miss (`*🚨 …*`, the live item
+    1297), or a rule added for a signature it once could not map. Left alone, a
+    row like that is unreachable by the very change that should escalate it —
+    classify() only ever touches `new` and reopen_if_needed() skips `note` —
+    so it just reprints in the daily digest forever.
+
+    This pass hands those rows back to `new` for the SAME pass's classify(),
+    which stays the only writer of repo/verb. The predicate is not re-derived:
+    `_parks_in_note()` IS classify()'s parking decision, the `ignore` list
+    included (that one routes a row to `ignored` instead), so a row is revived
+    exactly when a current classify() pass would no longer park it. A row whose
+    event has since resolved is left in `note` — reviving it would card,
+    through apply_resolutions(), a condition that is already over (the standing
+    scripts/reset-frozen-notes.py draws the same line). A row the predicate
+    still parks stays exactly where it is: an un-prefixed, rule-less Slack
+    diagnosis is still visible-but-quiet, never silently dropped and never
+    escalated.
+
+    Bounded and previewable, because it is the one pass in run() that is a
+    batch over historical rows: at most FROZEN_NOTE_REVIVE_MAX_PER_PASS rows
+    revive per pass, oldest first, and the remainder is named on stderr. It
+    stays in `note` (overflow waits, never drops) and drains on a later pass,
+    so a cold policy change cannot put an unbounded batch of items on the board
+    in one tick. Under `dry_run` nothing is written at all — the rows that
+    would revive are printed instead, which is the preview a change to the
+    predicate's inputs (a new rule, the emphasis strip) wants before it touches
+    the live ledger.
+
+    Idempotent: a revived row is `new` and no longer selected, so a second
+    immediate pass reports nothing and writes nothing."""
+    rows = conn.execute(
+        "SELECT ti.event_id, ti.repo, ti.verb FROM triage_items ti "
+        "JOIN events e ON e.id = ti.event_id "
+        "WHERE ti.state = ? AND e.resolved_at IS NULL ORDER BY ti.event_id ASC",
+        (STATE_NOTE,),
+    ).fetchall()
+    revived: list[int] = []
+    deferred: list[int] = []
+    for row in rows:
+        event_row = _get_event(conn, row["event_id"])
+        if event_row is None:
+            continue
+        # classify()'s parking decision itself — one predicate, shared, so the
+        # revive can never again disagree with the routing it re-evaluates.
+        if _parks_in_note(row, _match_targets(event_row), policy, event_row):
+            continue
+        if len(revived) >= FROZEN_NOTE_REVIVE_MAX_PER_PASS:
+            deferred.append(row["event_id"])
+            continue
+        if dry_run:
+            print(f"triage: [dry-run] frozen note {row['event_id']} would revive: "
+                  f"{event_row['title'][:120]!r}")
+        else:
+            _set_state(conn, row["event_id"], STATE_NEW, now,
+                       note=FROZEN_NOTE_REVIVE_REASON, expect_state=STATE_NOTE)
+        revived.append(row["event_id"])
+    if revived:
+        print(f"triage: frozen-note revive: {len(revived)} row(s) "
+              f"{'would revive' if dry_run else 'revived'}")
+    if deferred:
+        print(f"triage: frozen-note revive bound {FROZEN_NOTE_REVIVE_MAX_PER_PASS}"
+              f"/pass reached; {len(deferred)} row(s) stay in `note` for a later pass: "
+              f"{deferred}", file=sys.stderr)
+    if not dry_run:
+        conn.commit()
+
+
 def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> set[str]:
     """Resolve `repo`/`verb` (fnmatch against BOTH match targets — see
     _match_targets()) and apply, in order: the explicit `ignore` list (same
@@ -2659,8 +2782,10 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
         # No rule matched this row.
         unmapped.add(row["signature"])
 
-        if policy["ignoreUnstructuredSlackProse"] and event_row["source"] == "slack_alert" \
-                and not _looks_like_bot_alert(event_row["title"]):
+        # The parking decision is one shared predicate — reclassify_frozen_notes()
+        # asks the same function whether it may revive a row, so the two can no
+        # longer drift apart (see _parks_in_note()).
+        if _parks_in_note(row, targets, policy, event_row):
             _set_state(conn, row["event_id"], STATE_NOTE, now)
             # Not reported as unmapped: this row has its own digest section
             # (see maybe_post_daily_digest()'s STATE_NOTE half), and listing
@@ -8375,6 +8500,14 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     ingest(conn, now)
     ingest_github_issues(conn, now)
     reopen_if_needed(conn, now)
+    # A `note` row parked by an older policy/code state gets one more chance
+    # before classify() — otherwise the change that should escalate it (a
+    # newly-matched rule, a newly-recognized title shape) can never reach it
+    # (classify() only touches `new`, reopen_if_needed() skips `note`). Runs
+    # BEFORE classify() so the revived row is mapped in the same pass. The one
+    # batch pass in here: bounded per pass and previewed instead of written
+    # under --dry-run (see reclassify_frozen_notes()).
+    reclassify_frozen_notes(conn, policy, now, dry_run=dry_run)
     unsnooze_if_expired(conn, now)
     unmapped = classify(conn, policy, now)
     apply_resolutions(conn, now, policy)

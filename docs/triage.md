@@ -237,8 +237,17 @@ never becomes an episode — deliberately NOT the same state:
   never carded, never in the digest.
 - **`STATE_NOTE`** — the structural `ignoreUnstructuredSlackProse` fallback.
   A title that doesn't start with a recognized bot-alert shape (`[`, siren,
-  checkmark, warning). Visible: named (signature + a truncated title) under
-  its own heading in the daily digest, though never carded or escalated.
+  checkmark, warning — optionally wrapped in Slack mrkdwn emphasis, e.g. the
+  bold `*🚨 …*` a HyperDX siren alert can render as). Visible: named
+  (signature + a truncated title) under its own heading in the daily digest,
+  though never carded or escalated. Not a permanent freezer: when a later
+  rule, ignore entry or `_looks_like_bot_alert()` shape means a current
+  `classify()` pass would no longer park the row here, `reclassify_frozen_notes()`
+  hands it back to `new` (its event still live) for one more classify pass. Both
+  sides ask the same predicate (`_parks_in_note()`), and that pass is bounded
+  (25 rows, oldest first, the rest named on stderr and left in `note` for a
+  later tick) and previewable — under `--dry-run` it prints the rows it would
+  revive and writes nothing.
 
 The split exists because `watchdog.db` genuinely contains rows like a human
 Slack message diagnosing the exact 1Password rate-limit root cause with a
