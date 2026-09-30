@@ -5020,21 +5020,47 @@ def test_propose_mappings_skips_signatures_the_policy_already_covers():
 
 def test_propose_mappings_coverage_check_uses_the_title_target_too():
     """`_match_targets()`'s second candidate is `source:normalize_title(title)`
-    — the only way a `uk` monitor id is matchable at all (see the module
+    — the only way a state source whose external_id is NOT its title (a docker
+    container id, uk's opaque monitor id) is matchable at all (see the module
     docstring's MATCH TARGETS paragraph). The coverage check must run through
     that same helper rather than comparing the literal signature, or a rule
-    written against the title counts as absent and gets proposed again."""
+    written against the title counts as absent and gets proposed again. Uses
+    `docker_homelab`, not `uk`: a `uk` row is now withheld from this pass
+    before the coverage check ever sees it — see
+    test_propose_mappings_never_offers_an_opaque_uk_monitor."""
     with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="uk", external_id="204", title="MacMini Dev Host - Push",
-                       first_seen=VERY_OLD)
+        _insert_event(conn, source="docker_homelab", external_id="abc123",
+                       title="MacMini Dev Host - Push", first_seen=VERY_OLD)
         triage.ingest(conn, NOW)
         policy = {
             "proposeMappingsAgeDays": 7.0,
-            "rules": [{"match": "uk:macmini-dev-host-push", "repo": "dotfiles"}],
+            "rules": [{"match": "docker_homelab:macmini-dev-host-push", "repo": "dotfiles"}],
             "ignore": [],
         }
         sigs = {c["signature"] for c in triage._propose_mapping_candidates(conn, policy, NOW)}
         assert sigs == set(), f"a title-matched rule already covers this signature — got {sigs}"
+
+
+def test_propose_mappings_never_offers_an_opaque_uk_monitor():
+    """A `uk` row's signature is `uk:<opaque numeric monitor id>` — the one
+    target the proposer could only ever write as a bare numeric-id rule, which
+    the policy file's own convention forbids ("never the bare numeric id"): it
+    is unglobbable and breaks the moment the monitor is recreated. The model
+    cannot know the owner from an id, and got one wrong this way (`uk:226` was
+    auto-proposed to `warden`, then corrected to `homelab` by hand). So no `uk`
+    row is a candidate, whatever its state or age, while an ordinary
+    readable-source row still is."""
+    with _triage_env() as (conn, ctx):
+        _insert_event(conn, source="uk", external_id="226",
+                       title="MyAnonamouse Session - Push", first_seen=VERY_OLD)
+        _insert_event(conn, source="slack_alert", external_id="readable-sig",
+                       title="A normal alert", first_seen=VERY_OLD)
+        triage.ingest(conn, NOW)
+        policy = {"proposeMappingsAgeDays": 7.0}
+
+        sigs = {c["signature"] for c in triage._propose_mapping_candidates(conn, policy, NOW)}
+        assert sigs == {"slack_alert:readable-sig"}, (
+            f"a bare `uk:` monitor id must never reach the proposer — got {sigs}")
 
 
 def test_propose_mappings_unparseable_response_is_non_fatal():
