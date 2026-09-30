@@ -6,7 +6,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-29 (§113 — a corrected rule now heals the alert row it already mapped: `classify()` re-asks the rules for an `origin='alert'` row in `new`, so `uk:226`'s correction to `homelab` reaches the row that a recurrence reopens; `human`/`github_issue` rows are never re-resolved) |
+| Last updated | 2026-09-30 (§114 — a step-7 finding about the PR's *wrapper* no longer spends a revision: it is not something an episode can satisfy, so it routes to `needs_human`; revision briefs carry the origin brief's `Closes #<issue number>` line; `revisions-exhausted` describes rounds that each blocked on a different file instead of blaming the implementer) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
@@ -175,7 +175,8 @@ loop.
   `warden_self` events → repo `warden` → ordinary items; `/health.self_audit`.
   A finding's detail is derived from the state it describes, never hardcoded —
   `revisions-exhausted` reads the park note (§111), because a card that names
-  the wrong mechanism is read as evidence.
+  the wrong mechanism is read as evidence, and names the rounds that each
+  blocked on a different file (§114).
 - **A plan-gated rules read is "no rules" (§108).** `branch_rules()` returns
   `[]` for the 403 GitHub answers with on a private repo whose plan carries no
   rulesets ("Upgrade to GitHub Pro or make this repository public") — that repo
@@ -226,11 +227,15 @@ loop.
   The step-7 review gets the goal and `VALIDATION_GATE_QUESTIONS`; a
   policy-refused merge retries once the policy file changes. Hard human gate
   unchanged for `warden`/`sideclaw`/`dotfiles` and warden's policy files.
-- **Blocked fixes are revised (§92).** `maybe_revise_blocked()` (first step of
+- **Blocked fixes are revised (§92, §114).** `maybe_revise_blocked()` (first step of
   `advance_implement_chain()`) sends a `merge_blocked`/`needs_human` item whose
   review blocked it, or whose checks failed before push, back to a fresh
   implement episode with the findings, from the previous branch; the old PR is
-  closed with a pointer. `revisionMaxAttempts` (2) per item.
+  closed with a pointer. `revisionMaxAttempts` (2) per item. A blocking finding
+  about the PR's *wrapper* — its body, its trailer, whether the issue auto-closes
+  — is not one of them: no episode can satisfy it, so it routes to `needs_human`
+  instead of spending an attempt, and revision briefs carry the origin brief's
+  `Closes #<issue number>` line so that finding cannot recur (§114).
 - **Parked items count recurrences (§92).** `track_parked_recurrences()`: card
   line `Recurred N× since it parked here`, `parked_recurrences`/`revision_count`
   on `/board`, one extra reminder at `parkedRecurrenceReminder` (5).
@@ -442,6 +447,8 @@ log's past sections.
   "1Password refs unresolved" — §112
 - A corrected rule heals the alert row it already mapped; a hand-opened item
   keeps its repo — §113
+- A PR-wrapper finding is not a revision's job; revision briefs carry the
+  closing instruction — §114
 
 ### Next action
 

@@ -8203,7 +8203,7 @@ def test_quiet_anchor_takes_the_latest_iso_clock():
 
 def _seed_blocked_item(conn, *, external_id: str, blocking: list[dict[str, Any]] | None = None,
                        revision_count: int = 0) -> int:
-    eid = _seed_verdict_item(conn, external_id=external_id)
+    eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
     conn.execute(
         "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=?, revision_count=? "
         "WHERE event_id=?",
@@ -8297,6 +8297,172 @@ def test_revision_that_cannot_start_hands_the_item_back():
         assert item["implement_job"] == "impl-sig-refused" and item["pr_url"]
         assert "could not start" in item["note"]
         assert CLOSED_PRS == []
+
+
+# --- process-only blocking findings and the closing instruction (§113) --------
+
+# Review job 78f7cf25's two blocking findings for weatherorb PR #27, verbatim.
+# The first is the PR-wrapper class: no implement episode can satisfy it, and it
+# was raised against a body that already ended with `Closes #20.`
+_PROCESS_ONLY_FINDING = {
+    "file": "src/weatherorb/serve/cache.py",
+    "line": 328,
+    "message": "PR's stated goal is 'Closes #20' but the diff only adds non-closing 'Issue #20' source "
+               "comments — issue won't auto-close on merge. Add 'Closes #20' to the PR description or "
+               "commit trailer.",
+    "angle": "adversary",
+}
+_CODE_FINDING = {
+    "file": "src/weatherorb/serve/cache.py",
+    "line": 334,
+    "message": "Empty bands returned by the new guard get cached in `_BandCache._read_verified` "
+               "(field.nbytes == 0), but `_evict_locked` only fires on `_currsize > _budget_bytes`, so "
+               "zero-byte entries accumulate for the process lifetime.",
+    "angle": "ocr",
+}
+
+
+def test_a_process_only_blocking_finding_parks_for_a_human_instead_of_blocking():
+    """§113 — the review's PR-wrapper class is not the implementer's to fix, so it
+    must not read as `blocked`: `blocked` is what spends a revision, and no episode
+    can edit the previous PR's body. A human can, in one line, or merges without it."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-process-only")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-po", "validation-job-po",
+             "https://github.com/jkrumm/demo-repo/pull/10", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-po")
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result("actionable", blocking=[_PROCESS_ONLY_FINDING],
+                                     summary="1 blocking finding."),
+        }
+        merge_calls: list[int] = []
+
+        def _unexpected_merge(*a, **kw):
+            merge_calls.append(1)
+            raise AssertionError("a process-only finding must never reach merge")
+
+        triage._merge.plan_or_land = _unexpected_merge
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert merge_calls == []
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "process-only" in item["note"] and "Closes #20" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-po",)).fetchone()
+        assert d["validation_status"] == "needs_human", d["validation_status"]
+
+
+def test_a_process_only_finding_is_never_spent_as_a_revision():
+    """The same class on the revision path: `_revision_findings()` must not hand it
+    to an implement episode, because the only thing that would come back is the same
+    finding (the episode opens its own PR, whose body nobody asked it to fill in)."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-po-rev", blocking=[_PROCESS_ONLY_FINDING])
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert calls == []
+        assert item["state"] == triage.STATE_MERGE_BLOCKED and item["revision_count"] == 0
+
+
+def test_a_mixed_round_revises_the_code_findings_and_carries_the_closing_instruction():
+    """A round with both classes sends the code findings, drops the wrapper one, and
+    — for a trusted issue origin — carries the origin brief's `Closes #<n>` line the
+    revision brief never used to have (§113: the finding 'add Closes #20 to the PR
+    description' was unsatisfiable by any revision, because nothing asked for it)."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-mixed",
+                                 blocking=[_PROCESS_ONLY_FINDING, _CODE_FINDING])
+        conn.execute("UPDATE triage_items SET origin='github_issue' WHERE event_id=?", (eid,))
+        conn.execute("UPDATE events SET payload_json=? WHERE id=?",
+                     (json.dumps({"author": triage._github.GH_OWNER}), eid))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+
+        assert len(calls) == 1, calls
+        brief = calls[0]["brief"]
+        assert "only fires on" in brief, brief
+        assert "auto-close on merge" not in brief, brief
+        assert triage.ISSUE_CLOSING_INSTRUCTION in brief, brief
+
+
+def test_a_revision_brief_carries_the_closing_instruction_only_for_a_trusted_issue():
+    """An alert origin has no issue to close, and an untrusted issue is
+    investigate-only — neither gets the instruction. Separate environments: the
+    per-repo lock admits one implement episode per repo at a time."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="sig-alert-origin")
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+
+        assert len(calls) == 1, calls
+        assert triage.ISSUE_CLOSING_INSTRUCTION not in calls[0]["brief"], calls[0]["brief"]
+
+    with _triage_env() as (conn, ctx):
+        untrusted = _seed_blocked_item(conn, external_id="sig-untrusted")
+        conn.execute("UPDATE triage_items SET origin='github_issue' WHERE event_id=?", (untrusted,))
+        conn.execute("UPDATE events SET payload_json=? WHERE id=?",
+                     (json.dumps({"author": "some-stranger"}), untrusted))
+        conn.commit()
+        calls = []
+        triage._sideclaw.submit = _fake_submit(calls)
+
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+
+        assert len(calls) == 1, calls
+        assert triage.ISSUE_CLOSING_INSTRUCTION not in calls[0]["brief"], calls[0]["brief"]
+
+
+def test_revisions_exhausted_names_a_non_convergent_review():
+    """§113 — rounds that each blocked on a *different file* are a review that found
+    something new every time; the card describes that instead of asserting an
+    implementer failure it cannot evidence."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="non-convergent", state=triage.STATE_MERGE_BLOCKED,
+                          note="step-7 validation (blocked): src/x.py:12 — the guard is gone",
+                          revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
+        for note in ("step-7 validation (blocked): tests/a_test.py:395 — covers only the fixture",
+                     "step-7 validation (blocked): src/x.py:12 — the guard is gone"):
+            conn.execute(
+                "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+                (eid, triage.STATE_VALIDATING, triage.STATE_MERGE_BLOCKED, NOW.isoformat(), note))
+        conn.commit()
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        detail = details[f"revisions-exhausted-{eid}"]
+        assert "each blocking a different file" in detail, detail
+        assert "cannot satisfy the review" not in detail, detail
+
+
+def test_a_review_that_re_flagged_the_same_location_still_blames_the_review():
+    """The other side of §113: rounds that keep blocking on the *same* location are a
+    review doing its job and an implementer that did not fix it — unchanged."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_state(conn, external_id="converging", state=triage.STATE_MERGE_BLOCKED,
+                          note="step-7 validation (blocked): src/x.py:12 — the guard is gone",
+                          revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
+        for note in ("step-7 validation (blocked): src/x.py:12 — the guard is still gone",
+                     "step-7 validation (blocked): src/x.py:12 — the guard is gone"):
+            conn.execute(
+                "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+                (eid, triage.STATE_VALIDATING, triage.STATE_MERGE_BLOCKED, NOW.isoformat(), note))
+        conn.commit()
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        assert "cannot satisfy the review" in details[f"revisions-exhausted-{eid}"]
 
 
 # --- recurrences while parked (§92) -------------------------------------------

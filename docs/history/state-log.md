@@ -9245,3 +9245,72 @@ unchanged-rule no-op (a later `now` must not restamp `updated_at`), and
 mapped alert row — 81 of them — and running the fixed `classify()` re-points
 **exactly one**: item 843, `uk:226`, `warden` → `homelab`. No collateral
 re-points is the number that shows the guard is narrow.
+
+## 114. A PR-wrapper finding is not a revision's job, and a revision brief carries the closing instruction (2026-09-30)
+
+Item 1286 (weatherorb#20, the edge-of-domain tile 500s) parked at the 2-attempt
+revision cap with a mergeable fix on the branch and a card reading `step-7
+validation (blocked):`. The `revisions-exhausted-1286` self-audit finding told
+its reader "the implementer cannot satisfy the review in weatherorb; the brief
+or the gate is wrong". Three rounds, three different findings: the guard test
+covered only the synthetic fixture (`tests/serve/test_app.py:395`); then the new
+guard ran before the `local_index`/`time_count` bounds check and masked
+TimeOutOfRange (`src/weatherorb/serve/cache.py:310`); then two findings at once —
+the zero-byte bands the guard caches with no eviction path, and a PR-wrapper
+finding: *"PR's stated goal is 'Closes #20' but the diff only adds non-closing
+'Issue #20' source comments — issue won't auto-close on merge. Add 'Closes #20'
+to the PR description or commit trailer."*
+
+That last finding was false — the description's own final line was `Closes #20.`,
+unchanged since the push (the PR's `updatedAt` 03:28, the review ran 03:33–03:37)
+— and it was unsatisfiable by construction. The step-7 review reads the diff and
+the commit messages; the pull request's description is not in front of it. And
+nothing in a revision brief asked for the text either: `_origin_item_brief()`
+carries `'Closes #<issue number>'` for the *origin* brief only, while the
+revision brief — the one that has to satisfy the review — was assembled from the
+findings alone. One of two attempts could therefore only ever come back with the
+same finding, and the item parked at the cap.
+
+**The change, three parts.**
+
+1. `_is_process_only_finding()`: a step-7 blocking finding about the pull
+   request's *wrapper* — its body, its trailer, whether the issue auto-closes —
+   is no longer read as `blocked`. `blocked` is what spends a revision, and no
+   implement episode can satisfy this class: it cuts a fresh worktree and opens
+   its own PR, and the previous body is not its to edit. The class routes to
+   `needs_human` with the finding on the card, where a human edits one line or
+   merges without it. Recognition is narrow on purpose — a closing/auto-close
+   phrase **and** a wrapper subject **and** an add-it instruction — so a finding
+   that merely mentions `Closes #20` while pointing at a doc that overstates the
+   code, or at a diff that does not match the body, keeps its revision. The same
+   filter guards `_revision_findings()`, so an item parked `blocked` by an older
+   round cannot spend its last attempt on text no episode can write either.
+2. `ISSUE_CLOSING_INSTRUCTION` is one constant now, used by `_origin_item_brief()`
+   and by `maybe_revise_blocked()`'s brief, for the same trusted-issue items only
+   (an `alert` origin has no issue to close; an untrusted issue is
+   investigate-only and never reaches the revision path). "The revision cannot
+   satisfy 'add Closes #N'" is then false by construction.
+3. `_revision_exhaustion_detail()` describes the rounds it can read: when no file
+   was blocked on twice, the card says *"N step-7 rounds, each blocking a
+   different file (…) — every round found something new, so read the last head
+   before blaming the implementer"* instead of asserting an implementer failure
+   it cannot evidence (§111's rule, applied to the other direction).
+
+**What was deliberately not changed.** The obvious reading of "non-convergent" —
+park when a round's blocking set is disjoint from the previous round's — was
+built, measured against this item's own history, and dropped: it would have
+parked attempt 2, whose finding was a regression **attempt 1 introduced**, which
+is exactly the round the loop must spend. Every round in this incident held a
+real defect, and a converging review is disjoint by nature — it re-flags what is
+still broken before it finds the next thing. Disjointness stays a description of
+a history, never a parking decision, which is where part 3 puts it. The hard form
+is one early return in `maybe_revise_blocked()` if the owner wants it anyway.
+
+**Verified.** Six tests written first, RED for the stated reason, green after;
+`make test` green with `test_triage.py` at **351/351** (345 before, +6). Against
+a `VACUUM INTO` copy of the live ledger the classifier is narrow exactly where it
+matters: of **47** blocking findings in the whole ledger, **one** classifies
+process-only — 78f7cf25's `Closes #20` finding above — and no code finding is
+diverted. One live item sits at the cap (1273, dotfiles swap-gate): its two
+rounds blocked on lines 62 and 63 of one script, so it keeps the old wording —
+which is why the round comparison is per file, not per `file:line`.

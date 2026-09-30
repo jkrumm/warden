@@ -3686,6 +3686,36 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
 _UNTRUSTED_BLOCK_START = "--- BEGIN UNTRUSTED THIRD-PARTY ISSUE BODY ---"
 _UNTRUSTED_BLOCK_END = "--- END UNTRUSTED THIRD-PARTY ISSUE BODY ---"
 
+# The one instruction a brief must carry whenever the item *is* a GitHub issue and
+# the work will open a pull request: the step-7 review checks for the closing
+# keyword, so its absence is a finding — and a revision brief that omits the
+# instruction cannot satisfy that finding, whatever it writes in the code (§113).
+ISSUE_CLOSING_INSTRUCTION = ("When you open a pull request that closes this issue, include the exact text "
+                             "'Closes #<issue number>' in its body.")
+
+
+def _issue_closing_instruction(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
+    """`ISSUE_CLOSING_INSTRUCTION` for a revision of a trusted-issue item, else "".
+
+    `_origin_item_brief()` puts that line in the *origin* brief only, so a revision
+    brief — the one that actually has to satisfy a review checking for it — never
+    carried it. weatherorb#20 (2026-09-29) spent its last attempt on exactly that
+    finding: "add `Closes #20` to the PR description or commit trailer" is not a
+    code change, and nothing in the revision brief asked for it.
+
+    Same trust derivation as `_origin_item_brief()`: the event's own stored author,
+    never `max_tier` — an untrusted issue is investigate-only and can never reach
+    the revision path anyway (the caller requires `max_tier='implement'`).
+    """
+    if item["origin"] != "github_issue":
+        return ""
+    event = conn.execute("SELECT * FROM events WHERE id=?", (item["event_id"],)).fetchone()
+    if event is None:
+        return ""
+    if _safe_json(event["payload_json"]).get("author") != _github.GH_OWNER:
+        return ""
+    return ISSUE_CLOSING_INSTRUCTION + "\n\n"
+
 
 def _origin_item_brief(item: sqlite3.Row, event_row: sqlite3.Row) -> str:
     """The brief `escalate_origin_items()` hands to `open_episode()` — the
@@ -3717,10 +3747,7 @@ def _origin_item_brief(item: sqlite3.Row, event_row: sqlite3.Row) -> str:
     header = f"GitHub issue {url} by @{author or 'unknown'}"
 
     if trusted:
-        epilogue = (
-            "When you open a pull request that closes this issue, include the exact text "
-            "'Closes #<issue number>' in its body."
-        )
+        epilogue = ISSUE_CLOSING_INSTRUCTION
 
         def _build(body_text: str) -> str:
             return f"{header}\n\n{body_text}\n\n{epilogue}"
@@ -5741,6 +5768,57 @@ def _format_blocking_findings(blocking: list[dict[str, Any]]) -> str:
     return "; ".join(lines)[:600]
 
 
+# --- the PR-wrapper class of blocking findings (§113) -------------------------
+#
+# Step-7 `blocking` findings come in two classes and only one of them is the
+# implementer's to fix. This one is about the pull request's *wrapper* — its body,
+# its trailer, whether the issue auto-closes — never about the diff, and **no
+# implement episode can satisfy it**: a revision cuts a fresh worktree and opens
+# its own PR, and the previous body is not its to edit. Spent as a revision it buys
+# a whole episode to be told the same thing again.
+#
+# weatherorb#20 (2026-09-29) is what that costs. Its last attempt went to a finding
+# reading "PR's stated goal is 'Closes #20' but the diff only adds non-closing
+# 'Issue #20' source comments — issue won't auto-close on merge. Add 'Closes #20'
+# to the PR description or commit trailer." — raised against a description whose
+# last line was exactly `Closes #20.`, by a review that reads the diff and the
+# commit messages rather than the PR body. The item then parked at the cap with a
+# mergeable fix and a card blaming the implementer.
+#
+# The class is recognised narrowly on purpose: a closing/wrapper phrase *plus* an
+# add-it instruction. A finding that merely mentions `Closes #20` while pointing at
+# a doc that overstates the code, or at a diff that does not match the body, is a
+# real finding about the change and keeps its revision.
+_PROCESS_FINDING_CLOSING_RE = re.compile(r"auto[- ]?clos|\bcloses\s+#\d+|issue[- ]closing", re.IGNORECASE)
+_PROCESS_FINDING_WRAPPER_RE = re.compile(
+    r"pull request (?:body|description|title)|pr (?:body|description|title)|commit (?:trailer|message)",
+    re.IGNORECASE,
+)
+_PROCESS_FINDING_INSTRUCTION_RE = re.compile(
+    r"\badd\b|\binclude\b|\bmissing\b|\babsent\b|\black(s|ing)?\b|won'?t auto|will not auto|does not auto",
+    re.IGNORECASE,
+)
+
+
+def _is_process_only_finding(finding: dict[str, Any]) -> bool:
+    """True when a step-7 blocking finding is about the PR wrapper, not the diff.
+
+    All three phrases must be present — the closing/auto-close subject, the wrapper
+    it belongs to, and an instruction to add it — so this stays a classifier for
+    "the reviewer wants text put in the pull request", not for any finding that
+    happens to quote an issue number. Bias is deliberate: a miss costs one
+    revision (today's behaviour), a false positive would park a real code defect on
+    a human."""
+    message = str(finding.get("message") or "")
+    if not message:
+        return False
+    return bool(
+        _PROCESS_FINDING_CLOSING_RE.search(message)
+        and _PROCESS_FINDING_WRAPPER_RE.search(message)
+        and _PROCESS_FINDING_INSTRUCTION_RE.search(message)
+    )
+
+
 def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step 7 -> 8. Polls every STATE_VALIDATING item once against sideclaw's
@@ -5829,15 +5907,27 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         verdict = resp.get("result") if isinstance(resp.get("result"), dict) else {}
         outcome = verdict.get("outcome")
         blocking = verdict.get("blocking") or []
+        # §113: the wrapper class is not the implementer's — see
+        # _is_process_only_finding(). It must not read as `blocked` (that is what
+        # spends a revision) but it must not be dropped either, so it routes to a
+        # human with the finding on the card.
+        code_blocking = [f for f in blocking if not _is_process_only_finding(f)]
+        process_blocking = [f for f in blocking if _is_process_only_finding(f)]
         summary = verdict.get("summary") or "no further detail"
 
         unknown_outcome_note = None
+        process_only_note = None
         if outcome == "clean":
             validation_status = "confirmed"
-        elif outcome == "actionable" and not blocking:
+        elif outcome == "actionable" and not code_blocking and not process_blocking:
             validation_status = "confirmed"
-        elif blocking:
+        elif code_blocking:
             validation_status = "blocked"
+        elif process_blocking:
+            validation_status = "needs_human"
+            process_only_note = ("process-only finding(s), no code defect — a revision cannot "
+                                 "satisfy these: "
+                                 + _format_blocking_findings(process_blocking))
         elif outcome == "needs-human":
             validation_status = "needs_human"
         else:
@@ -5852,7 +5942,7 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         conn.commit()
 
         if validation_status == "needs_human":
-            note = f"step-7 validation (needs-human): {unknown_outcome_note or summary}"
+            note = f"step-7 validation (needs-human): {unknown_outcome_note or process_only_note or summary}"
             _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
             conn.commit()
         elif validation_status == "blocked":
@@ -6265,7 +6355,52 @@ def _restore_drill_findings(now: dt.datetime) -> list[dict[str, Any]]:
     return []
 
 
-def _revision_exhaustion_detail(state: str, note: str | None, repo: str) -> str:
+_FINDING_LOCATION_RE = re.compile(r"([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+):(\d+)")
+
+
+def _blocked_round_files(conn: sqlite3.Connection, event_id: int) -> list[set[str]]:
+    """The files each `step-7 validation (blocked):` round blocked on, oldest first.
+
+    `item_transitions` is append-only, so it is the real record of what each round
+    said — the item's own `note` only ever holds the latest one. Compared by *file*,
+    not `file:line`: two rounds that block on lines 62 and 63 of one script are
+    re-reading the same spot, not chasing a moving target."""
+    rounds: list[set[str]] = []
+    for r in conn.execute(
+        "SELECT note FROM item_transitions WHERE event_id=? AND to_state=? ORDER BY id",
+        (event_id, STATE_MERGE_BLOCKED),
+    ):
+        note = (r["note"] or "").strip()
+        if not note.startswith("step-7 validation (blocked):"):
+            continue
+        rounds.append({m.group(1) for m in _FINDING_LOCATION_RE.finditer(note)})
+    return rounds
+
+
+def _rounds_blocked_different_files(rounds: list[set[str]]) -> bool:
+    """True when every blocked round named a file no earlier round had (§113).
+
+    This is a *description* of the item's own history, not a verdict on the review:
+    weatherorb#20's rounds went test coverage → guard ordering → a wrapper finding,
+    each fixed before the next round — while a two-round item that blocked on a test
+    gap and then on the regression its own fix introduced looks the same from here.
+    Rounds whose files were truncated away (the park note is capped at 600 chars)
+    are ignored, and fewer than two comparable rounds is never a claim, because a
+    wrong diagnosis is worse than a vague one (§111)."""
+    comparable = [r for r in rounds if r]
+    if len(comparable) < 2:
+        return False
+    seen: set[str] = set()
+    for r in comparable:
+        if r & seen:
+            return False
+        seen |= r
+    return True
+
+
+def _revision_exhaustion_detail(state: str, note: str | None, repo: str, *,
+                                conn: sqlite3.Connection | None = None,
+                                event_id: int | None = None) -> str:
     """Why an item with its revisions spent is parked — from its own park note,
     never assumed (§111).
 
@@ -6275,9 +6410,20 @@ def _revision_exhaustion_detail(state: str, note: str | None, repo: str) -> str:
     (`actionable` with an empty `blocking` list is `confirmed`) and parked on a
     merge-time 403 reading branch rules, and the card sent its reader after a
     review failure that did not exist. A finding that names the wrong mechanism
-    is worse than a vague one — it is read as evidence."""
+    is worse than a vague one — it is read as evidence.
+
+    §113 adds the other direction: when no file was blocked on twice, the note says
+    what actually happened — each round blocked somewhere new — instead of asserting
+    an implementer failure. The decision to park or not stays where it was; this is
+    the card's own text, which is the only thing a reader has."""
     text = (note or "").strip()
     if text.startswith("step-7 validation (blocked):"):
+        rounds = _blocked_round_files(conn, event_id) if (conn is not None and event_id is not None) else []
+        if _rounds_blocked_different_files(rounds):
+            files = ", ".join(sorted(set().union(*rounds)))
+            return (f"{len(rounds)} step-7 rounds in {repo}, each blocking a different file "
+                    f"({files}) — every round found something new, so read the last head before "
+                    f"blaming the implementer")
         return f"the implementer cannot satisfy the review in {repo}; the brief or the gate is wrong"
     if text.startswith(MERGE_REFUSED_NOTE_PREFIX):
         return (f"{repo}'s merge gate refused the confirmed PR — "
@@ -6336,7 +6482,8 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     ):
         out.append({"key": f"revisions-exhausted-{r['event_id']}",
                     "title": f"{r['signature']} still blocked after {max_rev} revisions",
-                    "detail": _revision_exhaustion_detail(r["state"], r["note"], r["repo"])})
+                    "detail": _revision_exhaustion_detail(r["state"], r["note"], r["repo"],
+                                                          conn=conn, event_id=r["event_id"])})
     return out
 
 
@@ -6417,7 +6564,11 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
         rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
                            (item["validation_job"],)).fetchone()
         verdict = _safe_json(rev["verdict_json"] if rev else None)
-        blocking = verdict.get("blocking") or []
+        # §113: a wrapper-only round is a human's one-line edit, not a revision —
+        # see `_is_process_only_finding()`. Filtering here as well as in the
+        # folding switch keeps an item parked `blocked` by an older round from
+        # spending its remaining attempt on text no episode can write.
+        blocking = [f for f in (verdict.get("blocking") or []) if not _is_process_only_finding(f)]
         if not blocking:
             return None
         lines = []
@@ -6488,6 +6639,7 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         brief = (
             f"Revision {attempt} of {max_attempts} of a fix the alert triage loop already implemented"
             f"{f' as {prior_pr}' if prior_pr else ''}. {start}\n\n{findings}\n\n"
+            f"{_issue_closing_instruction(conn, item)}"
             "Address every finding. Keep what the previous attempt got right and do not widen scope. "
             "If a finding is wrong, keep the code and explain why in your verdict — the same "
             "independent review reads your PR next. If the finding cannot be fixed inside this repo, "
