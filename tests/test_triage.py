@@ -9044,12 +9044,32 @@ def test_self_audit_turns_a_violation_into_one_event_and_resolves_it():
         assert conn.execute("SELECT resolved_at FROM events WHERE source='warden_self'").fetchone()[0] is None
 
 
+def _seed_blocking_review(conn, *, event_id: int, suffix: str, repo: str = "demo-repo",
+                          outcome: str = "actionable", blocking: list[dict[str, Any]] | None = None) -> None:
+    """One implement dispatch row plus the step-7 REVIEW row it links to — the
+    shape `self_audit_findings()` reads (`implement.validation_job_id ->
+    review.job_id`), rather than the folded `validation_status` column. The review
+    verdict lives top-level in `verdict_json`, exactly as `sync_record()` stores
+    it. `blocking` defaults to one concrete code finding."""
+    impl_job, rev_job = f"impl-{suffix}", f"rev-{suffix}"
+    blocking = blocking if blocking is not None else [
+        {"file": "src/x.ts", "line": 12, "message": "the guard is gone"}]
+    conn.execute(
+        "INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id, "
+        "validation_job_id, validation_status) VALUES (?,?,?,?,?,?,?,?,?)",
+        (impl_job, "implement", repo, "b", "done", NOW.isoformat(), event_id, rev_job, "blocked"))
+    conn.execute(
+        "INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id, verdict_json) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (rev_job, "review", repo, "review", "done", NOW.isoformat(), event_id,
+         json.dumps({"outcome": outcome, "blocking": blocking, "summary": "s"})))
+    conn.commit()
+
+
 def test_self_audit_findings_catch_its_own_wrong_answers():
     with _triage_env() as (conn, ctx):
         for i in range(3):
-            conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, validation_status) "
-                         "VALUES (?,?,?,?,?,?,?)", (f"blk-{i}", "implement", "demo-repo", "b", "done",
-                                                    NOW.isoformat(), "blocked"))
+            _seed_blocking_review(conn, event_id=900 + i, suffix=f"blk-{i}")
         fixed = _seed_state(conn, external_id="came-back", state=triage.STATE_NEW)
         conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
                      (fixed, "fixed", "new", NOW.isoformat()))
@@ -9060,6 +9080,38 @@ def test_self_audit_findings_catch_its_own_wrong_answers():
         assert "review-always-blocks-demo-repo" in keys
         assert f"fixed-reopened-{fixed}" in keys
         assert any(k.startswith("revisions-exhausted-") for k in keys)
+
+
+def test_self_audit_sees_a_needs_human_review_that_carries_a_code_finding():
+    """§116 — §115 folds a `needs-human` review that carries findings to
+    `needs_human`, and this audit keyed "the review keeps blocking" on the folded
+    `blocked` column, so it went blind to exactly the reviews that keep raising
+    code findings. Keyed on the review's own `blocking[]` instead, the gate signal
+    survives the fold."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=910 + i, suffix=f"nh-{i}",
+                                  outcome="needs-human",
+                                  blocking=[{"file": "src/x.ts", "message": "the guard is gone"}])
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        assert "review-always-blocks-demo-repo" in keys
+
+
+def test_self_audit_counts_a_pr_once_across_its_revisions():
+    """§116 — one PR that took two revisions contributes two implement rows, and
+    the audit counted ROWS: two items could cross the `n >= 3` bar on the strength
+    of one item's second attempt. Two items (one with two blocked rows) is two."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=920, suffix="rev-920-a")
+        _seed_blocking_review(conn, event_id=920, suffix="rev-920-b")
+        _seed_blocking_review(conn, event_id=921, suffix="rev-921")
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        assert "review-always-blocks-demo-repo" not in keys
+
+        _seed_blocking_review(conn, event_id=922, suffix="rev-922")
+        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
 
 
 def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review():

@@ -9372,3 +9372,39 @@ for 24h. The control plane's own repo is merge-approval-gated and this is the ha
 lane — a saved edit to `scripts/triage.py` *is* the next tick's behaviour — so the
 change lands here, direct to `master`, and #1 is closed as superseded. Item 1294
 closes with it.
+
+## 116. The self-audit reads the review's own verdict, and counts PRs, not rows (2026-09-30)
+
+The self-audit's `review-always-blocks-<repo>` finding answers one question — is a
+repo's step-7 review gate refusing *every* PR — and it answered it off
+`dispatches.validation_status='blocked'`. §115 moved a `needs-human` review that
+carries findings off that column and onto `needs_human`, so the audit went blind to
+exactly the reviews that keep raising code findings: they were the class §115 was
+written for. The audit silently rode a column whose meaning changed for a different
+reason — no test covered a needs-human review, because every test seeded three
+`blocked` rows.
+
+**And it counted rows where it meant items.** The query was `COUNT(*)` over
+`tier='implement'` rows, so one PR that took two revisions contributed two. In the live
+14-day window `weatherorb` read **23** (11 distinct items, 10 of them revised) and the
+card said "all 23 PRs". The number is not cosmetic: the finding fires on `n >= 3`, so
+inflated rows lower the bar too.
+
+**The change keys on the review verdict's content and counts distinct items.** For each
+implement row in the window, join its review dispatch (`implement.validation_job_id ->
+review.job_id`), read the top-level `verdict_json`, and count an item as blocking when
+its `blocking[]` holds at least one finding `_is_process_only_finding()` does not call
+process-only. `COUNT(DISTINCT origin_event_id)` is both the denominator (items with a
+completed review — a `verdict_json` is required, so a review that errored on
+infrastructure cannot make the gate look non-blocking) and the numerator. A genuine
+"every PR blocked" still fires; `validation_status='needs_human'` from a process-only
+finding or an unknown outcome no longer silently counts, and a PR's second revision no
+longer counts twice.
+
+**Verified.** Test first: the existing `review-always-blocks-demo-repo` case now seeds
+implement+review pairs, and two regression cases were added — a needs-human review
+carrying a code finding still fires, and two items (one with two blocked rows) is two,
+not three. `make test` green with `test_triage.py` at **354/354** (352 before, +2). On
+the live ledger the old query fires only for `research-gateway` (6 rows / 6 blocked)
+and the new one still fires there — now honestly, **6 items / 6 code-blocked** — while
+`weatherorb` reads 11 / 9, `dotfiles` 4 / 3, `warden` 2 / 1, `homelab` 7 / 4.

@@ -6463,13 +6463,31 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     fix was wrong), and a revision budget used up."""
     since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
     out: list[dict[str, Any]] = []
+    # §116: the review gate signal is read off the REVIEW VERDICT's own content,
+    # never the folded `validation_status` column. §115 made a needs-human review
+    # that carries findings fold to `needs_human`, which this audit read as "not
+    # blocked" and went blind to exactly the reviews that keep raising them. One
+    # item is one row here: a PR that took two revisions to block (weatherorb's
+    # 23 implement rows / 11 items) counts once, not twice.
+    reviewed: dict[str, set[int]] = {}
+    code_blocked: dict[str, set[int]] = {}
     for r in conn.execute(
-        "SELECT repo, COUNT(*) AS n, SUM(validation_status='blocked') AS blocked FROM dispatches "
-        "WHERE tier='implement' AND validation_status IS NOT NULL AND created_at >= ? GROUP BY repo", (since,),
+        "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json "
+        "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
+        "WHERE d.tier='implement' AND d.origin_event_id IS NOT NULL "
+        "AND d.created_at >= ? AND r.verdict_json IS NOT NULL",
+        (since,),
     ):
-        if r["n"] >= 3 and r["blocked"] == r["n"]:
-            out.append({"key": f"review-always-blocks-{r['repo']}",
-                        "title": f"the step-7 review blocked all {r['n']} {r['repo']} PRs in {SELF_AUDIT_WINDOW_DAYS} days",
+        reviewed.setdefault(r["repo"], set()).add(r["event_id"])
+        blocking = [f for f in (_safe_json(r["verdict_json"]).get("blocking") or [])
+                    if not _is_process_only_finding(f)]
+        if blocking:
+            code_blocked.setdefault(r["repo"], set()).add(r["event_id"])
+    for repo, items in reviewed.items():
+        n = len(items)
+        if n >= 3 and len(code_blocked.get(repo, set())) == n:
+            out.append({"key": f"review-always-blocks-{repo}",
+                        "title": f"the step-7 review blocked all {n} {repo} PRs in {SELF_AUDIT_WINDOW_DAYS} days",
                         "detail": "either the implement briefs for this repo miss something the review keeps "
                                   "finding, or the review gate is miscalibrated for it"})
     for r in conn.execute(
