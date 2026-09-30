@@ -9331,8 +9331,8 @@ handled, just handled after the findings had already won.
 **What it cost, measured.** Of the **56** `review` dispatches in the live ledger that
 carry a stored verdict, **19** are `needs-human` reviews that also carry findings, and
 every one of them folded `blocked` — one review round in three. They belong to 15
-items; 11 of those items were eventually closed **by hand** rather than by the loop,
-and 1289 (weatherorb #9's flake guard) spent both of its attempts that way, its second
+items; 14 of the 15 were eventually closed **by hand** rather than by the loop — the fifteenth
+(1273, dotfiles swap-gate) is still parked — and 1289 (weatherorb #9's flake guard) spent both of its attempts that way, its second
 round's own summary naming a failed architect reviewer ("this reviewer did not examine
 the diff at all"). §111's `revisions-exhausted` card is what surfaced it.
 
