@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-30 (§114 — a step-7 finding about the PR's *wrapper* no longer spends a revision: it is not something an episode can satisfy, so it routes to `needs_human`; revision briefs carry the origin brief's `Closes #<issue number>` line; `revisions-exhausted` describes rounds that each blocked on a different file instead of blaming the implementer) |
+| Last updated | 2026-09-30 (§115 — a step-7 review that says `needs-human` is a question about the review, not a finding, so it never spends a revision even when it carries findings; those findings now ride the card, because a human is the reader. §114's wrapper class and §92's revisable set are unchanged; the disjoint-set guard stays rejected, on §114's evidence) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 345/345 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 352/352 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -235,7 +235,11 @@ loop.
   about the PR's *wrapper* — its body, its trailer, whether the issue auto-closes
   — is not one of them: no episode can satisfy it, so it routes to `needs_human`
   instead of spending an attempt, and revision briefs carry the origin brief's
-  `Closes #<issue number>` line so that finding cannot recur (§114).
+  `Closes #<issue number>` line so that finding cannot recur (§114). A `needs-human`
+  review is not one of them either (§115): that outcome says the *review* is
+  incomplete, so `poll_validation_jobs()` checks it before the findings and the
+  findings ride the card to a human instead of buying an episode that would act on a
+  review its own reviewer would not stand behind.
 - **Parked items count recurrences (§92).** `track_parked_recurrences()`: card
   line `Recurred N× since it parked here`, `parked_recurrences`/`revision_count`
   on `/board`, one extra reminder at `parkedRecurrenceReminder` (5).
@@ -449,6 +453,7 @@ log's past sections.
   keeps its repo — §113
 - A PR-wrapper finding is not a revision's job; revision briefs carry the
   closing instruction — §114
+- A needs-human review never spends a revision, and its findings ride the card — §115
 
 ### Next action
 

@@ -9314,3 +9314,61 @@ process-only — 78f7cf25's `Closes #20` finding above — and no code finding i
 diverted. One live item sits at the cap (1273, dotfiles swap-gate): its two
 rounds blocked on lines 62 and 63 of one script, so it keeps the old wording —
 which is why the round comparison is per file, not per `file:line`.
+
+## 115. A needs-human review is a question, not a finding, so it never spends a revision (2026-09-30)
+
+Item 1294's whole reason to exist was one line of switch order. A step-7 review that
+reports `outcome: "needs-human"` and *also* carries findings folded to the revisable
+`blocked`, because `poll_validation_jobs()` tested `elif code_blocking:` before
+`elif outcome == "needs-human":` — so `maybe_revise_blocked()` handed those findings
+straight back to the implementer as a fresh episode. The fold contradicted the code's
+own docstring a few hundred lines below it (`_revision_findings()`: "a needs-human
+review … is a question, not a finding, and stays with a human") and §92, which makes
+`validation_status='blocked'` and `checks_failed` the revisable reasons and nothing
+else. `assert_outcome()`/`REVIEW_OUTCOMES` never caught it: the outcome was known and
+handled, just handled after the findings had already won.
+
+**What it cost, measured.** Of the **56** `review` dispatches in the live ledger that
+carry a stored verdict, **19** are `needs-human` reviews that also carry findings, and
+every one of them folded `blocked` — one review round in three. They belong to 15
+items; 11 of those items were eventually closed **by hand** rather than by the loop,
+and 1289 (weatherorb #9's flake guard) spent both of its attempts that way, its second
+round's own summary naming a failed architect reviewer ("this reviewer did not examine
+the diff at all"). §111's `revisions-exhausted` card is what surfaced it.
+
+**The change is one precedence, and it runs in both directions.**
+`elif outcome == "needs-human"` now sits above `elif code_blocking`, and when that
+branch does carry findings they go on the card via `_format_blocking_findings()`: the
+human is the reader now, so the findings must not be dropped — the same rule §114
+applies to the wrapper class, which keeps its own branch immediately below. `blocked`
+stays what it was for `actionable` rounds with findings; a needs-human round with an
+empty `blocking` list is unchanged.
+
+**Deliberately not done, so it is not re-derived:** the same investigation's second
+recommendation — a disjoint-set guard in `maybe_revise_blocked()` — is the decision
+§114 already made against, and for a better reason than the guard had: attempt 2's
+finding was a regression **attempt 1 had introduced**, which is precisely the round
+the loop must spend. Disjointness stays a description of a history (§114), never a
+parking decision. This section does not touch it.
+
+**Also corrected here:** six comments cited the PR-wrapper class as §113 — the log's
+§113 is the `classify()` correction and the wrapper class is §114. And `STATE.md`'s
+test row still read 345/345 (§114 added six tests and moved it to 351); it now carries
+the true number, as does `AGENTS.md`'s gate line.
+
+**Verified.** Test first, RED for the stated reason
+(`test_validation_needs_human_with_blocking_stays_with_a_human: merge_blocked` — the
+item parked `merge_blocked` on a review that had said a human had to look), green
+after; `make test` green with `test_triage.py` at **352/352** (351 before, +1). The
+ledger numbers above are the shipped classifier (`_is_process_only_finding()`) run
+against a `VACUUM INTO` copy: 56 rows in, 19 re-classified, no code finding diverted,
+no `actionable` round changed. One live item still sits parked from the old order —
+1273 (dotfiles swap-gate) — left where it is, per the rule that a fixed mechanism does
+not move the rows it already parked.
+
+**The artifact.** The fix arrived as a draft PR (jkrumm/warden#1, branch
+`dispatch/a-prior-read-only-investigation-of-this-31918607`) and sat in `needs_human`
+for 24h. The control plane's own repo is merge-approval-gated and this is the hand-fix
+lane — a saved edit to `scripts/triage.py` *is* the next tick's behaviour — so the
+change lands here, direct to `master`, and #1 is closed as superseded. Item 1294
+closes with it.

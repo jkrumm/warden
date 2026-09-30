@@ -3894,6 +3894,59 @@ def test_validation_outcome_needs_human_routes_to_needs_human():
         assert d["validation_status"] == "needs_human"
 
 
+def test_validation_needs_human_with_blocking_stays_with_a_human():
+    """A `needs-human` review is a question, not a finding (§92): even when it
+    carries a NON-empty `blocking` list it must land `needs_human`, never the
+    revisable `blocked` the findings alone would produce, and it must be
+    ineligible for a revision dispatch — the findings are the reasons a human
+    must look, not a work order for the implementer. The findings stay on the
+    card, because the human is now the one who has to read them."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-val-needs-human-blocking")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-nh-blocking", "validation-job-nh-blocking",
+             "https://github.com/jkrumm/demo-repo/pull/22", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-nh-blocking")
+
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result(
+                "needs-human",
+                blocking=[{"file": "scripts/check.sh", "line": 808,
+                           "message": "exit 0 fails open on crash loops"}],
+                summary="a human must rule on the check's exit semantics",
+            ),
+        }
+        merge_calls: list[int] = []
+
+        def _unexpected_merge(*a, **kw):
+            merge_calls.append(1)
+            raise AssertionError("a needs-human validation must never call merge")
+
+        triage._merge.plan_or_land = _unexpected_merge
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert merge_calls == []
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "a human must rule on the check's exit semantics" in item["note"], item["note"]
+        assert "scripts/check.sh:808" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-nh-blocking",)).fetchone()
+        assert d["validation_status"] == "needs_human"
+
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
+        assert calls == [], "a needs-human review is never a revisable finding"
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_HUMAN
+        assert triage._get_item(conn, eid)["revision_count"] == 0
+
+
 def test_validation_actionable_with_empty_blocking_confirms():
     """`outcome == "actionable"` alone is not a refusal — only a NON-empty
     `blocking` list is. Improvements/discussions/testGaps with nothing

@@ -3689,7 +3689,7 @@ _UNTRUSTED_BLOCK_END = "--- END UNTRUSTED THIRD-PARTY ISSUE BODY ---"
 # The one instruction a brief must carry whenever the item *is* a GitHub issue and
 # the work will open a pull request: the step-7 review checks for the closing
 # keyword, so its absence is a finding — and a revision brief that omits the
-# instruction cannot satisfy that finding, whatever it writes in the code (§113).
+# instruction cannot satisfy that finding, whatever it writes in the code (§114).
 ISSUE_CLOSING_INSTRUCTION = ("When you open a pull request that closes this issue, include the exact text "
                              "'Closes #<issue number>' in its body.")
 
@@ -5768,7 +5768,7 @@ def _format_blocking_findings(blocking: list[dict[str, Any]]) -> str:
     return "; ".join(lines)[:600]
 
 
-# --- the PR-wrapper class of blocking findings (§113) -------------------------
+# --- the PR-wrapper class of blocking findings (§114) -------------------------
 #
 # Step-7 `blocking` findings come in two classes and only one of them is the
 # implementer's to fix. This one is about the pull request's *wrapper* — its body,
@@ -5833,19 +5833,24 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     (`sideclaw`/`warden`/`dotfiles`) does NOT auto-merge — `confirmed` still
     lands in `dispatches.validation_status`, but the item routes to
     `needs_human` carrying the PR and the `warden merge` call the owner runs
-    to approve it. ANY
-    non-empty `blocking` list refuses the merge outright — never read as a
-    pass, the brief's own words — and `"needs-human"` routes to a human
-    rather than either. A FAILED, ERRORED or CANCELLED review job blocks the
-    merge the same way. `dispatches.validation_status` lands one of
+    to approve it. A non-empty `blocking` list refuses the merge outright —
+    never read as a pass, the brief's own words — with ONE precedence above
+    it (§115): `"needs-human"` routes to a human even when it carries
+    findings, because that outcome says the REVIEW is incomplete and a
+    revision would be spent on findings its own reviewer would not stand
+    behind. A finding about the PR's own *wrapper* (§114) never
+    blocks-and-revises either — no episode can satisfy it — so it routes to
+    a human with the finding on the card. A FAILED, ERRORED or CANCELLED
+    review job blocks the merge the same way.
+    `dispatches.validation_status` lands one of
     `confirmed | blocked | needs_human | error`.
 
     Fail-closed, the same shape `poll_implement_jobs()` uses for its own
     outcome switch: `"clean"` confirms; `"actionable"` with nothing in
-    `blocking` confirms; ANY non-empty `blocking` blocks, regardless of
-    `outcome`; `"needs-human"` (with nothing in `blocking`) routes to a
-    human; anything else — missing, or an outcome value this switch does
-    not otherwise recognise — is ALSO a human, never a silent confirm.
+    `blocking` confirms; `"needs-human"` routes to a human whatever it
+    carries; any other non-empty `blocking` blocks, regardless of `outcome`;
+    anything else — missing, or an outcome value this switch does not
+    otherwise recognise — is ALSO a human, never a silent confirm.
     `assert_outcome()` above is the first line of defence (a value outside
     `REVIEW_OUTCOMES` entirely is a loud `RemoteError` before this switch
     ever runs); this switch's own `else` is the second."""
@@ -5907,7 +5912,7 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         verdict = resp.get("result") if isinstance(resp.get("result"), dict) else {}
         outcome = verdict.get("outcome")
         blocking = verdict.get("blocking") or []
-        # §113: the wrapper class is not the implementer's — see
+        # §114: the wrapper class is not the implementer's — see
         # _is_process_only_finding(). It must not read as `blocked` (that is what
         # spends a revision) but it must not be dropped either, so it routes to a
         # human with the finding on the card.
@@ -5917,10 +5922,22 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
         unknown_outcome_note = None
         process_only_note = None
+        human_question_note = None
         if outcome == "clean":
             validation_status = "confirmed"
         elif outcome == "actionable" and not code_blocking and not process_blocking:
             validation_status = "confirmed"
+        elif outcome == "needs-human":
+            # §115: a needs-human review is a question, not a finding (§92).
+            # Checked BEFORE `code_blocking`, because the old order folded it to
+            # the revisable `blocked` whenever the review carried a finding and
+            # `_revision_findings()` sent those findings straight back to the
+            # implementer — 1289 spent both its attempts that way, on rounds
+            # whose own reviews said a human had to look. The findings still
+            # reach the card: a human is the reader now.
+            validation_status = "needs_human"
+            if code_blocking:
+                human_question_note = _format_blocking_findings(code_blocking)
         elif code_blocking:
             validation_status = "blocked"
         elif process_blocking:
@@ -5928,8 +5945,6 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             process_only_note = ("process-only finding(s), no code defect — a revision cannot "
                                  "satisfy these: "
                                  + _format_blocking_findings(process_blocking))
-        elif outcome == "needs-human":
-            validation_status = "needs_human"
         else:
             # Missing, or an outcome value REVIEW_OUTCOMES carries but this
             # switch does not otherwise handle (there is none today — this
@@ -5942,7 +5957,11 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         conn.commit()
 
         if validation_status == "needs_human":
-            note = f"step-7 validation (needs-human): {unknown_outcome_note or process_only_note or summary}"
+            detail = unknown_outcome_note or process_only_note or summary
+            if human_question_note:
+                detail = (f"{detail} — findings the review leaves with you, reasons a human must "
+                          f"look rather than a work order: {human_question_note}")
+            note = f"step-7 validation (needs-human): {detail}"
             _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
             conn.commit()
         elif validation_status == "blocked":
@@ -6378,7 +6397,7 @@ def _blocked_round_files(conn: sqlite3.Connection, event_id: int) -> list[set[st
 
 
 def _rounds_blocked_different_files(rounds: list[set[str]]) -> bool:
-    """True when every blocked round named a file no earlier round had (§113).
+    """True when every blocked round named a file no earlier round had (§114).
 
     This is a *description* of the item's own history, not a verdict on the review:
     weatherorb#20's rounds went test coverage → guard ordering → a wrapper finding,
@@ -6412,7 +6431,7 @@ def _revision_exhaustion_detail(state: str, note: str | None, repo: str, *,
     review failure that did not exist. A finding that names the wrong mechanism
     is worse than a vague one — it is read as evidence.
 
-    §113 adds the other direction: when no file was blocked on twice, the note says
+    §114 adds the other direction: when no file was blocked on twice, the note says
     what actually happened — each round blocked somewhere new — instead of asserting
     an implementer failure. The decision to park or not stays where it was; this is
     the card's own text, which is the only thing a reader has."""
@@ -6564,7 +6583,7 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
         rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
                            (item["validation_job"],)).fetchone()
         verdict = _safe_json(rev["verdict_json"] if rev else None)
-        # §113: a wrapper-only round is a human's one-line edit, not a revision —
+        # §114: a wrapper-only round is a human's one-line edit, not a revision —
         # see `_is_process_only_finding()`. Filtering here as well as in the
         # folding switch keeps an item parked `blocked` by an older round from
         # spending its remaining attempt on text no episode can write.
