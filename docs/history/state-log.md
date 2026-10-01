@@ -9453,30 +9453,39 @@ the loop's log. The same round asked for the wrapper-finding filter that had bec
 to be extracted: `_code_blocking_findings()` now serves `poll_validation_jobs()`,
 `_revision_findings()` and this audit, so §114's rule has one home.
 
-**Fourth round.** The review on the third revision blocked it again: a `blocking` array of
-`[null]` was still considered complete, then passed to `_is_process_only_finding()` and crashed
-the loop. `_is_completed_review()` now requires every array entry to be a finding object,
-otherwise the row is counted and skipped just like a partial verdict. The same review caught
-that the partial-verdict test did not isolate what it claimed — it now carries a valid
-`schemaVersion` and `outcome` and omits ONLY `blocking`, so removing that check makes the test
-fail.
+**Fifth round.** The review on the fourth revision blocked the *logging* addition: a `print()`
+inside `self_audit_findings()` did not create a `warden_self` event, could not be asserted through
+a structured return, and let a sideclaw schema bump silently drain all reviews from the
+14-day denominator. Moving the print out alone would leave the same gap; the audit must carry an
+honest signal when its input is no longer parseable. `_review_always_blocks_findings()` is now
+its own helper and returns **one bounded `review-verdicts-unusable-<repo>` finding per affected
+repo**, aggregating malformed stored rows in the same 14-day window. It goes through the existing
+`warden_self` event pipeline — visible on the board, in Slack and `/health.self_audit` — and
+resolves when the window has no unusable verdicts; no new endpoint, no log-only contract. No
+unusable rows today → no extra item.
 
-**Verified.** Test first, all four rounds:
-`test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one` fails on the §116 code
-for the stated reason — three items, each blocked on round one and accepted on round two, fire
-the finding — and pins the positive direction (three items blocked on their LATEST round still
-fire, two of them having come back clean earlier);
-`test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item` fails on this section's
-first revision — three items blocked on round one, each then carrying an `{"outcome": "error"}`
-review, went silent — and `test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item`
-fails on its second — the same shape with a valid `schemaVersion`/`outcome` but no `blocking`;
-`test_self_audit_skips_a_completed_review_with_malformed_findings` pins `[null]` as unusable.
-All four pass with the shape gate. `tests/test_triage.py` at **358/358** (354 before, +4); all
-21 test files green. On a `VACUUM INTO` copy of the live ledger **0** of the window's
-implement→review rows fail the gate — it costs nothing on today's data — and the 14-day firing
-set is unchanged (`research-gateway` 6 items / 6 code-blocked in every reading), while the
-per-item status moves where it should: `weatherorb` 10 any-review-blocked → 6
-latest-review-blocked, `warden` 1 → 0 — the false positive is a live hazard, not a theory.
+**Verified.** Test first, all five rounds:
+`test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one` pins that an earlier
+block is forgotten only by a later complete pass;
+`test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item` and
+`test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item` cover error and missing
+`blocking`; `test_self_audit_skips_a_completed_review_with_malformed_findings` pins `[null]` as
+unusable. `test_self_audit_reports_unusable_stored_reviews_as_visible_findings` asserts the
+helper returns both the ordinary blocked finding and the unusable-verdict finding (row count in
+title and detail), then verifies `run_self_audit()` creates the `warden_self` event and resolves
+the same event after a valid pass. All five cases pass. `tests/test_triage.py` at **359/359**
+(354 before, +5); the full run is **21/21 files green**. On a `VACUUM INTO` copy of the live
+ledger, **0** of 15 in-window implement→review rows are unusable and the
+`review-always-blocks` firing set is unchanged (`research-gateway` 6/6); the new diagnostic
+creates no live event.
+
+**Landing.** §116 and §117 both ride PR #7 (branch
+`dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is
+merge-approval gated, so the owner's Argo Merge click is the outside. Item 1364 — the alert
+carrying the review's finding — was closed rather than carried: its investigate verdict was
+`implement`/high, but the auto-implement round is cut from the live checkout's `HEAD`, i.e.
+`master`, where `code_blocked` does not exist, so the correction was applied on the PR branch by
+hand instead of spending an episode on a tree that cannot show the defect.
 
 **Landing.** §116 and §117 both ride PR #7 (branch
 `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is

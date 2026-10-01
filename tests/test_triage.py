@@ -9200,9 +9200,12 @@ def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
             _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable"})
-        finding = next(f for f in triage.self_audit_findings(conn, NOW)
-                       if f["key"] == "review-always-blocks-demo-repo")
-        assert "all 3 demo-repo PRs" in finding["title"]
+        findings = triage._review_always_blocks_findings(conn, NOW.isoformat())
+        assert {f["key"] for f in findings} == {
+            "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
+        bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
+        assert "3 step-7 review verdict(s)" in bad["title"]
+        assert "3 stored review verdict(s)" in bad["detail"]
 
 
 def test_self_audit_skips_a_completed_review_with_malformed_findings():
@@ -9219,6 +9222,48 @@ def test_self_audit_skips_a_completed_review_with_malformed_findings():
         finding = next(f for f in triage.self_audit_findings(conn, NOW)
                        if f["key"] == "review-always-blocks-demo-repo")
         assert "all 3 demo-repo PRs" in finding["title"]
+
+
+def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():
+    """§117 — the review audit never reads an unusable verdict as a clean pass; it
+    emits a bounded self-audit finding through the same `warden_self` event path,
+    then resolves that event after a clean pass. No log-only print is the signal.
+
+    The earlier blocking review still speaks: the unusable later review neither
+    erases it nor joins the denominator. `run_self_audit()` writes the finding with
+    the same insert/reopen/resolve semantics as every other self-audit key."""
+    with _triage_env() as (conn, ctx):
+        _seed_state(conn, external_id="self-audit-route-seed", state=triage.STATE_NEEDS_HUMAN)
+        conn.execute("UPDATE events SET source=? WHERE external_id=?",
+                     (triage.SELF_SOURCE, "self-audit-route-seed"))
+        for i in range(3):
+            eid = _seed_state(conn, external_id=f"unusable-live-{1000 + i}", state=triage.STATE_NEEDS_HUMAN)
+            conn.execute("UPDATE events SET source=? WHERE id=(SELECT id FROM events WHERE external_id=?)",
+                         (triage.SELF_SOURCE, f"unusable-live-{1000 + i}"))
+            _seed_blocking_review(conn, event_id=eid, suffix=f"visible-{eid}-a")
+            _seed_blocking_review(conn, event_id=eid, suffix=f"visible-{eid}-b",
+                                  verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                                "outcome": "actionable"})
+        findings = triage._review_always_blocks_findings(conn, NOW.isoformat())
+        assert {f["key"] for f in findings} == {
+            "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
+        triage.run_self_audit(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert conn.execute("SELECT count(*) FROM events WHERE external_id='review-verdicts-unusable-demo-repo'").fetchone()[0] == 1
+        ev = conn.execute("SELECT * FROM events WHERE source=? AND external_id=?",
+                          (triage.SELF_SOURCE, "review-verdicts-unusable-demo-repo")).fetchone()
+        assert ev is not None and ev["resolved_at"] is None
+        # Route is a warden self-audit event; its event is the structured signal.
+        # Card/classification is exercised by the normal source classifier elsewhere.
+        assert ev["source"] == triage.SELF_SOURCE
+
+        # Repair the three payloads: no unusable finding on the next audit pass.
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id LIKE 'rev-visible-%-b'",
+                     (json.dumps({"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                  "outcome": "actionable", "blocking": []}),))
+        conn.commit()
+        later = NOW + dt.timedelta(hours=2)
+        triage.run_self_audit(conn, DEFAULT_POLICY, later, dry_run=False)
+        assert conn.execute("SELECT resolved_at FROM events WHERE id=?", (ev["id"],)).fetchone()[0]
 
 
 def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review():

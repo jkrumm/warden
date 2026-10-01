@@ -5833,19 +5833,61 @@ def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
 def _is_completed_review(verdict: dict[str, Any]) -> bool:
     """True when a STORED review verdict is a complete one: sideclaw's published
     schema version, an `outcome` inside its published `REVIEW_OUTCOMES`, and a
-    `blocking` list — the shape `assert_result_schema()`/`assert_outcome()` insist
-    on for a live response.
+    `blocking` list whose entries are all finding objects — the shape the live
+    response checks insist on.
 
     The self-audit reads stored payloads, so it re-checks the shape instead of
-    assuming it, the same way those two check a live one. A corrupt payload is `{}`
-    payload is `{}` after `_safe_json()`; a partial one like `{"outcome": "actionable"}` has no
-    `blocking` key at all. A list like `[null]` also isn't a verdict shape: the reviewer can only
-    give findings, and each finding must be an object with its own fields. Each is unusable —
-    never a pass that clears a code-blocked round — which is §115's blindness in another column
+    assuming it. A corrupt payload is `{}` after `_safe_json()`; a partial one like
+    `{"outcome": "actionable"}` has no `blocking` key at all. A list like `[null]`
+    also isn't a verdict shape: the reviewer can only give findings, and each
+    finding must be an object with its own fields. Each is unusable — never a pass
+    that clears a code-blocked round — which is §115's blindness in another column
     on the one check that exists to notice a broken review gate."""
     return (verdict.get("schemaVersion") == _sideclaw.REVIEW_SCHEMA_VERSION
             and verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
-            and isinstance(verdict.get("blocking"), list))
+            and isinstance(verdict.get("blocking"), list)
+            and all(isinstance(finding, dict) for finding in verdict["blocking"]))
+
+
+def _review_always_blocks_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
+    """A step-7 review gate that code-blocks every reviewed item in a repo, or
+    stored verdicts that are unusable and therefore cannot safely count as a pass.
+    Last COMPLETE review per item wins; a later unusable review cannot erase a
+    blocking one, and its missing result is a separate visible self-audit finding."""
+    per_repo: dict[str, dict[int, bool]] = {}
+    unusable: dict[str, int] = {}
+    for r in conn.execute(
+        "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json "
+        "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
+        "WHERE d.tier='implement' AND d.origin_event_id IS NOT NULL "
+        "AND d.created_at >= ? AND r.verdict_json IS NOT NULL "
+        "ORDER BY r.created_at, r.id",
+        (since,),
+    ):
+        verdict = _safe_json(r["verdict_json"])
+        if not _is_completed_review(verdict):
+            unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
+            continue
+        per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(
+            _code_blocking_findings(verdict["blocking"]))
+    findings: list[dict[str, Any]] = []
+    for repo, skipped in sorted(unusable.items()):
+        findings.append({
+            "key": f"review-verdicts-unusable-{repo}",
+            "title": f"{skipped} step-7 review verdict(s) in {repo} are unusable in "
+                     f"the last {SELF_AUDIT_WINDOW_DAYS} days",
+            "detail": f"{skipped} stored review verdict(s) do not match sideclaw's published schema, "
+                      "outcome, or finding shape; the self-audit cannot safely read them as passes",
+        })
+    for repo, by_event in per_repo.items():
+        n = len(by_event)
+        if n >= 3 and all(by_event.values()):
+            findings.append({"key": f"review-always-blocks-{repo}",
+                             "title": f"the step-7 review blocked all {n} {repo} PRs in "
+                                      f"{SELF_AUDIT_WINDOW_DAYS} days",
+                             "detail": "either the implement briefs for this repo miss something the review keeps "
+                                      "finding, or the review gate is miscalibrated for it"})
+    return findings
 
 
 def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -6492,63 +6534,7 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     fix was wrong), and a revision budget used up."""
     since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
     out: list[dict[str, Any]] = []
-    # §116: the review gate signal is read off the REVIEW VERDICT's own content,
-    # never the folded `validation_status` column. §115 made a needs-human review
-    # that carries findings fold to `needs_human`, which this audit read as "not
-    # blocked" and went blind to exactly the reviews that keep raising them. One
-    # item is one row here: a PR that took two revisions to block (weatherorb's
-    # 23 implement rows / 11 items) counts once, not twice.
-    #
-    # §117: the row is the item, but WHICH of its reviews speaks for it is the
-    # LAST one that actually completed. §116 added an item to `code_blocked` on
-    # any review of it that carried a code finding and never removed it, so a PR
-    # blocked on its first revision and accepted on its second still read as
-    # blocked — a repo that accepts its PRs after one revision round fired "the
-    # review blocked all N PRs" on items that were ultimately accepted. Ordered by
-    # the review's own created_at, then its row id, so each later completed review
-    # overwrites the item's status: a blocking one counts it, a clean one does not.
-    #
-    # Only a COMPLETED review may do either, and `_is_completed_review()` is what
-    # decides that: sideclaw's published schema version, its published `outcome`,
-    # and a `blocking` list. A review that errored, ran without a usable verdict, or
-    # stored a payload this build can neither read nor trust says nothing about the
-    # item — `_safe_json()` reduces a corrupt payload to `{}` and a partial one has
-    # no `blocking` key at all, and either collapsing to "no findings" would read as
-    # a PASS and clear a code-blocked round. That is §115's blindness in another
-    # column, on the one check that exists to notice a broken review gate. Such a row
-    # is skipped from the numerator AND the denominator (an item nobody has judged
-    # must not dilute the `n >= 3` bar) and counted, so the skip is visible in the
-    # loop's own log instead of being indistinguishable from "nothing to report".
-    per_repo: dict[str, dict[int, bool]] = {}
-    unusable: dict[str, int] = {}
-    for r in conn.execute(
-        "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json "
-        "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
-        "WHERE d.tier='implement' AND d.origin_event_id IS NOT NULL "
-        "AND d.created_at >= ? AND r.verdict_json IS NOT NULL "
-        "ORDER BY r.created_at, r.id",
-        (since,),
-    ):
-        verdict = _safe_json(r["verdict_json"])
-        if not _is_completed_review(verdict):
-            unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
-            continue
-        if any(not isinstance(finding, dict) for finding in verdict["blocking"]):
-            unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
-            continue
-        per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(
-            _code_blocking_findings(verdict["blocking"]))
-    for repo, skipped in sorted(unusable.items()):
-        print(f"triage: self-audit: {skipped} stored review verdict(s) in {repo} are not a "
-              f"complete review (schema version / outcome / blocking list) — skipped, "
-              f"never read as a pass")
-    for repo, by_event in per_repo.items():
-        n = len(by_event)
-        if n >= 3 and all(by_event.values()):
-            out.append({"key": f"review-always-blocks-{repo}",
-                        "title": f"the step-7 review blocked all {n} {repo} PRs in {SELF_AUDIT_WINDOW_DAYS} days",
-                        "detail": "either the implement briefs for this repo miss something the review keeps "
-                                  "finding, or the review gate is miscalibrated for it"})
+    out.extend(_review_always_blocks_findings(conn, since))
     for r in conn.execute(
         "SELECT ti.repo, SUM(t.to_state='new') AS reopened, SUM(t.to_state='fixed') AS fixed "
         "FROM item_transitions t JOIN triage_items ti ON ti.event_id = t.event_id "
