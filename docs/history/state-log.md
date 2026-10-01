@@ -9474,11 +9474,20 @@ its length. A later review found the partial-verdict test asserted the wrong res
 asserts both `review-always-blocks` and `review-verdicts-unusable` findings. The shared test
 fixture also uses `_NO_VERDICT` to faithfully seed a terminal row with no stored payload.
 
-**Verified.** `tests/test_triage.py` at **361/361** (354 before, +7); all 21 test files green.
+**Eighth round.** The review on the seventh revision found three edges: the unguarded
+`process_blocking` comprehension beside the newly guarded `code_blocking` still crashed on a
+non-dict member; `d.origin_event_id IS NOT NULL` silently narrowed the audit away from
+manually-dispatched implements (real rows, per `scripts/api.py`); and a negative stored
+`schemaVersion` passed the `<=` bound. All three are closed, with `_NO_VERDICT` in the shared test
+fixture so a terminal row with no stored payload is seedable, and a new case pinning that
+manual (null-origin) implements still reach the finding.
+
+**Verified.** `tests/test_triage.py` at **362/362** (354 before, +8); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
-schema version, and valid non-object input. The live-ledger 14-day review firing set remains
-`research-gateway` 6/6; no in-window stored verdict is unusable.
+and negative schema versions, non-list/non-dict `blocking` entries, manual null-origin implements,
+and valid non-object input. The live-ledger 14-day review firing set remains `research-gateway`
+6/6; no in-window stored verdict is unusable.
 
 **Landing.** §116 and §117 both ride PR #7 (branch
 `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is

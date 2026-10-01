@@ -9047,7 +9047,8 @@ def test_self_audit_turns_a_violation_into_one_event_and_resolves_it():
 _NO_VERDICT = object()
 
 
-def _seed_blocking_review(conn, *, event_id: int, suffix: str, repo: str = "demo-repo",
+
+def _seed_blocking_review(conn, *, event_id: int | None, suffix: str, repo: str = "demo-repo",
                           outcome: str = "actionable", blocking: list[dict[str, Any]] | None = None,
                           verdict_json: Any = _NO_VERDICT) -> None:
     """One implement dispatch row plus its step-7 REVIEW row. The `_NO_VERDICT`
@@ -9110,6 +9111,15 @@ def test_self_audit_sees_a_needs_human_review_that_carries_a_code_finding():
         assert "review-always-blocks-demo-repo" in keys
 
 
+def test_self_audit_keeps_manual_implement_reviews_with_null_origin():
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=None, suffix=f"manual-{i}")
+        finding = next(f for f in triage._review_health_findings(conn, NOW.isoformat())
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+
 def test_self_audit_counts_a_pr_once_across_its_revisions():
     """§116 — one PR that took two revisions contributes two implement rows, and
     the audit counted ROWS: two items could cross the `n >= 3` bar on the strength
@@ -9143,12 +9153,12 @@ def test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one():
         assert "review-always-blocks-demo-repo" not in keys
 
     with _triage_env() as (conn, ctx):
-        # ...and the positive direction: three items blocked on their LATEST round,
-        # two of which had come back clean earlier — the earlier clean round must
-        # not clear them either.
+        # Three items whose LATEST review blocks still fire, including items
+        # that returned clean on an earlier round.
         for i in range(3):
             _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-a",
-                                  outcome="actionable", blocking=[])
+                                  outcome="clean", blocking=[])
+        for i in range(3):
             _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-b")
         finding = next(f for f in triage.self_audit_findings(conn, NOW)
                        if f["key"] == "review-always-blocks-demo-repo")
@@ -9197,6 +9207,11 @@ def test_self_audit_completed_review_rejects_explicit_null_blocking_and_bool_sch
     assert triage._is_completed_review(clean)
     assert not triage._is_completed_review({**clean, "blocking": None})
     assert not triage._is_completed_review({"schemaVersion": True, "outcome": "clean"})
+    assert not triage._is_completed_review({"schemaVersion": -1, "outcome": "clean"})
+    assert not triage._is_completed_review({
+        "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+        "outcome": "actionable",
+    })
 
 
 def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():

@@ -5844,12 +5844,15 @@ def _is_completed_review(verdict: Any) -> bool:
     if not isinstance(verdict, dict):
         return False
     blocking = verdict.get("blocking")
-    if "blocking" not in verdict and verdict.get("outcome") == "clean":
-        blocking = []
+    if "blocking" not in verdict:
+        if verdict.get("outcome") == "clean":
+            blocking = []
+        else:
+            return False
     schema_version = verdict.get("schemaVersion")
     schema_matches = (isinstance(schema_version, int)
                       and not isinstance(schema_version, bool)
-                      and schema_version <= _sideclaw.REVIEW_SCHEMA_VERSION)
+                      and 0 <= schema_version <= _sideclaw.REVIEW_SCHEMA_VERSION)
     outcome_is_known = verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
     findings_are_complete = (
         isinstance(blocking, list)
@@ -5870,25 +5873,38 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     rows whose results cannot safely count as passes. Last COMPLETE successful
     review per item wins; a later unusable or non-successful job cannot erase a
     prior blocking review, and its missing result is a visible self-audit finding."""
-    per_repo: dict[str, dict[int, bool]] = {}
+    per_repo: dict[str, dict[Any, bool]] = {}
+    reviewed_event_ids: dict[str, set[Any]] = {}
     unusable: dict[str, list[int]] = {}
     terminal_status_placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
+    since_dt = _parse_ts(since)
+    if since_dt is None:
+        raise ValueError(f"invalid self-audit window start: {since!r}")
+    since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
     sql = (
-        "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json, "
+        "SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
+        "r.job_id AS review_job_id, "
+        "r.verdict_json AS verdict_json, "
         "r.status AS review_status "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
-        "WHERE d.tier='implement' AND d.origin_event_id IS NOT NULL "
+        "WHERE d.tier='implement' "
         "AND d.created_at >= ? AND r.status IN (" + terminal_status_placeholders + ") "
+        # Latest review per item wins: ascending order means the last write for an
+        # implement row is its newest review (its own created_at, then row id).
         "ORDER BY r.created_at, r.id"
     )
     rows = conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
     for r in rows:
         verdict = _safe_json(r["verdict_json"])
         if r["review_status"] != "done" or not _is_completed_review(verdict):
-            unusable.setdefault(r["repo"], []).append(r["event_id"])
+            unusable.setdefault(r["repo"], []).append(
+                r["event_id"] if r["event_id"] is not None else r["review_job_id"])
             continue
         blocking = verdict.get("blocking") or []
-        per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(
+        reviewed_event_ids.setdefault(r["repo"], set()).add(
+            r["event_id"] if r["event_id"] is not None else r["review_job_id"])
+        per_repo.setdefault(r["repo"], {})[
+            r["event_id"] if r["event_id"] is not None else r["implement_job_id"]] = bool(
             _code_blocking_findings(blocking))
     findings: list[dict[str, Any]] = []
     for repo, event_ids in sorted(unusable.items()):
@@ -5904,7 +5920,7 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
                       f"shape; event IDs: {sample}{suffix}. The self-audit cannot safely read them as passes",
         })
     for repo, by_event in sorted(per_repo.items()):
-        n = len(by_event)
+        n = len(reviewed_event_ids[repo])
         if n >= 3 and all(by_event.values()):
             findings.append({"key": f"review-always-blocks-{repo}",
                              "title": f"the step-7 review blocked all {n} {repo} PRs in "
@@ -6012,7 +6028,8 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # spends a revision) but it must not be dropped either, so it routes to a
         # human with the finding on the card.
         code_blocking = _code_blocking_findings(blocking)
-        process_blocking = [f for f in blocking if _is_process_only_finding(f)]
+        process_blocking = [f for f in blocking
+                            if isinstance(f, dict) and _is_process_only_finding(f)]
         summary = verdict.get("summary") or "no further detail"
 
         unknown_outcome_note = None
