@@ -87,7 +87,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **352/352**. Any other number is a
+`tests/test_triage.py` is the regression gate at **405/405**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -125,7 +125,13 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 - **The verdict schema is published by sideclaw**, not copied here. Copying it
   guarantees drift, and drift presents as "verdict silently ignored" — the exact
   failure warden exists to fix. A version mismatch is a loud refusal, never a
-  best-effort parse.
+  best-effort parse. `check-schema-versions.py` compares `version`, the
+  `outcomes` set AND the published **finding shape** (`is_review_finding()`'s
+  mirror of it, which is the one piece a version bump does not cover): warden may
+  require fewer fields than the producer — it requires `file` and `message` while
+  the live producer also requires `angle`, and that difference is printed, not
+  treated as a mismatch — but never more, because requiring more means rejecting
+  real findings.
 - **A dispatch names a repo, never a path.** That is what keeps a composed path
   out of the interface.
 - **The repo allowlist is enforced inside sideclaw**

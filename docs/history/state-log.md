@@ -9372,3 +9372,1179 @@ for 24h. The control plane's own repo is merge-approval-gated and this is the ha
 lane — a saved edit to `scripts/triage.py` *is* the next tick's behaviour — so the
 change lands here, direct to `master`, and #1 is closed as superseded. Item 1294
 closes with it.
+
+## 116. The self-audit reads the review's own verdict, and counts PRs, not rows (2026-09-30)
+
+The self-audit's `review-always-blocks-<repo>` finding answers one question — is a
+repo's step-7 review gate refusing *every* PR — and it answered it off
+`dispatches.validation_status='blocked'`. §115 moved a `needs-human` review that
+carries findings off that column and onto `needs_human`, so the audit went blind to
+exactly the reviews that keep raising code findings: they were the class §115 was
+written for. The audit silently rode a column whose meaning changed for a different
+reason — no test covered a needs-human review, because every test seeded three
+`blocked` rows.
+
+**And it counted rows where it meant items.** The query was `COUNT(*)` over
+`tier='implement'` rows, so one PR that took two revisions contributed two. In the live
+14-day window `weatherorb` read **23** (11 distinct items, 10 of them revised) and the
+card said "all 23 PRs". The number is not cosmetic: the finding fires on `n >= 3`, so
+inflated rows lower the bar too.
+
+**The change keys on the review verdict's content and counts distinct items.** For each
+implement row in the window, join its review dispatch (`implement.validation_job_id ->
+review.job_id`), read the top-level `verdict_json`, and count an item as blocking when
+its `blocking[]` holds at least one finding `_is_process_only_finding()` does not call
+process-only. `COUNT(DISTINCT origin_event_id)` is both the denominator (items with a
+completed review — a `verdict_json` is required, so a review that errored on
+infrastructure cannot make the gate look non-blocking) and the numerator. A genuine
+"every PR blocked" still fires; `validation_status='needs_human'` from a process-only
+finding or an unknown outcome no longer silently counts, and a PR's second revision no
+longer counts twice.
+
+**Verified.** Test first: the existing `review-always-blocks-demo-repo` case now seeds
+implement+review pairs, and two regression cases were added — a needs-human review
+carrying a code finding still fires, and two items (one with two blocked rows) is two,
+not three. `make test` green with `test_triage.py` at **354/354** (352 before, +2). On
+the live ledger the old query fires only for `research-gateway` (6 rows / 6 blocked)
+and the new one still fires there — now honestly, **6 items / 6 code-blocked** — while
+`weatherorb` reads 11 / 9, `dotfiles` 4 / 3, `warden` 2 / 1, `homelab` 7 / 4.
+
+## 117. The self-audit reads an item by its LATEST review, not any earlier one (2026-10-01)
+
+§116 keyed `review-always-blocks-<repo>` on the review verdict's own `blocking[]` and counted
+distinct items, but its per-item status was still an ACCUMULATION across that item's
+revisions: an event entered `code_blocked` on any review of it that carried a code finding and
+was never removed, so a PR whose first revision was blocked and whose second was accepted still
+read as blocked. The finding fires on `len(code_blocked) == n`, so a repo that accepts its PRs
+after one revision round — the healthy shape — fired "the review blocked all N PRs" on items
+that were ultimately accepted. It shipped as §116's deliberate judgment call ("any revision
+counts", flagged for the reviewer rather than decided); the step-7 review on PR #7's diff
+(sideclaw job `5233ae3b`, raised by the adversary angle alone) rejected it as a blocking
+correctness bug, and the owner's disposition was to fix it rather than settle it.
+
+**The change: the last completed review wins.** The implement→review join is ordered by the
+review's own `created_at`, then its row id (insertion order — the ordering the folded
+`validation_status` column never exposed), so each item ends on its LAST review: a blocking one
+counts it, a clean one does not. Only a COMPLETED review may do either — a verdict whose
+`outcome` is outside sideclaw's published `REVIEW_OUTCOMES` (the set `poll_validation_jobs()`
+refuses a verdict outside of) is not a review at all: it neither clears an earlier blocked round
+nor joins the denominator, because `_safe_json()` reduces a corrupt payload to `{}` and an
+absent `blocking` key must not read as "passed". The `n >= 3` bar and every other self-audit
+count are unchanged.
+
+**Second round.** The step-7 review on the first revision of this fix (`b18deaee`, the same
+adversary angle) blocked it on exactly that second half: "any non-`NULL` `verdict_json` is
+treated as a completed, clean review whenever it lacks a non-process `blocking` entry", so an
+errored or partially-serialised verdict would clear a code-blocked item — a false all-clear on
+the one check whose job is to notice a broken review gate. The `outcome` gate above is that
+finding's fix, and "an item nobody has judged is not counted" is now pinned by its own case.
+
+**Third round.** The review on the second revision (`4f48fc15`) blocked it once more: a
+parseable but partial payload (`{"outcome": "actionable"}`) lacked the `blocking` key and
+was being read as clean. `_is_completed_review()` now requires a known stored schema version,
+a known outcome, and the expected blocking shape. A version at or below the current pin remains
+parseable for stored history; a non-integer or future version is reported unusable. Clean
+outcomes may omit `blocking`, since the live fold treats it as empty; a non-clean outcome cannot
+silently clear an earlier block.
+Valid non-object JSON is rejected without raising, and `_code_blocking_findings()` ignores
+non-list containers and non-object members so malformed stored values cannot crash revision
+brief construction. The review-health helper is extracted and reports unusable rows with a
+bounded event-ID sample.
+
+**Fourth round.** The next review found a malformed finding object could still crash the loop
+or be miscounted. `_is_completed_review()` now requires a non-empty `file` and `message` on
+every finding entry, and the regression covers `null`, `{}`, and a missing-message object.
+
+**Fifth round.** The review on the fourth revision blocked the log-only diagnostic: a `print()`
+inside the formerly-pure `self_audit_findings()` would not create a `warden_self` event or
+surface through `/health.self_audit`. The unusable-verdict count now returns a bounded
+`review-verdicts-unusable-<repo>` finding through the existing event pipeline; it resolves when
+the affected window is clean. The DESIGN.md inventory now names this fifth key.
+
+**Sixth round.** The review on the fifth revision caught terminal failed reviews with
+`verdict_json IS NULL` being filtered out. The query now includes all terminal review rows,
+regardless of verdict presence; non-`done` terminal rows are reported unusable but cannot
+overwrite a previous completed review. The joined review status is explicitly `review_status`.
+
+**Seventh round.** The review on the sixth revision caught two boundaries: valid clean outcomes
+may omit `blocking`, and `_safe_json()` can return valid non-object JSON. Missing `blocking` is
+empty only for `clean`; a non-clean outcome without the list remains unusable. The terminal
+status list derives from sideclaw's canonical `TERMINAL` tuple, and SQL placeholders derive from
+its length. A later review found the partial-verdict test asserted the wrong result; it now
+asserts both `review-always-blocks` and `review-verdicts-unusable` findings. The shared test
+fixture also uses `_NO_VERDICT` to faithfully seed a terminal row with no stored payload.
+
+**Eighth round.** The review on the seventh revision found three edges: the unguarded
+`process_blocking` comprehension beside the newly guarded `code_blocking` still crashed on a
+non-dict member; `d.origin_event_id IS NOT NULL` silently narrowed the audit away from
+manually-dispatched implements (real rows, per `scripts/api.py`); and a negative stored
+`schemaVersion` passed the `<=` bound. All three are closed, with `_NO_VERDICT` in the shared test
+fixture so a terminal row with no stored payload is seedable, and a new case pinning that
+manual (null-origin) implements still reach the finding.
+
+**Ninth round.** The review on the eighth revision found the same class one level down: the
+unguarded iteration was still there beside the guarded one, this time as `process_blocking`
+walking a raw `blocking` value, so a scalar payload (`blocking: true`) still raised mid-tick
+after the job was persisted — and sideclaw's cached terminal result makes every later poll
+re-crash on it. `_published_findings()` is now the one normalizer both lists are built from
+(`_code_blocking_findings` / `_process_only_findings`), so a malformed payload cannot crash one
+list and not the other. The unusable report now follows the same latest-row rule as the blocking
+count instead of accumulating rows: an item whose newest review is a complete clean one is not
+reported unusable, and comparing a loop-originated int id with a manual dispatch's job-id string
+sorts by string rather than raising. The sample bound is `SELF_AUDIT_SAMPLE_LIMIT`.
+
+**Tenth round.** The review on the ninth revision blocked the same shape at the *merge gate*, not
+the audit: normalizing a corrupt `blocking` to "no findings" left `poll_validation_jobs()` folding
+a malformed `actionable` verdict exactly like a clean one, so a payload nobody can vouch for could
+reach a merge — a day before the hourly audit merely reported it. The fold now fails closed:
+a result that is not a complete verdict routes to `needs_human` with an explicit reason
+(`_unreadable_verdict()`), so it reads the same on the live gate as it does on the stored-payload
+side. The regression drives both a scalar and a malformed-member `blocking` through the real
+`poll_validation_jobs()` and asserts no merge call and `needs_human` on the row. The audit's
+per-item map collapsed to one boolean (`latest_unusable`, last write wins) in the same pass.
+
+**Eleventh round.** The review reported a `dry_run` leak in the new branch. **Verified false, and
+pinned so it stays false:** `poll_validation_jobs()` returns before it reads a single item
+(`if dry_run: return`), so no branch of it — including the two that predate this change — can
+publish a card or move an item under a dry run. A new regression drives the fail-closed branch
+with `dry_run=True` and asserts the state, `validation_status` and Slack posts are all untouched,
+so the invariant is checked rather than assumed. The round's three refactors are in: the review
+reduce is split from the two finding formats (`_review_item_status()` → pure
+`_unusable_verdict_findings()` / `_always_blocks_findings()`), the terminal
+"set state, commit, re-render the card" sequence is one `_park_item()` the three branches share,
+and the fold no longer normalizes `blocking` twice.
+
+**Twelfth round.** No blockers — `resilience`, `api-contract` and `adversary` all approved clean,
+for the first time on this change. Five non-blocking notes, all applied: the dual item identity is
+now the named `ItemKey = int | str` rather than `Any` (the `key=str` sort is no longer a workaround
+for an untyped union), the fold's missing-`blocking` case is a guard clause instead of a nested
+`if`, a no-op `set()` on already-unique dict keys is gone, `REVIEW_TERMINAL_STATUSES` carries the
+same `tuple[str, ...]` annotation as its neighbours, and `_review_item_status()`'s docstring now
+says what the code does — an earlier complete review **keeps** speaking after a later unreadable
+one, and only an item with no complete review at all is absent.
+
+**Deliberately not done:** the architect's proposal to lift this function family into its own
+module. The seam is already split into five single-purpose functions here
+(`_published_findings` / `_code_blocking_findings` / `_process_only_findings` /
+`_is_completed_review` / the reduce + two builders), and a module extraction would move code this
+change does not otherwise touch — its own commit, not a rider on a correctness fix.
+
+**Thirteenth round.** The adversary reviewer's sole blocking finding — `_revision_findings()`
+calling `.get()` on a non-dict persisted verdict — is **verified false**: `_safe_json()` (line 1726)
+already returns `{}` for any payload that is not a JSON object, so a persisted scalar, array, string
+or garbage reduces to an empty dict before the call. Pinned with a test that persists `5`, `[]`,
+`"error"`, `true` and unparseable text on blocked items and drives the brief builder over each.
+Two improvements applied: the code/process split is now one `_partition_findings()` returning
+`(published, code, process)`, so a `blocked` note quotes the findings in the review's own published
+order (the previous commit regrouped them by type, renumbering what a human reads), and the query is
+split from the fold (`_fetch_terminal_reviews()` → pure `_fold_review_status()`), with a unit test
+that states the latest-wins rule in seven plain rows and no database.
+
+**Fourteenth round.** Zero blockers — `resilience`, `api-contract`, `adversary` and `ocr` all clean
+and no test gaps or architecture concerns. Three notes, all applied: the fold now orders its own
+input (`sorted(rows, key=lambda r: (created_at, id))` on a projection that carries both) instead of
+trusting the query's `ORDER BY`, because "latest wins" is a sequential dict overwrite and shuffled
+input would otherwise pick an arbitrary row as an item's latest with no error anywhere — the shuffle
+test drives exactly that; `_fold_review_status()` is typed `Iterable[Mapping[str, Any]]`, which is
+what it reads (a `sqlite3.Row` and a test dict are both mappings, and the old `sqlite3.Row` hint
+described only one caller); and `_partition_findings()` delegates its split to
+`_code_blocking_findings()` / `_process_only_findings()` rather than re-deriving the filter, which
+restores the state-log's claim that they share one normalizer.
+
+**Fifteenth round.** Zero blockers; the two follow-ups converged on structure. First, the review
+fold now returns **one** repo → item map of `_ReviewedItem(code_blocked, unusable)` instead of
+two parallel dicts: a single record keeps the two facts about one review together while preserving
+the existing distinction between "no readable review" and `code_blocked=False`. Second, all three
+step-7 terminal branches now use one `_park_item()` for state, validation status, commit and card
+re-render; `validation_status` is an explicit argument, so failed/error rows, bad-schema rows and
+unreadable-finding rows cannot silently disagree about whether the dispatch itself is still
+"validating". The client assertions remain the sideclaw contract for a newly returned result; the
+new `_review_contract_matches()` checks that result's complete finding shape before the fold reads
+it, while `_is_completed_review()` deliberately remains the backwards-compatible reader for
+persisted history (older schema through the current version). They are not duplicate gates: one
+checks the new producer envelope and one checks that a stored historical payload is still readable.
+
+**Sixteenth round.** The four reviewers independently agreed: a missing `Mapping` import is real
+(the future-annotations import masks it until `get_type_hints()` or a type checker resolves it), so
+it is added. One improvement converged on a shared `_review_verdict_shape()` predicate returning
+`(usable, blocking)`: the new-result contract requires the exact current schema version, while the
+stored-history reader accepts older parseable versions. Outcome vocabulary, required blocking
+presence, list type and finding fields now have one definition. The fold returns one structured
+per-item record, ordered its own inputs, and keeps the latest complete review's decision if a later
+terminal result is unreadable.
+
+**Seventeenth round.** Zero blockers; one real defect closed and one record corrected.
+
+The adversary's blocking finding was **real**: `_revision_findings()` reads a stored verdict, and
+`_published_findings()` accepted any dict — so `blocking: [{}]` or `{"file": "x"}` counted as a
+code finding and the parked item spent its remaining attempt on a brief reading `- ? — ?`. The fix
+is at the shared gate rather than at that one caller: `_published_findings()` now applies
+`_is_finding_shape()`, so the same predicate governs the live fold, the `blocked` note, the
+partition and the revision brief, and a shape-invalid entry can never be quoted by any of them —
+while one real finding among junk still produces a brief. (Its "crashes formatting" half was
+checked and is false: `_format_blocking_findings` and the brief builder both use `.get()` with
+fallbacks, so the failure was a wasted revision, not an exception. That is still worth fixing.)
+Its `testGaps` entry is covered by a new test driving `_revision_findings()` over all-junk and
+mixed payloads.
+
+**Correction to round 14's entry.** That entry says `_fold_review_status()` is typed
+`Iterable[Mapping[str, Any]]`. It shipped as `Iterable[_ReviewRow]` against a bracket-access
+`Protocol`, because `sqlite3.Row` does not satisfy `Mapping` (no `.items()`/`.values()`) and a
+type checker rejected the `Mapping` annotation on the real caller — only the `Protocol` describes
+both the query's rows and the unit test's dicts. The history log is append-only, so the round-14
+line stands; this is its correction, and the round-14 code it describes was never in doubt.
+
+**Eighteenth round.** Zero blockers, all reviewers structurally clean; three notes, all applied.
+The adversary's timezone note is **latent, not live**: the loop's only caller passes an
+aware-UTC bound (`self_audit_findings()`'s `now - 14d`), so `astimezone()` was already a no-op in
+production — but a naive bound would have been read as host-local and shifted the text-compared
+window by the machine's offset, which on a CEST box pulls two extra hours into a 14-day audit. A
+naive bound is now explicitly UTC, and a test pins a row one hour outside the window so the offset
+cannot creep back in. The fifth finding's wording now covers both shapes it actually matches — a
+terminal row that stored **no** verdict at all (`failed`/`interrupted`/`cancelled`, where
+`sync_record` writes no `verdict_json`) and one whose stored verdict fails the shape check — since
+the old text described a payload that does not exist for the first case. And
+`REVIEW_TERMINAL_STATUSES` is `tuple(sorted(TERMINAL))`: `TERMINAL` is a frozenset, so the previous
+`tuple(...)` reordered with hash randomization from process to process.
+
+**Nineteenth round.** Zero blockers. The resilience note was the only one with real blast radius
+and is fixed: `self_audit_findings()` ran its sections in one unguarded body, so a raise in the new
+review-health query lost *every* finding for that hour — including the restore-drill signal (§104),
+the audit's only input from outside the ledger. Each section now runs through `_audit_section()`,
+which reports the failure as its own `self-audit-section-failed-<name>` finding and lets the other
+four run; the loop's own upstream guard ("self-audit failed, pass continues") was printing to
+stderr, which by DESIGN.md's own rule is not visibility. The five sections are now five named
+functions, so `self_audit_findings()` is a composition rather than a 40-line body. Two cleanups:
+the identical schema-version type guard in both gates is one `_schema_version_of()` (which also
+keeps `True` from passing as `1`), and `_fetch_terminal_reviews()`'s `ORDER BY` is gone — the fold
+sorts its own input, so the SQL only implied a contract nothing relies on.
+
+**Discussion resolved, not deferred.** The architect asked whether the switch's own `needs_human`
+and `blocked` branches should also route through `_park_item()`, and flagged the double-`sync_card`
+risk. Verified: they fall through to one shared `sync_card()` at the tail of
+`poll_validation_jobs()` that also serves the merged and needs-approval branches, so folding them
+in would render the same card twice per pass. `_park_item()` is for the early-exit branches only,
+and its docstring now says so — the seam is deliberate, not an oversight.
+
+**Twentieth round.** Two blockers from the cross-family adversary, both real.
+
+*Verified live before fixing:* every `dispatches.created_at` in the ledger (379 rows) is stored
+`+00:00`, so the text-vs-instant defect was **latent, not currently firing** — text order and real
+order agree today. It is still a correctness defect: the fold ordered by `str(created_at)` and the
+window compared stored text against a normalised bound, so one row written with any other offset
+(e.g. `10:30+01:00`, which is an hour *earlier* than `10:00+00:00` but sorts after it) would pick
+the wrong "latest" review and could report or suppress `review-always-blocks` wrongly. The window
+now compares instants through `datetime()`, and the fold orders by parsed instant via
+`_review_order_key()` — an unparseable timestamp sorts first, so it can never read as "latest".
+
+*The second was a straight hole in round 19's own fix:* `run_self_audit()` called
+`check_invariants()` first and unguarded, so a raise there still took down the cursor write, the
+hour's `warden_self` reopen/resolve, and every finding the newly-wrapped sections had produced.
+It is now guarded like the sections, and its failure is visible in two places rather than none:
+a `self-audit-section-failed-invariants` finding, and `invariants_error` on the cursor summary —
+an empty `violations` list from a check that never ran is a fabricated zero, which is exactly what
+docs/api.md's honesty rule forbids.
+
+Two cleanups: `_fetch_terminal_reviews()` now uses the file's established
+`f"… IN ({placeholders})"` SQL shape, and round 18's `tzinfo is None` guard is gone — `_parse_ts()`
+already returns a UTC-aware datetime, so the guard was unreachable.
+
+**Discussion answered, not deferred.** `_park_item()`'s seven parameters: the three early-exit
+callers need exactly `state`, `note` and `validation_status`, and no fourth state-specific flag is
+on the table. Collapsing them into an outcome record now would be speculative infrastructure for a
+call shape that does not exist yet; the parameter list is the honest signature of the three call
+sites. Worth revisiting when a fourth flag appears — at that point callers stop mapping 1:1 onto
+arguments, which is the actual signal.
+
+**Twenty-first round.** Zero blockers, six notes, all applied. The window's pre-filter is no
+longer the decision: SQLite's `datetime()` truncates to whole seconds (a microsecond-precision
+`now` pulled in rows just outside the window) and returns NULL for a timestamp it cannot parse
+(which silently *dropped* the row — the invisibility this file forbids). `datetime()` now only
+narrows the scan and the exact comparison happens on parsed instants in Python, where an
+unparseable timestamp is KEPT so a corrupt row makes the audit look at something rather than
+vanish. Writing the test for that caught a bug I had just introduced: the row carries **two**
+timestamps — the implement job's and the review's — and the new Python filter was reading the
+review's where the window has always been the implement job's. Hence `implement_created_at` as its
+own column, separate from the review's `created_at` that the fold orders by. The invariants guard
+also passes the original exception object now (the finding read "raised Exception" instead of the
+real class), the `_partition_findings()` split derives both lists from one normalised pass
+(`_published_findings()` was running three times per verdict), `_revision_findings()`'s `or "?"`
+fallbacks are gone as unreachable behind the shape gate, and `_is_completed_review()` requires
+`1 <= version` — version 0 never existed, so a stored 0 is a corrupt payload, not an older format.
+
+**Twenty-second round.** Zero blockers, three notes. One is a flip-flop worth naming: §114 asked
+`_partition_findings()` to delegate the split to the two helpers, §117's first pass then asked for
+one inline normalising pass, and §118 asks for the delegation back. Settled on **one definition**:
+the two helpers are the split, and the partition calls them on the already-normalised list. Their
+normalisation is idempotent, so this is the same partition plus an O(len(blocking)) filter over at
+most a handful of findings — a saved list comprehension is not worth a second copy of the
+classifier, which is the thing §114 was actually about. `REVIEW_TERMINAL_STATUSES` is renamed
+`TERMINAL_STATUSES`: the set is sideclaw's generic terminal set, not a review-only one, and the
+review framing now lives in `_fetch_terminal_reviews()`'s docstring where it applies. The two
+overlapping admission gates at the fail-closed call site carry a comment saying why both exist —
+the client asserts own the envelope and its wording, `_review_contract_matches()` owns the shape of
+`blocking` that the asserts do not check.
+
+**Twenty-third round.** One blocker, and it was mine from round 21: giving an unparseable
+timestamp the earliest sort key made a corrupt **newer** review erasable by an older readable one —
+`unusable` described "the latest row" where "latest" was itself unknowable, so the signal
+disappeared exactly when the ledger was least trustworthy. Fail-open in the audit of a
+fail-closed gate. Fixed by separating the two questions: the ordered case still follows the latest
+row (a newer readable review legitimately clears an older unreadable one), while a row nobody can
+place marks its item unusable and keeps it there — no later row can prove it is the newest. The
+test asserts both directions plus that ordinary ordering is untouched. Also: the invariants guard
+and `_audit_section()` now share `_run_isolated(name, fn)`, so the isolation and its stderr line
+have one owner; the fail-closed park note names the rule it refused —
+`_review_verdict_problems()` is now the one definition of the shape contract and the refusal is
+built from it (the version policy stays at the call site, so the gate is not weakened). The
+`_fetch_terminal_reviews()` index question is answered as *measure first*: the cursor summary
+carries `self_audit_ms`.
+
+**Twenty-fourth round.** One blocker — the second half of round 23's fix, which I stopped one step
+short of. Marking an unplaceable item `unusable` was not enough: it still carried the older readable
+row's `code_blocked=False`, and `_always_blocks_findings()` counts every non-`None` value into its
+`n >= 3` denominator. One quietly unplaceable clean-looking item could therefore falsify `all(...)`
+and silence `review-always-blocks` for its whole repo — the same fail-open, one layer down. An item
+whose ordering is unknowable is now **not judged at all**: `code_blocked=None`, which is the value
+that already means "do not dilute the bar". The test builds the full scenario (three blocking items
+plus one unplaceable) and asserts the `review-always-blocks` finding still appears while
+`review-verdicts-unusable` reports the bad row. Also folded in round 23's leftover: the stall comment
+at the fail-closed gate claimed `_review_contract_matches()` guarded below while the code had been
+inlined — the named contract function is the gate again, and the refusal note is built from the same
+rule set inside that branch.
+
+**Twenty-fifth round.** One blocker, and it is the most useful kind: a test that could never fail
+for the reason it documented. `test_a_naive_audit_window_is_read_as_utc_not_host_local` linked no
+review row, so `_fetch_terminal_reviews()`'s join matched nothing and its `== []` assertions held
+whatever the timezone logic did — six rounds of green that measured nothing. It now links both
+implement rows and asserts the discriminating count: a naive bound must exclude a row two hours
+before the window (a host-local reading would include it) and include one inside, with the boundary
+inclusive on the implement job's own timestamp. The reviewer's stated mechanism was wrong — `>=` was
+not the cause — but the test was worse than they said. Also: `dispatch-sweep.py` had its own
+`TERMINAL_STATUSES` alias pointing at the unordered `_sideclaw.TERMINAL`, so one concept had two
+values under one name in two files; it now points at the sorted constant. `_review_verdict_shape()`
+names its local `findings` as its docstring promises, and `_run_isolated()`/`_section_failure_finding()`
+annotate `Exception`, matching what the guard actually catches (`KeyboardInterrupt` still propagates,
+which is correct and now documented by the type).
+
+**Twenty-sixth round.** One blocker, and the first live-data one in several rounds: the review join
+was pinned only on `d.validation_job_id`, never on `r.tier`. The live ledger has **two**
+implement→investigate pairs (`argo`, 2026-09-10) whose investigate results were therefore readable
+as that item's review verdict. Measured before/after on a copy of the live ledger with a 30-day
+window: pre-fix the fold reports `review-verdicts-unusable-argo` — a fabricated finding, because an
+investigate payload `{"verdict": …}` has no `outcome` — and credits `argo` with a judged item;
+post-fix, 63 rows, no `argo`, no unusable finding. The 14-day window the loop actually uses happens
+to exclude those two rows (they are 21 days old), so the audit output is unchanged today; that is
+luck, not safety, and the same join is what a widened window or a fresher malformed pointer would
+hit. `AND r.tier = 'review'` now pins it, with a test that flips a pointer's target tier both ways.
+Also: `_review_instant()` is the single definition the sort key and the placeability rule both read
+(two independent `_parse_ts()` calls could drift silently), and `distinct` → `sorted_keys` in
+`_unusable_verdict_findings()`, which sorts dict keys and never deduplicated anything.
+
+**Twenty-seventh round.** One blocker and two discussions closed by measurement rather than
+argument. The blocker: the join was pinned on `r.tier='review'` but not `r.repo = d.repo`, so a
+stale pointer naming a terminal *review of another repo* would still be attributed to this item.
+No such pair exists in the live ledger today (measured: 0), but round 26 proved the class is real,
+so the pair's whole identity is now pinned and a test flips the pointer's repo both ways.
+
+The first discussion was right about the shape and wrong about the fix I had reasoned toward hours
+earlier: `idx_dispatches_created` **does** exist, and my `datetime(d.created_at) >= datetime(?)`
+was what disabled it. The pre-filter now compares the raw column, widened by 26h so it stays a
+provable superset for any real UTC offset, with the exact instant comparison still in Python (so
+the round-21/22/23 rules are untouched). `EXPLAIN QUERY PLAN` reports `SEARCH d USING INDEX
+idx_dispatches_created (created_at>?)`, the live-ledger row count with a 30-day window is 63 (the
+two mis-joined investigate pairs are gone), and no index was added. The second discussion: the
+timing now spans the whole tick — `started` before the invariant check, computed after the event
+sync — so `self_audit_ms` measures the cost that would justify further work instead of the section
+queries alone. Also moved: the finding-shape rule to `_sideclaw.is_review_finding()`, next to the
+schema constants and its `assert_*` siblings, verified against the producer's own Zod `FINDING`
+(`server/jobs/handlers/review.ts`: required `file`/`message`, optional `line`/`angle` — the reader
+is deliberately stricter on blank strings because a finding warden cannot name is one it cannot
+report); and the fold's nested ternary into `_carry_forward_code_blocked()`.
+
+**Twenty-eighth round.** One blocker, and it was a hole my own index fix from round 27 opened: the
+sargable pre-filter dropped the `IS NULL` branch, so an implement row with a corrupt timestamp
+sorted below the text cutoff and never reached the fail-visible rule at all — the safety claim of
+round 25 silently bypassed by the performance fix of round 27. No comparison on a value SQLite
+cannot read can be a superset of it, so the term has to be explicit: `OR datetime(d.created_at) IS
+NULL`. Its cost is that this query scans `dispatches` again — measured on the live ledger, both
+shapes run in **0.085 ms** at 379 rows, so the term costs nothing measurable today and the revisit
+is an expression index (`CREATE INDEX … ON dispatches(datetime(created_at))`), not a weaker
+predicate; recorded in STATE.md with that trigger. The fold now applies the same rule to both
+timestamps: an unreadable implement timestamp is the WINDOW key, so such an item cannot be said to
+belong in this window at all → unusable and unjudged, reported by
+`review-verdicts-unusable-<repo>` instead of evading both findings. The `_ReviewRow` protocol now
+names the columns the fold reads — a test double missing `implement_created_at` is not a row this
+fold accepts, which is how four tests failed loudly rather than silently.
+
+**Twenty-ninth round.** **Zero blockers** — adversary and all five specialist angles clean on
+correctness. Four improvements and three discussions, all closed rather than parked. The substantive
+ones: (1) the growth path §126 named had no visible signal, so a tick crossing
+`SELF_AUDIT_SLOW_MS` (5 s, against sub-millisecond work today) now files `self-audit-slow` — built
+BEFORE the event sync, because a finding appended after it would be live in the summary JSON and
+nowhere else, which the test asserts; (2) the timing had to be split rather than widened: `self_audit_ms`
+is the tick's own work (invariants + the five sections — the part that grows with the ledger), and
+`event_sync_ms` is the sync that scales with live findings, so the tripwire watches the right
+number; (3) the summary now carries `self_audit_schema = 2`, because these keys have meant
+different things across this work and a diff of finding counts across generations is otherwise a
+silent misread; (4) `docs/api.md` never described `self_audit`'s shape at all — its fields, their
+meaning and the five-plus finding keys are now tabled there. Cleanups: `_review_verdict_shape()`'s
+`(usable, findings)` tuple had no production consumer of its second half, so it is gone and the
+three gates call `_review_verdict_problems()` directly; the fold's placeability test is a named
+predicate (`_row_is_placeable()`); the three stray blank lines are collapsed.
+
+**Thirtieth round.** **Zero blockers** for the second round running — the loop has converged on
+correctness; what remains is polish in the hardening this branch added. Two improvements, both
+real: `event_sync_ms` started after the per-finding upserts, so it measured only the resolve
+sweep and matched neither half of the sync — the clock now opens before the upserts and closes
+at the cursor write; and the fold-purity test carried a private copy of the row builder, so it
+could drift from the shape the fold reads — it calls `_review_row()` now. Two discussions were
+deferrals this branch has already declined twice, so instead of a fifth note they became tracked
+issues: **#8** (extract the review-verdict subsystem — the seam is real, `_ReviewRow` is already
+its own Protocol) and **#9** (expression index on `datetime(created_at)`, then collapse the
+widened pre-filter and the Python re-filter into one clause). Both are labelled `warden:skip`
+until this branch merges: warden ingests every open issue by default, and an extraction episode
+starting from master would rewrite the same functions this PR is hardening. The label did not
+exist in the repo — the code has read `GITHUB_SKIP_LABEL` for a while, so it was created.
+
+**Thirty-first round.** One blocker, from the adversary alone, and it is the sharpest of the
+series: the join pinned the pointer, the tier and the repo — but not the **item**. A stale
+`validation_job_id` naming a terminal review of a *different* item in the same repo and tier
+still matched, and the verdict was attributed to `d.origin_event_id`, which can fabricate or
+suppress `review-always-blocks` for an item that never had that review. The fix is the last
+piece of the pair's identity: `AND r.origin_event_id IS d.origin_event_id`. `IS` and not `=`,
+because a manual dispatch pair has no origin and `NULL = NULL` is not true. Measured on the
+live ledger *before* choosing it, since this is exactly the shape where a tidy-looking fix
+silently drops rows: 63 of 63 matched pairs share an origin, none differ, and all six
+implement rows with a NULL origin carry no pointer at all — so the clause is inert today and
+closes the one case the pointer cannot prove. Both halves are pinned by a test that was
+proved able to fail: one fails without the clause (it reads the foreign review), the other
+fails if the clause becomes `=` (the manual pair disappears). A test that cannot fail is the
+§125 finding, so the check is "remove the rule and watch it break", not "it passes".
+
+**Thirty-second round.** One blocker, and it is the *inverse* of the thirty-first: having pinned
+the pair's identity in the join, the inner join silently **dropped** the implement row when the
+pointer did not match. Same identity, opposite failure — §128 said a mismatched pointer must not
+be read as this item's verdict, §129 says it must not make the item disappear either, because the
+denominator `review-always-blocks` is computed over shrinks and the stale pointer that caused it
+is never mentioned. Both are right about different questions, so the pin stops being a join: the
+query resolves the pointer and nothing else (`LEFT JOIN`), and `_pointer_identity_reason()` is ONE
+predicate the audit uses both ways. Matching rows are the fold's input; mismatched ones are folded
+with their verdict blanked, which reuses the rule already in the fold — an unreadable row sets
+`unusable`, retains an earlier readable review's decision, and never enters the denominator — and
+they surface through the existing `review-verdicts-unusable-<repo>` key rather than a seventh one.
+Its order key is the implement job's time: a row with no review has no review time, and borrowing
+the target's would order this item by another item's clock. The two lists travel together in one
+`ReviewRows` tuple, so a caller cannot take the attributed half and forget the other exists.
+Measured: 0 mismatched in the live 14-day window, so the replay is unchanged at 39 items, and the
+query costs 0.185 ms (from 0.085 ms) — the tripwire, not a manual check, is what says if that ever
+matters. New tests: a mismatched pointer is reported (proved able to fail by folding only
+`rows.terminal`), and a pointer at a *running* review is neither a verdict nor a finding.
+
+**Thirty-third round.** **Zero blockers** — adversary, resilience and performance all clean. Two
+improvements, both about the boundary this branch built rather than the original diff, and both
+worth taking: (1) `_ReviewRow` was a bracket-access `Protocol` — `__getitem__(key: str) -> Any`
+accepts any mapping, so a renamed or dropped SQL alias type-checked and failed only wherever the
+row was first read, which is exactly how the implement job's time was read as the review's for a
+round. It is now a `TypedDict` (`ReviewRow`), with `_review_fold_rows()` as the single conversion
+point that checks every projected column against `REVIEW_QUERY_COLUMNS` and NAMES the missing
+one. The check immediately earned itself: a test that passed raw query rows straight to the fold
+is now an error at the boundary instead of an `IndexError` inside it. (2) `_review_fold_rows()`
+wrote its free-text mismatch reason into `review_status`, a column that is a terminal-status enum
+everywhere else — it only "worked" because the fold's single check is `== "done"`, i.e. it would
+break the day anything enumerated statuses. The reason now travels in its own `mismatch_reason`
+key, and it goes one step further than the finding text did before: `_ReviewedItem` carries it, so
+`review-verdicts-unusable-<repo>` says WHY the verdict is unreadable, not only which items are
+affected.
+
+**Thirty-fourth round.** One blocker and two improvements, all three in code this branch added —
+and the blocker is a genuine class of bug, not polish: `_review_fold_rows()` type-hinted its input
+`Iterable[sqlite3.Row]` and then iterated it twice (the column check, then the conversion). An
+`Iterable` may be a one-shot iterator, whose second pass yields nothing — an item's terminal
+reviews would drop out of the fold and `review-always-blocks` would undercount silently. `rows` is
+normalized like `mismatched` already was, with the reason written down. The improvements: the
+`pointer mismatches` list clipped at the sample limit without saying so (the sibling item-id list
+has `(+N more)`; now both do — a clipped list that does not admit it reads as the whole list), and
+a stray `Protocol` import left by §130's migration.
+
+The discussion worth acting on was architect's: `is_review_finding()` mirrors the producer's
+finding shape, but `check-schema-versions.py` only compared `version` and `outcomes` — so a renamed
+required field would leave warden reading a shape sideclaw no longer emits, with every other check
+green. That is the drift AGENTS.md says the check exists to prevent, so it is now compared:
+`_published_finding_shape()` reads `output.properties.blocking.items` from the live endpoint, and
+only one direction is unsafe — requiring MORE than the producer means rejecting real findings,
+so warden's set must be a subset of the published one. The live producer requires `file`, `message`
+AND `angle`; warden deliberately requires only the first two (a reader that quotes what it is given
+should not refuse a finding over a missing reviewer name), and that tolerated difference is printed
+rather than hidden. Verified against the running sideclaw, not the stub: `✓ dispatch=3 review=1
+(producer also requires: angle)`, exit 0. A missing published shape is a disagreement, not a skip —
+the alternative is an unverifiable copy.
+
+**Verified.** `tests/test_triage.py` at **396/396** (354 before, +42), `tests/test_clients.py` at **118/118** (+3), all 21+ test files green. Live-ledger replay unchanged at 39 judged items.
+`scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
+Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
+verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
+and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
+driven through `poll_validation_jobs()` (including that the merge gate fails closed on it and
+that a dry run is still a no-op),
+manual null-origin implements, mixed int/string item keys
+in one unusable report, an earlier unusable row superseded by a later clean one, and valid
+non-object input. Against a `VACUUM INTO` copy of the live ledger (53 in-window
+implement→terminal-review rows, **0** null verdicts, **0** null `origin_event_id`): **39** judged
+items, **no** unusable verdict — the fifth finding emits nothing on real data — and the
+`review-always-blocks` firing set is `research-gateway` 6/6, the honest reading of a repo whose
+step-7 review has blocked every reviewed PR in the window.
+
+**Landing.** §116 and §117 both ride PR #7 (branch
+`dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is
+merge-approval gated, so the owner's Argo Merge click is the outside. Item 1364 — the alert
+carrying the review's finding — was closed rather than carried: its investigate verdict was
+`implement`/high, but the auto-implement round is cut from the live checkout's `HEAD`, i.e.
+`master`, where `code_blocked` does not exist, so the correction was applied on the PR branch by
+hand instead of spending an episode on a tree that cannot show the defect.
+
+**Thirty-fifth round.** Two blockers, both fail-opens one level above the failures the
+thirty-fourth round closed, plus the two improvements they came with.
+
+The first is the sharper one, and it was in the resolve sweep rather than in a reader.
+The sweep resolves every `warden_self` event whose key is absent from this pass's findings —
+"the finding is gone, so close its event". That reading is only sound for a section that
+actually RAN this pass. Review health raises (`_audit_section()` catches it, reports
+`self-audit-section-failed-review-health`), its real findings are therefore missing, and the
+sweep took that absence as evidence: a database error cleared the live
+`review-always-blocks-*` alert it had just stopped checking, and the hour's card showed a
+clean bill with one broken check. The exemption is now owned by the same table that runs the
+sections — `SELF_AUDIT_SECTIONS` names each section with the finding-key prefixes it owns,
+the run loop iterates it (so a section cannot run without declaring them), and
+`_unrechecked_prefixes()` turns the failed names read back out of their own
+`SECTION_FAILURE_PREFIX` findings into the prefixes the sweep must leave alone. A section
+that raised keeps its alerts until a pass that re-checks them; the failure event itself
+still fires, so the hour reports a broken check rather than a quiet one. The regression test
+pins both halves: with the section raising, the alert survives and the failure event is
+live; on the next pass that runs the section, the failure event resolves and the alert (still
+holding) stays. Removing the exemption turns it red with "a section that raised cleared the
+alert it stopped checking".
+
+The second was mine, one round old: `_published_finding_shape()` guarded `parsed["output"]`
+with `or {}`, which survives `None` and `{}` but not a truthy non-dict — and the helper sits
+outside `check_schema_versions()`'s `try/except`, on the `make status` path, so a drifted
+schema would have raised `AttributeError: 'str' object has no attribute 'get'` instead of
+producing the "unreadable shape" refusal it documents. It now returns `None` for anything
+that is not an object, and the test drives `"yes"`, `["x"]`, `7`, `None` and `{}` through it:
+before the fix the first case raised, which is what the reviewer meant by "escapes a function
+that is documented never to raise".
+
+Two improvements. The event sync was extracted as `_sync_self_audit_events()` — it is a
+self-contained policy (insert, re-open, sweep) that was reached only by reading the middle
+of `run_self_audit()`, and the reviewer's point that a reviewer cannot see its boundary is
+the same point as the first blocker's: the sweep's rule was invisible precisely because it
+was three lines inside a god function. And the window's corrupt-timestamp term is no longer
+an invisible term: since a row whose `created_at` cannot be read cannot be dropped by any
+time bound without losing a recent one (§123), those rows recur every pass, so the count is
+now in the cursor summary as `unreadable_timestamps` — the cost the tripwire watches gets a
+number beside it. Documented in `docs/api.md` with the reason it cannot be bounded.
+
+**Verified.** `tests/test_triage.py` at **399/399** (396 before, +3), `tests/test_clients.py`
+at **119/119** (+1), all suites green. Live-ledger replay unchanged at 39 judged items, and
+the drift check still passes against the running sideclaw.
+
+**Thirty-sixth round.** Two blockers — one in the drift check, one in the helper that feeds it —
+plus four improvements, two of which were the same defect seen from two angles.
+
+The first blocker is a gap in what the round-34 comparison actually compares. Field NAMES are not
+the contract: a producer that keeps `file` and `message` and changes either type leaves every name
+in place, matches `version`, matches `outcomes`, and still makes `is_review_finding()` reject every
+finding it emits. The version is unchanged, so every other gate stays green, and the whole verdict
+is silently unreadable — the same failure the drift check was added to prevent, one level down from
+where it was looking. It now compares types as well, and only `"string"` passes: warden reads a
+string and nothing else, so a published property with a type of `"array"` — or with no readable
+`type` at all, which is JSON Schema's "any" and not a promise warden can rely on — is a
+disagreement rather than a tolerated difference. `PublishedFindingShape` carries the types beside
+the names so both readers of the shape see the same extraction.
+
+The second blocker was mine, one round old again: `_published_finding_shape()`'s "never raises"
+contract held for the level the thirty-fifth round fixed and not for the level below it.
+`(output.get("properties") or {}).get("blocking")` raises `AttributeError` on a truthy non-dict
+`properties`, and `frozenset(required or ())` raises `TypeError` on a number while reading a bare
+string as a set of its own characters. Both are the malformed bodies the function exists to
+REPORT, and it sits outside `check_schema_versions()`'s `try/except` on the operator-facing
+`make status` path, so either one replaced the refusal with a traceback. Every level is now read
+through `_as_object()`, and `required` is a list or tuple of names or it is nothing. The reviewer's
+own example is a test case. Proving the guards fail-capable paid for itself immediately: my first
+version carried a redundant `isinstance(required, str)` branch, unreachable behind the
+list-or-tuple check, and removing the guard it claimed to be left every test green — a comment
+describing protection that was not the protection doing the work is worse than no comment, so the
+branch is gone and the comment now says what the tuple check actually catches.
+
+Of the four improvements, two were one defect: the round-35 change paid for the corrupt-timestamp
+count with a second unconditional non-sargable scan of `dispatches` on every hourly tick, and
+never counted it, because the call sat after `self_audit_ms` and `event_sync_ms` had both stopped
+their clocks — an invisible cost added to the path that exists to keep that cost visible, by the
+round that added the tripwire. The count is now the fetch's own (`ReviewRows.corrupt_timestamps`,
+from rows already in hand) and reaches the summary through a metric sink the review-health section
+fills while the tick is still being timed. Third: the disagreement line printed `missingFromRequired
+or missingFromProperties`, so when the two sets named different fields the operator saw one and
+would have to run the check again to learn the other. Both are merged, and the line now also names
+retyped fields. Fourth, cosmetic: the multi-line SQL literal in `_fetch_review_rows()` was built
+from `f`-strings with no interpolation, which reads as though substitution were happening.
+
+**Verified.** `tests/test_triage.py` at **399/399**, `tests/test_clients.py` at **120/120** (+1),
+all suites green; live-ledger replay unchanged at 39 judged items. The drift check was exercised
+against the RUNNING sideclaw (`✓ dispatch=3 review=1 (producer also requires: angle)`, exit 0) and
+against a stub serving each drift — a retyped `file`, an untyped `message`, and a shape whose two
+shortfall sets differ — with the pre-fix printer shown printing only one of them.
+
+**Thirty-seventh round.** `needs-human`: one blocker, four improvements, one discussion. The
+blocker was in the identity rule the thirty-first round wrote and the thirty-second generalised,
+and it was the round's real finding.
+
+The clause pinned tier, repo and origin, with `IS` semantics so that two NULL origins matched.
+That was the wrong reading of the same rule: two NULLs are not evidence that two rows are one
+item, they are the ABSENCE of evidence. A manual `warden dispatch` pair has no origin, so the
+pointer — `dispatches.validation_job_id` — is simultaneously the only claim linking the two rows
+and the thing being checked, and a claim cannot verify itself. Two manual pairs in one repo were
+therefore interchangeable: a stale pointer would be read as this item's verdict, fabricated or
+suppressed, with nothing reported. The identity is now a shared NON-NULL origin. An origin-less
+pair is unverifiable, which puts it on the path every other unverifiable pointer already takes:
+verdict blanked, item `unusable`, previous decision kept, and
+`review-verdicts-unusable-<repo>` naming the reason ("links two rows that carry no origin").
+
+Two things about this are worth stating plainly. First, the live ledger contains no such pair —
+the six NULL-origin implement rows carry no pointer at all — so this closes a shape the loop
+could produce, not a defect in today's data; the replay is unchanged at 39 items. Second, the
+real fix is a stable linkage the schema does not have, so it is now the first entry in STATE.md's
+carried debt: a back-pointer on the review row written when step 7 opens it, and/or the
+implement's `origin_channel`/`origin_thread_ts` carried onto the review's origin. That is a
+migration, and inventing a heuristic (nearest-in-time, unique-target) would have replaced an
+unverifiable identity with a wrong one.
+
+Fixing it exposed a second, quieter problem in the tests: `_seed_blocked_item()` — the helper
+that models a normal item's pair — never stamped an origin on either row, so seven tests were
+passing on a shape the live loop never produces, and would have gone on passing while the
+identity rule was unverifiable. The helper now stamps both rows with the item's event, exactly as
+step 7 does, and the two tests that genuinely model a manual pair assert the new refusal.
+
+The improvements: the `unreadable_timestamps` count — added last round so a cost could be seen —
+was written as `metrics.get(..., 0)`, so a raising review-health section published a clean `0`
+into the field and `/health`, which is the fabricated-clean-bill anti-pattern `invariants_error`
+exists to prevent one key over. It is now `null` plus an `unreadable_timestamps_error` naming the
+failure, and the docs say `null` means NOT MEASURED. The `findingShape` report became a
+discriminated union of two `TypedDict`s (`published: Literal[True|False]`), so the reader in
+`check-schema-versions.py` proves the comparison keys exist instead of bracket-reading a bare
+dict the way `ReviewRow` was promoted out of. And two costs inside the timed tick: `keys()` was
+rebuilt once per column per row in the fold's contract check, and each implement timestamp was
+parsed twice (once for the window, once for the corrupt count) — one `keys()` and one parse per
+row now.
+
+The discussion is the index-scan tradeoff on the review-health window, which is unchanged and
+stays where it was put: measured, tripwired by `self-audit-slow`, with the expression index
+tracked as issue #9 rather than a weaker predicate here.
+
+**Verified.** `tests/test_triage.py` at **400/400** (+1), `tests/test_clients.py` at **120/120**,
+all suites green; live-ledger replay unchanged at 39 judged items; drift check still green against
+the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
+the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
+
+**Fifty-first round.** `actionable`: one blocker, no improvements, no discussions. Architect,
+senior-dev and OCR approved clean; the adversary found the blocker — an asymmetry, and a real one.
+
+The blocker is a rule applied at every level of a descent except the first. `_published_finding_
+shape()` holds `blocking` and its `items` to `type: "array"`/`"object"`, and §149 had just made that
+comparison set-based and strict — but the root `output` schema only had to EXIST. A producer could
+publish `output.type: ["object", "null"]`, or drop the keyword entirely, with every nested check
+green; the runtime then rejects a null `result` outright (`_review_verdict_problems()` returns
+`["result is not an object"]`), so each such review parks `needs_human` with no verdict, and the check
+that exists to catch contract drift reported the contract held. `_require_output_schema()` is the root
+both readers now call — the finding reader and the envelope reader descend through the same level, so
+a refused root reports one reason in both reports instead of one refusal and one cheerful comparison.
+The live root publishes `{"type": "object"}`, so this reads what sideclaw serves rather than demanding
+something new of it — the distinction §149's round had to correct one level down.
+
+**Verified.** `tests/test_clients.py` 133 → **135/135** (+1 end-to-end: a null-capable, array-typed
+and keyword-less root each fail with both reports naming the root, while the live root passes; plus
+three root assertions inside the shape-reader test, whose fixture bodies now publish the root they
+claim to be testing under), `tests/test_triage.py` **405/405**, every suite green; live-ledger replay
+unchanged at 39 judged items; drift check green against the running sideclaw. Proved fail-capable by
+reverting `_require_output_schema()` to the bare existence check: the new test and the fixture-based
+reader test both fail.
+
+**Fiftieth round.** `needs-human`: one blocker, two improvements, one discussion. Senior-dev,
+resilience, performance and api-contract approved cleanly; the adversary found the blocker, and it
+was a false-refusal bug rather than a hole.
+
+The blocker is the mirror image of §147's: the check read the raw `type` keyword, so a producer whose
+serializer wraps every type in a one-member list — `{"type": ["string"]}` instead of
+`{"type": "string"}` — read as a producer that retyped every field. Same schema, same constraints,
+loud failure. §147 had just made that rule stricter, which turned a harmless serialization change into
+a drift report that would send an operator looking for drift that is not there. The keyword is read as
+the SET of type names it publishes now (`_as_schema_types()`), a single-member set answers as that one
+name (`_as_schema_type()`), and both container guards compare sets — while a genuine union stays a
+disagreement, because `["string", "null"]` admits a value `is_review_finding()` refuses and
+`["array", "null"]` is a container the fold would eventually be handed. Encoding is not constraint.
+
+The two improvements were one structural and one documentary. `check_schema_versions()` had the
+generic per-tool loop and the ~75-line review-only deep-shape comparison nested inside it, the branch
+the larger half of the body; the comparison is `_apply_review_shape_checks(entry, parsed)` now, called
+once after the entry is built, so a reader following "how does a tool's entry get its version" no
+longer reads past a JSON-Schema descent to find where the loop ends. And `EnvelopeShapeComparison`'s
+docstring still named `versionTypeOk`/`versionConstOk` — the two fields §147 replaced — which is
+exactly the drift a docstring naming keys no reader emits produces in the next consumer.
+
+The discussion is the self-audit extraction, raised again (it is carried debt from the previous round)
+and again called a bigger-than-this-PR restructuring rather than a blocker.
+
+**Verified.** `tests/test_clients.py` 133 → **134/134** (+1: a fully list-wrapped schema — containers,
+item fields and the version — reads as agreeing, while `["string", "null"]` on a required field still
+reads as mistyped), `tests/test_triage.py` **405/405**, every suite green; live-ledger replay
+unchanged at 39 judged items; drift check green against the running sideclaw. Both halves of the
+normalization are proved fail-capable by reverting them separately: the container comparison and the
+property reader each turn the new test red on their own.
+
+**Forty-ninth round.** `needs-human`: one blocker, six improvements, one test gap, three
+discussions. Architect, resilience, performance and OCR approved clean; the adversary found the gap.
+
+The blocker was the pin rule, one level in from §143's: the envelope check asked whether the published
+`schemaVersion` schema could HOLD the version warden compares. `{"type": "number"}` and
+`["integer", "string"]` both pass that question and neither promises anything — the first admits `2`,
+the second `"1"`, and `assert_result_schema()` compares the value, so a producer could satisfy the
+check and park every review. The check reads a PIN now (`const: 1` or a one-member `enum: [1]`), with
+booleans excluded because `True == 1` in Python — a `const: true` read with `==` alone is a pin on the
+number 1, which is the accidental-equality class this branch keeps removing. A pin also wins over a
+permissive type list: if the only legal value left is the one compared, the type is no longer a
+promise warden needs. The live producer publishes `{"type": "number", "const": 1}`, so the stricter
+rule is what the endpoint already serves rather than a demand it fails.
+
+The six improvements were all "more copies than the thing needs". `poll_validation_jobs()` evaluated
+the review contract twice per unreadable verdict — once to gate, once to write the note — now one
+`_review_contract_problems()` list read by both, so the note cannot describe a rule the gate never
+applied. `_published_finding_shape()` lost a guard that could not fire (the non-string check on
+`required + properties`, after `_require_names()` had checked one and `json.loads()` guarantees the
+other). The registry test asked `self_audit_findings()` twice and had a disjunct that made its second
+half unreachable whenever the first half was true. And three tests were tightened where they were
+mirroring rather than checking: `TERMINAL_STATUSES` against a literal tuple instead of the production
+`tuple(sorted(...))`; the fixture self-check named for what it checks, with the live comparison left
+where it belongs (`check_schema_versions()` against the real endpoint); and a variable that said
+`envelope` while holding a finding-shape report.
+
+The test gap was real and mine: `_fold_review_status()`'s "latest row wins" cases all stamped the
+same `created_at`, so they exercised the id tie-break, never time. The new case gives the row that
+must LOSE the higher id — an id-ordered fold answers `True` and the test fails — while the winning row
+carries the earlier id.
+
+The three discussions are architectural and all three are recorded in STATE.md's carried debt rather
+than acted on: extract the self-audit subsystem, extract the now ~480-line schema walker, and collapse
+the three self-audit registries into one ordered mapping. The last one is not a cleanup: it removes
+`SELF_AUDIT_ELSEWHERE`, which is how `invariants` (violations, not findings) and `review-health` (its
+own isolated fetch) are declared to live outside the map — a change to a correctness guard, and the
+same reasoning that made §141's cross-check a finding rather than a skip. The reviews themselves call
+all three a human timing/scope call; the branch's own rule is that a 47-commit branch does not end
+with a structural move.
+
+**Verified.** `tests/test_clients.py` 132 → **133/133** (the pin cases: a bare numeric type, a
+`["integer", "string"]` union, a two-member enum and a boolean `const` all fail; `const: 1` and
+`enum: [1]` pass and the live body is unchanged), `tests/test_triage.py` **405/405** with the fold's
+new time-ordering case, every suite green; live-ledger replay unchanged at 39 judged items; drift
+check green against the running sideclaw — the endpoint whose `const: 1` is what the stricter rule
+reads.
+
+**Forty-eighth round.** `needs-human`: one blocker, two improvements, no discussions. Architect,
+resilience and performance approved clean; the adversary found the gap, and it was real.
+
+The blocker was the last piece of the same contract §137 and §140 have been closing: the comparison
+covered the endpoint's own `version`/`outcomes` metadata, the trio's presence in `output.required`
+and the finding object, but never the two envelope fields the runtime reads by VALUE off every result.
+`assert_result_schema()` compares `result["schemaVersion"]` to `REVIEW_SCHEMA_VERSION` with a strict
+`!=` and `assert_outcome()` tests membership in `REVIEW_OUTCOMES`; both fail closed. A producer could
+therefore keep every published name and both metadata values identical, retype `schemaVersion` to a
+string or widen `outcome`'s enum, and have this check report success while every live review was
+parked `needs_human` — the failure mode the check exists to catch, arrived at from one level up.
+`_published_envelope_shape()` now reads those two properties, with the rule this check follows
+everywhere: only the direction that breaks the runtime is a refusal (an outcome the producer may emit
+and warden refuses), while the other — a warden outcome the producer can no longer emit, a branch of
+ours gone unreachable — is named as a tolerated difference next to `producer also requires`.
+`schemaVersion` has to publish a type that can carry the integer, and a published `const` has to
+agree with it; `outcome` has to publish an `enum` of strings, because without one nothing constrains
+it. The fixture had to grow a `schemaVersion` property for its own tests to mean anything, which is
+itself the evidence: a body without one publishes an unreadable envelope, and every test built on it
+would have been asserting a mismatch of its own making.
+
+Both improvements were the same shape — a structure with more copies than it needs. `_published_
+finding_shape()`'s descent had seven `raise _UnreadableShape(...)` sites threaded through ~80 lines,
+so each rule was reachable only by driving the whole reader from above; the repeated ones are steps
+now (`_require_names()`, `_require_type_keyword()`, `_require_output_promise()`), the orchestrator
+reads as the descent it is, and every message is byte-identical to the one it replaced — verified by
+the suite and by the live drift check, the one endpoint the wording has to keep matching. Extracting
+them exposed a gap the old code only appeared to close: `output.required` was checked for being a list
+of names but its ENTRIES were not checked at the top level, so `frozenset([7])` would have read as
+"the producer requires nothing" — the fabricated-clean-bill shape again, caught incidentally by the
+promise check and now refused by the step that owns the rule. Second, `main()` narrowed the
+finding-shape union twice in one function and the envelope would have made it four;
+`_finding_shape_notes()` and `_envelope_notes()` now return `(refusals, tolerated differences)` and
+both branches read them, so a tolerated difference cannot be shown on one branch and dropped on the
+other.
+
+**Verified.** `tests/test_clients.py` 125 → **132/132** (+7: a retyped `schemaVersion`, a moved
+`const`, an outcome outside the vocabulary, an `outcome` with no `enum`, a `required` list carrying a
+non-string at each level, the tolerated omission path named rather than refused, and the two suffix
+readers), `tests/test_triage.py` **405/405**, every
+suite green; live-ledger replay unchanged at 39 judged items; drift check green against the running
+sideclaw — a real endpoint whose envelope now reads as agreeing, which is the check this round could
+most easily have got wrong in the other direction. Proved fail-capable by removing the envelope
+comparison from `check_schema_versions()`: all six envelope tests fail, and the live probe is
+unaffected. The non-string-entry guard is proved the same way: reverted, its test fails while the
+refusal it backstops still happens for a different reason.
+
+**Forty-seventh round.** `needs-human`: no blockers, one improvement, one discussion. Architect,
+resilience, api-contract and adversary all approved clean.
+
+The discussion was a claim in the walker's own docstring, and it was wrong: it said the four published
+arrays share the one object schema it reads from `blocking`. Measured against the live
+`/api/review-schema` — the body this branch has been comparing against for fifteen rounds — the four
+are NOT alike: `improvements` and `discussions` publish the identical item object, and `testGaps`
+publishes `{"items": {"type": "string"}}`. Both of the remedies the reviewer offered were considered
+against that fact: asserting structural identity across all four would refuse the shape sideclaw
+serves today, and extending the check to the three object arrays would police a shape nothing in
+warden reads — `_review_verdict_problems()` iterates `blocking` and nothing else, which
+`test_validation_actionable_with_empty_blocking_confirms` already states as behaviour. So the
+docstring says `blocking`, and the scope is now a test in both directions: a string-array
+`improvements` is not a mismatch, the same divergence in `blocking` is.
+
+The improvement was a type that promised less than it should: `types` was `dict[str, Any]` while every
+value is a JSON-Schema `type` string or nothing. `_as_schema_type()` enforces that rather than
+asserting it — `{"type": 7}` now reads as "no readable type", hence as mistyped, instead of comparing
+a number to `"string"` by accident — and both declarations are `dict[str, str | None]`. Reverting the
+coercion fails the assertion that walks the mapping's values.
+
+**Verified.** `tests/test_clients.py` 124 → **125/125** (+1: a diverging `improvements` tolerated, the
+same divergence in `blocking` caught), `tests/test_triage.py` **405/405**, every suite green;
+live-ledger replay unchanged at 39 judged items; drift check green against the running sideclaw,
+which still reads as a valid shape with the stricter `types` mapping.
+
+**Forty-sixth round.** `needs-human`: no blockers, one improvement, no discussions. senior-dev,
+resilience, performance and OCR all approved clean — and the adversary's claimed blocker was
+rejected on the evidence rather than by argument: it held that invariant events are keyed with an
+`invariant-` prefix the exemption table does not carry, and the reviewer checked the live source
+(`triage.py:7167`, `7402`, `7435-7436`) to find `inv_id.lower()` on both sides with no such prefix
+anywhere. That is the conclusion the same class of claim got before, when an adversary located it
+in `_INVARIANT_PREFIXES` instead: both sides are `inv_id.lower()`, and there is no prefixed key to
+mismatch.
+
+The improvement was a real drift risk the previous tests could not see: the self-audit dispatched
+over the INTERSECTION of `SELF_AUDIT_SECTIONS` (name → key prefixes) and a local name → callable map,
+so a section declared in one and missing from the other was skipped silently — it stopped running,
+its silence read as "nothing to report", and the sweep resolved the alerts it had stopped checking.
+That is §132's failure with no exception to report. Both directions are findings now, and the map is
+`_self_audit_sections()`, a function, so "which sections exist" is observable and the test can
+compare it with the registry — the old `test_every_running_section_declares_the_keys_it_owns`
+compared the table against a hardcoded literal set, which cannot see the map at all.
+`SELF_AUDIT_ELSEWHERE` states why `invariants` and `review-health` legitimately live outside it.
+
+The first cut of that guard reported `invariants` as a missing section and broke fourteen tests at
+once — the right kind of failure for a guard whose whole subject is a silently skipped section, and
+it is why the exemption is a named constant instead of a special case inside the loop.
+
+**Verified.** `tests/test_triage.py` 404 → **405/405** (+1: both drift directions, each with the
+prefix-exemption consequence it has), `tests/test_clients.py` **124/124**, every suite green;
+live-ledger replay unchanged at 39 judged items; drift check green against the running sideclaw. The
+guard is proved fail-capable by reverting it: the new test then finds no failure finding at all,
+because the fabricated section is exactly as invisible as before.
+
+**Forty-fifth round.** `needs-human`: one blocker, two improvements, no discussions. Architect,
+resilience and api-contract all approved clean.
+
+The blocker was §137's promise one name wider, and it is the same fail-open shape three rounds in a
+row have now closed: the check required `blocking` in `output.required` and never `schemaVersion` or
+`outcome`, which the runtime reads off every RESULT and refuses to proceed without. A producer could
+stop requiring either — same version, same outcome vocabulary, item schema byte-identical — and this
+comparison would report `ok: True` while every review it emitted was parked `needs_human` with
+nothing saying why. `REVIEW_OUTPUT_REQUIRED` is the runtime's own reading list now, checked in one
+loop, with the refusal naming the promise that moved. Proved by reverting: dropping `schemaVersion`
+alone answered `ok: True, published: True` before the change, and fails naming it after.
+
+The first improvement asked for the stub stanza eight schema tests each restated. It is one
+`_stub_schemas()` helper now, with the parts under test overridable — and the copies had already
+drifted from the live producer twice, which is the argument: `output.required` was missing from all
+eight, and the container fixtures kept a `required` list the producer does not publish. Four
+in-function fixtures were still promising only `blocking` and had to carry the runtime's list for
+their real subject to be reached at all.
+
+The second aligned the operator-facing preview with its sibling: the unreadable-report branch
+narrowed the `FindingShapeReport` union on truthiness while the branch below narrows on the
+discriminator. Both readers say `shape is not None and shape["published"] is <literal>` now.
+
+**Verified.** `tests/test_clients.py` 123 → **124/124** (+1: each runtime-read name dropped on its
+own must fail, and the names beyond the three stay tolerated), `tests/test_triage.py` **404/404**,
+every suite green; live-ledger replay unchanged at 39 judged items; drift check green against the
+running sideclaw. The walker was checked against the LIVE `/api/review-schema` after the change — the
+producer promises all three names, so this is a check and not a refusal of the real shape.
+
+**Forty-fourth round.** `needs-human`: no blockers, three improvements, one discussion — the first
+round on this branch with nothing blocking, from all three reviewer angles.
+
+The two doc-sync improvements were the gate count: `AGENTS.md` and `STATE.md` still said 403/403
+while the suite was at 404/404 after the previous round's test. Both files are the ones that carry
+the count as a claimed fact, and `AGENTS.md` states its own rule — a mismatched number is a finding
+to report, not a count to edit — so the finding is this round's and the fix is the sync, in the same
+pass as the test that moved it.
+
+The third was a dead store: `entry["ok"] = ok = False` in the schema client rebound a local nothing
+reads afterwards, in both branches, implying a read that does not exist. The cleanup is one line per
+branch — and it caught me: the first edit collapsed the unreadable branch too far and dropped its
+`entry["findingShape"]` assignment, which the clients suite refused before any commit. The test that
+caught it (`KeyError: 'findingShape'`) is one of the round-36 additions.
+
+The discussion re-raised the non-sargable window predicate §139's previous round introduced, as a
+deliberate timing decision rather than an edit — it is issue #9, and the reviewer's framing matches
+where it stays: an expression index against the live ledger's schema is the owner's call. What this
+round added is the number that decision needs: `dispatches` grows **6.3 rows/day** (379 rows over
+59.7 days on the live copy), so the scan is linear at ~2,300 rows/year — **0.052 ms per call today,
+~0.32 ms after a year, ~1 ms after three**, under a tripwire over the whole tick. Years, not weeks.
+
+**Verified.** `tests/test_triage.py` **404/404**, `tests/test_clients.py` **123/123**, every suite
+green; live-ledger replay unchanged at 39 judged items; drift check green against the running
+sideclaw. No behaviour changed in this round, so there is nothing to prove fail-capable: the two
+counts and the dead store are the whole diff.
+
+**Forty-third round.** `needs-human`: one blocker, two improvements, one discussion. Architect,
+senior-dev and resilience all approved clean.
+
+The blocker claimed the review-health pre-filter drops in-window rows by their TEXT: a
+space-separated or date-only timestamp sorting below a bound written with `T`, before `_parse_ts`
+ever ran. **Checked, and it does not reproduce.** The bound handed to the SQL is the window start
+minus 26 hours, and an in-window row's date is always a later date than that bound's date, so the
+date prefix decides every in-window comparison before the separator can — the slack, not the
+compare, is what kept those rows. Probed directly on a copy of the live ledger with the pre-fix SQL
+in hand: all three representations (space-separated with `+02:00`, date-only, `T` with `+00:00`) of
+a 2-hour-old row ARE admitted, and the only row the old form drops that the new one admits sits 25
+hours before the window start, which the window's own decision drops anyway. It is not reported as a
+fixed bug.
+
+What changed is that the admission no longer DEPENDS on that accident. It is `datetime(d.created_at)`
+— SQLite's own normalised parse — plus `datetime(...) IS NULL` for rows it cannot read, which stay
+visible as `corrupt_timestamps`. With `widen = timedelta(0)` the raw-text form WOULD have dropped
+space-separated in-window rows, silently, in the one direction §129 forbids; that dependence is
+gone. Cost measured rather than argued: `EXPLAIN QUERY PLAN` says `SCAN d` for both spellings (the
+`IS NULL` term had already put the query on a scan) and 200 runs over the live 379-row ledger took
+10.4 ms against 14.6 ms. It is also the shape issue #9's planned expression index covers, so the
+predicate and the index agree instead of needing a second form. The 26-hour slack stays for the one
+reason that survives: SQLite truncates fractional seconds where Python keeps microseconds.
+
+The property is a test now, and it is written as a property rather than a restatement of the
+implementation: in-window rows in three representations must stay visible, and a slack-region row
+must still be removed by the decision — which passes with EITHER spelling, and did before this
+change.
+
+The first improvement collapsed `_published_finding_shape()`'s repeated guard pair into
+`_require_object()` plus an internal `_UnreadableShape` caught at the bottom of the same function.
+Every refusal message is byte-identical on purpose: the tests assert the reason at each of the seven
+levels, so they are what holds the refactor to being a refactor.
+
+The second asked to split the fold's per-row classification into a helper. Declined with the reason
+recorded in the function: the loop's inputs are accumulated state — the previous record for the key
+and the `unplaceable` set that has to survive because a key can recur — so a helper takes that set
+as a mutable parameter, which is the same bookkeeping one frame deeper, or re-derives the ordering
+rule it exists to keep in one place.
+
+The third was the same scoping slip as the previous round's, one file over: the operator-facing
+preview narrowed the `FindingShapeReport` union on truthiness, leaving the comparison's keys as
+unproven reads. It is annotated and narrowed on the discriminator now.
+
+The discussion asked whether "report-only" and the resolve sweep are tied together by anything but
+convention. They are, and the tie is now asserted in both directions: a report-only invariant's
+violation is measured and reaches the summary `/health` reads back, while producing no finding and
+therefore no `warden_self` event for the sweep to keep alive or resolve — and the same tick's
+non-report-only violation does become one.
+
+**Verified.** `tests/test_triage.py` 403 → **404/404** (+1), `tests/test_clients.py` **123/123**,
+every suite green; live-ledger replay unchanged at 39 judged items; drift check green against the
+running sideclaw, still reporting the one tolerated `angle` difference. The pre-filter property test
+was run against BOTH spellings (old and new) before the change was kept.
+
+**Forty-second round.** `needs-human`: one blocker, two improvements, one discussion. Architect,
+senior-dev and resilience all approved clean.
+
+The blocker was in the merge gate, and it is the sharpest finding of the branch so far. The rule
+set required `blocking` only for a NON-clean outcome, so a freshly received
+`{"schemaVersion": 1, "outcome": "clean"}` with no `blocking` field at all passed
+`_review_contract_matches()` — and the gate then read it as "clean, nothing to report". The
+prover here is not an argument: reverting the fix makes the new test fail with `merge` actually
+called, i.e. code shipped on a partially serialized payload. The producer's published schema
+requires `blocking` for every outcome, which is the promise §137 added the drift check for, so a
+new result without one is a partial payload. `_review_verdict_problems()` now takes
+`require_blocking`, set by the fresh-result gate and by the park note that reports its refusal
+(built from the same rule set, or it would say "unknown mismatch" about the payload it refused),
+while `_is_completed_review()` keeps the leniency for a stored clean verdict that has no list at
+all: re-reading history merges nothing, and strictness there would only invalidate old rows. The
+existing test that asserted the old behaviour — a version-only check whose fixture happened to
+carry no `blocking` — now carries the list, with the reason written next to it.
+
+The first improvement was a real scoping slip in the diagnostic: the mismatch branch narrowed the
+`FindingShapeReport` union on a truthiness test, which does not narrow a TypedDict union, so the
+`required`/`wardenRequires` reads below were unproven on the unreadable arm — the same rule the
+sibling branch already states. It reads `shape is not None and shape["published"] is True` now.
+
+The second improvement asked to collapse `_partition_findings()`'s three passes into one loop.
+Declined with the reason recorded in the function itself (§138): the two extra passes are over a
+verdict's OWN findings, a handful of entries, and a single loop needs the §114 classifier exposed
+as a per-finding predicate — the honest version of that change, named in the docstring as the thing
+to do if a verdict ever carries a big `blocking` list, rather than a second copy of the split.
+
+The discussion (the non-sargable `datetime(created_at)` window term) is the same already-tracked
+issue as last round: STATE.md issue #9, expression index, `SELF_AUDIT_SLOW_MS` tripwire.
+
+**Verified.** `tests/test_triage.py` 402 → **403/403** (+1 at the gate, with the note and the
+persisted `validation_status` both checked), `tests/test_clients.py` **123/123**, every suite
+green; live-ledger replay unchanged at 39 judged items; drift check green against the running
+sideclaw; the merge-gate fix proven fail-capable by reverting it — the new test then fails because
+`merge` is invoked.
+
+**Forty-first round.** `needs-human`: one blocker, one extract-method improvement, two
+discussions. senior-dev, resilience and OCR all approved clean.
+
+The blocker was the third layer of the same contract, and the adversary found it where the
+previous two rounds had not: after the field NAMES and TYPES (rounds 36/38) and the CONTAINERS
+(round 39), nothing checked that the producer still PROMISES to publish the findings at all. A
+producer that dropped `blocking` from `output.required` while keeping the item schema
+byte-identical stayed green here, and `_review_verdict_problems()` — which refuses a non-clean
+verdict with no `blocking` list — then reported every actionable review unusable, parking real
+reviews with nothing saying why. `output.required` must now list `blocking`, and a conditional
+requirement (`if`/`then`) is refused rather than assumed: a promise that is only conditional is
+not one this check can read. The live producer's own list does promise it, so this is a check and
+not a refusal of the real shape — and the test fixture, which had omitted `output.required`
+entirely, now carries the live list, which is what made the omission look harmless for three
+rounds.
+
+The improvement extracted `_self_audit_summary()` from `run_self_audit()`: the summary document is
+the order-independent half of the tick (it reads values already measured and writes nothing), while
+what stayed behind is sequencing that has to be in one place — the clock, the finding list the sync
+mutates, the cursor write. `live_keys` is passed in rather than recomputed from `findings`, so
+"the findings this pass published" keeps one definition, and the new test pins both `*_error` rules
+at that seam instead of only through a whole tick.
+
+The first discussion named three `tuple(sideclaw.TERMINAL)` call sites that had not migrated to
+`TERMINAL_STATUSES` — a drift the state-log records twice as a repeat incident. Two of the three do
+not exist: `scripts/warden.py:664/672` are membership tests (`status in sideclaw.TERMINAL`), where
+the frozenset is the right type and there is nothing to migrate. `scripts/lifecycle/dispatch.py:271`
+was real and is now the canonical tuple, which also fixes the order of the list that path renders.
+Checked rather than taken on faith, and fixed rather than deferred a third time.
+
+The second discussion (the non-sargable `datetime(created_at)` term in the review-health window
+query, with the expression index that removes it) is unchanged by this diff and already tracked in
+STATE.md's carried debt, still guarded by `SELF_AUDIT_SLOW_MS`.
+
+**Verified.** `tests/test_clients.py` 122 → **123/123** (+1: a producer that keeps the item schema
+and stops requiring `blocking` must fail the check), `tests/test_triage.py` 401 → **402/402** (+1:
+the summary's two `*_error` rules at the seam), every suite green; live-ledger replay unchanged at
+39 judged items; drift check green against the running sideclaw; the required-promise check proven
+fail-capable by reverting it.
+
+**Fortieth round.** Zero blockers, two improvements, two discussions. senior-dev, performance,
+adversary and OCR all approved clean.
+
+The first improvement was two definitions of one fact: `is_review_finding()` restated
+`{"file", "message"}` inline while `REVIEW_FINDING_REQUIRED` declared the same set for the drift
+comparison. They agree today, which is the whole problem — the drift check measures the producer
+against the constant, and a reader with its own copy could keep accepting findings the check calls
+wrong. The reader now iterates the constant, and the test moves the constant to prove the reader
+moves with it: restoring the literal turns that test red. The lenient direction is unchanged, so
+the producer's extra `angle` stays tolerated.
+
+The second was a formatting nit in the operator-facing diagnostic: both new detail strings carried
+their own two-space indent while `details` is printed one level in, so they landed a level too
+deep, and one restated the `review:` label the tool line above it already prints. Verified by
+driving the real script against stub producers — a retyped field and a `blocking` that is no
+longer an array — and printing the lines as the operator sees them, which no unit test covers
+because the strings are assembled in the script itself.
+
+The first discussion asked for sign-off that deferring the manual-pair linkage is still right,
+on the grounds that an unverifiable pair "reopens a `review-verdicts-unusable-<repo>` event
+forever with no auto-resolution". Two of its three parts are accurate: the finding IS re-derived
+every tick, and the event row stays open, because a permanent condition is a permanent condition.
+The third is not what the code does, and the round checked rather than agreed. `_sync_self_audit_events()`
+refreshes only title and payload while a finding holds — it never resets `notified_at` — and
+`reopen_if_needed()` compares `_occurrence_mark()`, not `resolved_at IS NULL`; that comparison was
+the explicit fix for an earlier bug that did reopen and re-close such a row every pass. None of the
+mark's five slots moves for a live `warden_self` finding, and title churn (the item count in the
+title) is deliberately outside the mark. So a permanent manual pair notifies once, then closes on
+the ordinary silence path. The deferral therefore costs a blanked verdict and nothing else,
+recorded in STATE.md's carried debt with that evidence; the live ledger has 0 such rows. The second
+discussion (the schema walker's module placement) is already carried debt and unchanged by this
+diff.
+
+**Verified.** `tests/test_clients.py` 121 → **122/122** (+1), `tests/test_triage.py` **401/401**,
+all suites green; live-ledger replay unchanged at 39 judged items; drift check green against the
+running sideclaw; the reader's single definition proven fail-capable by restoring the literal.
+
+**Thirty-ninth round.** `needs-human`: one blocking schema-validation gap, one dead import,
+and two architect-flagged module boundaries. The senior-dev, resilience and performance reviewers
+all approved clean.
+
+The blocker was a hole in the comparison the previous four rounds spent building: the check
+compared the finding object's field NAMES and TYPES, but never the containers around them.
+`output.properties.blocking` could stop being an array — object-shaped, or null-capable as
+`["array", "null"]` — while the same `items` object stayed exactly as it was, and
+`check_schema_versions()` would report `ok: True` while `_review_verdict_problems()` iterated
+`blocking` as a list and rejected every verdict the producer emitted. Every field name green,
+every result silently unreadable: the same fail-open the type comparison was added to close, one
+level up. The walker now requires `blocking` to be exactly `"array"` and `items` exactly
+`"object"` before it will describe a finding shape. Checked against the live producer first —
+`blocking.type == "array"`, `items.type == "object"` — so this is a check and not a refusal of the
+shape sideclaw actually publishes.
+
+Making that refusal useful meant the walker could no longer answer with a bare `None`: "no
+readable finding shape" is true of a body with no `blocking` at all and of one whose `blocking`
+moved, and those send an operator to different places. It returns `UnreadableFindingShape(reason)`
+now, `FindingShapeUnreadable` carries the reason to the report, and the operator-facing line
+prints it. The type-checking lesson from earlier rounds holds: Pyright does not narrow a TypedDict
+union on `not shape["published"]`, but it does on `is False`, which is why the reader says that.
+
+The dead import was `cast` in `triage.py`, left behind by the previous round's key-by-key
+`_as_review_row()` — the only remaining `cast(` was a keyword argument and a local parameter of
+the same name, which is exactly the kind of thing a plausible-looking grep confirms and a
+`py_compile` never would.
+
+The two architect discussions are recorded in `STATE.md`'s carried debt rather than acted on:
+extracting the self-audit subsystem into `scripts/self_audit.py`, and moving the schema-shape
+walker out of `clients.sideclaw` to sit beside the one script that uses it. Both are the right
+shape eventually and both would touch every importer — work for its own PR, not the last act of a
+branch whose tests all pass.
+
+**Verified.** `tests/test_clients.py` 120 → **121/121** (+1: a producer that keeps every field
+name and changes only the `blocking` container must fail the check), `tests/test_triage.py`
+**401/401**, all suites green; live replay unchanged at 39 judged items; drift check green against
+the running sideclaw; both container requirements proven fail-capable by reverting each one and
+watching the check go back to reporting success.
+
+**Thirty-eighth round.** Zero blockers, two improvements, and the adversary's one claim was
+checked and discarded rather than acted on: it held that the resolve-sweep exemption matches
+`invariant-<id.lower()>`-style keys while `_INVARIANT_PREFIXES` builds `inv_id.lower()` ones. Both
+sides are `inv_id.lower()` (the findings read `inv-1-clock`), so the exemption matches exactly and
+there was no bug. Worth recording because the right response to an adversary finding is to check
+it against the source, not to make the change look clean.
+
+The two improvements were both in plumbing rather than policy, and neither changed behaviour.
+
+`_as_review_row()` spread the source mapping into the cast, so a `ReviewRow` also carried the
+projection's `pointer`/`target_*` columns: the dict said one shape, the annotation said another,
+and a downstream reader could take an undeclared key through the contract without ever meeting it.
+It now builds the declared keys one by one, and the test compares the result against
+`ReviewRow.__annotations__` itself rather than a second copy of the list — so the contract cannot
+drift from its own definition. Restoring the spread turns that test red.
+
+`_review_health_findings()` wrote its number into a mutable `metrics` dict threaded from
+`run_self_audit()` through `self_audit_findings()` into the section closures, purely so one section
+could escape the uniform `Callable[[], list[dict]]` contract the other four satisfy. The pipeline
+now returns `SelfAuditFindings(findings, unreadable_timestamps)`, and review health's FETCH is
+isolated inside the pipeline — it is the only step that can fail as a unit — so the section takes
+rows it cannot re-query and the count is a return value instead of a side effect. That also
+sharpened the honesty rule from the previous round: the count is `None` when the fetch raised,
+because nothing measured it, but a section that fails *after* a good fetch leaves a measured number
+standing. `unreadable_timestamps_error` is keyed on the value being `None` rather than on "the
+section failed", so the field explains itself and nothing else; the failure stays a finding. The
+test covers all three states — fetch failed, fold failed, both healthy — and moving the `next()`
+lookup to a stated reason removed a `StopIteration` that a drifted invariant could have thrown
+inside the hourly tick.
+
+**Verified.** `tests/test_triage.py` at **401/401** (+1), `tests/test_clients.py` at **120/120**,
+all suites green; live-ledger replay unchanged at 39 judged items; drift check green against the
+running sideclaw; both improvements proven fail-capable by reverting them.

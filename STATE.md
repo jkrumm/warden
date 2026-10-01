@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-30 (§115 — a step-7 review that says `needs-human` is a question about the review, not a finding, so it never spends a revision even when it carries findings; those findings now ride the card, because a human is the reader. §114's wrapper class and §92's revisable set are unchanged; the disjoint-set guard stays rejected, on §114's evidence) |
+| Last updated | 2026-10-01 (§117 — the self-audit's `review-always-blocks` finding reads each item by its LATEST review, so a PR blocked on one revision and accepted on the next stops counting as blocked; §116 and §117 both ride PR #7, unmerged, owner-merge-gated) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
-| Repo state | `master`, six LaunchAgents on the mini |
+| Repo state | `master` (00dc001), six LaunchAgents on the mini. **§116 and §117 are NOT on `master` — both ride PR #7**, branch `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`, waiting on the owner's Argo Merge click (`warden` is merge-approval gated, no `autoMergePaths`). The live loop therefore still runs the pre-§116 self-audit |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 352/352 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 405/405 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -176,7 +176,13 @@ loop.
   A finding's detail is derived from the state it describes, never hardcoded —
   `revisions-exhausted` reads the park note (§111), because a card that names
   the wrong mechanism is read as evidence, and names the rounds that each
-  blocked on a different file (§114).
+  blocked on a different file (§114). `review-always-blocks` reads the review
+  verdict's own `blocking[]` and counts distinct items, not implement rows, so
+  §115's needs-human fold cannot blind it and a revised PR counts once (§116);
+  each item is read by its LATEST COMPLETE review — a stored verdict without
+  sideclaw's schema version, a published `outcome`, a `blocking` list of finding
+  objects is no review at all: it neither clears an item nor joins the count, and
+  the same self-audit creates a `warden_self` event for the gap (§117).
 - **A plan-gated rules read is "no rules" (§108).** `branch_rules()` returns
   `[]` for the 403 GitHub answers with on a private repo whose plan carries no
   rulesets ("Upgrade to GitHub Pro or make this repository public") — that repo
@@ -299,8 +305,102 @@ loop.
 
 ## Carried debt
 
+- **Two module boundaries the review flagged and this branch does NOT move** (both are
+  structural refactors of code that is otherwise merge-ready, and each would touch every
+  importer). (1) The self-audit subsystem — review-pointer resolution, `ReviewRow`/`ReviewRows`/
+  `_ReviewedItem`, the fold and the five-section pipeline, ~560 added lines — has narrow enough
+  dependencies (`conn`, `_parse_ts`, `_safe_json`, `_sideclaw`, `INVARIANTS`/`check_invariants`,
+  the `STATE_*` constants) to extract into `scripts/self_audit.py` exposing `run_self_audit()`.
+  (2) The JSON-Schema-shape walker (`_as_object`, `_require_object`, `_require_names`,
+  `_require_type_keyword`, `_require_output_promise`, `_published_finding_shape`,
+  `_published_envelope_shape`, `_pins_version`/`_version_is_pinned`, and the six shape types) is
+  used only by `scripts/check-schema-versions.py` but is pulled in by every importer of
+  `clients.sideclaw`; it belongs beside its one consumer (`clients/schema_introspection.py`, per the
+  review's own suggestion). §143 and §147 grew it to ~480 lines from ~110, which is the argument for
+  the move rather than against it, and still not a change to make as the last act of a branch whose
+  tests all pass.
+  (3) The self-audit registry is three structures that must agree at runtime —
+  `SELF_AUDIT_SECTIONS` (names and the finding-key prefixes each owns), `_self_audit_sections()`
+  (the callables) and `SELF_AUDIT_ELSEWHERE` (the declared names run outside the map) — held together
+  by the two-direction cross-check §141 added. Collapsing them into one ordered mapping of name →
+  `(prefixes, Optional[Callable])` would make the drift unrepresentable instead of runtime-detected,
+  but it also removes `SELF_AUDIT_ELSEWHERE`: `invariants` returns violations rather than findings and
+  `review-health` needs its own isolated fetch, so either fact would have to move into the mapping
+  (as a flag, or as `None` meaning "runs elsewhere"). That is a change to a correctness guard, not a
+  cleanup — the identical reasoning that made §141's guard a finding rather than a skip. Owner call,
+  deferred (raised again in the fiftieth round, where the review repeated that triage.py "already has
+  a norm of growing in place" and called it a bigger-than-this-PR restructuring). All three are worth
+  doing as their own PR with the import paths settled first — not as the last act of a branch whose
+  tests all pass.
+
+- **A manual dispatch pair has no verifiable linkage** (§133). `dispatches.validation_job_id`
+  is the only thing tying an implement row to its review, and for a pair with no
+  `origin_event_id` — a manual `warden dispatch` — the pointer is simultaneously the claim and
+  the thing to be checked, so the row is now treated as unverifiable rather than read
+  (`_pointer_identity_reason()`; the live ledger has no such pair, so nothing regressed). The
+  fix is a stable per-item linkage the schema does not have: a back-pointer on the review row
+  (`parent_job_id`) written when step 7 opens it, and/or carrying the implement's
+  `origin_channel`/`origin_thread_ts` onto the review's origin. Own PR, needs a migration
+  (`~/.warden/warden.db`, schema 11).
+  Deferring it costs no alert noise (§136), which was worth checking rather than assuming: the
+  finding is re-derived every tick by design — it is a state source — but it does NOT re-notify.
+  `_sync_self_audit_events()` refreshes only title and payload while a finding holds, and
+  `reopen_if_needed()` compares `_occurrence_mark()`, whose five slots no live `warden_self`
+  finding moves: there is no `payload.ts_last`, the ISO slots move only on the reopen reset
+  (which happens only after the finding *stopped* holding), and title churn — the item count in
+  the title — is deliberately outside the mark. So a permanent pair notifies once, then closes on
+  the ordinary silence path, with the `events` row left open as the honest record. What remains is
+  the blanked verdict and the missing linkage.
 - `triage.py` stays one 6.6k-line file: 248 tests patch its globals by
   name, a split buys no behaviour (§66). Dead code: none (AST-verified, §65).
+- The review-verdict concern (fold, shape gates, self-audit findings, revision
+  brief — the §104–§126 block) is the one extractable module in `triage.py`, and
+  review rounds have now asked for it four times (§118, §126 ×2). The seam is
+  real and cheap: pure functions, `_ReviewRow` as its own Protocol instead of a
+  `sqlite3.Row` dependency, one entry point (`_review_health_findings`) plus
+  `_unusable_verdict_findings`. **Still deferred to its own PR, not this
+  hardening branch:** the tests reach those functions as `triage.<name>` and
+  monkeypatch `triage.check_invariants` / `_restore_drill_findings` /
+  `_audit_section`, so moving them moves the seam those 248 patchers sit on — a
+  behaviour-neutral refactor that needs its own review round, and growing a
+  verified PR to do it is what §66 warns against. **Now tracked as issue #8**
+  (`warden:skip` until this branch merges, so the two don't collide in the same
+  file); the other review-round deferral, the expression index that would let the
+  window query drop its non-sargable term, is issue #9 under the same label.
+- `_fetch_review_rows()` resolves `dispatches.validation_job_id` against `dispatches` every
+  hour (§118/§122/§128/§129). Measured on the live copy after §129's `LEFT JOIN` and the extra
+  target columns: **0.185 ms** per call (min of 20, median 0.190), against 0.085 ms for the
+  inner-join shape — `EXPLAIN QUERY PLAN` still shows `SCAN d` for the same reason §123 added
+  the `IS NULL` term, and `self-audit-slow` is the tripwire that says when that matters.
+  **The index existed; one query shape disabled it.** `idx_dispatches_created`
+  covers `created_at`, but wrapping it in `datetime(...)` forced a full scan, so
+  the pre-filter compares the raw column (widened 26h to stay a superset of the
+  window, exact instant comparison in Python). That recovered
+  `SEARCH d USING INDEX idx_dispatches_created` in §122 — and §123's
+  corrupt-timestamp term (`OR datetime(d.created_at) IS NULL`) gave the scan back,
+  because no comparison on an unreadable value can be a superset of it. Both
+  shapes measured on the live copy: 0.085 ms each way at 379 `dispatches` rows. The
+  window's own term became `datetime(d.created_at) >= datetime(?)` in §139's round
+  (the representation must not decide admission), so the index below covers BOTH
+  terms of this predicate now. Growth measured rather than assumed so the timing
+  decision on #9 has a number: `dispatches` gains **6.3 rows/day** over the live
+  copy's 59.7-day window (379 rows) → ~2,300 rows/year, and the scan is linear at
+  **0.052 ms per call today → ~0.32 ms after a year → ~1 ms after three**, against a
+  tripwire over the whole tick. This is a years-not-weeks problem; the reviewer who
+  raised it again in §139's round called it "worth a deliberate decision on timing,
+  not a drive-by edit", and that is exactly where it stays.
+  That is the trade this branch chose knowingly — fail-visible beats an index —
+  and issue #9 is the expression index that would end it. `self_audit_ms` in the
+  cursor summary is the tick's own work (invariants + the five sections, the part
+  that grows with the ledger) and `event_sync_ms` is the sync beside it (§126);
+  `self-audit-slow` is the tripwire over the first.
+- The window's corrupt-timestamp term (`OR datetime(d.created_at) IS NULL`, §123)
+  is the one predicate that puts that query back on a scan: no comparison on a
+  value SQLite cannot read can be a superset of it, so a corrupt row could only
+  otherwise be *silently dropped*. Measured on the live ledger both shapes run in
+  0.085 ms at 379 rows, so the term stays. **The revisit is an expression index —
+  `CREATE INDEX … ON dispatches(datetime(created_at))` — not a weaker predicate**;
+  that makes the `datetime()` form index-usable and lets both terms go.
 - `warden.py` still carries its own `_secrets_run_path` copy (left out of the
   §66 consolidation because the `close` verb landed in the same file at the
   same time).
@@ -454,6 +554,8 @@ log's past sections.
 - A PR-wrapper finding is not a revision's job; revision briefs carry the
   closing instruction — §114
 - A needs-human review never spends a revision, and its findings ride the card — §115
+- The self-audit reads the review's own verdict, and counts PRs not rows — §116
+- The self-audit reads an item by its latest review, not any earlier one — §117
 
 ### Next action
 

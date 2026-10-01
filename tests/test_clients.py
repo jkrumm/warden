@@ -13,7 +13,10 @@ Run: .venv/bin/python3 tests/test_clients.py
 
 from __future__ import annotations
 
+from typing import Any
+
 import contextlib
+import importlib.util
 import datetime as dt
 import io
 import json
@@ -396,17 +399,80 @@ def test_assert_outcome_skips_non_done_jobs():
     sideclaw.assert_outcome({"status": "cancelled"}, sideclaw.REVIEW_OUTCOMES, "review")
 
 
-def test_check_schema_versions_ok():
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
-        }),
+# `/api/review-schema`'s real body, abridged to what the check reads: the published finding
+# object lives at `output.properties.blocking.items`, and the producer requires `angle` while
+# warden deliberately does not (see `REVIEW_FINDING_REQUIRED`).
+_REVIEW_SCHEMA_OUTPUT = {
+    "type": "object",
+    # The live producer's `output.required` (all seven names), which the fixture used to omit
+    # entirely — and the omission was the gap §137 is about: `blocking` is required there, and
+    # the runtime reads that promise.
+    "required": ["outcome", "blocking", "improvements", "discussions", "testGaps", "summary",
+                 "schemaVersion"],
+    "properties": {
+        "outcome": {"type": "string", "enum": list(sideclaw.REVIEW_OUTCOMES)},
+        # The live producer's `{"type": "number", "const": 1}` — the runtime compares this field to
+        # an integer and refuses a result that carries anything else, so a fixture that left it out
+        # (as this one did until §143) is a producer whose envelope cannot be read at all, and every
+        # test built on it would be asserting against a mismatch of its own making.
+        "schemaVersion": {"type": "number", "const": sideclaw.REVIEW_SCHEMA_VERSION},
+        "blocking": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"file": {"type": "string"}, "line": {"type": "number"},
+                           "message": {"type": "string"}, "angle": {"type": "string"}},
+            "required": ["file", "message", "angle"],
+            "additionalProperties": False,
+        }},
+    },
+}
+
+
+# The three names the runtime reads off a result — spelled once, so a fixture that satisfies the
+# promise cannot drift from what the check requires (§140). The vocabulary is read from the module
+# for the same reason: the fixture asserts what warden READS, and a second hand-written copy of the
+# outcome list would be one more place to forget when it changes.
+_PROMISED = list(sideclaw.REVIEW_OUTPUT_REQUIRED)
+
+_LIVE = object()
+
+
+def _stub_schemas(*, review_version: Any = _LIVE, review_outcomes: Any = _LIVE,
+                  review_output: Any = _LIVE, dispatch_version: Any = _LIVE,
+                  dispatch_outcomes: Any = _LIVE) -> "_StubServer":
+    """The two `/api/*-schema` routes every schema-check test needs, each part overridable.
+
+    Extracted because the stanza was copy-pasted into eight tests and the copies had already
+    drifted from the live producer twice: `output.required` was missing from all of them (which is
+    what made §137's hole invisible for three rounds), and the container fixtures kept a
+    `required` list the producer does not publish. A fixture a test has to restate is a fixture
+    that will be wrong in seven places.
+
+    `_LIVE` means "the live-shaped value"; passing `None` for `review_output` means the body
+    carries NO `output` key at all, which is a different producer (it publishes no schema) from one
+    whose `output` is null."""
+    def pick(value: Any, live: Any) -> Any:
+        return live if value is _LIVE else value
+
+    dispatch: dict[str, Any] = {
+        "ok": True,
+        "version": pick(dispatch_version, sideclaw.DISPATCH_SCHEMA_VERSION),
+        "outcomes": pick(dispatch_outcomes, list(sideclaw.DISPATCH_OUTCOMES)),
+    }
+    review: dict[str, Any] = {
+        "ok": True,
+        "version": pick(review_version, sideclaw.REVIEW_SCHEMA_VERSION),
+        "outcomes": pick(review_outcomes, list(sideclaw.REVIEW_OUTCOMES)),
+    }
+    if review_output is not None:
+        review["output"] = json.loads(json.dumps(pick(review_output, _REVIEW_SCHEMA_OUTPUT)))
+    return _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, dispatch),
+        ("GET", "/api/review-schema"): (200, review),
     })
+
+
+def test_check_schema_versions_ok():
+    srv = _stub_schemas()
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         results = sideclaw.check_schema_versions()
@@ -417,16 +483,7 @@ def test_check_schema_versions_ok():
 
 
 def test_check_schema_versions_version_mismatch():
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION + 1,
-            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
-        }),
-    })
+    srv = _stub_schemas(dispatch_version=sideclaw.DISPATCH_SCHEMA_VERSION + 1)
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         results = sideclaw.check_schema_versions()
@@ -440,20 +497,348 @@ def test_check_schema_versions_outcome_set_mismatch():
     """A version match with a DIFFERENT outcome set is still a mismatch —
     sideclaw could add/rename an outcome without bumping the version, and a
     consumer that only compared `version` would silently miss it."""
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-            "outcomes": [*sideclaw.DISPATCH_OUTCOMES, "a_new_outcome"],
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
-        }),
-    })
+    srv = _stub_schemas(dispatch_outcomes=[*sideclaw.DISPATCH_OUTCOMES, "a_new_outcome"])
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         results = sideclaw.check_schema_versions()
         assert results["dispatch"]["ok"] is False, results
+    finally:
+        srv.stop()
+
+
+def test_check_schema_versions_catches_a_finding_shape_that_lost_a_required_field():
+    """§131: version and outcomes can agree while the FINDING shape differs, and that was the one
+    piece of the published contract nothing compared — `is_review_finding()` mirrors it in Python,
+    so a producer that renamed `message` would leave warden reading a shape nobody emits, with
+    every other check green and the missing field only visible as an unusable verdict later."""
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))  # deep copy, no shared mutation
+    items = output["properties"]["blocking"]["items"]
+    items["required"] = ["file", "angle"]
+    items["properties"].pop("message")
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+        assert review["ok"] is False, review
+        shape = review["findingShape"]
+        assert shape["missingFromProperties"] == ["message"], shape
+        assert shape["missingFromRequired"] == ["message"], shape
+        assert set(shape["wardenRequires"]) == {"file", "message"}, shape
+    finally:
+        srv.stop()
+
+
+def test_check_schema_versions_treats_an_unpublished_finding_shape_as_a_disagreement():
+    """No readable shape is a finding, not a reason to skip: the alternative is warden's copy
+    being unverifiable, which is exactly the drift the comparison exists to catch."""
+    srv = _stub_schemas(review_output=None)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+        assert review["ok"] is False, review
+        assert review["findingShape"]["published"] is False, review
+        # And it says WHICH requirement the body failed, not only that it failed one. This stub
+        # publishes no `output` at all, so the reason names that level.
+        assert "output" in review["findingShape"]["reason"], review["findingShape"]
+    finally:
+        srv.stop()
+
+
+def test_a_producer_that_stops_requiring_blocking_fails_the_schema_check():
+    """§137 — the same shape-only blind spot as the container check, one level up: keep the item
+    schema byte-identical and drop `blocking` from `output.required`. Every field name and both
+    containers stay green, `check_schema_versions()` reports success — and the runtime refuses
+    every non-clean verdict ("outcome 'actionable' publishes no `blocking` list"), so each real
+    review is parked as unusable and nothing says why."""
+    for required in ([], ["outcome", "summary", "schemaVersion"], "blocking"):
+        output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+        output["required"] = required
+        srv = _stub_schemas(review_output=output)
+        os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+        try:
+            review = sideclaw.check_schema_versions()["review"]
+        finally:
+            srv.stop()
+        assert review["ok"] is False, (required, review)
+        shape = review["findingShape"]
+        assert shape["published"] is False, (required, shape)
+        assert "required" in shape["reason"], shape
+    # …and the live producer's own list, which does promise it, reads as a comparison.
+    live = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
+    assert isinstance(live, sideclaw.PublishedFindingShape), live
+
+
+def test_a_producer_that_stops_requiring_a_runtime_read_name_fails_the_schema_check():
+    """§140 — the same promise as §137, one level up and one name wider. The check required
+    `blocking` in `output.required` and never `schemaVersion` or `outcome`, which the runtime reads
+    off every RESULT and fails closed without (`assert_result_schema()`, `assert_outcome()`). A
+    producer could stop requiring either — same version, same outcome vocabulary, item schema
+    untouched — and this comparison would report success while every review it emitted was parked
+    `needs_human` with nothing saying why. Each name is dropped on its own here, and the refusal
+    has to name the one that moved."""
+    # The fixture must promise what the runtime reads, or this test would prove nothing.
+    assert set(sideclaw.REVIEW_OUTPUT_REQUIRED) <= set(_REVIEW_SCHEMA_OUTPUT["required"]), \
+        sideclaw.REVIEW_OUTPUT_REQUIRED
+    for name in sideclaw.REVIEW_OUTPUT_REQUIRED:
+        output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+        output["required"] = [n for n in output["required"] if n != name]
+        srv = _stub_schemas(review_output=output)
+        os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+        try:
+            review = sideclaw.check_schema_versions()["review"]
+        finally:
+            srv.stop()
+        assert review["ok"] is False, (name, review)
+        shape = review["findingShape"]
+        assert shape["published"] is False, (name, shape)
+        assert f"`{name}`" in shape["reason"], (name, shape)
+    # …and the names the producer publishes BEYOND those three are tolerated, not required: this
+    # is a check on the promise warden reads, not a mirror of the whole schema.
+    assert set(_REVIEW_SCHEMA_OUTPUT["required"]) > set(sideclaw.REVIEW_OUTPUT_REQUIRED)
+
+
+def test_a_diverging_improvements_shape_is_not_a_mismatch():
+    """§142 — the check reads `blocking.items` because `blocking` is the ONE array warden's runtime
+    reads: `_review_verdict_problems()` iterates it and filters every entry through
+    `is_review_finding()`, while `improvements`/`discussions`/`testGaps` are never inspected (an
+    empty `blocking` alongside a populated `improvements` still confirms and merges). Their shape is
+    therefore the producer's business, and the live producer proves the point: its `testGaps` is a
+    STRING array. A check demanding identity across all four would refuse the shape sideclaw
+    actually serves — while the same divergence in `blocking` is exactly what it must catch."""
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    for divergent in ("improvements", "discussions", "testGaps"):
+        output["properties"][divergent] = {"type": "array", "items": {"type": "string"}}
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is True, review
+    assert review["findingShape"]["published"] is True, review
+
+    # …and the same divergence one array over, in `blocking`, is the mismatch.
+    output["properties"]["blocking"]["items"] = {"type": "string"}
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is False, review
+    assert review["findingShape"]["published"] is False, review
+
+
+def test_is_review_finding_reads_the_required_set_from_the_one_constant():
+    """§136 — `is_review_finding()` restated `{"file", "message"}` inline while
+    `REVIEW_FINDING_REQUIRED` declared the same set for the drift comparison: two definitions
+    that agree today, one place to change and one to forget. Moving the constant must move the
+    reader, or the comparison would report a mismatch against a set the reader no longer uses
+    while the reader keeps accepting findings the schema calls wrong."""
+    real = sideclaw.REVIEW_FINDING_REQUIRED
+    entry = {"file": "a.py", "message": "why", "line": 3}
+    assert sideclaw.is_review_finding(entry) is True
+    try:
+        sideclaw.REVIEW_FINDING_REQUIRED = real | {"angle"}
+        assert sideclaw.is_review_finding(entry) is False
+        assert sideclaw.is_review_finding({**entry, "angle": "reviewer"}) is True
+    finally:
+        sideclaw.REVIEW_FINDING_REQUIRED = real
+    # Each required name is required, and a blank one is not a name: the reader stays stricter
+    # than the producer in that one direction, as its docstring says.
+    for name in sorted(real):
+        assert sideclaw.is_review_finding({**entry, name: "   "}) is False, name
+    assert sideclaw.is_review_finding({"file": "a.py"}) is False
+    assert sideclaw.is_review_finding("a.py") is False
+    assert sideclaw.is_review_finding(None) is False
+
+
+def test_a_blocking_container_that_is_no_longer_an_array_fails_the_schema_check():
+    """§135 — the field comparison this check already had, run against a producer that keeps
+    every field NAME and changes only the container around them. `output.properties.blocking`
+    becomes an object (or admits `null`), the `items` object stays exactly as it was, and the
+    check used to report success — while `_review_verdict_problems()` iterates `blocking` as a
+    list and would reject every verdict the producer emits, silently."""
+    for blocking_type in ("object", ["array", "null"]):
+        output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+        output["properties"]["blocking"]["type"] = blocking_type
+        srv = _stub_schemas(review_output=output)
+        os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+        try:
+            review = sideclaw.check_schema_versions()["review"]
+        finally:
+            srv.stop()
+        assert review["ok"] is False, (blocking_type, review)
+        shape = review["findingShape"]
+        assert shape["published"] is False, (blocking_type, shape)
+        assert "blocking" in shape["reason"], shape
+
+
+def test_the_warden_required_finding_fields_are_the_ones_the_stub_fixture_publishes():
+    """The comparison is only meaningful if both sides name the same fields, so this pins
+    warden's side against the stub's published shape rather than against prose.
+
+    It is a FIXTURE self-check and cannot catch live drift — nothing in this suite can, because
+    every schema here is the stub's. Live drift is `check_schema_versions()`'s job, run against the
+    real endpoint by `scripts/check-schema-versions.py` on every `make status` (and by hand on every
+    round of this branch). Named for what it checks now, since the old name claimed the live schema
+    was one of the two things compared here (§147)."""
+    published = set(_REVIEW_SCHEMA_OUTPUT["properties"]["blocking"]["items"]["properties"])
+    assert set(sideclaw.REVIEW_FINDING_REQUIRED) <= published, sideclaw.REVIEW_FINDING_REQUIRED
+    # And the deliberately-lenient direction is explicit: the producer requires a field warden
+    # does not, and that is tolerated (reported, never a mismatch).
+    extra = set(_REVIEW_SCHEMA_OUTPUT["properties"]["blocking"]["items"]["required"]) \
+        - set(sideclaw.REVIEW_FINDING_REQUIRED)
+    assert extra == {"angle"}, extra
+
+
+def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
+    """§132 — `parsed.get("output") or {}` survives `None` and `{}` but not a truthy non-dict,
+    and this helper sits OUTSIDE `check_schema_versions()`'s try/except on the operator-facing
+    `make status` path: an `AttributeError` there would turn a drifted schema into a traceback
+    instead of the "unreadable shape" refusal it is documented to produce."""
+    # The refusal states WHICH requirement the body failed, so this reads the reason instead of
+    # only asserting a refusal: a body with no `blocking` at all and one whose `blocking` stopped
+    # being an array are both refused, and telling them apart is the difference between a check
+    # that explains a red and one that only reports it (§135).
+    def reason(parsed: Any) -> str:
+        shape = sideclaw._published_finding_shape(parsed)
+        assert isinstance(shape, sideclaw.UnreadableFindingShape), shape
+        return shape.reason
+
+    assert "`output`" in reason({"output": "yes"})
+    assert "`output`" in reason({"output": ["x"]})
+    assert "`output`" in reason({"output": 7})
+    assert "`output`" in reason({"output": None})
+    # The item shape is only worth reading if a NON-CLEAN outcome promises to publish it, so
+    # `output.required` is checked too (§137): the runtime refuses a findings-shaped verdict
+    # without `blocking`, so a producer that made it optional while keeping this exact item
+    # schema would leave every field and container green here and park every actionable review
+    # as unusable. A body that does not promise it, promises nothing, or promises it in a shape
+    # that is not a list of names — all three are refused rather than assumed, because a
+    # conditional requirement cannot be read as a plain one.
+    def unpromised(required: Any) -> Any:
+        # `"type": "object"` on the root, because §150 made it part of what a body has to publish:
+        # these bodies are valid apart from the one thing each case is about.
+        output = {"type": "object", "properties": {"blocking": {
+            "type": "array", "items": {"type": "object",
+                                       "properties": {"file": {}, "message": {}}}}}}
+        if required is not None:
+            output["required"] = required
+        return {"output": output}
+
+    assert "required" in reason(unpromised(None))
+    assert "required" in reason(unpromised([]))
+    assert "required" in reason(unpromised(["outcome", "summary"]))
+    assert "required" in reason(unpromised("blocking"))
+    assert "required" in reason(unpromised(["blocking", 7]))
+    assert "`output`" in reason({})
+    # One level down, the same case the first guard covers: `properties` reached with `or {}`
+    # raises on a truthy non-dict, and it is the level a drifted body is most likely to break.
+    assert "properties" in reason({"output": {"type": "object", "properties": "yes"}})
+    assert "blocking" in reason({"output": {"type": "object", "required": _PROMISED,
+                                            "properties": {"blocking": ["x"]}}})
+    # `blocking` typed but its `items` unreadable: the guards reach the level below too.
+    assert "items" in reason(
+        {"output": {"type": "object", "required": _PROMISED,
+                    "properties": {"blocking": {"type": "array", "items": "x"}}}})
+    # …and the ROOT of that descent is checked like every level under it (§150): `output` itself
+    # has to be an object, because `_review_verdict_problems()` rejects any result that is not one
+    # ("result is not an object"), so a null-capable root parks a review the drift check called fine.
+    assert "not exactly an object" in reason({"output": {"type": ["object", "null"],
+                                                         "properties": {"blocking": {}}}})
+    assert "not exactly an object" in reason({"output": {"type": "array",
+                                                         "properties": {"blocking": {}}}})
+    assert "not exactly an object" in reason(
+        {"output": {"required": _PROMISED, "properties": {"blocking": {}}}})
+
+    def body(blocking_type: Any, items_type: Any,
+             *, required: Any = sideclaw.REVIEW_OUTPUT_REQUIRED) -> Any:
+        """A published body whose FIELD NAMES never change — only the containers around them."""
+        return {"output": {"type": "object", "required": list(required),
+                           "properties": {"blocking": {
+            "type": blocking_type,
+            "items": {"type": items_type,
+                      "properties": {"file": {"type": "string"}, "message": {"type": "string"}},
+                      "required": ["file", "message"]}}}}}
+
+    # The container is part of the contract (§135). Every field name stays green in these bodies,
+    # which is exactly why comparing names alone passed them while the runtime rejected every
+    # verdict: `_review_verdict_problems()` iterates `blocking` as a list, and reads `items`'
+    # fields by name. `["array", "null"]` admits the null it would then iterate.
+    assert "blocking" in reason(body("object", "object"))
+    assert "blocking" in reason(body(["array", "null"], "object"))
+    assert "blocking" in reason(body(None, "object"))
+    assert "items" in reason(body("array", "string"))
+    assert "items" in reason(body("array", ["object", "null"]))
+    assert "items" in reason(body("array", None))
+    # …while the containers the producer actually publishes read as a comparison, so this stays a
+    # check rather than a refusal of the live shape.
+    live = sideclaw._published_finding_shape(body("array", "object"))
+    assert isinstance(live, sideclaw.PublishedFindingShape), live
+    assert live.required == frozenset({"file", "message"})
+    # `required` is read as a collection of names or not at all: a bare string would become a
+    # set of its own characters (silently passing a name check it should fail) and a number
+    # would raise TypeError out of a function that is documented never to raise.
+    for bad in ("file", 7, {"file": 1}, [7], ["file", 7]):
+        why = reason({"output": {"type": "object", "required": _PROMISED,
+                                 "properties": {"blocking": {"type": "array", "items": {
+                                     "type": "object",
+                                     "properties": {"file": {}, "message": {}},
+                                     "required": bad}}}}})
+        assert "required" in why or "items" in why, (bad, why)
+    # An empty `properties` carries no shape either — that is "not published", not "nothing
+    # required".
+    assert "publishes no fields" in reason(
+        {"output": {"type": "object", "required": _PROMISED,
+                    "properties": {"blocking": {"type": "array", "items": {
+                        "type": "object", "properties": {}, "required": []}}}}})
+    # …and the same shape read from a well-formed body still works, types included.
+    shape = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
+    assert isinstance(shape, sideclaw.PublishedFindingShape), shape
+    assert shape.required == frozenset({"file", "message", "angle"})
+    assert shape.properties >= {"file", "message", "line", "angle"}
+    assert shape.types["file"] == "string" and shape.types["line"] == "number"
+
+
+def test_check_schema_versions_catches_a_field_that_was_retyped_but_not_renamed():
+    """§133 — names are not the whole contract. A producer that keeps `file` and `message` and
+    changes either type leaves every name in place: the version still matches, the outcome list
+    still matches, every field is still published, and `is_review_finding()` rejects every
+    finding the producer emits — the verdict silently unreadable, with the check that exists to
+    catch exactly this reporting success. Types are compared, and a property with no readable
+    type is not assumed to be a string."""
+    retyped = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    retyped["properties"]["blocking"]["items"]["properties"]["file"] = {"type": "array"}
+    srv = _stub_schemas(review_output=retyped)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+        assert review["ok"] is False, review
+        assert review["findingShape"]["mistyped"] == ["file"], review["findingShape"]
+        assert review["findingShape"]["missingFromProperties"] == []
+    finally:
+        srv.stop()
+
+    # A `type` that is not a string at all is not a readable type either: it is reported as None
+    # (and therefore as mistyped) rather than comparing a number to "string" by accident, and the
+    # mapping is typed so it cannot claim to hold a type nobody read (§142).
+    numeric = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    numeric["properties"]["blocking"]["items"]["properties"]["file"] = {"type": 7}
+    shape = sideclaw._published_finding_shape({"output": numeric})
+    assert isinstance(shape, sideclaw.PublishedFindingShape), shape
+    assert shape.types["file"] is None, shape.types
+    assert all(isinstance(v, str) or v is None for v in shape.types.values()), shape.types
+
+    # A published property with NO readable type is a disagreement too: warden reads a string,
+    # and "any type" is not a promise it can rely on.
+    untyped = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    untyped["properties"]["blocking"]["items"]["properties"]["message"] = {}
+    srv = _stub_schemas(review_output=untyped)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+        assert review["ok"] is False and review["findingShape"]["mistyped"] == ["message"]
     finally:
         srv.stop()
 
@@ -1691,6 +2076,232 @@ def test_interactive_token_is_hermes_never_the_chat_write_only_warden_app():
     finally:
         clients_slack.resolve_secret = saved
     assert calls == [("SLACK_BOT_TOKEN", "op://hermes/slack/bot-token")]
+
+
+# ------------------------------------------------------------------ the result envelope (§143) and
+# the rendering the operator reads (§144).
+
+
+def _load_check_schema_versions() -> Any:
+    """`scripts/check-schema-versions.py` as a module.
+
+    The file name has dashes, so it cannot be imported by name, and the two lines it renders are
+    behaviour an operator reads on every `make status`: which differences are refusals and which are
+    tolerated-on-purpose suffixes. Loading it here is what makes those lines testable at all."""
+    path = REPO / "scripts" / "check-schema-versions.py"
+    spec = importlib.util.spec_from_file_location("check_schema_versions_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _envelope_body(**changes: Any) -> dict[str, Any]:
+    """The live-shaped output body with named changes applied to the two envelope properties."""
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    for name, value in changes.items():
+        output["properties"][name] = value
+    return output
+
+
+def _envelope_check(**changes: Any) -> dict[str, Any]:
+    srv = _stub_schemas(review_output=_envelope_body(**changes))
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        return sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+
+
+def test_a_schema_version_the_producer_can_move_is_a_mismatch():
+    """§143/§147 — the runtime compares `schemaVersion` to an integer with a strict `!=`, so it is
+    the VALUE that has to be promised, not the type. Required-presence alone reported success for a
+    string; a type that merely ADMITS the version reports success for `{"type": "number"}` (the
+    producer could emit `2`) and for a `["integer", "string"]` union (it could emit `"1"`) — both of
+    which `assert_result_schema()` refuses, per review, while this check said the contract held."""
+    for movable in ({"type": "string"},
+                    {"type": "number"},
+                    {"type": ["integer", "string"]},
+                    {"type": "integer", "enum": [1, 2]}):
+        review = _envelope_check(schemaVersion=movable)
+        assert review["ok"] is False, (movable, review)
+        envelope = review["envelopeShape"]
+        assert envelope["published"] is True and envelope["versionPinned"] is False, (movable, envelope)
+    # The live producer's own `{"type": "number", "const": 1}` pins it, and so does the strict
+    # spelling; a pin wins over a permissive type list, because the only legal value left is the
+    # one warden compares.
+    assert _envelope_check()["ok"] is True
+    assert _envelope_check(schemaVersion={"type": "integer", "const": 1})["ok"] is True
+    assert _envelope_check(schemaVersion={"type": ["integer", "string"], "const": 1})["ok"] is True
+    assert _envelope_check(schemaVersion={"type": "number", "enum": [1]})["ok"] is True
+
+
+def test_a_version_const_that_moved_is_a_mismatch():
+    """§143 — a published `const` is the producer stating the version a second time; when it
+    disagrees with the pinned number, one of the two is about to move under warden."""
+    review = _envelope_check(schemaVersion={"type": "number", "const": 2})
+    assert review["ok"] is False, review
+    envelope = review["envelopeShape"]
+    assert envelope["versionPinned"] is False, envelope
+    assert envelope["versionConst"] == 2, envelope
+
+
+def test_a_boolean_const_does_not_pin_the_version():
+    """§147 — `True == 1` in Python, so a `const: true` compared with `==` alone reads as a pin on
+    the number 1. It is not one: warden compares the value it receives, and `true` is not `1` to
+    anything that reads the JSON. The accidental-equality class this branch keeps removing."""
+    review = _envelope_check(schemaVersion={"type": "boolean", "const": True})
+    assert review["ok"] is False, review
+    assert review["envelopeShape"]["versionPinned"] is False, review["envelopeShape"]
+
+
+def test_an_outcome_outside_wardens_vocabulary_is_a_mismatch():
+    """§143 — `assert_outcome()` parks any review whose outcome is not in `REVIEW_OUTCOMES`, so a
+    producer that WIDENS its enum parks every review carrying the new name. The top-level `outcomes`
+    metadata can stay identical while this moves, which is why it needed its own comparison."""
+    review = _envelope_check(outcome={"type": "string",
+                                      "enum": [*sideclaw.REVIEW_OUTCOMES, "blocked"]})
+    assert review["ok"] is False, review
+    assert review["envelopeShape"]["unknownOutcomes"] == ["blocked"], review["envelopeShape"]
+
+
+def test_a_producer_that_omits_a_warden_outcome_is_tolerated_and_named():
+    """§143 — the other direction is safe: a warden outcome the producer can no longer emit is a
+    branch of ours gone unreachable, not a review mis-parsed. Refusing it would refuse a producer
+    that narrowed its own vocabulary, so it is named instead — the rule the `producer also
+    requires:` suffix already follows for findings."""
+    review = _envelope_check(outcome={"type": "string", "enum": ["clean", "actionable"]})
+    assert review["ok"] is True, review
+    assert review["envelopeShape"]["unknownOutcomes"] == [], review["envelopeShape"]
+    script = _load_check_schema_versions()
+    problems, tolerated = script._envelope_notes(review)
+    assert problems == [], problems
+    assert tolerated == ["producer also omits: needs-human"], tolerated
+
+
+def test_an_outcome_with_no_enum_is_an_unreadable_envelope():
+    """§143 — `output.properties.outcome` without an `enum` constrains nothing, and the runtime's
+    membership test is the only thing that would notice an unknown value. Read as unreadable rather
+    than as an empty comparison, and with a reason that names the requirement that failed."""
+    review = _envelope_check(outcome={"type": "string"})
+    assert review["ok"] is False, review
+    envelope = review["envelopeShape"]
+    assert envelope["published"] is False and "enum" in envelope["reason"], envelope
+
+
+def test_a_root_schema_that_admits_null_is_a_mismatch():
+    """§150 — the ROOT of the descent is checked like every level under it. `blocking` and `items`
+    were held to `type: "array"`/`"object"` while the schema above them only had to exist, so a
+    producer could publish a null-capable or keyword-less `output` with every nested check green —
+    and `_review_verdict_problems()` rejects any result that is not an object outright, so a null
+    result parks the item with no verdict at all. Both readers report the same refusal, because both
+    descend through the same root."""
+    for root_type in (["object", "null"], "array", None):
+        output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+        if root_type is None:
+            output.pop("type", None)
+        else:
+            output["type"] = root_type
+        srv = _stub_schemas(review_output=output)
+        os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+        try:
+            review = sideclaw.check_schema_versions()["review"]
+        finally:
+            srv.stop()
+        assert review["ok"] is False, (root_type, review)
+        for report_key in ("findingShape", "envelopeShape"):
+            report = review[report_key]
+            assert report["published"] is False, (root_type, report_key, report)
+            assert "not exactly an object" in report["reason"], (root_type, report_key, report)
+    # …and the live root (`{"type": "object"}`) is what both readers accept, so this stays a check
+    # rather than a refusal of the shape sideclaw serves.
+    assert _envelope_check()["ok"] is True
+
+
+def test_a_singleton_type_array_is_not_a_mismatch():
+    """§149 — `{"type": ["string"]}` is the SAME schema as `{"type": "string"}`: the dialect allows a
+    list of type names, so a producer whose serializer wraps every type in one is not a producer
+    whose field changed type. The check compared the raw keyword, which turned a harmless
+    serialization change into a loud refusal — the false-failure class this tooling exists to avoid,
+    and the one §147's stricter pin rule makes worse if it is not normalized."""
+    wrapped = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    wrapped["properties"]["blocking"]["type"] = ["array"]
+    wrapped["properties"]["blocking"]["items"]["type"] = ["object"]
+    for subschema in wrapped["properties"]["blocking"]["items"]["properties"].values():
+        subschema["type"] = [subschema["type"]]
+    wrapped["properties"]["schemaVersion"] = {"type": ["number"], "const": 1}
+    srv = _stub_schemas(review_output=wrapped)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is True, review
+    assert review["findingShape"]["types"] == {"angle": "string", "file": "string",
+                                               "line": "number", "message": "string"}, review
+    # …and a UNION is not the same schema: a `file` that may be null is a finding
+    # `is_review_finding()` refuses, so the field reads as mistyped rather than as equivalent.
+    unioned = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    unioned["properties"]["blocking"]["items"]["properties"]["file"]["type"] = ["string", "null"]
+    srv = _stub_schemas(review_output=unioned)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is False, review
+    assert review["findingShape"]["mistyped"] == ["file"], review["findingShape"]
+    assert review["findingShape"]["types"]["file"] is None, review["findingShape"]
+
+
+def test_a_required_list_carrying_a_non_string_name_is_unreadable():
+    """§143 — both `required` lists are checked for their ENTRIES, not only their container. A list
+    holding a non-string is not a field warden could ever look up, and `frozenset([7])` would read as
+    "the producer requires nothing" — the fabricated-clean-bill shape this branch keeps removing.
+    The refusal names the level, because the two lists send a reader to different fixes."""
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    output["required"] = ["outcome", "blocking", 7]
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is False, review
+    # The finding-shape report, not the envelope's: the name said `envelope` and the assertion
+    # below reads `findingShape` (§147).
+    finding_shape = review["findingShape"]
+    assert finding_shape["published"] is False, finding_shape
+    assert "`output.required` carries non-string" in finding_shape["reason"], finding_shape["reason"]
+
+    # …and the item level, independently.
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    output["properties"]["blocking"]["items"]["required"] = ["file", "message", 7]
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is False, review
+    assert "`items.required` carries non-string" in review["findingShape"]["reason"], review
+
+
+def test_the_operator_notes_name_both_tolerated_differences():
+    """§144 — both reports are read through one helper each, so a tolerated difference cannot be
+    printed in the ✓ line and dropped from the ✗ line. This asserts the two suffixes together, on
+    the live-shaped body: the producer requires `angle` and warden does not, and a producer that
+    dropped `needs-human` from its vocabulary is named rather than refused."""
+    script = _load_check_schema_versions()
+    review = _envelope_check(outcome={"type": "string", "enum": ["clean", "actionable"]})
+    assert script._finding_shape_notes(review)[1] == ["producer also requires: angle"]
+    assert script._envelope_notes(review)[1] == ["producer also omits: needs-human"]
+    # The refusal paths return their line and NO tolerated suffix, so a problem can never be
+    # rendered as a suffix the ✓ branch would print.
+    refused = _envelope_check(schemaVersion={"type": "string"})
+    problems, tolerated = script._envelope_notes(refused)
+    assert len(problems) == 1 and "schemaVersion is not pinned to 1" in problems[0], problems
+    assert tolerated == [], tolerated
 
 
 if __name__ == "__main__":

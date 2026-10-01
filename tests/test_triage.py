@@ -31,6 +31,7 @@ import datetime as dt
 import time
 import importlib.util
 import io
+import itertools
 import json
 import os
 import shutil
@@ -3788,6 +3789,44 @@ def test_implement_pr_opened_with_unparseable_pr_url_is_merge_blocked():
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGE_BLOCKED, item["state"]
         assert item["note"] == "could not parse the PR number", item["note"]
+
+
+def test_a_clean_review_result_with_no_blocking_list_is_parked_not_merged():
+    """§138 — the merge gate accepted `{"schemaVersion": 1, "outcome": "clean"}` with no
+    `blocking` field at all, because the rule set required the list only for a NON-clean outcome.
+    A partially serialized result therefore read as "clean, nothing to report" and the item
+    merged on it: the one direction where an unreadable payload ships code. The producer's
+    published schema requires `blocking` for every outcome, so a freshly received result without
+    one is a partial payload — parked with the reason named, never merged."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-val-partial-clean")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-partial", "validation-job-partial",
+             "https://github.com/jkrumm/demo-repo/pull/11", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-partial")
+
+        partial = _review_result("clean")
+        del partial["blocking"]
+        triage._sideclaw.get = lambda job_id: {"status": "done", "result": partial}
+
+        def _unexpected_merge(*a, **kw):
+            raise AssertionError("a result with no `blocking` list must never reach merge")
+
+        triage._merge.plan_or_land = _unexpected_merge
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item
+        assert "blocking" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-partial",)).fetchone()
+        assert d["validation_status"] == "needs_human", d["validation_status"]
+        # …and the same payload READ BACK from history is still a complete review: the leniency
+        # is scoped to the stored-verdict reader, which merges nothing.
+        assert triage._is_completed_review(partial) is True
 
 
 def test_blocking_validation_blocks_the_merge():
@@ -8254,7 +8293,7 @@ def test_quiet_anchor_takes_the_latest_iso_clock():
 
 # --- revision of a blocked implementation (§92) -------------------------------
 
-def _seed_blocked_item(conn, *, external_id: str, blocking: list[dict[str, Any]] | None = None,
+def _seed_blocked_item(conn, *, external_id: str, blocking: list[Any] | None = None,
                        revision_count: int = 0) -> int:
     eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
     conn.execute(
@@ -8264,17 +8303,815 @@ def _seed_blocked_item(conn, *, external_id: str, blocking: list[dict[str, Any]]
          "https://github.com/jkrumm/demo-repo/pull/7", revision_count, eid),
     )
     _seed_implement_dispatch(conn, f"impl-{external_id}")
+    # The live loop stamps BOTH rows of a pair with the item's own event — step 7 opens the review
+    # with `Origin(event_id=event_id)` — and that shared, non-NULL origin IS the pair's identity
+    # (§133). A pair seeded without one would model a shape the loop does not produce, and would
+    # exercise the unverifiable-pointer path by accident instead of the path under test.
+    conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id=?",
+                 (eid, f"impl-{external_id}"))
     conn.execute("UPDATE dispatches SET validation_status='blocked', verdict_json=? WHERE job_id=?",
                  (json.dumps({"outcome": "pr_opened", "branch": "dispatch/prior-branch",
                               "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/7"}),
                   f"impl-{external_id}"))
-    conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, verdict_json) "
-                 "VALUES (?,?,?,?,?,?,?)",
+    conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, "
+                 "origin_event_id, verdict_json) VALUES (?,?,?,?,?,?,?,?)",
                  (f"val-{external_id}", "review", "demo-repo", "review PR #7", "done", NOW.isoformat(),
+                  eid,
                   json.dumps({"outcome": "actionable", "blocking": blocking if blocking is not None else [
                       {"file": "scripts/check.sh", "line": 808, "message": "exit 0 fails open on crash loops"}]})))
     conn.commit()
     return eid
+
+
+def test_a_failing_self_audit_section_reports_itself_and_spares_the_others():
+    """§117 — the audit's sections are independent queries. One raising section must
+    not take the others down with it, and it must not be silent either: a check that
+    only reaches a `.err` file is indistinguishable from a check with nothing to say."""
+    with _triage_env() as (conn, ctx):
+        def boom(*a, **kw):
+            raise RuntimeError("verdict_json is not JSON")
+        marker = {"key": "restore-drill-marker", "title": "t", "detail": "d"}
+        original_review, original_drill = triage._review_health_findings, triage._restore_drill_findings
+        triage._review_health_findings = boom
+        triage._restore_drill_findings = lambda now: [marker]
+        try:
+            findings = triage.self_audit_findings(conn, NOW).findings
+        finally:
+            triage._review_health_findings = original_review
+            triage._restore_drill_findings = original_drill
+        keys = [f["key"] for f in findings]
+        assert "self-audit-section-failed-review-health" in keys, keys
+        assert "restore-drill-marker" in keys, "one bad section must not hide the others"
+        failed = next(f for f in findings if f["key"].endswith("review-health"))
+        assert "RuntimeError" in failed["title"] and "verdict_json is not JSON" in failed["detail"]
+
+
+def test_the_self_audit_sections_are_all_wired_in():
+    """Each section is reached through `_audit_section()` — a section dropped from the
+    loop would otherwise be a check nobody runs, which reads exactly like a pass."""
+    with _triage_env() as (conn, ctx):
+        seen: list[str] = []
+        original = triage._audit_section
+        triage._audit_section = lambda name, fn: (seen.append(name), fn())[1]
+        try:
+            triage.self_audit_findings(conn, NOW).findings
+        finally:
+            triage._audit_section = original
+        assert seen == ["review-health", "liveness", "fixed-reopened", "restore-drill",
+                        "revisions-exhausted"], seen
+
+
+def test_a_schema_version_must_be_a_real_int_for_either_gate():
+    """`isinstance(True, int)` is True, so a boolean version must read as absent —
+    otherwise `True == 1` would pass the exact-match producer gate."""
+    assert triage._schema_version_of({"schemaVersion": 1}) == 1
+    for bad in (True, False, None, "1", 1.0, [1], {}):
+        assert triage._schema_version_of({"schemaVersion": bad}) is None, bad
+    assert triage._schema_version_of({}) is None
+    assert triage._schema_version_of("not a dict") is None
+    assert not triage._review_contract_matches({"schemaVersion": True, "outcome": "clean"})
+    # The `blocking` list is present here because a NEW result must carry one whatever its
+    # outcome (§138) — this assertion used to read `{"schemaVersion": …, "outcome": "clean"}`
+    # with no `blocking` at all and pass, which was the merge-gate hole in miniature: a
+    # partially serialized clean result counted as a clean review.
+    assert triage._review_contract_matches(
+        {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean",
+         "blocking": []})
+
+
+def test_a_naive_audit_window_is_read_as_utc_not_host_local():
+    """The window bound is parsed as UTC (the ledger's own format). Read as host-local
+    instead, a naive bound shifts by the machine's offset — on a CEST host it becomes two
+    hours earlier and pulls a row from two hours before the window into it.
+
+    Both implement rows are LINKED to their review row here: without the link the query's
+    join matches nothing and the test would pass while measuring nothing at all, which is
+    how this covered the timezone rule for six rounds without ever exercising it."""
+    with _triage_env() as (conn, ctx):
+        for name, age in (("inside", dt.timedelta(minutes=30)), ("outside", dt.timedelta(hours=2))):
+            _seed_blocked_item(conn, external_id=f"tz-{name}")
+            conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                         (f"val-tz-{name}", f"impl-tz-{name}"))
+            conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                         ((NOW - age).isoformat(), f"impl-tz-{name}"))
+        conn.commit()
+        bound = NOW - dt.timedelta(hours=1)
+        naive = bound.replace(tzinfo=None).isoformat()
+        aware = bound.astimezone(dt.timezone.utc).isoformat()
+        # Exactly the in-window row: a host-local reading of the naive bound would add the
+        # 2h-old row and make this 2.
+        assert len(triage._fetch_review_rows(conn, naive).terminal) == 1
+        assert len(triage._fetch_review_rows(conn, aware).terminal) == 1
+        # The boundary is inclusive, on the implement job's own timestamp.
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(minutes=30)).isoformat()).terminal
+        assert len(rows) == 1 and rows[0]["implement_job_id"] == "impl-tz-inside"
+
+
+def _review_row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00+00:00",
+                row_id=0, implement_created_at=None, mismatch_reason=None):
+    """One `ReviewRow`, as `_review_fold_rows()` builds it from a query row. Both timestamps are
+    present as the query returns them: `created_at` is the review's (the fold's order key) and
+    `implement_created_at` the implement job's (the window key). `mismatch_reason` is the
+    derived key a row gets when its pointer does not resolve to its own review (§129)."""
+    return {"repo": "demo-repo", "event_id": event_id, "implement_job_id": job,
+            "verdict_json": None if verdict is None else json.dumps(verdict),
+            "review_status": status, "created_at": created_at, "id": row_id,
+            "implement_created_at": implement_created_at if implement_created_at is not None
+            else created_at, "mismatch_reason": mismatch_reason}
+
+
+def test_the_latest_review_is_chosen_by_instant_not_by_timestamp_text():
+    """A stored timestamp is TEXT. Two rows for one item written with different UTC
+    offsets must be ordered by the instant they denote — `10:30+01:00` is EARLIER than
+    `10:00+00:00` even though its text sorts later. Ordering by text would pick the
+    wrong "latest" review, and so report or suppress `review-always-blocks` wrongly."""
+    blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                "outcome": "actionable", "blocking": [_CODE_FINDING]}
+    clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean",
+             "blocking": []}
+    # Text order says the +01:00 row is later; it is an hour EARLIER in real time.
+    rows = [_review_row(1, "impl-1", clean, created_at="2026-10-01T09:00:00+00:00", row_id=1),
+            _review_row(1, "impl-1", blocking, created_at="2026-10-01T10:30:00+01:00", row_id=2),
+            _review_row(1, "impl-1", clean, created_at="2026-10-01T10:00:00+00:00", row_id=3)]
+    assert [str(r["created_at"]) for r in sorted(rows, key=lambda r: str(r["created_at"]))] == [
+        "2026-10-01T09:00:00+00:00", "2026-10-01T10:00:00+00:00", "2026-10-01T10:30:00+01:00"]
+    folded = triage._fold_review_status(rows)
+    # The 10:00+00:00 clean row is the latest instant, so the item is not blocked.
+    assert folded["demo-repo"][1] == triage._ReviewedItem(code_blocked=False, unusable=False)
+
+
+def test_the_audit_window_is_microsecond_exact_and_never_drops_a_bad_timestamp():
+    """SQLite's `datetime()` is only a pre-filter: it truncates to whole seconds and
+    returns NULL for a timestamp it cannot parse. The exact comparison happens on parsed
+    instants, and an unparseable timestamp is KEPT — a corrupt row must make the audit
+    look at something, never quietly leave the window."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="precision-window")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-precision-window", "impl-precision-window"))
+        conn.execute("UPDATE dispatches SET created_at='2026-10-01T06:00:00.000000+00:00' "
+                     "WHERE job_id=?", ("impl-precision-window",))
+        conn.execute("UPDATE dispatches SET created_at='2026-10-01T06:00:00.000000+00:00' "
+                     "WHERE job_id=?", ("val-precision-window",))
+        conn.commit()
+
+        # The cutoff is half a second LATER: the row is outside the window, even though
+        # second-truncated `datetime()` values compare equal.
+        assert triage._fetch_review_rows(conn, "2026-10-01T06:00:00.500000+00:00").terminal == []
+        assert len(triage._fetch_review_rows(conn, "2026-10-01T06:00:00.000000+00:00").terminal) == 1
+
+        # A timestamp nothing can parse is KEPT, so it reaches the fold instead of
+        # vanishing; the fold then orders it first. Both sides are exercised: the window
+        # reads the IMPLEMENT row's `implement_created_at`, the ordering key the REVIEW
+        # row's `created_at`.
+        conn.execute("UPDATE dispatches SET created_at='garbage' WHERE job_id=?",
+                     ("impl-precision-window",))
+        conn.execute("UPDATE dispatches SET created_at='garbage' WHERE job_id=?",
+                     ("val-precision-window",))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, "2026-10-01T23:59:59+00:00").terminal
+        assert len(rows) == 1 and rows[0]["implement_created_at"] == "garbage"
+        assert triage._review_order_key(rows[0])[0] == dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def test_a_review_row_with_an_unparseable_timestamp_is_never_the_latest():
+    """An item whose rows cannot be placed in time has no knowable order, so it must read
+    as unusable — an older readable review must never stand in for the current one, which
+    would erase a corrupt newer review's signal (§119)."""
+    blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                "outcome": "actionable", "blocking": [_CODE_FINDING]}
+    clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+             "outcome": "clean", "blocking": []}
+    # (a) an unparseable row ALONGSIDE a newer readable one: the item is unusable and
+    # unjudged, never clean, even though the readable row sorts later.
+    rows = [_review_row(1, "impl-1", clean, created_at="not a timestamp", row_id=99),
+            _review_row(1, "impl-1", clean, created_at="2026-10-01T06:00:00+00:00", row_id=1)]
+    status = triage._fold_review_status(rows)["demo-repo"][1]
+    assert status.unusable is True and status.code_blocked is None
+    # (b) an unparseable row that is itself a blocked review: still unusable — the audit
+    # claims "cannot tell", not "not blocking".
+    rows = [_review_row(1, "impl-1", blocking, created_at="garbage", row_id=99),
+            _review_row(1, "impl-1", clean, created_at="2026-10-01T06:00:00+00:00", row_id=1)]
+    status = triage._fold_review_status(rows)["demo-repo"][1]
+    assert status.unusable is True
+    # (b2) and it is NOT judged: a stale `code_blocked=False` here would enter
+    # `_always_blocks_findings()`'s denominator and, being false, suppress that finding for
+    # the whole repo (§120). An item nobody can place carries no verdict at all.
+    assert status.code_blocked is None
+    # (c) ordering among placeable rows is unaffected: latest readable wins.
+    rows = [_review_row(1, "impl-1", blocking, created_at="2026-10-01T06:00:00+00:00", row_id=1),
+            _review_row(1, "impl-1", clean, created_at="2026-10-01T07:00:00+00:00", row_id=2)]
+    status = triage._fold_review_status(rows)["demo-repo"][1]
+    assert status.unusable is False and status.code_blocked is False
+    assert triage._review_order_key(_review_row(1, "impl-1", clean, created_at="garbage"))[0] == \
+        dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def test_an_unplaceable_item_cannot_suppress_the_always_blocks_finding():
+    """§120: the fail-open in full — three genuinely blocking items plus ONE quietly
+    unplaceable one must still report `review-always-blocks`. Before the fix the stale
+    `code_blocked=False` put that item in the denominator and silenced the whole finding."""
+    def _blocking_row(event_id):
+        return _review_row(event_id, f"impl-{event_id}", {
+            "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcome": "actionable", "blocking": [_CODE_FINDING]}, row_id=event_id)
+    rows = [_blocking_row(i) for i in (1, 2, 3)]
+    rows.append(_review_row(4, "impl-4", {
+        "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+        "outcome": "clean", "blocking": []}, created_at="not a timestamp", row_id=4))
+    status = triage._fold_review_status(rows)
+    keys = [f["key"] for f in triage._always_blocks_findings(status)]
+    assert keys == ["review-always-blocks-demo-repo"], keys
+    # The unplaceable item is reported by the other section instead — visible, not silent.
+    unusable = triage._unusable_verdict_findings(status)
+    assert unusable and unusable[0]["key"] == "review-verdicts-unusable-demo-repo"
+
+
+def test_a_pointer_at_another_tier_is_not_read_as_a_review_verdict():
+    """§121: `validation_job_id` is a pointer, and a stale one that names a terminal
+    dispatch of another tier must not be read as the item's review. The live ledger has
+    implement→investigate pairs, so this is not hypothetical."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="wrong-tier")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-wrong-tier", "impl-wrong-tier"))
+        # The pointer's target is a terminal job that is NOT a review, with a clean verdict.
+        conn.execute("UPDATE dispatches SET tier='investigate', status='done', verdict_json=? "
+                     "WHERE job_id=?", (json.dumps({
+                         "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                         "outcome": "clean", "blocking": []}), "val-wrong-tier"))
+        conn.commit()
+        assert triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=1)).isoformat()).terminal == []
+        # It becomes visible again the moment the pointer names a real review.
+        conn.execute("UPDATE dispatches SET tier='review' WHERE job_id=?", ("val-wrong-tier",))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=1)).isoformat()).terminal
+        assert len(rows) == 1 and rows[0]["implement_job_id"] == "impl-wrong-tier"
+
+
+def test_a_pointer_into_another_repo_is_not_read_as_this_review():
+    """§122: the join pins the pair's whole identity. A stale pointer naming a valid
+    terminal REVIEW of a different repo must not be read as this item's verdict — that is
+    how a verdict gets attributed to the wrong item's `review-always-blocks`."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="cross-repo")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-cross-repo", "impl-cross-repo"))
+        conn.execute("UPDATE dispatches SET tier='review', repo='other-repo', status='done', "
+                     "verdict_json=? WHERE job_id=?", (json.dumps({
+                         "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                         "outcome": "actionable", "blocking": [_CODE_FINDING]}), "val-cross-repo"))
+        conn.commit()
+        assert triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=1)).isoformat()).terminal == []
+        conn.execute("UPDATE dispatches SET repo='demo-repo' WHERE job_id=?", ("val-cross-repo",))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=1)).isoformat()).terminal
+        assert len(rows) == 1 and rows[0]["repo"] == "demo-repo"
+
+
+def test_the_window_prefilter_is_a_superset_of_the_instant_decision():
+    """§122/§139: the pre-filter admits permissively and the exact instant comparison is the
+    decision, so a row it admits outside the window must still be dropped — and one inside kept,
+    including a naive timestamp an offset-reading would have misplaced.
+
+    §139 adds the property the pre-filter has to have whatever spelling it uses: the decision is
+    on INSTANTS, so an in-window row stays visible in whatever representation its writer chose.
+    The raw-text compare held that property only by accident (`datetime('2026-09-30 14:00:00
+    -12:00')` sorts below `'2026-09-30T00:00:00'` — `' '` < `'T'` — although its instant is
+    2026-10-01T02:00Z; what saved it was the 26h-widened bound, since an in-window row's date is
+    always a later date than the bound's). Admission is SQLite's own normalised parse now."""
+    with _triage_env() as (conn, ctx):
+        for name, age in (("inside", dt.timedelta(hours=2)), ("outside", dt.timedelta(hours=30))):
+            _seed_blocked_item(conn, external_id=f"pf-{name}")
+            conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                         (f"val-pf-{name}", f"impl-pf-{name}"))
+            conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                         ((NOW - age).isoformat(), f"impl-pf-{name}"))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
+        assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
+        # A naive stored timestamp 2h before "now" is inside a 24h window read as UTC.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ((NOW - dt.timedelta(hours=2)).replace(tzinfo=None).isoformat(), "impl-pf-inside"))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
+        assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
+        # §139: same instant, three other representations. None may fall out of the audit by its
+        # text — a row that vanishes here is a row the review-health numbers never see.
+        for name, rendered in (
+            # Space-separated with a real UTC offset: the text is local, the instant is not.
+            ("space", (NOW - dt.timedelta(hours=2))
+             .astimezone(dt.timezone(dt.timedelta(hours=2))).strftime("%Y-%m-%d %H:%M:%S") + "+02:00"),
+            ("date", (NOW - dt.timedelta(hours=2)).strftime("%Y-%m-%d")),
+            ("zulu", (NOW - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        ):
+            _seed_blocked_item(conn, external_id=f"pf-rep-{name}")
+            conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                         (f"val-pf-rep-{name}", f"impl-pf-rep-{name}"))
+            conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                         (rendered, f"impl-pf-rep-{name}"))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
+        assert sorted(r["implement_job_id"] for r in rows) == [
+            "impl-pf-inside", "impl-pf-rep-date", "impl-pf-rep-space", "impl-pf-rep-zulu"]
+        # §139: and the pre-filter is not narrower than the instant decision — a row it lets
+        # through out of the window (26h of slack) is still removed by the decision, not folded.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ((NOW - dt.timedelta(hours=25)).strftime("%Y-%m-%d %H:%M:%S"), "impl-pf-rep-space"))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
+        assert sorted(r["implement_job_id"] for r in rows) == [
+            "impl-pf-inside", "impl-pf-rep-date", "impl-pf-rep-zulu"]
+
+
+def test_a_mismatched_pointer_is_reported_rather_than_dropped():
+    """§129: excluding the row (§128) must not remove the ITEM from the audit. An inner join on
+    the identity predicates dropped the implement row entirely, which shrinks the denominator
+    `review-always-blocks` is computed over and hides the stale pointer that caused it — so the
+    row is folded with its verdict blanked and the item is reported as unusable."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=42, suffix="foreign")
+        conn.execute("UPDATE dispatches SET origin_event_id=99 WHERE job_id='rev-foreign'")
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, since)
+        assert rows.terminal == []
+        assert [r["implement_job_id"] for r, _ in rows.mismatched] == ["impl-foreign"]
+        assert "another item's review" in rows.mismatched[0][1]
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, since))
+        unusable = [f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo"]
+        assert len(unusable) == 1, findings
+        assert "42" in unusable[0]["detail"], unusable[0]["detail"]
+        # Why, not only which: the finding carries the reason the pointer is not this item's.
+        assert "pointer mismatches: " in unusable[0]["detail"], unusable[0]["detail"]
+        assert "another item's review" in unusable[0]["detail"], unusable[0]["detail"]
+        # Not judged: the broken pointer must not enter the always-blocks denominator.
+        assert triage._always_blocks_findings(
+            triage._fold_review_status(triage._review_fold_rows(rows.terminal, rows.mismatched))) == []
+
+
+def test_a_row_that_lost_a_projected_column_fails_at_the_boundary_and_says_which():
+    """§130: the fold reads its input by column NAME, so a renamed or dropped SQL alias must
+    fail where the projection and its readers meet, naming the column — not wherever the row is
+    first dereferenced, which is how the implement job's time was once read as the review's."""
+    # No fixture needed: the check is on the row contract, not on a database.
+    try:
+        triage._review_fold_rows([{"repo": "demo-repo", "event_id": 1, "id": 1}], [])
+    except RuntimeError as e:
+        assert "implement_created_at" in str(e) and "verdict_json" in str(e), str(e)
+    else:
+        raise AssertionError("a row missing projected columns was accepted by the fold")
+
+
+def test_a_pointer_at_a_review_that_has_not_finished_is_neither_verdict_nor_finding():
+    """A review still running is normal: nothing to read yet and nothing wrong. Only a pointer
+    that cannot resolve to THIS item's review is a mismatch, or every in-flight review would
+    file an unusable-verdict finding."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=7, suffix="running")
+        conn.execute("UPDATE dispatches SET status='running' WHERE job_id='rev-running'")
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, since)
+        assert rows.terminal == [] and rows.mismatched == []
+        assert triage._review_health_findings(triage._fetch_review_rows(conn, since)) == []
+
+
+def test_the_self_audit_summary_carries_its_schema_and_both_timings():
+    """§126: the summary's own generation is recorded (its keys have meant different things
+    across this work), and the two costs are separate — the one that grows with the ledger
+    is the number a tripwire can watch."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="schema-marker")
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["self_audit_schema"] == triage.SELF_AUDIT_SCHEMA
+        assert isinstance(summary["self_audit_ms"], int) and summary["self_audit_ms"] >= 0
+        assert isinstance(summary["event_sync_ms"], int) and summary["event_sync_ms"] >= 0
+        assert "self-audit-slow" not in summary["findings"]
+        assert summary["unreadable_timestamps"] == 0
+
+
+def test_a_failed_section_does_not_resolve_the_alerts_it_stopped_checking():
+    """§132 — the resolve sweep reads "this key is absent" as "nothing to report", which is only
+    true for a section that actually RAN. Review health raising used to resolve its own live
+    `review-always-blocks-*` event, so the failure that stopped the check silently cleared the
+    very alert it was watching — fail-open one level above §124, and the reason a broken check
+    looked like a clean bill. The section's own failure finding still fires; the alerts it owns
+    simply survive until a pass that re-checks them."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=900 + i, suffix=f"blk-{i}")
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        live = "review-always-blocks-demo-repo"
+        assert conn.execute("SELECT resolved_at FROM events WHERE source=? AND external_id=?",
+                            (triage.SELF_SOURCE, live)).fetchone()["resolved_at"] is None
+
+        def _raise(*_a, **_k):
+            raise RuntimeError("OperationalError: no such column")
+
+        real = triage._review_health_findings
+        triage._review_health_findings = _raise
+        try:
+            triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=2),
+                                  dry_run=False)
+        finally:
+            triage._review_health_findings = real
+        rows = {r["external_id"]: r["resolved_at"] for r in conn.execute(
+            "SELECT external_id, resolved_at FROM events WHERE source=?", (triage.SELF_SOURCE,))}
+        assert rows[live] is None, "a section that raised cleared the alert it stopped checking"
+        assert rows[f"{triage.SECTION_FAILURE_PREFIX}review-health"] is None
+
+        # …and the exemption is not permanent: the next pass that runs the section again
+        # resolves the failure event itself, because the section did re-check that time.
+        triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=4), dry_run=False)
+        rows = {r["external_id"]: r["resolved_at"] for r in conn.execute(
+            "SELECT external_id, resolved_at FROM events WHERE source=?", (triage.SELF_SOURCE,))}
+        assert rows[live] is None
+        assert rows[f"{triage.SECTION_FAILURE_PREFIX}review-health"] is not None
+
+
+def test_every_running_section_declares_the_keys_it_owns():
+    """§132 — the exemption table is only sound if it is complete: a section whose keys are not
+    declared there gets its alerts resolved the moment it raises, silently back to fail-open.
+    Read both sides off the module rather than a copy."""
+    declared = dict(triage.SELF_AUDIT_SECTIONS)
+    assert set(declared) == {"invariants", "review-health", "liveness", "fixed-reopened",
+                             "restore-drill", "revisions-exhausted"}
+    assert declared["review-health"] == ("review-always-blocks-", "review-verdicts-unusable-")
+    assert triage._unrechecked_prefixes(["review-health"]) == declared["review-health"]
+    assert triage._unrechecked_prefixes(["invariants"]) == tuple(i.lower() for i in triage.INVARIANTS)
+    # A name the table does not know protects nothing rather than raising: a section that was
+    # removed must not make the sweep refuse to run.
+    assert triage._unrechecked_prefixes(["gone"]) == ()
+    assert triage._failed_section_names(
+        [triage._section_failure_finding("liveness", RuntimeError("x"))]) == ["liveness"]
+
+
+def test_the_summary_counts_the_rows_admitted_for_an_unreadable_timestamp():
+    """§131's discussion — the corrupt-timestamp term of the review window cannot be bounded by
+    time without dropping rows of unknown age, so those rows are re-admitted every pass. The
+    count rides in the summary so that recurrence is a number someone can see, next to the tick
+    cost it feeds, instead of an invisible term that grows."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=901, suffix="corrupt")
+        conn.execute("UPDATE dispatches SET created_at='not-a-timestamp' WHERE job_id='impl-corrupt'")
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=14)).isoformat())
+        # The count is the FETCH's own, not a second query: the same rows the review health
+        # section already pulled, so the summary costs nothing extra (§131's discussion).
+        assert rows.corrupt_timestamps == 1
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["unreadable_timestamps"] == 1
+
+
+def test_the_fold_row_contract_carries_exactly_the_declared_keys():
+    """§134 — the conversion spread the source mapping, so a `ReviewRow` also carried the
+    projection's pointer columns (`pointer`, `target_*`): the dict said one shape, the annotation
+    said another, and a reader could take an undeclared key through the contract without meeting
+    it. The keys are exactly the declared ones now, compared against the `TypedDict` itself
+    rather than against a second copy of the list."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=7, suffix="keys")
+        rows = triage._fetch_review_rows(conn, since)
+        # The fetched row DOES carry the extras — that is the projection the predicate reads.
+        assert "pointer" in rows.terminal[0].keys() and "target_tier" in rows.terminal[0].keys()
+        folded = triage._review_fold_rows(rows.terminal, rows.mismatched)
+        assert len(folded) == 1
+        assert set(folded[0]) == set(triage.ReviewRow.__annotations__), sorted(folded[0])
+        # The blanked path goes through the same conversion.
+        blanked = triage._review_fold_rows([], [(rows.terminal[0], "why")])
+        assert set(blanked[0]) == set(triage.ReviewRow.__annotations__)
+        assert blanked[0]["mismatch_reason"] == "why" and blanked[0]["verdict_json"] is None
+
+
+def test_the_summary_document_names_a_check_that_did_not_run_instead_of_zeroing_it():
+    """§137 — `_self_audit_summary()` is the order-independent half of the tick (the caller keeps
+    the clock, the sync and the cursor write), and both `*_error` fields are one rule: a count or
+    an empty list from a check that did NOT run is a fabricated clean bill, so the field says
+    "not measured, and why". Pinned at that seam rather than through the tick, because it is the
+    part a caller can get wrong on its own."""
+    ok = triage._self_audit_summary(
+        "2026-10-01T00:00:00", 12, 3, {"clock": [{"id": "clock"}]}, ["a"],
+        triage.SelfAuditFindings([], 0), None)
+    assert ok["violations"] == [{"id": "clock", "count": 1}], ok
+    assert ok["unreadable_timestamps"] == 0, ok
+    assert ok["findings"] == ["a"] and ok["self_audit_ms"] == 12 and ok["event_sync_ms"] == 3
+    assert "invariants_error" not in ok and "unreadable_timestamps_error" not in ok
+
+    failed = triage._self_audit_summary(
+        "2026-10-01T00:00:00", 12, 3, {}, [], triage.SelfAuditFindings([], None),
+        RuntimeError("OperationalError: boom"))
+    assert failed["violations"] == [] and failed["findings"] == []
+    assert failed["invariants_error"].startswith("RuntimeError:"), failed
+    assert failed["unreadable_timestamps"] is None
+    assert "review-health" in failed["unreadable_timestamps_error"], failed
+
+
+def test_a_failed_review_health_fetch_reports_no_count_rather_than_a_clean_zero():
+    """§133/§134 — the count comes from the FETCH, so when the fetch raises there IS no number.
+    Writing `0` there would read as "no corrupt timestamps": a fabricated clean bill in the
+    exact field this work added to keep that cost visible, and the same anti-pattern
+    `invariants_error` already exists to prevent one key over. `None` says not measured, and the
+    reason says why.
+
+    A section that fails AFTER a good fetch is a different state, and this pins the difference:
+    the number was measured, so it stands (a real 0 here) while the section's failure is its own
+    live finding. Only the fetch can unmeasure the count."""
+    with _triage_env() as (conn, ctx):
+        real_fetch = triage._fetch_review_rows
+
+        def _raise(*_a, **_k):
+            raise RuntimeError("OperationalError: no such table: dispatches")
+
+        triage._fetch_review_rows = _raise
+        try:
+            triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        finally:
+            triage._fetch_review_rows = real_fetch
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["unreadable_timestamps"] is None, summary["unreadable_timestamps"]
+        assert "review-health" in summary["unreadable_timestamps_error"]
+        # The failure is a live finding too, so the hour is not a quiet one either way.
+        assert f"{triage.SECTION_FAILURE_PREFIX}review-health" in summary["findings"]
+
+        # The fold (not the fetch) failing leaves the measured number standing.
+        real_section = triage._review_health_findings
+        triage._review_health_findings = _raise
+        try:
+            triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=2),
+                                  dry_run=False)
+        finally:
+            triage._review_health_findings = real_section
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["unreadable_timestamps"] == 0
+        assert "unreadable_timestamps_error" not in summary
+        assert f"{triage.SECTION_FAILURE_PREFIX}review-health" in summary["findings"]
+
+        # And the next pass that runs the section clears both.
+        triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=4), dry_run=False)
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["unreadable_timestamps"] == 0
+        assert f"{triage.SECTION_FAILURE_PREFIX}review-health" not in summary["findings"]
+
+
+def test_a_slow_self_audit_tick_reports_itself():
+    """§126: the growth path has no other visible signal, so crossing the threshold becomes
+    a finding — and it must exist BEFORE the event sync, or the event it needs is never
+    written and the finding would be live only in the summary JSON. The threshold is moved
+    rather than the clock: this runner passes no fixtures, so the attribute is restored by
+    hand."""
+    original = triage.SELF_AUDIT_SLOW_MS
+    try:
+        with _triage_env() as (conn, ctx):
+            triage.SELF_AUDIT_SLOW_MS = -1
+            triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+            summary = json.loads(conn.execute(
+                "SELECT value FROM cursors WHERE key=?",
+                (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+            assert "self-audit-slow" in summary["findings"]
+            ev = conn.execute("SELECT id, resolved_at FROM events WHERE source=? AND external_id=?",
+                              (triage.SELF_SOURCE, "self-audit-slow")).fetchone()
+            assert ev is not None and ev["resolved_at"] is None
+            # And it clears when the tick is fast again.
+            triage.SELF_AUDIT_SLOW_MS = 10 ** 9
+            triage.run_self_audit(conn, triage.load_policy(),
+                                  NOW + dt.timedelta(hours=2), dry_run=False)
+            ev = conn.execute("SELECT resolved_at FROM events WHERE source=? AND external_id=?",
+                              (triage.SELF_SOURCE, "self-audit-slow")).fetchone()
+            assert ev is not None and ev["resolved_at"] is not None
+    finally:
+        triage.SELF_AUDIT_SLOW_MS = original
+
+
+def test_a_pointer_at_another_items_review_is_not_read_as_this_items_verdict():
+    """§128: the join pins the pair's whole identity — pointer, tier, repo AND origin — so a
+    stale pointer naming a different item's review in the same repo and tier cannot be
+    attributed to this item. The tier and repo pins closed the cross-tier and cross-repo
+    cases; this closes the one the pointer cannot prove, where reading it would fabricate or
+    suppress a merge-gating finding for the wrong item."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=41, suffix="own")
+        _seed_blocking_review(conn, event_id=42, suffix="foreign")
+        # `foreign`'s review now belongs to another item; its pointer still names it.
+        conn.execute("UPDATE dispatches SET origin_event_id=99 WHERE job_id='rev-foreign'")
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, since).terminal
+        assert [r["event_id"] for r in rows] == [41], [dict(r) for r in rows]
+
+
+def test_an_origin_less_pair_is_unverifiable_rather_than_read():
+    """§133 — two NULL origins are not a match, they are the ABSENCE of one. A manual
+    `warden dispatch` pair has no origin, so the pointer is the only claim that its two rows are
+    one item, and the pointer is the thing in question: nothing can check it, so any manual
+    implement in the repo could name any manual review in it and a stale pointer would be read
+    as this item's verdict — fabricated or suppressed, with no alert. The live ledger has no
+    such pair today (the six NULL-origin implement rows carry no pointer), so this is a rule
+    for a shape the loop could start producing, not a description of the data."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=None, suffix="manual")
+        rows = triage._fetch_review_rows(conn, since)
+        assert rows.terminal == [], [dict(r) for r in rows.terminal]
+        assert [r["implement_job_id"] for r, _ in rows.mismatched] == ["impl-manual"]
+        assert "carry no origin" in rows.mismatched[0][1]
+        assert rows.mismatched[0][0]["event_id"] is None
+        # Reported, not dropped: the item is named by the fifth finding, keyed on the implement
+        # job id because a manual dispatch has no event to be keyed on.
+        finding = next(f for f in triage._review_health_findings(triage._fetch_review_rows(conn, since))
+                       if f["key"] == "review-verdicts-unusable-demo-repo")
+        assert "impl-manual" in finding["detail"], finding["detail"]
+        assert "carry no origin" in finding["detail"], finding["detail"]
+
+
+def test_a_corrupt_implement_timestamp_is_admitted_and_never_judged():
+    """§123: no comparison on a corrupt value can be a superset, so the SQL pre-filter
+    admits unreadable timestamps explicitly. The row then reaches the fold, marks its item
+    unusable and unjudged — the alternative was a corrupt row that evaded both
+    review-health findings by sorting below a text cutoff."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="corrupt-window")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-corrupt-window", "impl-corrupt-window"))
+        conn.execute("UPDATE dispatches SET created_at='2020-corrupt' WHERE job_id=?",
+                     ("impl-corrupt-window",))
+        conn.commit()
+        # A window far in the FUTURE still returns it: the row's position is unknown, which
+        # is exactly why it cannot be filtered by comparison.
+        rows = triage._fetch_review_rows(conn, (NOW + dt.timedelta(days=365)).isoformat()).terminal
+        assert [r["implement_job_id"] for r in rows] == ["impl-corrupt-window"], [
+            dict(r) for r in rows]
+        status = triage._fold_review_status(triage._review_fold_rows(rows, []))
+        item = status["demo-repo"][list(status["demo-repo"])[0]]
+        assert item.unusable is True and item.code_blocked is None
+        keys = [f["key"] for f in triage._unusable_verdict_findings(status)]
+        assert keys == ["review-verdicts-unusable-demo-repo"], keys
+
+
+def test_the_review_instant_has_one_definition():
+    """§121: the sort key and the fold's placeability read the same helper, so a row cannot
+    be placeable to one and unplaceable to the other."""
+    row = _review_row(1, "impl-1", {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                    "outcome": "clean", "blocking": []},
+                      created_at="2026-10-01T06:00:00+00:00")
+    assert triage._review_instant(row) == dt.datetime(2026, 10, 1, 6, tzinfo=dt.timezone.utc)
+    assert triage._review_order_key(row)[0] == triage._review_instant(row)
+    bad = dict(row, created_at="garbage")
+    assert triage._review_instant(bad) is None
+    assert triage._review_order_key(bad)[0] == dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def test_the_verdict_refusal_names_what_is_wrong():
+    """§119: the fail-closed park note is the operator's only clue, so the shape gate
+    reports the specific rule it refused rather than "does not match the schema"."""
+    current = triage._sideclaw.REVIEW_SCHEMA_VERSION
+    assert triage._review_verdict_problems(
+        {"schemaVersion": current, "outcome": "clean", "blocking": []}) == []
+    problems = triage._review_verdict_problems(
+        {"schemaVersion": current, "outcome": "actionable", "blocking": [None, _CODE_FINDING]})
+    assert len(problems) == 1 and "not findings" in problems[0] and "1 of 2" in problems[0]
+    assert "_is_finding_shape" not in problems[0]
+    assert "unknown outcome" in triage._review_verdict_problems({"outcome": "banana"})[0]
+    assert "not a list" in triage._review_verdict_problems(
+        {"outcome": "clean", "blocking": True})[0]
+    assert "is not an object" in triage._review_verdict_problems([])[0]
+    # One rule set: the gate, the diagnostic and the stored-history reader cannot disagree.
+    for verdict in (None, [], {}, {"blocking": []}, {"outcome": "clean", "blocking": [None]},
+                    {"outcome": "banana", "blocking": []}):
+        assert triage._review_verdict_problems(verdict) != []
+        assert triage._review_contract_matches(verdict) is False
+        assert triage._is_completed_review(verdict) is False
+    assert triage._review_contract_matches({"schemaVersion": current - 1, "outcome": "clean",
+                                            "blocking": []}) is False
+    assert triage._review_contract_matches({"schemaVersion": current, "outcome": "clean",
+                                            "blocking": []}) is True
+
+
+def test_a_section_failure_and_the_invariant_guard_share_one_isolation_point():
+    """§119: `_audit_section()` and the invariants guard are the same isolation, so a
+    change to it cannot land in one and miss the other."""
+    calls = []
+
+    def _boom():
+        calls.append(1)
+        raise RuntimeError("section blew up")
+
+    result, failure = triage._run_isolated("demo", _boom)
+    assert result is None and isinstance(failure, RuntimeError) and calls == [1]
+    finding, = triage._audit_section("demo", _boom)
+    assert finding["key"] == "self-audit-section-failed-demo"
+    assert "RuntimeError" in repr(finding), finding
+    assert triage._audit_section("demo", lambda: [{"key": "k"}]) == [{"key": "k"}]
+    ok, none = triage._run_isolated("demo", lambda: [{"key": "k"}])
+    assert ok == [{"key": "k"}] and none is None
+
+
+def test_the_audit_window_compares_instants_not_timestamp_text():
+    """A row stored with a non-UTC offset must land in the window by its instant. As
+    text, `10:30+01:00` sorts after `10:00+00:00`; as an instant it is an hour earlier."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="offset-window")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-offset-window", "impl-offset-window"))
+        # The implement row is 09:30 UTC — inside the window that starts at 09:00 UTC.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ("2026-10-01T09:30:00+00:00", "impl-offset-window"))
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ("2026-10-01T09:35:00+00:00", "val-offset-window"))
+        conn.commit()
+        since = "2026-10-01T09:00:00+00:00"
+        assert len(triage._fetch_review_rows(conn, since).terminal) == 1
+
+        # Same text length, but the row is 09:00+01:00 == 08:00 UTC: outside the window.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ("2026-10-01T09:30:00+01:00", "impl-offset-window"))
+        conn.commit()
+        assert triage._fetch_review_rows(conn, since).terminal == []
+
+
+def test_a_failing_invariants_check_does_not_lose_the_rest_of_the_pass():
+    """The invariants call runs first and is the same failure class the findings sections
+    are wrapped against. Its raise must not discard the cursor write, the `warden_self`
+    sync, or the findings already produced — and /health must not read the empty
+    `violations` list as a clean bill."""
+    with _triage_env() as (conn, ctx):
+        marker = {"key": "restore-drill-marker", "title": "t", "detail": "d"}
+        original_inv, original_drill = triage.check_invariants, triage._restore_drill_findings
+        triage.check_invariants = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("bad INVARIANTS rule"))
+        triage._restore_drill_findings = lambda now: [marker]
+        try:
+            triage.run_self_audit(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        finally:
+            triage.check_invariants = original_inv
+            triage._restore_drill_findings = original_drill
+
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()["value"])
+        assert "self-audit-section-failed-invariants" in summary["findings"], summary["findings"]
+        assert "RuntimeError: bad INVARIANTS rule" in summary["invariants_error"]
+        # The cursor write and the self-source event both landed despite the failure.
+        assert conn.execute("SELECT 1 FROM events WHERE source=? AND external_id=?",
+                            ("warden_self", "self-audit-section-failed-invariants")).fetchone() is not None
+        assert marker["key"] in summary["findings"], "the other sections still reported"
+
+
+def test_the_unusable_verdict_finding_covers_a_missing_verdict_too():
+    """A terminal `failed`/`cancelled` review stores no verdict at all — the finding
+    must say so rather than describing a payload that does not exist."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="no-verdict-row")
+        conn.execute("UPDATE dispatches SET status='failed', verdict_json=NULL, created_at=? "
+                     "WHERE job_id=?", (NOW.isoformat(), "val-no-verdict-row"))
+        conn.execute("UPDATE dispatches SET validation_job_id=?, created_at=? WHERE job_id=?",
+                     ("val-no-verdict-row", NOW.isoformat(), "impl-no-verdict-row"))
+        conn.commit()
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
+        finding = next(f for f in findings if f["key"].startswith("review-verdicts-unusable-"))
+        assert "no verdict at all" in finding["detail"]
+        assert "does not match sideclaw's published schema" in finding["detail"]
+        assert "demo-repo" in finding["key"]
+
+
+def test_the_terminal_statuses_constant_is_deterministically_ordered():
+    """`TERMINAL` is a frozenset, so a raw `tuple()` of it varies with hash
+    randomization — a public constant must not reorder between processes.
+
+    Asserted against a LITERAL tuple, not `tuple(sorted(...))`: mirroring the production expression
+    would prove only that the constant equals itself, and a status the loop must treat as terminal
+    being dropped from the set is exactly the drift this pin is for (§147)."""
+    assert triage._sideclaw.TERMINAL_STATUSES == ("cancelled", "done", "failed", "interrupted")
+    assert set(triage._sideclaw.TERMINAL_STATUSES) == set(triage._sideclaw.TERMINAL)
+
+
+def test_a_revision_brief_never_quotes_a_finding_that_is_not_one():
+    """§117 — `_revision_findings()` reads a STORED verdict, so it must apply the same
+    finding-shape gate the audit does. `{}` and `{"file": "x"}` pass a bare
+    `isinstance(…, dict)` check, and a brief built from them is a whole episode spent
+    on `- ? — ?` instead of on the reviewer's actual finding."""
+    with _triage_env() as (conn, ctx):
+        assert triage._published_findings([{}, {"file": "x"}, {"message": "y"}, None, 5]) == []
+        assert triage._code_blocking_findings([{}, _CODE_FINDING]) == [_CODE_FINDING]
+
+        # A blocked verdict whose findings are ALL junk yields no brief at all — the
+        # item stays with a human rather than spending its remaining attempt.
+        for idx, junk in enumerate(([{}], [{"file": "x"}], [{"message": "y"}], [None], [[]])):
+            eid = _seed_blocked_item(conn, external_id=f"junk-brief-{idx}", blocking=junk)
+            assert triage._revision_findings(conn, triage._get_item(conn, eid)) is None
+
+        # ... while one real finding among the junk still produces a brief naming it.
+        eid = _seed_blocked_item(conn, external_id="mixed-brief",
+                                 blocking=[{}, _CODE_FINDING, {"file": "x"}])
+        brief = triage._revision_findings(conn, triage._get_item(conn, eid))
+        assert brief is not None and "src/weatherorb/serve/cache.py:334" in brief
+        assert "? — ?" not in brief
 
 
 def test_blocked_implementation_goes_back_to_the_implementer_with_findings():
@@ -8495,7 +9332,7 @@ def test_revisions_exhausted_names_a_non_convergent_review():
                 "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
                 (eid, triage.STATE_VALIDATING, triage.STATE_MERGE_BLOCKED, NOW.isoformat(), note))
         conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW).findings}
         detail = details[f"revisions-exhausted-{eid}"]
         assert "each blocking a different file" in detail, detail
         assert "cannot satisfy the review" not in detail, detail
@@ -8514,7 +9351,7 @@ def test_a_review_that_re_flagged_the_same_location_still_blames_the_review():
                 "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
                 (eid, triage.STATE_VALIDATING, triage.STATE_MERGE_BLOCKED, NOW.isoformat(), note))
         conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW).findings}
         assert "cannot satisfy the review" in details[f"revisions-exhausted-{eid}"]
 
 
@@ -8981,7 +9818,7 @@ def test_self_audit_never_audits_its_own_items():
         conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
                      (eid, "liveness_pending", "new", NOW.isoformat()))
         conn.commit()
-        assert triage.self_audit_findings(conn, NOW, triage.load_policy()) == []
+        assert triage.self_audit_findings(conn, NOW, triage.load_policy()).findings == []
 
 
 def test_inv4_a_finished_investigation_without_effect():
@@ -9044,22 +9881,464 @@ def test_self_audit_turns_a_violation_into_one_event_and_resolves_it():
         assert conn.execute("SELECT resolved_at FROM events WHERE source='warden_self'").fetchone()[0] is None
 
 
+_NO_VERDICT = object()
+
+
+def _seed_blocking_review(conn, *, event_id: int | None, suffix: str, repo: str = "demo-repo",
+                          outcome: str = "actionable", blocking: list[dict[str, Any]] | None = None,
+                          verdict_json: Any = _NO_VERDICT) -> None:
+    """One implement dispatch row plus its step-7 REVIEW row. The `_NO_VERDICT`
+    sentinel distinguishes the normal constructed review from an explicit `None`
+    verdict, which is a failed terminal review with no stored payload."""
+    impl_job, rev_job = f"impl-{suffix}", f"rev-{suffix}"
+    blocking = blocking if blocking is not None else [
+        {"file": "src/x.ts", "line": 12, "message": "the guard is gone"}]
+    if verdict_json is _NO_VERDICT:
+        verdict_json = {"outcome": outcome, "blocking": blocking, "summary": "s",
+                        "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION}
+    if outcome == "needs-human":
+        validation_status = "needs_human"
+    elif outcome == "clean" or not blocking:
+        validation_status = "confirmed"
+    else:
+        validation_status = "blocked"
+    conn.execute(
+        "INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id, "
+        "validation_job_id, validation_status) VALUES (?,?,?,?,?,?,?,?,?)",
+        (impl_job, "implement", repo, "b", "done", NOW.isoformat(), event_id, rev_job,
+         validation_status))
+    review_status = "done" if verdict_json is not None else "failed"
+    conn.execute(
+        "INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id, verdict_json) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (rev_job, "review", repo, "review", review_status, NOW.isoformat(), event_id,
+         json.dumps(verdict_json) if verdict_json is not None else None))
+    conn.commit()
+
+
 def test_self_audit_findings_catch_its_own_wrong_answers():
     with _triage_env() as (conn, ctx):
         for i in range(3):
-            conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, validation_status) "
-                         "VALUES (?,?,?,?,?,?,?)", (f"blk-{i}", "implement", "demo-repo", "b", "done",
-                                                    NOW.isoformat(), "blocked"))
+            _seed_blocking_review(conn, event_id=900 + i, suffix=f"blk-{i}")
         fixed = _seed_state(conn, external_id="came-back", state=triage.STATE_NEW)
         conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
                      (fixed, "fixed", "new", NOW.isoformat()))
         _seed_state(conn, external_id="out-of-revisions", state=triage.STATE_MERGE_BLOCKED, note="blocked",
                     revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
         conn.commit()
-        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW).findings}
         assert "review-always-blocks-demo-repo" in keys
         assert f"fixed-reopened-{fixed}" in keys
         assert any(k.startswith("revisions-exhausted-") for k in keys)
+
+
+def test_self_audit_sees_a_needs_human_review_that_carries_a_code_finding():
+    """§116 — §115 folds a `needs-human` review that carries findings to
+    `needs_human`, and this audit keyed "the review keeps blocking" on the folded
+    `blocked` column, so it went blind to exactly the reviews that keep raising
+    code findings. Keyed on the review's own `blocking[]` instead, the gate signal
+    survives the fold."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=910 + i, suffix=f"nh-{i}",
+                                  outcome="needs-human",
+                                  blocking=[{"file": "src/x.ts", "message": "the guard is gone"}])
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW).findings}
+        assert "review-always-blocks-demo-repo" in keys
+
+
+def test_self_audit_reports_an_origin_less_pair_instead_of_judging_it():
+    """§133 — the consequence of the rule above, at the finding level: three manual pairs whose
+    pointer nothing can verify must not be counted as a review gate that blocks every PR (that
+    would be a verdict no one could corroborate) and must not vanish either. They are the
+    unusable finding, and the gate finding says nothing about them."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=None, suffix=f"manual-{i}")
+        keys = {f["key"] for f in triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))}
+        assert "review-verdicts-unusable-demo-repo" in keys
+        assert "review-always-blocks-demo-repo" not in keys, keys
+
+
+def test_self_audit_counts_a_pr_once_across_its_revisions():
+    """§116 — one PR that took two revisions contributes two implement rows, and
+    the audit counted ROWS: two items could cross the `n >= 3` bar on the strength
+    of one item's second attempt. Two items (one with two blocked rows) is two."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=920, suffix="rev-920-a")
+        _seed_blocking_review(conn, event_id=920, suffix="rev-920-b")
+        _seed_blocking_review(conn, event_id=921, suffix="rev-921")
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW).findings}
+        assert "review-always-blocks-demo-repo" not in keys
+
+        _seed_blocking_review(conn, event_id=922, suffix="rev-922")
+        finding = next(f for f in triage.self_audit_findings(conn, NOW).findings
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+
+def test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one():
+    """§117 — §116 added an item to `code_blocked` on ANY of its reviews that
+    carried a code finding and never removed it, so a PR whose first revision was
+    blocked and whose latest revision passed still read as blocked: a repo that
+    accepts its PRs after one revision round fired "the review blocked all N PRs"
+    on items that were ultimately accepted. An item's status is its LATEST review's
+    — an earlier blocked round must not keep it counted."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=930 + i, suffix=f"late-{930 + i}-a")
+            _seed_blocking_review(conn, event_id=930 + i, suffix=f"late-{930 + i}-b",
+                                  outcome="actionable", blocking=[])
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW).findings}
+        assert "review-always-blocks-demo-repo" not in keys
+
+    with _triage_env() as (conn, ctx):
+        # Three items whose LATEST review blocks still fire, including items
+        # that returned clean on an earlier round.
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-a",
+                                  outcome="clean", blocking=[])
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-b")
+        finding = next(f for f in triage.self_audit_findings(conn, NOW).findings
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+
+def test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item():
+    """§117 — only a COMPLETED review speaks for an item. A review that left no
+    usable verdict behind — a payload `_safe_json()` reduces to `{}`, or an
+    `outcome` outside sideclaw's published `REVIEW_OUTCOMES` — says nothing about
+    the item, so it must neither clear an earlier code-blocked round nor join the
+    denominator. Reading "no `blocking` key" as "passed" is §115's blindness in
+    another column, on the one check whose job is to notice a broken review gate."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=960 + i, suffix=f"unusable-{960 + i}-a")
+            _seed_blocking_review(conn, event_id=960 + i, suffix=f"unusable-{960 + i}-b",
+                                  outcome="error", blocking=[], verdict_json={"outcome": "error"})
+        finding = next(f for f in triage.self_audit_findings(conn, NOW).findings
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+    with _triage_env() as (conn, ctx):
+        # ...and an item whose ONLY review is unusable is not part of the
+        # denominator either — the item count stays honest at 3.
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=970 + i, suffix=f"den-{970 + i}")
+        _seed_blocking_review(conn, event_id=973, suffix="den-973",
+                              outcome="error", blocking=[], verdict_json={"summary": "no verdict"})
+        finding = next(f for f in triage.self_audit_findings(conn, NOW).findings
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+
+def test_self_audit_completed_review_shape_handles_clean_and_non_object_payloads():
+    """§117 — clean outcomes may omit `blocking` (the live fold reads that as
+    `[]`), while valid non-object JSON must be unusable without crashing."""
+    clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean"}
+    assert triage._is_completed_review(clean)
+    for value in (None, [], "error", 12):
+        assert not triage._is_completed_review(value)
+
+
+def test_self_audit_completed_review_rejects_explicit_null_blocking_and_bool_schema():
+    clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean"}
+    assert triage._is_completed_review(clean)
+    assert not triage._is_completed_review({**clean, "blocking": None})
+    assert not triage._is_completed_review({"schemaVersion": True, "outcome": "clean"})
+    assert not triage._is_completed_review({"schemaVersion": -1, "outcome": "clean"})
+    assert not triage._is_completed_review({
+        "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+        "outcome": "actionable",
+    })
+
+
+def test_a_non_list_blocking_payload_does_not_crash_the_validation_tick():
+    """§117 — sideclaw publishes `blocking` as a list of objects, but a corrupt or
+    hand-written payload can hold a scalar. Two things must hold: the normalizer
+    reads it as "no finding" rather than raising mid-tick (the job is already
+    persisted, so a raise here re-crashes identically on every poll), and the merge
+    gate FAILS CLOSED on it rather than folding it like a clean verdict and letting
+    a merge through on a payload nobody can vouch for."""
+    with _triage_env() as (conn, ctx):
+        for value in (True, 7, "a finding", {"file": "src/x.ts"}, [None], ["nope"]):
+            assert triage._code_blocking_findings(value) == []
+            assert triage._process_only_findings(value) == []
+
+        for idx, value in enumerate((True, [{"file": "src/x.ts"}], "not a list")):
+            eid = _seed_verdict_item(conn, external_id=f"sig-scalar-blocking-{idx}",
+                                     investigate_job=f"investigate-job-scalar-{idx}")
+            job = f"implement-job-scalar-{idx}"
+            conn.execute(
+                "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? "
+                "WHERE event_id=?",
+                (triage.STATE_VALIDATING, job, f"validation-job-scalar-{idx}",
+                 f"https://github.com/jkrumm/demo-repo/pull/1{idx}", eid),
+            )
+            conn.commit()
+            _seed_implement_dispatch(conn, job)
+            triage._sideclaw.get = lambda job_id, _v=value: {
+                "status": "done",
+                "result": _review_result("actionable", blocking=_v, summary="malformed payload."),
+            }
+            merged: list[int] = []
+            triage._merge.plan_or_land = lambda *a, **kw: merged.append(1)
+
+            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+            assert merged == [], "a malformed verdict must never reach a merge"
+            assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_HUMAN
+            d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                             (job,)).fetchone()
+            assert d["validation_status"] == "needs_human", d["validation_status"]
+
+
+def test_a_dry_run_validation_tick_is_a_no_op_even_for_an_unreadable_verdict():
+    """The dry-run contract (AGENTS.md): never touches Slack, never shells out,
+    everything else real. `poll_validation_jobs()` returns before it reads a single
+    item, so the new fail-closed branch — like the two terminal branches above it —
+    can never publish a card or move an item under `dry_run=True`."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-dry-run", investigate_job="investigate-dry")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-dry", "validation-job-dry",
+             "https://github.com/jkrumm/demo-repo/pull/12", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-dry")
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result("actionable", blocking=True, summary="malformed payload."),
+        }
+        merged: list[int] = []
+        triage._merge.plan_or_land = lambda *a, **kw: merged.append(1)
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=True)
+
+        assert merged == []
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_VALIDATING
+        assert ctx.posted == [], "a dry run must not publish a card"
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-dry",)).fetchone()
+        assert d["validation_status"] is None, d["validation_status"]
+
+
+def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
+    """The fold orders its own input, keeps one record per item, and the review
+    classifiers share exactly one payload-shape predicate."""
+    complete_blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                         "outcome": "actionable", "blocking": [_CODE_FINDING]}
+    complete_clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                      "outcome": "clean", "blocking": []}
+    # `REVIEW_SCHEMA_VERSION` starts at 1 and no version 0 ever existed, so a stored 0 is
+    # a corrupt payload rather than an older format this reader knows how to read.
+    assert not triage._is_completed_review(dict(complete_clean, schemaVersion=0))
+    assert not triage._is_completed_review(dict(complete_clean, schemaVersion=-1))
+    assert triage._is_completed_review(complete_clean)
+    assert triage._review_contract_matches(complete_clean)
+    lower = triage._sideclaw.REVIEW_SCHEMA_VERSION - 1
+    if lower >= 1:
+        # A genuinely older version stays parseable for stored history, but a NEW result
+        # must carry today's exact version.
+        assert triage._is_completed_review(dict(complete_clean, schemaVersion=lower))
+        assert not triage._review_contract_matches(dict(complete_clean, schemaVersion=lower))
+    for corrupt in (None, [], {**complete_clean, "blocking": None},
+                    {**complete_clean, "blocking": [None]}):
+        assert not triage._review_contract_matches(corrupt)
+        assert not triage._is_completed_review(corrupt)
+    # The shape rule has one entry point; a complete payload passes it with nothing to say.
+    assert triage._review_verdict_problems(complete_clean) == []
+    assert triage._review_verdict_problems(complete_blocking) == []
+
+    seq = itertools.count()
+
+    def row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00"):
+        # The module-level helper, so this test cannot drift from the row shape the fold
+        # reads (§127); only the id source is local.
+        return _review_row(event_id, job, verdict, status=status, created_at=created_at,
+                           row_id=next(seq))
+
+    rows = [
+        row(1, "impl-1a", complete_blocking),   # blocked, then accepted: not blocked
+        row(1, "impl-1b", complete_clean),
+        row(2, "impl-2", complete_blocking),
+        row(3, "impl-3", complete_blocking),
+        row(4, "impl-4a", complete_blocking),   # blocked, then unreadable: still blocked
+        row(4, "impl-4b", None, status="failed"),
+        row(5, "impl-5", None, status="failed"),  # no complete review at all: absent
+    ]
+    status_by_repo = triage._fold_review_status(rows)
+    # The fold orders its own input: the same rows shuffled give the same answer.
+    for shuffled in (list(reversed(rows)), rows[3:] + rows[:3]):
+        assert triage._fold_review_status(shuffled) == status_by_repo
+    demo = status_by_repo["demo-repo"]
+    assert {k: v.code_blocked for k, v in demo.items()} == {
+        1: False, 2: True, 3: True, 4: True, 5: None}
+    assert {k: v.unusable for k, v in demo.items()} == {
+        1: False, 2: False, 3: False, 4: True, 5: True}
+    # A manual dispatch has no triage event, so its implement job is the item key.
+    manual = triage._fold_review_status([row(None, "impl-manual", complete_blocking)])
+    assert manual["demo-repo"]["impl-manual"].code_blocked is True
+    assert manual["demo-repo"]["impl-manual"].unusable is False
+
+    # "Latest" is by TIME and the id only breaks a tie: every row above shares one `created_at`, so
+    # the cases proved the tie-break alone (see the case below, where the row that must LOSE is the
+    # one with the higher id — an id-ordered fold would answer `True`).
+    stale_blocking = _review_row(6, "impl-6-stale", complete_blocking,
+                                 created_at="2026-10-01T05:00:00", row_id=9999)
+    fresh_clean = _review_row(6, "impl-6-fresh", complete_clean,
+                              created_at="2026-10-01T07:00:00", row_id=next(seq))
+    for order in ([stale_blocking, fresh_clean], [fresh_clean, stale_blocking]):
+        folded = triage._fold_review_status(order)["demo-repo"][6]
+        assert folded.code_blocked is False, folded
+        assert folded.unusable is False, folded
+
+
+def test_a_persisted_non_object_verdict_cannot_crash_the_revision_brief():
+    """§117 — the recurring loop reads a blocked item's stored review verdict to build
+    the revision brief. `_safe_json()` reduces valid non-object JSON to `{}`, so a
+    persisted scalar/array/string verdict reads as an empty dict and the brief falls
+    through to `None` — it must never raise while the loop is mid-tick."""
+    with _triage_env() as (conn, ctx):
+        for idx, raw in enumerate(("5", "[]", '"error"', "true", "not json at all")):
+            raw_marker = f"raw-{idx}"
+            eid = _seed_blocked_item(conn, external_id=raw_marker)
+            conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id=?",
+                         (raw, f"val-{raw_marker}"))
+            conn.commit()
+            item = triage._get_item(conn, eid)
+            assert triage._revision_findings(conn, item) is None
+
+
+def test_the_blocked_note_keeps_the_reviews_own_finding_order():
+    """§117 — the split into code/process findings is a DECISION input, not a display
+    one: a `blocked` note must quote the findings in the order the review published
+    them, or the numbering a human reads stops matching the payload."""
+    with _triage_env() as (conn, ctx):
+        published, code, process = triage._partition_findings(
+            [_PROCESS_ONLY_FINDING, _CODE_FINDING])
+        assert published == [_PROCESS_ONLY_FINDING, _CODE_FINDING]
+        assert code == [_CODE_FINDING] and process == [_PROCESS_ONLY_FINDING]
+
+        eid = _seed_blocked_item(conn, external_id="note-order",
+                                 blocking=[_PROCESS_ONLY_FINDING, _CODE_FINDING])
+        brief = triage._revision_findings(conn, triage._get_item(conn, eid))
+        # The wrapper class is not handed to an episode (§114), so the brief carries
+        # the code finding — in the review's own position, not regrouped by type.
+        assert brief is not None and "src/weatherorb/serve/cache.py:334" in brief
+        assert "Closes #20" not in brief
+
+
+def test_self_audit_reports_an_item_by_its_latest_row_not_an_earlier_unusable_one():
+    """§117 — the unusable report follows the same "latest row wins" rule as the
+    blocking count. An item whose earlier review was unusable but whose newest
+    review is a complete clean one is healthy, and must not be reported as having
+    an unusable verdict for the rest of the window."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=950 + i, suffix=f"stale-{950 + i}-a",
+                                  verdict_json={"schemaVersion": 1, "outcome": "actionable"})
+            _seed_blocking_review(conn, event_id=950 + i, suffix=f"stale-{950 + i}-b",
+                                  outcome="clean", blocking=[])
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
+        assert findings == []
+
+
+def test_self_audit_handles_mixed_origin_unusable_keys_without_crashing():
+    """§117 — a loop-originated item keys its unusable report on an int event id,
+    a manual `warden dispatch` on its job-id string. Sorting the sample must not
+    compare the two types."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=960, suffix="mixed-loop",
+                              verdict_json={"schemaVersion": 1, "outcome": "actionable"})
+        _seed_blocking_review(conn, event_id=None, suffix="mixed-manual",
+                              verdict_json={"schemaVersion": 1, "outcome": "actionable"})
+        finding = next(f for f in triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
+                       if f["key"] == "review-verdicts-unusable-demo-repo")
+        assert "2 item(s)" in finding["title"]
+        assert "960" in finding["detail"] and "mixed-manual" in finding["detail"]
+
+
+def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
+    """§117 — a parseable-but-INCOMPLETE stored verdict with a non-clean outcome
+    and no `blocking` key must not read as a clean review or erase a prior block.
+    Clean outcomes alone may omit `blocking`; every other known outcome must
+    carry the list the reviewer publishes."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-a")
+            _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-b",
+                                  verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                                "outcome": "actionable"})
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
+        assert {f["key"] for f in findings} == {
+            "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
+
+
+def test_self_audit_skips_a_completed_review_with_malformed_findings():
+    """§117 — a list is necessary but not sufficient for a complete review. Its
+    entries must be finding objects with non-empty `file` and `message` fields too:
+    `[null]`, `[{}]`, and `[{"file": "src/x.ts"}]` must surface as unusable, not
+    crash the loop or be miscounted as an actual reviewer finding."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-a")
+            if i == 0:
+                _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-b",
+                                      verdict_json=None)
+                continue
+            malformed = [{}] if i == 1 else [{"file": "src/x.ts"}]
+            _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-b",
+                                  verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                                "outcome": "actionable", "blocking": malformed})
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
+        assert {f["key"] for f in findings} == {
+            "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
+        bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
+        assert "3 item(s)" in bad["title"]
+
+
+def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():
+    """§117 — the review audit never reads an unusable verdict as a clean pass; it
+    emits a bounded self-audit finding through the same `warden_self` event path,
+    then resolves that event after a clean pass. No log-only print is the signal.
+
+    The earlier blocking review still speaks: the unusable later review neither
+    erases it nor joins the denominator. `run_self_audit()` writes the finding with
+    the same insert/reopen/resolve semantics as every other self-audit key."""
+    with _triage_env() as (conn, ctx):
+        _seed_state(conn, external_id="self-audit-route-seed", state=triage.STATE_NEEDS_HUMAN)
+        conn.execute("UPDATE events SET source=? WHERE external_id=?",
+                     (triage.SELF_SOURCE, "self-audit-route-seed"))
+        for i in range(3):
+            eid = _seed_state(conn, external_id=f"unusable-live-{1000 + i}", state=triage.STATE_NEEDS_HUMAN)
+            conn.execute("UPDATE events SET source=? WHERE id=(SELECT id FROM events WHERE external_id=?)",
+                         (triage.SELF_SOURCE, f"unusable-live-{1000 + i}"))
+            _seed_blocking_review(conn, event_id=eid, suffix=f"visible-{eid}-a")
+            _seed_blocking_review(conn, event_id=eid, suffix=f"visible-{eid}-b",
+                                  verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                                "outcome": "actionable", "blocking": [None]})
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
+        assert {f["key"] for f in findings} == {"review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
+        triage.run_self_audit(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert conn.execute("SELECT count(*) FROM events WHERE external_id='review-verdicts-unusable-demo-repo'").fetchone()[0] == 1
+        ev = conn.execute("SELECT * FROM events WHERE source=? AND external_id=?",
+                          (triage.SELF_SOURCE, "review-verdicts-unusable-demo-repo")).fetchone()
+        assert ev is not None and ev["resolved_at"] is None
+        # Route is a warden self-audit event; its event is the structured signal.
+        # Card/classification is exercised by the normal source classifier elsewhere.
+        assert ev["source"] == triage.SELF_SOURCE
+
+        # Repair the three payloads: no unusable finding on the next audit pass.
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id LIKE 'rev-visible-%-b'",
+                     (json.dumps({"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                  "outcome": "actionable", "blocking": []}),))
+        conn.commit()
+        later = NOW + dt.timedelta(hours=2)
+        triage.run_self_audit(conn, DEFAULT_POLICY, later, dry_run=False)
+        assert conn.execute("SELECT resolved_at FROM events WHERE id=?", (ev["id"],)).fetchone()[0]
 
 
 def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review():
@@ -9084,12 +10363,59 @@ def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review()
                                            "serialize a structured verdict",
                                       revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
         conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW).findings}
         gate_detail = details[f"revisions-exhausted-{on_the_gate}"]
         assert "merge gate" in gate_detail and "403" in gate_detail
         assert "cannot satisfy the review" not in gate_detail
         assert "cannot satisfy the review" in details[f"revisions-exhausted-{on_the_review}"]
         assert "review pipeline" in details[f"revisions-exhausted-{on_the_pipeline}"]
+
+
+def test_the_two_self_audit_registries_have_to_agree():
+    """§141 — the section registry and the section map were two structures kept in sync by hand,
+    and the pipeline dispatched on their INTERSECTION: a declared section with no callable was
+    skipped without a word, so it stopped running, its silence read as "nothing to report", and the
+    resolve sweep closed the very alerts it had stopped checking. Both directions are a finding
+    now, and this test is what keeps the real registries honest — the previous check compared the
+    table against a hardcoded literal set, which cannot see the map at all."""
+    with _triage_env() as (conn, ctx):
+        declared = {name for name, _keys in triage.SELF_AUDIT_SECTIONS}
+        # The two registries agree, and the only names without a section here are the ones that say
+        # why they are elsewhere.
+        assert set(triage._self_audit_sections(conn, NOW.isoformat(), NOW, None)) == \
+            declared - set(triage.SELF_AUDIT_ELSEWHERE)
+        assert set(triage.SELF_AUDIT_ELSEWHERE) <= declared
+        # One call, one list: the first draft asked twice and the first half of the disjunction
+        # made the second half unreachable whenever the list was empty (§147).
+        findings = triage.self_audit_findings(conn, NOW).findings
+        assert not [f for f in findings if f["key"].startswith(triage.SECTION_FAILURE_PREFIX)]
+
+        # A name declared but never built: the pipeline reports it instead of skipping it, and the
+        # prefixes it owns are exempted from the sweep because it did not run.
+        real = triage.SELF_AUDIT_SECTIONS
+        try:
+            setattr(triage, "SELF_AUDIT_SECTIONS", (*real, ("fabricated", ("fabricated-",))))
+            findings = triage.self_audit_findings(conn, NOW).findings
+            failure = [f for f in findings if f["key"] == f"{triage.SECTION_FAILURE_PREFIX}fabricated"]
+            assert failure, [f["key"] for f in findings]
+            assert "SELF_AUDIT_SECTIONS" in failure[0]["detail"], failure[0]
+            assert triage._unrechecked_prefixes(["fabricated"]) == ("fabricated-",)
+        finally:
+            triage.SELF_AUDIT_SECTIONS = real
+
+        # A section built but never declared: its key prefixes are unknown, so the sweep cannot
+        # protect them — reported, because it is a finding nobody would otherwise see.
+        try:
+            setattr(triage, "SELF_AUDIT_SECTIONS",
+                    tuple(entry for entry in real if entry[0] != "restore-drill"))
+            findings = triage.self_audit_findings(conn, NOW).findings
+            failure = [f for f in findings
+                       if f["key"] == f"{triage.SECTION_FAILURE_PREFIX}restore-drill"]
+            assert failure, [f["key"] for f in findings]
+            assert "not declared" in failure[0]["detail"], failure[0]
+            assert triage._unrechecked_prefixes(["restore-drill"]) == ()
+        finally:
+            setattr(triage, "SELF_AUDIT_SECTIONS", real)
 
 
 def test_warden_self_events_route_to_warden_by_the_real_policy():
@@ -9098,6 +10424,44 @@ def test_warden_self_events_route_to_warden_by_the_real_policy():
     assert hit is not None and hit["repo"] == "warden"
     assert "warden_self" in triage.INGEST_SOURCES
     assert set(triage.INVARIANTS) >= triage.REPORT_ONLY_INVARIANTS
+
+
+def test_a_report_only_invariant_is_measured_but_never_alerted():
+    """§139 — the coupling between "report-only" and the resolve sweep, asserted instead of
+    implied. `REPORT_ONLY_INVARIANTS` are dropped before the finding dict is built, so their keys
+    never enter `live_keys`, and an event that existed for one would be RESOLVED by the sweep that
+    same pass. That is the intent (a second item about something already in front of the owner
+    breaks "one entry per thing that needs him"), but the violation still has to be measured, or
+    "report-only" would mean "not checked at all". Both halves are pinned here, so adding an id to
+    that set cannot silently change resolve-sweep behaviour without failing this test."""
+    with _triage_env() as (conn, ctx):
+        stale = (NOW - dt.timedelta(days=triage.OWNER_QUEUE_STALE_DAYS + 1)).isoformat()
+        parked = _seed_state(conn, external_id="stale-parked", state=triage.STATE_NEEDS_HUMAN,
+                             note="approve it",
+                             state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at, note) "
+                     "VALUES (?,?,?,?,?)",
+                     (parked, triage.STATE_NEW, triage.STATE_NEEDS_HUMAN, stale, "seed"))
+        # …and a violation of an invariant that is NOT report-only, for the contrast.
+        clocked = _seed_state(conn, external_id="no-clock", state=triage.STATE_VERDICT,
+                              state_deadline=None)
+        conn.commit()
+        assert ("INV-7-owner-queue", parked) in _ids(triage.check_invariants(conn, NOW))
+        assert ("INV-1-clock", clocked) in _ids(triage.check_invariants(conn, NOW))
+
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        cursor = json.loads(conn.execute("SELECT value FROM cursors WHERE key=?",
+                                         (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()["value"])
+        # Measured: the report-only violation is in the summary /health reads back.
+        assert {"id": "INV-7-owner-queue", "count": 1} in cursor["violations"]
+        # Not alerted: no finding, so no `warden_self` event for a sweep to keep alive or resolve.
+        assert "inv-7-owner-queue" not in cursor["findings"]
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE source=? AND external_id=?",
+                            (triage.SELF_SOURCE, "inv-7-owner-queue")).fetchone()[0] == 0
+        # The non-report-only violation does become one, which is the whole difference.
+        assert "inv-1-clock" in cursor["findings"]
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE source=? AND external_id=?",
+                            (triage.SELF_SOURCE, "inv-1-clock")).fetchone()[0] == 1
 
 
 

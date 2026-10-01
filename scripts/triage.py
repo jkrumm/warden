@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, TypedDict, TypeVar
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
@@ -5819,6 +5819,644 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
     )
 
 
+def _published_findings(blocking: Any) -> list[dict[str, Any]]:
+    """The finding objects a verdict's `blocking` field actually carries. Sideclaw
+    publishes a list of objects, but a corrupt or hand-written payload can hold a
+    scalar, a non-list container, or members that are not objects — and the step-7
+    fold, the `blocked` note and the revision brief all iterate this value. Anything
+    that is not one of the published objects reads as "no finding", never as a crash
+    mid-tick.
+
+    `_sideclaw.is_review_finding()` (the published contract's own rule, §121) is applied
+    here rather than only in the audit because this
+    is the one gate every consumer of a STORED verdict goes through: `{}` (or
+    `{"file": "x"}` with no message) is not a finding, and a revision brief built from
+    one is an episode bought to fix `- ? — ?`."""
+    if not isinstance(blocking, list):
+        return []
+    return [f for f in blocking if _sideclaw.is_review_finding(f)]
+
+
+def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
+    """The step-7 findings in a review's `blocking` list that are about the DIFF:
+    §114's wrapper class removed (see `_is_process_only_finding()`)."""
+    return [f for f in _published_findings(blocking) if not _is_process_only_finding(f)]
+
+
+def _process_only_findings(blocking: Any) -> list[dict[str, Any]]:
+    """The complement of `_code_blocking_findings()` — the §114 wrapper class, which
+    must not read as `blocked` but must not be dropped either."""
+    return [f for f in _published_findings(blocking) if _is_process_only_finding(f)]
+
+
+def _partition_findings(blocking: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
+                                                list[dict[str, Any]]]:
+    """`(published, code, process)` from one verdict's `blocking` field.
+
+    `published` keeps the reviewer's own order — that is what a card, a brief or a note
+    should quote, so a human reading them sees the same sequence the review published.
+    `code` and `process` delegate to `_code_blocking_findings()` /
+    `_process_only_findings()`, which hold the §114 split. Those helpers normalise their
+    input first, which is idempotent, so calling them on the already-normalised
+    `published` list is the same partition — one definition of the split, one extra
+    O(len(blocking)) filter pass over at most a handful of findings. Deriving the two
+    lists inline would be a second copy of that classifier, which is the thing to avoid.
+
+    Three passes over a verdict's OWN findings is the price of that single definition, and it
+    is deliberately paid (§138): the alternative considered was one partition loop, which needs
+    the §114 classifier exposed as a per-finding predicate — worth doing when the input can be
+    large, not worth a second classification rule for a list that is a handful of entries. If a
+    verdict ever carries a big `blocking` list, expose that predicate and loop once; never
+    re-implement the split here."""
+    published = _published_findings(blocking)
+    return published, _code_blocking_findings(published), _process_only_findings(published)
+
+
+def _review_verdict_problems(verdict: Any, *, require_blocking: bool = False) -> list[str]:
+    """Every reason the shared verdict-shape contract fails, NAMED.
+
+    A bare "unusable" tells an operator nothing they can act on, so the rule set lives here
+    and every gate is expressed in terms of it — `_is_completed_review()`,
+    `_review_contract_matches()` and the park note below. One
+    place defines the contract, so a rule added for the fold's benefit is automatically
+    what the fail-closed park note reports about the payload it refused.
+
+    `require_blocking` separates the two readers this rule set serves, and it is the one
+    difference between them (§138). A FRESHLY RECEIVED result must carry `blocking`: the
+    producer's published schema lists it in `output.required` for every outcome — the drift
+    check reads exactly that promise — so a new result without it is a partially serialized
+    payload, not a clean review. Reading one as "clean, nothing to report" is the single
+    direction that MERGES code on data nobody could read, which is what §115 exists to stop.
+    The stored reader keeps the leniency: a clean verdict persisted before this contract may
+    simply have no list, and re-reading history merges nothing."""
+    if not isinstance(verdict, dict):
+        return ["result is not an object"]
+    problems: list[str] = []
+    outcome = verdict.get("outcome")
+    if outcome not in _sideclaw.REVIEW_OUTCOMES:
+        problems.append(f"unknown outcome {outcome!r}")
+    blocking = verdict.get("blocking", [])
+    if "blocking" not in verdict and (outcome != "clean" or require_blocking):
+        problems.append(f"outcome {outcome!r} publishes no `blocking` list")
+    elif not isinstance(blocking, list):
+        problems.append(f"`blocking` is {type(blocking).__name__}, not a list")
+    elif not all(_sideclaw.is_review_finding(f) for f in blocking):
+        bad = [f for f in blocking if not _sideclaw.is_review_finding(f)]
+        problems.append(f"{len(bad)} of {len(blocking)} `blocking` entries are not findings "
+                        f"(first: {bad[0]!r:.80})")
+    return problems
+
+
+def _schema_version_of(verdict: Any) -> int | None:
+    """The verdict's schema version as a real integer, or None when it is absent,
+    a bool (which `isinstance(…, int)` accepts), or any other type. One definition of
+    "a version number we can compare" for both gates below."""
+    version = verdict.get("schemaVersion") if isinstance(verdict, dict) else None
+    if isinstance(version, bool) or not isinstance(version, int):
+        return None
+    return version
+
+
+def _review_contract_problems(verdict: Any) -> list[str]:
+    """Why a NEW review result breaks sideclaw's current producer contract, or `[]`.
+
+    ONE evaluation, read by both the gate and the refusal note. They used to ask the same
+    question twice — `_review_contract_matches()` ran `_review_verdict_problems(...,
+    require_blocking=True)` and the caller then ran it AGAIN to build the note — which is two
+    copies of a rule set that has to agree, for the same payload, in the same tick (§147).
+
+    The version is the one part of the contract with no shape to describe, so it contributes its
+    own problem line; a result that is both mistyped and mis-versioned reports both, in that
+    order, exactly as the note did before."""
+    # A new result must publish `blocking` whatever its outcome (§138): see the flag's own
+    # note — this is the one reader whose verdict can send code to a merge.
+    problems = _review_verdict_problems(verdict, require_blocking=True)
+    version = _schema_version_of(verdict)
+    if version != _sideclaw.REVIEW_SCHEMA_VERSION:
+        problems.append(f"schemaVersion {version!r} is not {_sideclaw.REVIEW_SCHEMA_VERSION}")
+    return problems
+
+
+def _review_contract_matches(verdict: Any) -> bool:
+    """Current sideclaw producer contract for a new result: exact schema version plus
+    the shared published review shape. `_is_completed_review()` uses the same rule set
+    (`_review_verdict_problems()`) but accepts an older stored schema version the code can
+    still parse, and `_review_contract_problems()` is the same rule set as a list of reasons."""
+    return not _review_contract_problems(verdict)
+
+
+def _is_completed_review(verdict: Any) -> bool:
+    """True when a STORED review verdict is a complete one: a schema version this
+    consumer can parse, and the shared published outcome and finding shape.
+
+    The self-audit reads stored payloads, so it re-checks the shape instead of assuming
+    it. A corrupt payload becomes `{}` after `_safe_json()`; a partial actionable
+    result has no `blocking` key; `[null]` and `[{}]` are not findings because the
+    reviewer must name both file and message. All are unusable — never passes clearing
+    a code-blocked round — which closes §115's blindness in the audit of that gate."""
+    if _review_verdict_problems(verdict):
+        return False
+    version = _schema_version_of(verdict)
+    # 1, not 0: `REVIEW_SCHEMA_VERSION` starts at 1 and no version 0 ever existed, so a
+    # stored 0 is a corrupt payload, not an older format this reader knows.
+    return version is not None and 1 <= version <= _sideclaw.REVIEW_SCHEMA_VERSION
+
+
+# The two things that can identify a reviewed item: its triage event, or — for a
+# manual `warden dispatch` that never had one — the implement job it was submitted
+# under. Named here because the self-audit keys its per-item maps on it.
+ItemKey = int | str
+
+
+def _pointer_identity_reason(row: sqlite3.Row) -> str | None:
+    """`None` when this row's pointer resolves to a REVIEW of this item; else why it does not.
+
+    ONE definition of the pair's identity. The join used to pin `r.tier='review'`,
+    `r.repo = d.repo` and `r.origin_event_id IS d.origin_event_id` and let an inner join
+    decide, which answered two different questions with one mechanism:
+
+    * ATTRIBUTION (§128) — a mismatched pointer must never be read as this item's review
+      verdict, or `review-always-blocks` can be fabricated or suppressed for an item that
+      never had that review.
+    * VISIBILITY (§129) — and it must not make the item disappear either. An inner join on
+      those predicates drops the implement row entirely, which shrinks the very denominator
+      `review-always-blocks` is computed over *and* hides the stale pointer that did it.
+
+    Same identity, two questions, so the pin is a predicate the caller can use both ways
+    rather than a join for one answer and Python for the other. The identity it checks is a
+    shared NON-NULL origin, and two NULLs are a refusal rather than a match (§133): a NULL
+    origin on both rows is not evidence that they are one item, it is the absence of any
+    evidence. A manual `warden dispatch` pair has no origin, so the pointer is the only claim
+    linking the two rows and nothing can check it — any manual implement in the repo could
+    name any manual review in it, and a stale pointer would be read as this item's verdict,
+    fabricated or suppressed with no alert. Unverifiable is reported like every other
+    unverifiable pointer: the row is folded with its verdict blanked, the item keeps its
+    previous decision, and `review-verdicts-unusable-<repo>` names the reason.
+
+    Terminality is deliberately NOT part of this predicate: a pointer at this item's review
+    that has not finished yet is normal and belongs to no finding."""
+    if row["target_job"] is None:
+        return f"validation_job_id {row['pointer']!r} names no dispatch"
+    if row["target_tier"] != "review":
+        return (f"validation_job_id {row['pointer']!r} names a "
+                f"{row['target_tier']!r} dispatch, not a review")
+    if row["target_repo"] != row["repo"]:
+        return (f"validation_job_id {row['pointer']!r} names a review in repo "
+                f"{row['target_repo']!r}, not {row['repo']!r}")
+    target_origin, origin = row["target_event_id"], row["event_id"]
+    if target_origin is None and origin is None:
+        # Not a match: an absence of evidence read as proof of identity. Nothing but the
+        # pointer links two origin-less rows, and the pointer is what is in question.
+        return (f"validation_job_id {row['pointer']!r} links two rows that carry no origin, "
+                f"so the pointer is the only claim they are one item — unverifiable")
+    if target_origin != origin:
+        return (f"validation_job_id {row['pointer']!r} is another item's review "
+                f"(event {target_origin!r}, not {origin!r})")
+    return None
+
+
+class ReviewRows(NamedTuple):
+    """One query, two outcomes — and they must travel together: `terminal` are the rows that
+    ARE an item's terminal review, `mismatched` the rows whose pointer is not one, each with
+    the reason. One predicate decides which list a row lands in (§128/§129), so a caller
+    cannot take the attributed half and forget the other exists."""
+    terminal: list[sqlite3.Row]
+    mismatched: list[tuple[sqlite3.Row, str]]
+    # Rows admitted only because `datetime(created_at)` cannot be read. It rides here because
+    # this fetch is the one place that already knows (§123's undroppable term), and the summary
+    # needs the number without paying for a second non-sargable scan of `dispatches` on every
+    # tick — a count query derived from rows already in hand is the only shape that costs nothing.
+    corrupt_timestamps: int = 0
+
+
+def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
+    """Every implement row in the window that has a `validation_job_id`, sorted into
+    `terminal` (the pointer resolves to this item's terminal review) and `mismatched`.
+
+    The window is the IMPLEMENT job's `d.created_at`, as it always was; the row's
+    `created_at` is the review's own, which is what the fold orders reviews by. A review
+    result speaks for an implement item only after sideclaw reached a terminal status
+    (`_sideclaw.TERMINAL_STATUSES`); a terminal job may still lack a usable verdict, and that
+    case is reported by the review self-audit rather than mistaken for a pass. A pointer that
+    resolves to this item's review but has not finished is in neither list: there is nothing
+    to read yet and nothing wrong.
+
+    The join resolves the pointer and nothing else — `LEFT JOIN dispatches r ON r.job_id =
+    d.validation_job_id`. Tier, repo and origin are decided by `_pointer_identity_reason()`,
+    so the second list can exist at all; a non-null pointer that resolves to nothing, to
+    another tier (the live ledger has implement→investigate pairs), to another repo, or to
+    another item's review is returned as a mismatch instead of being silently dropped.
+
+    The window compares INSTANTS, not text, and the decision is the one at the tail, in Python:
+    a stored `+HH:MM`/`Z`/naive/space-separated timestamp is parsed, so a row cannot land in or
+    out of the window by its REPRESENTATION. The SQL pre-filter admits on SQLite's own normalised
+    parse of the same column plus unparseable rows, so it is a superset of that decision rather
+    than a cheaper approximation of it — a lexical compare against a bound is not a superset, and
+    it dropped in-window rows whose text sorted low (a space separator, a date-only value).
+
+    No `ORDER BY`: `_fold_review_status()` orders its own input by parsed instant, and a
+    sort here would only imply a contract the fold does not rely on."""
+    since_dt = _parse_ts(since)
+    if since_dt is None:
+        raise ValueError(f"invalid self-audit window start: {since!r}")
+    # The SQL pre-filter is a SUPERSET of the window, not the window itself: the exact
+    # comparison below is on parsed instants, so this only has to be permissive, and anything
+    # it wrongly admits is removed below.
+    #
+    # It admits on `datetime(d.created_at)` — SQLite's OWN normalised parse (§139). A raw-text
+    # compare is not a superset of an instant compare in general, because the REPRESENTATION
+    # decides it: `'2026-09-30 14:00:00-12:00'` sorts before `'2026-09-30T00:00:00'` (`' '` <
+    # `'T'`) although its instant is 2026-10-01T02:00Z, and a bare `'2026-09-30'` sorts before any
+    # bound on the same date. What kept those rows visible was the SLACK, not the compare: the
+    # bound handed in is the window start minus 26 hours, and an in-window row's date is always a
+    # later date than that, so the date prefix decided every in-window comparison before the
+    # separator could. Measured, both ways, over a live-ledger copy: the raw-text form admits all
+    # three representations of an in-window row, and it drops only rows the window's own Python
+    # decision drops anyway. The normalised form removes the dependence on that accident —
+    # `widen = timedelta(0)` would have made the raw-text version drop space-separated in-window
+    # rows, silently and in the one direction §129 forbids — while admitting at most the same
+    # slack-region rows, which the decision below removes.
+    #
+    # The 26-hour slack stays regardless: SQLite truncates fractional seconds, so a row under a
+    # second past the bound could compare as outside it while Python, which keeps microseconds,
+    # keeps it. Slack far larger than any such disagreement removes the question.
+    # Cost: `datetime(...)` on the column is non-sargable, and the query already scans
+    # `dispatches` because of the `IS NULL` term below — `EXPLAIN QUERY PLAN` says `SCAN d` for
+    # both spellings, and 200 runs over the live copy's 379 rows took 10.4 ms normalised against
+    # 14.6 ms raw. It also makes the planned revisit (an expression index on
+    # `datetime(created_at)`, STATE.md) cover this predicate exactly instead of needing a second
+    # shape.
+    widen = dt.timedelta(hours=26)
+    naive_utc = ((since_dt - widen).astimezone(dt.timezone.utc).replace(tzinfo=None)
+                 .isoformat())
+    sql = (
+        "SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
+        "d.created_at AS implement_created_at, d.validation_job_id AS pointer, "
+        "r.job_id AS target_job, r.tier AS target_tier, r.repo AS target_repo, "
+        "r.origin_event_id AS target_event_id, "
+        "r.verdict_json AS verdict_json, "
+        "r.status AS review_status, r.created_at AS created_at, r.id AS id "
+        "FROM dispatches d LEFT JOIN dispatches r ON r.job_id = d.validation_job_id "
+        "WHERE d.tier='implement' AND d.validation_job_id IS NOT NULL "
+        "AND (datetime(d.created_at) >= datetime(?) OR datetime(d.created_at) IS NULL) "
+    )
+    fetched = conn.execute(sql, (naive_utc,)).fetchall()
+    # A row whose timestamp SQLite cannot read is admitted explicitly by the pre-filter
+    # above: no comparison on a corrupt value can be a superset of anything, so without
+    # that term the fail-visible rule below could never see one (§123). The price is that
+    # `OR datetime(...) IS NULL` puts SQLite on a scan of `dispatches` instead of
+    # `idx_dispatches_created` — measured at this size (379 rows, live ledger) both shapes
+    # run in 0.085 ms, so the trade is safety for nothing measurable; the revisit is an
+    # expression index on `datetime(created_at)`, not a weaker predicate (STATE.md).
+    # The exact comparison: parsed instants, microsecond precision, and a row whose
+    # timestamp will not parse is KEPT — a corrupt row must make the audit look at
+    # something, not leave it out. The pre-filter cannot be the decision for either reason
+    # (text comparison, and `>=` on a widened bound admits rows this drops).
+    # Parsed ONCE per row and kept: the window decision and the corrupt-timestamp count are two
+    # questions about the same instant, and answering the second by re-parsing would double the
+    # work inside the tick cost the tripwire watches (§133). `None` always passes the filter, so
+    # the pairs that keep `when is None` are exactly the admitted corrupt rows.
+    admissible = [(r, _parse_ts(r["implement_created_at"])) for r in fetched]
+    rows = [r for r, when in admissible if when is None or when >= since_dt]
+    terminal, mismatched = [], []
+    for r in rows:
+        reason = _pointer_identity_reason(r)
+        if reason is not None:
+            mismatched.append((r, reason))
+        elif r["review_status"] in _sideclaw.TERMINAL_STATUSES:
+            terminal.append(r)
+    return ReviewRows(terminal=terminal, mismatched=mismatched,
+                      corrupt_timestamps=sum(1 for _, when in admissible if when is None))
+
+
+class ReviewRow(TypedDict):
+    """The fold's input contract — and the one place the SQL projection is tied to its readers.
+
+    A `TypedDict`, not a bracket-access `Protocol`: a Protocol that declares only
+    `__getitem__(key: str) -> Any` accepts any mapping, so a renamed or dropped SQL alias
+    type-checks and only fails wherever it is first read. (That is not hypothetical: the alias
+    for the implement job's time was read as the review's for a round.) Every row reaching the
+    fold passes through `_review_fold_rows()`, which validates this key set against what the
+    query actually returned and names the missing column, so the failure is at the boundary and
+    says what it is.
+
+    `created_at` is the REVIEW's own time — the fold's order key; `implement_created_at` is the
+    implement job's — the window key, which decides whether the row could be placed in the
+    window at all. `mismatch_reason` is derived, not stored: it is set only on the synthetic
+    rows `_review_fold_rows()` builds for a pointer that does not resolve to this item's review,
+    and it is a key of its own rather than a value written into `review_status`, which is a
+    terminal-status enum everywhere else.
+    """
+    repo: str
+    event_id: int | None
+    implement_job_id: str
+    implement_created_at: str
+    verdict_json: str | None
+    review_status: str | None
+    created_at: str
+    id: int | None
+    mismatch_reason: str | None
+
+
+# The column aliases `_fetch_review_rows()` projects. Named once because two readers depend on
+# them: the runtime check in `_review_fold_rows()`, and the test that asserts the projection
+# still supplies them.
+REVIEW_QUERY_COLUMNS = ("repo", "event_id", "implement_job_id", "implement_created_at",
+                        "pointer", "target_job", "target_tier", "target_repo",
+                        "target_event_id", "verdict_json", "review_status", "created_at", "id")
+
+
+def _review_fold_rows(rows: Iterable[sqlite3.Row],
+                      mismatched: Iterable[tuple[sqlite3.Row, str]]) -> list[ReviewRow]:
+    """The fold's input: this item's terminal reviews, plus one row per mismatched pointer
+    with its verdict blanked, so §128's exclusion does not become §129's disappearance.
+
+    Blanking is the whole mechanism, and it reuses the rule already in the fold: a row with no
+    readable verdict sets `unusable` and retains an earlier readable review's `code_blocked`
+    through the same carry-forward an unreadable terminal row gets, while an item with nothing
+    readable left stays unjudged rather than entering `review-always-blocks`'s denominator.
+    Dropping the row instead would remove the item from the audit quietly — the denominator
+    shrinks and the stale pointer that caused it is never mentioned.
+
+    A mismatched row is ordered by the IMPLEMENT job's time: it has no review, so it has no
+    review time, and borrowing the target's would order this item by another item's clock. Its
+    `review_status` stays whatever the target actually holds (None when there is no target):
+    the reason travels in `mismatch_reason`, so a reader never finds a sentence where every
+    other row has a status."""
+    # Both inputs are ONE-SHOT-iteration safe: `rows` is consumed for the column check and
+    # again for the conversion, and an `Iterable` is allowed to be an iterator, whose second
+    # pass yields nothing — an item's terminal reviews would drop out of the fold and
+    # `review-always-blocks` would undercount with nothing said (§131).
+    rows = list(rows)
+    mismatched = list(mismatched)
+    for r in rows + [r for r, _ in mismatched]:
+        # `keys()` builds a fresh list of 13 column names, so calling it inside the comprehension
+        # rebuilt it once per column per row (§133).
+        keys = r.keys()
+        missing = [c for c in REVIEW_QUERY_COLUMNS if c not in keys]
+        if missing:
+            raise RuntimeError(
+                f"_fetch_review_rows() did not project {missing} — the fold reads a row by "
+                f"these names, and a renamed alias must fail here rather than at a reader")
+    return ([_as_review_row(r, None) for r in rows]
+            + [_as_review_row({**dict(r), "verdict_json": None, "id": None,
+                               "created_at": r["implement_created_at"]}, reason)
+               for r, reason in mismatched])
+
+
+def _as_review_row(row: Mapping[str, Any] | sqlite3.Row,
+                   mismatch_reason: str | None) -> ReviewRow:
+    """One row in, one `ReviewRow` out — the single conversion point into the fold's contract.
+
+    Built key by key rather than `cast()` over `{**row, ...}`: a spread carried the projection's
+    pointer columns (`pointer`, `target_*`) into the result, so the dict said one shape while the
+    annotation said another and a later reader could take an undeclared key through the contract
+    without ever meeting it (§134). `_review_fold_rows()` has already checked that the source
+    carries every column named here, which is what makes the direct reads safe for both a
+    `sqlite3.Row` and a test double."""
+    return ReviewRow(
+        repo=row["repo"],
+        event_id=row["event_id"],
+        implement_job_id=row["implement_job_id"],
+        implement_created_at=row["implement_created_at"],
+        verdict_json=row["verdict_json"],
+        review_status=row["review_status"],
+        created_at=row["created_at"],
+        id=row["id"],
+        mismatch_reason=mismatch_reason,
+    )
+
+
+class _ReviewedItem(NamedTuple):
+    """The latest terminal row's effects on the audit.
+
+    `mismatch` carries the reason a row's pointer did not resolve to its own review, so the
+    fifth finding can name the cause and not only the item id. It rides here rather than in
+    `unusable` because it is the *why*; `unusable` stays the boolean the other findings read."""
+    code_blocked: bool | None  # None: no complete review; don't dilute n >= 3.
+    unusable: bool             # latest terminal row's result cannot be safely read.
+    mismatch: str | None = None  # why this row's pointer is not this item's review.
+
+
+def _carry_forward_code_blocked(verdict: dict[str, Any], readable: bool,
+                                previous: _ReviewedItem | None) -> bool | None:
+    """What this row says about the item's review gate, in order of authority.
+
+    A readable verdict speaks for itself. A row we cannot read says nothing: the last
+    known answer is carried forward so a previous complete review keeps counting, and an
+    item that never had one stays `None` — the value that keeps it out of
+    `_always_blocks_findings()`'s `n >= 3` denominator instead of diluting it."""
+    if readable:
+        return bool(_code_blocking_findings(verdict.get("blocking")))
+    if previous is not None:
+        return previous.code_blocked
+    return None
+
+
+def _row_is_placeable(r: ReviewRow) -> bool:
+    """Whether this row can be POSITIONED — in the item's review sequence and in the window.
+
+    Both timestamps have to parse: the review's `created_at` is the fold's order key, and
+    the implement job's is the window key. An unreadable one means the row's place is
+    unknown, which is not the same as "old" — §123 admits such rows past the SQL pre-filter
+    precisely so the fold can see them and refuse to judge, rather than have them dropped
+    before anything looks."""
+    return _review_instant(r) is not None and _parse_ts(r["implement_created_at"]) is not None
+
+
+def _review_instant(r: ReviewRow) -> dt.datetime | None:
+    """The review's timestamp as an instant, or None when it cannot be placed.
+
+    One definition for both readers: the sort key and the fold's placeability rule. Kept
+    together because two independent `_parse_ts()` calls deciding the same thing would
+    drift, and the drift would be silent — a row ordered as placeable by the sort and as
+    unplaceable by the fold (or the reverse)."""
+    return _parse_ts(r["created_at"])
+
+
+def _review_order_key(r: ReviewRow) -> tuple[dt.datetime, int, int]:
+    """Order rows by the review's INSTANT, not its text: `created_at` is stored text, and
+    two rows written with different offsets would otherwise sort by representation, so an
+    item's "latest" review could be an earlier one. An unplaceable row gets the earliest
+    key; the fold does not rely on that position for safety — it marks such an item
+    unusable (`_fold_review_status()`).
+
+    The middle element splits a real review (0) from a folded mismatched pointer (1), which
+    stands for an implement job and has no review id. At equal instants the unreadable
+    reading is the one to believe, so the mismatch sorts LAST and nothing gets cleared by a
+    tie-break; without the split, `r["id"]` is None for those rows and a tie would raise
+    comparing None to an int."""
+    return (_review_instant(r) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            0 if r["id"] is not None else 1, r["id"] or 0)
+
+
+def _fold_review_status(rows: Iterable[ReviewRow]) -> dict[str, dict[ItemKey, _ReviewedItem]]:
+    """The review-health fold — pure, so the latest-wins rule is testable without a
+    database. It is typed by the small bracket-access protocol it reads: the query
+    returns `sqlite3.Row`, the unit test passes dicts, and both satisfy this contract.
+    Each item gets one structured record, not two parallel maps whose keys must stay in
+    lockstep.
+
+    Rows are **ordered here rather than assumed ordered**: "latest wins" is a
+    sequential dict overwrite, so shuffled input would pick an arbitrary row as an
+    item's latest with no error anywhere. Sorting by the parsed instant, then the row
+    id, makes that impossible for any caller — including one whose timestamps carry
+    different UTC offsets.
+
+    Returns a single repo -> item key -> `_ReviewedItem` map. `code_blocked=None`
+    means that item has never had a readable complete review; an earlier readable
+    review's boolean is retained after a later unreadable row. `unusable` always
+    describes the latest terminal row, independently of which complete row spoke, and
+    an item with ANY row it cannot place in time is unusable too: a corrupt timestamp
+    must not let an older readable review stand in for the current one.
+
+    The loop stays ONE loop rather than a per-row `classify(row) -> _ReviewedItem` helper (§139).
+    Its inputs are accumulated state — the previous record for the key, and the `unplaceable` set
+    that has to survive across rows because a key can recur — so a helper would take that set as a
+    mutable parameter, which is the same bookkeeping moved one frame deeper, or re-derive the
+    ordering rule it exists to keep in one place. Each of the four things the body does landed as a
+    separate finding with a comment of its own; if a fifth rule ever lands here, split it then, with
+    the tests that pin these four still passing.
+
+    A later unreadable row sets `unusable=True` but retains the last complete review's
+    `code_blocked` value. If there was no complete review, that stays `None` so the
+    item does not dilute the `n >= 3` bar; an earlier complete review keeps speaking."""
+    status_by_repo: dict[str, dict[ItemKey, _ReviewedItem]] = {}
+    # Items with a row that cannot be placed in time. Kept apart from the per-row state:
+    # the ordered case follows the latest row (a newer readable review legitimately clears
+    # an older unreadable one), but a row nobody can place keeps its item unusable, because
+    # no later row can prove it is the newest.
+    unplaceable: set[tuple[str, ItemKey]] = set()
+    for r in sorted(rows, key=_review_order_key):
+        # A manual `warden dispatch` has no triage event; its implement job is the
+        # only identity it has, and it is a real row this audit must not drop.
+        item_key: ItemKey = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]
+        verdict = _safe_json(r["verdict_json"])
+        # A row whose pointer does not resolve to its own review (§129) is folded exactly like
+        # an unreadable one — not readable, so `unusable` and carry-forward apply — and its
+        # reason is kept so the fifth finding can name the cause.
+        mismatch_reason = r["mismatch_reason"]
+        readable = (mismatch_reason is None and r["review_status"] == "done"
+                    and _is_completed_review(verdict))
+        previous = status_by_repo.get(r["repo"], {}).get(item_key)
+        code_blocked = _carry_forward_code_blocked(verdict, readable, previous)
+        # A row whose timestamp will not parse cannot be PLACED against the others, so
+        # "latest wins" cannot be decided for its item: an older readable review reported as
+        # current would assert an order nobody knows, and a corrupt newer review would be
+        # erased by it — fail-open in the audit of a fail-closed gate. `code_blocked` becomes
+        # None as well as `unusable=True`: retaining a stale value would put the item into
+        # `_always_blocks_findings()`'s denominator and, when it is False, suppress that
+        # finding for the whole repo. An item we cannot place is not judged at all.
+        if not _row_is_placeable(r):
+            unplaceable.add((r["repo"], item_key))
+        unplaceable_item = (r["repo"], item_key) in unplaceable
+        status_by_repo.setdefault(r["repo"], {})[item_key] = _ReviewedItem(
+            code_blocked=None if unplaceable_item else code_blocked,
+            unusable=unplaceable_item or not readable,
+            mismatch=mismatch_reason)
+    return status_by_repo
+
+
+def _unusable_verdict_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _ReviewedItem]]) -> list[dict[str, Any]]:
+    """One finding per repo whose items' latest stored review cannot be read — the
+    fifth self-audit key. A bounded sample of item IDs rides along so the operator can
+    open the offending row without an ad-hoc query."""
+    findings: list[dict[str, Any]] = []
+    for repo, by_item in sorted(status_by_repo.items()):
+        item_keys = [k for k, status in by_item.items() if status.unusable]
+        if not item_keys:
+            continue
+        # A sort, not a dedup: `item_keys` are dict keys, already unique. Sorted by `str`
+        # because an item key is an event id (int) or an implement job id (str).
+        sorted_keys = sorted(item_keys, key=str)
+        sample = ", ".join(str(k) for k in sorted_keys[:SELF_AUDIT_SAMPLE_LIMIT])
+        # The pointer mismatches this run found, so the finding says WHY the verdict is
+        # unreadable and not only which items are affected (§129).
+        reasons = sorted({s.mismatch for s in by_item.values() if s.mismatch})
+        # Same truncation-visibility rule as the item-id sample above: a clipped list that
+        # does not say it was clipped reads as the whole list.
+        clipped = len(reasons) - min(len(reasons), SELF_AUDIT_SAMPLE_LIMIT)
+        why = (f"; pointer mismatches: {'; '.join(reasons[:SELF_AUDIT_SAMPLE_LIMIT])}"
+               f"{f' (+{clipped} more)' if clipped else ''}") if reasons else ""
+        remainder = len(sorted_keys) - min(len(sorted_keys), SELF_AUDIT_SAMPLE_LIMIT)
+        suffix = f" (+{remainder} more)" if remainder else ""
+        findings.append({
+            "key": f"review-verdicts-unusable-{repo}",
+            "title": f"{len(sorted_keys)} item(s) in {repo} have an unusable or missing step-7 review "
+                     f"verdict in the last {SELF_AUDIT_WINDOW_DAYS} days",
+            "detail": f"their latest terminal review stored no verdict at all (failed, interrupted or "
+                      f"cancelled before a result existed), stored one that does not match sideclaw's "
+                      f"published schema, outcome and finding shape, or is a row whose "
+                      f"validation_job_id does not resolve to this item's own review (a stale pointer "
+                      f"— §129: reported here, never dropped, or the item would vanish from "
+                      f"review-always-blocks' denominator); item IDs: {sample}{suffix}{why}. The "
+                      f"self-audit cannot read any of them as a pass",
+        })
+    return findings
+
+
+def _always_blocks_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _ReviewedItem]]) -> list[dict[str, Any]]:
+    """One finding per repo whose review gate code-blocked EVERY reviewed item — a
+    gate refusing all work, not a repo with bad PRs. `n >= 3` keeps a two-item repo
+    from reading as a pattern."""
+    findings: list[dict[str, Any]] = []
+    for repo, by_item in sorted(status_by_repo.items()):
+        judged = [status.code_blocked for status in by_item.values()
+                  if status.code_blocked is not None]
+        n = len(judged)
+        if n >= 3 and all(judged):
+            findings.append({"key": f"review-always-blocks-{repo}",
+                             "title": f"the step-7 review blocked all {n} {repo} PRs in "
+                                      f"{SELF_AUDIT_WINDOW_DAYS} days",
+                             "detail": "either the implement briefs for this repo miss something the review keeps "
+                                      "finding, or the review gate is miscalibrated for it"})
+    return findings
+
+
+def _review_health_findings(rows: ReviewRows) -> list[dict[str, Any]]:
+    """Both review-gate findings: a gate that blocks every reviewed item, and terminal
+    reviews whose stored results cannot safely count as passes.
+
+    The fetch layer doesn't validate outcomes a second time: sideclaw's client-level
+    schema/outcome assertions are the admission gate; this helper is the audit's
+    backward-compatible re-read of already persisted rows, where `_is_completed_review`
+    allows older schema versions that are still explicitly parseable. Keeping these
+    gates separate prevents a historical verdict from being judged by today's producer
+    contract while current envelopes still fail closed at ingestion.
+
+    The item record expresses two independent questions without parallel maps: `code_blocked`
+    answers what the latest readable verdict did; `unusable` answers whether the latest
+    terminal row can be read at all. A later unusable row does not clear a prior readable
+    review's decision, but it remains visible in the fifth self-audit finding."""
+    status_by_repo = _fold_review_status(_review_fold_rows(rows.terminal, rows.mismatched))
+    return (_unusable_verdict_findings(status_by_repo)
+            + _always_blocks_findings(status_by_repo))
+
+
+def _park_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
+               policy: dict[str, Any], *, state: str, note: str,
+               validation_status: str | None = None) -> None:
+    """Set an item's state, record why on the dispatch row, and re-render its card —
+    the step-7 terminal sequence for `poll_validation_jobs()`'s EARLY-EXIT branches
+    (a failed job, an unreadable envelope, an unreadable verdict). `validation_status`
+    is a parameter rather than something the callers write themselves because two of
+    them used to disagree about whether to set it at all, and a `needs_human` item
+    whose row still says `validating` reads as a restart.
+
+    The switch's own `needs_human` and `blocked` branches deliberately do NOT call
+    this: they fall through to one shared `sync_card()` at the tail of the function,
+    which also serves the merged and needs-approval branches. Folding them in here
+    would render the same card twice for one pass."""
+    if validation_status is not None:
+        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
+                     (validation_status, item["implement_job"]))
+    _set_state(conn, item["event_id"], state, now, note=note)
+    conn.commit()
+    fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
+    if fresh_item is not None and fresh_event is not None:
+        sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+
+
 def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step 7 -> 8. Polls every STATE_VALIDATING item once against sideclaw's
@@ -5886,38 +6524,45 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
         if status != "done":
             reason = resp.get("error") or ("cancelled" if status == "cancelled" else "no further detail")
-            conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
-                         ("error", item["implement_job"]))
-            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                       note=f"step-7 validation (error): {reason}")
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+            _park_item(conn, item, now, policy, state=STATE_MERGE_BLOCKED,
+                       note=f"step-7 validation (error): {reason}", validation_status="error")
             continue
 
+        result = resp.get("result")
+        verdict = result if isinstance(result, dict) else {}
+        # The client helpers are sideclaw's own published contract for the whole envelope
+        # and they raise its exact wording; `_review_contract_matches()` below then guards
+        # the part they do not cover — the shape of `blocking` itself — so the fold can
+        # never read a malformed payload as "no findings". Two gates, different jobs.
         try:
             _sideclaw.assert_result_schema(resp, _sideclaw.REVIEW_SCHEMA_VERSION, "review")
             _sideclaw.assert_outcome(resp, _sideclaw.REVIEW_OUTCOMES, "review")
         except RemoteError as e:
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=str(e))
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+            _park_item(conn, item, now, policy, state=STATE_NEEDS_HUMAN, note=str(e),
+                       validation_status="needs_human")
+            continue
+        # The gate IS the contract (no inline reimplementation), and the note is built from the
+        # SAME list it decided with rather than a second evaluation of the same rules: one payload,
+        # one reading, and no way for the refusal to describe a rule the gate never applied (§147).
+        problems = _review_contract_problems(verdict)
+        if problems:
+            # Flag included: a note built from a narrower reading would say "unknown mismatch"
+            # about the payload it just refused.
+            detail = "; ".join(problems) or "unknown mismatch"
+            _park_item(conn, item, now, policy, state=STATE_NEEDS_HUMAN,
+                       validation_status="needs_human", note=(
+                           "step-7 validation (unreadable verdict): the review's result does not "
+                           "match sideclaw's published schema, outcome or finding shape, so its "
+                           "findings cannot be read — failing closed rather than treating it as "
+                           f"'no findings'. Got: {detail}")[:600])
             continue
 
-        # Same nested envelope as poll_implement_jobs() above — the verdict
-        # lives in `result`, never at the top level.
-        verdict = resp.get("result") if isinstance(resp.get("result"), dict) else {}
         outcome = verdict.get("outcome")
-        blocking = verdict.get("blocking") or []
         # §114: the wrapper class is not the implementer's — see
         # _is_process_only_finding(). It must not read as `blocked` (that is what
         # spends a revision) but it must not be dropped either, so it routes to a
         # human with the finding on the card.
-        code_blocking = [f for f in blocking if not _is_process_only_finding(f)]
-        process_blocking = [f for f in blocking if _is_process_only_finding(f)]
+        blocking, code_blocking, process_blocking = _partition_findings(verdict.get("blocking"))
         summary = verdict.get("summary") or "no further detail"
 
         unknown_outcome_note = None
@@ -6265,8 +6910,22 @@ def reconcile_stranded_prs(conn: sqlite3.Connection, policy: dict[str, Any], now
 SELF_SOURCE = "warden_self"
 SELF_AUDIT_CURSOR_KEY = "self_audit"
 SELF_AUDIT_INTERVAL_S = 3600
+# The stored summary's own generation, so a consumer of the cursor JSON can tell which
+# semantics its numbers carry: the same keys have meant different things across the
+# review-health work (the findings, and the window they are computed over), and a diff of
+# finding counts across generations is otherwise a silent misread (§126).
+SELF_AUDIT_SCHEMA = 2
+# A tripwire on this tick's own cost, not a performance target. The window query carries
+# one non-sargable term by necessity (§123) on a table that is never pruned, so its cost
+# grows with the ledger's lifetime; the tick's real cost is in the cursor summary, and this
+# turns that number into something visible instead of a note. Sized well above the work the
+# tick does today (< 1 ms measured at 379 rows) so it cannot fire on ordinary variance.
+SELF_AUDIT_SLOW_MS = 5000
 OWNER_QUEUE_STALE_DAYS = 3.0
 SELF_AUDIT_WINDOW_DAYS = 14
+# How many offending item ids a self-audit finding names before it summarises the
+# rest as a count — enough to open the first one, bounded so the card stays a card.
+SELF_AUDIT_SAMPLE_LIMIT = 8
 # scripts/restore.py's drill result (§104) — the self-audit's only input from
 # outside the ledger. A failed drill, or none successful in this many days, is
 # a finding: a backup that has not been restored from is an assumption.
@@ -6455,23 +7114,9 @@ def _revision_exhaustion_detail(state: str, note: str | None, repo: str, *,
             f"recorded{' — ' + text if text else ''}; read the park note before blaming the review")
 
 
-def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
-                        policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Gaps the loop can see in its own behaviour, each keyed so one finding
-    is one event: a review gate that blocks every PR in a repo, a liveness
-    probe that never confirms, a `fixed` that reopened (the verdict or the
-    fix was wrong), and a revision budget used up."""
-    since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
+def _liveness_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
+    """One finding per repo whose liveness probe kept timing out and never confirmed."""
     out: list[dict[str, Any]] = []
-    for r in conn.execute(
-        "SELECT repo, COUNT(*) AS n, SUM(validation_status='blocked') AS blocked FROM dispatches "
-        "WHERE tier='implement' AND validation_status IS NOT NULL AND created_at >= ? GROUP BY repo", (since,),
-    ):
-        if r["n"] >= 3 and r["blocked"] == r["n"]:
-            out.append({"key": f"review-always-blocks-{r['repo']}",
-                        "title": f"the step-7 review blocked all {r['n']} {r['repo']} PRs in {SELF_AUDIT_WINDOW_DAYS} days",
-                        "detail": "either the implement briefs for this repo miss something the review keeps "
-                                  "finding, or the review gate is miscalibrated for it"})
     for r in conn.execute(
         "SELECT ti.repo, SUM(t.to_state='new') AS reopened, SUM(t.to_state='fixed') AS fixed "
         "FROM item_transitions t JOIN triage_items ti ON ti.event_id = t.event_id "
@@ -6483,6 +7128,12 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
             out.append({"key": f"liveness-never-confirms-{r['repo']}",
                         "title": f"{r['repo']}'s liveness probe timed out {r['reopened']}× and never confirmed a fix",
                         "detail": "the probe may be checking the wrong thing, or the deploy never lands"})
+    return out
+
+
+def _fixed_reopened_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
+    """One finding per item that came back after warden marked it fixed."""
+    out: list[dict[str, Any]] = []
     for r in conn.execute(
         "SELECT DISTINCT t.event_id, ti.signature, ti.repo FROM item_transitions t "
         "JOIN triage_items ti ON ti.event_id = t.event_id JOIN events e ON e.id = t.event_id "
@@ -6491,7 +7142,13 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
         out.append({"key": f"fixed-reopened-{r['event_id']}",
                     "title": f"{r['signature']} came back after warden marked it fixed",
                     "detail": f"the verdict or the fix in {r['repo']} was wrong — event {r['event_id']}"})
-    out.extend(_restore_drill_findings(now))
+    return out
+
+
+def _revisions_exhausted_findings(conn: sqlite3.Connection, policy: dict[str, Any] | None
+                                  ) -> list[dict[str, Any]]:
+    """One finding per item still parked after spending its whole revision budget."""
+    out: list[dict[str, Any]] = []
     max_rev = int((policy or {}).get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
     for r in conn.execute(
         f"SELECT ti.event_id, ti.signature, ti.repo, ti.state, ti.note FROM triage_items ti "
@@ -6506,37 +7163,199 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     return out
 
 
-def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
-                   *, dry_run: bool) -> None:
-    """Hourly: check INVARIANTS and self_audit_findings(), publish the result
-    in the `self_audit` cursor (read by /health), and keep one `warden_self`
-    event per finding in step with it — inserted or re-opened while the
-    finding holds, resolved the pass it stops holding (a state source, so the
-    ordinary silence path closes a still-`new` item and reopen_if_needed()
-    reopens a closed one on recurrence)."""
-    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (SELF_AUDIT_CURSOR_KEY,)).fetchone()
-    last = _parse_ts(row["updated_at"]) if row else None
-    if last is not None and (now - last).total_seconds() < SELF_AUDIT_INTERVAL_S:
-        return
-    violations = check_invariants(conn, now)
-    findings = self_audit_findings(conn, now, policy)
-    by_inv: dict[str, list[dict[str, Any]]] = {}
-    for v in violations:
-        by_inv.setdefault(v["id"], []).append(v)
-    for inv_id, vs in by_inv.items():
-        if inv_id in REPORT_ONLY_INVARIANTS:
-            continue
-        findings.append({
-            "key": inv_id.lower(),
-            "title": f"invariant {inv_id} violated by {len(vs)} item(s): {INVARIANTS[inv_id]}",
-            "detail": "; ".join(f"event {v['event_id']}: {v['detail']}" for v in vs[:8]),
-        })
-    if dry_run:
-        print(f"[dry-run] self-audit: {len(violations)} invariant violation(s), {len(findings)} finding(s): "
-              f"{[f['key'] for f in findings]}")
-        return
-    now_iso = _now_iso(now)
-    live_keys = {f["key"] for f in findings}
+# The result type of a self-audit section: findings for most, invariant violations for
+# the one check that reports those. `_run_isolated()` is generic over it.
+_T = TypeVar("_T")
+
+
+# The finding key a failed section reports, and the prefix the event sync reads back out of the
+# findings to learn WHICH sections did not run this pass (§132). One constant for both directions.
+SECTION_FAILURE_PREFIX = "self-audit-section-failed-"
+
+# What each section owns, by finding-key prefix. Named once because two readers depend on it:
+# `self_audit_findings()` runs exactly these sections, and the event sync may only resolve an
+# absent key for a section that actually COMPLETED. A section that raised has re-checked nothing,
+# so resolving its alerts would let a query failure silently clear the very alerts it stopped
+# checking — the fail-open twin of §124, one level up.
+_INVARIANT_PREFIXES = tuple(inv_id.lower() for inv_id in INVARIANTS)
+SELF_AUDIT_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("invariants", _INVARIANT_PREFIXES),
+    ("review-health", ("review-always-blocks-", "review-verdicts-unusable-")),
+    ("liveness", ("liveness-never-confirms-",)),
+    ("fixed-reopened", ("fixed-reopened-",)),
+    ("restore-drill", ("restore-drill-",)),
+    ("revisions-exhausted", ("revisions-exhausted-",)),
+)
+
+
+# The declared names whose sections are NOT in the pipeline's own map, and why (§141).
+# `invariants` returns violations rather than findings, and `run_self_audit()` runs it beside the
+# pipeline; `review-health`'s section is added by the pipeline itself once its fetch — the one step
+# that can fail as a unit — has succeeded, and its failure is reported in its place. Every OTHER
+# declared name must have a section, or the audit would skip it silently, and a section silently
+# skipped is a section whose alerts the resolve sweep then closes.
+SELF_AUDIT_ELSEWHERE = ("invariants", "review-health")
+
+
+def _self_audit_sections(conn: sqlite3.Connection, since: str, now: dt.datetime,
+                         policy: dict[str, Any] | None
+                         ) -> dict[str, Callable[[], list[dict[str, Any]]]]:
+    """The finding-producing sections keyed by their `SELF_AUDIT_SECTIONS` names.
+
+    A function rather than a literal inside the pipeline so that "which sections exist" is
+    observable: the registry and this map are two structures that have to agree, and the test that
+    says so can only compare them if both are reachable (§141). `review-health` is absent here on
+    purpose — it needs the rows its own isolated fetch produced."""
+    return {
+        "liveness": lambda: _liveness_findings(conn, since),
+        "fixed-reopened": lambda: _fixed_reopened_findings(conn, since),
+        "restore-drill": lambda: _restore_drill_findings(now),
+        "revisions-exhausted": lambda: _revisions_exhausted_findings(conn, policy),
+    }
+
+
+def _unrechecked_prefixes(failed_sections: Iterable[str]) -> tuple[str, ...]:
+    """The finding-key prefixes whose owning section did NOT run, so their events must survive.
+
+    An empty tuple is the ordinary case: every section ran, silence means "nothing to report".
+    For a failed one, silence means nothing at all, and the resolve sweep must not read it as a
+    clean bill — see `run_self_audit()`."""
+    owners = dict(SELF_AUDIT_SECTIONS)
+    return tuple(prefix for name in failed_sections for prefix in owners.get(name, ()))
+
+
+def _failed_section_names(findings: Iterable[dict[str, Any]]) -> list[str]:
+    """Which sections reported a failure in this pass, read back from their own findings."""
+    return [f["key"][len(SECTION_FAILURE_PREFIX):] for f in findings
+            if f["key"].startswith(SECTION_FAILURE_PREFIX)]
+
+
+def _section_failure_finding(name: str, e: Exception) -> dict[str, Any]:
+    """The finding a failed self-audit section reports in place of its own output."""
+    return {"key": f"{SECTION_FAILURE_PREFIX}{name}",
+            "title": f"the self-audit's {name} check raised {type(e).__name__}",
+            "detail": f"{e} — its findings are missing from this pass, so anything it would "
+                      f"have reported stays unseen until the cause is fixed"}
+
+
+def _run_isolated(name: str, section: Callable[[], _T]) -> tuple[_T | None, Exception | None]:
+    """Run one self-audit section and hand its failure back instead of raising it.
+
+    One place owns the isolation and the stderr line, so a change to either cannot land
+    at one call site and miss the other. The caller maps the failure into its own shape:
+    the finding-producing sections turn it into `_section_failure_finding()`, the
+    invariant check — which returns violations, not findings — into `invariants_error`
+    in the cursor summary."""
+    try:
+        return section(), None
+    except Exception as e:  # noqa: BLE001 — isolation is the point, not suppression
+        print(f"triage: self-audit section '{name}' failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None, e
+
+
+def _audit_section(name: str, section: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Run one self-audit section so its failure cannot hide the others.
+
+    The sections are independent queries over one ledger, and without this a single
+    raising section loses every other finding for that hour — including the
+    restore-drill signal (§104), the audit's only input from outside the ledger. The
+    failure becomes a finding of its own: a broken check that only reaches a `.err`
+    file is indistinguishable from a check that had nothing to report, which is the
+    invisibility DESIGN.md's "deferral must be visible" forbids."""
+    findings, failure = _run_isolated(name, section)
+    if failure is not None:
+        return [_section_failure_finding(name, failure)]
+    return findings if findings is not None else []
+
+
+class SelfAuditFindings(NamedTuple):
+    """The section pipeline's output: the findings, plus the numbers a section measured on the
+    way that the summary publishes.
+
+    A returned value, not a mutable dict handed down through three call levels: the sink that
+    carried `unreadable_timestamps` let one section escape the uniform
+    `Callable[[], list[dict]]` contract every `SELF_AUDIT_SECTIONS` entry satisfies, and three
+    levels cannot be type-checked (§134). The fetch is the only step of review health that can
+    fail as a unit, so it is isolated here and the section then takes rows it cannot re-query —
+    which is what makes the count a value instead of a side effect.
+
+    `unreadable_timestamps` is `None` when the fetch that measures it failed: no number was
+    measured, and `0` would read as "no corrupt rows"."""
+
+    findings: list[dict[str, Any]]
+    unreadable_timestamps: int | None
+
+
+def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
+                        policy: dict[str, Any] | None = None) -> SelfAuditFindings:
+    """Gaps the loop can see in its own behaviour, each keyed so one finding is one
+    event. Five kinds, one per section: `review-always-blocks-<repo>` (a review gate
+    that blocks every PR in a repo), `review-verdicts-unusable-<repo>` (a terminal review
+    row whose result cannot be read, or whose position among its item's rows cannot be
+    placed), `liveness-never-confirms-<repo>`, `fixed-reopened-<event>` (the verdict or
+    the fix was wrong), and `revisions-exhausted-<event>` (a revision budget used up).
+    `run_self_audit()` adds one more of its own, `self-audit-slow`, when this tick's own
+    cost crosses `SELF_AUDIT_SLOW_MS` — it is the only one that measures the auditor.
+
+    Each section is isolated, so a section that raises reports `self-audit-section-failed-
+    <name>` instead of taking the other four down with it."""
+    since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
+    # Keyed by the SAME names as `SELF_AUDIT_SECTIONS`, and the loop runs that table's order: a
+    # section cannot be added here without declaring the finding keys it owns, which is what the
+    # event sync needs to know whose silence may resolve an alert (§132). `invariants` is not in
+    # this map — it returns violations rather than findings, and `run_self_audit()` runs it.
+    sections = _self_audit_sections(conn, since, now, policy)
+    # Review health's fetch runs here, inside the same isolation, because it is the one step
+    # that can fail as a unit: a failed query reports `self-audit-section-failed-review-health`
+    # and the other four still run. The section itself then takes the rows, so a number the
+    # fetch measured travels back in the return value instead of through a mutable sink.
+    review_rows, review_health_failure = _run_isolated(
+        "review-health", lambda: _fetch_review_rows(conn, since))
+    out: list[dict[str, Any]] = []
+    if review_health_failure is not None:
+        out.append(_section_failure_finding("review-health", review_health_failure))
+    elif review_rows is not None:
+        sections["review-health"] = lambda: _review_health_findings(review_rows)
+    # Both registries are walked, in the table's order, and a name in one without a counterpart in
+    # the other is a FAILURE rather than a skip (§141). This used to be `if name in sections`,
+    # which silently dropped a section that was declared but had no callable: it stopped running,
+    # its silence read as "nothing to report", and the resolve sweep then closed the very alerts it
+    # had stopped checking — §132's failure, arriving without an exception to report. `review-health`
+    # names in `SELF_AUDIT_ELSEWHERE` are the ones that can legitimately be absent here:
+    # `review-health`, whose fetch has already reported its own failure above, and `invariants`,
+    # which `run_self_audit()` runs beside this pipeline.
+    declared = {name for name, _keys in SELF_AUDIT_SECTIONS}
+    for name, _keys in SELF_AUDIT_SECTIONS:
+        if name in sections:
+            out.extend(_audit_section(name, sections[name]))
+        elif name not in SELF_AUDIT_ELSEWHERE:
+            out.append(_section_failure_finding(
+                name, KeyError(f"`{name}` is declared in SELF_AUDIT_SECTIONS and "
+                               "self_audit_findings() builds no section for it")))
+    # …and the other direction: a section wired up here but NOT declared owns finding-key prefixes
+    # nobody has listed, so those are the events the sweep cannot protect. Also a finding.
+    for name in sorted(set(sections) - declared):
+        out.append(_section_failure_finding(
+            name, KeyError(f"`{name}` has a section in self_audit_findings() but is not declared "
+                           "in SELF_AUDIT_SECTIONS, so the keys it owns are unknown")))
+    return SelfAuditFindings(
+        out, None if review_rows is None else review_rows.corrupt_timestamps)
+
+
+def _sync_self_audit_events(conn: sqlite3.Connection, findings: list[dict[str, Any]],
+                            live_keys: set[str], now_iso: str,
+                            unrechecked: tuple[str, ...] = ()) -> None:
+    """Bring one `warden_self` event per finding in step with this pass: inserted or re-opened
+    while the finding holds, resolved the pass it stops holding.
+
+    `unrechecked` is the finding-key prefixes whose section did NOT complete this pass. Their
+    events are exempt from the resolve sweep, because an absent key is only evidence of
+    "nothing to report" when the section that owns it actually ran: a section that raised has
+    re-checked nothing, and resolving its alerts there would let a query failure silently clear
+    the very alerts it stopped checking (§132). The failure is still visible — it carries its own
+    `self-audit-section-failed-<name>` finding — so the hour reports a broken check instead of a
+    clean bill."""
     for f in findings:
         payload = json.dumps({"first_text": f"{f['title']} — {f['detail']}"[:1500]})
         ev = conn.execute("SELECT id, resolved_at FROM events WHERE source=? AND external_id=?",
@@ -6552,11 +7371,125 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
             conn.execute("UPDATE events SET title=?, payload_json=? WHERE id=?", (f["title"][:300], payload, ev["id"]))
     for ev in conn.execute("SELECT id, external_id FROM events WHERE source=? AND resolved_at IS NULL",
                            (SELF_SOURCE,)).fetchall():
-        if ev["external_id"] not in live_keys:
-            conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
-    summary = {"checked_at": now_iso, "invariants": sorted(INVARIANTS),
-               "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
-               "findings": sorted(live_keys)}
+        if ev["external_id"] in live_keys:
+            continue
+        if any(ev["external_id"].startswith(p) for p in unrechecked):
+            continue
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
+
+
+def _self_audit_summary(now_iso: str, self_audit_ms: int, event_sync_ms: int,
+                        by_inv: Mapping[str, list[dict[str, Any]]], live_keys: Iterable[str],
+                        pipeline: SelfAuditFindings,
+                        invariants_failure: Exception | None) -> dict[str, Any]:
+    """The `self_audit` cursor document — the one place /health reads this tick back from.
+
+    Assembled apart from `run_self_audit()` because it is the order-independent part: it reads
+    values the tick has already measured and writes nothing, while everything left in the
+    orchestrator is sequencing that has to stay in one place (the clock, the finding list the
+    sync mutates, the cursor write). `live_keys` is passed in rather than recomputed from
+    `findings`, so "the findings this pass published" has one definition and not two that could
+    drift apart.
+
+    Both `*_error` fields are one rule: a zero or an empty list from a check that did NOT run is
+    a fabricated clean bill, so the field says "not measured, and why" instead. `violations: []`
+    beside `invariants_error`, and `unreadable_timestamps: null` beside
+    `unreadable_timestamps_error` — the count is `None` exactly when the fetch that measures it
+    raised (§134), and the reason names where the exception itself is rather than restating it
+    in wording that would drift from the finding's."""
+    summary: dict[str, Any] = {
+        "checked_at": now_iso, "self_audit_schema": SELF_AUDIT_SCHEMA,
+        "invariants": sorted(INVARIANTS),
+        "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
+        "self_audit_ms": self_audit_ms,
+        "event_sync_ms": event_sync_ms,
+        "unreadable_timestamps": pipeline.unreadable_timestamps,
+        "findings": sorted(live_keys),
+    }
+    if invariants_failure is not None:
+        summary["invariants_error"] = f"{type(invariants_failure).__name__}: {invariants_failure}"
+    if pipeline.unreadable_timestamps is None:
+        summary["unreadable_timestamps_error"] = (
+            "the review-health fetch raised, so nothing measured this count; the exception is "
+            f"reported as {SECTION_FAILURE_PREFIX}review-health")
+    return summary
+
+
+def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                   *, dry_run: bool) -> None:
+    """Hourly: check INVARIANTS and self_audit_findings(), publish the result
+    in the `self_audit` cursor (read by /health), and keep one `warden_self`
+    event per finding in step with it — inserted or re-opened while the
+    finding holds, resolved the pass it stops holding (a state source, so the
+    ordinary silence path closes a still-`new` item and reopen_if_needed()
+    reopens a closed one on recurrence)."""
+    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (SELF_AUDIT_CURSOR_KEY,)).fetchone()
+    last = _parse_ts(row["updated_at"]) if row else None
+    if last is not None and (now - last).total_seconds() < SELF_AUDIT_INTERVAL_S:
+        return
+    # Invariants run FIRST and are the same failure class the sections below are wrapped
+    # against: without this guard a raise here (a bad INVARIANTS rule, an OperationalError,
+    # a malformed row) propagates out of run_self_audit entirely — losing the cursor write,
+    # the hour's `warden_self` reopen/resolve, and every finding the sections below had
+    # already produced. Its failure is reported, not swallowed.
+    # Timed from here so the number covers the whole tick, not just the section queries:
+    # the invariant check runs before it and the event sync after it (§118's second
+    # discussion). Only the cursor write itself is outside the measurement.
+    started = dt.datetime.now(dt.timezone.utc)
+    violations, invariants_failure = _run_isolated(
+        "invariants", lambda: check_invariants(conn, now))
+    violations = violations or []
+    findings = ([_section_failure_finding("invariants", invariants_failure)]
+                if invariants_failure is not None else [])
+    # The pipeline's own numbers (measured inside the timed window, so their cost counts toward
+    # `self_audit_ms` like every other non-sargable scan) — see `self_audit_findings()`.
+    pipeline = self_audit_findings(conn, now, policy)
+    findings.extend(pipeline.findings)
+    by_inv: dict[str, list[dict[str, Any]]] = {}
+    for v in violations:
+        by_inv.setdefault(v["id"], []).append(v)
+    for inv_id, vs in by_inv.items():
+        if inv_id in REPORT_ONLY_INVARIANTS:
+            continue
+        findings.append({
+            "key": inv_id.lower(),
+            "title": f"invariant {inv_id} violated by {len(vs)} item(s): {INVARIANTS[inv_id]}",
+            "detail": "; ".join(f"event {v['event_id']}: {v['detail']}" for v in vs[:8]),
+        })
+    if dry_run:
+        failed = (f" (invariants FAILED: {type(invariants_failure).__name__}: {invariants_failure})"
+                  if invariants_failure is not None else "")
+        print(f"[dry-run] self-audit: {len(violations)} invariant violation(s){failed}, "
+              f"{len(findings)} finding(s): {[f['key'] for f in findings]}")
+        return
+    # The tick's own cost — invariants plus the five sections — is taken here, BEFORE the
+    # event sync, because that is the part that grows with the ledger (§118/§123) and
+    # because the finding built from it has to exist before the sync writes events. The
+    # sync's own cost is measured separately: it scales with the number of live findings,
+    # not with history, so folding it in would blur the number the tripwire watches.
+    self_audit_ms = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1000)
+    if self_audit_ms >= SELF_AUDIT_SLOW_MS:
+        findings.append({
+            "key": "self-audit-slow",
+            "title": f"the hourly self-audit tick took {self_audit_ms} ms "
+                     f"(threshold {SELF_AUDIT_SLOW_MS} ms)",
+            "detail": "the review-health window query carries a non-sargable term and "
+                      "`dispatches` is never pruned, so this grows with the ledger's "
+                      "lifetime — STATE.md names the expression index that removes it",
+        })
+    now_iso = _now_iso(now)
+    live_keys = {f["key"] for f in findings}
+    failed_sections = _failed_section_names(findings)
+    # Everything from here to the cursor write is the sync — the per-finding lookup and
+    # insert/update AND the sweep that resolves events whose finding is gone. Timed as one
+    # block: stopping the clock between them, as an earlier round did, stored a number that
+    # matched neither half (§127).
+    sync_started = dt.datetime.now(dt.timezone.utc)
+    _sync_self_audit_events(conn, findings, live_keys, now_iso,
+                            _unrechecked_prefixes(failed_sections))
+    event_sync_ms = int((dt.datetime.now(dt.timezone.utc) - sync_started).total_seconds() * 1000)
+    summary = _self_audit_summary(now_iso, self_audit_ms, event_sync_ms, by_inv, live_keys,
+                                  pipeline, invariants_failure)
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
@@ -6584,18 +7517,18 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
                            (item["validation_job"],)).fetchone()
         verdict = _safe_json(rev["verdict_json"] if rev else None)
         # §114: a wrapper-only round is a human's one-line edit, not a revision —
-        # see `_is_process_only_finding()`. Filtering here as well as in the
+        # see `_code_blocking_findings()`. Filtering here as well as in the
         # folding switch keeps an item parked `blocked` by an older round from
         # spending its remaining attempt on text no episode can write.
-        blocking = [f for f in (verdict.get("blocking") or []) if not _is_process_only_finding(f)]
+        blocking = _code_blocking_findings(verdict.get("blocking"))
         if not blocking:
             return None
+        # `_code_blocking_findings()` only yields shape-valid findings (see
+        # `_published_findings()`), so both fields are present and non-empty.
         lines = []
         for f in blocking:
-            loc = f.get("file") or "?"
-            if f.get("line") is not None:
-                loc = f"{loc}:{f.get('line')}"
-            lines.append(f"- {loc} — {f.get('message') or '?'}")
+            loc = f"{f['file']}:{f['line']}" if f.get("line") is not None else f["file"]
+            lines.append(f"- {loc} — {f['message']}")
         return "The independent review BLOCKED the previous attempt:\n" + "\n".join(lines)
     result = _safe_json(impl["verdict_json"])
     if result.get("outcome") == "checks_failed":

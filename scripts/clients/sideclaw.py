@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal, NamedTuple, TypedDict
 
 from .errors import PolicyError, RemoteError
 
@@ -60,6 +60,56 @@ DISPATCH_OUTCOMES: tuple[str, ...] = (
 
 # server/jobs/handlers/review.ts REVIEW_OUTCOMES at schema version 1.
 REVIEW_OUTCOMES: tuple[str, ...] = ("clean", "actionable", "needs-human")
+
+# sideclaw's terminal statuses, shared by every dispatch tier. Sorted, not raw: the
+# source is a frozenset whose iteration order varies with hash randomization, and a
+# public constant must not present a different sequence per process to anything
+# order-sensitive (logging, tests, a displayed list).
+TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(TERMINAL))
+
+
+# The two fields warden REQUIRES on a published review finding, named so `check_schema_versions()`
+# can compare them against sideclaw's own JSON schema (`/api/review-schema`'s
+# `output.properties.blocking.items`) instead of both sides copying by hand. The direction of a
+# disagreement is what matters, and only one direction is unsafe: requiring LESS than the
+# producer is tolerated (an unmodelled field is simply not read), requiring MORE means rejecting
+# real findings — a verdict silently ignored, the failure warden exists to fix. The live producer
+# requires `file`, `message` AND `angle`; warden deliberately does not require `angle`, because a
+# reader that only quotes what it is given should not refuse a finding over a missing reviewer
+# name — so that difference is reported, not treated as a mismatch.
+REVIEW_FINDING_REQUIRED = frozenset({"file", "message"})
+
+# The names warden's runtime READS OFF a RESULT envelope, and therefore has to be promised by the
+# producer's published `output.required` (§140). `assert_result_schema()` reads `schemaVersion`,
+# `assert_outcome()` reads `outcome`, and `_review_verdict_problems()` reads `blocking`; all three
+# fail CLOSED on a result that lacks one, which is why a producer that stopped requiring one —
+# without touching its version or its outcome vocabulary — would leave this comparison green and
+# have every review parked `needs_human` with nothing saying why. A tuple, not a set: the refusal
+# names them in the order the runtime depends on them.
+REVIEW_OUTPUT_REQUIRED = ("schemaVersion", "outcome", "blocking")
+
+
+def is_review_finding(entry: Any) -> bool:
+    """True when `entry` is one published review finding.
+
+    Mirrors `server/jobs/handlers/review.ts`'s `FINDING` (schema version
+    `REVIEW_SCHEMA_VERSION`): the fields in `REVIEW_FINDING_REQUIRED` are required strings,
+    `line` and `angle` are optional for a consumer that only quotes what it is given. This
+    lives beside the schema constants because it is part of the same published contract
+    `assert_result_schema()` refuses on — a reader must not invent its own idea of the
+    shape. It is stricter than the producer in one direction on purpose: a blank `file`/
+    `message` is rejected, because a finding warden cannot name is one it cannot report
+    (DESIGN.md §115), so a stored payload carrying one is unusable rather than a quote with
+    a hole in it.
+
+    The required set is READ from `REVIEW_FINDING_REQUIRED` rather than restated here: the
+    drift check compares that same constant against the producer's published schema, and a
+    second hand-written copy would be a second place to change and one to forget — with the
+    comparison still green while this reader disagreed with it (§136)."""
+    if not isinstance(entry, dict):
+        return False
+    return all(isinstance(entry.get(name), str) and bool(entry[name].strip())
+               for name in REVIEW_FINDING_REQUIRED)
 
 
 def _base() -> str:
@@ -317,7 +367,7 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
         remote_version = parsed.get("version")
         remote_outcomes = tuple(parsed.get("outcomes") or ())
         ok = remote_version == expected_version and set(remote_outcomes) == set(expected_outcomes)
-        out[tool] = {
+        entry: dict[str, Any] = {
             "reachable": True,
             "ok": ok,
             "expectedVersion": expected_version,
@@ -325,7 +375,502 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
             "expectedOutcomes": expected_outcomes,
             "remoteOutcomes": remote_outcomes,
         }
+        if tool == "review":
+            _apply_review_shape_checks(entry, parsed)
+        out[tool] = entry
     return out
+
+
+def _apply_review_shape_checks(entry: dict[str, Any], parsed: dict[str, Any]) -> None:
+    """The review-only half of `check_schema_versions()`: the two published shapes warden reads.
+
+    Called once, with the per-tool entry already built (reachability, version, outcome vocabulary).
+    Extracted because the generic loop and the deep comparison are two different jobs that had grown
+    into one body, the review branch the larger of them: a reader following "how does a tool's entry
+    get its version" had to read past ~75 lines of JSON-Schema descent to find where the loop ends
+    (§149). Mutating `entry` is the point rather than a side effect — the shapes are part of the same
+    answer, and the caller's `ok` is the value every reader of this check sees."""
+
+    # The finding shape is part of the same published contract and was the one piece
+    # nothing compared: `is_review_finding()` mirrors it in Python, so a renamed find
+    # shape would leave warden reading a shape the producer no longer emits, with the
+    # version number unchanged and every check green.
+    result = _published_finding_shape(parsed)
+    if isinstance(result, UnreadableFindingShape):
+        unreadable: FindingShapeUnreadable = {
+            "published": False, "reason": result.reason}
+        entry["findingShape"] = unreadable
+        # `entry["ok"]` is the value the caller reads; the local `ok` was only ever
+        # a dead store here (nothing reads it after this line — the dict was built
+        # with it above).
+        entry["ok"] = False
+    else:
+        shape = result
+        missing_required = sorted(REVIEW_FINDING_REQUIRED - shape.required)
+        missing_properties = sorted(REVIEW_FINDING_REQUIRED - shape.properties)
+        # Names are not the whole contract: a field kept but retyped (a scalar that
+        # became an array, say) leaves every name in place while `is_review_finding()`
+        # rejects every finding the producer emits — the whole verdict silently
+        # unreadable, with this check reporting success. Only `str` reads as a finding
+        # in warden, so anything else — including a published property with no readable
+        # type — is a disagreement, not a tolerated difference.
+        mistyped = sorted(field for field in REVIEW_FINDING_REQUIRED
+                          if field in shape.properties
+                          and shape.types.get(field) != "string")
+        report: FindingShapeComparison = {
+            "published": True,
+            "required": sorted(shape.required),
+            "properties": sorted(shape.properties),
+            "types": dict(sorted(shape.types.items())),
+            "wardenRequires": sorted(REVIEW_FINDING_REQUIRED),
+            "missingFromRequired": missing_required,
+            "missingFromProperties": missing_properties,
+            "mistyped": mistyped,
+        }
+        entry["findingShape"] = report
+        if missing_required or missing_properties or mistyped:
+            entry["ok"] = False
+    # The envelope is the third contract, and the one the `version`/`outcomes` comparison
+    # above cannot see: those are the endpoint's own metadata, while these are the fields
+    # the runtime reads by VALUE off every result and refuses one that fails (§143). A
+    # producer can keep its metadata identical and still park every review by retyping
+    # `schemaVersion` or widening `outcome`'s vocabulary.
+    envelope_result = _published_envelope_shape(parsed)
+    if isinstance(envelope_result, UnreadableEnvelopeShape):
+        unreadable_envelope: EnvelopeShapeUnreadable = {
+            "published": False, "reason": envelope_result.reason}
+        entry["envelopeShape"] = unreadable_envelope
+        entry["ok"] = False
+    else:
+        envelope = envelope_result
+        # Only the direction that breaks the runtime is a refusal, as everywhere else on
+        # this check: an outcome the producer may emit and warden refuses is a review
+        # parked per job, while a warden outcome the producer no longer emits is a branch
+        # of ours gone unreachable — reported by the caller, not refused (§143).
+        unknown_outcomes = sorted(set(envelope.outcomes) - set(REVIEW_OUTCOMES))
+        version_pinned = _version_is_pinned(envelope.version_const, envelope.version_enum)
+        envelope_report: EnvelopeShapeComparison = {
+            "published": True,
+            "versionTypes": sorted(envelope.version_types),
+            "versionConst": envelope.version_const,
+            "versionEnum": (list(envelope.version_enum)
+                            if envelope.version_enum is not None else None),
+            "versionPinned": version_pinned,
+            "outcomes": list(envelope.outcomes),
+            "wardenVersion": REVIEW_SCHEMA_VERSION,
+            "wardenOutcomes": sorted(REVIEW_OUTCOMES),
+            "unknownOutcomes": unknown_outcomes,
+        }
+        entry["envelopeShape"] = envelope_report
+        if unknown_outcomes or not version_pinned:
+            entry["ok"] = False
+
+
+
+class FindingShapeUnreadable(TypedDict):
+    """The endpoint publishes no readable finding shape, and then there is nothing to describe.
+
+    No empty lists here on purpose: `[]` reads as "the producer requires nothing", which is the
+    fabricated-clean-bill shape this branch keeps having to remove. An unreadable shape is a
+    disagreement, not an empty comparison.
+
+    `reason` names the requirement the body failed (§135). "No readable finding shape" is true of
+    a body with no `blocking` at all and of one whose `blocking` stopped being an array, and the
+    two send an operator to different files."""
+
+    published: Literal[False]
+    reason: str
+
+
+class FindingShapeComparison(TypedDict):
+    """What the published finding shape holds, against what warden requires of it."""
+
+    published: Literal[True]
+    required: list[str]
+    properties: list[str]
+    types: dict[str, str | None]
+    wardenRequires: list[str]
+    missingFromRequired: list[str]
+    missingFromProperties: list[str]
+    mistyped: list[str]
+
+
+# `published` discriminates the union, so a reader that narrows on it can subscript the rest —
+# which is the point of typing this at all. It was a bare string-keyed dict written here and read
+# by bracket in two other modules, where a renamed key type-checked and failed only at the read:
+# the pattern `ReviewRow` was promoted out of on this branch.
+FindingShapeReport = FindingShapeUnreadable | FindingShapeComparison
+
+
+class EnvelopeShapeUnreadable(TypedDict):
+    """The endpoint publishes no readable result envelope, so there is nothing to compare.
+
+    No empty lists and no `None` here on purpose, for the reason `FindingShapeUnreadable` states one
+    level up: `[]` reads as "the producer constrains nothing", which is the fabricated-clean-bill
+    shape this branch keeps removing. An unreadable envelope is a disagreement."""
+
+    published: Literal[False]
+    reason: str
+
+
+class EnvelopeShapeComparison(TypedDict):
+    """What the published result envelope holds, against what the runtime reads from it.
+
+    `unknownOutcomes` and `versionPinned` are the refusals — `assert_outcome()` would park every
+    review carrying an outcome outside warden's vocabulary, and `assert_result_schema()` every
+    result whose version is not the pinned one. The rest is the evidence an operator needs to see
+    where the producer moved: `versionTypes`/`versionConst`/`versionEnum` are what the pin was read
+    from. A previous revision of this docstring named `versionTypeOk`/`versionConstOk`, two fields
+    §147 replaced and no reader emits."""
+
+    published: Literal[True]
+    versionTypes: list[str]
+    versionConst: object
+    versionEnum: list[object] | None
+    versionPinned: bool
+    outcomes: list[str]
+    wardenVersion: int
+    wardenOutcomes: list[str]
+    unknownOutcomes: list[str]
+
+
+EnvelopeShapeReport = EnvelopeShapeUnreadable | EnvelopeShapeComparison
+
+
+class UnreadableFindingShape(NamedTuple):
+    """Why the published finding object could not be read, in terms of the requirement it failed.
+
+    A returned value rather than `None`, for the reason `FindingShapeUnreadable.reason` exists
+    one level up: `None` cannot tell "this endpoint publishes no finding object" apart from "it
+    publishes one whose `blocking` is no longer an array", and only the second one means the
+    runtime's own reading of that container has drifted (§135)."""
+
+    reason: str
+
+
+def _as_schema_type(value: Any) -> str | None:
+    """A JSON Schema `type` as a single type name, or None when it names more than one.
+
+    A ONE-MEMBER ARRAY is the same schema as its scalar form: `{"type": ["string"]}` and
+    `{"type": "string"}` constrain a value identically, so a producer whose serializer wraps every
+    type in a list is not a producer whose field changed type (§149). Reading that as `None` made
+    every such field mistyped — a false failure of exactly the class this check exists to avoid.
+    A genuine UNION still reads as `None`: `["string", "null"]` admits `null`, and warden reads a
+    string.
+
+    `None` is also the answer for a `type` that is a number or an object, which is what lets the
+    mapping be typed `str | None` instead of `Any`: it never claims to hold a type it could not
+    read, and `{"type": 7}` reports the field as mistyped rather than comparing 7 to `"string"` by
+    accident."""
+    types = _as_schema_types(value)
+    return next(iter(types)) if len(types) == 1 else None
+
+
+def _as_schema_types(value: Any) -> frozenset[str]:
+    """The JSON Schema `type` keyword as a set: the dialect allows a LIST of types, and only the
+    string entries name a type (`frozenset()` for anything else, so an unreadable keyword reads as
+    "no type published" rather than raising on the operator's `make status` path)."""
+    if isinstance(value, str):
+        return frozenset({value})
+    if isinstance(value, (list, tuple)):
+        return frozenset(entry for entry in value if isinstance(entry, str))
+    return frozenset()
+
+
+def _pins_version(value: object) -> bool:
+    """Whether one published value pins the version warden compares.
+
+    `==` alone is not enough: `True == 1` in Python, so a `const: true` would read as a pin on the
+    number 1 — the accidental-equality class this branch keeps having to remove (§147)."""
+    return not isinstance(value, bool) and value == REVIEW_SCHEMA_VERSION
+
+
+def _version_is_pinned(const: object, enum: tuple[object, ...] | None) -> bool:
+    """Whether the published `schemaVersion` schema PINS the version, not merely admits it.
+
+    A `type` says which values are POSSIBLE; only a pin says which value is promised. `{"type":
+    "number"}` admits `2`, and `{"type": ["integer", "string"]}` admits `"1"` — both are refused by
+    `assert_result_schema()`, which compares the VALUE, so a type-only rule reports success for a
+    producer that can park every review it emits. `const: 1` or a one-member `enum: [1]` is the pin
+    this reads; a multi-member enum is not one, because the producer could emit the other value."""
+    if _pins_version(const):
+        return True
+    return enum is not None and len(enum) == 1 and _pins_version(enum[0])
+
+
+class PublishedEnvelopeShape(NamedTuple):
+    """What the endpoint publishes about the two result fields warden reads by VALUE.
+
+    `_published_finding_shape()` covers `output.properties.blocking.items` — the noun of a review —
+    but a review's ENVELOPE carries two more contracts and neither was compared: the runtime's
+    `assert_result_schema()` refuses any result whose `schemaVersion` is not
+    `REVIEW_SCHEMA_VERSION` (a strict `!=`, so a producer that retypes it to a string refuses every
+    review it emits), and `assert_outcome()` refuses any result whose `outcome` is not in
+    `REVIEW_OUTCOMES`. Comparing only the top-level `version`/`outcomes` metadata and the trio's
+    presence in `output.required` left a producer free to change both and have every live review
+    parked with this check reporting success (§143).
+
+    `version_const`/`version_enum` are `object` and not a string type on purpose: a `const` and an
+    `enum` member are whatever JSON values the producer wrote, and the only thing warden does with
+    them is compare them to an int (`_pins_version()`)."""
+
+    version_types: frozenset[str]
+    version_const: object
+    version_enum: tuple[object, ...] | None
+    outcomes: tuple[str, ...]
+
+
+class UnreadableEnvelopeShape(NamedTuple):
+    """Why the published result envelope could not be read, in terms of the requirement it failed.
+
+    A returned value rather than `None`, for the reason the finding-shape pair next door exists:
+    "this endpoint publishes no envelope fields" and "it publishes an `outcome` with no `enum`" send
+    an operator to different lines, and a bare `None` cannot tell them apart (§139)."""
+
+    reason: str
+
+
+class PublishedFindingShape(NamedTuple):
+    """What the endpoint publishes about the review finding object.
+
+    `types` maps each published property to its JSON Schema `type` (None when the property
+    carries no readable subschema, or carries one that is not a string), because the NAME of a
+    field is not the whole contract: a producer that keeps `file` and changes it from a string to
+    an array of strings leaves every name in place while `is_review_finding()` rejects every
+    finding it emits."""
+
+    required: frozenset[str]
+    properties: frozenset[str]
+    types: dict[str, str | None]
+
+
+def _as_object(value: Any) -> dict[str, Any] | None:
+    """A JSON object, or None. The guard `_published_finding_shape()` applies at every level of
+    the published body, so a malformed or drifted schema reads as "not published" — the refusal
+    this check exists to produce — instead of raising out of a function nothing wraps."""
+    return value if isinstance(value, dict) else None
+
+
+class _UnreadableShape(Exception):
+    """Internal: a `_require_object()` step that did not find its object.
+
+    Never escapes `_published_finding_shape()` or `_published_envelope_shape()`: it exists so each
+    descent can be written as a descent instead of one copy of the same two-line guard per level.
+    Its message IS the refusal reason, which is what keeps the wording of each step in one place
+    (§139)."""
+
+
+def _require_object(container: dict[str, Any], key: str, what: str) -> dict[str, Any]:
+    """The object at `container[key]`, or a refusal naming `what`.
+
+    The rule at every level is the same — a level that is not a non-empty object makes the shape
+    unreadable, and the reason has to name the level — so it is written once. `_as_object()` is
+    the type test; an empty object is treated as absent, because a schema with no fields at that
+    level says nothing either."""
+    value = _as_object(container.get(key))
+    if not value:
+        raise _UnreadableShape(f"no {what} in the published schema")
+    return value
+
+
+def _require_names(container: dict[str, Any], key: str, what: str, *,
+                   because: str | None = None) -> list[str]:
+    """The list of names at `container[key]`, or a refusal naming `what`.
+
+    The rule is the same at both levels and is written once: a value that is not a list or tuple of
+    names makes the shape unreadable, and a bare string is the case that matters (`frozenset("file")`
+    is four characters and would pass a name check it should fail). `because` carries the reason a
+    particular level gives, so the wording stays with the requirement it explains (§139)."""
+    value = container.get(key)
+    if not isinstance(value, (list, tuple)):
+        raise _UnreadableShape(
+            f"{what} is a {type(value).__name__}, not a list of names"
+            + (f", {because}" if because else ""))
+    names = list(value)
+    if not all(isinstance(name, str) for name in names):
+        # A name that is not a name is not a missing field, it is an unreadable list: a set built
+        # from `[7]` would silently contain no names at all, and one built from a nested list would
+        # raise out of a function documented never to raise.
+        raise _UnreadableShape(f"{what} carries non-string, non-field names")
+    return names
+
+
+def _require_type_keyword(schema: dict[str, Any], what: str, expected: str, why: str) -> None:
+    """Refuse unless `schema["type"]` is exactly `expected`, saying what the runtime does instead.
+
+    Both callers exist for the same reason — a container whose JSON Schema shape no longer matches
+    how warden reads it (a list it does not iterate, an object it does not subscript) leaves every
+    field name green while every verdict is rejected — so the guard is written once with the
+    consequence passed in.
+
+    Compared as a SET of type names, so a singleton array (`["array"]`) is the same schema as its
+    scalar form while a union (`["array", "null"]`) is not: a null-capable container is one the
+    runtime's `for entry in blocking` would eventually be handed (§149, §135)."""
+    found = schema.get("type")
+    if _as_schema_types(found) != {expected}:
+        article = "an" if expected[:1] in "aeiou" else "a"
+        raise _UnreadableShape(
+            f"{what} is not exactly {article} {expected} (type={found!r}), and {why}")
+
+
+def _require_output_schema(parsed: dict[str, Any]) -> dict[str, Any]:
+    """The published `output` schema: an object, and typed as one.
+
+    The root is the container NEITHER descent checked — `blocking` and `items` are held to
+    `type == "array"`/`"object"` while the schema above them only had to exist. A producer that made
+    its root null-capable (`["object", "null"]`) or dropped the keyword kept every nested check green,
+    and the runtime rejects any `result` that is not an object outright: `_review_verdict_problems()`
+    returns `["result is not an object"]` for one, so a null result under that schema parks the item
+    `needs_human` with no verdict — the `needs_human`-per-review failure this check exists to catch
+    before it happens (§150).
+
+    Called by BOTH readers, so neither can describe a different root than the other read, and a
+    refused root is reported with the same reason in both."""
+    output = _require_object(parsed, "output", "`output` object")
+    _require_type_keyword(
+        output, "`output`", "object", "the runtime rejects a result that is not an object")
+    return output
+
+
+def _require_output_promise(output: dict[str, Any]) -> None:
+    """`output.required` must be a list of names AND must promise the whole envelope warden reads.
+
+    The shape only matters if a NON-CLEAN outcome promises to publish it (§137): the runtime reports
+    `outcome 'actionable' publishes no `blocking` list` and such a verdict is unusable, so a producer
+    that made `blocking` optional while keeping this exact item schema would leave every field and
+    container green here and have every actionable review parked as unusable. A conditional
+    requirement (`if`/`then`) cannot be read as a plain promise, so it is refused rather than assumed.
+
+    The three names are the whole envelope, not only `blocking` (§140): the runtime reads
+    `schemaVersion`, `outcome` and `blocking` off every result and fails closed without any of them.
+    Names checked against the LIVE producer, which lists them all — this is a check, not a refusal of
+    the real shape."""
+    output_required = _require_names(
+        output, "required", "`output.required`",
+        because="so the promise that a non-clean outcome publishes `blocking` cannot be read")
+    unpromised = [name for name in REVIEW_OUTPUT_REQUIRED if name not in output_required]
+    if unpromised:
+        names = ", ".join(f"`{name}`" for name in unpromised)
+        raise _UnreadableShape(
+            f"`output.required` does not list {names}, and the runtime reads "
+            f"{'that' if len(unpromised) == 1 else 'those'} off every result and fails closed "
+            "without it (a conditional requirement is not readable here): a producer that "
+            "stopped requiring one would leave this comparison green while every affected "
+            "review was parked as unusable")
+
+
+def _published_finding_shape(
+        parsed: dict[str, Any]) -> PublishedFindingShape | UnreadableFindingShape:
+    """The finding object sideclaw publishes, or WHY it could not be read.
+
+    Read from `output.properties.blocking.items`, because `blocking` is the one array warden's
+    runtime READS: `_review_verdict_problems()` iterates it and filters every entry through
+    `is_review_finding()`, while `improvements`/`discussions`/`testGaps` are never inspected
+    (`test_validation_actionable_with_empty_blocking_confirms` is the executable statement of
+    that: they may be empty, or anything else, and the item still confirms and merges). An
+    unreadable shape is a finding in itself, not a reason to skip the check: warden's
+    `is_review_finding()` would then be an unverifiable copy, which is the drift this
+    comparison exists to catch.
+
+    This used to claim the four arrays "share this one object schema", which was never checked
+    and is not true of the live producer (§142): `improvements` and `discussions` do publish the
+    identical item object, but `testGaps` publishes `{"items": {"type": "string"}}` — strings,
+    not findings. Asserting structural identity across all four would therefore refuse the shape
+    sideclaw actually serves, and checking the three object arrays would police a shape nothing
+    in warden reads. The check is `blocking`'s item object, and the docstring now says so.
+
+    The CONTAINERS are part of the contract, not only the field names inside them (§135):
+    `blocking` must be exactly an array of objects, and not `["array", "null"]` either. A
+    producer that made the container object-shaped or null-capable while keeping the same
+    `items` would leave every field name green here and have every verdict rejected at runtime,
+    because `_review_verdict_problems()` iterates `blocking` as a list.
+
+    Every step is guarded, and the guards are the point rather than boilerplate: this runs on
+    the operator-facing `make status` path OUTSIDE `check_schema_versions()`'s try/except, so
+    the one body it must survive is the malformed one it is there to report. `required` is a
+    list or tuple OF NAMES or it is nothing: `frozenset()` over a bare string would read as a
+    set of its own characters (`{"f", "i", "l", "e"}` passing a name check it should fail) and
+    a number would raise out of a function documented never to raise."""
+    # One guard per level, each saying "not published, and here is what moved" rather than letting
+    # anything out: the body this has to survive is precisely the malformed one it exists to
+    # report. `_UnreadableShape` is caught at the bottom and becomes that return value.
+    try:
+        output = _require_output_schema(parsed)
+        container = _require_object(output, "properties", "`output.properties` object")
+        _require_output_promise(output)
+        blocking = _require_object(
+            container, "blocking", "`output.properties.blocking` schema object")
+        _require_type_keyword(
+            blocking, "`output.properties.blocking`", "array",
+            "the runtime iterates it as a list")
+        items = _require_object(
+            blocking, "items", "`output.properties.blocking.items` object schema")
+        _require_type_keyword(
+            items, "`output.properties.blocking.items`", "object",
+            "warden reads its fields by name")
+        properties = _as_object(items.get("properties"))
+        if not properties:
+            raise _UnreadableShape(
+                "`output.properties.blocking.items` publishes no fields")
+        # `required`'s entries are checked by `_require_names()`, and `properties`' keys are JSON
+        # object keys — always strings by the time `json.loads()` is done with them — so the guard
+        # that used to sit here (`all(isinstance(name, str) for name in required + properties)`)
+        # could not fire (§146). Removed rather than kept as reassurance: a check that cannot fail
+        # reads as coverage the reader does not have.
+        required = _require_names(items, "required", "`items.required`")
+        return PublishedFindingShape(
+            frozenset(required),
+            frozenset(properties),
+            {name: _as_schema_type((_as_object(subschema) or {}).get("type"))
+             for name, subschema in properties.items()},
+        )
+    except _UnreadableShape as exc:
+        return UnreadableFindingShape(str(exc))
+
+
+def _published_envelope_shape(
+        parsed: dict[str, Any]) -> PublishedEnvelopeShape | UnreadableEnvelopeShape:
+    """The envelope fields sideclaw publishes, or WHY they could not be read.
+
+    Read from `output.properties.schemaVersion` and `output.properties.outcome`, because those are
+    the two fields the runtime reads by VALUE off every result: `assert_result_schema()` compares
+    `result["schemaVersion"]` to `REVIEW_SCHEMA_VERSION` with a strict `!=`, and `assert_outcome()`
+    tests `result["outcome"] in REVIEW_OUTCOMES`. Both fail CLOSED — the item lands `needs_human` —
+    which is why a producer that drifts here is not a silent mis-parse but a fleet-wide parking, and
+    why the check that exists to catch contract drift has to read them (§143).
+
+    What is required of `schemaVersion` is a PIN, not a type: `version_const` and `version_enum`
+    are read so the caller can tell whether the producer promises exactly the version warden
+    compares, which is the only thing `assert_result_schema()` can rely on (`_version_is_pinned()`).
+    Of `outcome` an `enum` of strings is required: `output.properties.outcome` without one constrains
+    nothing, and the runtime's membership test is the only thing that would have caught an unknown
+    value — at the point where it is too late to call it drift.
+
+    Every step is guarded for the reason the finding reader's are: this runs OUTSIDE
+    `check_schema_versions()`'s try/except, on the operator-facing `make status` path, and the one
+    body it must survive is the malformed one it is there to report."""
+    try:
+        output = _require_output_schema(parsed)
+        container = _require_object(output, "properties", "`output.properties` object")
+        version = _require_object(
+            container, "schemaVersion", "`output.properties.schemaVersion` property")
+        outcome = _require_object(container, "outcome", "`output.properties.outcome` property")
+        published_enum = outcome.get("enum")
+        if not isinstance(published_enum, (list, tuple)) or not all(
+                isinstance(value, str) for value in published_enum):
+            raise _UnreadableShape(
+                "`output.properties.outcome` publishes no `enum` of outcome names, so nothing "
+                "promises the producer stays inside warden's vocabulary while the runtime refuses "
+                "any value outside it")
+        raw_version_enum = version.get("enum")
+        return PublishedEnvelopeShape(
+            _as_schema_types(version.get("type")),
+            version.get("const"),
+            (tuple(raw_version_enum) if isinstance(raw_version_enum, (list, tuple)) else None),
+            tuple(published_enum),
+        )
+    except _UnreadableShape as exc:
+        return UnreadableEnvelopeShape(str(exc))
 
 
 def classify_dispatch_outcome(status: str | None, verdict_json: str | None) -> tuple[str, str | None]:

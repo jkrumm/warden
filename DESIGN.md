@@ -788,10 +788,281 @@ they flag is already exactly one entry in the owner's list.
 | INV-7-owner-queue | anything waiting on the owner > 3 days (report only) | same |
 | TRIP (§103) | a Kuma push monitor marked `fixed` without proof it can still go DOWN | `test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding` |
 
-The self-audit adds four findings about the loop's own answers:
-`review-always-blocks-<repo>`, `liveness-never-confirms-<repo>`,
+The self-audit reads an item's review through `d.validation_job_id`, and the pointer decides
+TWO questions that must not share one mechanism:
+
+- **Attribution (§128/§133).** Only a review whose tier, repo and origin all match the implement
+  row may be read as that item's verdict; otherwise a stale pointer naming a terminal dispatch
+  of another tier (the ledger has implement→investigate pairs), another repo, or a *different
+  item's* review fabricates or suppresses a merge-gating finding. The origin must match AND be
+  present: **two NULL origins are a refusal, not a match.** A manual `warden dispatch` pair
+  carries no origin, so the pointer is the only claim linking its two rows — and the pointer is
+  what is in question, so any manual implement in that repo could name any manual review in it
+  and a stale pointer would be read as this item's verdict with no alert. `IS` semantics were
+  the earlier reading of this same clause (§132's discussion) and they made absence of evidence
+  into proof of identity; the row is now unverifiable like every other unverifiable pointer —
+  verdict blanked, item reported, previous decision kept. (The live ledger has no such pair: the
+  six NULL-origin implement rows carry no pointer at all, so this closes a shape the loop could
+  produce rather than a defect in the data. The real fix for manual pairs is a stable linkage
+  the schema does not have yet — a review back-pointer or the origin thread carried onto the
+  review row; tracked in STATE.md's carried debt.)
+- **Visibility (§129).** The same mismatch may not make the item disappear. Deciding
+  attribution with an inner join dropped the implement row entirely, which shrinks the
+  denominator `review-always-blocks` is computed over *and* hides the stale pointer that did
+  it. So the query resolves the pointer and nothing else (`LEFT JOIN`), and the identity is a
+  predicate the audit uses both ways: matching rows are the fold's input, mismatched rows are
+  folded with their verdict blanked, which makes the item `unusable` through the same
+  carry-forward an unreadable terminal row gets — reported by
+  `review-verdicts-unusable-<repo>`, never judged.
+
+A pointer at this item's own review that has not finished yet is in neither list: nothing to
+read and nothing wrong.
+
+The fold's input is one `TypedDict` (`ReviewRow`), not a bracket-access `Protocol` that accepts
+any mapping: a Protocol declaring `__getitem__(key: str) -> Any` type-checks while a renamed or
+dropped SQL alias fails only wherever the row is first read (§130 — that is how the implement
+job's time was read as the review's for a round). `_review_fold_rows()` is the single conversion
+point and checks every projected column name against `REVIEW_QUERY_COLUMNS`, so a change to the
+projection fails at the boundary and names the missing column. The reason a pointer did not
+resolve travels in its own `mismatch_reason` key, never written into `review_status` — that
+column is a terminal-status enum everywhere else — and it reaches the finding, which says *why*
+the verdict is unreadable and not only which items are affected. A `ReviewRow` carries EXACTLY
+the declared keys: the conversion builds them one by one instead of spreading the source row,
+which used to hand the projection's pointer columns (`pointer`, `target_*`) to every downstream
+reader through a contract that never declared them (§134).
+
+The section pipeline returns a value, not a sink. `self_audit_findings()` gives back
+`SelfAuditFindings(findings, unreadable_timestamps)`, and the one number the summary needs
+travels as that field — where the earlier shape threaded a mutable `metrics` dict down three
+call levels so a single section could escape the uniform `Callable[[], list[dict]]` contract the
+others satisfy, and no level of that path could be type-checked. Review health's FETCH is the
+one step that can fail as a unit, so it is isolated inside the pipeline and the section then
+takes rows it cannot re-query; that is what makes the count a return value at all. It also
+sharpens the honesty rule: the count is `None` only when the fetch raised — nothing measured it —
+while a section that fails *after* a good fetch leaves a measured number standing, with its
+failure reported as its own finding.
+
+The window's SQL pre-filter compares the raw
+`created_at` column (keeping `idx_dispatches_created` usable) and is widened to a superset;
+the exact instant comparison happens in Python.
+
+`is_review_finding()` mirrors a shape the producer publishes, so
+`check-schema-versions.py` compares that shape too — `version` and `outcomes` can agree while
+the finding object changes, and a renamed required field would leave warden reading a shape
+sideclaw no longer emits with every other check green. Only one direction is unsafe: requiring
+MORE than the producer means rejecting real findings, so warden's required set must be a subset
+of the published one, and the tolerated direction is reported rather than hidden (the live
+producer requires `angle`; warden deliberately does not). No readable published shape is itself
+a disagreement — the alternative is an unverifiable copy, which is the drift being caught.
+The comparison covers TYPES, not only names: a producer that keeps `file` and changes it from a
+string to an array leaves every name in place, matches the version and the outcomes, and still
+makes `is_review_finding()` reject every finding it emits — the whole verdict silently
+unreadable, with this check reporting success. Since warden reads a string and nothing else, a
+published type that is not `"string"` (including a property with no readable `type` at all) is a
+disagreement, and the disagreement line names every shortfall at once: a missing required name,
+a missing property and a retyped field are independent, and an operator sent back for a second
+run to learn the second one has been handed a diagnostic that lies by omission.
+
+The set of fields warden requires has ONE definition (§136): `REVIEW_FINDING_REQUIRED` is what
+the drift comparison measures the producer against, and `is_review_finding()` reads that same
+constant instead of restating `{"file", "message"}` inline. Two hand-written copies that agree
+today are one place to change and one to forget, and forgetting the reader's copy leaves the
+comparison reporting a mismatch against a set the reader no longer uses — while the reader keeps
+accepting findings the schema calls wrong.
+
+The two readers of that contract are not the same reader (§138). A FRESHLY RECEIVED result must
+carry `blocking` whatever its outcome: the published schema lists it in `output.required` for every
+outcome, so a new result without one is a partially serialized payload, and reading it as "clean,
+nothing to report" is the single direction where an unreadable payload MERGES code — the item is
+parked with the missing list named instead. The STORED-verdict reader keeps the leniency for a
+`clean` verdict persisted with no list at all: re-reading history merges nothing, so being strict
+there would only invalidate old rows. `_review_verdict_problems(require_blocking=True)` is that
+difference, spelled at one call site, and the refusal note is built with the same flag so it cannot
+report "unknown mismatch" about a payload it just refused.
+
+A raw-text admission is not a superset of an instant comparison (§139). `_fetch_review_rows()`
+pre-filters in SQL and decides in Python, and the pre-filter must never be the narrower of the
+two, or a row disappears before the window is ever applied to it — silently, in the one direction
+that hides work. A lexical compare against a bound is not that superset: `'2026-09-30 14:00:00
+-12:00'` sorts before `'2026-09-30T00:00:00'` (`' '` < `'T'`) although its instant is
+2026-10-01T02:00Z, and a bare `'2026-09-30'` sorts before any bound on the same date. What kept
+those rows visible was the 26-hour WIDENING of the bound — an in-window row's date is always a
+later date than a bound that far back, so the date prefix decided every in-window comparison before
+the separator could. Measured both ways on a copy of the live ledger: the raw-text form admits all
+three representations of an in-window row and drops only rows the window's own decision drops
+anyway, and `widen = timedelta(0)` would have made it drop space-separated in-window rows. The
+pre-filter now admits on `datetime(d.created_at)`, SQLite's own normalised parse — plus
+`datetime(...) IS NULL` for rows it cannot read, which stay visible as `corrupt_timestamps`. The
+slack stays for a smaller, real reason: SQLite truncates fractional seconds where Python keeps
+microseconds. `EXPLAIN QUERY PLAN` says `SCAN d` for both spellings (the `IS NULL` term already
+put the query on a scan), measured 10.4 ms against 14.6 ms for 200 runs over the live 379-row
+ledger, and the normalised form is the shape the planned expression index covers.
+
+The shape only matters where the producer PROMISES to publish it (§137). `blocking` must be
+listed in `output.required`, because that is the promise the runtime reads:
+`_review_verdict_problems()` refuses a non-clean verdict with no `blocking` list, and such a
+verdict is unusable — so a producer that made `blocking` optional while keeping the item schema
+byte-identical would leave every field name and both containers green, and have every actionable
+review parked as unusable with nothing saying why. A conditional requirement (`if`/`then`) cannot
+be read as a plain promise and is refused rather than assumed.
+
+The check reads the fields the runtime reads, by value as well as by name (§143). The comparison
+covered the endpoint's own `version`/`outcomes` metadata, the trio's presence in `output.required`,
+and the finding object — but not the two envelope fields the runtime reads by VALUE off every result:
+`assert_result_schema()` compares `result["schemaVersion"]` to `REVIEW_SCHEMA_VERSION` with a strict
+`!=`, and `assert_outcome()` tests `result["outcome"] in REVIEW_OUTCOMES`. Both fail closed, so a
+producer could keep its metadata identical, republish `schemaVersion` as a string or widen `outcome`'s
+enum, and have `check-schema-versions.py` report success while every live review was parked
+`needs_human`. `_published_envelope_shape()` reads the two properties beside
+`_published_finding_shape()`'s item object, and the rule is the one this check follows everywhere:
+only the direction that breaks the runtime is a refusal (an outcome the producer may emit and warden
+refuses), while the other (a warden outcome the producer can no longer emit: a branch of ours gone
+unreachable) is named as a tolerated difference. `schemaVersion` must publish a type that can carry
+the integer the comparison wants, and a published `const` has to agree with it; `outcome` must
+publish an `enum` of strings, because without one nothing constrains it and the runtime's membership
+test is the only thing that would have noticed.
+
+Every level of a descent is checked, the root included (§150). `blocking` and its `items` were held
+to `type: "array"`/`"object"` while the schema ABOVE them only had to exist, so a producer could
+publish `output.type: ["object", "null"]` — or drop the keyword — with every nested check green; a
+null `result` under that schema is rejected outright by `_review_verdict_problems()` (`result is not
+an object`), so the item parks `needs_human` with no verdict, which is the failure this check exists
+to report before it happens rather than after. The asymmetry is the tell: a rule applied at every
+level except the first is a rule whose absence nobody notices until a producer moves the level nobody
+looked at. `_require_output_schema()` is the root both readers call, so neither can describe a
+different root than the other read and a refused root reports one reason in both places.
+
+A JSON Schema `type` keyword is compared as the SET of types it names (§149). The dialect allows a
+list, so `{"type": ["string"]}` and `{"type": "string"}` are the same schema — and the check compared
+the raw keyword, which made a producer whose serializer wraps every type in a list read as a producer
+that retyped every field. That is a false refusal, the failure class this whole check exists to avoid
+(§137's promise and §147's pin are refusals only because the producer can move the value): a harmless
+serialization change would have failed the drift check loudly and sent an operator looking for drift
+that is not there. `_as_schema_types()` reads the keyword as a set of names, `_as_schema_type()`
+answers a single name when the set has one member and `None` when it has more, and both container
+guards compare sets. A real UNION still reads as a disagreement: `["string", "null"]` admits a value
+`is_review_finding()` refuses, and `["array", "null"]` is a container the fold would be handed — the
+normalization is about the encoding, never about the constraint.
+
+A version is promised by a pin, not by a type (§147). §143's envelope check asked whether the
+published `schemaVersion` schema could hold the integer the runtime compares — `{"type": "number"}`
+passed, and so did `["integer", "string"]`, because both admit the value. Neither PROMISES it: the
+first lets the producer emit `2`, the second `"1"`, and `assert_result_schema()` compares the value
+with a strict `!=`, so both park every review while the drift check reports the contract held. What
+the check reads now is a pin: `const: 1`, or a one-member `enum: [1]`. A multi-member enum is not one
+(the producer could emit the other value), and the comparison is `_pins_version()`, which excludes
+booleans on purpose — `True == 1` in Python, so a `const: true` read with `==` alone would be a pin
+on the number 1, which is the accidental-equality class this branch keeps removing. A pin also wins
+over a permissive `type` list: if the only legal value left is the one warden compares, the type no
+longer matters.
+
+A rule set is evaluated once and read by everything that reports it (§148). `poll_validation_jobs()`
+asked the same question twice — `_review_contract_matches()` ran `_review_verdict_problems(...,
+require_blocking=True)` and the caller then ran it AGAIN to build the refusal note — which is two
+copies of one contract that have to agree, for the same payload, in the same tick. The rule set is
+`_review_contract_problems()` now, returning the reasons, and the gate is `not` that list, so the
+note cannot describe a rule the gate never applied. The same round removed a guard that could not
+fail (`all(isinstance(name, str) for name in required + properties)` after `_require_names()` had
+already checked `required`'s entries, with `properties`' keys string by construction from
+`json.loads()`) and two tests that could not fail either — one mirroring the production expression it
+was checking (`tuple(sorted(TERMINAL))`), one comparing a constant against the fixture that serves it
+rather than against the endpoint — because a check that cannot fail reads as coverage the code does
+not have.
+
+A guarded descent is a list of steps, not seven raise sites (§145). `_published_finding_shape()` was
+~80 lines of a linear descent with a `raise _UnreadableShape(...)` threaded through each level, so
+every step was reachable only by driving the whole reader from above and the shape of the code
+matched neither the shape of the contract nor the test that would pin one rule. The repeated rules are
+their own steps now — `_require_object()` (which already existed), `_require_names()`,
+`_require_type_keyword()` and `_require_output_promise()` — each refusing in one place with its
+reason passed in, and the orchestrator reads as the descent it is: output → properties → the promise →
+`blocking` → its items → their fields. Extracting them found a real gap the old code only appeared to
+cover: the `output.required` container was checked for being a list of names, but its ENTRIES were not
+checked at the top level, so `frozenset([7])` would have read as "the producer requires nothing" —
+caught there by the promise check incidentally, and now refused by the step that owns the rule.
+Every refusal message is byte-identical to the one it replaced, so the operator's diagnostic and the
+tests that assert on it are unchanged; the extraction was verified by the whole suite and by the live
+drift check, which is the one endpoint the wording has to keep matching.
+
+One reader per report, for both the ✗ and the ✓ line (§144). `main()` narrowed the finding-shape
+union twice in one function — once for the mismatch detail, once for the `(producer also requires:
+…)` suffix on the success line — and the envelope would have made that four. `_finding_shape_notes()`
+and `_envelope_notes()` each return `(refusals, tolerated differences)`, and both branches of `main()`
+read them, so a tolerated difference cannot be printed on one branch and dropped on the other, and
+the narrowing on the `published` discriminator exists exactly once per report type.
+
+The check reads the array the runtime reads (§142). `_published_finding_shape()` claimed in prose
+that the four published arrays — `blocking`, `improvements`, `discussions`, `testGaps` — "share this
+one object schema", which was never checked and is not true: measured against the live
+`/api/review-schema`, `improvements` and `discussions` do publish the identical item object, but
+`testGaps` publishes `{"items": {"type": "string"}}`. Asserting identity across all four would
+refuse the shape sideclaw actually serves, and policing the three object arrays would police a shape
+nothing in warden reads: `_review_verdict_problems()` iterates `blocking` and filters it through
+`is_review_finding()`, and the other three are never inspected — `test_validation_actionable_with_
+empty_blocking_confirms` is the executable statement. So the docstring says `blocking`, and
+`test_a_diverging_improvements_shape_is_not_a_mismatch` holds the scope in place from both sides: a
+string-array `improvements` is not a mismatch, the same divergence in `blocking` is.
+
+A `types` mapping holds schema types or nothing (§142). `PublishedFindingShape.types` and
+`FindingShapeComparison.types` were `dict[str, Any]` while every value is a JSON-Schema `type` string
+or `None`; `_as_schema_type()` enforces that instead of asserting it, so `{"type": 7}` reads as
+"no readable type" (and therefore as mistyped) rather than comparing a number to `"string"` by
+accident. Reverting the coercion fails the test that walks the mapping's values.
+
+A registry and the map it dispatches to are one structure or they drift (§141). `self_audit_findings()`
+kept `SELF_AUDIT_SECTIONS` (name → the finding-key prefixes it owns) beside a local map of the same
+names to their callables, and dispatched over their INTERSECTION: a section declared in the table
+with no callable was skipped without a word. That is §132's failure arriving without an exception to
+report — the section stops running, its silence reads as "nothing to report", and the resolve sweep
+closes the very alerts it stopped checking. Both directions are findings now: a declared name with no
+section, and a section with no declaration (whose key prefixes nobody has listed, so the sweep cannot
+protect them). The map moved into `_self_audit_sections()` so that "which sections exist" is
+observable, and the test compares it against the registry — the old check compared the table against
+a hardcoded literal set, which cannot see the map at all. `SELF_AUDIT_ELSEWHERE` names the two
+declared sections that legitimately live outside the map, with the reason each does.
+
+The promise covers every name the runtime READS OFF A RESULT, not only `blocking` (§140).
+`assert_result_schema()` reads `schemaVersion`, `assert_outcome()` reads `outcome`, and
+`_review_verdict_problems()` reads `blocking` — each fails CLOSED on a result missing its name. The
+check required `blocking` and nothing else, so a producer that stopped requiring `schemaVersion` or
+`outcome`, while keeping its version, its outcome vocabulary and the whole item schema byte-identical,
+left this comparison green while every review it emitted was parked `needs_human` with nothing saying
+why. `REVIEW_OUTPUT_REQUIRED` is that list — one definition of what the runtime reads, checked against
+the live producer, which promises all three — and the refusal names which one moved. Measured by
+reverting it: with the old check, dropping `schemaVersion` alone reports `ok: True`.
+
+The CONTAINERS are part of that contract too (§135), not only the field names inside them.
+`blocking` must be exactly an array and its `items` exactly an object, because that is what the
+runtime does with them: `_review_verdict_problems()` iterates `blocking` as a list and reads
+`items`' fields by name. A producer that made the container object-shaped, or null-capable
+(`["array", "null"]`), while keeping the same `items` object leaves every field name green —
+and every verdict rejected at runtime. The refusal names the requirement that moved, rather than
+only that something did: a body with no `blocking` at all and one whose `blocking` stopped being
+an array send an operator to different files, so the walker returns its reason instead of a bare
+`None` and the operator-facing line prints it.
+
+The self-audit adds five findings about the loop's own answers:
+`review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>` (a terminal review row
+without a usable result, or one whose timestamp cannot be placed among its item's other
+rows — an unknown order must never resolve to an older readable review, and such an item
+is left OUT of `review-always-blocks`'s denominator rather than judged by a stale value;
+cannot count as a pass), `liveness-never-confirms-<repo>`,
 `fixed-reopened-<event>` (a verdict or fix proven wrong), and
-`revisions-exhausted-<event>`. Enforced elsewhere, by name: the fail-closed
+`revisions-exhausted-<event>`. `run_self_audit()` adds `self-audit-slow` when the tick's
+own cost crosses `SELF_AUDIT_SLOW_MS` — the one finding that measures the auditor, because
+the window query carries a non-sargable term on a table that is never pruned (§126/§123).
+The stored summary carries `self_audit_schema` so a consumer can tell which generation of
+these semantics its numbers belong to. Each section that produces them runs through
+`_audit_section()`, so a section that raises reports `self-audit-section-failed-<name>`
+instead of taking the other four down with it for that hour — and a section that raised
+also keeps its own events through the resolve sweep (§132). The sweep reads an absent key
+as "nothing to report", which is only true of a section that actually RAN: without the
+exemption a query failure resolved the live alerts it had just stopped checking, so the
+hour's card showed a clean bill. `SELF_AUDIT_SECTIONS` names each section with the finding
+key PREFIXES it owns — the same table the run loop iterates, so a section cannot run
+without declaring them — and only a completed section's silence resolves anything.
+Enforced elsewhere, by name:
+the fail-closed
 executor gate (`EXECUTOR_REPOS` in `merge.py`, §99/§107 — `NEVER_AUTO_MERGE`
 itself was withdrawn in §107), GitHub's rules as the only review gate (§97),
 `OWNER_AUTHORIZERS = ("owner:argo",)` (§96).
