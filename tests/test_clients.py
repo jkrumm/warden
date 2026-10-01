@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 import contextlib
+import importlib.util
 import datetime as dt
 import io
 import json
@@ -410,6 +411,11 @@ _REVIEW_SCHEMA_OUTPUT = {
                  "schemaVersion"],
     "properties": {
         "outcome": {"type": "string", "enum": list(sideclaw.REVIEW_OUTCOMES)},
+        # The live producer's `{"type": "number", "const": 1}` — the runtime compares this field to
+        # an integer and refuses a result that carries anything else, so a fixture that left it out
+        # (as this one did until §143) is a producer whose envelope cannot be read at all, and every
+        # test built on it would be asserting against a mismatch of its own making.
+        "schemaVersion": {"type": "number", "const": sideclaw.REVIEW_SCHEMA_VERSION},
         "blocking": {"type": "array", "items": {
             "type": "object",
             "properties": {"file": {"type": "string"}, "line": {"type": "number"},
@@ -422,7 +428,9 @@ _REVIEW_SCHEMA_OUTPUT = {
 
 
 # The three names the runtime reads off a result — spelled once, so a fixture that satisfies the
-# promise cannot drift from what the check requires (§140).
+# promise cannot drift from what the check requires (§140). The vocabulary is read from the module
+# for the same reason: the fixture asserts what warden READS, and a second hand-written copy of the
+# outcome list would be one more place to forget when it changes.
 _PROMISED = list(sideclaw.REVIEW_OUTPUT_REQUIRED)
 
 _LIVE = object()
@@ -2045,6 +2053,146 @@ def test_interactive_token_is_hermes_never_the_chat_write_only_warden_app():
     finally:
         clients_slack.resolve_secret = saved
     assert calls == [("SLACK_BOT_TOKEN", "op://hermes/slack/bot-token")]
+
+
+# ------------------------------------------------------------------ the result envelope (§143) and
+# the rendering the operator reads (§144).
+
+
+def _load_check_schema_versions() -> Any:
+    """`scripts/check-schema-versions.py` as a module.
+
+    The file name has dashes, so it cannot be imported by name, and the two lines it renders are
+    behaviour an operator reads on every `make status`: which differences are refusals and which are
+    tolerated-on-purpose suffixes. Loading it here is what makes those lines testable at all."""
+    path = REPO / "scripts" / "check-schema-versions.py"
+    spec = importlib.util.spec_from_file_location("check_schema_versions_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _envelope_body(**changes: Any) -> dict[str, Any]:
+    """The live-shaped output body with named changes applied to the two envelope properties."""
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    for name, value in changes.items():
+        output["properties"][name] = value
+    return output
+
+
+def _envelope_check(**changes: Any) -> dict[str, Any]:
+    srv = _stub_schemas(review_output=_envelope_body(**changes))
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        return sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+
+
+def test_a_retyped_schema_version_is_a_mismatch():
+    """§143 — the runtime compares `schemaVersion` to an integer with a strict `!=`, so a producer
+    that republishes it as a string can emit `"1"` and have `assert_result_schema()` refuse every
+    review it produces. Required-presence alone (`output.required` still lists it) reported success
+    for exactly that body."""
+    review = _envelope_check(schemaVersion={"type": "string"})
+    assert review["ok"] is False, review
+    envelope = review["envelopeShape"]
+    assert envelope["published"] is True and envelope["versionTypeOk"] is False, envelope
+    # …and the live producer's own `{"type": "number", "const": 1}` is fine, because an integer is
+    # what the comparison accepts.
+    assert _envelope_check()["ok"] is True
+    assert _envelope_check(schemaVersion={"type": "integer", "const": 1})["ok"] is True
+
+
+def test_a_version_const_that_moved_is_a_mismatch():
+    """§143 — a published `const` is the producer stating the version a second time; when it
+    disagrees with the pinned number, one of the two is about to move under warden."""
+    review = _envelope_check(schemaVersion={"type": "number", "const": 2})
+    assert review["ok"] is False, review
+    assert review["envelopeShape"]["versionConstOk"] is False, review["envelopeShape"]
+
+
+def test_an_outcome_outside_wardens_vocabulary_is_a_mismatch():
+    """§143 — `assert_outcome()` parks any review whose outcome is not in `REVIEW_OUTCOMES`, so a
+    producer that WIDENS its enum parks every review carrying the new name. The top-level `outcomes`
+    metadata can stay identical while this moves, which is why it needed its own comparison."""
+    review = _envelope_check(outcome={"type": "string",
+                                      "enum": [*sideclaw.REVIEW_OUTCOMES, "blocked"]})
+    assert review["ok"] is False, review
+    assert review["envelopeShape"]["unknownOutcomes"] == ["blocked"], review["envelopeShape"]
+
+
+def test_a_producer_that_omits_a_warden_outcome_is_tolerated_and_named():
+    """§143 — the other direction is safe: a warden outcome the producer can no longer emit is a
+    branch of ours gone unreachable, not a review mis-parsed. Refusing it would refuse a producer
+    that narrowed its own vocabulary, so it is named instead — the rule the `producer also
+    requires:` suffix already follows for findings."""
+    review = _envelope_check(outcome={"type": "string", "enum": ["clean", "actionable"]})
+    assert review["ok"] is True, review
+    assert review["envelopeShape"]["unknownOutcomes"] == [], review["envelopeShape"]
+    script = _load_check_schema_versions()
+    problems, tolerated = script._envelope_notes(review)
+    assert problems == [], problems
+    assert tolerated == ["producer also omits: needs-human"], tolerated
+
+
+def test_an_outcome_with_no_enum_is_an_unreadable_envelope():
+    """§143 — `output.properties.outcome` without an `enum` constrains nothing, and the runtime's
+    membership test is the only thing that would notice an unknown value. Read as unreadable rather
+    than as an empty comparison, and with a reason that names the requirement that failed."""
+    review = _envelope_check(outcome={"type": "string"})
+    assert review["ok"] is False, review
+    envelope = review["envelopeShape"]
+    assert envelope["published"] is False and "enum" in envelope["reason"], envelope
+
+
+def test_a_required_list_carrying_a_non_string_name_is_unreadable():
+    """§143 — both `required` lists are checked for their ENTRIES, not only their container. A list
+    holding a non-string is not a field warden could ever look up, and `frozenset([7])` would read as
+    "the producer requires nothing" — the fabricated-clean-bill shape this branch keeps removing.
+    The refusal names the level, because the two lists send a reader to different fixes."""
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    output["required"] = ["outcome", "blocking", 7]
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is False, review
+    envelope = review["findingShape"]
+    assert envelope["published"] is False, envelope
+    assert "`output.required` carries non-string" in envelope["reason"], envelope["reason"]
+
+    # …and the item level, independently.
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    output["properties"]["blocking"]["items"]["required"] = ["file", "message", 7]
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is False, review
+    assert "`items.required` carries non-string" in review["findingShape"]["reason"], review
+
+
+def test_the_operator_notes_name_both_tolerated_differences():
+    """§144 — both reports are read through one helper each, so a tolerated difference cannot be
+    printed in the ✓ line and dropped from the ✗ line. This asserts the two suffixes together, on
+    the live-shaped body: the producer requires `angle` and warden does not, and a producer that
+    dropped `needs-human` from its vocabulary is named rather than refused."""
+    script = _load_check_schema_versions()
+    review = _envelope_check(outcome={"type": "string", "enum": ["clean", "actionable"]})
+    assert script._finding_shape_notes(review)[1] == ["producer also requires: angle"]
+    assert script._envelope_notes(review)[1] == ["producer also omits: needs-human"]
+    # The refusal paths return their line and NO tolerated suffix, so a problem can never be
+    # rendered as a suffix the ✓ branch would print.
+    refused = _envelope_check(schemaVersion={"type": "string"})
+    problems, tolerated = script._envelope_notes(refused)
+    assert len(problems) == 1 and "schemaVersion is typed ['string']" in problems[0], problems
+    assert tolerated == [], tolerated
 
 
 if __name__ == "__main__":

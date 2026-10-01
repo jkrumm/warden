@@ -906,6 +906,44 @@ byte-identical would leave every field name and both containers green, and have 
 review parked as unusable with nothing saying why. A conditional requirement (`if`/`then`) cannot
 be read as a plain promise and is refused rather than assumed.
 
+The check reads the fields the runtime reads, by value as well as by name (§143). The comparison
+covered the endpoint's own `version`/`outcomes` metadata, the trio's presence in `output.required`,
+and the finding object — but not the two envelope fields the runtime reads by VALUE off every result:
+`assert_result_schema()` compares `result["schemaVersion"]` to `REVIEW_SCHEMA_VERSION` with a strict
+`!=`, and `assert_outcome()` tests `result["outcome"] in REVIEW_OUTCOMES`. Both fail closed, so a
+producer could keep its metadata identical, republish `schemaVersion` as a string or widen `outcome`'s
+enum, and have `check-schema-versions.py` report success while every live review was parked
+`needs_human`. `_published_envelope_shape()` reads the two properties beside
+`_published_finding_shape()`'s item object, and the rule is the one this check follows everywhere:
+only the direction that breaks the runtime is a refusal (an outcome the producer may emit and warden
+refuses), while the other (a warden outcome the producer can no longer emit: a branch of ours gone
+unreachable) is named as a tolerated difference. `schemaVersion` must publish a type that can carry
+the integer the comparison wants, and a published `const` has to agree with it; `outcome` must
+publish an `enum` of strings, because without one nothing constrains it and the runtime's membership
+test is the only thing that would have noticed.
+
+A guarded descent is a list of steps, not seven raise sites (§145). `_published_finding_shape()` was
+~80 lines of a linear descent with a `raise _UnreadableShape(...)` threaded through each level, so
+every step was reachable only by driving the whole reader from above and the shape of the code
+matched neither the shape of the contract nor the test that would pin one rule. The repeated rules are
+their own steps now — `_require_object()` (which already existed), `_require_names()`,
+`_require_type_keyword()` and `_require_output_promise()` — each refusing in one place with its
+reason passed in, and the orchestrator reads as the descent it is: output → properties → the promise →
+`blocking` → its items → their fields. Extracting them found a real gap the old code only appeared to
+cover: the `output.required` container was checked for being a list of names, but its ENTRIES were not
+checked at the top level, so `frozenset([7])` would have read as "the producer requires nothing" —
+caught there by the promise check incidentally, and now refused by the step that owns the rule.
+Every refusal message is byte-identical to the one it replaced, so the operator's diagnostic and the
+tests that assert on it are unchanged; the extraction was verified by the whole suite and by the live
+drift check, which is the one endpoint the wording has to keep matching.
+
+One reader per report, for both the ✗ and the ✓ line (§144). `main()` narrowed the finding-shape
+union twice in one function — once for the mismatch detail, once for the `(producer also requires:
+…)` suffix on the success line — and the envelope would have made that four. `_finding_shape_notes()`
+and `_envelope_notes()` each return `(refusals, tolerated differences)`, and both branches of `main()`
+read them, so a tolerated difference cannot be printed on one branch and dropped on the other, and
+the narrowing on the `published` discriminator exists exactly once per report type.
+
 The check reads the array the runtime reads (§142). `_published_finding_shape()` claimed in prose
 that the four published arrays — `blocking`, `improvements`, `discussions`, `testGaps` — "share this
 one object schema", which was never checked and is not true: measured against the live

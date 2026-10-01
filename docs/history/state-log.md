@@ -10045,6 +10045,53 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-eighth round.** `needs-human`: one blocker, two improvements, no discussions. Architect,
+resilience and performance approved clean; the adversary found the gap, and it was real.
+
+The blocker was the last piece of the same contract §137 and §140 have been closing: the comparison
+covered the endpoint's own `version`/`outcomes` metadata, the trio's presence in `output.required`
+and the finding object, but never the two envelope fields the runtime reads by VALUE off every result.
+`assert_result_schema()` compares `result["schemaVersion"]` to `REVIEW_SCHEMA_VERSION` with a strict
+`!=` and `assert_outcome()` tests membership in `REVIEW_OUTCOMES`; both fail closed. A producer could
+therefore keep every published name and both metadata values identical, retype `schemaVersion` to a
+string or widen `outcome`'s enum, and have this check report success while every live review was
+parked `needs_human` — the failure mode the check exists to catch, arrived at from one level up.
+`_published_envelope_shape()` now reads those two properties, with the rule this check follows
+everywhere: only the direction that breaks the runtime is a refusal (an outcome the producer may emit
+and warden refuses), while the other — a warden outcome the producer can no longer emit, a branch of
+ours gone unreachable — is named as a tolerated difference next to `producer also requires`.
+`schemaVersion` has to publish a type that can carry the integer, and a published `const` has to
+agree with it; `outcome` has to publish an `enum` of strings, because without one nothing constrains
+it. The fixture had to grow a `schemaVersion` property for its own tests to mean anything, which is
+itself the evidence: a body without one publishes an unreadable envelope, and every test built on it
+would have been asserting a mismatch of its own making.
+
+Both improvements were the same shape — a structure with more copies than it needs. `_published_
+finding_shape()`'s descent had seven `raise _UnreadableShape(...)` sites threaded through ~80 lines,
+so each rule was reachable only by driving the whole reader from above; the repeated ones are steps
+now (`_require_names()`, `_require_type_keyword()`, `_require_output_promise()`), the orchestrator
+reads as the descent it is, and every message is byte-identical to the one it replaced — verified by
+the suite and by the live drift check, the one endpoint the wording has to keep matching. Extracting
+them exposed a gap the old code only appeared to close: `output.required` was checked for being a list
+of names but its ENTRIES were not checked at the top level, so `frozenset([7])` would have read as
+"the producer requires nothing" — the fabricated-clean-bill shape again, caught incidentally by the
+promise check and now refused by the step that owns the rule. Second, `main()` narrowed the
+finding-shape union twice in one function and the envelope would have made it four;
+`_finding_shape_notes()` and `_envelope_notes()` now return `(refusals, tolerated differences)` and
+both branches read them, so a tolerated difference cannot be shown on one branch and dropped on the
+other.
+
+**Verified.** `tests/test_clients.py` 125 → **132/132** (+7: a retyped `schemaVersion`, a moved
+`const`, an outcome outside the vocabulary, an `outcome` with no `enum`, a `required` list carrying a
+non-string at each level, the tolerated omission path named rather than refused, and the two suffix
+readers), `tests/test_triage.py` **405/405**, every
+suite green; live-ledger replay unchanged at 39 judged items; drift check green against the running
+sideclaw — a real endpoint whose envelope now reads as agreeing, which is the check this round could
+most easily have got wrong in the other direction. Proved fail-capable by removing the envelope
+comparison from `check_schema_versions()`: all six envelope tests fail, and the live probe is
+unaffected. The non-string-entry guard is proved the same way: reverted, its test fails while the
+refusal it backstops still happens for a different reason.
+
 **Forty-seventh round.** `needs-human`: no blockers, one improvement, one discussion. Architect,
 resilience, api-contract and adversary all approved clean.
 
