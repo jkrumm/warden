@@ -5961,6 +5961,11 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     (`_sideclaw.TERMINAL_STATUSES`); a terminal job may still lack a usable verdict, and
     that case is reported by the review self-audit rather than mistaken for a pass.
 
+    The join is pinned on `r.tier='review'` as well as `d.validation_job_id`: the column is
+    a pointer, and a stale or malformed one that happens to name a terminal dispatch of
+    another tier (the live ledger has implement→investigate pairs) would otherwise be read
+    as that item's review verdict — able to fabricate or suppress a merge-gating finding.
+
     The window compares INSTANTS, not text: `datetime()` normalises a stored
     `+HH:MM`/`Z`/naive timestamp to UTC before the comparison, so a row written with a
     non-UTC offset cannot land in or out of the window by its representation. (Every
@@ -5984,7 +5989,7 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
         f"r.verdict_json AS verdict_json, "
         f"r.status AS review_status, r.created_at AS created_at, r.id AS id "
         f"FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
-        f"WHERE d.tier='implement' "
+        f"WHERE d.tier='implement' AND r.tier='review' "
         f"AND (datetime(d.created_at) IS NULL OR datetime(d.created_at) >= datetime(?)) "
         f"AND r.status IN ({placeholders}) "
     )
@@ -6012,14 +6017,23 @@ class _ReviewedItem(NamedTuple):
     unusable: bool             # latest terminal row's result cannot be safely read.
 
 
+def _review_instant(r: _ReviewRow) -> dt.datetime | None:
+    """The review's timestamp as an instant, or None when it cannot be placed.
+
+    One definition for both readers: the sort key and the fold's placeability rule. Kept
+    together because two independent `_parse_ts()` calls deciding the same thing would
+    drift, and the drift would be silent — a row ordered as placeable by the sort and as
+    unplaceable by the fold (or the reverse)."""
+    return _parse_ts(r["created_at"])
+
+
 def _review_order_key(r: _ReviewRow) -> tuple[dt.datetime, int]:
     """Order rows by the review's INSTANT, not its text: `created_at` is stored text, and
     two rows written with different offsets would otherwise sort by representation, so an
-    item's "latest" review could be an earlier one. A row whose timestamp will not parse
-    is unorderable and gets the earliest key; the fold does not rely on that position for
-    safety — it marks such an item unusable, because an unknown order must never resolve
-    to a readable row's state (see `_fold_review_status()`)."""
-    return (_parse_ts(r["created_at"]) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), r["id"])
+    item's "latest" review could be an earlier one. An unplaceable row gets the earliest
+    key; the fold does not rely on that position for safety — it marks such an item
+    unusable (`_fold_review_status()`)."""
+    return (_review_instant(r) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), r["id"])
 
 
 def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _ReviewedItem]]:
@@ -6067,7 +6081,7 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
         # None as well as `unusable=True`: retaining a stale value would put the item into
         # `_always_blocks_findings()`'s denominator and, when it is False, suppress that
         # finding for the whole repo. An item we cannot place is not judged at all.
-        if _parse_ts(r["created_at"]) is None:
+        if _review_instant(r) is None:
             unplaceable.add((r["repo"], item_key))
         unplaceable_item = (r["repo"], item_key) in unplaceable
         status_by_repo.setdefault(r["repo"], {})[item_key] = _ReviewedItem(
@@ -6085,13 +6099,15 @@ def _unusable_verdict_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Re
         item_keys = [k for k, status in by_item.items() if status.unusable]
         if not item_keys:
             continue
-        distinct = sorted(item_keys, key=str)
-        sample = ", ".join(str(k) for k in distinct[:SELF_AUDIT_SAMPLE_LIMIT])
-        remainder = len(distinct) - min(len(distinct), SELF_AUDIT_SAMPLE_LIMIT)
+        # A sort, not a dedup: `item_keys` are dict keys, already unique. Sorted by `str`
+        # because an item key is an event id (int) or an implement job id (str).
+        sorted_keys = sorted(item_keys, key=str)
+        sample = ", ".join(str(k) for k in sorted_keys[:SELF_AUDIT_SAMPLE_LIMIT])
+        remainder = len(sorted_keys) - min(len(sorted_keys), SELF_AUDIT_SAMPLE_LIMIT)
         suffix = f" (+{remainder} more)" if remainder else ""
         findings.append({
             "key": f"review-verdicts-unusable-{repo}",
-            "title": f"{len(distinct)} item(s) in {repo} have an unusable or missing step-7 review "
+            "title": f"{len(sorted_keys)} item(s) in {repo} have an unusable or missing step-7 review "
                      f"verdict in the last {SELF_AUDIT_WINDOW_DAYS} days",
             "detail": f"their latest terminal review stored no verdict at all (failed, interrupted or "
                       f"cancelled before a result existed), or stored one that does not match sideclaw's "

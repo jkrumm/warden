@@ -788,6 +788,11 @@ they flag is already exactly one entry in the owner's list.
 | INV-7-owner-queue | anything waiting on the owner > 3 days (report only) | same |
 | TRIP (§103) | a Kuma push monitor marked `fixed` without proof it can still go DOWN | `test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding` |
 
+The self-audit reads an item's review through `d.validation_job_id`, pinned on
+`r.tier='review'`: the column is a pointer, and a stale one naming a terminal dispatch of
+another tier (the ledger has implement→investigate pairs) would otherwise be read as a
+verdict — able to fabricate or suppress a merge-gating finding.
+
 The self-audit adds five findings about the loop's own answers:
 `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>` (a terminal review row
 without a usable result, or one whose timestamp cannot be placed among its item's other

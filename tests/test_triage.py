@@ -8471,6 +8471,41 @@ def test_an_unplaceable_item_cannot_suppress_the_always_blocks_finding():
     assert unusable and unusable[0]["key"] == "review-verdicts-unusable-demo-repo"
 
 
+def test_a_pointer_at_another_tier_is_not_read_as_a_review_verdict():
+    """§121: `validation_job_id` is a pointer, and a stale one that names a terminal
+    dispatch of another tier must not be read as the item's review. The live ledger has
+    implement→investigate pairs, so this is not hypothetical."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="wrong-tier")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-wrong-tier", "impl-wrong-tier"))
+        # The pointer's target is a terminal job that is NOT a review, with a clean verdict.
+        conn.execute("UPDATE dispatches SET tier='investigate', status='done', verdict_json=? "
+                     "WHERE job_id=?", (json.dumps({
+                         "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                         "outcome": "clean", "blocking": []}), "val-wrong-tier"))
+        conn.commit()
+        assert triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(days=1)).isoformat()) == []
+        # It becomes visible again the moment the pointer names a real review.
+        conn.execute("UPDATE dispatches SET tier='review' WHERE job_id=?", ("val-wrong-tier",))
+        conn.commit()
+        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(days=1)).isoformat())
+        assert len(rows) == 1 and rows[0]["implement_job_id"] == "impl-wrong-tier"
+
+
+def test_the_review_instant_has_one_definition():
+    """§121: the sort key and the fold's placeability read the same helper, so a row cannot
+    be placeable to one and unplaceable to the other."""
+    row = _review_row(1, "impl-1", {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                    "outcome": "clean", "blocking": []},
+                      created_at="2026-10-01T06:00:00+00:00")
+    assert triage._review_instant(row) == dt.datetime(2026, 10, 1, 6, tzinfo=dt.timezone.utc)
+    assert triage._review_order_key(row)[0] == triage._review_instant(row)
+    bad = dict(row, created_at="garbage")
+    assert triage._review_instant(bad) is None
+    assert triage._review_order_key(bad)[0] == dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
 def test_the_verdict_refusal_names_what_is_wrong():
     """§119: the fail-closed park note is the operator's only clue, so the shape gate
     reports the specific rule it refused rather than "does not match the schema"."""

@@ -9727,7 +9727,21 @@ names its local `findings` as its docstring promises, and `_run_isolated()`/`_se
 annotate `Exception`, matching what the guard actually catches (`KeyboardInterrupt` still propagates,
 which is correct and now documented by the type).
 
-**Verified.** `tests/test_triage.py` at **384/384** (354 before, +30); all 21 test files green.
+**Twenty-sixth round.** One blocker, and the first live-data one in several rounds: the review join
+was pinned only on `d.validation_job_id`, never on `r.tier`. The live ledger has **two**
+implement→investigate pairs (`argo`, 2026-09-10) whose investigate results were therefore readable
+as that item's review verdict. Measured before/after on a copy of the live ledger with a 30-day
+window: pre-fix the fold reports `review-verdicts-unusable-argo` — a fabricated finding, because an
+investigate payload `{"verdict": …}` has no `outcome` — and credits `argo` with a judged item;
+post-fix, 63 rows, no `argo`, no unusable finding. The 14-day window the loop actually uses happens
+to exclude those two rows (they are 21 days old), so the audit output is unchanged today; that is
+luck, not safety, and the same join is what a widened window or a fresher malformed pointer would
+hit. `AND r.tier = 'review'` now pins it, with a test that flips a pointer's target tier both ways.
+Also: `_review_instant()` is the single definition the sort key and the placeability rule both read
+(two independent `_parse_ts()` calls could drift silently), and `distinct` → `sorted_keys` in
+`_unusable_verdict_findings()`, which sorts dict keys and never deduplicated anything.
+
+**Verified.** `tests/test_triage.py` at **386/386** (354 before, +32); all 21 test files green. Live-ledger replay unchanged at 39 judged items (the two mis-joined rows are outside the window).
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
