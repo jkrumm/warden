@@ -10045,6 +10045,38 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Fiftieth round.** `needs-human`: one blocker, two improvements, one discussion. Senior-dev,
+resilience, performance and api-contract approved cleanly; the adversary found the blocker, and it
+was a false-refusal bug rather than a hole.
+
+The blocker is the mirror image of §147's: the check read the raw `type` keyword, so a producer whose
+serializer wraps every type in a one-member list — `{"type": ["string"]}` instead of
+`{"type": "string"}` — read as a producer that retyped every field. Same schema, same constraints,
+loud failure. §147 had just made that rule stricter, which turned a harmless serialization change into
+a drift report that would send an operator looking for drift that is not there. The keyword is read as
+the SET of type names it publishes now (`_as_schema_types()`), a single-member set answers as that one
+name (`_as_schema_type()`), and both container guards compare sets — while a genuine union stays a
+disagreement, because `["string", "null"]` admits a value `is_review_finding()` refuses and
+`["array", "null"]` is a container the fold would eventually be handed. Encoding is not constraint.
+
+The two improvements were one structural and one documentary. `check_schema_versions()` had the
+generic per-tool loop and the ~75-line review-only deep-shape comparison nested inside it, the branch
+the larger half of the body; the comparison is `_apply_review_shape_checks(entry, parsed)` now, called
+once after the entry is built, so a reader following "how does a tool's entry get its version" no
+longer reads past a JSON-Schema descent to find where the loop ends. And `EnvelopeShapeComparison`'s
+docstring still named `versionTypeOk`/`versionConstOk` — the two fields §147 replaced — which is
+exactly the drift a docstring naming keys no reader emits produces in the next consumer.
+
+The discussion is the self-audit extraction, raised again (it is carried debt from the previous round)
+and again called a bigger-than-this-PR restructuring rather than a blocker.
+
+**Verified.** `tests/test_clients.py` 133 → **134/134** (+1: a fully list-wrapped schema — containers,
+item fields and the version — reads as agreeing, while `["string", "null"]` on a required field still
+reads as mistyped), `tests/test_triage.py` **405/405**, every suite green; live-ledger replay
+unchanged at 39 judged items; drift check green against the running sideclaw. Both halves of the
+normalization are proved fail-capable by reverting them separately: the container comparison and the
+property reader each turn the new test red on their own.
+
 **Forty-ninth round.** `needs-human`: one blocker, six improvements, one test gap, three
 discussions. Architect, resilience, performance and OCR approved clean; the adversary found the gap.
 

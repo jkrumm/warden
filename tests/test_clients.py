@@ -2172,6 +2172,42 @@ def test_an_outcome_with_no_enum_is_an_unreadable_envelope():
     assert envelope["published"] is False and "enum" in envelope["reason"], envelope
 
 
+def test_a_singleton_type_array_is_not_a_mismatch():
+    """§149 — `{"type": ["string"]}` is the SAME schema as `{"type": "string"}`: the dialect allows a
+    list of type names, so a producer whose serializer wraps every type in one is not a producer
+    whose field changed type. The check compared the raw keyword, which turned a harmless
+    serialization change into a loud refusal — the false-failure class this tooling exists to avoid,
+    and the one §147's stricter pin rule makes worse if it is not normalized."""
+    wrapped = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    wrapped["properties"]["blocking"]["type"] = ["array"]
+    wrapped["properties"]["blocking"]["items"]["type"] = ["object"]
+    for subschema in wrapped["properties"]["blocking"]["items"]["properties"].values():
+        subschema["type"] = [subschema["type"]]
+    wrapped["properties"]["schemaVersion"] = {"type": ["number"], "const": 1}
+    srv = _stub_schemas(review_output=wrapped)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is True, review
+    assert review["findingShape"]["types"] == {"angle": "string", "file": "string",
+                                               "line": "number", "message": "string"}, review
+    # …and a UNION is not the same schema: a `file` that may be null is a finding
+    # `is_review_finding()` refuses, so the field reads as mistyped rather than as equivalent.
+    unioned = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    unioned["properties"]["blocking"]["items"]["properties"]["file"]["type"] = ["string", "null"]
+    srv = _stub_schemas(review_output=unioned)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is False, review
+    assert review["findingShape"]["mistyped"] == ["file"], review["findingShape"]
+    assert review["findingShape"]["types"]["file"] is None, review["findingShape"]
+
+
 def test_a_required_list_carrying_a_non_string_name_is_unreadable():
     """§143 — both `required` lists are checked for their ENTRIES, not only their container. A list
     holding a non-string is not a field warden could ever look up, and `frozenset([7])` would read as

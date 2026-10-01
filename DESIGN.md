@@ -922,6 +922,18 @@ the integer the comparison wants, and a published `const` has to agree with it; 
 publish an `enum` of strings, because without one nothing constrains it and the runtime's membership
 test is the only thing that would have noticed.
 
+A JSON Schema `type` keyword is compared as the SET of types it names (§149). The dialect allows a
+list, so `{"type": ["string"]}` and `{"type": "string"}` are the same schema — and the check compared
+the raw keyword, which made a producer whose serializer wraps every type in a list read as a producer
+that retyped every field. That is a false refusal, the failure class this whole check exists to avoid
+(§137's promise and §147's pin are refusals only because the producer can move the value): a harmless
+serialization change would have failed the drift check loudly and sent an operator looking for drift
+that is not there. `_as_schema_types()` reads the keyword as a set of names, `_as_schema_type()`
+answers a single name when the set has one member and `None` when it has more, and both container
+guards compare sets. A real UNION still reads as a disagreement: `["string", "null"]` admits a value
+`is_review_finding()` refuses, and `["array", "null"]` is a container the fold would be handed — the
+normalization is about the encoding, never about the constraint.
+
 A version is promised by a pin, not by a type (§147). §143's envelope check asked whether the
 published `schemaVersion` schema could hold the integer the runtime compares — `{"type": "number"}`
 passed, and so did `["integer", "string"]`, because both admit the value. Neither PROMISES it: the

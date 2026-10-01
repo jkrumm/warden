@@ -328,8 +328,10 @@ loop.
   `review-health` needs its own isolated fetch, so either fact would have to move into the mapping
   (as a flag, or as `None` meaning "runs elsewhere"). That is a change to a correctness guard, not a
   cleanup — the identical reasoning that made §141's guard a finding rather than a skip. Owner call,
-  deferred. Both are worth doing as their own PR with the import paths settled first — not as the
-  last act of a 47-commit branch whose tests all pass.
+  deferred (raised again in the fiftieth round, where the review repeated that triage.py "already has
+  a norm of growing in place" and called it a bigger-than-this-PR restructuring). All three are worth
+  doing as their own PR with the import paths settled first — not as the last act of a branch whose
+  tests all pass.
 
 - **A manual dispatch pair has no verifiable linkage** (§133). `dispatches.validation_job_id`
   is the only thing tying an implement row to its review, and for a pair with no
