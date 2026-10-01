@@ -10045,6 +10045,46 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Thirty-ninth round.** `needs-human`: one blocking schema-validation gap, one dead import,
+and two architect-flagged module boundaries. The senior-dev, resilience and performance reviewers
+all approved clean.
+
+The blocker was a hole in the comparison the previous four rounds spent building: the check
+compared the finding object's field NAMES and TYPES, but never the containers around them.
+`output.properties.blocking` could stop being an array — object-shaped, or null-capable as
+`["array", "null"]` — while the same `items` object stayed exactly as it was, and
+`check_schema_versions()` would report `ok: True` while `_review_verdict_problems()` iterated
+`blocking` as a list and rejected every verdict the producer emitted. Every field name green,
+every result silently unreadable: the same fail-open the type comparison was added to close, one
+level up. The walker now requires `blocking` to be exactly `"array"` and `items` exactly
+`"object"` before it will describe a finding shape. Checked against the live producer first —
+`blocking.type == "array"`, `items.type == "object"` — so this is a check and not a refusal of the
+shape sideclaw actually publishes.
+
+Making that refusal useful meant the walker could no longer answer with a bare `None`: "no
+readable finding shape" is true of a body with no `blocking` at all and of one whose `blocking`
+moved, and those send an operator to different places. It returns `UnreadableFindingShape(reason)`
+now, `FindingShapeUnreadable` carries the reason to the report, and the operator-facing line
+prints it. The type-checking lesson from earlier rounds holds: Pyright does not narrow a TypedDict
+union on `not shape["published"]`, but it does on `is False`, which is why the reader says that.
+
+The dead import was `cast` in `triage.py`, left behind by the previous round's key-by-key
+`_as_review_row()` — the only remaining `cast(` was a keyword argument and a local parameter of
+the same name, which is exactly the kind of thing a plausible-looking grep confirms and a
+`py_compile` never would.
+
+The two architect discussions are recorded in `STATE.md`'s carried debt rather than acted on:
+extracting the self-audit subsystem into `scripts/self_audit.py`, and moving the schema-shape
+walker out of `clients.sideclaw` to sit beside the one script that uses it. Both are the right
+shape eventually and both would touch every importer — work for its own PR, not the last act of a
+branch whose tests all pass.
+
+**Verified.** `tests/test_clients.py` 120 → **121/121** (+1: a producer that keeps every field
+name and changes only the `blocking` container must fail the check), `tests/test_triage.py`
+**401/401**, all suites green; live replay unchanged at 39 judged items; drift check green against
+the running sideclaw; both container requirements proven fail-capable by reverting each one and
+watching the check go back to reporting success.
+
 **Thirty-eighth round.** Zero blockers, two improvements, and the adversary's one claim was
 checked and discarded rather than acted on: it held that the resolve-sweep exemption matches
 `invariant-<id.lower()>`-style keys while `_INVARIANT_PREFIXES` builds `inv_id.lower()` ones. Both

@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, TypedDict, TypeVar, cast
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, TypedDict, TypeVar
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads

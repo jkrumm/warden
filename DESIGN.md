@@ -863,6 +863,16 @@ disagreement, and the disagreement line names every shortfall at once: a missing
 a missing property and a retyped field are independent, and an operator sent back for a second
 run to learn the second one has been handed a diagnostic that lies by omission.
 
+The CONTAINERS are part of that contract too (§135), not only the field names inside them.
+`blocking` must be exactly an array and its `items` exactly an object, because that is what the
+runtime does with them: `_review_verdict_problems()` iterates `blocking` as a list and reads
+`items`' fields by name. A producer that made the container object-shaped, or null-capable
+(`["array", "null"]`), while keeping the same `items` object leaves every field name green —
+and every verdict rejected at runtime. The refusal names the requirement that moved, rather than
+only that something did: a body with no `blocking` at all and one whose `blocking` stopped being
+an array send an operator to different files, so the walker returns its reason instead of a bare
+`None` and the operator-facing line prints it.
+
 The self-audit adds five findings about the loop's own answers:
 `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>` (a terminal review row
 without a usable result, or one whose timestamp cannot be placed among its item's other

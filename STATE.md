@@ -305,6 +305,19 @@ loop.
 
 ## Carried debt
 
+- **Two module boundaries the review flagged and this branch does NOT move** (both are
+  structural refactors of code that is otherwise merge-ready, and each would touch every
+  importer). (1) The self-audit subsystem — review-pointer resolution, `ReviewRow`/`ReviewRows`/
+  `_ReviewedItem`, the fold and the five-section pipeline, ~560 added lines — has narrow enough
+  dependencies (`conn`, `_parse_ts`, `_safe_json`, `_sideclaw`, `INVARIANTS`/`check_invariants`,
+  the `STATE_*` constants) to extract into `scripts/self_audit.py` exposing `run_self_audit()`.
+  (2) The ~110-line JSON-Schema-shape walker (`_as_object`, `_published_finding_shape`,
+  `PublishedFindingShape`, `FindingShapeComparison`, `FindingShapeUnreadable`,
+  `UnreadableFindingShape`) is used only by `scripts/check-schema-versions.py` but is pulled in by
+  every importer of `clients.sideclaw`; it belongs beside its one consumer. Both are worth doing
+  as their own PR with the import paths settled first — not as the last act of a 46-commit
+  branch whose tests all pass.
+
 - **A manual dispatch pair has no verifiable linkage** (§133). `dispatches.validation_job_id`
   is the only thing tying an implement row to its review, and for a pair with no
   `origin_event_id` — a manual `warden dispatch` — the pointer is simultaneously the claim and

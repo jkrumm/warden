@@ -365,12 +365,14 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
             # nothing compared: `is_review_finding()` mirrors it in Python, so a renamed find
             # shape would leave warden reading a shape the producer no longer emits, with the
             # version number unchanged and every check green.
-            shape = _published_finding_shape(parsed)
-            if shape is None:
-                unreadable: FindingShapeUnreadable = {"published": False}
+            result = _published_finding_shape(parsed)
+            if isinstance(result, UnreadableFindingShape):
+                unreadable: FindingShapeUnreadable = {
+                    "published": False, "reason": result.reason}
                 entry["findingShape"] = unreadable
                 entry["ok"] = ok = False
             else:
+                shape = result
                 missing_required = sorted(REVIEW_FINDING_REQUIRED - shape.required)
                 missing_properties = sorted(REVIEW_FINDING_REQUIRED - shape.properties)
                 # Names are not the whole contract: a field kept but retyped (a scalar that
@@ -404,9 +406,14 @@ class FindingShapeUnreadable(TypedDict):
 
     No empty lists here on purpose: `[]` reads as "the producer requires nothing", which is the
     fabricated-clean-bill shape this branch keeps having to remove. An unreadable shape is a
-    disagreement, not an empty comparison."""
+    disagreement, not an empty comparison.
+
+    `reason` names the requirement the body failed (§135). "No readable finding shape" is true of
+    a body with no `blocking` at all and of one whose `blocking` stopped being an array, and the
+    two send an operator to different files."""
 
     published: Literal[False]
+    reason: str
 
 
 class FindingShapeComparison(TypedDict):
@@ -429,6 +436,17 @@ class FindingShapeComparison(TypedDict):
 FindingShapeReport = FindingShapeUnreadable | FindingShapeComparison
 
 
+class UnreadableFindingShape(NamedTuple):
+    """Why the published finding object could not be read, in terms of the requirement it failed.
+
+    A returned value rather than `None`, for the reason `FindingShapeUnreadable.reason` exists
+    one level up: `None` cannot tell "this endpoint publishes no finding object" apart from "it
+    publishes one whose `blocking` is no longer an array", and only the second one means the
+    runtime's own reading of that container has drifted (§135)."""
+
+    reason: str
+
+
 class PublishedFindingShape(NamedTuple):
     """What the endpoint publishes about the review finding object.
 
@@ -449,14 +467,21 @@ def _as_object(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _published_finding_shape(parsed: dict[str, Any]) -> PublishedFindingShape | None:
-    """The finding object sideclaw publishes, or None when the endpoint does not publish a
-    readable one.
+def _published_finding_shape(
+        parsed: dict[str, Any]) -> PublishedFindingShape | UnreadableFindingShape:
+    """The finding object sideclaw publishes, or WHY it could not be read.
 
     Read from `output.properties.blocking.items` — the four arrays (`blocking`,
-    `improvements`, `discussions`, `testGaps`) share this one object schema. `None` is a
-    finding in itself, not a reason to skip the check: warden's `is_review_finding()` would
-    then be an unverifiable copy, which is the drift this comparison exists to catch.
+    `improvements`, `discussions`, `testGaps`) share this one object schema. An unreadable
+    shape is a finding in itself, not a reason to skip the check: warden's
+    `is_review_finding()` would then be an unverifiable copy, which is the drift this
+    comparison exists to catch.
+
+    The CONTAINERS are part of the contract, not only the field names inside them (§135):
+    `blocking` must be exactly an array of objects, and not `["array", "null"]` either. A
+    producer that made the container object-shaped or null-capable while keeping the same
+    `items` would leave every field name green here and have every verdict rejected at runtime,
+    because `_review_verdict_problems()` iterates `blocking` as a list.
 
     Every step is guarded, and the guards are the point rather than boilerplate: this runs on
     the operator-facing `make status` path OUTSIDE `check_schema_versions()`'s try/except, so
@@ -464,22 +489,41 @@ def _published_finding_shape(parsed: dict[str, Any]) -> PublishedFindingShape | 
     list or tuple OF NAMES or it is nothing: `frozenset()` over a bare string would read as a
     set of its own characters (`{"f", "i", "l", "e"}` passing a name check it should fail) and
     a number would raise out of a function documented never to raise."""
-    # One guard per level, each one returning "not published" rather than raising: the body
-    # this has to survive is precisely the malformed one it exists to report.
+    # One guard per level, each returning "not published, and here is what moved" rather than
+    # raising: the body this has to survive is precisely the malformed one it exists to report.
     output = _as_object(parsed.get("output"))
-    container = _as_object(output.get("properties")) if output else None
-    blocking = _as_object(container.get("blocking")) if container else None
-    items = _as_object(blocking.get("items")) if blocking else None
-    properties = _as_object(items.get("properties")) if items else None
+    if not output:
+        return UnreadableFindingShape("no `output` object in the published schema")
+    container = _as_object(output.get("properties"))
+    if not container:
+        return UnreadableFindingShape("no `output.properties` object in the published schema")
+    blocking = _as_object(container.get("blocking"))
+    if not blocking:
+        return UnreadableFindingShape("no `output.properties.blocking` schema object")
+    if blocking.get("type") != "array":
+        return UnreadableFindingShape(
+            "`output.properties.blocking` is not exactly an array "
+            f"(type={blocking.get('type')!r}), and the runtime iterates it as a list")
+    items = _as_object(blocking.get("items"))
+    if not items:
+        return UnreadableFindingShape("no `output.properties.blocking.items` object schema")
+    if items.get("type") != "object":
+        return UnreadableFindingShape(
+            "`output.properties.blocking.items` is not exactly an object "
+            f"(type={items.get('type')!r}), and warden reads its fields by name")
+    properties = _as_object(items.get("properties"))
     if not properties:
-        return None
+        return UnreadableFindingShape(
+            "`output.properties.blocking.items` publishes no fields")
     required = items.get("required", [])
     if not isinstance(required, (list, tuple)):
         # Catches `str` too, which is the case that matters: `frozenset("file")` is four
         # characters, and an int raises. Both are unreadable shapes, not missing fields.
-        return None
+        return UnreadableFindingShape(
+            f"`items.required` is a {type(required).__name__}, not a list of names")
     if not all(isinstance(name, str) for name in list(required) + list(properties)):
-        return None
+        return UnreadableFindingShape(
+            "`items.required`/`items.properties` carry non-string, non-field names")
     return PublishedFindingShape(
         frozenset(required),
         frozenset(properties),

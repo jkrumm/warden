@@ -13,6 +13,8 @@ Run: .venv/bin/python3 tests/test_clients.py
 
 from __future__ import annotations
 
+from typing import Any
+
 import contextlib
 import datetime as dt
 import io
@@ -526,9 +528,43 @@ def test_check_schema_versions_treats_an_unpublished_finding_shape_as_a_disagree
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         review = sideclaw.check_schema_versions()["review"]
-        assert review["ok"] is False and review["findingShape"] == {"published": False}, review
+        assert review["ok"] is False, review
+        assert review["findingShape"]["published"] is False, review
+        # And it says WHICH requirement the body failed, not only that it failed one. This stub
+        # publishes no `output` at all, so the reason names that level.
+        assert "output" in review["findingShape"]["reason"], review["findingShape"]
     finally:
         srv.stop()
+
+
+def test_a_blocking_container_that_is_no_longer_an_array_fails_the_schema_check():
+    """§135 — the field comparison this check already had, run against a producer that keeps
+    every field NAME and changes only the container around them. `output.properties.blocking`
+    becomes an object (or admits `null`), the `items` object stays exactly as it was, and the
+    check used to report success — while `_review_verdict_problems()` iterates `blocking` as a
+    list and would reject every verdict the producer emits, silently."""
+    for blocking_type in ("object", ["array", "null"]):
+        output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+        output["properties"]["blocking"]["type"] = blocking_type
+        srv = _StubServer({
+            ("GET", "/api/dispatch-schema"): (200, {
+                "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
+                "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
+            }),
+            ("GET", "/api/review-schema"): (200, {
+                "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+                "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": output,
+            }),
+        })
+        os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+        try:
+            review = sideclaw.check_schema_versions()["review"]
+        finally:
+            srv.stop()
+        assert review["ok"] is False, (blocking_type, review)
+        shape = review["findingShape"]
+        assert shape["published"] is False, (blocking_type, shape)
+        assert "blocking" in shape["reason"], shape
 
 
 def test_the_warden_required_finding_fields_are_the_ones_the_live_schema_publishes():
@@ -548,31 +584,67 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     and this helper sits OUTSIDE `check_schema_versions()`'s try/except on the operator-facing
     `make status` path: an `AttributeError` there would turn a drifted schema into a traceback
     instead of the "unreadable shape" refusal it is documented to produce."""
-    assert sideclaw._published_finding_shape({"output": "yes"}) is None
-    assert sideclaw._published_finding_shape({"output": ["x"]}) is None
-    assert sideclaw._published_finding_shape({"output": 7}) is None
-    assert sideclaw._published_finding_shape({"output": None}) is None
-    assert sideclaw._published_finding_shape({}) is None
+    # The refusal states WHICH requirement the body failed, so this reads the reason instead of
+    # only asserting a refusal: a body with no `blocking` at all and one whose `blocking` stopped
+    # being an array are both refused, and telling them apart is the difference between a check
+    # that explains a red and one that only reports it (§135).
+    def reason(parsed: Any) -> str:
+        shape = sideclaw._published_finding_shape(parsed)
+        assert isinstance(shape, sideclaw.UnreadableFindingShape), shape
+        return shape.reason
+
+    assert "`output`" in reason({"output": "yes"})
+    assert "`output`" in reason({"output": ["x"]})
+    assert "`output`" in reason({"output": 7})
+    assert "`output`" in reason({"output": None})
+    assert "`output`" in reason({})
     # One level down, the same case the first guard covers: `properties` reached with `or {}`
     # raises on a truthy non-dict, and it is the level a drifted body is most likely to break.
-    assert sideclaw._published_finding_shape({"output": {"properties": "yes"}}) is None
-    assert sideclaw._published_finding_shape(
-        {"output": {"properties": {"blocking": ["x"]}}}) is None
-    assert sideclaw._published_finding_shape(
-        {"output": {"properties": {"blocking": {"items": "x"}}}}) is None
+    assert "properties" in reason({"output": {"properties": "yes"}})
+    assert "blocking" in reason({"output": {"properties": {"blocking": ["x"]}}})
+    # `blocking` typed but its `items` unreadable: the guards reach the level below too.
+    assert "items" in reason(
+        {"output": {"properties": {"blocking": {"type": "array", "items": "x"}}}})
+
+    def body(blocking_type: Any, items_type: Any) -> Any:
+        """A published body whose FIELD NAMES never change — only the containers around them."""
+        return {"output": {"properties": {"blocking": {
+            "type": blocking_type,
+            "items": {"type": items_type,
+                      "properties": {"file": {"type": "string"}, "message": {"type": "string"}},
+                      "required": ["file", "message"]}}}}}
+
+    # The container is part of the contract (§135). Every field name stays green in these bodies,
+    # which is exactly why comparing names alone passed them while the runtime rejected every
+    # verdict: `_review_verdict_problems()` iterates `blocking` as a list, and reads `items`'
+    # fields by name. `["array", "null"]` admits the null it would then iterate.
+    assert "blocking" in reason(body("object", "object"))
+    assert "blocking" in reason(body(["array", "null"], "object"))
+    assert "blocking" in reason(body(None, "object"))
+    assert "items" in reason(body("array", "string"))
+    assert "items" in reason(body("array", ["object", "null"]))
+    assert "items" in reason(body("array", None))
+    # …while the containers the producer actually publishes read as a comparison, so this stays a
+    # check rather than a refusal of the live shape.
+    live = sideclaw._published_finding_shape(body("array", "object"))
+    assert isinstance(live, sideclaw.PublishedFindingShape), live
+    assert live.required == frozenset({"file", "message"})
     # `required` is read as a collection of names or not at all: a bare string would become a
     # set of its own characters (silently passing a name check it should fail) and a number
     # would raise TypeError out of a function that is documented never to raise.
     for bad in ("file", 7, {"file": 1}, [7], ["file", 7]):
-        assert sideclaw._published_finding_shape(
-            {"output": {"properties": {"blocking": {"items": {
-                "properties": {"file": {}, "message": {}}, "required": bad}}}}}) is None, bad
+        why = reason({"output": {"properties": {"blocking": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"file": {}, "message": {}}, "required": bad}}}}})
+        assert "required" in why or "items" in why, (bad, why)
     # An empty `properties` carries no shape either — that is "not published", not "nothing
     # required".
-    assert sideclaw._published_finding_shape(
-        {"output": {"properties": {"blocking": {"items": {"properties": {}, "required": []}}}}}) is None
+    assert "publishes no fields" in reason(
+        {"output": {"properties": {"blocking": {"type": "array", "items": {
+            "type": "object", "properties": {}, "required": []}}}}})
     # …and the same shape read from a well-formed body still works, types included.
     shape = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
+    assert isinstance(shape, sideclaw.PublishedFindingShape), shape
     assert shape.required == frozenset({"file", "message", "angle"})
     assert shape.properties >= {"file", "message", "line", "angle"}
     assert shape.types["file"] == "string" and shape.types["line"] == "number"
