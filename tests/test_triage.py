@@ -8255,7 +8255,7 @@ def test_quiet_anchor_takes_the_latest_iso_clock():
 
 # --- revision of a blocked implementation (§92) -------------------------------
 
-def _seed_blocked_item(conn, *, external_id: str, blocking: list[dict[str, Any]] | None = None,
+def _seed_blocked_item(conn, *, external_id: str, blocking: list[Any] | None = None,
                        revision_count: int = 0) -> int:
     eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
     conn.execute(
@@ -8276,6 +8276,29 @@ def _seed_blocked_item(conn, *, external_id: str, blocking: list[dict[str, Any]]
                       {"file": "scripts/check.sh", "line": 808, "message": "exit 0 fails open on crash loops"}]})))
     conn.commit()
     return eid
+
+
+def test_a_revision_brief_never_quotes_a_finding_that_is_not_one():
+    """§117 — `_revision_findings()` reads a STORED verdict, so it must apply the same
+    finding-shape gate the audit does. `{}` and `{"file": "x"}` pass a bare
+    `isinstance(…, dict)` check, and a brief built from them is a whole episode spent
+    on `- ? — ?` instead of on the reviewer's actual finding."""
+    with _triage_env() as (conn, ctx):
+        assert triage._published_findings([{}, {"file": "x"}, {"message": "y"}, None, 5]) == []
+        assert triage._code_blocking_findings([{}, _CODE_FINDING]) == [_CODE_FINDING]
+
+        # A blocked verdict whose findings are ALL junk yields no brief at all — the
+        # item stays with a human rather than spending its remaining attempt.
+        for idx, junk in enumerate(([{}], [{"file": "x"}], [{"message": "y"}], [None], [[]])):
+            eid = _seed_blocked_item(conn, external_id=f"junk-brief-{idx}", blocking=junk)
+            assert triage._revision_findings(conn, triage._get_item(conn, eid)) is None
+
+        # ... while one real finding among the junk still produces a brief naming it.
+        eid = _seed_blocked_item(conn, external_id="mixed-brief",
+                                 blocking=[{}, _CODE_FINDING, {"file": "x"}])
+        brief = triage._revision_findings(conn, triage._get_item(conn, eid))
+        assert brief is not None and "src/weatherorb/serve/cache.py:334" in brief
+        assert "? — ?" not in brief
 
 
 def test_blocked_implementation_goes_back_to_the_implementer_with_findings():

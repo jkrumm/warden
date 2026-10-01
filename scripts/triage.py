@@ -5823,11 +5823,17 @@ def _published_findings(blocking: Any) -> list[dict[str, Any]]:
     """The finding objects a verdict's `blocking` field actually carries. Sideclaw
     publishes a list of objects, but a corrupt or hand-written payload can hold a
     scalar, a non-list container, or members that are not objects — and the step-7
-    fold and the revision brief both iterate this value. Anything that is not one
-    of the published objects reads as "no finding", never as a crash mid-tick."""
+    fold, the `blocked` note and the revision brief all iterate this value. Anything
+    that is not one of the published objects reads as "no finding", never as a crash
+    mid-tick.
+
+    `_is_finding_shape()` is applied here rather than only in the audit because this
+    is the one gate every consumer of a STORED verdict goes through: `{}` (or
+    `{"file": "x"}` with no message) is not a finding, and a revision brief built from
+    one is an episode bought to fix `- ? — ?`."""
     if not isinstance(blocking, list):
         return []
-    return [f for f in blocking if isinstance(f, dict)]
+    return [f for f in blocking if _is_finding_shape(f)]
 
 
 def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:

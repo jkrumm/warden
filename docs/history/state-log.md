@@ -9573,7 +9573,28 @@ presence, list type and finding fields now have one definition. The fold returns
 per-item record, ordered its own inputs, and keeps the latest complete review's decision if a later
 terminal result is unreadable.
 
-**Verified.** `tests/test_triage.py` at **369/369** (354 before, +15); all 21 test files green.
+**Seventeenth round.** Zero blockers; one real defect closed and one record corrected.
+
+The adversary's blocking finding was **real**: `_revision_findings()` reads a stored verdict, and
+`_published_findings()` accepted any dict — so `blocking: [{}]` or `{"file": "x"}` counted as a
+code finding and the parked item spent its remaining attempt on a brief reading `- ? — ?`. The fix
+is at the shared gate rather than at that one caller: `_published_findings()` now applies
+`_is_finding_shape()`, so the same predicate governs the live fold, the `blocked` note, the
+partition and the revision brief, and a shape-invalid entry can never be quoted by any of them —
+while one real finding among junk still produces a brief. (Its "crashes formatting" half was
+checked and is false: `_format_blocking_findings` and the brief builder both use `.get()` with
+fallbacks, so the failure was a wasted revision, not an exception. That is still worth fixing.)
+Its `testGaps` entry is covered by a new test driving `_revision_findings()` over all-junk and
+mixed payloads.
+
+**Correction to round 14's entry.** That entry says `_fold_review_status()` is typed
+`Iterable[Mapping[str, Any]]`. It shipped as `Iterable[_ReviewRow]` against a bracket-access
+`Protocol`, because `sqlite3.Row` does not satisfy `Mapping` (no `.items()`/`.values()`) and a
+type checker rejected the `Mapping` annotation on the real caller — only the `Protocol` describes
+both the query's rows and the unit test's dicts. The history log is append-only, so the round-14
+line stands; this is its correction, and the round-14 code it describes was never in doubt.
+
+**Verified.** `tests/test_triage.py` at **370/370** (354 before, +16); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
