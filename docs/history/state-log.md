@@ -9453,28 +9453,31 @@ the loop's log. The same round asked for the wrapper-finding filter that had bec
 to be extracted: `_code_blocking_findings()` now serves `poll_validation_jobs()`,
 `_revision_findings()` and this audit, so §114's rule has one home.
 
-**Sixth round.** The review on the fifth revision found that the query filtered on
-`verdict_json IS NOT NULL`: a terminal errored/failed review with no stored result vanished
-from both the audit and its unusable-verdict event, silently hiding the broken gate. The query
-now reads terminal review jobs regardless of verdict presence; a null payload folds to `{}` and
-is counted unusable. A terminal non-`done` job is reported as unusable but cannot overwrite an
-earlier completed review, even if a stale partial verdict happened to persist alongside its
-failure. The terminal-status set lives once in the sideclaw client; the audit selects the
-review's status explicitly rather than conflating it with the implement row.
 
-The same review suggested two consistency improvements — the review-health helper now owns
-both review-related finding kinds, and `REVIEW_OUTCOMES` remains next to the terminal-status
-constant — plus the `DESIGN.md` self-audit inventory now names the fifth key. The subsequent
-review caught the selected `status` needed an explicit alias (since both joined rows have one); it
-is now `review_status` and checked on the review row. The next review caught two more boundaries:
-valid clean verdicts may omit `blocking`, and `_safe_json()` can return valid non-object JSON. A
-missing/null blocking list now normalizes to `[]`, while a non-object verdict is unusable without
-raising. `_is_completed_review()` handles two compatibility boundaries the second review found:
-valid clean outcomes omit `blocking` (treated as empty), and `_safe_json()` can return valid
-non-object JSON (treated as unusable without raising). A non-clean outcome missing `blocking`
-is unusable and cannot clear a prior block. The terminal-status set is `tuple(TERMINAL)` from
-the same client module — one source of truth — and SQL placeholders derive from its length.
-The `DESIGN.md` self-audit inventory now names the fifth finding key.
+**Sixth round.** The review on the fifth revision blocked the exact missing-verdict case again:
+a terminal failed review with `verdict_json IS NULL` had to reach the unusable-verdict event,
+not disappear at a `verdict_json IS NOT NULL` filter. The query now includes every terminal
+review row regardless of verdict presence; a null payload normalizes to `{}` and is counted
+unusable. Non-`done` terminal jobs are visible as unusable, but cannot overwrite a prior
+completed review even if a stale verdict was stored alongside their failure. The review status
+is selected explicitly as `review_status` (the implement and review rows both have a `status`).
+
+**Seventh round.** The next review caught a false-positive regression in the previous guard:
+`clean` is the successful outcome that routinely omits `blocking`, so a missing/null list on
+that outcome is an empty list, not an unusable verdict. `_is_completed_review()` now treats
+missing `blocking` as empty ONLY for `clean`; a non-clean outcome without findings is still
+unusable and cannot erase an earlier code block. It also checks valid non-object JSON is
+rejected without raising. The live classifier `_code_blocking_findings()` now safely ignores
+non-list containers and non-object members, so a malformed stored list cannot crash a
+revision-brief read. Unusable findings include a bounded sample of event IDs for operators.
+
+**Verified.** `tests/test_triage.py` at **360/360** (354 before, +6); all 21 test files green.
+The regression cases cover blocked-then-clean, blocked-then-partial-actionable, terminal failed
+review with no verdict, malformed findings (`null`, empty object, missing message), a clean
+verdict without `blocking`, and valid non-object input to the shape checker. The live-ledger
+14-day review firing set remains `research-gateway` 6/6; no in-window stored verdict is
+unusable.
+
 
 **Fifth round.** The review on the fourth revision blocked the *logging* addition: a `print()`
 inside `self_audit_findings()` did not create a `warden_self` event, could not be asserted through
