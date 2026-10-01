@@ -5838,11 +5838,11 @@ def _is_completed_review(verdict: dict[str, Any]) -> bool:
 
     The self-audit reads stored payloads, so it re-checks the shape instead of
     assuming it, the same way those two check a live one. A corrupt payload is `{}`
-    after `_safe_json()`; a partial one like `{"outcome": "actionable"}` has no
-    `blocking` key at all. Both would otherwise collapse to "no findings" and read
-    as a PASS — silently clearing a code-blocked round on an item nobody has
-    actually judged, which is §115's blindness in another column on the one check
-    that exists to notice a broken review gate."""
+    payload is `{}` after `_safe_json()`; a partial one like `{"outcome": "actionable"}` has no
+    `blocking` key at all. A list like `[null]` also isn't a verdict shape: the reviewer can only
+    give findings, and each finding must be an object with its own fields. Each is unusable —
+    never a pass that clears a code-blocked round — which is §115's blindness in another column
+    on the one check that exists to notice a broken review gate."""
     return (verdict.get("schemaVersion") == _sideclaw.REVIEW_SCHEMA_VERSION
             and verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
             and isinstance(verdict.get("blocking"), list))
@@ -6533,8 +6533,11 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
         if not _is_completed_review(verdict):
             unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
             continue
+        if any(not isinstance(finding, dict) for finding in verdict["blocking"]):
+            unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
+            continue
         per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(
-            _code_blocking_findings(verdict.get("blocking")))
+            _code_blocking_findings(verdict["blocking"]))
     for repo, skipped in sorted(unusable.items()):
         print(f"triage: self-audit: {skipped} stored review verdict(s) in {repo} are not a "
               f"complete review (schema version / outcome / blocking list) — skipped, "

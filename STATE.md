@@ -180,9 +180,9 @@ loop.
   verdict's own `blocking[]` and counts distinct items, not implement rows, so
   §115's needs-human fold cannot blind it and a revised PR counts once (§116);
   each item is read by its LATEST COMPLETE review — a stored verdict without
-  sideclaw's schema version, a published `outcome` and a `blocking` list is no
-  review at all: it neither clears an item nor joins the count, and the skip is
-  logged (§117).
+  sideclaw's schema version, a published `outcome`, a `blocking` list of finding
+  objects is no review at all: it neither clears an item nor joins the count, and
+  the skip is logged (§117).
 - **A plan-gated rules read is "no rules" (§108).** `branch_rules()` returns
   `[]` for the 403 GitHub answers with on a private repo whose plan carries no
   rulesets ("Upgrade to GitHub Pro or make this repository public") — that repo

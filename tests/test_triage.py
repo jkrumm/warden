@@ -9198,7 +9198,24 @@ def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
         for i in range(3):
             _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-a")
             _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-b",
-                                  verdict_json={"outcome": "actionable"})
+                                  verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                                "outcome": "actionable"})
+        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+
+def test_self_audit_skips_a_completed_review_with_malformed_findings():
+    """§117 — a list is necessary but not sufficient for a complete review. Its
+    entries must be finding objects too: passing `[None]` into the shared classifier
+    otherwise raises AttributeError and takes the loop down instead of skipping the
+    unusable verdict and keeping the earlier code-blocked status."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-a")
+            _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-b",
+                                  verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                                                "outcome": "actionable", "blocking": [None]})
         finding = next(f for f in triage.self_audit_findings(conn, NOW)
                        if f["key"] == "review-always-blocks-demo-repo")
         assert "all 3 demo-repo PRs" in finding["title"]
