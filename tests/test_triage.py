@@ -9074,11 +9074,12 @@ def _seed_blocking_review(conn, *, event_id: int, suffix: str, repo: str = "demo
         "validation_job_id, validation_status) VALUES (?,?,?,?,?,?,?,?,?)",
         (impl_job, "implement", repo, "b", "done", NOW.isoformat(), event_id, rev_job,
          validation_status))
+    review_status = "done" if verdict_json is not None else "failed"
     conn.execute(
         "INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id, verdict_json) "
         "VALUES (?,?,?,?,?,?,?,?)",
-        (rev_job, "review", repo, "review", "done", NOW.isoformat(), event_id,
-         json.dumps(verdict_json)))
+        (rev_job, "review", repo, "review", review_status, NOW.isoformat(), event_id,
+         json.dumps(verdict_json) if verdict_json is not None else None))
     conn.commit()
 
 
@@ -9210,13 +9211,17 @@ def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
 
 def test_self_audit_skips_a_completed_review_with_malformed_findings():
     """§117 — a list is necessary but not sufficient for a complete review. Its
-    entries must be finding objects with a non-empty `file` and `message` too:
-    passing `[None]` or `[{}]` into the shared classifier otherwise raises or treats
-    a malformed row as a real blocker instead of surfacing it as unusable."""
+    entries must be finding objects with non-empty `file` and `message` fields too:
+    `[null]`, `[{}]`, and `[{"file": "src/x.ts"}]` must surface as unusable, not
+    crash the loop or be miscounted as an actual reviewer finding."""
     with _triage_env() as (conn, ctx):
         for i in range(3):
             _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-a")
-            malformed = [None] if i == 0 else ([{}] if i == 1 else [{"file": "src/x.ts"}])
+            if i == 0:
+                _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-b",
+                                      verdict_json=None)
+                continue
+            malformed = [{}] if i == 1 else [{"file": "src/x.ts"}]
             _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable", "blocking": malformed})
@@ -9224,7 +9229,7 @@ def test_self_audit_skips_a_completed_review_with_malformed_findings():
         assert {f["key"] for f in findings} == {
             "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
-        assert "3 step-7 review verdict(s)" in bad["title"]
+        assert "2 step-7 review verdict(s)" in bad["title"]
 
 
 def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():

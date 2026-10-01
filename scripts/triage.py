@@ -5843,13 +5843,20 @@ def _is_completed_review(verdict: dict[str, Any]) -> bool:
     round — which is §115's blindness in another column on the one check that
     exists to notice a broken review gate."""
     blocking = verdict.get("blocking")
-    return (verdict.get("schemaVersion") == _sideclaw.REVIEW_SCHEMA_VERSION
-            and verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
-            and isinstance(blocking, list)
-            and all(isinstance(finding, dict)
-                    and isinstance(finding.get("file"), str) and bool(finding["file"].strip())
-                    and isinstance(finding.get("message"), str) and bool(finding["message"].strip())
-                    for finding in blocking))
+    schema_matches = verdict.get("schemaVersion") == _sideclaw.REVIEW_SCHEMA_VERSION
+    outcome_is_known = verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
+    findings_are_complete = (
+        isinstance(blocking, list)
+        and all(_is_finding_shape(finding) for finding in blocking)
+    )
+    return schema_matches and outcome_is_known and findings_are_complete
+
+
+def _is_finding_shape(finding: Any) -> bool:
+    """A published blocking entry identifies both its file and what is wrong."""
+    return (isinstance(finding, dict)
+            and isinstance(finding.get("file"), str) and bool(finding["file"].strip())
+            and isinstance(finding.get("message"), str) and bool(finding["message"].strip()))
 
 
 def _review_always_blocks_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
@@ -5863,7 +5870,7 @@ def _review_always_blocks_findings(conn: sqlite3.Connection, since: str) -> list
         "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' AND d.origin_event_id IS NOT NULL "
-        "AND d.created_at >= ? AND r.verdict_json IS NOT NULL "
+        "AND d.created_at >= ? AND r.status IN ('done', 'failed', 'interrupted', 'cancelled') "
         "ORDER BY r.created_at, r.id",
         (since,),
     ):
@@ -5882,7 +5889,7 @@ def _review_always_blocks_findings(conn: sqlite3.Connection, since: str) -> list
             "detail": f"{skipped} stored review verdict(s) do not match sideclaw's published schema, "
                       "outcome, or finding shape; the self-audit cannot safely read them as passes",
         })
-    for repo, by_event in per_repo.items():
+    for repo, by_event in sorted(per_repo.items()):
         n = len(by_event)
         if n >= 3 and all(by_event.values()):
             findings.append({"key": f"review-always-blocks-{repo}",
