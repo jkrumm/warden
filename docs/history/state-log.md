@@ -10045,6 +10045,43 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Fortieth round.** Zero blockers, two improvements, two discussions. senior-dev, performance,
+adversary and OCR all approved clean.
+
+The first improvement was two definitions of one fact: `is_review_finding()` restated
+`{"file", "message"}` inline while `REVIEW_FINDING_REQUIRED` declared the same set for the drift
+comparison. They agree today, which is the whole problem — the drift check measures the producer
+against the constant, and a reader with its own copy could keep accepting findings the check calls
+wrong. The reader now iterates the constant, and the test moves the constant to prove the reader
+moves with it: restoring the literal turns that test red. The lenient direction is unchanged, so
+the producer's extra `angle` stays tolerated.
+
+The second was a formatting nit in the operator-facing diagnostic: both new detail strings carried
+their own two-space indent while `details` is printed one level in, so they landed a level too
+deep, and one restated the `review:` label the tool line above it already prints. Verified by
+driving the real script against stub producers — a retyped field and a `blocking` that is no
+longer an array — and printing the lines as the operator sees them, which no unit test covers
+because the strings are assembled in the script itself.
+
+The first discussion asked for sign-off that deferring the manual-pair linkage is still right,
+on the grounds that an unverifiable pair "reopens a `review-verdicts-unusable-<repo>` event
+forever with no auto-resolution". Two of its three parts are accurate: the finding IS re-derived
+every tick, and the event row stays open, because a permanent condition is a permanent condition.
+The third is not what the code does, and the round checked rather than agreed. `_sync_self_audit_events()`
+refreshes only title and payload while a finding holds — it never resets `notified_at` — and
+`reopen_if_needed()` compares `_occurrence_mark()`, not `resolved_at IS NULL`; that comparison was
+the explicit fix for an earlier bug that did reopen and re-close such a row every pass. None of the
+mark's five slots moves for a live `warden_self` finding, and title churn (the item count in the
+title) is deliberately outside the mark. So a permanent manual pair notifies once, then closes on
+the ordinary silence path. The deferral therefore costs a blanked verdict and nothing else,
+recorded in STATE.md's carried debt with that evidence; the live ledger has 0 such rows. The second
+discussion (the schema walker's module placement) is already carried debt and unchanged by this
+diff.
+
+**Verified.** `tests/test_clients.py` 121 → **122/122** (+1), `tests/test_triage.py` **401/401**,
+all suites green; live-ledger replay unchanged at 39 judged items; drift check green against the
+running sideclaw; the reader's single definition proven fail-capable by restoring the literal.
+
 **Thirty-ninth round.** `needs-human`: one blocking schema-validation gap, one dead import,
 and two architect-flagged module boundaries. The senior-dev, resilience and performance reviewers
 all approved clean.

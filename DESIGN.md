@@ -863,6 +863,13 @@ disagreement, and the disagreement line names every shortfall at once: a missing
 a missing property and a retyped field are independent, and an operator sent back for a second
 run to learn the second one has been handed a diagnostic that lies by omission.
 
+The set of fields warden requires has ONE definition (§136): `REVIEW_FINDING_REQUIRED` is what
+the drift comparison measures the producer against, and `is_review_finding()` reads that same
+constant instead of restating `{"file", "message"}` inline. Two hand-written copies that agree
+today are one place to change and one to forget, and forgetting the reader's copy leaves the
+comparison reporting a mismatch against a set the reader no longer uses — while the reader keeps
+accepting findings the schema calls wrong.
+
 The CONTAINERS are part of that contract too (§135), not only the field names inside them.
 `blocking` must be exactly an array and its `items` exactly an object, because that is what the
 runtime does with them: `_review_verdict_problems()` iterates `blocking` as a list and reads

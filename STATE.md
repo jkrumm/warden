@@ -327,6 +327,15 @@ loop.
   (`parent_job_id`) written when step 7 opens it, and/or carrying the implement's
   `origin_channel`/`origin_thread_ts` onto the review's origin. Own PR, needs a migration
   (`~/.warden/warden.db`, schema 11).
+  Deferring it costs no alert noise (§136), which was worth checking rather than assuming: the
+  finding is re-derived every tick by design — it is a state source — but it does NOT re-notify.
+  `_sync_self_audit_events()` refreshes only title and payload while a finding holds, and
+  `reopen_if_needed()` compares `_occurrence_mark()`, whose five slots no live `warden_self`
+  finding moves: there is no `payload.ts_last`, the ISO slots move only on the reopen reset
+  (which happens only after the finding *stopped* holding), and title churn — the item count in
+  the title — is deliberately outside the mark. So a permanent pair notifies once, then closes on
+  the ordinary silence path, with the `events` row left open as the honest record. What remains is
+  the blanked verdict and the missing linkage.
 - `triage.py` stays one 6.6k-line file: 248 tests patch its globals by
   name, a split buys no behaviour (§66). Dead code: none (AST-verified, §65).
 - The review-verdict concern (fold, shape gates, self-audit findings, revision

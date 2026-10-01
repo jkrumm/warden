@@ -63,9 +63,11 @@ def main(argv: list[str]) -> int:
                 # to different places: no finding object at all is a producer that stopped
                 # publishing one, while a `blocking` that is no longer an array is a container
                 # the runtime reads differently (§135).
+                # No leading indent and no `review:` label: `details` is printed one level in
+                # already, and the tool line above this one already says which tool it is.
                 details.append(
-                    "  review: sideclaw publishes no readable finding shape — warden's "
-                    f"is_review_finding() would be an unverifiable copy of it ({shape['reason']})")
+                    "no readable finding shape — warden's is_review_finding() would be an "
+                    f"unverifiable copy of it ({shape['reason']})")
             elif shape:
                 # Both shortfalls are reported together: they are independent sets, and printing
                 # one of them when both are non-empty sends the operator back for a second run to
@@ -74,7 +76,7 @@ def main(argv: list[str]) -> int:
                                  | set(shape.get("missingFromProperties") or ()))
                 mistyped = shape.get("mistyped") or []
                 details.append(
-                    f"  review findings: sideclaw requires {shape['required']} "
+                    f"findings: sideclaw requires {shape['required']} "
                     f"(types {shape.get('types')}) with properties {shape['properties']}; "
                     f"warden requires {shape['wardenRequires']}"
                     + (f" — MISSING {missing}" if missing else "")

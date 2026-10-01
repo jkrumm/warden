@@ -537,6 +537,30 @@ def test_check_schema_versions_treats_an_unpublished_finding_shape_as_a_disagree
         srv.stop()
 
 
+def test_is_review_finding_reads_the_required_set_from_the_one_constant():
+    """§136 — `is_review_finding()` restated `{"file", "message"}` inline while
+    `REVIEW_FINDING_REQUIRED` declared the same set for the drift comparison: two definitions
+    that agree today, one place to change and one to forget. Moving the constant must move the
+    reader, or the comparison would report a mismatch against a set the reader no longer uses
+    while the reader keeps accepting findings the schema calls wrong."""
+    real = sideclaw.REVIEW_FINDING_REQUIRED
+    entry = {"file": "a.py", "message": "why", "line": 3}
+    assert sideclaw.is_review_finding(entry) is True
+    try:
+        sideclaw.REVIEW_FINDING_REQUIRED = real | {"angle"}
+        assert sideclaw.is_review_finding(entry) is False
+        assert sideclaw.is_review_finding({**entry, "angle": "reviewer"}) is True
+    finally:
+        sideclaw.REVIEW_FINDING_REQUIRED = real
+    # Each required name is required, and a blank one is not a name: the reader stays stricter
+    # than the producer in that one direction, as its docstring says.
+    for name in sorted(real):
+        assert sideclaw.is_review_finding({**entry, name: "   "}) is False, name
+    assert sideclaw.is_review_finding({"file": "a.py"}) is False
+    assert sideclaw.is_review_finding("a.py") is False
+    assert sideclaw.is_review_finding(None) is False
+
+
 def test_a_blocking_container_that_is_no_longer_an_array_fails_the_schema_check():
     """§135 — the field comparison this check already had, run against a producer that keeps
     every field NAME and changes only the container around them. `output.properties.blocking`
