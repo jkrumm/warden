@@ -10044,3 +10044,37 @@ tracked as issue #9 rather than a weaker predicate here.
 all suites green; live-ledger replay unchanged at 39 judged items; drift check still green against
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
+
+**Thirty-eighth round.** Zero blockers, two improvements, and the adversary's one claim was
+checked and discarded rather than acted on: it held that the resolve-sweep exemption matches
+`invariant-<id.lower()>`-style keys while `_INVARIANT_PREFIXES` builds `inv_id.lower()` ones. Both
+sides are `inv_id.lower()` (the findings read `inv-1-clock`), so the exemption matches exactly and
+there was no bug. Worth recording because the right response to an adversary finding is to check
+it against the source, not to make the change look clean.
+
+The two improvements were both in plumbing rather than policy, and neither changed behaviour.
+
+`_as_review_row()` spread the source mapping into the cast, so a `ReviewRow` also carried the
+projection's `pointer`/`target_*` columns: the dict said one shape, the annotation said another,
+and a downstream reader could take an undeclared key through the contract without ever meeting it.
+It now builds the declared keys one by one, and the test compares the result against
+`ReviewRow.__annotations__` itself rather than a second copy of the list — so the contract cannot
+drift from its own definition. Restoring the spread turns that test red.
+
+`_review_health_findings()` wrote its number into a mutable `metrics` dict threaded from
+`run_self_audit()` through `self_audit_findings()` into the section closures, purely so one section
+could escape the uniform `Callable[[], list[dict]]` contract the other four satisfy. The pipeline
+now returns `SelfAuditFindings(findings, unreadable_timestamps)`, and review health's FETCH is
+isolated inside the pipeline — it is the only step that can fail as a unit — so the section takes
+rows it cannot re-query and the count is a return value instead of a side effect. That also
+sharpened the honesty rule from the previous round: the count is `None` when the fetch raised,
+because nothing measured it, but a section that fails *after* a good fetch leaves a measured number
+standing. `unreadable_timestamps_error` is keyed on the value being `None` rather than on "the
+section failed", so the field explains itself and nothing else; the failure stays a finding. The
+test covers all three states — fetch failed, fold failed, both healthy — and moving the `next()`
+lookup to a stated reason removed a `StopIteration` that a drifted invariant could have thrown
+inside the hourly tick.
+
+**Verified.** `tests/test_triage.py` at **401/401** (+1), `tests/test_clients.py` at **120/120**,
+all suites green; live-ledger replay unchanged at 39 judged items; drift check green against the
+running sideclaw; both improvements proven fail-capable by reverting them.

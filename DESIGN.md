@@ -826,7 +826,21 @@ point and checks every projected column name against `REVIEW_QUERY_COLUMNS`, so 
 projection fails at the boundary and names the missing column. The reason a pointer did not
 resolve travels in its own `mismatch_reason` key, never written into `review_status` — that
 column is a terminal-status enum everywhere else — and it reaches the finding, which says *why*
-the verdict is unreadable and not only which items are affected.
+the verdict is unreadable and not only which items are affected. A `ReviewRow` carries EXACTLY
+the declared keys: the conversion builds them one by one instead of spreading the source row,
+which used to hand the projection's pointer columns (`pointer`, `target_*`) to every downstream
+reader through a contract that never declared them (§134).
+
+The section pipeline returns a value, not a sink. `self_audit_findings()` gives back
+`SelfAuditFindings(findings, unreadable_timestamps)`, and the one number the summary needs
+travels as that field — where the earlier shape threaded a mutable `metrics` dict down three
+call levels so a single section could escape the uniform `Callable[[], list[dict]]` contract the
+others satisfy, and no level of that path could be type-checked. Review health's FETCH is the
+one step that can fail as a unit, so it is isolated inside the pipeline and the section then
+takes rows it cannot re-query; that is what makes the count a return value at all. It also
+sharpens the honesty rule: the count is `None` only when the fetch raised — nothing measured it —
+while a section that fails *after* a good fetch leaves a measured number standing, with its
+failure reported as its own finding.
 
 The window's SQL pre-filter compares the raw
 `created_at` column (keeping `idx_dispatches_created` usable) and is widened to a superset;

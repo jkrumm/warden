@@ -6152,11 +6152,23 @@ def _as_review_row(row: Mapping[str, Any] | sqlite3.Row,
                    mismatch_reason: str | None) -> ReviewRow:
     """One row in, one `ReviewRow` out — the single conversion point into the fold's contract.
 
-    The cast is the whole trick and it is deliberate: `sqlite3.Row` and the test doubles are
-    mappings of the projected columns, and `_review_fold_rows()` has already checked the key set
-    against `REVIEW_QUERY_COLUMNS`. What the checker cannot see is that a mapping carries those
-    keys; what it *can* see, everywhere downstream, is `ReviewRow`."""
-    return cast(ReviewRow, {**row, "mismatch_reason": mismatch_reason})
+    Built key by key rather than `cast()` over `{**row, ...}`: a spread carried the projection's
+    pointer columns (`pointer`, `target_*`) into the result, so the dict said one shape while the
+    annotation said another and a later reader could take an undeclared key through the contract
+    without ever meeting it (§134). `_review_fold_rows()` has already checked that the source
+    carries every column named here, which is what makes the direct reads safe for both a
+    `sqlite3.Row` and a test double."""
+    return ReviewRow(
+        repo=row["repo"],
+        event_id=row["event_id"],
+        implement_job_id=row["implement_job_id"],
+        implement_created_at=row["implement_created_at"],
+        verdict_json=row["verdict_json"],
+        review_status=row["review_status"],
+        created_at=row["created_at"],
+        id=row["id"],
+        mismatch_reason=mismatch_reason,
+    )
 
 
 class _ReviewedItem(NamedTuple):
@@ -6337,8 +6349,7 @@ def _always_blocks_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Revie
     return findings
 
 
-def _review_health_findings(conn: sqlite3.Connection, since: str,
-                            metrics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _review_health_findings(rows: ReviewRows) -> list[dict[str, Any]]:
     """Both review-gate findings: a gate that blocks every reviewed item, and terminal
     reviews whose stored results cannot safely count as passes.
 
@@ -6353,9 +6364,6 @@ def _review_health_findings(conn: sqlite3.Connection, since: str,
     answers what the latest readable verdict did; `unusable` answers whether the latest
     terminal row can be read at all. A later unusable row does not clear a prior readable
     review's decision, but it remains visible in the fifth self-audit finding."""
-    rows = _fetch_review_rows(conn, since)
-    if metrics is not None:
-        metrics["unreadable_timestamps"] = rows.corrupt_timestamps
     status_by_repo = _fold_review_status(_review_fold_rows(rows.terminal, rows.mismatched))
     return (_unusable_verdict_findings(status_by_repo)
             + _always_blocks_findings(status_by_repo))
@@ -7172,9 +7180,26 @@ def _audit_section(name: str, section: Callable[[], list[dict[str, Any]]]) -> li
     return findings if findings is not None else []
 
 
+class SelfAuditFindings(NamedTuple):
+    """The section pipeline's output: the findings, plus the numbers a section measured on the
+    way that the summary publishes.
+
+    A returned value, not a mutable dict handed down through three call levels: the sink that
+    carried `unreadable_timestamps` let one section escape the uniform
+    `Callable[[], list[dict]]` contract every `SELF_AUDIT_SECTIONS` entry satisfies, and three
+    levels cannot be type-checked (§134). The fetch is the only step of review health that can
+    fail as a unit, so it is isolated here and the section then takes rows it cannot re-query —
+    which is what makes the count a value instead of a side effect.
+
+    `unreadable_timestamps` is `None` when the fetch that measures it failed: no number was
+    measured, and `0` would read as "no corrupt rows"."""
+
+    findings: list[dict[str, Any]]
+    unreadable_timestamps: int | None
+
+
 def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
-                        policy: dict[str, Any] | None = None, *,
-                        metrics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                        policy: dict[str, Any] | None = None) -> SelfAuditFindings:
     """Gaps the loop can see in its own behaviour, each keyed so one finding is one
     event. Five kinds, one per section: `review-always-blocks-<repo>` (a review gate
     that blocks every PR in a repo), `review-verdicts-unusable-<repo>` (a terminal review
@@ -7192,17 +7217,27 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     # event sync needs to know whose silence may resolve an alert (§132). `invariants` is not in
     # this map — it returns violations rather than findings, and `run_self_audit()` runs it.
     sections: dict[str, Callable[[], list[dict[str, Any]]]] = {
-        "review-health": lambda: _review_health_findings(conn, since, metrics),
         "liveness": lambda: _liveness_findings(conn, since),
         "fixed-reopened": lambda: _fixed_reopened_findings(conn, since),
         "restore-drill": lambda: _restore_drill_findings(now),
         "revisions-exhausted": lambda: _revisions_exhausted_findings(conn, policy),
     }
+    # Review health's fetch runs here, inside the same isolation, because it is the one step
+    # that can fail as a unit: a failed query reports `self-audit-section-failed-review-health`
+    # and the other four still run. The section itself then takes the rows, so a number the
+    # fetch measured travels back in the return value instead of through a mutable sink.
+    review_rows, review_health_failure = _run_isolated(
+        "review-health", lambda: _fetch_review_rows(conn, since))
     out: list[dict[str, Any]] = []
+    if review_health_failure is not None:
+        out.append(_section_failure_finding("review-health", review_health_failure))
+    elif review_rows is not None:
+        sections["review-health"] = lambda: _review_health_findings(review_rows)
     for name, _keys in SELF_AUDIT_SECTIONS:
         if name in sections:
             out.extend(_audit_section(name, sections[name]))
-    return out
+    return SelfAuditFindings(
+        out, None if review_rows is None else review_rows.corrupt_timestamps)
 
 
 def _sync_self_audit_events(conn: sqlite3.Connection, findings: list[dict[str, Any]],
@@ -7266,11 +7301,10 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     violations = violations or []
     findings = ([_section_failure_finding("invariants", invariants_failure)]
                 if invariants_failure is not None else [])
-    # Section-owned numbers the summary cannot re-derive without paying for them, collected by
-    # the sections themselves (inside the timed window, so their cost counts toward
-    # `self_audit_ms` like every other non-sargable scan) — see `_review_health_findings()`.
-    metrics: dict[str, Any] = {}
-    findings.extend(self_audit_findings(conn, now, policy, metrics=metrics))
+    # The pipeline's own numbers (measured inside the timed window, so their cost counts toward
+    # `self_audit_ms` like every other non-sargable scan) — see `self_audit_findings()`.
+    pipeline = self_audit_findings(conn, now, policy)
+    findings.extend(pipeline.findings)
     by_inv: dict[str, list[dict[str, Any]]] = {}
     for v in violations:
         by_inv.setdefault(v["id"], []).append(v)
@@ -7319,20 +7353,22 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
                "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
                "self_audit_ms": self_audit_ms,
                "event_sync_ms": event_sync_ms,
-               "unreadable_timestamps": metrics.get("unreadable_timestamps"),
+               "unreadable_timestamps": pipeline.unreadable_timestamps,
                "findings": sorted(live_keys)}
     if invariants_failure is not None:
         # An empty `violations` from a check that never ran is a fabricated zero, not a
         # clean bill — /health's reader gets the reason instead.
         summary["invariants_error"] = f"{type(invariants_failure).__name__}: {invariants_failure}"
-    if "review-health" in failed_sections:
-        # Same rule for the count: the section that measures it raised, so nothing measured it,
-        # and `0` would read as "no corrupt timestamps" — a fabricated clean bill in the exact
-        # field this work added to keep a cost visible. `None` says "not measured", and the
-        # reason says why, next to the section failure that is already a live finding.
-        summary["unreadable_timestamps_error"] = next(
-            f["title"] for f in findings
-            if f["key"] == f"{SECTION_FAILURE_PREFIX}review-health")
+    if pipeline.unreadable_timestamps is None:
+        # Same rule for the count, and keyed on the VALUE rather than on "the section failed":
+        # the number is None exactly when the fetch that measures it raised (§134), so the error
+        # field explains this field and nothing else. A section that failed after a good fetch
+        # leaves a measured number standing — its failure is a finding, not a missing count —
+        # and the reason names where the exception itself is, instead of restating it here in
+        # wording that would drift from the finding's.
+        summary["unreadable_timestamps_error"] = (
+            "the review-health fetch raised, so nothing measured this count; the exception is "
+            f"reported as {SECTION_FAILURE_PREFIX}review-health")
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",

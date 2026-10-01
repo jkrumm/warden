@@ -8297,7 +8297,7 @@ def test_a_failing_self_audit_section_reports_itself_and_spares_the_others():
         triage._review_health_findings = boom
         triage._restore_drill_findings = lambda now: [marker]
         try:
-            findings = triage.self_audit_findings(conn, NOW)
+            findings = triage.self_audit_findings(conn, NOW).findings
         finally:
             triage._review_health_findings = original_review
             triage._restore_drill_findings = original_drill
@@ -8316,7 +8316,7 @@ def test_the_self_audit_sections_are_all_wired_in():
         original = triage._audit_section
         triage._audit_section = lambda name, fn: (seen.append(name), fn())[1]
         try:
-            triage.self_audit_findings(conn, NOW)
+            triage.self_audit_findings(conn, NOW).findings
         finally:
             triage._audit_section = original
         assert seen == ["review-health", "liveness", "fixed-reopened", "restore-drill",
@@ -8563,7 +8563,7 @@ def test_a_mismatched_pointer_is_reported_rather_than_dropped():
         assert rows.terminal == []
         assert [r["implement_job_id"] for r, _ in rows.mismatched] == ["impl-foreign"]
         assert "another item's review" in rows.mismatched[0][1]
-        findings = triage._review_health_findings(conn, since)
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, since))
         unusable = [f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo"]
         assert len(unusable) == 1, findings
         assert "42" in unusable[0]["detail"], unusable[0]["detail"]
@@ -8599,7 +8599,7 @@ def test_a_pointer_at_a_review_that_has_not_finished_is_neither_verdict_nor_find
         conn.commit()
         rows = triage._fetch_review_rows(conn, since)
         assert rows.terminal == [] and rows.mismatched == []
-        assert triage._review_health_findings(conn, since) == []
+        assert triage._review_health_findings(triage._fetch_review_rows(conn, since)) == []
 
 
 def test_the_self_audit_summary_carries_its_schema_and_both_timings():
@@ -8693,35 +8693,75 @@ def test_the_summary_counts_the_rows_admitted_for_an_unreadable_timestamp():
         assert summary["unreadable_timestamps"] == 1
 
 
-def test_a_failed_review_health_section_reports_no_count_rather_than_a_clean_zero():
-    """§133 — the count is written by the section that measures it, so when that section raises
-    there IS no number. Writing `0` there would read as "no corrupt timestamps": a fabricated
-    clean bill in the exact field this work added to keep that cost visible, and the same
-    anti-pattern `invariants_error` already exists to prevent one key over. `None` says not
-    measured, and the reason says why."""
+def test_the_fold_row_contract_carries_exactly_the_declared_keys():
+    """§134 — the conversion spread the source mapping, so a `ReviewRow` also carried the
+    projection's pointer columns (`pointer`, `target_*`): the dict said one shape, the annotation
+    said another, and a reader could take an undeclared key through the contract without meeting
+    it. The keys are exactly the declared ones now, compared against the `TypedDict` itself
+    rather than against a second copy of the list."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
     with _triage_env() as (conn, ctx):
-        real = triage._review_health_findings
+        _seed_blocking_review(conn, event_id=7, suffix="keys")
+        rows = triage._fetch_review_rows(conn, since)
+        # The fetched row DOES carry the extras — that is the projection the predicate reads.
+        assert "pointer" in rows.terminal[0].keys() and "target_tier" in rows.terminal[0].keys()
+        folded = triage._review_fold_rows(rows.terminal, rows.mismatched)
+        assert len(folded) == 1
+        assert set(folded[0]) == set(triage.ReviewRow.__annotations__), sorted(folded[0])
+        # The blanked path goes through the same conversion.
+        blanked = triage._review_fold_rows([], [(rows.terminal[0], "why")])
+        assert set(blanked[0]) == set(triage.ReviewRow.__annotations__)
+        assert blanked[0]["mismatch_reason"] == "why" and blanked[0]["verdict_json"] is None
+
+
+def test_a_failed_review_health_fetch_reports_no_count_rather_than_a_clean_zero():
+    """§133/§134 — the count comes from the FETCH, so when the fetch raises there IS no number.
+    Writing `0` there would read as "no corrupt timestamps": a fabricated clean bill in the
+    exact field this work added to keep that cost visible, and the same anti-pattern
+    `invariants_error` already exists to prevent one key over. `None` says not measured, and the
+    reason says why.
+
+    A section that fails AFTER a good fetch is a different state, and this pins the difference:
+    the number was measured, so it stands (a real 0 here) while the section's failure is its own
+    live finding. Only the fetch can unmeasure the count."""
+    with _triage_env() as (conn, ctx):
+        real_fetch = triage._fetch_review_rows
 
         def _raise(*_a, **_k):
             raise RuntimeError("OperationalError: no such table: dispatches")
 
-        triage._review_health_findings = _raise
+        triage._fetch_review_rows = _raise
         try:
             triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
         finally:
-            triage._review_health_findings = real
+            triage._fetch_review_rows = real_fetch
         summary = json.loads(conn.execute(
             "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
         assert summary["unreadable_timestamps"] is None, summary["unreadable_timestamps"]
         assert "review-health" in summary["unreadable_timestamps_error"]
         # The failure is a live finding too, so the hour is not a quiet one either way.
         assert f"{triage.SECTION_FAILURE_PREFIX}review-health" in summary["findings"]
-        # And the next pass that runs the section measures again, without the error key.
-        triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=2), dry_run=False)
+
+        # The fold (not the fetch) failing leaves the measured number standing.
+        real_section = triage._review_health_findings
+        triage._review_health_findings = _raise
+        try:
+            triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=2),
+                                  dry_run=False)
+        finally:
+            triage._review_health_findings = real_section
         summary = json.loads(conn.execute(
             "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
         assert summary["unreadable_timestamps"] == 0
         assert "unreadable_timestamps_error" not in summary
+        assert f"{triage.SECTION_FAILURE_PREFIX}review-health" in summary["findings"]
+
+        # And the next pass that runs the section clears both.
+        triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=4), dry_run=False)
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["unreadable_timestamps"] == 0
+        assert f"{triage.SECTION_FAILURE_PREFIX}review-health" not in summary["findings"]
 
 
 def test_a_slow_self_audit_tick_reports_itself():
@@ -8788,7 +8828,7 @@ def test_an_origin_less_pair_is_unverifiable_rather_than_read():
         assert rows.mismatched[0][0]["event_id"] is None
         # Reported, not dropped: the item is named by the fifth finding, keyed on the implement
         # job id because a manual dispatch has no event to be keyed on.
-        finding = next(f for f in triage._review_health_findings(conn, since)
+        finding = next(f for f in triage._review_health_findings(triage._fetch_review_rows(conn, since))
                        if f["key"] == "review-verdicts-unusable-demo-repo")
         assert "impl-manual" in finding["detail"], finding["detail"]
         assert "carry no origin" in finding["detail"], finding["detail"]
@@ -8935,7 +8975,7 @@ def test_the_unusable_verdict_finding_covers_a_missing_verdict_too():
         conn.execute("UPDATE dispatches SET validation_job_id=?, created_at=? WHERE job_id=?",
                      ("val-no-verdict-row", NOW.isoformat(), "impl-no-verdict-row"))
         conn.commit()
-        findings = triage._review_health_findings(conn, NOW.isoformat())
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
         finding = next(f for f in findings if f["key"].startswith("review-verdicts-unusable-"))
         assert "no verdict at all" in finding["detail"]
         assert "does not match sideclaw's published schema" in finding["detail"]
@@ -9190,7 +9230,7 @@ def test_revisions_exhausted_names_a_non_convergent_review():
                 "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
                 (eid, triage.STATE_VALIDATING, triage.STATE_MERGE_BLOCKED, NOW.isoformat(), note))
         conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW).findings}
         detail = details[f"revisions-exhausted-{eid}"]
         assert "each blocking a different file" in detail, detail
         assert "cannot satisfy the review" not in detail, detail
@@ -9209,7 +9249,7 @@ def test_a_review_that_re_flagged_the_same_location_still_blames_the_review():
                 "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
                 (eid, triage.STATE_VALIDATING, triage.STATE_MERGE_BLOCKED, NOW.isoformat(), note))
         conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW).findings}
         assert "cannot satisfy the review" in details[f"revisions-exhausted-{eid}"]
 
 
@@ -9676,7 +9716,7 @@ def test_self_audit_never_audits_its_own_items():
         conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
                      (eid, "liveness_pending", "new", NOW.isoformat()))
         conn.commit()
-        assert triage.self_audit_findings(conn, NOW, triage.load_policy()) == []
+        assert triage.self_audit_findings(conn, NOW, triage.load_policy()).findings == []
 
 
 def test_inv4_a_finished_investigation_without_effect():
@@ -9784,7 +9824,7 @@ def test_self_audit_findings_catch_its_own_wrong_answers():
         _seed_state(conn, external_id="out-of-revisions", state=triage.STATE_MERGE_BLOCKED, note="blocked",
                     revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
         conn.commit()
-        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW).findings}
         assert "review-always-blocks-demo-repo" in keys
         assert f"fixed-reopened-{fixed}" in keys
         assert any(k.startswith("revisions-exhausted-") for k in keys)
@@ -9801,7 +9841,7 @@ def test_self_audit_sees_a_needs_human_review_that_carries_a_code_finding():
             _seed_blocking_review(conn, event_id=910 + i, suffix=f"nh-{i}",
                                   outcome="needs-human",
                                   blocking=[{"file": "src/x.ts", "message": "the guard is gone"}])
-        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW).findings}
         assert "review-always-blocks-demo-repo" in keys
 
 
@@ -9813,7 +9853,7 @@ def test_self_audit_reports_an_origin_less_pair_instead_of_judging_it():
     with _triage_env() as (conn, ctx):
         for i in range(3):
             _seed_blocking_review(conn, event_id=None, suffix=f"manual-{i}")
-        keys = {f["key"] for f in triage._review_health_findings(conn, NOW.isoformat())}
+        keys = {f["key"] for f in triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))}
         assert "review-verdicts-unusable-demo-repo" in keys
         assert "review-always-blocks-demo-repo" not in keys, keys
 
@@ -9826,11 +9866,11 @@ def test_self_audit_counts_a_pr_once_across_its_revisions():
         _seed_blocking_review(conn, event_id=920, suffix="rev-920-a")
         _seed_blocking_review(conn, event_id=920, suffix="rev-920-b")
         _seed_blocking_review(conn, event_id=921, suffix="rev-921")
-        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW).findings}
         assert "review-always-blocks-demo-repo" not in keys
 
         _seed_blocking_review(conn, event_id=922, suffix="rev-922")
-        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+        finding = next(f for f in triage.self_audit_findings(conn, NOW).findings
                        if f["key"] == "review-always-blocks-demo-repo")
         assert "all 3 demo-repo PRs" in finding["title"]
 
@@ -9847,7 +9887,7 @@ def test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one():
             _seed_blocking_review(conn, event_id=930 + i, suffix=f"late-{930 + i}-a")
             _seed_blocking_review(conn, event_id=930 + i, suffix=f"late-{930 + i}-b",
                                   outcome="actionable", blocking=[])
-        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW).findings}
         assert "review-always-blocks-demo-repo" not in keys
 
     with _triage_env() as (conn, ctx):
@@ -9858,7 +9898,7 @@ def test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one():
                                   outcome="clean", blocking=[])
         for i in range(3):
             _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-b")
-        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+        finding = next(f for f in triage.self_audit_findings(conn, NOW).findings
                        if f["key"] == "review-always-blocks-demo-repo")
         assert "all 3 demo-repo PRs" in finding["title"]
 
@@ -9875,7 +9915,7 @@ def test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item():
             _seed_blocking_review(conn, event_id=960 + i, suffix=f"unusable-{960 + i}-a")
             _seed_blocking_review(conn, event_id=960 + i, suffix=f"unusable-{960 + i}-b",
                                   outcome="error", blocking=[], verdict_json={"outcome": "error"})
-        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+        finding = next(f for f in triage.self_audit_findings(conn, NOW).findings
                        if f["key"] == "review-always-blocks-demo-repo")
         assert "all 3 demo-repo PRs" in finding["title"]
 
@@ -9886,7 +9926,7 @@ def test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item():
             _seed_blocking_review(conn, event_id=970 + i, suffix=f"den-{970 + i}")
         _seed_blocking_review(conn, event_id=973, suffix="den-973",
                               outcome="error", blocking=[], verdict_json={"summary": "no verdict"})
-        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+        finding = next(f for f in triage.self_audit_findings(conn, NOW).findings
                        if f["key"] == "review-always-blocks-demo-repo")
         assert "all 3 demo-repo PRs" in finding["title"]
 
@@ -10088,7 +10128,7 @@ def test_self_audit_reports_an_item_by_its_latest_row_not_an_earlier_unusable_on
                                   verdict_json={"schemaVersion": 1, "outcome": "actionable"})
             _seed_blocking_review(conn, event_id=950 + i, suffix=f"stale-{950 + i}-b",
                                   outcome="clean", blocking=[])
-        findings = triage._review_health_findings(conn, NOW.isoformat())
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
         assert findings == []
 
 
@@ -10101,7 +10141,7 @@ def test_self_audit_handles_mixed_origin_unusable_keys_without_crashing():
                               verdict_json={"schemaVersion": 1, "outcome": "actionable"})
         _seed_blocking_review(conn, event_id=None, suffix="mixed-manual",
                               verdict_json={"schemaVersion": 1, "outcome": "actionable"})
-        finding = next(f for f in triage._review_health_findings(conn, NOW.isoformat())
+        finding = next(f for f in triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
                        if f["key"] == "review-verdicts-unusable-demo-repo")
         assert "2 item(s)" in finding["title"]
         assert "960" in finding["detail"] and "mixed-manual" in finding["detail"]
@@ -10118,7 +10158,7 @@ def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
             _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable"})
-        findings = triage._review_health_findings(conn, NOW.isoformat())
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
         assert {f["key"] for f in findings} == {
             "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
 
@@ -10139,7 +10179,7 @@ def test_self_audit_skips_a_completed_review_with_malformed_findings():
             _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable", "blocking": malformed})
-        findings = triage._review_health_findings(conn, NOW.isoformat())
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
         assert {f["key"] for f in findings} == {
             "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
@@ -10166,7 +10206,7 @@ def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():
             _seed_blocking_review(conn, event_id=eid, suffix=f"visible-{eid}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable", "blocking": [None]})
-        findings = triage._review_health_findings(conn, NOW.isoformat())
+        findings = triage._review_health_findings(triage._fetch_review_rows(conn, NOW.isoformat()))
         assert {f["key"] for f in findings} == {"review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         triage.run_self_audit(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert conn.execute("SELECT count(*) FROM events WHERE external_id='review-verdicts-unusable-demo-repo'").fetchone()[0] == 1
@@ -10209,7 +10249,7 @@ def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review()
                                            "serialize a structured verdict",
                                       revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
         conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
+        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW).findings}
         gate_detail = details[f"revisions-exhausted-{on_the_gate}"]
         assert "merge gate" in gate_detail and "403" in gate_detail
         assert "cannot satisfy the review" not in gate_detail
