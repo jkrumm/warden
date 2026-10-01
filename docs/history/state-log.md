@@ -9486,11 +9486,3 @@ carrying the review's finding — was closed rather than carried: its investigat
 `implement`/high, but the auto-implement round is cut from the live checkout's `HEAD`, i.e.
 `master`, where `code_blocked` does not exist, so the correction was applied on the PR branch by
 hand instead of spending an episode on a tree that cannot show the defect.
-
-**Landing.** §116 and §117 both ride PR #7 (branch
-`dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is
-merge-approval gated, so the owner's Argo Merge click is the outside. Item 1364 — the alert
-carrying the review's finding — was closed rather than carried: its investigate verdict was
-`implement`/high, but the auto-implement round is cut from the live checkout's `HEAD`, i.e.
-`master`, where `code_blocked` does not exist, so the correction was applied on the PR branch by
-hand instead of spending an episode on a tree that cannot show the defect.

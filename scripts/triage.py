@@ -5833,20 +5833,23 @@ def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
 def _is_completed_review(verdict: dict[str, Any]) -> bool:
     """True when a STORED review verdict is a complete one: sideclaw's published
     schema version, an `outcome` inside its published `REVIEW_OUTCOMES`, and a
-    `blocking` list whose entries are all finding objects — the shape the live
-    response checks insist on.
+    `blocking` list of finding objects with the published required fields.
 
     The self-audit reads stored payloads, so it re-checks the shape instead of
     assuming it. A corrupt payload is `{}` after `_safe_json()`; a partial one like
     `{"outcome": "actionable"}` has no `blocking` key at all. A list like `[null]`
-    also isn't a verdict shape: the reviewer can only give findings, and each
-    finding must be an object with its own fields. Each is unusable — never a pass
-    that clears a code-blocked round — which is §115's blindness in another column
-    on the one check that exists to notice a broken review gate."""
+    or `[{}]` also isn't a verdict shape: the reviewer must name the file and the
+    finding's message. Each is unusable — never a pass that clears a code-blocked
+    round — which is §115's blindness in another column on the one check that
+    exists to notice a broken review gate."""
+    blocking = verdict.get("blocking")
     return (verdict.get("schemaVersion") == _sideclaw.REVIEW_SCHEMA_VERSION
             and verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
-            and isinstance(verdict.get("blocking"), list)
-            and all(isinstance(finding, dict) for finding in verdict["blocking"]))
+            and isinstance(blocking, list)
+            and all(isinstance(finding, dict)
+                    and isinstance(finding.get("file"), str) and bool(finding["file"].strip())
+                    and isinstance(finding.get("message"), str) and bool(finding["message"].strip())
+                    for finding in blocking))
 
 
 def _review_always_blocks_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:

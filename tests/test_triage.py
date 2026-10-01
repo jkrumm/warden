@@ -9210,18 +9210,21 @@ def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
 
 def test_self_audit_skips_a_completed_review_with_malformed_findings():
     """§117 — a list is necessary but not sufficient for a complete review. Its
-    entries must be finding objects too: passing `[None]` into the shared classifier
-    otherwise raises AttributeError and takes the loop down instead of skipping the
-    unusable verdict and keeping the earlier code-blocked status."""
+    entries must be finding objects with a non-empty `file` and `message` too:
+    passing `[None]` or `[{}]` into the shared classifier otherwise raises or treats
+    a malformed row as a real blocker instead of surfacing it as unusable."""
     with _triage_env() as (conn, ctx):
         for i in range(3):
             _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-a")
+            malformed = [None] if i == 0 else ([{}] if i == 1 else [{"file": "src/x.ts"}])
             _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
-                                                "outcome": "actionable", "blocking": [None]})
-        finding = next(f for f in triage.self_audit_findings(conn, NOW)
-                       if f["key"] == "review-always-blocks-demo-repo")
-        assert "all 3 demo-repo PRs" in finding["title"]
+                                                "outcome": "actionable", "blocking": malformed})
+        findings = triage._review_always_blocks_findings(conn, NOW.isoformat())
+        assert {f["key"] for f in findings} == {
+            "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
+        bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
+        assert "3 step-7 review verdict(s)" in bad["title"]
 
 
 def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():
