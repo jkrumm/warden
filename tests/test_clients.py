@@ -718,7 +718,9 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     # that is not a list of names — all three are refused rather than assumed, because a
     # conditional requirement cannot be read as a plain one.
     def unpromised(required: Any) -> Any:
-        output = {"properties": {"blocking": {
+        # `"type": "object"` on the root, because §150 made it part of what a body has to publish:
+        # these bodies are valid apart from the one thing each case is about.
+        output = {"type": "object", "properties": {"blocking": {
             "type": "array", "items": {"type": "object",
                                        "properties": {"file": {}, "message": {}}}}}}
         if required is not None:
@@ -733,16 +735,28 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     assert "`output`" in reason({})
     # One level down, the same case the first guard covers: `properties` reached with `or {}`
     # raises on a truthy non-dict, and it is the level a drifted body is most likely to break.
-    assert "properties" in reason({"output": {"properties": "yes"}})
-    assert "blocking" in reason({"output": {"required": _PROMISED, "properties": {"blocking": ["x"]}}})
+    assert "properties" in reason({"output": {"type": "object", "properties": "yes"}})
+    assert "blocking" in reason({"output": {"type": "object", "required": _PROMISED,
+                                            "properties": {"blocking": ["x"]}}})
     # `blocking` typed but its `items` unreadable: the guards reach the level below too.
     assert "items" in reason(
-        {"output": {"required": _PROMISED, "properties": {"blocking": {"type": "array", "items": "x"}}}})
+        {"output": {"type": "object", "required": _PROMISED,
+                    "properties": {"blocking": {"type": "array", "items": "x"}}}})
+    # …and the ROOT of that descent is checked like every level under it (§150): `output` itself
+    # has to be an object, because `_review_verdict_problems()` rejects any result that is not one
+    # ("result is not an object"), so a null-capable root parks a review the drift check called fine.
+    assert "not exactly an object" in reason({"output": {"type": ["object", "null"],
+                                                         "properties": {"blocking": {}}}})
+    assert "not exactly an object" in reason({"output": {"type": "array",
+                                                         "properties": {"blocking": {}}}})
+    assert "not exactly an object" in reason(
+        {"output": {"required": _PROMISED, "properties": {"blocking": {}}}})
 
     def body(blocking_type: Any, items_type: Any,
              *, required: Any = sideclaw.REVIEW_OUTPUT_REQUIRED) -> Any:
         """A published body whose FIELD NAMES never change — only the containers around them."""
-        return {"output": {"required": list(required), "properties": {"blocking": {
+        return {"output": {"type": "object", "required": list(required),
+                           "properties": {"blocking": {
             "type": blocking_type,
             "items": {"type": items_type,
                       "properties": {"file": {"type": "string"}, "message": {"type": "string"}},
@@ -767,15 +781,18 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     # set of its own characters (silently passing a name check it should fail) and a number
     # would raise TypeError out of a function that is documented never to raise.
     for bad in ("file", 7, {"file": 1}, [7], ["file", 7]):
-        why = reason({"output": {"required": _PROMISED, "properties": {"blocking": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"file": {}, "message": {}}, "required": bad}}}}})
+        why = reason({"output": {"type": "object", "required": _PROMISED,
+                                 "properties": {"blocking": {"type": "array", "items": {
+                                     "type": "object",
+                                     "properties": {"file": {}, "message": {}},
+                                     "required": bad}}}}})
         assert "required" in why or "items" in why, (bad, why)
     # An empty `properties` carries no shape either — that is "not published", not "nothing
     # required".
     assert "publishes no fields" in reason(
-        {"output": {"required": _PROMISED, "properties": {"blocking": {"type": "array", "items": {
-            "type": "object", "properties": {}, "required": []}}}}})
+        {"output": {"type": "object", "required": _PROMISED,
+                    "properties": {"blocking": {"type": "array", "items": {
+                        "type": "object", "properties": {}, "required": []}}}}})
     # …and the same shape read from a well-formed body still works, types included.
     shape = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
     assert isinstance(shape, sideclaw.PublishedFindingShape), shape
@@ -2170,6 +2187,35 @@ def test_an_outcome_with_no_enum_is_an_unreadable_envelope():
     assert review["ok"] is False, review
     envelope = review["envelopeShape"]
     assert envelope["published"] is False and "enum" in envelope["reason"], envelope
+
+
+def test_a_root_schema_that_admits_null_is_a_mismatch():
+    """§150 — the ROOT of the descent is checked like every level under it. `blocking` and `items`
+    were held to `type: "array"`/`"object"` while the schema above them only had to exist, so a
+    producer could publish a null-capable or keyword-less `output` with every nested check green —
+    and `_review_verdict_problems()` rejects any result that is not an object outright, so a null
+    result parks the item with no verdict at all. Both readers report the same refusal, because both
+    descend through the same root."""
+    for root_type in (["object", "null"], "array", None):
+        output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+        if root_type is None:
+            output.pop("type", None)
+        else:
+            output["type"] = root_type
+        srv = _stub_schemas(review_output=output)
+        os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+        try:
+            review = sideclaw.check_schema_versions()["review"]
+        finally:
+            srv.stop()
+        assert review["ok"] is False, (root_type, review)
+        for report_key in ("findingShape", "envelopeShape"):
+            report = review[report_key]
+            assert report["published"] is False, (root_type, report_key, report)
+            assert "not exactly an object" in report["reason"], (root_type, report_key, report)
+    # …and the live root (`{"type": "object"}`) is what both readers accept, so this stays a check
+    # rather than a refusal of the shape sideclaw serves.
+    assert _envelope_check()["ok"] is True
 
 
 def test_a_singleton_type_array_is_not_a_mismatch():

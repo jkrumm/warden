@@ -922,6 +922,16 @@ the integer the comparison wants, and a published `const` has to agree with it; 
 publish an `enum` of strings, because without one nothing constrains it and the runtime's membership
 test is the only thing that would have noticed.
 
+Every level of a descent is checked, the root included (§150). `blocking` and its `items` were held
+to `type: "array"`/`"object"` while the schema ABOVE them only had to exist, so a producer could
+publish `output.type: ["object", "null"]` — or drop the keyword — with every nested check green; a
+null `result` under that schema is rejected outright by `_review_verdict_problems()` (`result is not
+an object`), so the item parks `needs_human` with no verdict, which is the failure this check exists
+to report before it happens rather than after. The asymmetry is the tell: a rule applied at every
+level except the first is a rule whose absence nobody notices until a producer moves the level nobody
+looked at. `_require_output_schema()` is the root both readers call, so neither can describe a
+different root than the other read and a refused root reports one reason in both places.
+
 A JSON Schema `type` keyword is compared as the SET of types it names (§149). The dialect allows a
 list, so `{"type": ["string"]}` and `{"type": "string"}` are the same schema — and the check compared
 the raw keyword, which made a producer whose serializer wraps every type in a list read as a producer

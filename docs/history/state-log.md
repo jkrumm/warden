@@ -10045,6 +10045,29 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Fifty-first round.** `actionable`: one blocker, no improvements, no discussions. Architect,
+senior-dev and OCR approved clean; the adversary found the blocker — an asymmetry, and a real one.
+
+The blocker is a rule applied at every level of a descent except the first. `_published_finding_
+shape()` holds `blocking` and its `items` to `type: "array"`/`"object"`, and §149 had just made that
+comparison set-based and strict — but the root `output` schema only had to EXIST. A producer could
+publish `output.type: ["object", "null"]`, or drop the keyword entirely, with every nested check
+green; the runtime then rejects a null `result` outright (`_review_verdict_problems()` returns
+`["result is not an object"]`), so each such review parks `needs_human` with no verdict, and the check
+that exists to catch contract drift reported the contract held. `_require_output_schema()` is the root
+both readers now call — the finding reader and the envelope reader descend through the same level, so
+a refused root reports one reason in both reports instead of one refusal and one cheerful comparison.
+The live root publishes `{"type": "object"}`, so this reads what sideclaw serves rather than demanding
+something new of it — the distinction §149's round had to correct one level down.
+
+**Verified.** `tests/test_clients.py` 133 → **135/135** (+1 end-to-end: a null-capable, array-typed
+and keyword-less root each fail with both reports naming the root, while the live root passes; plus
+three root assertions inside the shape-reader test, whose fixture bodies now publish the root they
+claim to be testing under), `tests/test_triage.py` **405/405**, every suite green; live-ledger replay
+unchanged at 39 judged items; drift check green against the running sideclaw. Proved fail-capable by
+reverting `_require_output_schema()` to the bare existence check: the new test and the fixture-based
+reader test both fail.
+
 **Fiftieth round.** `needs-human`: one blocker, two improvements, one discussion. Senior-dev,
 resilience, performance and api-contract approved cleanly; the adversary found the blocker, and it
 was a false-refusal bug rather than a hole.

@@ -713,6 +713,25 @@ def _require_type_keyword(schema: dict[str, Any], what: str, expected: str, why:
             f"{what} is not exactly {article} {expected} (type={found!r}), and {why}")
 
 
+def _require_output_schema(parsed: dict[str, Any]) -> dict[str, Any]:
+    """The published `output` schema: an object, and typed as one.
+
+    The root is the container NEITHER descent checked — `blocking` and `items` are held to
+    `type == "array"`/`"object"` while the schema above them only had to exist. A producer that made
+    its root null-capable (`["object", "null"]`) or dropped the keyword kept every nested check green,
+    and the runtime rejects any `result` that is not an object outright: `_review_verdict_problems()`
+    returns `["result is not an object"]` for one, so a null result under that schema parks the item
+    `needs_human` with no verdict — the `needs_human`-per-review failure this check exists to catch
+    before it happens (§150).
+
+    Called by BOTH readers, so neither can describe a different root than the other read, and a
+    refused root is reported with the same reason in both."""
+    output = _require_object(parsed, "output", "`output` object")
+    _require_type_keyword(
+        output, "`output`", "object", "the runtime rejects a result that is not an object")
+    return output
+
+
 def _require_output_promise(output: dict[str, Any]) -> None:
     """`output.required` must be a list of names AND must promise the whole envelope warden reads.
 
@@ -776,7 +795,7 @@ def _published_finding_shape(
     # anything out: the body this has to survive is precisely the malformed one it exists to
     # report. `_UnreadableShape` is caught at the bottom and becomes that return value.
     try:
-        output = _require_object(parsed, "output", "`output` object")
+        output = _require_output_schema(parsed)
         container = _require_object(output, "properties", "`output.properties` object")
         _require_output_promise(output)
         blocking = _require_object(
@@ -831,7 +850,7 @@ def _published_envelope_shape(
     `check_schema_versions()`'s try/except, on the operator-facing `make status` path, and the one
     body it must survive is the malformed one it is there to report."""
     try:
-        output = _require_object(parsed, "output", "`output` object")
+        output = _require_output_schema(parsed)
         container = _require_object(output, "properties", "`output.properties` object")
         version = _require_object(
             container, "schemaVersion", "`output.properties.schemaVersion` property")
