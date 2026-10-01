@@ -5827,13 +5827,14 @@ def _published_findings(blocking: Any) -> list[dict[str, Any]]:
     that is not one of the published objects reads as "no finding", never as a crash
     mid-tick.
 
-    `_is_finding_shape()` is applied here rather than only in the audit because this
+    `_sideclaw.is_review_finding()` (the published contract's own rule, §121) is applied
+    here rather than only in the audit because this
     is the one gate every consumer of a STORED verdict goes through: `{}` (or
     `{"file": "x"}` with no message) is not a finding, and a revision brief built from
     one is an episode bought to fix `- ? — ?`."""
     if not isinstance(blocking, list):
         return []
-    return [f for f in blocking if _is_finding_shape(f)]
+    return [f for f in blocking if _sideclaw.is_review_finding(f)]
 
 
 def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
@@ -5882,8 +5883,8 @@ def _review_verdict_problems(verdict: Any) -> list[str]:
         problems.append(f"outcome {outcome!r} publishes no `blocking` list")
     elif not isinstance(blocking, list):
         problems.append(f"`blocking` is {type(blocking).__name__}, not a list")
-    elif not all(_is_finding_shape(f) for f in blocking):
-        bad = [f for f in blocking if not _is_finding_shape(f)]
+    elif not all(_sideclaw.is_review_finding(f) for f in blocking):
+        bad = [f for f in blocking if not _sideclaw.is_review_finding(f)]
         problems.append(f"{len(bad)} of {len(blocking)} `blocking` entries are not findings "
                         f"(first: {bad[0]!r:.80})")
     return problems
@@ -5939,13 +5940,6 @@ def _is_completed_review(verdict: Any) -> bool:
     return version is not None and 1 <= version <= _sideclaw.REVIEW_SCHEMA_VERSION
 
 
-def _is_finding_shape(finding: Any) -> bool:
-    """A published blocking entry identifies both its file and what is wrong."""
-    return (isinstance(finding, dict)
-            and isinstance(finding.get("file"), str) and bool(finding["file"].strip())
-            and isinstance(finding.get("message"), str) and bool(finding["message"].strip()))
-
-
 # The two things that can identify a reviewed item: its triage event, or — for a
 # manual `warden dispatch` that never had one — the implement job it was submitted
 # under. Named here because the self-audit keys its per-item maps on it.
@@ -5961,27 +5955,32 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     (`_sideclaw.TERMINAL_STATUSES`); a terminal job may still lack a usable verdict, and
     that case is reported by the review self-audit rather than mistaken for a pass.
 
-    The join is pinned on `r.tier='review'` as well as `d.validation_job_id`: the column is
-    a pointer, and a stale or malformed one that happens to name a terminal dispatch of
-    another tier (the live ledger has implement→investigate pairs) would otherwise be read
-    as that item's review verdict — able to fabricate or suppress a merge-gating finding.
+    The join is pinned on the pair's identity, not only on the pointer: `r.tier='review'`
+    AND `r.repo = d.repo` alongside `d.validation_job_id`. The column is a pointer, and a
+    stale or malformed one that names a terminal dispatch of another tier (the live ledger
+    has implement→investigate pairs) or another repo would otherwise be read as that item's
+    review verdict — able to fabricate or suppress a merge-gating finding.
 
-    The window compares INSTANTS, not text: `datetime()` normalises a stored
-    `+HH:MM`/`Z`/naive timestamp to UTC before the comparison, so a row written with a
-    non-UTC offset cannot land in or out of the window by its representation. (Every
-    deliberate writer here stores `+00:00`, where text and instant agree — this is what
-    keeps a future writer's format from being a silent correctness change.) The wrapper
-    forgoes `idx_dispatches_created`; the hourly pass over `dispatches` is small enough
-    that correctness is the better trade.
+    The window compares INSTANTS, not text, and the comparison is the one below, in Python:
+    a stored `+HH:MM`/`Z`/naive timestamp is parsed, so a row cannot land in or out of the
+    window by its representation. The SQL pre-filter is only a cheap superset (widened for
+    real UTC offsets) that keeps `idx_dispatches_created` usable.
 
     No `ORDER BY`: `_fold_review_status()` orders its own input by parsed instant, and a
     sort here would only imply a contract the fold does not rely on."""
     since_dt = _parse_ts(since)
     if since_dt is None:
         raise ValueError(f"invalid self-audit window start: {since!r}")
-    # `_parse_ts()` has already made this UTC-aware; formatting it back to the ledger's
-    # naive-UTC text is what the placeholder below is compared as.
-    naive_utc = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
+    # The SQL pre-filter is a SUPERSET of the window, not the window itself, and it is
+    # deliberately widened: the exact comparison below is on parsed instants, so this only
+    # has to be cheap. `datetime(d.created_at)` would disable `idx_dispatches_created`
+    # (§118's discussion); comparing the column directly keeps the index usable, and the
+    # 26-hour slack covers any real UTC offset (-12:00 … +14:00) so a row written with one
+    # cannot fall out of the pre-filter by its text. Widening is safe in that direction
+    # because anything the pre-filter wrongly admits is removed below.
+    widen = dt.timedelta(hours=26)
+    naive_utc = ((since_dt - widen).astimezone(dt.timezone.utc).replace(tzinfo=None)
+                 .isoformat())
     placeholders = ",".join("?" for _ in _sideclaw.TERMINAL_STATUSES)
     sql = (
         f"SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
@@ -5989,17 +5988,15 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
         f"r.verdict_json AS verdict_json, "
         f"r.status AS review_status, r.created_at AS created_at, r.id AS id "
         f"FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
-        f"WHERE d.tier='implement' AND r.tier='review' "
-        f"AND (datetime(d.created_at) IS NULL OR datetime(d.created_at) >= datetime(?)) "
+        f"WHERE d.tier='implement' AND r.tier='review' AND r.repo = d.repo "
+        f"AND d.created_at >= ? "
         f"AND r.status IN ({placeholders}) "
     )
     rows = conn.execute(sql, (naive_utc, *_sideclaw.TERMINAL_STATUSES)).fetchall()
-    # SQLite's `datetime()` is a permissive pre-filter, not the decision: it truncates to
-    # whole seconds (so a microsecond-precision `now` would pull in rows just outside the
-    # window) and returns NULL for a timestamp it cannot parse (which would silently drop
-    # the row — the invisibility this file's "deferral must be visible" forbids). The exact
-    # comparison happens here on parsed instants, and a row whose timestamp will not parse
-    # is KEPT: a corrupt row must make the audit look at something, not leave it out.
+    # The exact comparison: parsed instants, microsecond precision, and a row whose
+    # timestamp will not parse is KEPT — a corrupt row must make the audit look at
+    # something, not leave it out. The pre-filter above cannot be the decision for either
+    # reason (text comparison, and `>=` on a widened bound admits rows this drops).
     # The window is the IMPLEMENT job's time, as it always was; `created_at` on the row is
     # the review's, which is what the fold orders items' reviews by.
     return [r for r in rows
@@ -6015,6 +6012,21 @@ class _ReviewedItem(NamedTuple):
     """The latest terminal row's two independent effects on the audit."""
     code_blocked: bool | None  # None: no complete review; don't dilute n >= 3.
     unusable: bool             # latest terminal row's result cannot be safely read.
+
+
+def _carry_forward_code_blocked(verdict: dict[str, Any], readable: bool,
+                                previous: _ReviewedItem | None) -> bool | None:
+    """What this row says about the item's review gate, in order of authority.
+
+    A readable verdict speaks for itself. A row we cannot read says nothing: the last
+    known answer is carried forward so a previous complete review keeps counting, and an
+    item that never had one stays `None` — the value that keeps it out of
+    `_always_blocks_findings()`'s `n >= 3` denominator instead of diluting it."""
+    if readable:
+        return bool(_code_blocking_findings(verdict.get("blocking")))
+    if previous is not None:
+        return previous.code_blocked
+    return None
 
 
 def _review_instant(r: _ReviewRow) -> dt.datetime | None:
@@ -6072,8 +6084,7 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
         verdict = _safe_json(r["verdict_json"])
         readable = r["review_status"] == "done" and _is_completed_review(verdict)
         previous = status_by_repo.get(r["repo"], {}).get(item_key)
-        code_blocked = (bool(_code_blocking_findings(verdict.get("blocking"))) if readable
-                        else previous.code_blocked if previous is not None else None)
+        code_blocked = _carry_forward_code_blocked(verdict, readable, previous)
         # A row whose timestamp will not parse cannot be PLACED against the others, so
         # "latest wins" cannot be decided for its item: an older readable review reported as
         # current would assert an order nobody knows, and a corrupt newer review would be
@@ -6959,18 +6970,16 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     # a malformed row) propagates out of run_self_audit entirely — losing the cursor write,
     # the hour's `warden_self` reopen/resolve, and every finding the sections below had
     # already produced. Its failure is reported, not swallowed.
+    # Timed from here so the number covers the whole tick, not just the section queries:
+    # the invariant check runs before it and the event sync after it (§118's second
+    # discussion). Only the cursor write itself is outside the measurement.
+    started = dt.datetime.now(dt.timezone.utc)
     violations, invariants_failure = _run_isolated(
         "invariants", lambda: check_invariants(conn, now))
     violations = violations or []
     findings = ([_section_failure_finding("invariants", invariants_failure)]
                 if invariants_failure is not None else [])
-    started = dt.datetime.now(dt.timezone.utc)
     findings.extend(self_audit_findings(conn, now, policy))
-    # Latency instrumentation, not a decision: `_fetch_terminal_reviews()` self-joins the
-    # append-only `dispatches` table with no supporting index, so this cost grows with the
-    # ledger's lifetime. §118 raised index-vs-log; a number in every cursor row answers it
-    # without adding write amplification to the hottest table on a guess.
-    self_audit_ms = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1000)
     by_inv: dict[str, list[dict[str, Any]]] = {}
     for v in violations:
         by_inv.setdefault(v["id"], []).append(v)
@@ -6988,6 +6997,8 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
         print(f"[dry-run] self-audit: {len(violations)} invariant violation(s){failed}, "
               f"{len(findings)} finding(s): {[f['key'] for f in findings]}")
         return
+    # Measured after the event sync below, just before the summary is built, so the tick's
+    # real cost is what lands in the cursor row that informs §118's index decision.
     now_iso = _now_iso(now)
     live_keys = {f["key"] for f in findings}
     for f in findings:
@@ -7007,6 +7018,7 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
                            (SELF_SOURCE,)).fetchall():
         if ev["external_id"] not in live_keys:
             conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
+    self_audit_ms = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1000)
     summary = {"checked_at": now_iso, "invariants": sorted(INVARIANTS),
                "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
                "self_audit_ms": self_audit_ms,

@@ -8493,6 +8493,49 @@ def test_a_pointer_at_another_tier_is_not_read_as_a_review_verdict():
         assert len(rows) == 1 and rows[0]["implement_job_id"] == "impl-wrong-tier"
 
 
+def test_a_pointer_into_another_repo_is_not_read_as_this_review():
+    """§122: the join pins the pair's whole identity. A stale pointer naming a valid
+    terminal REVIEW of a different repo must not be read as this item's verdict — that is
+    how a verdict gets attributed to the wrong item's `review-always-blocks`."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="cross-repo")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-cross-repo", "impl-cross-repo"))
+        conn.execute("UPDATE dispatches SET tier='review', repo='other-repo', status='done', "
+                     "verdict_json=? WHERE job_id=?", (json.dumps({
+                         "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                         "outcome": "actionable", "blocking": [_CODE_FINDING]}), "val-cross-repo"))
+        conn.commit()
+        assert triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(days=1)).isoformat()) == []
+        conn.execute("UPDATE dispatches SET repo='demo-repo' WHERE job_id=?", ("val-cross-repo",))
+        conn.commit()
+        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(days=1)).isoformat())
+        assert len(rows) == 1 and rows[0]["repo"] == "demo-repo"
+
+
+def test_the_window_prefilter_is_an_index_friendly_superset():
+    """§122: the pre-filter compares the raw column (keeping `idx_dispatches_created`
+    usable) and is widened by 26h; the exact instant comparison is the decision, so a row
+    the pre-filter admits outside the window must still be dropped — and one inside kept,
+    including a naive timestamp an offset-reading would have misplaced."""
+    with _triage_env() as (conn, ctx):
+        for name, age in (("inside", dt.timedelta(hours=2)), ("outside", dt.timedelta(hours=30))):
+            _seed_blocked_item(conn, external_id=f"pf-{name}")
+            conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                         (f"val-pf-{name}", f"impl-pf-{name}"))
+            conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                         ((NOW - age).isoformat(), f"impl-pf-{name}"))
+        conn.commit()
+        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(hours=24)).isoformat())
+        assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
+        # A naive stored timestamp 2h before "now" is inside a 24h window read as UTC.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ((NOW - dt.timedelta(hours=2)).replace(tzinfo=None).isoformat(), "impl-pf-inside"))
+        conn.commit()
+        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(hours=24)).isoformat())
+        assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
+
+
 def test_the_review_instant_has_one_definition():
     """§121: the sort key and the fold's placeability read the same helper, so a row cannot
     be placeable to one and unplaceable to the other."""

@@ -10,7 +10,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master` (00dc001), six LaunchAgents on the mini. **§116 and §117 are NOT on `master` — both ride PR #7**, branch `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`, waiting on the owner's Argo Merge click (`warden` is merge-approval gated, no `autoMergePaths`). The live loop therefore still runs the pre-§116 self-audit |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 386/386 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 388/388 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -315,13 +315,15 @@ loop.
   `_audit_section`, so moving them moves the seam those 248 patchers sit on —
   a behaviour-neutral refactor that nonetheless needs its own review round,
   and growing a verified PR to do it is what §66 warns against.
-- `_fetch_terminal_reviews()` self-joins `dispatches` with no supporting index
-  (§118). **Decision: measure first, index only on evidence.** The cursor
-  summary now carries `self_audit_ms`, so every hourly row is a datum; the
-  table is 379 rows and index-free today, while `dispatches` is the hottest
-  write path in the loop — an index costs write amplification there to buy
-  nothing yet. Revisit when `self_audit_ms` shows the join approaching the
-  tick's own budget.
+- `_fetch_terminal_reviews()` self-joins `dispatches` every hour (§118/§122).
+  **The index existed; the query shape disabled it.** `idx_dispatches_created`
+  covers `created_at`, but wrapping it in `datetime(...)` forced a full scan. The
+  pre-filter now compares the raw column (widened 26h to stay a superset of the
+  window, with the exact instant comparison in Python) and `EXPLAIN QUERY PLAN`
+  reports `SEARCH d USING INDEX idx_dispatches_created`. No new index, no write
+  amplification. `self_audit_ms` in the cursor summary covers the whole tick —
+  invariants, the five sections and the event sync — so the number that would
+  justify more work is the tick's real cost.
 - `warden.py` still carries its own `_secrets_run_path` copy (left out of the
   §66 consolidation because the `close` verb landed in the same file at the
   same time).

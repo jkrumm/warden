@@ -9741,7 +9741,28 @@ Also: `_review_instant()` is the single definition the sort key and the placeabi
 (two independent `_parse_ts()` calls could drift silently), and `distinct` → `sorted_keys` in
 `_unusable_verdict_findings()`, which sorts dict keys and never deduplicated anything.
 
-**Verified.** `tests/test_triage.py` at **386/386** (354 before, +32); all 21 test files green. Live-ledger replay unchanged at 39 judged items (the two mis-joined rows are outside the window).
+**Twenty-seventh round.** One blocker and two discussions closed by measurement rather than
+argument. The blocker: the join was pinned on `r.tier='review'` but not `r.repo = d.repo`, so a
+stale pointer naming a terminal *review of another repo* would still be attributed to this item.
+No such pair exists in the live ledger today (measured: 0), but round 26 proved the class is real,
+so the pair's whole identity is now pinned and a test flips the pointer's repo both ways.
+
+The first discussion was right about the shape and wrong about the fix I had reasoned toward hours
+earlier: `idx_dispatches_created` **does** exist, and my `datetime(d.created_at) >= datetime(?)`
+was what disabled it. The pre-filter now compares the raw column, widened by 26h so it stays a
+provable superset for any real UTC offset, with the exact instant comparison still in Python (so
+the round-21/22/23 rules are untouched). `EXPLAIN QUERY PLAN` reports `SEARCH d USING INDEX
+idx_dispatches_created (created_at>?)`, the live-ledger row count with a 30-day window is 63 (the
+two mis-joined investigate pairs are gone), and no index was added. The second discussion: the
+timing now spans the whole tick — `started` before the invariant check, computed after the event
+sync — so `self_audit_ms` measures the cost that would justify further work instead of the section
+queries alone. Also moved: the finding-shape rule to `_sideclaw.is_review_finding()`, next to the
+schema constants and its `assert_*` siblings, verified against the producer's own Zod `FINDING`
+(`server/jobs/handlers/review.ts`: required `file`/`message`, optional `line`/`angle` — the reader
+is deliberately stricter on blank strings because a finding warden cannot name is one it cannot
+report); and the fold's nested ternary into `_carry_forward_code_blocked()`.
+
+**Verified.** `tests/test_triage.py` at **388/388** (354 before, +34); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean

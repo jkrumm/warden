@@ -68,6 +68,23 @@ REVIEW_OUTCOMES: tuple[str, ...] = ("clean", "actionable", "needs-human")
 TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(TERMINAL))
 
 
+def is_review_finding(entry: Any) -> bool:
+    """True when `entry` is one published review finding.
+
+    Mirrors `server/jobs/handlers/review.ts`'s `FINDING` (schema version
+    `REVIEW_SCHEMA_VERSION`): `file` and `message` are required strings, `line` and
+    `angle` are optional for a consumer that only quotes what it is given. This lives
+    beside the schema constants because it is part of the same published contract
+    `assert_result_schema()` refuses on — a reader must not invent its own idea of the
+    shape. It is stricter than the producer in one direction on purpose: a blank
+    `file`/`message` is rejected, because a finding warden cannot name is one it cannot
+    report (DESIGN.md §115), so a stored payload carrying one is unusable rather than a
+    quote with a hole in it."""
+    return (isinstance(entry, dict)
+            and isinstance(entry.get("file"), str) and bool(entry["file"].strip())
+            and isinstance(entry.get("message"), str) and bool(entry["message"].strip()))
+
+
 def _base() -> str:
     return os.environ.get("WARDEN_SIDECLAW_BASE", _DEFAULT_BASE)
 
