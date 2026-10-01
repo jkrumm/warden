@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, Protocol, TypeVar, cast
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Protocol, TypedDict, TypeVar, cast
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
@@ -6052,8 +6052,45 @@ def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
     return ReviewRows(terminal=terminal, mismatched=mismatched)
 
 
+class ReviewRow(TypedDict):
+    """The fold's input contract — and the one place the SQL projection is tied to its readers.
+
+    A `TypedDict`, not a bracket-access `Protocol`: a Protocol that declares only
+    `__getitem__(key: str) -> Any` accepts any mapping, so a renamed or dropped SQL alias
+    type-checks and only fails wherever it is first read. (That is not hypothetical: the alias
+    for the implement job's time was read as the review's for a round.) Every row reaching the
+    fold passes through `_review_fold_rows()`, which validates this key set against what the
+    query actually returned and names the missing column, so the failure is at the boundary and
+    says what it is.
+
+    `created_at` is the REVIEW's own time — the fold's order key; `implement_created_at` is the
+    implement job's — the window key, which decides whether the row could be placed in the
+    window at all. `mismatch_reason` is derived, not stored: it is set only on the synthetic
+    rows `_review_fold_rows()` builds for a pointer that does not resolve to this item's review,
+    and it is a key of its own rather than a value written into `review_status`, which is a
+    terminal-status enum everywhere else.
+    """
+    repo: str
+    event_id: int | None
+    implement_job_id: str
+    implement_created_at: str
+    verdict_json: str | None
+    review_status: str | None
+    created_at: str
+    id: int | None
+    mismatch_reason: str | None
+
+
+# The column aliases `_fetch_review_rows()` projects. Named once because two readers depend on
+# them: the runtime check in `_review_fold_rows()`, and the test that asserts the projection
+# still supplies them.
+REVIEW_QUERY_COLUMNS = ("repo", "event_id", "implement_job_id", "implement_created_at",
+                        "pointer", "target_job", "target_tier", "target_repo",
+                        "target_event_id", "verdict_json", "review_status", "created_at", "id")
+
+
 def _review_fold_rows(rows: Iterable[sqlite3.Row],
-                      mismatched: Iterable[tuple[sqlite3.Row, str]]) -> list[_ReviewRow]:
+                      mismatched: Iterable[tuple[sqlite3.Row, str]]) -> list[ReviewRow]:
     """The fold's input: this item's terminal reviews, plus one row per mismatched pointer
     with its verdict blanked, so §128's exclusion does not become §129's disappearance.
 
@@ -6065,32 +6102,43 @@ def _review_fold_rows(rows: Iterable[sqlite3.Row],
     shrinks and the stale pointer that caused it is never mentioned.
 
     A mismatched row is ordered by the IMPLEMENT job's time: it has no review, so it has no
-    review time, and borrowing the target's would order this item by another item's clock."""
-    fold_rows = [dict(r) for r in rows]
-    fold_rows += [{**dict(r), "verdict_json": None, "review_status": reason,
-                   "created_at": r["implement_created_at"], "id": None}
-                  for r, reason in mismatched]
-    # The dicts satisfy `_ReviewRow` structurally (bracket access); the cast is what says so
-    # to a checker, since a plain `dict` is not also a `sqlite3.Row`.
-    return cast(list[_ReviewRow], fold_rows)
+    review time, and borrowing the target's would order this item by another item's clock. Its
+    `review_status` stays whatever the target actually holds (None when there is no target):
+    the reason travels in `mismatch_reason`, so a reader never finds a sentence where every
+    other row has a status."""
+    mismatched = list(mismatched)
+    for r in list(rows) + [r for r, _ in mismatched]:
+        missing = [c for c in REVIEW_QUERY_COLUMNS if c not in r.keys()]
+        if missing:
+            raise RuntimeError(
+                f"_fetch_review_rows() did not project {missing} — the fold reads a row by "
+                f"these names, and a renamed alias must fail here rather than at a reader")
+    return ([_as_review_row(r, None) for r in rows]
+            + [_as_review_row({**dict(r), "verdict_json": None, "id": None,
+                               "created_at": r["implement_created_at"]}, reason)
+               for r, reason in mismatched])
 
 
-class _ReviewRow(Protocol):
-    """The bracket-access shape shared by sqlite3.Row and the fold's plain-dict tests.
+def _as_review_row(row: Mapping[str, Any] | sqlite3.Row,
+                   mismatch_reason: str | None) -> ReviewRow:
+    """One row in, one `ReviewRow` out — the single conversion point into the fold's contract.
 
-    The columns the fold reads, one of which is only reachable through the query:
-    `repo`, `event_id`, `implement_job_id`, `verdict_json`, `review_status`,
-    `created_at` (the REVIEW's own time — the fold's order key) and
-    `implement_created_at` (the implement job's — the window key, which decides whether
-    the row could be placed in the window at all). A test double that omits the last one
-    is not a row this fold accepts."""
-    def __getitem__(self, key: str) -> Any: ...
+    The cast is the whole trick and it is deliberate: `sqlite3.Row` and the test doubles are
+    mappings of the projected columns, and `_review_fold_rows()` has already checked the key set
+    against `REVIEW_QUERY_COLUMNS`. What the checker cannot see is that a mapping carries those
+    keys; what it *can* see, everywhere downstream, is `ReviewRow`."""
+    return cast(ReviewRow, {**row, "mismatch_reason": mismatch_reason})
 
 
 class _ReviewedItem(NamedTuple):
-    """The latest terminal row's two independent effects on the audit."""
+    """The latest terminal row's effects on the audit.
+
+    `mismatch` carries the reason a row's pointer did not resolve to its own review, so the
+    fifth finding can name the cause and not only the item id. It rides here rather than in
+    `unusable` because it is the *why*; `unusable` stays the boolean the other findings read."""
     code_blocked: bool | None  # None: no complete review; don't dilute n >= 3.
     unusable: bool             # latest terminal row's result cannot be safely read.
+    mismatch: str | None = None  # why this row's pointer is not this item's review.
 
 
 def _carry_forward_code_blocked(verdict: dict[str, Any], readable: bool,
@@ -6108,7 +6156,7 @@ def _carry_forward_code_blocked(verdict: dict[str, Any], readable: bool,
     return None
 
 
-def _row_is_placeable(r: _ReviewRow) -> bool:
+def _row_is_placeable(r: ReviewRow) -> bool:
     """Whether this row can be POSITIONED — in the item's review sequence and in the window.
 
     Both timestamps have to parse: the review's `created_at` is the fold's order key, and
@@ -6119,7 +6167,7 @@ def _row_is_placeable(r: _ReviewRow) -> bool:
     return _review_instant(r) is not None and _parse_ts(r["implement_created_at"]) is not None
 
 
-def _review_instant(r: _ReviewRow) -> dt.datetime | None:
+def _review_instant(r: ReviewRow) -> dt.datetime | None:
     """The review's timestamp as an instant, or None when it cannot be placed.
 
     One definition for both readers: the sort key and the fold's placeability rule. Kept
@@ -6129,7 +6177,7 @@ def _review_instant(r: _ReviewRow) -> dt.datetime | None:
     return _parse_ts(r["created_at"])
 
 
-def _review_order_key(r: _ReviewRow) -> tuple[dt.datetime, int, int]:
+def _review_order_key(r: ReviewRow) -> tuple[dt.datetime, int, int]:
     """Order rows by the review's INSTANT, not its text: `created_at` is stored text, and
     two rows written with different offsets would otherwise sort by representation, so an
     item's "latest" review could be an earlier one. An unplaceable row gets the earliest
@@ -6145,7 +6193,7 @@ def _review_order_key(r: _ReviewRow) -> tuple[dt.datetime, int, int]:
             0 if r["id"] is not None else 1, r["id"] or 0)
 
 
-def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _ReviewedItem]]:
+def _fold_review_status(rows: Iterable[ReviewRow]) -> dict[str, dict[ItemKey, _ReviewedItem]]:
     """The review-health fold — pure, so the latest-wins rule is testable without a
     database. It is typed by the small bracket-access protocol it reads: the query
     returns `sqlite3.Row`, the unit test passes dicts, and both satisfy this contract.
@@ -6179,7 +6227,12 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
         # only identity it has, and it is a real row this audit must not drop.
         item_key: ItemKey = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]
         verdict = _safe_json(r["verdict_json"])
-        readable = r["review_status"] == "done" and _is_completed_review(verdict)
+        # A row whose pointer does not resolve to its own review (§129) is folded exactly like
+        # an unreadable one — not readable, so `unusable` and carry-forward apply — and its
+        # reason is kept so the fifth finding can name the cause.
+        mismatch_reason = r["mismatch_reason"]
+        readable = (mismatch_reason is None and r["review_status"] == "done"
+                    and _is_completed_review(verdict))
         previous = status_by_repo.get(r["repo"], {}).get(item_key)
         code_blocked = _carry_forward_code_blocked(verdict, readable, previous)
         # A row whose timestamp will not parse cannot be PLACED against the others, so
@@ -6194,7 +6247,8 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
         unplaceable_item = (r["repo"], item_key) in unplaceable
         status_by_repo.setdefault(r["repo"], {})[item_key] = _ReviewedItem(
             code_blocked=None if unplaceable_item else code_blocked,
-            unusable=unplaceable_item or not readable)
+            unusable=unplaceable_item or not readable,
+            mismatch=mismatch_reason)
     return status_by_repo
 
 
@@ -6211,6 +6265,10 @@ def _unusable_verdict_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Re
         # because an item key is an event id (int) or an implement job id (str).
         sorted_keys = sorted(item_keys, key=str)
         sample = ", ".join(str(k) for k in sorted_keys[:SELF_AUDIT_SAMPLE_LIMIT])
+        # The pointer mismatches this run found, so the finding says WHY the verdict is
+        # unreadable and not only which items are affected (§129).
+        reasons = sorted({s.mismatch for s in by_item.values() if s.mismatch})
+        why = ("; pointer mismatches: " + "; ".join(reasons[:SELF_AUDIT_SAMPLE_LIMIT])) if reasons else ""
         remainder = len(sorted_keys) - min(len(sorted_keys), SELF_AUDIT_SAMPLE_LIMIT)
         suffix = f" (+{remainder} more)" if remainder else ""
         findings.append({
@@ -6222,8 +6280,8 @@ def _unusable_verdict_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Re
                       f"published schema, outcome and finding shape, or is a row whose "
                       f"validation_job_id does not resolve to this item's own review (a stale pointer "
                       f"— §129: reported here, never dropped, or the item would vanish from "
-                      f"review-always-blocks' denominator); item IDs: {sample}{suffix}. The self-audit "
-                      f"cannot read any of them as a pass",
+                      f"review-always-blocks' denominator); item IDs: {sample}{suffix}{why}. The "
+                      f"self-audit cannot read any of them as a pass",
         })
     return findings
 

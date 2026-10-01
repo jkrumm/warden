@@ -809,6 +809,16 @@ TWO questions that must not share one mechanism:
 A pointer at this item's own review that has not finished yet is in neither list: nothing to
 read and nothing wrong.
 
+The fold's input is one `TypedDict` (`ReviewRow`), not a bracket-access `Protocol` that accepts
+any mapping: a Protocol declaring `__getitem__(key: str) -> Any` type-checks while a renamed or
+dropped SQL alias fails only wherever the row is first read (§130 — that is how the implement
+job's time was read as the review's for a round). `_review_fold_rows()` is the single conversion
+point and checks every projected column name against `REVIEW_QUERY_COLUMNS`, so a change to the
+projection fails at the boundary and names the missing column. The reason a pointer did not
+resolve travels in its own `mismatch_reason` key, never written into `review_status` — that
+column is a terminal-status enum everywhere else — and it reaches the finding, which says *why*
+the verdict is unreadable and not only which items are affected.
+
 The window's SQL pre-filter compares the raw
 `created_at` column (keeping `idx_dispatches_created` usable) and is widened to a superset;
 the exact instant comparison happens in Python.

@@ -9841,7 +9841,23 @@ query costs 0.185 ms (from 0.085 ms) — the tripwire, not a manual check, is wh
 matters. New tests: a mismatched pointer is reported (proved able to fail by folding only
 `rows.terminal`), and a pointer at a *running* review is neither a verdict nor a finding.
 
-**Verified.** `tests/test_triage.py` at **395/395** (354 before, +41); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
+**Thirty-third round.** **Zero blockers** — adversary, resilience and performance all clean. Two
+improvements, both about the boundary this branch built rather than the original diff, and both
+worth taking: (1) `_ReviewRow` was a bracket-access `Protocol` — `__getitem__(key: str) -> Any`
+accepts any mapping, so a renamed or dropped SQL alias type-checked and failed only wherever the
+row was first read, which is exactly how the implement job's time was read as the review's for a
+round. It is now a `TypedDict` (`ReviewRow`), with `_review_fold_rows()` as the single conversion
+point that checks every projected column against `REVIEW_QUERY_COLUMNS` and NAMES the missing
+one. The check immediately earned itself: a test that passed raw query rows straight to the fold
+is now an error at the boundary instead of an `IndexError` inside it. (2) `_review_fold_rows()`
+wrote its free-text mismatch reason into `review_status`, a column that is a terminal-status enum
+everywhere else — it only "worked" because the fold's single check is `== "done"`, i.e. it would
+break the day anything enumerated statuses. The reason now travels in its own `mismatch_reason`
+key, and it goes one step further than the finding text did before: `_ReviewedItem` carries it, so
+`review-verdicts-unusable-<repo>` says WHY the verdict is unreadable, not only which items are
+affected.
+
+**Verified.** `tests/test_triage.py` at **396/396** (354 before, +42); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
