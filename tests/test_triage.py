@@ -9061,7 +9061,8 @@ def _seed_blocking_review(conn, *, event_id: int, suffix: str, repo: str = "demo
     blocking = blocking if blocking is not None else [
         {"file": "src/x.ts", "line": 12, "message": "the guard is gone"}]
     if verdict_json is None:
-        verdict_json = {"outcome": outcome, "blocking": blocking, "summary": "s"}
+        verdict_json = {"outcome": outcome, "blocking": blocking, "summary": "s",
+                        "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION}
     if outcome == "needs-human":
         validation_status = "needs_human"
     elif outcome == "clean" or not blocking:
@@ -9180,6 +9181,24 @@ def test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item():
             _seed_blocking_review(conn, event_id=970 + i, suffix=f"den-{970 + i}")
         _seed_blocking_review(conn, event_id=973, suffix="den-973",
                               outcome="error", blocking=[], verdict_json={"summary": "no verdict"})
+        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+
+def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
+    """§117 — a parseable-but-INCOMPLETE stored verdict (`{"outcome": "actionable"}`
+    with no `blocking` key) must not read as a clean review just because the gate on
+    `outcome` alone let it through: `(verdict.get("blocking") or [])` collapses to
+    `[]`, which would silently overwrite a code-blocked round and suppress the
+    gate-failure the audit exists to report. A review speaks only when the stored
+    payload is a COMPLETE one — sideclaw's schema version, its published `outcome`,
+    and a `blocking` list."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-a")
+            _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-b",
+                                  verdict_json={"outcome": "actionable"})
         finding = next(f for f in triage.self_audit_findings(conn, NOW)
                        if f["key"] == "review-always-blocks-demo-repo")
         assert "all 3 demo-repo PRs" in finding["title"]

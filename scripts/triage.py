@@ -5819,6 +5819,35 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
     )
 
 
+def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
+    """The step-7 findings in a review's `blocking` list that are about the DIFF:
+    §114's wrapper class removed (see `_is_process_only_finding()`), with a missing
+    or malformed list reading as "none". This is the set a revision can act on and
+    the set `review-always-blocks` counts, and ONE function decides it — the fold
+    (`poll_validation_jobs()`), the revision brief (`_revision_findings()`) and the
+    self-audit used to carry the same list comprehension with its own comment, and
+    three copies of a rule is how they drift apart."""
+    return [f for f in (blocking or []) if not _is_process_only_finding(f)]
+
+
+def _is_completed_review(verdict: dict[str, Any]) -> bool:
+    """True when a STORED review verdict is a complete one: sideclaw's published
+    schema version, an `outcome` inside its published `REVIEW_OUTCOMES`, and a
+    `blocking` list — the shape `assert_result_schema()`/`assert_outcome()` insist
+    on for a live response.
+
+    The self-audit reads stored payloads, so it re-checks the shape instead of
+    assuming it, the same way those two check a live one. A corrupt payload is `{}`
+    after `_safe_json()`; a partial one like `{"outcome": "actionable"}` has no
+    `blocking` key at all. Both would otherwise collapse to "no findings" and read
+    as a PASS — silently clearing a code-blocked round on an item nobody has
+    actually judged, which is §115's blindness in another column on the one check
+    that exists to notice a broken review gate."""
+    return (verdict.get("schemaVersion") == _sideclaw.REVIEW_SCHEMA_VERSION
+            and verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
+            and isinstance(verdict.get("blocking"), list))
+
+
 def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step 7 -> 8. Polls every STATE_VALIDATING item once against sideclaw's
@@ -5916,7 +5945,7 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # _is_process_only_finding(). It must not read as `blocked` (that is what
         # spends a revision) but it must not be dropped either, so it routes to a
         # human with the finding on the card.
-        code_blocking = [f for f in blocking if not _is_process_only_finding(f)]
+        code_blocking = _code_blocking_findings(blocking)
         process_blocking = [f for f in blocking if _is_process_only_finding(f)]
         summary = verdict.get("summary") or "no further detail"
 
@@ -6479,16 +6508,19 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     # the review's own created_at, then its row id, so each later completed review
     # overwrites the item's status: a blocking one counts it, a clean one does not.
     #
-    # Only a COMPLETED review may do either. A review that errored, ran without a
-    # usable verdict, or stored a payload this build cannot read says nothing about
-    # the item: `_safe_json()` reduces it to `{}`, whose absent `blocking` key must
-    # not read as "passed" — that is §115's blindness in another column, on the one
-    # check that exists to notice a broken review gate — and it must not join the
-    # denominator either, or it dilutes the `n >= 3` bar with items nobody has
-    # judged. The vocabulary is sideclaw's own published `REVIEW_OUTCOMES`, the set
-    # `poll_validation_jobs()` refuses a verdict outside of, so the audit and the
-    # fold agree on what a review is.
+    # Only a COMPLETED review may do either, and `_is_completed_review()` is what
+    # decides that: sideclaw's published schema version, its published `outcome`,
+    # and a `blocking` list. A review that errored, ran without a usable verdict, or
+    # stored a payload this build can neither read nor trust says nothing about the
+    # item — `_safe_json()` reduces a corrupt payload to `{}` and a partial one has
+    # no `blocking` key at all, and either collapsing to "no findings" would read as
+    # a PASS and clear a code-blocked round. That is §115's blindness in another
+    # column, on the one check that exists to notice a broken review gate. Such a row
+    # is skipped from the numerator AND the denominator (an item nobody has judged
+    # must not dilute the `n >= 3` bar) and counted, so the skip is visible in the
+    # loop's own log instead of being indistinguishable from "nothing to report".
     per_repo: dict[str, dict[int, bool]] = {}
+    unusable: dict[str, int] = {}
     for r in conn.execute(
         "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
@@ -6498,11 +6530,15 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
         (since,),
     ):
         verdict = _safe_json(r["verdict_json"])
-        if verdict.get("outcome") not in _sideclaw.REVIEW_OUTCOMES:
+        if not _is_completed_review(verdict):
+            unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
             continue
-        code_blocking = [f for f in (verdict.get("blocking") or [])
-                         if not _is_process_only_finding(f)]
-        per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(code_blocking)
+        per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(
+            _code_blocking_findings(verdict.get("blocking")))
+    for repo, skipped in sorted(unusable.items()):
+        print(f"triage: self-audit: {skipped} stored review verdict(s) in {repo} are not a "
+              f"complete review (schema version / outcome / blocking list) — skipped, "
+              f"never read as a pass")
     for repo, by_event in per_repo.items():
         n = len(by_event)
         if n >= 3 and all(by_event.values()):
@@ -6622,10 +6658,10 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
                            (item["validation_job"],)).fetchone()
         verdict = _safe_json(rev["verdict_json"] if rev else None)
         # §114: a wrapper-only round is a human's one-line edit, not a revision —
-        # see `_is_process_only_finding()`. Filtering here as well as in the
+        # see `_code_blocking_findings()`. Filtering here as well as in the
         # folding switch keeps an item parked `blocked` by an older round from
         # spending its remaining attempt on text no episode can write.
-        blocking = [f for f in (verdict.get("blocking") or []) if not _is_process_only_finding(f)]
+        blocking = _code_blocking_findings(verdict.get("blocking"))
         if not blocking:
             return None
         lines = []

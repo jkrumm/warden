@@ -9439,19 +9439,36 @@ errored or partially-serialised verdict would clear a code-blocked item — a fa
 the one check whose job is to notice a broken review gate. The `outcome` gate above is that
 finding's fix, and "an item nobody has judged is not counted" is now pinned by its own case.
 
-**Verified.** Test first, both rounds:
+**Third round.** The review on the second revision (`4f48fc15`) blocked it once more, one step
+further in: the `outcome` gate alone still let a parseable but PARTIAL stored payload through —
+`{"outcome": "actionable"}` with no `blocking` key — whose `(verdict.get("blocking") or [])`
+collapses to `[]` and reads as a clean review, again clearing a code-blocked round. The gate is
+now the whole published shape, `_is_completed_review()`: sideclaw's `schemaVersion`, its
+published `outcome`, and a `blocking` list — the same three `assert_result_schema()` /
+`assert_outcome()` insist on for a live response, applied to the stored payload because that is
+what this audit reads. A skipped row is counted and printed
+(`self-audit: N stored review verdict(s) in <repo> are not a complete review … skipped, never
+read as a pass`), so "no usable verdict" is visible in the loop's log instead of
+indistinguishable from "nothing to report". The same round asked for the wrapper-finding filter
+that had become triplicated to be extracted: `_code_blocking_findings()` now serves
+`poll_validation_jobs()`, `_revision_findings()` and this audit, so §114's rule has one home.
+
+**Verified.** Test first, all three rounds:
 `test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one` fails on the §116 code
 for the stated reason — three items, each blocked on round one and accepted on round two, fire
 the finding — and pins the positive direction (three items blocked on their LATEST round still
 fire, two of them having come back clean earlier);
 `test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item` fails on this section's
 first revision — three items blocked on round one, each then carrying an `{"outcome": "error"}`
-review, went silent — and passes with the outcome gate, also pinning that an item whose only
-review is unusable stays out of the denominator. `tests/test_triage.py` at **356/356** (354
-before, +2); all other suites unchanged. On a `VACUUM INTO` copy of the live ledger the 14-day
-window's firing set is unchanged (`research-gateway` 6 items / 6 code-blocked, in every
-reading), while the per-item status moves where it should: `weatherorb` 9 any-review-blocked → 5
-latest-review-blocked, `warden` 1 → 0 — the false positive is a live hazard, not a theory.
+review, went silent — and `test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item`
+fails on its second — the same shape with `{"outcome": "actionable"}`. Both pass with the shape
+gate, which also pins that an item whose only review is unusable stays out of the denominator.
+`tests/test_triage.py` at **357/357** (354 before, +3); all other suites unchanged. On a
+`VACUUM INTO` copy of the live ledger **0** of the window's implement→review rows fail the gate —
+it costs nothing on today's data — and the 14-day firing set is unchanged (`research-gateway` 6
+items / 6 code-blocked in every reading), while the per-item status moves where it should:
+`weatherorb` 10 any-review-blocked → 6 latest-review-blocked, `warden` 1 → 0 — the false
+positive is a live hazard, not a theory.
 
 **Landing.** §116 and §117 both ride PR #7 (branch
 `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is
