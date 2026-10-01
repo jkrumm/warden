@@ -82,12 +82,14 @@ def _envelope_notes(result: dict[str, Any]) -> tuple[list[str], list[str]]:
         return [f"no readable result envelope — warden's assert_result_schema()/assert_outcome() "
                 f"would be unverifiable ({envelope['reason']})"], []
     problems = []
-    if not envelope["versionTypeOk"]:
-        problems.append(f"schemaVersion is typed {envelope['versionTypes']}, while warden compares "
-                        f"an integer ({envelope['wardenVersion']})")
-    if not envelope["versionConstOk"]:
-        problems.append(f"schemaVersion const {envelope['versionConst']!r}, while warden pins "
-                        f"{envelope['wardenVersion']}")
+    if not envelope["versionPinned"]:
+        # A type is not a promise: the runtime compares the VALUE, so anything that admits another
+        # value — a bare `{"type": "number"}`, a `["integer", "string"]` union — lets the producer
+        # emit a version warden refuses, and the check would have called that green (§147).
+        problems.append(
+            f"schemaVersion is not pinned to {envelope['wardenVersion']} (type "
+            f"{envelope['versionTypes']}, const {envelope['versionConst']!r}, enum "
+            f"{envelope['versionEnum']}), while warden refuses every other version")
     if envelope["unknownOutcomes"]:
         problems.append(f"outcome(s) {envelope['unknownOutcomes']} outside warden's "
                         f"{envelope['wardenOutcomes']} — every review carrying one would be parked")

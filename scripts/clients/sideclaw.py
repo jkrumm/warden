@@ -433,22 +433,21 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
                 # parked per job, while a warden outcome the producer no longer emits is a branch
                 # of ours gone unreachable — reported by the caller, not refused (§143).
                 unknown_outcomes = sorted(set(envelope.outcomes) - set(REVIEW_OUTCOMES))
-                version_type_ok = bool(envelope.version_types & _NUMERIC_SCHEMA_TYPES)
-                version_const_ok = (envelope.version_const is None
-                                    or envelope.version_const == REVIEW_SCHEMA_VERSION)
+                version_pinned = _version_is_pinned(envelope.version_const, envelope.version_enum)
                 envelope_report: EnvelopeShapeComparison = {
                     "published": True,
                     "versionTypes": sorted(envelope.version_types),
                     "versionConst": envelope.version_const,
+                    "versionEnum": (list(envelope.version_enum)
+                                    if envelope.version_enum is not None else None),
+                    "versionPinned": version_pinned,
                     "outcomes": list(envelope.outcomes),
                     "wardenVersion": REVIEW_SCHEMA_VERSION,
                     "wardenOutcomes": sorted(REVIEW_OUTCOMES),
                     "unknownOutcomes": unknown_outcomes,
-                    "versionTypeOk": version_type_ok,
-                    "versionConstOk": version_const_ok,
                 }
                 entry["envelopeShape"] = envelope_report
-                if unknown_outcomes or not version_type_ok or not version_const_ok:
+                if unknown_outcomes or not version_pinned:
                     entry["ok"] = False
         out[tool] = entry
     return out
@@ -510,12 +509,12 @@ class EnvelopeShapeComparison(TypedDict):
     published: Literal[True]
     versionTypes: list[str]
     versionConst: object
+    versionEnum: list[object] | None
+    versionPinned: bool
     outcomes: list[str]
     wardenVersion: int
     wardenOutcomes: list[str]
     unknownOutcomes: list[str]
-    versionTypeOk: bool
-    versionConstOk: bool
 
 
 EnvelopeShapeReport = EnvelopeShapeUnreadable | EnvelopeShapeComparison
@@ -554,6 +553,27 @@ def _as_schema_types(value: Any) -> frozenset[str]:
     return frozenset()
 
 
+def _pins_version(value: object) -> bool:
+    """Whether one published value pins the version warden compares.
+
+    `==` alone is not enough: `True == 1` in Python, so a `const: true` would read as a pin on the
+    number 1 — the accidental-equality class this branch keeps having to remove (§147)."""
+    return not isinstance(value, bool) and value == REVIEW_SCHEMA_VERSION
+
+
+def _version_is_pinned(const: object, enum: tuple[object, ...] | None) -> bool:
+    """Whether the published `schemaVersion` schema PINS the version, not merely admits it.
+
+    A `type` says which values are POSSIBLE; only a pin says which value is promised. `{"type":
+    "number"}` admits `2`, and `{"type": ["integer", "string"]}` admits `"1"` — both are refused by
+    `assert_result_schema()`, which compares the VALUE, so a type-only rule reports success for a
+    producer that can park every review it emits. `const: 1` or a one-member `enum: [1]` is the pin
+    this reads; a multi-member enum is not one, because the producer could emit the other value."""
+    if _pins_version(const):
+        return True
+    return enum is not None and len(enum) == 1 and _pins_version(enum[0])
+
+
 class PublishedEnvelopeShape(NamedTuple):
     """What the endpoint publishes about the two result fields warden reads by VALUE.
 
@@ -566,11 +586,13 @@ class PublishedEnvelopeShape(NamedTuple):
     presence in `output.required` left a producer free to change both and have every live review
     parked with this check reporting success (§143).
 
-    `version_const` is `object` and not a string type on purpose: `const` is whatever JSON value the
-    producer wrote, and the only thing warden does with it is compare it to an int."""
+    `version_const`/`version_enum` are `object` and not a string type on purpose: a `const` and an
+    `enum` member are whatever JSON values the producer wrote, and the only thing warden does with
+    them is compare them to an int (`_pins_version()`)."""
 
     version_types: frozenset[str]
     version_const: object
+    version_enum: tuple[object, ...] | None
     outcomes: tuple[str, ...]
 
 
@@ -743,10 +765,12 @@ def _published_finding_shape(
         if not properties:
             raise _UnreadableShape(
                 "`output.properties.blocking.items` publishes no fields")
+        # `required`'s entries are checked by `_require_names()`, and `properties`' keys are JSON
+        # object keys — always strings by the time `json.loads()` is done with them — so the guard
+        # that used to sit here (`all(isinstance(name, str) for name in required + properties)`)
+        # could not fire (§146). Removed rather than kept as reassurance: a check that cannot fail
+        # reads as coverage the reader does not have.
         required = _require_names(items, "required", "`items.required`")
-        if not all(isinstance(name, str) for name in list(required) + list(properties)):
-            raise _UnreadableShape(
-                "`items.required`/`items.properties` carry non-string, non-field names")
         return PublishedFindingShape(
             frozenset(required),
             frozenset(properties),
@@ -768,13 +792,12 @@ def _published_envelope_shape(
     which is why a producer that drifts here is not a silent mis-parse but a fleet-wide parking, and
     why the check that exists to catch contract drift has to read them (§143).
 
-    `const` is read but not required: a producer that pins `1` states the version in a second place,
-    and one that omits it still promises the type. What IS required of `schemaVersion` is that some
-    published type can hold an integer, because "number or integer" is what the comparison accepts;
-    a `schemaVersion` published as a string is a producer that can emit `"1" != 1` and park every
-    review. Of `outcome` an `enum` of strings is required: `output.properties.outcome` without one
-    constrains nothing, and the runtime's membership test is the only thing that would have caught
-    an unknown value — at the point where it is too late to call it drift.
+    What is required of `schemaVersion` is a PIN, not a type: `version_const` and `version_enum`
+    are read so the caller can tell whether the producer promises exactly the version warden
+    compares, which is the only thing `assert_result_schema()` can rely on (`_version_is_pinned()`).
+    Of `outcome` an `enum` of strings is required: `output.properties.outcome` without one constrains
+    nothing, and the runtime's membership test is the only thing that would have caught an unknown
+    value — at the point where it is too late to call it drift.
 
     Every step is guarded for the reason the finding reader's are: this runs OUTSIDE
     `check_schema_versions()`'s try/except, on the operator-facing `make status` path, and the one
@@ -792,20 +815,15 @@ def _published_envelope_shape(
                 "`output.properties.outcome` publishes no `enum` of outcome names, so nothing "
                 "promises the producer stays inside warden's vocabulary while the runtime refuses "
                 "any value outside it")
+        raw_version_enum = version.get("enum")
         return PublishedEnvelopeShape(
             _as_schema_types(version.get("type")),
             version.get("const"),
+            (tuple(raw_version_enum) if isinstance(raw_version_enum, (list, tuple)) else None),
             tuple(published_enum),
         )
     except _UnreadableShape as exc:
         return UnreadableEnvelopeShape(str(exc))
-
-
-# Which JSON Schema types can carry the integer `REVIEW_SCHEMA_VERSION` the comparison accepts.
-# "number" is what the live producer publishes (`{"type": "number", "const": 1}`); "integer" is the
-# stricter spelling of the same promise, and refusing it would refuse a producer that states the
-# contract more precisely than sideclaw does today.
-_NUMERIC_SCHEMA_TYPES = frozenset({"number", "integer"})
 
 
 def classify_dispatch_outcome(status: str | None, verdict_json: str | None) -> tuple[str, str | None]:

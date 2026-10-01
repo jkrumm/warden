@@ -9082,8 +9082,12 @@ def test_the_unusable_verdict_finding_covers_a_missing_verdict_too():
 
 def test_the_terminal_statuses_constant_is_deterministically_ordered():
     """`TERMINAL` is a frozenset, so a raw `tuple()` of it varies with hash
-    randomization — a public constant must not reorder between processes."""
-    assert triage._sideclaw.TERMINAL_STATUSES == tuple(sorted(triage._sideclaw.TERMINAL))
+    randomization — a public constant must not reorder between processes.
+
+    Asserted against a LITERAL tuple, not `tuple(sorted(...))`: mirroring the production expression
+    would prove only that the constant equals itself, and a status the loop must treat as terminal
+    being dropped from the set is exactly the drift this pin is for (§147)."""
+    assert triage._sideclaw.TERMINAL_STATUSES == ("cancelled", "done", "failed", "interrupted")
     assert set(triage._sideclaw.TERMINAL_STATUSES) == set(triage._sideclaw.TERMINAL)
 
 
@@ -10179,6 +10183,18 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
     assert manual["demo-repo"]["impl-manual"].code_blocked is True
     assert manual["demo-repo"]["impl-manual"].unusable is False
 
+    # "Latest" is by TIME and the id only breaks a tie: every row above shares one `created_at`, so
+    # the cases proved the tie-break alone (see the case below, where the row that must LOSE is the
+    # one with the higher id — an id-ordered fold would answer `True`).
+    stale_blocking = _review_row(6, "impl-6-stale", complete_blocking,
+                                 created_at="2026-10-01T05:00:00", row_id=9999)
+    fresh_clean = _review_row(6, "impl-6-fresh", complete_clean,
+                              created_at="2026-10-01T07:00:00", row_id=next(seq))
+    for order in ([stale_blocking, fresh_clean], [fresh_clean, stale_blocking]):
+        folded = triage._fold_review_status(order)["demo-repo"][6]
+        assert folded.code_blocked is False, folded
+        assert folded.unusable is False, folded
+
 
 def test_a_persisted_non_object_verdict_cannot_crash_the_revision_brief():
     """§117 — the recurring loop reads a blocked item's stored review verdict to build
@@ -10369,9 +10385,10 @@ def test_the_two_self_audit_registries_have_to_agree():
         assert set(triage._self_audit_sections(conn, NOW.isoformat(), NOW, None)) == \
             declared - set(triage.SELF_AUDIT_ELSEWHERE)
         assert set(triage.SELF_AUDIT_ELSEWHERE) <= declared
-        assert triage.self_audit_findings(conn, NOW).findings == [] or not [
-            f for f in triage.self_audit_findings(conn, NOW).findings
-            if f["key"].startswith(triage.SECTION_FAILURE_PREFIX)]
+        # One call, one list: the first draft asked twice and the first half of the disjunction
+        # made the second half unreachable whenever the list was empty (§147).
+        findings = triage.self_audit_findings(conn, NOW).findings
+        assert not [f for f in findings if f["key"].startswith(triage.SECTION_FAILURE_PREFIX)]
 
         # A name declared but never built: the pipeline reports it instead of skipping it, and the
         # prefixes it owns are exempted from the sweep because it did not run.

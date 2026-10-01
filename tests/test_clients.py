@@ -674,9 +674,15 @@ def test_a_blocking_container_that_is_no_longer_an_array_fails_the_schema_check(
         assert "blocking" in shape["reason"], shape
 
 
-def test_the_warden_required_finding_fields_are_the_ones_the_live_schema_publishes():
+def test_the_warden_required_finding_fields_are_the_ones_the_stub_fixture_publishes():
     """The comparison is only meaningful if both sides name the same fields, so this pins
-    warden's side against the stub's published shape rather than against prose."""
+    warden's side against the stub's published shape rather than against prose.
+
+    It is a FIXTURE self-check and cannot catch live drift — nothing in this suite can, because
+    every schema here is the stub's. Live drift is `check_schema_versions()`'s job, run against the
+    real endpoint by `scripts/check-schema-versions.py` on every `make status` (and by hand on every
+    round of this branch). Named for what it checks now, since the old name claimed the live schema
+    was one of the two things compared here (§147)."""
     published = set(_REVIEW_SCHEMA_OUTPUT["properties"]["blocking"]["items"]["properties"])
     assert set(sideclaw.REVIEW_FINDING_REQUIRED) <= published, sideclaw.REVIEW_FINDING_REQUIRED
     # And the deliberately-lenient direction is explicit: the producer requires a field warden
@@ -2090,19 +2096,27 @@ def _envelope_check(**changes: Any) -> dict[str, Any]:
         srv.stop()
 
 
-def test_a_retyped_schema_version_is_a_mismatch():
-    """§143 — the runtime compares `schemaVersion` to an integer with a strict `!=`, so a producer
-    that republishes it as a string can emit `"1"` and have `assert_result_schema()` refuse every
-    review it produces. Required-presence alone (`output.required` still lists it) reported success
-    for exactly that body."""
-    review = _envelope_check(schemaVersion={"type": "string"})
-    assert review["ok"] is False, review
-    envelope = review["envelopeShape"]
-    assert envelope["published"] is True and envelope["versionTypeOk"] is False, envelope
-    # …and the live producer's own `{"type": "number", "const": 1}` is fine, because an integer is
-    # what the comparison accepts.
+def test_a_schema_version_the_producer_can_move_is_a_mismatch():
+    """§143/§147 — the runtime compares `schemaVersion` to an integer with a strict `!=`, so it is
+    the VALUE that has to be promised, not the type. Required-presence alone reported success for a
+    string; a type that merely ADMITS the version reports success for `{"type": "number"}` (the
+    producer could emit `2`) and for a `["integer", "string"]` union (it could emit `"1"`) — both of
+    which `assert_result_schema()` refuses, per review, while this check said the contract held."""
+    for movable in ({"type": "string"},
+                    {"type": "number"},
+                    {"type": ["integer", "string"]},
+                    {"type": "integer", "enum": [1, 2]}):
+        review = _envelope_check(schemaVersion=movable)
+        assert review["ok"] is False, (movable, review)
+        envelope = review["envelopeShape"]
+        assert envelope["published"] is True and envelope["versionPinned"] is False, (movable, envelope)
+    # The live producer's own `{"type": "number", "const": 1}` pins it, and so does the strict
+    # spelling; a pin wins over a permissive type list, because the only legal value left is the
+    # one warden compares.
     assert _envelope_check()["ok"] is True
     assert _envelope_check(schemaVersion={"type": "integer", "const": 1})["ok"] is True
+    assert _envelope_check(schemaVersion={"type": ["integer", "string"], "const": 1})["ok"] is True
+    assert _envelope_check(schemaVersion={"type": "number", "enum": [1]})["ok"] is True
 
 
 def test_a_version_const_that_moved_is_a_mismatch():
@@ -2110,7 +2124,18 @@ def test_a_version_const_that_moved_is_a_mismatch():
     disagrees with the pinned number, one of the two is about to move under warden."""
     review = _envelope_check(schemaVersion={"type": "number", "const": 2})
     assert review["ok"] is False, review
-    assert review["envelopeShape"]["versionConstOk"] is False, review["envelopeShape"]
+    envelope = review["envelopeShape"]
+    assert envelope["versionPinned"] is False, envelope
+    assert envelope["versionConst"] == 2, envelope
+
+
+def test_a_boolean_const_does_not_pin_the_version():
+    """§147 — `True == 1` in Python, so a `const: true` compared with `==` alone reads as a pin on
+    the number 1. It is not one: warden compares the value it receives, and `true` is not `1` to
+    anything that reads the JSON. The accidental-equality class this branch keeps removing."""
+    review = _envelope_check(schemaVersion={"type": "boolean", "const": True})
+    assert review["ok"] is False, review
+    assert review["envelopeShape"]["versionPinned"] is False, review["envelopeShape"]
 
 
 def test_an_outcome_outside_wardens_vocabulary_is_a_mismatch():
@@ -2161,9 +2186,11 @@ def test_a_required_list_carrying_a_non_string_name_is_unreadable():
     finally:
         srv.stop()
     assert review["ok"] is False, review
-    envelope = review["findingShape"]
-    assert envelope["published"] is False, envelope
-    assert "`output.required` carries non-string" in envelope["reason"], envelope["reason"]
+    # The finding-shape report, not the envelope's: the name said `envelope` and the assertion
+    # below reads `findingShape` (§147).
+    finding_shape = review["findingShape"]
+    assert finding_shape["published"] is False, finding_shape
+    assert "`output.required` carries non-string" in finding_shape["reason"], finding_shape["reason"]
 
     # …and the item level, independently.
     output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
@@ -2191,7 +2218,7 @@ def test_the_operator_notes_name_both_tolerated_differences():
     # rendered as a suffix the ✓ branch would print.
     refused = _envelope_check(schemaVersion={"type": "string"})
     problems, tolerated = script._envelope_notes(refused)
-    assert len(problems) == 1 and "schemaVersion is typed ['string']" in problems[0], problems
+    assert len(problems) == 1 and "schemaVersion is not pinned to 1" in problems[0], problems
     assert tolerated == [], tolerated
 
 

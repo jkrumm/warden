@@ -5917,16 +5917,32 @@ def _schema_version_of(verdict: Any) -> int | None:
     return version
 
 
+def _review_contract_problems(verdict: Any) -> list[str]:
+    """Why a NEW review result breaks sideclaw's current producer contract, or `[]`.
+
+    ONE evaluation, read by both the gate and the refusal note. They used to ask the same
+    question twice — `_review_contract_matches()` ran `_review_verdict_problems(...,
+    require_blocking=True)` and the caller then ran it AGAIN to build the note — which is two
+    copies of a rule set that has to agree, for the same payload, in the same tick (§147).
+
+    The version is the one part of the contract with no shape to describe, so it contributes its
+    own problem line; a result that is both mistyped and mis-versioned reports both, in that
+    order, exactly as the note did before."""
+    # A new result must publish `blocking` whatever its outcome (§138): see the flag's own
+    # note — this is the one reader whose verdict can send code to a merge.
+    problems = _review_verdict_problems(verdict, require_blocking=True)
+    version = _schema_version_of(verdict)
+    if version != _sideclaw.REVIEW_SCHEMA_VERSION:
+        problems.append(f"schemaVersion {version!r} is not {_sideclaw.REVIEW_SCHEMA_VERSION}")
+    return problems
+
+
 def _review_contract_matches(verdict: Any) -> bool:
     """Current sideclaw producer contract for a new result: exact schema version plus
     the shared published review shape. `_is_completed_review()` uses the same rule set
     (`_review_verdict_problems()`) but accepts an older stored schema version the code can
-    still parse."""
-    # A new result must publish `blocking` whatever its outcome (§138): see the flag's own
-    # note — this is the one reader whose verdict can send code to a merge.
-    if _review_verdict_problems(verdict, require_blocking=True):
-        return False
-    return _schema_version_of(verdict) == _sideclaw.REVIEW_SCHEMA_VERSION
+    still parse, and `_review_contract_problems()` is the same rule set as a list of reasons."""
+    return not _review_contract_problems(verdict)
 
 
 def _is_completed_review(verdict: Any) -> bool:
@@ -6525,16 +6541,13 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _park_item(conn, item, now, policy, state=STATE_NEEDS_HUMAN, note=str(e),
                        validation_status="needs_human")
             continue
-        # `_review_contract_matches()` IS the gate (no inline reimplementation of the
-        # contract); the refusal note is built from the same rule set it decided with.
-        if not _review_contract_matches(verdict):
-            # The same rule set the gate decided with, flag included: a note built from a
-            # narrower reading would say "unknown mismatch" about the payload it just refused.
-            problems = _review_verdict_problems(verdict, require_blocking=True)
-            version = _schema_version_of(verdict)
-            if version != _sideclaw.REVIEW_SCHEMA_VERSION:
-                problems.append(
-                    f"schemaVersion {version!r} is not {_sideclaw.REVIEW_SCHEMA_VERSION}")
+        # The gate IS the contract (no inline reimplementation), and the note is built from the
+        # SAME list it decided with rather than a second evaluation of the same rules: one payload,
+        # one reading, and no way for the refusal to describe a rule the gate never applied (§147).
+        problems = _review_contract_problems(verdict)
+        if problems:
+            # Flag included: a note built from a narrower reading would say "unknown mismatch"
+            # about the payload it just refused.
             detail = "; ".join(problems) or "unknown mismatch"
             _park_item(conn, item, now, policy, state=STATE_NEEDS_HUMAN,
                        validation_status="needs_human", note=(

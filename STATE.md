@@ -311,12 +311,25 @@ loop.
   `_ReviewedItem`, the fold and the five-section pipeline, ~560 added lines — has narrow enough
   dependencies (`conn`, `_parse_ts`, `_safe_json`, `_sideclaw`, `INVARIANTS`/`check_invariants`,
   the `STATE_*` constants) to extract into `scripts/self_audit.py` exposing `run_self_audit()`.
-  (2) The ~110-line JSON-Schema-shape walker (`_as_object`, `_published_finding_shape`,
-  `PublishedFindingShape`, `FindingShapeComparison`, `FindingShapeUnreadable`,
-  `UnreadableFindingShape`) is used only by `scripts/check-schema-versions.py` but is pulled in by
-  every importer of `clients.sideclaw`; it belongs beside its one consumer. Both are worth doing
-  as their own PR with the import paths settled first — not as the last act of a 46-commit
-  branch whose tests all pass.
+  (2) The JSON-Schema-shape walker (`_as_object`, `_require_object`, `_require_names`,
+  `_require_type_keyword`, `_require_output_promise`, `_published_finding_shape`,
+  `_published_envelope_shape`, `_pins_version`/`_version_is_pinned`, and the six shape types) is
+  used only by `scripts/check-schema-versions.py` but is pulled in by every importer of
+  `clients.sideclaw`; it belongs beside its one consumer (`clients/schema_introspection.py`, per the
+  review's own suggestion). §143 and §147 grew it to ~480 lines from ~110, which is the argument for
+  the move rather than against it, and still not a change to make as the last act of a branch whose
+  tests all pass.
+  (3) The self-audit registry is three structures that must agree at runtime —
+  `SELF_AUDIT_SECTIONS` (names and the finding-key prefixes each owns), `_self_audit_sections()`
+  (the callables) and `SELF_AUDIT_ELSEWHERE` (the declared names run outside the map) — held together
+  by the two-direction cross-check §141 added. Collapsing them into one ordered mapping of name →
+  `(prefixes, Optional[Callable])` would make the drift unrepresentable instead of runtime-detected,
+  but it also removes `SELF_AUDIT_ELSEWHERE`: `invariants` returns violations rather than findings and
+  `review-health` needs its own isolated fetch, so either fact would have to move into the mapping
+  (as a flag, or as `None` meaning "runs elsewhere"). That is a change to a correctness guard, not a
+  cleanup — the identical reasoning that made §141's guard a finding rather than a skip. Owner call,
+  deferred. Both are worth doing as their own PR with the import paths settled first — not as the
+  last act of a 47-commit branch whose tests all pass.
 
 - **A manual dispatch pair has no verifiable linkage** (§133). `dispatches.validation_job_id`
   is the only thing tying an implement row to its review, and for a pair with no

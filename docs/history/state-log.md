@@ -10045,6 +10045,53 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-ninth round.** `needs-human`: one blocker, six improvements, one test gap, three
+discussions. Architect, resilience, performance and OCR approved clean; the adversary found the gap.
+
+The blocker was the pin rule, one level in from §143's: the envelope check asked whether the published
+`schemaVersion` schema could HOLD the version warden compares. `{"type": "number"}` and
+`["integer", "string"]` both pass that question and neither promises anything — the first admits `2`,
+the second `"1"`, and `assert_result_schema()` compares the value, so a producer could satisfy the
+check and park every review. The check reads a PIN now (`const: 1` or a one-member `enum: [1]`), with
+booleans excluded because `True == 1` in Python — a `const: true` read with `==` alone is a pin on the
+number 1, which is the accidental-equality class this branch keeps removing. A pin also wins over a
+permissive type list: if the only legal value left is the one compared, the type is no longer a
+promise warden needs. The live producer publishes `{"type": "number", "const": 1}`, so the stricter
+rule is what the endpoint already serves rather than a demand it fails.
+
+The six improvements were all "more copies than the thing needs". `poll_validation_jobs()` evaluated
+the review contract twice per unreadable verdict — once to gate, once to write the note — now one
+`_review_contract_problems()` list read by both, so the note cannot describe a rule the gate never
+applied. `_published_finding_shape()` lost a guard that could not fire (the non-string check on
+`required + properties`, after `_require_names()` had checked one and `json.loads()` guarantees the
+other). The registry test asked `self_audit_findings()` twice and had a disjunct that made its second
+half unreachable whenever the first half was true. And three tests were tightened where they were
+mirroring rather than checking: `TERMINAL_STATUSES` against a literal tuple instead of the production
+`tuple(sorted(...))`; the fixture self-check named for what it checks, with the live comparison left
+where it belongs (`check_schema_versions()` against the real endpoint); and a variable that said
+`envelope` while holding a finding-shape report.
+
+The test gap was real and mine: `_fold_review_status()`'s "latest row wins" cases all stamped the
+same `created_at`, so they exercised the id tie-break, never time. The new case gives the row that
+must LOSE the higher id — an id-ordered fold answers `True` and the test fails — while the winning row
+carries the earlier id.
+
+The three discussions are architectural and all three are recorded in STATE.md's carried debt rather
+than acted on: extract the self-audit subsystem, extract the now ~480-line schema walker, and collapse
+the three self-audit registries into one ordered mapping. The last one is not a cleanup: it removes
+`SELF_AUDIT_ELSEWHERE`, which is how `invariants` (violations, not findings) and `review-health` (its
+own isolated fetch) are declared to live outside the map — a change to a correctness guard, and the
+same reasoning that made §141's cross-check a finding rather than a skip. The reviews themselves call
+all three a human timing/scope call; the branch's own rule is that a 47-commit branch does not end
+with a structural move.
+
+**Verified.** `tests/test_clients.py` 132 → **133/133** (the pin cases: a bare numeric type, a
+`["integer", "string"]` union, a two-member enum and a boolean `const` all fail; `const: 1` and
+`enum: [1]` pass and the live body is unchanged), `tests/test_triage.py` **405/405** with the fold's
+new time-ordering case, every suite green; live-ledger replay unchanged at 39 judged items; drift
+check green against the running sideclaw — the endpoint whose `const: 1` is what the stricter rule
+reads.
+
 **Forty-eighth round.** `needs-human`: one blocker, two improvements, no discussions. Architect,
 resilience and performance approved clean; the adversary found the gap, and it was real.
 

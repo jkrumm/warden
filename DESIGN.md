@@ -922,6 +922,31 @@ the integer the comparison wants, and a published `const` has to agree with it; 
 publish an `enum` of strings, because without one nothing constrains it and the runtime's membership
 test is the only thing that would have noticed.
 
+A version is promised by a pin, not by a type (§147). §143's envelope check asked whether the
+published `schemaVersion` schema could hold the integer the runtime compares — `{"type": "number"}`
+passed, and so did `["integer", "string"]`, because both admit the value. Neither PROMISES it: the
+first lets the producer emit `2`, the second `"1"`, and `assert_result_schema()` compares the value
+with a strict `!=`, so both park every review while the drift check reports the contract held. What
+the check reads now is a pin: `const: 1`, or a one-member `enum: [1]`. A multi-member enum is not one
+(the producer could emit the other value), and the comparison is `_pins_version()`, which excludes
+booleans on purpose — `True == 1` in Python, so a `const: true` read with `==` alone would be a pin
+on the number 1, which is the accidental-equality class this branch keeps removing. A pin also wins
+over a permissive `type` list: if the only legal value left is the one warden compares, the type no
+longer matters.
+
+A rule set is evaluated once and read by everything that reports it (§148). `poll_validation_jobs()`
+asked the same question twice — `_review_contract_matches()` ran `_review_verdict_problems(...,
+require_blocking=True)` and the caller then ran it AGAIN to build the refusal note — which is two
+copies of one contract that have to agree, for the same payload, in the same tick. The rule set is
+`_review_contract_problems()` now, returning the reasons, and the gate is `not` that list, so the
+note cannot describe a rule the gate never applied. The same round removed a guard that could not
+fail (`all(isinstance(name, str) for name in required + properties)` after `_require_names()` had
+already checked `required`'s entries, with `properties`' keys string by construction from
+`json.loads()`) and two tests that could not fail either — one mirroring the production expression it
+was checking (`tuple(sorted(TERMINAL))`), one comparing a constant against the fixture that serves it
+rather than against the endpoint — because a check that cannot fail reads as coverage the code does
+not have.
+
 A guarded descent is a list of steps, not seven raise sites (§145). `_published_finding_shape()` was
 ~80 lines of a linear descent with a `raise _UnreadableShape(...)` threaded through each level, so
 every step was reachable only by driving the whole reader from above and the shape of the code
