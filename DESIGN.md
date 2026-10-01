@@ -792,7 +792,10 @@ The self-audit adds five findings about the loop's own answers:
 `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>` (a terminal review row
 without a usable result; cannot count as a pass), `liveness-never-confirms-<repo>`,
 `fixed-reopened-<event>` (a verdict or fix proven wrong), and
-`revisions-exhausted-<event>`. Enforced elsewhere, by name: the fail-closed
+`revisions-exhausted-<event>`. Each section that produces them runs through
+`_audit_section()`, so a section that raises reports `self-audit-section-failed-<name>`
+instead of taking the other four down with it for that hour. Enforced elsewhere, by name:
+the fail-closed
 executor gate (`EXECUTOR_REPOS` in `merge.py`, §99/§107 — `NEVER_AUTO_MERGE`
 itself was withdrawn in §107), GitHub's rules as the only review gate (§97),
 `OWNER_AUTHORIZERS = ("owner:argo",)` (§96).

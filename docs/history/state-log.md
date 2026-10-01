@@ -9607,7 +9607,26 @@ the old text described a payload that does not exist for the first case. And
 `REVIEW_TERMINAL_STATUSES` is `tuple(sorted(TERMINAL))`: `TERMINAL` is a frozenset, so the previous
 `tuple(...)` reordered with hash randomization from process to process.
 
-**Verified.** `tests/test_triage.py` at **373/373** (354 before, +19); all 21 test files green.
+**Nineteenth round.** Zero blockers. The resilience note was the only one with real blast radius
+and is fixed: `self_audit_findings()` ran its sections in one unguarded body, so a raise in the new
+review-health query lost *every* finding for that hour — including the restore-drill signal (§104),
+the audit's only input from outside the ledger. Each section now runs through `_audit_section()`,
+which reports the failure as its own `self-audit-section-failed-<name>` finding and lets the other
+four run; the loop's own upstream guard ("self-audit failed, pass continues") was printing to
+stderr, which by DESIGN.md's own rule is not visibility. The five sections are now five named
+functions, so `self_audit_findings()` is a composition rather than a 40-line body. Two cleanups:
+the identical schema-version type guard in both gates is one `_schema_version_of()` (which also
+keeps `True` from passing as `1`), and `_fetch_terminal_reviews()`'s `ORDER BY` is gone — the fold
+sorts its own input, so the SQL only implied a contract nothing relies on.
+
+**Discussion resolved, not deferred.** The architect asked whether the switch's own `needs_human`
+and `blocked` branches should also route through `_park_item()`, and flagged the double-`sync_card`
+risk. Verified: they fall through to one shared `sync_card()` at the tail of
+`poll_validation_jobs()` that also serves the merged and needs-approval branches, so folding them
+in would render the same card twice per pass. `_park_item()` is for the early-exit branches only,
+and its docstring now says so — the seam is deliberate, not an oversight.
+
+**Verified.** `tests/test_triage.py` at **376/376** (354 before, +22); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload

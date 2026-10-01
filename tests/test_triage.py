@@ -8278,6 +8278,57 @@ def _seed_blocked_item(conn, *, external_id: str, blocking: list[Any] | None = N
     return eid
 
 
+def test_a_failing_self_audit_section_reports_itself_and_spares_the_others():
+    """§117 — the audit's sections are independent queries. One raising section must
+    not take the others down with it, and it must not be silent either: a check that
+    only reaches a `.err` file is indistinguishable from a check with nothing to say."""
+    with _triage_env() as (conn, ctx):
+        def boom(*a, **kw):
+            raise RuntimeError("verdict_json is not JSON")
+        marker = {"key": "restore-drill-marker", "title": "t", "detail": "d"}
+        original_review, original_drill = triage._review_health_findings, triage._restore_drill_findings
+        triage._review_health_findings = boom
+        triage._restore_drill_findings = lambda now: [marker]
+        try:
+            findings = triage.self_audit_findings(conn, NOW)
+        finally:
+            triage._review_health_findings = original_review
+            triage._restore_drill_findings = original_drill
+        keys = [f["key"] for f in findings]
+        assert "self-audit-section-failed-review-health" in keys, keys
+        assert "restore-drill-marker" in keys, "one bad section must not hide the others"
+        failed = next(f for f in findings if f["key"].endswith("review-health"))
+        assert "RuntimeError" in failed["title"] and "verdict_json is not JSON" in failed["detail"]
+
+
+def test_the_self_audit_sections_are_all_wired_in():
+    """Each section is reached through `_audit_section()` — a section dropped from the
+    loop would otherwise be a check nobody runs, which reads exactly like a pass."""
+    with _triage_env() as (conn, ctx):
+        seen: list[str] = []
+        original = triage._audit_section
+        triage._audit_section = lambda name, fn: (seen.append(name), fn())[1]
+        try:
+            triage.self_audit_findings(conn, NOW)
+        finally:
+            triage._audit_section = original
+        assert seen == ["review-health", "liveness", "fixed-reopened", "restore-drill",
+                        "revisions-exhausted"], seen
+
+
+def test_a_schema_version_must_be_a_real_int_for_either_gate():
+    """`isinstance(True, int)` is True, so a boolean version must read as absent —
+    otherwise `True == 1` would pass the exact-match producer gate."""
+    assert triage._schema_version_of({"schemaVersion": 1}) == 1
+    for bad in (True, False, None, "1", 1.0, [1], {}):
+        assert triage._schema_version_of({"schemaVersion": bad}) is None, bad
+    assert triage._schema_version_of({}) is None
+    assert triage._schema_version_of("not a dict") is None
+    assert not triage._review_contract_matches({"schemaVersion": True, "outcome": "clean"})
+    assert triage._review_contract_matches(
+        {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean"})
+
+
 def test_a_naive_audit_window_is_read_as_utc_not_host_local():
     """The window bound is compared as text against the ledger's aware-UTC
     timestamps. A naive bound is UTC (the ledger's own format); `astimezone()` alone

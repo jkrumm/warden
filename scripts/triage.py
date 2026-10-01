@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable, Mapping, NamedTuple, Protocol
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Protocol
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
@@ -5878,6 +5878,16 @@ def _review_verdict_shape(verdict: Any) -> tuple[bool, list[dict[str, Any]]]:
     return True, blocking
 
 
+def _schema_version_of(verdict: Any) -> int | None:
+    """The verdict's schema version as a real integer, or None when it is absent,
+    a bool (which `isinstance(…, int)` accepts), or any other type. One definition of
+    "a version number we can compare" for both gates below."""
+    version = verdict.get("schemaVersion") if isinstance(verdict, dict) else None
+    if isinstance(version, bool) or not isinstance(version, int):
+        return None
+    return version
+
+
 def _review_contract_matches(verdict: Any) -> bool:
     """Current sideclaw producer contract for a new result: exact schema version plus
     the shared published review shape. `_is_completed_review()` uses the same shape
@@ -5885,10 +5895,7 @@ def _review_contract_matches(verdict: Any) -> bool:
     usable, _ = _review_verdict_shape(verdict)
     if not usable:
         return False
-    schema_version = verdict.get("schemaVersion")
-    return (isinstance(schema_version, int)
-            and not isinstance(schema_version, bool)
-            and schema_version == _sideclaw.REVIEW_SCHEMA_VERSION)
+    return _schema_version_of(verdict) == _sideclaw.REVIEW_SCHEMA_VERSION
 
 
 def _is_completed_review(verdict: Any) -> bool:
@@ -5903,10 +5910,8 @@ def _is_completed_review(verdict: Any) -> bool:
     usable, _ = _review_verdict_shape(verdict)
     if not usable:
         return False
-    schema_version = verdict.get("schemaVersion")
-    return (isinstance(schema_version, int)
-            and not isinstance(schema_version, bool)
-            and 0 <= schema_version <= _sideclaw.REVIEW_SCHEMA_VERSION)
+    version = _schema_version_of(verdict)
+    return version is not None and 0 <= version <= _sideclaw.REVIEW_SCHEMA_VERSION
 
 
 def _is_finding_shape(finding: Any) -> bool:
@@ -5923,10 +5928,13 @@ ItemKey = int | str
 
 
 def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite3.Row]:
-    """Every implement→review pair in the window whose review reached a terminal status,
-    oldest first. `since` is normalised to the ledger's own stored format first: the
-    window bound is compared as text, and the harness passes an offset-carrying
-    `isoformat()` where the ledger holds microsecond strings."""
+    """Every implement→review pair in the window whose review reached a terminal status.
+    `since` is normalised to the ledger's own stored format first: the window bound is
+    compared as text, and the harness passes an offset-carrying `isoformat()` where the
+    ledger holds microsecond strings.
+
+    No `ORDER BY`: `_fold_review_status()` sorts its own input, and a sort here would
+    only imply an ordering contract the fold does not rely on."""
     since_dt = _parse_ts(since)
     if since_dt is None:
         raise ValueError(f"invalid self-audit window start: {since!r}")
@@ -5944,7 +5952,6 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' "
         "AND d.created_at >= ? AND r.status IN (" + placeholders + ") "
-        "ORDER BY r.created_at, r.id"
     )
     return conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
 
@@ -6063,10 +6070,16 @@ def _park_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
                policy: dict[str, Any], *, state: str, note: str,
                validation_status: str | None = None) -> None:
     """Set an item's state, record why on the dispatch row, and re-render its card —
-    the whole step-7 terminal sequence, in the one place all three of its callers reach
-    it. `validation_status` is a parameter rather than something the callers write
-    themselves because two of them used to disagree about whether to set it at all,
-    and a `needs_human` item whose row still says `validating` reads as a restart."""
+    the step-7 terminal sequence for `poll_validation_jobs()`'s EARLY-EXIT branches
+    (a failed job, an unreadable envelope, an unreadable verdict). `validation_status`
+    is a parameter rather than something the callers write themselves because two of
+    them used to disagree about whether to set it at all, and a `needs_human` item
+    whose row still says `validating` reads as a restart.
+
+    The switch's own `needs_human` and `blocked` branches deliberately do NOT call
+    this: they fall through to one shared `sync_card()` at the tail of the function,
+    which also serves the merged and needs-approval branches. Folding them in here
+    would render the same card twice for one pass."""
     if validation_status is not None:
         conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
                      (validation_status, item["implement_job"]))
@@ -6712,15 +6725,9 @@ def _revision_exhaustion_detail(state: str, note: str | None, repo: str, *,
             f"recorded{' — ' + text if text else ''}; read the park note before blaming the review")
 
 
-def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
-                        policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Gaps the loop can see in its own behaviour, each keyed so one finding
-    is one event: a review gate that blocks every PR in a repo, a liveness
-    probe that never confirms, a `fixed` that reopened (the verdict or the
-    fix was wrong), and a revision budget used up."""
-    since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
+def _liveness_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
+    """One finding per repo whose liveness probe kept timing out and never confirmed."""
     out: list[dict[str, Any]] = []
-    out.extend(_review_health_findings(conn, since))
     for r in conn.execute(
         "SELECT ti.repo, SUM(t.to_state='new') AS reopened, SUM(t.to_state='fixed') AS fixed "
         "FROM item_transitions t JOIN triage_items ti ON ti.event_id = t.event_id "
@@ -6732,6 +6739,12 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
             out.append({"key": f"liveness-never-confirms-{r['repo']}",
                         "title": f"{r['repo']}'s liveness probe timed out {r['reopened']}× and never confirmed a fix",
                         "detail": "the probe may be checking the wrong thing, or the deploy never lands"})
+    return out
+
+
+def _fixed_reopened_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
+    """One finding per item that came back after warden marked it fixed."""
+    out: list[dict[str, Any]] = []
     for r in conn.execute(
         "SELECT DISTINCT t.event_id, ti.signature, ti.repo FROM item_transitions t "
         "JOIN triage_items ti ON ti.event_id = t.event_id JOIN events e ON e.id = t.event_id "
@@ -6740,7 +6753,13 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
         out.append({"key": f"fixed-reopened-{r['event_id']}",
                     "title": f"{r['signature']} came back after warden marked it fixed",
                     "detail": f"the verdict or the fix in {r['repo']} was wrong — event {r['event_id']}"})
-    out.extend(_restore_drill_findings(now))
+    return out
+
+
+def _revisions_exhausted_findings(conn: sqlite3.Connection, policy: dict[str, Any] | None
+                                  ) -> list[dict[str, Any]]:
+    """One finding per item still parked after spending its whole revision budget."""
+    out: list[dict[str, Any]] = []
     max_rev = int((policy or {}).get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
     for r in conn.execute(
         f"SELECT ti.event_id, ti.signature, ti.repo, ti.state, ti.note FROM triage_items ti "
@@ -6752,6 +6771,47 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
                     "title": f"{r['signature']} still blocked after {max_rev} revisions",
                     "detail": _revision_exhaustion_detail(r["state"], r["note"], r["repo"],
                                                           conn=conn, event_id=r["event_id"])})
+    return out
+
+
+def _audit_section(name: str, section: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Run one self-audit section so its failure cannot hide the others.
+
+    The sections are independent queries over one ledger, and without this a single
+    raising section loses every other finding for that hour — including the
+    restore-drill signal (§104), the audit's only input from outside the ledger. The
+    failure becomes a finding of its own: a broken check that only reaches a `.err`
+    file is indistinguishable from a check that had nothing to report, which is the
+    invisibility DESIGN.md's "deferral must be visible" forbids."""
+    try:
+        return section()
+    except Exception as e:  # noqa: BLE001 — isolation is the point, not suppression
+        print(f"triage: self-audit section '{name}' failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return [{"key": f"self-audit-section-failed-{name}",
+                 "title": f"the self-audit's {name} check raised {type(e).__name__}",
+                 "detail": f"{e} — its findings are missing from this pass, so anything it would "
+                           f"have reported stays unseen until the cause is fixed"}]
+
+
+def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
+                        policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Gaps the loop can see in its own behaviour, each keyed so one finding
+    is one event: a review gate that blocks every PR in a repo, a liveness
+    probe that never confirms, a `fixed` that reopened (the verdict or the
+    fix was wrong), and a revision budget used up.
+
+    Each section is isolated, so a section that raises reports itself instead of
+    taking the other four down with it."""
+    since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
+    out: list[dict[str, Any]] = []
+    for name, section in (
+        ("review-health", lambda: _review_health_findings(conn, since)),
+        ("liveness", lambda: _liveness_findings(conn, since)),
+        ("fixed-reopened", lambda: _fixed_reopened_findings(conn, since)),
+        ("restore-drill", lambda: _restore_drill_findings(now)),
+        ("revisions-exhausted", lambda: _revisions_exhausted_findings(conn, policy)),
+    ):
+        out.extend(_audit_section(name, section))
     return out
 
 
