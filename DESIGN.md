@@ -906,6 +906,18 @@ byte-identical would leave every field name and both containers green, and have 
 review parked as unusable with nothing saying why. A conditional requirement (`if`/`then`) cannot
 be read as a plain promise and is refused rather than assumed.
 
+A registry and the map it dispatches to are one structure or they drift (§141). `self_audit_findings()`
+kept `SELF_AUDIT_SECTIONS` (name → the finding-key prefixes it owns) beside a local map of the same
+names to their callables, and dispatched over their INTERSECTION: a section declared in the table
+with no callable was skipped without a word. That is §132's failure arriving without an exception to
+report — the section stops running, its silence reads as "nothing to report", and the resolve sweep
+closes the very alerts it stopped checking. Both directions are findings now: a declared name with no
+section, and a section with no declaration (whose key prefixes nobody has listed, so the sweep cannot
+protect them). The map moved into `_self_audit_sections()` so that "which sections exist" is
+observable, and the test compares it against the registry — the old check compared the table against
+a hardcoded literal set, which cannot see the map at all. `SELF_AUDIT_ELSEWHERE` names the two
+declared sections that legitimately live outside the map, with the reason each does.
+
 The promise covers every name the runtime READS OFF A RESULT, not only `blocking` (§140).
 `assert_result_schema()` reads `schemaVersion`, `assert_outcome()` reads `outcome`, and
 `_review_verdict_problems()` reads `blocking` — each fails CLOSED on a result missing its name. The

@@ -7175,6 +7175,32 @@ SELF_AUDIT_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+# The declared names whose sections are NOT in the pipeline's own map, and why (§141).
+# `invariants` returns violations rather than findings, and `run_self_audit()` runs it beside the
+# pipeline; `review-health`'s section is added by the pipeline itself once its fetch — the one step
+# that can fail as a unit — has succeeded, and its failure is reported in its place. Every OTHER
+# declared name must have a section, or the audit would skip it silently, and a section silently
+# skipped is a section whose alerts the resolve sweep then closes.
+SELF_AUDIT_ELSEWHERE = ("invariants", "review-health")
+
+
+def _self_audit_sections(conn: sqlite3.Connection, since: str, now: dt.datetime,
+                         policy: dict[str, Any] | None
+                         ) -> dict[str, Callable[[], list[dict[str, Any]]]]:
+    """The finding-producing sections keyed by their `SELF_AUDIT_SECTIONS` names.
+
+    A function rather than a literal inside the pipeline so that "which sections exist" is
+    observable: the registry and this map are two structures that have to agree, and the test that
+    says so can only compare them if both are reachable (§141). `review-health` is absent here on
+    purpose — it needs the rows its own isolated fetch produced."""
+    return {
+        "liveness": lambda: _liveness_findings(conn, since),
+        "fixed-reopened": lambda: _fixed_reopened_findings(conn, since),
+        "restore-drill": lambda: _restore_drill_findings(now),
+        "revisions-exhausted": lambda: _revisions_exhausted_findings(conn, policy),
+    }
+
+
 def _unrechecked_prefixes(failed_sections: Iterable[str]) -> tuple[str, ...]:
     """The finding-key prefixes whose owning section did NOT run, so their events must survive.
 
@@ -7266,12 +7292,7 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     # section cannot be added here without declaring the finding keys it owns, which is what the
     # event sync needs to know whose silence may resolve an alert (§132). `invariants` is not in
     # this map — it returns violations rather than findings, and `run_self_audit()` runs it.
-    sections: dict[str, Callable[[], list[dict[str, Any]]]] = {
-        "liveness": lambda: _liveness_findings(conn, since),
-        "fixed-reopened": lambda: _fixed_reopened_findings(conn, since),
-        "restore-drill": lambda: _restore_drill_findings(now),
-        "revisions-exhausted": lambda: _revisions_exhausted_findings(conn, policy),
-    }
+    sections = _self_audit_sections(conn, since, now, policy)
     # Review health's fetch runs here, inside the same isolation, because it is the one step
     # that can fail as a unit: a failed query reports `self-audit-section-failed-review-health`
     # and the other four still run. The section itself then takes the rows, so a number the
@@ -7283,9 +7304,28 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
         out.append(_section_failure_finding("review-health", review_health_failure))
     elif review_rows is not None:
         sections["review-health"] = lambda: _review_health_findings(review_rows)
+    # Both registries are walked, in the table's order, and a name in one without a counterpart in
+    # the other is a FAILURE rather than a skip (§141). This used to be `if name in sections`,
+    # which silently dropped a section that was declared but had no callable: it stopped running,
+    # its silence read as "nothing to report", and the resolve sweep then closed the very alerts it
+    # had stopped checking — §132's failure, arriving without an exception to report. `review-health`
+    # names in `SELF_AUDIT_ELSEWHERE` are the ones that can legitimately be absent here:
+    # `review-health`, whose fetch has already reported its own failure above, and `invariants`,
+    # which `run_self_audit()` runs beside this pipeline.
+    declared = {name for name, _keys in SELF_AUDIT_SECTIONS}
     for name, _keys in SELF_AUDIT_SECTIONS:
         if name in sections:
             out.extend(_audit_section(name, sections[name]))
+        elif name not in SELF_AUDIT_ELSEWHERE:
+            out.append(_section_failure_finding(
+                name, KeyError(f"`{name}` is declared in SELF_AUDIT_SECTIONS and "
+                               "self_audit_findings() builds no section for it")))
+    # …and the other direction: a section wired up here but NOT declared owns finding-key prefixes
+    # nobody has listed, so those are the events the sweep cannot protect. Also a finding.
+    for name in sorted(set(sections) - declared):
+        out.append(_section_failure_finding(
+            name, KeyError(f"`{name}` has a section in self_audit_findings() but is not declared "
+                           "in SELF_AUDIT_SECTIONS, so the keys it owns are unknown")))
     return SelfAuditFindings(
         out, None if review_rows is None else review_rows.corrupt_timestamps)
 

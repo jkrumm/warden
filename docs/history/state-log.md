@@ -10045,6 +10045,35 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-sixth round.** `needs-human`: no blockers, one improvement, no discussions. senior-dev,
+resilience, performance and OCR all approved clean — and the adversary's claimed blocker was
+rejected on the evidence rather than by argument: it held that invariant events are keyed with an
+`invariant-` prefix the exemption table does not carry, and the reviewer checked the live source
+(`triage.py:7167`, `7402`, `7435-7436`) to find `inv_id.lower()` on both sides with no such prefix
+anywhere. That is the conclusion the same class of claim got before, when an adversary located it
+in `_INVARIANT_PREFIXES` instead: both sides are `inv_id.lower()`, and there is no prefixed key to
+mismatch.
+
+The improvement was a real drift risk the previous tests could not see: the self-audit dispatched
+over the INTERSECTION of `SELF_AUDIT_SECTIONS` (name → key prefixes) and a local name → callable map,
+so a section declared in one and missing from the other was skipped silently — it stopped running,
+its silence read as "nothing to report", and the sweep resolved the alerts it had stopped checking.
+That is §132's failure with no exception to report. Both directions are findings now, and the map is
+`_self_audit_sections()`, a function, so "which sections exist" is observable and the test can
+compare it with the registry — the old `test_every_running_section_declares_the_keys_it_owns`
+compared the table against a hardcoded literal set, which cannot see the map at all.
+`SELF_AUDIT_ELSEWHERE` states why `invariants` and `review-health` legitimately live outside it.
+
+The first cut of that guard reported `invariants` as a missing section and broke fourteen tests at
+once — the right kind of failure for a guard whose whole subject is a silently skipped section, and
+it is why the exemption is a named constant instead of a special case inside the loop.
+
+**Verified.** `tests/test_triage.py` 404 → **405/405** (+1: both drift directions, each with the
+prefix-exemption consequence it has), `tests/test_clients.py` **124/124**, every suite green;
+live-ledger replay unchanged at 39 judged items; drift check green against the running sideclaw. The
+guard is proved fail-capable by reverting it: the new test then finds no failure finding at all,
+because the fabricated section is exactly as invisible as before.
+
 **Forty-fifth round.** `needs-human`: one blocker, two improvements, no discussions. Architect,
 resilience and api-contract all approved clean.
 

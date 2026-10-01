@@ -10355,6 +10355,52 @@ def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review()
         assert "review pipeline" in details[f"revisions-exhausted-{on_the_pipeline}"]
 
 
+def test_the_two_self_audit_registries_have_to_agree():
+    """§141 — the section registry and the section map were two structures kept in sync by hand,
+    and the pipeline dispatched on their INTERSECTION: a declared section with no callable was
+    skipped without a word, so it stopped running, its silence read as "nothing to report", and the
+    resolve sweep closed the very alerts it had stopped checking. Both directions are a finding
+    now, and this test is what keeps the real registries honest — the previous check compared the
+    table against a hardcoded literal set, which cannot see the map at all."""
+    with _triage_env() as (conn, ctx):
+        declared = {name for name, _keys in triage.SELF_AUDIT_SECTIONS}
+        # The two registries agree, and the only names without a section here are the ones that say
+        # why they are elsewhere.
+        assert set(triage._self_audit_sections(conn, NOW.isoformat(), NOW, None)) == \
+            declared - set(triage.SELF_AUDIT_ELSEWHERE)
+        assert set(triage.SELF_AUDIT_ELSEWHERE) <= declared
+        assert triage.self_audit_findings(conn, NOW).findings == [] or not [
+            f for f in triage.self_audit_findings(conn, NOW).findings
+            if f["key"].startswith(triage.SECTION_FAILURE_PREFIX)]
+
+        # A name declared but never built: the pipeline reports it instead of skipping it, and the
+        # prefixes it owns are exempted from the sweep because it did not run.
+        real = triage.SELF_AUDIT_SECTIONS
+        try:
+            setattr(triage, "SELF_AUDIT_SECTIONS", (*real, ("fabricated", ("fabricated-",))))
+            findings = triage.self_audit_findings(conn, NOW).findings
+            failure = [f for f in findings if f["key"] == f"{triage.SECTION_FAILURE_PREFIX}fabricated"]
+            assert failure, [f["key"] for f in findings]
+            assert "SELF_AUDIT_SECTIONS" in failure[0]["detail"], failure[0]
+            assert triage._unrechecked_prefixes(["fabricated"]) == ("fabricated-",)
+        finally:
+            triage.SELF_AUDIT_SECTIONS = real
+
+        # A section built but never declared: its key prefixes are unknown, so the sweep cannot
+        # protect them — reported, because it is a finding nobody would otherwise see.
+        try:
+            setattr(triage, "SELF_AUDIT_SECTIONS",
+                    tuple(entry for entry in real if entry[0] != "restore-drill"))
+            findings = triage.self_audit_findings(conn, NOW).findings
+            failure = [f for f in findings
+                       if f["key"] == f"{triage.SECTION_FAILURE_PREFIX}restore-drill"]
+            assert failure, [f["key"] for f in findings]
+            assert "not declared" in failure[0]["detail"], failure[0]
+            assert triage._unrechecked_prefixes(["restore-drill"]) == ()
+        finally:
+            setattr(triage, "SELF_AUDIT_SECTIONS", real)
+
+
 def test_warden_self_events_route_to_warden_by_the_real_policy():
     rules = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
     hit = triage._match_rule(["warden_self:inv-1-clock"], rules)
