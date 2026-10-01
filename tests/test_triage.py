@@ -8676,7 +8676,10 @@ def test_the_summary_counts_the_rows_admitted_for_an_unreadable_timestamp():
         _seed_blocking_review(conn, event_id=901, suffix="corrupt")
         conn.execute("UPDATE dispatches SET created_at='not-a-timestamp' WHERE job_id='impl-corrupt'")
         conn.commit()
-        assert triage._unreadable_timestamp_count(conn) == 1
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=14)).isoformat())
+        # The count is the FETCH's own, not a second query: the same rows the review health
+        # section already pulled, so the summary costs nothing extra (§131's discussion).
+        assert rows.corrupt_timestamps == 1
         triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
         summary = json.loads(conn.execute(
             "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])

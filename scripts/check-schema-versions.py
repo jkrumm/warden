@@ -60,12 +60,19 @@ def main(argv: list[str]) -> int:
                     "  review: sideclaw publishes no readable finding shape — warden's "
                     "is_review_finding() would be an unverifiable copy of it")
             elif shape:
+                # Both shortfalls are reported together: they are independent sets, and printing
+                # one of them when both are non-empty sends the operator back for a second run to
+                # learn the other — the diagnostic is the only thing this check produces.
+                missing = sorted(set(shape.get("missingFromRequired") or ())
+                                 | set(shape.get("missingFromProperties") or ()))
+                mistyped = shape.get("mistyped") or []
                 details.append(
-                    f"  review findings: sideclaw requires {shape['required']} with properties "
-                    f"{shape['properties']}; warden requires {shape['wardenRequires']}"
-                    + (f" — MISSING {shape['missingFromRequired'] or shape['missingFromProperties']}"
-                       if shape.get("missingFromRequired") or shape.get("missingFromProperties")
-                       else ""))
+                    f"  review findings: sideclaw requires {shape['required']} "
+                    f"(types {shape.get('types')}) with properties {shape['properties']}; "
+                    f"warden requires {shape['wardenRequires']}"
+                    + (f" — MISSING {missing}" if missing else "")
+                    + (f" — WRONG TYPE {mistyped} (warden reads a string)"
+                       if mistyped else ""))
         print("✗ sideclaw schemas DISAGREE with warden's pinned versions:")
         for line in details:
             print(f"  {line}")

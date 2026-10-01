@@ -831,6 +831,14 @@ MORE than the producer means rejecting real findings, so warden's required set m
 of the published one, and the tolerated direction is reported rather than hidden (the live
 producer requires `angle`; warden deliberately does not). No readable published shape is itself
 a disagreement — the alternative is an unverifiable copy, which is the drift being caught.
+The comparison covers TYPES, not only names: a producer that keeps `file` and changes it from a
+string to an array leaves every name in place, matches the version and the outcomes, and still
+makes `is_review_finding()` reject every finding it emits — the whole verdict silently
+unreadable, with this check reporting success. Since warden reads a string and nothing else, a
+published type that is not `"string"` (including a property with no readable `type` at all) is a
+disagreement, and the disagreement line names every shortfall at once: a missing required name,
+a missing property and a retyped field are independent, and an operator sent back for a second
+run to learn the second one has been handed a diagnostic that lies by omission.
 
 The self-audit adds five findings about the loop's own answers:
 `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>` (a terminal review row

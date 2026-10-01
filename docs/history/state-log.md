@@ -9947,3 +9947,49 @@ number beside it. Documented in `docs/api.md` with the reason it cannot be bound
 **Verified.** `tests/test_triage.py` at **399/399** (396 before, +3), `tests/test_clients.py`
 at **119/119** (+1), all suites green. Live-ledger replay unchanged at 39 judged items, and
 the drift check still passes against the running sideclaw.
+
+**Thirty-sixth round.** Two blockers — one in the drift check, one in the helper that feeds it —
+plus four improvements, two of which were the same defect seen from two angles.
+
+The first blocker is a gap in what the round-34 comparison actually compares. Field NAMES are not
+the contract: a producer that keeps `file` and `message` and changes either type leaves every name
+in place, matches `version`, matches `outcomes`, and still makes `is_review_finding()` reject every
+finding it emits. The version is unchanged, so every other gate stays green, and the whole verdict
+is silently unreadable — the same failure the drift check was added to prevent, one level down from
+where it was looking. It now compares types as well, and only `"string"` passes: warden reads a
+string and nothing else, so a published property with a type of `"array"` — or with no readable
+`type` at all, which is JSON Schema's "any" and not a promise warden can rely on — is a
+disagreement rather than a tolerated difference. `PublishedFindingShape` carries the types beside
+the names so both readers of the shape see the same extraction.
+
+The second blocker was mine, one round old again: `_published_finding_shape()`'s "never raises"
+contract held for the level the thirty-fifth round fixed and not for the level below it.
+`(output.get("properties") or {}).get("blocking")` raises `AttributeError` on a truthy non-dict
+`properties`, and `frozenset(required or ())` raises `TypeError` on a number while reading a bare
+string as a set of its own characters. Both are the malformed bodies the function exists to
+REPORT, and it sits outside `check_schema_versions()`'s `try/except` on the operator-facing
+`make status` path, so either one replaced the refusal with a traceback. Every level is now read
+through `_as_object()`, and `required` is a list or tuple of names or it is nothing. The reviewer's
+own example is a test case. Proving the guards fail-capable paid for itself immediately: my first
+version carried a redundant `isinstance(required, str)` branch, unreachable behind the
+list-or-tuple check, and removing the guard it claimed to be left every test green — a comment
+describing protection that was not the protection doing the work is worse than no comment, so the
+branch is gone and the comment now says what the tuple check actually catches.
+
+Of the four improvements, two were one defect: the round-35 change paid for the corrupt-timestamp
+count with a second unconditional non-sargable scan of `dispatches` on every hourly tick, and
+never counted it, because the call sat after `self_audit_ms` and `event_sync_ms` had both stopped
+their clocks — an invisible cost added to the path that exists to keep that cost visible, by the
+round that added the tripwire. The count is now the fetch's own (`ReviewRows.corrupt_timestamps`,
+from rows already in hand) and reaches the summary through a metric sink the review-health section
+fills while the tick is still being timed. Third: the disagreement line printed `missingFromRequired
+or missingFromProperties`, so when the two sets named different fields the operator saw one and
+would have to run the check again to learn the other. Both are merged, and the line now also names
+retyped fields. Fourth, cosmetic: the multi-line SQL literal in `_fetch_review_rows()` was built
+from `f`-strings with no interpolation, which reads as though substitution were happening.
+
+**Verified.** `tests/test_triage.py` at **399/399**, `tests/test_clients.py` at **120/120** (+1),
+all suites green; live-ledger replay unchanged at 39 judged items. The drift check was exercised
+against the RUNNING sideclaw (`✓ dispatch=3 review=1 (producer also requires: angle)`, exit 0) and
+against a stub serving each drift — a retyped `file`, an untyped `message`, and a shape whose two
+shortfall sets differ — with the pre-fix printer shown printing only one of them.

@@ -553,9 +553,79 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     assert sideclaw._published_finding_shape({"output": 7}) is None
     assert sideclaw._published_finding_shape({"output": None}) is None
     assert sideclaw._published_finding_shape({}) is None
-    # …and the same shape read from a well-formed body still works.
-    required, published = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
-    assert required == frozenset({"file", "message", "angle"}) and "message" in published
+    # One level down, the same case the first guard covers: `properties` reached with `or {}`
+    # raises on a truthy non-dict, and it is the level a drifted body is most likely to break.
+    assert sideclaw._published_finding_shape({"output": {"properties": "yes"}}) is None
+    assert sideclaw._published_finding_shape(
+        {"output": {"properties": {"blocking": ["x"]}}}) is None
+    assert sideclaw._published_finding_shape(
+        {"output": {"properties": {"blocking": {"items": "x"}}}}) is None
+    # `required` is read as a collection of names or not at all: a bare string would become a
+    # set of its own characters (silently passing a name check it should fail) and a number
+    # would raise TypeError out of a function that is documented never to raise.
+    for bad in ("file", 7, {"file": 1}, [7], ["file", 7]):
+        assert sideclaw._published_finding_shape(
+            {"output": {"properties": {"blocking": {"items": {
+                "properties": {"file": {}, "message": {}}, "required": bad}}}}}) is None, bad
+    # An empty `properties` carries no shape either — that is "not published", not "nothing
+    # required".
+    assert sideclaw._published_finding_shape(
+        {"output": {"properties": {"blocking": {"items": {"properties": {}, "required": []}}}}}) is None
+    # …and the same shape read from a well-formed body still works, types included.
+    shape = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
+    assert shape.required == frozenset({"file", "message", "angle"})
+    assert shape.properties >= {"file", "message", "line", "angle"}
+    assert shape.types["file"] == "string" and shape.types["line"] == "number"
+
+
+def test_check_schema_versions_catches_a_field_that_was_retyped_but_not_renamed():
+    """§133 — names are not the whole contract. A producer that keeps `file` and `message` and
+    changes either type leaves every name in place: the version still matches, the outcome list
+    still matches, every field is still published, and `is_review_finding()` rejects every
+    finding the producer emits — the verdict silently unreadable, with the check that exists to
+    catch exactly this reporting success. Types are compared, and a property with no readable
+    type is not assumed to be a string."""
+    retyped = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    retyped["properties"]["blocking"]["items"]["properties"]["file"] = {"type": "array"}
+    srv = _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, {
+            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
+        }),
+        ("GET", "/api/review-schema"): (200, {
+            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": retyped,
+        }),
+    })
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+        assert review["ok"] is False, review
+        assert review["findingShape"]["mistyped"] == ["file"], review["findingShape"]
+        assert review["findingShape"]["missingFromProperties"] == []
+    finally:
+        srv.stop()
+
+    # A published property with NO readable type is a disagreement too: warden reads a string,
+    # and "any type" is not a promise it can rely on.
+    untyped = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    untyped["properties"]["blocking"]["items"]["properties"]["message"] = {}
+    srv = _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, {
+            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
+        }),
+        ("GET", "/api/review-schema"): (200, {
+            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": untyped,
+        }),
+    })
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+        assert review["ok"] is False and review["findingShape"]["mistyped"] == ["message"]
+    finally:
+        srv.stop()
 
 
 def test_check_schema_versions_unreachable_never_raises():

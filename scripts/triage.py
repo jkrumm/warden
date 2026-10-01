@@ -5977,6 +5977,11 @@ class ReviewRows(NamedTuple):
     cannot take the attributed half and forget the other exists."""
     terminal: list[sqlite3.Row]
     mismatched: list[tuple[sqlite3.Row, str]]
+    # Rows admitted only because `datetime(created_at)` cannot be read. It rides here because
+    # this fetch is the one place that already knows (§123's undroppable term), and the summary
+    # needs the number without paying for a second non-sargable scan of `dispatches` on every
+    # tick — a count query derived from rows already in hand is the only shape that costs nothing.
+    corrupt_timestamps: int = 0
 
 
 def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
@@ -6018,15 +6023,15 @@ def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
     naive_utc = ((since_dt - widen).astimezone(dt.timezone.utc).replace(tzinfo=None)
                  .isoformat())
     sql = (
-        f"SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
-        f"d.created_at AS implement_created_at, d.validation_job_id AS pointer, "
-        f"r.job_id AS target_job, r.tier AS target_tier, r.repo AS target_repo, "
-        f"r.origin_event_id AS target_event_id, "
-        f"r.verdict_json AS verdict_json, "
-        f"r.status AS review_status, r.created_at AS created_at, r.id AS id "
-        f"FROM dispatches d LEFT JOIN dispatches r ON r.job_id = d.validation_job_id "
-        f"WHERE d.tier='implement' AND d.validation_job_id IS NOT NULL "
-        f"AND (d.created_at >= ? OR datetime(d.created_at) IS NULL) "
+        "SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
+        "d.created_at AS implement_created_at, d.validation_job_id AS pointer, "
+        "r.job_id AS target_job, r.tier AS target_tier, r.repo AS target_repo, "
+        "r.origin_event_id AS target_event_id, "
+        "r.verdict_json AS verdict_json, "
+        "r.status AS review_status, r.created_at AS created_at, r.id AS id "
+        "FROM dispatches d LEFT JOIN dispatches r ON r.job_id = d.validation_job_id "
+        "WHERE d.tier='implement' AND d.validation_job_id IS NOT NULL "
+        "AND (d.created_at >= ? OR datetime(d.created_at) IS NULL) "
     )
     fetched = conn.execute(sql, (naive_utc,)).fetchall()
     # A row whose timestamp SQLite cannot read is admitted explicitly by the pre-filter
@@ -6049,7 +6054,9 @@ def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
             mismatched.append((r, reason))
         elif r["review_status"] in _sideclaw.TERMINAL_STATUSES:
             terminal.append(r)
-    return ReviewRows(terminal=terminal, mismatched=mismatched)
+    return ReviewRows(terminal=terminal, mismatched=mismatched,
+                      corrupt_timestamps=sum(
+                          1 for r in rows if _parse_ts(r["implement_created_at"]) is None))
 
 
 class ReviewRow(TypedDict):
@@ -6313,20 +6320,8 @@ def _always_blocks_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Revie
     return findings
 
 
-def _unreadable_timestamp_count(conn: sqlite3.Connection) -> int:
-    """How many rows this pass admitted BECAUSE `created_at` cannot be read as an instant.
-
-    The window's corrupt-timestamp term cannot be time-bounded without dropping rows whose true
-    age is unknown, so these are re-admitted every pass — cost proportional to how many exist,
-    not to how old they are. That is the price of not dropping them (§123), and this number is
-    what keeps the price visible instead of silently growing: it rides in the cursor summary
-    beside the tick cost it feeds."""
-    return conn.execute(
-        "SELECT COUNT(*) AS n FROM dispatches WHERE tier='implement' "
-        "AND validation_job_id IS NOT NULL AND datetime(created_at) IS NULL").fetchone()["n"]
-
-
-def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
+def _review_health_findings(conn: sqlite3.Connection, since: str,
+                            metrics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Both review-gate findings: a gate that blocks every reviewed item, and terminal
     reviews whose stored results cannot safely count as passes.
 
@@ -6342,6 +6337,8 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     terminal row can be read at all. A later unusable row does not clear a prior readable
     review's decision, but it remains visible in the fifth self-audit finding."""
     rows = _fetch_review_rows(conn, since)
+    if metrics is not None:
+        metrics["unreadable_timestamps"] = rows.corrupt_timestamps
     status_by_repo = _fold_review_status(_review_fold_rows(rows.terminal, rows.mismatched))
     return (_unusable_verdict_findings(status_by_repo)
             + _always_blocks_findings(status_by_repo))
@@ -7159,7 +7156,8 @@ def _audit_section(name: str, section: Callable[[], list[dict[str, Any]]]) -> li
 
 
 def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
-                        policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                        policy: dict[str, Any] | None = None, *,
+                        metrics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Gaps the loop can see in its own behaviour, each keyed so one finding is one
     event. Five kinds, one per section: `review-always-blocks-<repo>` (a review gate
     that blocks every PR in a repo), `review-verdicts-unusable-<repo>` (a terminal review
@@ -7177,7 +7175,7 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     # event sync needs to know whose silence may resolve an alert (§132). `invariants` is not in
     # this map — it returns violations rather than findings, and `run_self_audit()` runs it.
     sections: dict[str, Callable[[], list[dict[str, Any]]]] = {
-        "review-health": lambda: _review_health_findings(conn, since),
+        "review-health": lambda: _review_health_findings(conn, since, metrics),
         "liveness": lambda: _liveness_findings(conn, since),
         "fixed-reopened": lambda: _fixed_reopened_findings(conn, since),
         "restore-drill": lambda: _restore_drill_findings(now),
@@ -7251,7 +7249,11 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     violations = violations or []
     findings = ([_section_failure_finding("invariants", invariants_failure)]
                 if invariants_failure is not None else [])
-    findings.extend(self_audit_findings(conn, now, policy))
+    # Section-owned numbers the summary cannot re-derive without paying for them, collected by
+    # the sections themselves (inside the timed window, so their cost counts toward
+    # `self_audit_ms` like every other non-sargable scan) — see `_review_health_findings()`.
+    metrics: dict[str, Any] = {}
+    findings.extend(self_audit_findings(conn, now, policy, metrics=metrics))
     by_inv: dict[str, list[dict[str, Any]]] = {}
     for v in violations:
         by_inv.setdefault(v["id"], []).append(v)
@@ -7299,7 +7301,7 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
                "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
                "self_audit_ms": self_audit_ms,
                "event_sync_ms": event_sync_ms,
-               "unreadable_timestamps": _unreadable_timestamp_count(conn),
+               "unreadable_timestamps": metrics.get("unreadable_timestamps", 0),
                "findings": sorted(live_keys)}
     if invariants_failure is not None:
         # An empty `violations` from a check that never ran is a fabricated zero, not a

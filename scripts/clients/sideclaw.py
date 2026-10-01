@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from .errors import PolicyError, RemoteError
 
@@ -370,46 +370,89 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
                 entry["findingShape"] = {"published": False}
                 entry["ok"] = ok = False
             else:
-                required, properties = shape
-                missing_required = sorted(REVIEW_FINDING_REQUIRED - required)
-                missing_properties = sorted(REVIEW_FINDING_REQUIRED - properties)
+                missing_required = sorted(REVIEW_FINDING_REQUIRED - shape.required)
+                missing_properties = sorted(REVIEW_FINDING_REQUIRED - shape.properties)
+                # Names are not the whole contract: a field kept but retyped (a scalar that
+                # became an array, say) leaves every name in place while `is_review_finding()`
+                # rejects every finding the producer emits — the whole verdict silently
+                # unreadable, with this check reporting success. Only `str` reads as a finding
+                # in warden, so anything else — including a published property with no readable
+                # type — is a disagreement, not a tolerated difference.
+                mistyped = sorted(field for field in REVIEW_FINDING_REQUIRED
+                                  if field in shape.properties
+                                  and shape.types.get(field) != "string")
                 entry["findingShape"] = {
                     "published": True,
-                    "required": sorted(required),
-                    "properties": sorted(properties),
+                    "required": sorted(shape.required),
+                    "properties": sorted(shape.properties),
+                    "types": dict(sorted(shape.types.items())),
                     "wardenRequires": sorted(REVIEW_FINDING_REQUIRED),
                     "missingFromRequired": missing_required,
                     "missingFromProperties": missing_properties,
+                    "mistyped": mistyped,
                 }
-                if missing_required or missing_properties:
+                if missing_required or missing_properties or mistyped:
                     entry["ok"] = ok = False
         out[tool] = entry
     return out
 
 
-def _published_finding_shape(parsed: dict[str, Any]) -> tuple[frozenset[str], frozenset[str]] | None:
-    """`(required, properties)` of the finding object sideclaw publishes, or None when the
-    endpoint does not publish a readable one.
+class PublishedFindingShape(NamedTuple):
+    """What the endpoint publishes about the review finding object.
+
+    `types` maps each published property to its JSON Schema `type` (None when the property
+    carries no readable subschema), because the NAME of a field is not the whole contract: a
+    producer that keeps `file` and changes it from a string to an array of strings leaves
+    every name in place while `is_review_finding()` rejects every finding it emits."""
+
+    required: frozenset[str]
+    properties: frozenset[str]
+    types: dict[str, Any]
+
+
+def _as_object(value: Any) -> dict[str, Any] | None:
+    """A JSON object, or None. The guard `_published_finding_shape()` applies at every level of
+    the published body, so a malformed or drifted schema reads as "not published" — the refusal
+    this check exists to produce — instead of raising out of a function nothing wraps."""
+    return value if isinstance(value, dict) else None
+
+
+def _published_finding_shape(parsed: dict[str, Any]) -> PublishedFindingShape | None:
+    """The finding object sideclaw publishes, or None when the endpoint does not publish a
+    readable one.
 
     Read from `output.properties.blocking.items` — the four arrays (`blocking`,
     `improvements`, `discussions`, `testGaps`) share this one object schema. `None` is a
     finding in itself, not a reason to skip the check: warden's `is_review_finding()` would
-    then be an unverifiable copy, which is the drift this comparison exists to catch."""
-    output = parsed.get("output")
-    if not isinstance(output, dict):
-        # Truthy-but-not-an-object included: this function's contract is that it never raises
-        # (it sits outside `check_schema_versions()`'s try/except, on the operator-facing
-        # `make status` path), so an unreadable shape is None, exactly like the guards below.
+    then be an unverifiable copy, which is the drift this comparison exists to catch.
+
+    Every step is guarded, and the guards are the point rather than boilerplate: this runs on
+    the operator-facing `make status` path OUTSIDE `check_schema_versions()`'s try/except, so
+    the one body it must survive is the malformed one it is there to report. `required` is a
+    list or tuple OF NAMES or it is nothing: `frozenset()` over a bare string would read as a
+    set of its own characters (`{"f", "i", "l", "e"}` passing a name check it should fail) and
+    a number would raise out of a function documented never to raise."""
+    # One guard per level, each one returning "not published" rather than raising: the body
+    # this has to survive is precisely the malformed one it exists to report.
+    output = _as_object(parsed.get("output"))
+    container = _as_object(output.get("properties")) if output else None
+    blocking = _as_object(container.get("blocking")) if container else None
+    items = _as_object(blocking.get("items")) if blocking else None
+    properties = _as_object(items.get("properties")) if items else None
+    if not properties:
         return None
-    blocking = (output.get("properties") or {}).get("blocking")
-    items = (blocking or {}).get("items") if isinstance(blocking, dict) else None
-    if not isinstance(items, dict):
+    required = items.get("required", [])
+    if not isinstance(required, (list, tuple)):
+        # Catches `str` too, which is the case that matters: `frozenset("file")` is four
+        # characters, and an int raises. Both are unreadable shapes, not missing fields.
         return None
-    properties = items.get("properties")
-    if not isinstance(properties, dict):
+    if not all(isinstance(name, str) for name in list(required) + list(properties)):
         return None
-    required = items.get("required")
-    return frozenset(required or ()), frozenset(properties)
+    return PublishedFindingShape(
+        frozenset(required),
+        frozenset(properties),
+        {name: (_as_object(subschema) or {}).get("type") for name, subschema in properties.items()},
+    )
 
 
 def classify_dispatch_outcome(status: str | None, verdict_json: str | None) -> tuple[str, str | None]:
