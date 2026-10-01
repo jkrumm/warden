@@ -5821,13 +5821,12 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
 
 def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
     """The step-7 findings in a review's `blocking` list that are about the DIFF:
-    §114's wrapper class removed (see `_is_process_only_finding()`), with a missing
-    or malformed list reading as "none". This is the set a revision can act on and
-    the set `review-always-blocks` counts, and ONE function decides it — the fold
-    (`poll_validation_jobs()`), the revision brief (`_revision_findings()`) and the
-    self-audit used to carry the same list comprehension with its own comment, and
-    three copies of a rule is how they drift apart."""
-    return [f for f in (blocking or []) if not _is_process_only_finding(f)]
+    §114's wrapper class removed (see `_is_process_only_finding()`). Missing,
+    malformed and non-list payloads read as no actionable code findings; callers
+    that need to distinguish unusable verdicts validate the full envelope first."""
+    if not isinstance(blocking, list):
+        return []
+    return [f for f in blocking if isinstance(f, dict) and not _is_process_only_finding(f)]
 
 
 def _is_completed_review(verdict: dict[str, Any]) -> bool:
@@ -5869,12 +5868,8 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     review per item wins; a later unusable or non-successful job cannot erase a
     prior blocking review, and its missing result is a visible self-audit finding."""
     per_repo: dict[str, dict[int, bool]] = {}
-    unusable: dict[str, int] = {}
+    unusable: dict[str, list[int]] = {}
     terminal_status_placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
-    since_dt = _parse_ts(since)
-    if since_dt is None:
-        raise ValueError(f"invalid self-audit window start: {since!r}")
-    since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
     sql = (
         "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json, "
         "r.status AS review_status "
@@ -5887,19 +5882,22 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     for r in rows:
         verdict = _safe_json(r["verdict_json"])
         if r["review_status"] != "done" or not _is_completed_review(verdict):
-            unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
+            unusable.setdefault(r["repo"], []).append(r["event_id"])
             continue
         blocking = verdict.get("blocking") or []
         per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(
             _code_blocking_findings(blocking))
     findings: list[dict[str, Any]] = []
-    for repo, skipped in sorted(unusable.items()):
+    for repo, event_ids in sorted(unusable.items()):
+        sample = ", ".join(str(event_id) for event_id in event_ids[:8])
+        remainder = len(event_ids) - min(len(event_ids), 8)
+        suffix = f" (+{remainder} more)" if remainder else ""
         findings.append({
             "key": f"review-verdicts-unusable-{repo}",
-            "title": f"{skipped} step-7 review verdict(s) in {repo} are unusable in "
+            "title": f"{len(event_ids)} step-7 review verdict(s) in {repo} are unusable in "
                      f"the last {SELF_AUDIT_WINDOW_DAYS} days",
-            "detail": f"{skipped} stored review verdict(s) do not match sideclaw's published schema, "
-                      "outcome, or finding shape; the self-audit cannot safely read them as passes",
+            "detail": f"stored verdicts do not match sideclaw's published schema, outcome, or finding "
+                      f"shape; event IDs: {sample}{suffix}. The self-audit cannot safely read them as passes",
         })
     for repo, by_event in sorted(per_repo.items()):
         n = len(by_event)
