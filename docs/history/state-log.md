@@ -9713,7 +9713,22 @@ at the fail-closed gate claimed `_review_contract_matches()` guarded below while
 inlined — the named contract function is the gate again, and the refusal note is built from the same
 rule set inside that branch.
 
+**Twenty-fifth round.** One blocker, and it is the most useful kind: a test that could never fail
+for the reason it documented. `test_a_naive_audit_window_is_read_as_utc_not_host_local` linked no
+review row, so `_fetch_terminal_reviews()`'s join matched nothing and its `== []` assertions held
+whatever the timezone logic did — six rounds of green that measured nothing. It now links both
+implement rows and asserts the discriminating count: a naive bound must exclude a row two hours
+before the window (a host-local reading would include it) and include one inside, with the boundary
+inclusive on the implement job's own timestamp. The reviewer's stated mechanism was wrong — `>=` was
+not the cause — but the test was worse than they said. Also: `dispatch-sweep.py` had its own
+`TERMINAL_STATUSES` alias pointing at the unordered `_sideclaw.TERMINAL`, so one concept had two
+values under one name in two files; it now points at the sorted constant. `_review_verdict_shape()`
+names its local `findings` as its docstring promises, and `_run_isolated()`/`_section_failure_finding()`
+annotate `Exception`, matching what the guard actually catches (`KeyboardInterrupt` still propagates,
+which is correct and now documented by the type).
+
 **Verified.** `tests/test_triage.py` at **384/384** (354 before, +30); all 21 test files green.
+`scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload

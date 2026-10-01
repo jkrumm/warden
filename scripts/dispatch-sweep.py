@@ -151,10 +151,10 @@ WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
 DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
            if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
-# sideclaw's own terminal statuses (done/failed/interrupted/cancelled) —
-# clients/sideclaw.py's TERMINAL is this sweeper's own vocabulary now, not a
-# copy of it: a job in any of these is done reporting, one way or another.
-TERMINAL_STATUSES = _sideclaw.TERMINAL
+# sideclaw's own terminal statuses (done/failed/interrupted/cancelled) — the same
+# vocabulary every caller of the client shares, taken from the one sorted constant so
+# two files cannot give the same name two different values.
+TERMINAL_STATUSES = _sideclaw.TERMINAL_STATUSES
 # Consecutive sideclaw 404s before a row is declared pruned. Three sweeps = 15
 # min, long enough to ride out a sideclaw restart that briefly answers 404 for
 # everything, short enough that a pruned job does not haunt every sweep for

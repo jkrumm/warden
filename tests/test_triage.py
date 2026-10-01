@@ -8330,23 +8330,31 @@ def test_a_schema_version_must_be_a_real_int_for_either_gate():
 
 
 def test_a_naive_audit_window_is_read_as_utc_not_host_local():
-    """The window bound is compared as text against the ledger's aware-UTC
-    timestamps. A naive bound is UTC (the ledger's own format); `astimezone()` alone
-    would read it as host-local and shift the window by the machine's offset — on a
-    CEST host that silently pulls a row from two hours before the window into it."""
+    """The window bound is parsed as UTC (the ledger's own format). Read as host-local
+    instead, a naive bound shifts by the machine's offset — on a CEST host it becomes two
+    hours earlier and pulls a row from two hours before the window into it.
+
+    Both implement rows are LINKED to their review row here: without the link the query's
+    join matches nothing and the test would pass while measuring nothing at all, which is
+    how this covered the timezone rule for six rounds without ever exercising it."""
     with _triage_env() as (conn, ctx):
-        eid = _seed_blocked_item(conn, external_id="tz-boundary")
-        # The review lands one hour BEFORE the bound: outside the window, and the
-        # implement row inside it, so only the window comparison decides the count.
-        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
-                     ((NOW - dt.timedelta(hours=1)).isoformat(), "val-tz-boundary"))
-        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
-                     (NOW.isoformat(), "impl-tz-boundary"))
+        for name, age in (("inside", dt.timedelta(minutes=30)), ("outside", dt.timedelta(hours=2))):
+            _seed_blocked_item(conn, external_id=f"tz-{name}")
+            conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                         (f"val-tz-{name}", f"impl-tz-{name}"))
+            conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                         ((NOW - age).isoformat(), f"impl-tz-{name}"))
         conn.commit()
-        naive = NOW.replace(tzinfo=None).isoformat()
-        aware = NOW.astimezone(dt.timezone.utc).isoformat()
-        assert triage._fetch_terminal_reviews(conn, naive) == []
-        assert triage._fetch_terminal_reviews(conn, aware) == []
+        bound = NOW - dt.timedelta(hours=1)
+        naive = bound.replace(tzinfo=None).isoformat()
+        aware = bound.astimezone(dt.timezone.utc).isoformat()
+        # Exactly the in-window row: a host-local reading of the naive bound would add the
+        # 2h-old row and make this 2.
+        assert len(triage._fetch_terminal_reviews(conn, naive)) == 1
+        assert len(triage._fetch_terminal_reviews(conn, aware)) == 1
+        # The boundary is inclusive, on the implement job's own timestamp.
+        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(minutes=30)).isoformat())
+        assert len(rows) == 1 and rows[0]["implement_job_id"] == "impl-tz-inside"
 
 
 def _review_row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00+00:00",

@@ -5898,8 +5898,8 @@ def _review_verdict_shape(verdict: Any) -> tuple[bool, list[dict[str, Any]]]:
     unusable."""
     if _review_verdict_problems(verdict):
         return False, []
-    blocking = verdict.get("blocking", []) if isinstance(verdict, dict) else []
-    return True, blocking
+    findings = verdict.get("blocking", []) if isinstance(verdict, dict) else []
+    return True, findings
 
 
 def _schema_version_of(verdict: Any) -> int | None:
@@ -6865,7 +6865,7 @@ def _revisions_exhausted_findings(conn: sqlite3.Connection, policy: dict[str, An
 _T = TypeVar("_T")
 
 
-def _section_failure_finding(name: str, e: BaseException) -> dict[str, Any]:
+def _section_failure_finding(name: str, e: Exception) -> dict[str, Any]:
     """The finding a failed self-audit section reports in place of its own output."""
     return {"key": f"self-audit-section-failed-{name}",
             "title": f"the self-audit's {name} check raised {type(e).__name__}",
@@ -6873,7 +6873,7 @@ def _section_failure_finding(name: str, e: BaseException) -> dict[str, Any]:
                       f"have reported stays unseen until the cause is fixed"}
 
 
-def _run_isolated(name: str, section: Callable[[], _T]) -> tuple[_T | None, BaseException | None]:
+def _run_isolated(name: str, section: Callable[[], _T]) -> tuple[_T | None, Exception | None]:
     """Run one self-audit section and hand its failure back instead of raising it.
 
     One place owns the isolation and the stderr line, so a change to either cannot land
