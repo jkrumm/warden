@@ -9216,32 +9216,42 @@ def test_self_audit_completed_review_rejects_explicit_null_blocking_and_bool_sch
 
 def test_a_non_list_blocking_payload_does_not_crash_the_validation_tick():
     """§117 — sideclaw publishes `blocking` as a list of objects, but a corrupt or
-    hand-written payload can hold a scalar. The step-7 fold iterates it, so a
-    non-list value must read as "no finding" rather than raise mid-tick after the
-    job is already persisted (which would re-crash identically on every poll)."""
+    hand-written payload can hold a scalar. Two things must hold: the normalizer
+    reads it as "no finding" rather than raising mid-tick (the job is already
+    persisted, so a raise here re-crashes identically on every poll), and the merge
+    gate FAILS CLOSED on it rather than folding it like a clean verdict and letting
+    a merge through on a payload nobody can vouch for."""
     with _triage_env() as (conn, ctx):
-        for value in (True, 7, "a finding"):
+        for value in (True, 7, "a finding", {"file": "src/x.ts"}, [None], ["nope"]):
             assert triage._code_blocking_findings(value) == []
             assert triage._process_only_findings(value) == []
 
-        eid = _seed_verdict_item(conn, external_id="sig-scalar-blocking")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
-            (triage.STATE_VALIDATING, "implement-job-scalar", "validation-job-scalar",
-             "https://github.com/jkrumm/demo-repo/pull/11", eid),
-        )
-        conn.commit()
-        _seed_implement_dispatch(conn, "implement-job-scalar")
-        triage._sideclaw.get = lambda job_id: {
-            "status": "done",
-            "result": _review_result("actionable", blocking=True, summary="malformed payload."),
-        }
+        for idx, value in enumerate((True, [{"file": "src/x.ts"}], "not a list")):
+            eid = _seed_verdict_item(conn, external_id=f"sig-scalar-blocking-{idx}",
+                                     investigate_job=f"investigate-job-scalar-{idx}")
+            job = f"implement-job-scalar-{idx}"
+            conn.execute(
+                "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? "
+                "WHERE event_id=?",
+                (triage.STATE_VALIDATING, job, f"validation-job-scalar-{idx}",
+                 f"https://github.com/jkrumm/demo-repo/pull/1{idx}", eid),
+            )
+            conn.commit()
+            _seed_implement_dispatch(conn, job)
+            triage._sideclaw.get = lambda job_id, _v=value: {
+                "status": "done",
+                "result": _review_result("actionable", blocking=_v, summary="malformed payload."),
+            }
+            merged: list[int] = []
+            triage._merge.plan_or_land = lambda *a, **kw: merged.append(1)
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        # The tick completed and the item reached a decision rather than wedging in
-        # STATE_VALIDATING for the next poll to crash on again.
-        assert triage._get_item(conn, eid)["state"] != triage.STATE_VALIDATING
+            assert merged == [], "a malformed verdict must never reach a merge"
+            assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_HUMAN
+            d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                             (job,)).fetchone()
+            assert d["validation_status"] == "needs_human", d["validation_status"]
 
 
 def test_self_audit_reports_an_item_by_its_latest_row_not_an_earlier_unusable_one():

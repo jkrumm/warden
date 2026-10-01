@@ -9493,11 +9493,22 @@ count instead of accumulating rows: an item whose newest review is a complete cl
 reported unusable, and comparing a loop-originated int id with a manual dispatch's job-id string
 sorts by string rather than raising. The sample bound is `SELF_AUDIT_SAMPLE_LIMIT`.
 
+**Tenth round.** The review on the ninth revision blocked the same shape at the *merge gate*, not
+the audit: normalizing a corrupt `blocking` to "no findings" left `poll_validation_jobs()` folding
+a malformed `actionable` verdict exactly like a clean one, so a payload nobody can vouch for could
+reach a merge — a day before the hourly audit merely reported it. The fold now fails closed:
+a result that is not a complete verdict routes to `needs_human` with an explicit reason
+(`_unreadable_verdict()`), so it reads the same on the live gate as it does on the stored-payload
+side. The regression drives both a scalar and a malformed-member `blocking` through the real
+`poll_validation_jobs()` and asserts no merge call and `needs_human` on the row. The audit's
+per-item map collapsed to one boolean (`latest_unusable`, last write wins) in the same pass.
+
 **Verified.** `tests/test_triage.py` at **365/365** (354 before, +11); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
-driven through `poll_validation_jobs()`, manual null-origin implements, mixed int/string item keys
+driven through `poll_validation_jobs()` (including that the merge gate fails closed on it),
+manual null-origin implements, mixed int/string item keys
 in one unusable report, an earlier unusable row superseded by a later clean one, and valid
 non-object input. Against a `VACUUM INTO` copy of the live ledger (53 in-window
 implement→terminal-review rows, **0** null verdicts, **0** null `origin_event_id`): **39** judged
