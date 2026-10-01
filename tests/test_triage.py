@@ -8411,12 +8411,77 @@ def test_the_audit_window_is_microsecond_exact_and_never_drops_a_bad_timestamp()
 
 
 def test_a_review_row_with_an_unparseable_timestamp_is_never_the_latest():
-    """An ordering key nothing can parse must not read as an item's latest review."""
+    """An item whose rows cannot be placed in time has no knowable order, so it must read
+    as unusable — an older readable review must never stand in for the current one, which
+    would erase a corrupt newer review's signal (§119)."""
     blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                 "outcome": "actionable", "blocking": [_CODE_FINDING]}
-    rows = [_review_row(1, "impl-1", blocking, created_at="not a timestamp", row_id=99),
-            _review_row(1, "impl-1", blocking, created_at="2026-10-01T06:00:00+00:00", row_id=1)]
-    assert triage._fold_review_status(rows)["demo-repo"][1].code_blocked is True
+    clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+             "outcome": "clean", "blocking": []}
+    # (a) an unparseable row ALONGSIDE a newer readable one: the item is unusable, not
+    # clean, even though the readable row sorts later.
+    rows = [_review_row(1, "impl-1", clean, created_at="not a timestamp", row_id=99),
+            _review_row(1, "impl-1", clean, created_at="2026-10-01T06:00:00+00:00", row_id=1)]
+    status = triage._fold_review_status(rows)["demo-repo"][1]
+    assert status.unusable is True and status.code_blocked is False
+    # (b) an unparseable row that is itself a blocked review: still unusable — the audit
+    # claims "cannot tell", not "not blocking".
+    rows = [_review_row(1, "impl-1", blocking, created_at="garbage", row_id=99),
+            _review_row(1, "impl-1", clean, created_at="2026-10-01T06:00:00+00:00", row_id=1)]
+    status = triage._fold_review_status(rows)["demo-repo"][1]
+    assert status.unusable is True
+    # (c) ordering among placeable rows is unaffected: latest readable wins.
+    rows = [_review_row(1, "impl-1", blocking, created_at="2026-10-01T06:00:00+00:00", row_id=1),
+            _review_row(1, "impl-1", clean, created_at="2026-10-01T07:00:00+00:00", row_id=2)]
+    status = triage._fold_review_status(rows)["demo-repo"][1]
+    assert status.unusable is False and status.code_blocked is False
+    assert triage._review_order_key(_review_row(1, "impl-1", clean, created_at="garbage"))[0] == \
+        dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def test_the_verdict_refusal_names_what_is_wrong():
+    """§119: the fail-closed park note is the operator's only clue, so the shape gate
+    reports the specific rule it refused rather than "does not match the schema"."""
+    current = triage._sideclaw.REVIEW_SCHEMA_VERSION
+    assert triage._review_verdict_problems(
+        {"schemaVersion": current, "outcome": "clean", "blocking": []}) == []
+    problems = triage._review_verdict_problems(
+        {"schemaVersion": current, "outcome": "actionable", "blocking": [None, _CODE_FINDING]})
+    assert len(problems) == 1 and "not findings" in problems[0] and "1 of 2" in problems[0]
+    assert "_is_finding_shape" not in problems[0]
+    assert "unknown outcome" in triage._review_verdict_problems({"outcome": "banana"})[0]
+    assert "not a list" in triage._review_verdict_problems(
+        {"outcome": "clean", "blocking": True})[0]
+    assert "is not an object" in triage._review_verdict_problems([])[0]
+    # One rule set: the boolean gate and the diagnostic cannot disagree.
+    for verdict in (None, [], {}, {"blocking": []}, {"outcome": "clean", "blocking": [None]},
+                    {"outcome": "banana", "blocking": []}):
+        usable, findings = triage._review_verdict_shape(verdict)
+        assert usable is False and findings == []
+        assert triage._review_verdict_problems(verdict) != []
+    assert triage._review_contract_matches({"schemaVersion": current - 1, "outcome": "clean",
+                                            "blocking": []}) is False
+    assert triage._review_contract_matches({"schemaVersion": current, "outcome": "clean",
+                                            "blocking": []}) is True
+
+
+def test_a_section_failure_and_the_invariant_guard_share_one_isolation_point():
+    """§119: `_audit_section()` and the invariants guard are the same isolation, so a
+    change to it cannot land in one and miss the other."""
+    calls = []
+
+    def _boom():
+        calls.append(1)
+        raise RuntimeError("section blew up")
+
+    result, failure = triage._run_isolated("demo", _boom)
+    assert result is None and isinstance(failure, RuntimeError) and calls == [1]
+    finding, = triage._audit_section("demo", _boom)
+    assert finding["key"] == "self-audit-section-failed-demo"
+    assert "RuntimeError" in repr(finding), finding
+    assert triage._audit_section("demo", lambda: [{"key": "k"}]) == [{"key": "k"}]
+    ok, none = triage._run_isolated("demo", lambda: [{"key": "k"}])
+    assert ok == [{"key": "k"}] and none is None
 
 
 def test_the_audit_window_compares_instants_not_timestamp_text():

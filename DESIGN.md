@@ -790,7 +790,9 @@ they flag is already exactly one entry in the owner's list.
 
 The self-audit adds five findings about the loop's own answers:
 `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>` (a terminal review row
-without a usable result; cannot count as a pass), `liveness-never-confirms-<repo>`,
+without a usable result, or one whose timestamp cannot be placed among its item's other
+rows — an unknown order must never resolve to an older readable review; cannot count as a
+pass), `liveness-never-confirms-<repo>`,
 `fixed-reopened-<event>` (a verdict or fix proven wrong), and
 `revisions-exhausted-<event>`. Each section that produces them runs through
 `_audit_section()`, so a section that raises reports `self-audit-section-failed-<name>`

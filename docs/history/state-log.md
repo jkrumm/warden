@@ -9685,7 +9685,22 @@ overlapping admission gates at the fail-closed call site carry a comment saying 
 the client asserts own the envelope and its wording, `_review_contract_matches()` owns the shape of
 `blocking` that the asserts do not check.
 
-**Verified.** `tests/test_triage.py` at **381/381**; all 21 test files green.
+**Twenty-third round.** One blocker, and it was mine from round 21: giving an unparseable
+timestamp the earliest sort key made a corrupt **newer** review erasable by an older readable one —
+`unusable` described "the latest row" where "latest" was itself unknowable, so the signal
+disappeared exactly when the ledger was least trustworthy. Fail-open in the audit of a
+fail-closed gate. Fixed by separating the two questions: the ordered case still follows the latest
+row (a newer readable review legitimately clears an older unreadable one), while a row nobody can
+place marks its item unusable and keeps it there — no later row can prove it is the newest. The
+test asserts both directions plus that ordinary ordering is untouched. Also: the invariants guard
+and `_audit_section()` now share `_run_isolated(name, fn)`, so the isolation and its stderr line
+have one owner; the fail-closed park note names the rule it refused —
+`_review_verdict_problems()` is now the one definition of the shape contract and the refusal is
+built from it (the version policy stays at the call site, so the gate is not weakened). The
+`_fetch_terminal_reviews()` index question is answered as *measure first*: the cursor summary
+carries `self_audit_ms`.
+
+**Verified.** `tests/test_triage.py` at **383/383** (354 before, +29); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
