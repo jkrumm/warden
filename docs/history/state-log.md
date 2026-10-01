@@ -9594,7 +9594,20 @@ type checker rejected the `Mapping` annotation on the real caller — only the `
 both the query's rows and the unit test's dicts. The history log is append-only, so the round-14
 line stands; this is its correction, and the round-14 code it describes was never in doubt.
 
-**Verified.** `tests/test_triage.py` at **370/370** (354 before, +16); all 21 test files green.
+**Eighteenth round.** Zero blockers, all reviewers structurally clean; three notes, all applied.
+The adversary's timezone note is **latent, not live**: the loop's only caller passes an
+aware-UTC bound (`self_audit_findings()`'s `now - 14d`), so `astimezone()` was already a no-op in
+production — but a naive bound would have been read as host-local and shifted the text-compared
+window by the machine's offset, which on a CEST box pulls two extra hours into a 14-day audit. A
+naive bound is now explicitly UTC, and a test pins a row one hour outside the window so the offset
+cannot creep back in. The fifth finding's wording now covers both shapes it actually matches — a
+terminal row that stored **no** verdict at all (`failed`/`interrupted`/`cancelled`, where
+`sync_record` writes no `verdict_json`) and one whose stored verdict fails the shape check — since
+the old text described a payload that does not exist for the first case. And
+`REVIEW_TERMINAL_STATUSES` is `tuple(sorted(TERMINAL))`: `TERMINAL` is a frozenset, so the previous
+`tuple(...)` reordered with hash randomization from process to process.
+
+**Verified.** `tests/test_triage.py` at **373/373** (354 before, +19); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload

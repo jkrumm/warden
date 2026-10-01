@@ -64,7 +64,10 @@ REVIEW_OUTCOMES: tuple[str, ...] = ("clean", "actionable", "needs-human")
 # A review result speaks for an implement item only after sideclaw has reached
 # a terminal status. A terminal job may still lack a usable verdict; that case
 # is reported separately by the review self-audit, never mistaken for a pass.
-REVIEW_TERMINAL_STATUSES: tuple[str, ...] = tuple(TERMINAL)
+# Sorted, not raw: this is a public constant, and `TERMINAL` is a frozenset whose
+# iteration order varies with hash randomization — anything order-sensitive
+# (logging, tests, a displayed list) must not see a different sequence per process.
+REVIEW_TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(TERMINAL))
 
 
 def _base() -> str:

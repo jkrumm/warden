@@ -8278,6 +8278,50 @@ def _seed_blocked_item(conn, *, external_id: str, blocking: list[Any] | None = N
     return eid
 
 
+def test_a_naive_audit_window_is_read_as_utc_not_host_local():
+    """The window bound is compared as text against the ledger's aware-UTC
+    timestamps. A naive bound is UTC (the ledger's own format); `astimezone()` alone
+    would read it as host-local and shift the window by the machine's offset — on a
+    CEST host that silently pulls a row from two hours before the window into it."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="tz-boundary")
+        # The review lands one hour BEFORE the bound: outside the window, and the
+        # implement row inside it, so only the window comparison decides the count.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ((NOW - dt.timedelta(hours=1)).isoformat(), "val-tz-boundary"))
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     (NOW.isoformat(), "impl-tz-boundary"))
+        conn.commit()
+        naive = NOW.replace(tzinfo=None).isoformat()
+        aware = NOW.astimezone(dt.timezone.utc).isoformat()
+        assert triage._fetch_terminal_reviews(conn, naive) == []
+        assert triage._fetch_terminal_reviews(conn, aware) == []
+
+
+def test_the_unusable_verdict_finding_covers_a_missing_verdict_too():
+    """A terminal `failed`/`cancelled` review stores no verdict at all — the finding
+    must say so rather than describing a payload that does not exist."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="no-verdict-row")
+        conn.execute("UPDATE dispatches SET status='failed', verdict_json=NULL, created_at=? "
+                     "WHERE job_id=?", (NOW.isoformat(), "val-no-verdict-row"))
+        conn.execute("UPDATE dispatches SET validation_job_id=?, created_at=? WHERE job_id=?",
+                     ("val-no-verdict-row", NOW.isoformat(), "impl-no-verdict-row"))
+        conn.commit()
+        findings = triage._review_health_findings(conn, NOW.isoformat())
+        finding = next(f for f in findings if f["key"].startswith("review-verdicts-unusable-"))
+        assert "no verdict at all" in finding["detail"]
+        assert "does not match sideclaw's published schema" in finding["detail"]
+        assert "demo-repo" in finding["key"]
+
+
+def test_the_review_terminal_statuses_are_deterministically_ordered():
+    """`TERMINAL` is a frozenset, so a raw `tuple()` of it varies with hash
+    randomization — a public constant must not reorder between processes."""
+    assert triage._sideclaw.REVIEW_TERMINAL_STATUSES == tuple(sorted(triage._sideclaw.TERMINAL))
+    assert set(triage._sideclaw.REVIEW_TERMINAL_STATUSES) == set(triage._sideclaw.TERMINAL)
+
+
 def test_a_revision_brief_never_quotes_a_finding_that_is_not_one():
     """§117 — `_revision_findings()` reads a STORED verdict, so it must apply the same
     finding-shape gate the audit does. `{}` and `{"file": "x"}` pass a bare

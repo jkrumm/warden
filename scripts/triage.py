@@ -5930,6 +5930,11 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     since_dt = _parse_ts(since)
     if since_dt is None:
         raise ValueError(f"invalid self-audit window start: {since!r}")
+    # A naive bound is the ledger's own (naive UTC) format, not host-local: letting
+    # `astimezone()` infer the machine's zone would shift the window by the host's
+    # offset on any non-UTC box, silently widening or narrowing the audit.
+    if since_dt.tzinfo is None:
+        since_dt = since_dt.replace(tzinfo=dt.timezone.utc)
     since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
     placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
     sql = (
@@ -6005,10 +6010,12 @@ def _unusable_verdict_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Re
         suffix = f" (+{remainder} more)" if remainder else ""
         findings.append({
             "key": f"review-verdicts-unusable-{repo}",
-            "title": f"{len(distinct)} item(s) in {repo} have unusable step-7 review verdicts "
-                     f"in the last {SELF_AUDIT_WINDOW_DAYS} days",
-            "detail": f"stored verdicts do not match sideclaw's published schema, outcome, or finding "
-                      f"shape; item IDs: {sample}{suffix}. The self-audit cannot safely read them as passes",
+            "title": f"{len(distinct)} item(s) in {repo} have an unusable or missing step-7 review "
+                     f"verdict in the last {SELF_AUDIT_WINDOW_DAYS} days",
+            "detail": f"their latest terminal review stored no verdict at all (failed, interrupted or "
+                      f"cancelled before a result existed), or stored one that does not match sideclaw's "
+                      f"published schema, outcome and finding shape; item IDs: {sample}{suffix}. The "
+                      f"self-audit cannot read either as a pass",
         })
     return findings
 
