@@ -317,7 +317,10 @@ loop.
   monkeypatch `triage.check_invariants` / `_restore_drill_findings` /
   `_audit_section`, so moving them moves the seam those 248 patchers sit on — a
   behaviour-neutral refactor that needs its own review round, and growing a
-  verified PR to do it is what §66 warns against.
+  verified PR to do it is what §66 warns against. **Now tracked as issue #8**
+  (`warden:skip` until this branch merges, so the two don't collide in the same
+  file); the other review-round deferral, the expression index that would let the
+  window query drop its non-sargable term, is issue #9 under the same label.
 - `_fetch_terminal_reviews()` self-joins `dispatches` every hour (§118/§122).
   **The index existed; the query shape disabled it.** `idx_dispatches_created`
   covers `created_at`, but wrapping it in `datetime(...)` forced a full scan. The

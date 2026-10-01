@@ -65,7 +65,7 @@ serves that stored value as `self_audit` (it never runs the audit itself):
 | `invariants_error` | present only when the invariant check itself raised |
 | `findings` | the live self-audit finding keys, e.g. `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>`, `liveness-never-confirms-<repo>`, `fixed-reopened-<event>`, `revisions-exhausted-<event>`, `self-audit-slow`, `self-audit-section-failed-<name>` |
 | `self_audit_ms` | cost of the tick's own work — invariants plus the five sections; the part that grows with the ledger's history |
-| `event_sync_ms` | cost of the event sync that follows it; scales with the number of live findings, not with history |
+| `event_sync_ms` | cost of the whole event sync — per-finding upserts plus the sweep that resolves events whose finding is gone; scales with the number of live findings, not with history |
 
 ### `GET /metrics`
 

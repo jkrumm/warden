@@ -9793,6 +9793,20 @@ meaning and the five-plus finding keys are now tabled there. Cleanups: `_review_
 three gates call `_review_verdict_problems()` directly; the fold's placeability test is a named
 predicate (`_row_is_placeable()`); the three stray blank lines are collapsed.
 
+**Thirtieth round.** **Zero blockers** for the second round running — the loop has converged on
+correctness; what remains is polish in the hardening this branch added. Two improvements, both
+real: `event_sync_ms` started after the per-finding upserts, so it measured only the resolve
+sweep and matched neither half of the sync — the clock now opens before the upserts and closes
+at the cursor write; and the fold-purity test carried a private copy of the row builder, so it
+could drift from the shape the fold reads — it calls `_review_row()` now. Two discussions were
+deferrals this branch has already declined twice, so instead of a fifth note they became tracked
+issues: **#8** (extract the review-verdict subsystem — the seam is real, `_ReviewRow` is already
+its own Protocol) and **#9** (expression index on `datetime(created_at)`, then collapse the
+widened pre-filter and the Python re-filter into one clause). Both are labelled `warden:skip`
+until this branch merges: warden ingests every open issue by default, and an extraction episode
+starting from master would rewrite the same functions this PR is hardening. The label did not
+exist in the repo — the code has read `GITHUB_SKIP_LABEL` for a while, so it was created.
+
 **Verified.** `tests/test_triage.py` at **391/391** (354 before, +37); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no

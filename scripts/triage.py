@@ -7042,6 +7042,11 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
         })
     now_iso = _now_iso(now)
     live_keys = {f["key"] for f in findings}
+    # Everything from here to the cursor write is the sync — the per-finding lookup and
+    # insert/update AND the sweep that resolves events whose finding is gone. Timed as one
+    # block: stopping the clock between them, as an earlier round did, stored a number that
+    # matched neither half (§127).
+    sync_started = dt.datetime.now(dt.timezone.utc)
     for f in findings:
         payload = json.dumps({"first_text": f"{f['title']} — {f['detail']}"[:1500]})
         ev = conn.execute("SELECT id, resolved_at FROM events WHERE source=? AND external_id=?",
@@ -7055,7 +7060,6 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
                          (now_iso, f["title"][:300], payload, ev["id"]))
         else:
             conn.execute("UPDATE events SET title=?, payload_json=? WHERE id=?", (f["title"][:300], payload, ev["id"]))
-    sync_started = dt.datetime.now(dt.timezone.utc)
     for ev in conn.execute("SELECT id, external_id FROM events WHERE source=? AND resolved_at IS NULL",
                            (SELF_SOURCE,)).fetchall():
         if ev["external_id"] not in live_keys:

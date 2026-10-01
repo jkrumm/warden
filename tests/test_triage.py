@@ -9800,10 +9800,10 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
     seq = itertools.count()
 
     def row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00"):
-        return {"repo": "demo-repo", "event_id": event_id, "implement_job_id": job,
-                "verdict_json": None if verdict is None else json.dumps(verdict),
-                "review_status": status, "created_at": created_at, "id": next(seq),
-                "implement_created_at": created_at}
+        # The module-level helper, so this test cannot drift from the row shape the fold
+        # reads (§127); only the id source is local.
+        return _review_row(event_id, job, verdict, status=status, created_at=created_at,
+                           row_id=next(seq))
 
     rows = [
         row(1, "impl-1a", complete_blocking),   # blocked, then accepted: not blocked
