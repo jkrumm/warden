@@ -79,6 +79,15 @@ TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(TERMINAL))
 # name — so that difference is reported, not treated as a mismatch.
 REVIEW_FINDING_REQUIRED = frozenset({"file", "message"})
 
+# The names warden's runtime READS OFF a RESULT envelope, and therefore has to be promised by the
+# producer's published `output.required` (§140). `assert_result_schema()` reads `schemaVersion`,
+# `assert_outcome()` reads `outcome`, and `_review_verdict_problems()` reads `blocking`; all three
+# fail CLOSED on a result that lacks one, which is why a producer that stopped requiring one —
+# without touching its version or its outcome vocabulary — would leave this comparison green and
+# have every review parked `needs_human` with nothing saying why. A tuple, not a set: the refusal
+# names them in the order the runtime depends on them.
+REVIEW_OUTPUT_REQUIRED = ("schemaVersion", "outcome", "blocking")
+
 
 def is_review_finding(entry: Any) -> bool:
     """True when `entry` is one published review finding.
@@ -539,11 +548,19 @@ def _published_finding_shape(
             raise _UnreadableShape(
                 "`output.required` is not a list of names, so the promise that a non-clean "
                 "outcome publishes `blocking` cannot be read")
-        if "blocking" not in output_required:
+        # The whole envelope the runtime reads, not only `blocking` (§140): the runtime reads
+        # `schemaVersion`, `outcome` and `blocking` off every result and refuses one that lacks
+        # any of them, so the promise has to cover all three. Names checked against the LIVE
+        # producer, which lists them all — this is a check, not a refusal of the real shape.
+        unpromised = [name for name in REVIEW_OUTPUT_REQUIRED if name not in output_required]
+        if unpromised:
+            names = ", ".join(f"`{name}`" for name in unpromised)
             raise _UnreadableShape(
-                "a non-clean outcome must publish `blocking`, and `output.required` does not "
-                "list it (a conditional requirement is not readable here): the runtime refuses a "
-                "findings-shaped verdict without it, so every actionable review would be unusable")
+                f"`output.required` does not list {names}, and the runtime reads "
+                f"{'that' if len(unpromised) == 1 else 'those'} off every result and fails closed "
+                "without it (a conditional requirement is not readable here): a producer that "
+                "stopped requiring one would leave this comparison green while every affected "
+                "review was parked as unusable")
         blocking = _require_object(
             container, "blocking", "`output.properties.blocking` schema object")
         if blocking.get("type") != "array":

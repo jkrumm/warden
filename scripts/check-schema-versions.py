@@ -58,7 +58,7 @@ def main(argv: list[str]) -> int:
             # `published` discriminates the union: below this line the other keys are proven
             # present, which is why the report is a union of two TypedDicts and not one with
             # optional fields.
-            if shape and shape["published"] is False:
+            if shape is not None and shape["published"] is False:
                 # The reason is printed because the two causes it distinguishes send an operator
                 # to different places: no finding object at all is a producer that stopped
                 # publishing one, while a `blocking` that is no longer an array is a container

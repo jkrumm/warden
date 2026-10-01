@@ -421,18 +421,50 @@ _REVIEW_SCHEMA_OUTPUT = {
 }
 
 
-def test_check_schema_versions_ok():
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
-            "output": _REVIEW_SCHEMA_OUTPUT,
-        }),
+# The three names the runtime reads off a result — spelled once, so a fixture that satisfies the
+# promise cannot drift from what the check requires (§140).
+_PROMISED = list(sideclaw.REVIEW_OUTPUT_REQUIRED)
+
+_LIVE = object()
+
+
+def _stub_schemas(*, review_version: Any = _LIVE, review_outcomes: Any = _LIVE,
+                  review_output: Any = _LIVE, dispatch_version: Any = _LIVE,
+                  dispatch_outcomes: Any = _LIVE) -> "_StubServer":
+    """The two `/api/*-schema` routes every schema-check test needs, each part overridable.
+
+    Extracted because the stanza was copy-pasted into eight tests and the copies had already
+    drifted from the live producer twice: `output.required` was missing from all of them (which is
+    what made §137's hole invisible for three rounds), and the container fixtures kept a
+    `required` list the producer does not publish. A fixture a test has to restate is a fixture
+    that will be wrong in seven places.
+
+    `_LIVE` means "the live-shaped value"; passing `None` for `review_output` means the body
+    carries NO `output` key at all, which is a different producer (it publishes no schema) from one
+    whose `output` is null."""
+    def pick(value: Any, live: Any) -> Any:
+        return live if value is _LIVE else value
+
+    dispatch: dict[str, Any] = {
+        "ok": True,
+        "version": pick(dispatch_version, sideclaw.DISPATCH_SCHEMA_VERSION),
+        "outcomes": pick(dispatch_outcomes, list(sideclaw.DISPATCH_OUTCOMES)),
+    }
+    review: dict[str, Any] = {
+        "ok": True,
+        "version": pick(review_version, sideclaw.REVIEW_SCHEMA_VERSION),
+        "outcomes": pick(review_outcomes, list(sideclaw.REVIEW_OUTCOMES)),
+    }
+    if review_output is not None:
+        review["output"] = json.loads(json.dumps(pick(review_output, _REVIEW_SCHEMA_OUTPUT)))
+    return _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, dispatch),
+        ("GET", "/api/review-schema"): (200, review),
     })
+
+
+def test_check_schema_versions_ok():
+    srv = _stub_schemas()
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         results = sideclaw.check_schema_versions()
@@ -443,17 +475,7 @@ def test_check_schema_versions_ok():
 
 
 def test_check_schema_versions_version_mismatch():
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION + 1,
-            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
-            "output": _REVIEW_SCHEMA_OUTPUT,
-        }),
-    })
+    srv = _stub_schemas(dispatch_version=sideclaw.DISPATCH_SCHEMA_VERSION + 1)
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         results = sideclaw.check_schema_versions()
@@ -467,17 +489,7 @@ def test_check_schema_versions_outcome_set_mismatch():
     """A version match with a DIFFERENT outcome set is still a mismatch —
     sideclaw could add/rename an outcome without bumping the version, and a
     consumer that only compared `version` would silently miss it."""
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-            "outcomes": [*sideclaw.DISPATCH_OUTCOMES, "a_new_outcome"],
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
-            "output": _REVIEW_SCHEMA_OUTPUT,
-        }),
-    })
+    srv = _stub_schemas(dispatch_outcomes=[*sideclaw.DISPATCH_OUTCOMES, "a_new_outcome"])
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         results = sideclaw.check_schema_versions()
@@ -495,16 +507,7 @@ def test_check_schema_versions_catches_a_finding_shape_that_lost_a_required_fiel
     items = output["properties"]["blocking"]["items"]
     items["required"] = ["file", "angle"]
     items["properties"].pop("message")
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": output,
-        }),
-    })
+    srv = _stub_schemas(review_output=output)
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         review = sideclaw.check_schema_versions()["review"]
@@ -520,16 +523,7 @@ def test_check_schema_versions_catches_a_finding_shape_that_lost_a_required_fiel
 def test_check_schema_versions_treats_an_unpublished_finding_shape_as_a_disagreement():
     """No readable shape is a finding, not a reason to skip: the alternative is warden's copy
     being unverifiable, which is exactly the drift the comparison exists to catch."""
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
-        }),
-    })
+    srv = _stub_schemas(review_output=None)
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         review = sideclaw.check_schema_versions()["review"]
@@ -551,16 +545,7 @@ def test_a_producer_that_stops_requiring_blocking_fails_the_schema_check():
     for required in ([], ["outcome", "summary", "schemaVersion"], "blocking"):
         output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
         output["required"] = required
-        srv = _StubServer({
-            ("GET", "/api/dispatch-schema"): (200, {
-                "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-                "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-            }),
-            ("GET", "/api/review-schema"): (200, {
-                "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-                "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": output,
-            }),
-        })
+        srv = _stub_schemas(review_output=output)
         os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
         try:
             review = sideclaw.check_schema_versions()["review"]
@@ -573,6 +558,35 @@ def test_a_producer_that_stops_requiring_blocking_fails_the_schema_check():
     # …and the live producer's own list, which does promise it, reads as a comparison.
     live = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
     assert isinstance(live, sideclaw.PublishedFindingShape), live
+
+
+def test_a_producer_that_stops_requiring_a_runtime_read_name_fails_the_schema_check():
+    """§140 — the same promise as §137, one level up and one name wider. The check required
+    `blocking` in `output.required` and never `schemaVersion` or `outcome`, which the runtime reads
+    off every RESULT and fails closed without (`assert_result_schema()`, `assert_outcome()`). A
+    producer could stop requiring either — same version, same outcome vocabulary, item schema
+    untouched — and this comparison would report success while every review it emitted was parked
+    `needs_human` with nothing saying why. Each name is dropped on its own here, and the refusal
+    has to name the one that moved."""
+    # The fixture must promise what the runtime reads, or this test would prove nothing.
+    assert set(sideclaw.REVIEW_OUTPUT_REQUIRED) <= set(_REVIEW_SCHEMA_OUTPUT["required"]), \
+        sideclaw.REVIEW_OUTPUT_REQUIRED
+    for name in sideclaw.REVIEW_OUTPUT_REQUIRED:
+        output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+        output["required"] = [n for n in output["required"] if n != name]
+        srv = _stub_schemas(review_output=output)
+        os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+        try:
+            review = sideclaw.check_schema_versions()["review"]
+        finally:
+            srv.stop()
+        assert review["ok"] is False, (name, review)
+        shape = review["findingShape"]
+        assert shape["published"] is False, (name, shape)
+        assert f"`{name}`" in shape["reason"], (name, shape)
+    # …and the names the producer publishes BEYOND those three are tolerated, not required: this
+    # is a check on the promise warden reads, not a mirror of the whole schema.
+    assert set(_REVIEW_SCHEMA_OUTPUT["required"]) > set(sideclaw.REVIEW_OUTPUT_REQUIRED)
 
 
 def test_is_review_finding_reads_the_required_set_from_the_one_constant():
@@ -608,16 +622,7 @@ def test_a_blocking_container_that_is_no_longer_an_array_fails_the_schema_check(
     for blocking_type in ("object", ["array", "null"]):
         output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
         output["properties"]["blocking"]["type"] = blocking_type
-        srv = _StubServer({
-            ("GET", "/api/dispatch-schema"): (200, {
-                "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-                "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-            }),
-            ("GET", "/api/review-schema"): (200, {
-                "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-                "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": output,
-            }),
-        })
+        srv = _stub_schemas(review_output=output)
         os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
         try:
             review = sideclaw.check_schema_versions()["review"]
@@ -683,12 +688,13 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     # One level down, the same case the first guard covers: `properties` reached with `or {}`
     # raises on a truthy non-dict, and it is the level a drifted body is most likely to break.
     assert "properties" in reason({"output": {"properties": "yes"}})
-    assert "blocking" in reason({"output": {"required": ["blocking"], "properties": {"blocking": ["x"]}}})
+    assert "blocking" in reason({"output": {"required": _PROMISED, "properties": {"blocking": ["x"]}}})
     # `blocking` typed but its `items` unreadable: the guards reach the level below too.
     assert "items" in reason(
-        {"output": {"required": ["blocking"], "properties": {"blocking": {"type": "array", "items": "x"}}}})
+        {"output": {"required": _PROMISED, "properties": {"blocking": {"type": "array", "items": "x"}}}})
 
-    def body(blocking_type: Any, items_type: Any, *, required: Any = ("outcome", "blocking")) -> Any:
+    def body(blocking_type: Any, items_type: Any,
+             *, required: Any = sideclaw.REVIEW_OUTPUT_REQUIRED) -> Any:
         """A published body whose FIELD NAMES never change — only the containers around them."""
         return {"output": {"required": list(required), "properties": {"blocking": {
             "type": blocking_type,
@@ -715,14 +721,14 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     # set of its own characters (silently passing a name check it should fail) and a number
     # would raise TypeError out of a function that is documented never to raise.
     for bad in ("file", 7, {"file": 1}, [7], ["file", 7]):
-        why = reason({"output": {"required": ["blocking"], "properties": {"blocking": {"type": "array", "items": {
+        why = reason({"output": {"required": _PROMISED, "properties": {"blocking": {"type": "array", "items": {
             "type": "object",
             "properties": {"file": {}, "message": {}}, "required": bad}}}}})
         assert "required" in why or "items" in why, (bad, why)
     # An empty `properties` carries no shape either — that is "not published", not "nothing
     # required".
     assert "publishes no fields" in reason(
-        {"output": {"required": ["blocking"], "properties": {"blocking": {"type": "array", "items": {
+        {"output": {"required": _PROMISED, "properties": {"blocking": {"type": "array", "items": {
             "type": "object", "properties": {}, "required": []}}}}})
     # …and the same shape read from a well-formed body still works, types included.
     shape = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
@@ -741,16 +747,7 @@ def test_check_schema_versions_catches_a_field_that_was_retyped_but_not_renamed(
     type is not assumed to be a string."""
     retyped = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
     retyped["properties"]["blocking"]["items"]["properties"]["file"] = {"type": "array"}
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": retyped,
-        }),
-    })
+    srv = _stub_schemas(review_output=retyped)
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         review = sideclaw.check_schema_versions()["review"]
@@ -764,16 +761,7 @@ def test_check_schema_versions_catches_a_field_that_was_retyped_but_not_renamed(
     # and "any type" is not a promise it can rely on.
     untyped = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
     untyped["properties"]["blocking"]["items"]["properties"]["message"] = {}
-    srv = _StubServer({
-        ("GET", "/api/dispatch-schema"): (200, {
-            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
-        }),
-        ("GET", "/api/review-schema"): (200, {
-            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
-            "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": untyped,
-        }),
-    })
+    srv = _stub_schemas(review_output=untyped)
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
         review = sideclaw.check_schema_versions()["review"]

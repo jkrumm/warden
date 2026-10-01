@@ -906,6 +906,16 @@ byte-identical would leave every field name and both containers green, and have 
 review parked as unusable with nothing saying why. A conditional requirement (`if`/`then`) cannot
 be read as a plain promise and is refused rather than assumed.
 
+The promise covers every name the runtime READS OFF A RESULT, not only `blocking` (§140).
+`assert_result_schema()` reads `schemaVersion`, `assert_outcome()` reads `outcome`, and
+`_review_verdict_problems()` reads `blocking` — each fails CLOSED on a result missing its name. The
+check required `blocking` and nothing else, so a producer that stopped requiring `schemaVersion` or
+`outcome`, while keeping its version, its outcome vocabulary and the whole item schema byte-identical,
+left this comparison green while every review it emitted was parked `needs_human` with nothing saying
+why. `REVIEW_OUTPUT_REQUIRED` is that list — one definition of what the runtime reads, checked against
+the live producer, which promises all three — and the refusal names which one moved. Measured by
+reverting it: with the old check, dropping `schemaVersion` alone reports `ok: True`.
+
 The CONTAINERS are part of that contract too (§135), not only the field names inside them.
 `blocking` must be exactly an array and its `items` exactly an object, because that is what the
 runtime does with them: `_review_verdict_problems()` iterates `blocking` as a list and reads

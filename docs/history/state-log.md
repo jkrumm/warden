@@ -10045,6 +10045,35 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-fifth round.** `needs-human`: one blocker, two improvements, no discussions. Architect,
+resilience and api-contract all approved clean.
+
+The blocker was §137's promise one name wider, and it is the same fail-open shape three rounds in a
+row have now closed: the check required `blocking` in `output.required` and never `schemaVersion` or
+`outcome`, which the runtime reads off every RESULT and refuses to proceed without. A producer could
+stop requiring either — same version, same outcome vocabulary, item schema byte-identical — and this
+comparison would report `ok: True` while every review it emitted was parked `needs_human` with
+nothing saying why. `REVIEW_OUTPUT_REQUIRED` is the runtime's own reading list now, checked in one
+loop, with the refusal naming the promise that moved. Proved by reverting: dropping `schemaVersion`
+alone answered `ok: True, published: True` before the change, and fails naming it after.
+
+The first improvement asked for the stub stanza eight schema tests each restated. It is one
+`_stub_schemas()` helper now, with the parts under test overridable — and the copies had already
+drifted from the live producer twice, which is the argument: `output.required` was missing from all
+eight, and the container fixtures kept a `required` list the producer does not publish. Four
+in-function fixtures were still promising only `blocking` and had to carry the runtime's list for
+their real subject to be reached at all.
+
+The second aligned the operator-facing preview with its sibling: the unreadable-report branch
+narrowed the `FindingShapeReport` union on truthiness while the branch below narrows on the
+discriminator. Both readers say `shape is not None and shape["published"] is <literal>` now.
+
+**Verified.** `tests/test_clients.py` 123 → **124/124** (+1: each runtime-read name dropped on its
+own must fail, and the names beyond the three stay tolerated), `tests/test_triage.py` **404/404**,
+every suite green; live-ledger replay unchanged at 39 judged items; drift check green against the
+running sideclaw. The walker was checked against the LIVE `/api/review-schema` after the change — the
+producer promises all three names, so this is a check and not a refusal of the real shape.
+
 **Forty-fourth round.** `needs-human`: no blockers, three improvements, one discussion — the first
 round on this branch with nothing blocking, from all three reviewer angles.
 
