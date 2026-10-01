@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable, NamedTuple
+from typing import Any, Iterable, Mapping, NamedTuple
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
@@ -5851,9 +5851,7 @@ def _partition_findings(blocking: Any) -> tuple[list[dict[str, Any]], list[dict[
     `code` and `process` split it by §114's rule for the decision; one partition pass
     means the two lists cannot disagree about what the payload contained."""
     published = _published_findings(blocking)
-    code = [f for f in published if not _is_process_only_finding(f)]
-    process = [f for f in published if _is_process_only_finding(f)]
-    return published, code, process
+    return published, _code_blocking_findings(published), _process_only_findings(published)
 
 
 def _is_completed_review(verdict: Any) -> bool:
@@ -5914,7 +5912,7 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     sql = (
         "SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
         "r.verdict_json AS verdict_json, "
-        "r.status AS review_status "
+        "r.status AS review_status, r.created_at AS created_at, r.id AS id "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' "
         "AND d.created_at >= ? AND r.status IN (" + placeholders + ") "
@@ -5923,10 +5921,18 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     return conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
 
 
-def _fold_review_status(rows: Iterable[sqlite3.Row]) -> tuple[
+def _fold_review_status(rows: Iterable[Mapping[str, Any]]) -> tuple[
         dict[str, dict[ItemKey, bool]], dict[str, dict[ItemKey, bool]]]:
     """The review-health fold — pure, so the latest-wins rule is testable without a
-    database. Returns `(per_repo, latest_unusable)`:
+    database, and typed by what it actually reads (`Mapping`): the query returns
+    `sqlite3.Row`, the unit test passes dicts, and both are mappings here.
+
+    Rows are **ordered here rather than assumed ordered**: "latest wins" is a
+    sequential dict overwrite, so shuffled input would pick an arbitrary row as an
+    item's latest with no error anywhere. Sorting by `(created_at, id)` — the review's
+    own timestamp, then its row id — makes that impossible for any caller.
+
+    Returns `(per_repo, latest_unusable)`:
 
     - `per_repo` — repo -> item key -> did that item's LATEST COMPLETE review carry a
       code finding. An item with no complete review at all (every terminal row
@@ -5941,7 +5947,7 @@ def _fold_review_status(rows: Iterable[sqlite3.Row]) -> tuple[
     item, and an earlier complete review keeps speaking (§117)."""
     per_repo: dict[str, dict[ItemKey, bool]] = {}
     latest_unusable: dict[str, dict[ItemKey, bool]] = {}
-    for r in rows:
+    for r in sorted(rows, key=lambda r: (str(r["created_at"]), r["id"])):
         # A manual `warden dispatch` has no triage event; its implement job is the
         # only identity it has, and it is a real row this audit must not drop.
         item_key: ItemKey = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]

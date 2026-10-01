@@ -9540,6 +9540,17 @@ order (the previous commit regrouped them by type, renumbering what a human read
 split from the fold (`_fetch_terminal_reviews()` → pure `_fold_review_status()`), with a unit test
 that states the latest-wins rule in seven plain rows and no database.
 
+**Fourteenth round.** Zero blockers — `resilience`, `api-contract`, `adversary` and `ocr` all clean
+and no test gaps or architecture concerns. Three notes, all applied: the fold now orders its own
+input (`sorted(rows, key=lambda r: (created_at, id))` on a projection that carries both) instead of
+trusting the query's `ORDER BY`, because "latest wins" is a sequential dict overwrite and shuffled
+input would otherwise pick an arbitrary row as an item's latest with no error anywhere — the shuffle
+test drives exactly that; `_fold_review_status()` is typed `Iterable[Mapping[str, Any]]`, which is
+what it reads (a `sqlite3.Row` and a test dict are both mappings, and the old `sqlite3.Row` hint
+described only one caller); and `_partition_findings()` delegates its split to
+`_code_blocking_findings()` / `_process_only_findings()` rather than re-deriving the filter, which
+restores the state-log's claim that they share one normalizer.
+
 **Verified.** `tests/test_triage.py` at **369/369** (354 before, +15); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean

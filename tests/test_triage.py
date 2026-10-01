@@ -31,6 +31,7 @@ import datetime as dt
 import time
 import importlib.util
 import io
+import itertools
 import json
 import os
 import shutil
@@ -9294,12 +9295,14 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
     complete_clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                       "outcome": "clean", "blocking": []}
 
-    def row(event_id, job, verdict, status="done"):
+    seq = itertools.count()
+
+    def row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00"):
         return {"repo": "demo-repo", "event_id": event_id, "implement_job_id": job,
                 "verdict_json": None if verdict is None else json.dumps(verdict),
-                "review_status": status}
+                "review_status": status, "created_at": created_at, "id": next(seq)}
 
-    per_repo, latest = triage._fold_review_status([
+    rows = [
         row(1, "impl-1a", complete_blocking),   # blocked, then accepted: not blocked
         row(1, "impl-1b", complete_clean),
         row(2, "impl-2", complete_blocking),
@@ -9307,7 +9310,11 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
         row(4, "impl-4a", complete_blocking),   # blocked, then unreadable: still blocked
         row(4, "impl-4b", None, status="failed"),
         row(5, "impl-5", None, status="failed"),  # no complete review at all: absent
-    ])
+    ]
+    per_repo, latest = triage._fold_review_status(rows)
+    # The fold orders its own input: the same rows shuffled give the same answer.
+    for shuffled in (list(reversed(rows)), rows[3:] + rows[:3]):
+        assert triage._fold_review_status(shuffled) == (per_repo, latest)
     assert per_repo == {"demo-repo": {1: False, 2: True, 3: True, 4: True}}
     assert latest == {"demo-repo": {1: False, 2: False, 3: False, 4: True, 5: True}}
     # A manual dispatch has no triage event, so its implement job is the item key.
