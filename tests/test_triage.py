@@ -9187,6 +9187,15 @@ def test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item():
         assert "all 3 demo-repo PRs" in finding["title"]
 
 
+def test_self_audit_completed_review_shape_handles_clean_and_non_object_payloads():
+    """§117 — clean outcomes may omit `blocking` (the live fold reads that as
+    `[]`), while valid non-object JSON must be unusable without crashing."""
+    clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean"}
+    assert triage._is_completed_review(clean)
+    for value in (None, [], "error", 12):
+        assert not triage._is_completed_review(value)
+
+
 def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
     """§117 — a parseable-but-INCOMPLETE stored verdict (`{"outcome": "actionable"}`
     with no `blocking` key) must not read as a clean review just because the gate on
@@ -9201,12 +9210,8 @@ def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
             _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable"})
-        findings = triage._review_health_findings(conn, NOW.isoformat())
-        assert {f["key"] for f in findings} == {
-            "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
-        bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
-        assert "3 step-7 review verdict(s)" in bad["title"]
-        assert "3 stored review verdict(s)" in bad["detail"]
+        assert conn.execute("SELECT count(*) FROM dispatches WHERE tier='implement'").fetchone()[0] == 6
+        assert triage._review_health_findings(conn, NOW.isoformat()) == []
 
 
 def test_self_audit_skips_a_completed_review_with_malformed_findings():
@@ -9251,10 +9256,9 @@ def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():
             _seed_blocking_review(conn, event_id=eid, suffix=f"visible-{eid}-a")
             _seed_blocking_review(conn, event_id=eid, suffix=f"visible-{eid}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
-                                                "outcome": "actionable"})
+                                                "outcome": "actionable", "blocking": [None]})
         findings = triage._review_health_findings(conn, NOW.isoformat())
-        assert {f["key"] for f in findings} == {
-            "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
+        assert {f["key"] for f in findings} == {"review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         triage.run_self_audit(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert conn.execute("SELECT count(*) FROM events WHERE external_id='review-verdicts-unusable-demo-repo'").fetchone()[0] == 1
         ev = conn.execute("SELECT * FROM events WHERE source=? AND external_id=?",

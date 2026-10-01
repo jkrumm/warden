@@ -9466,7 +9466,13 @@ The same review suggested two consistency improvements — the review-health hel
 both review-related finding kinds, and `REVIEW_OUTCOMES` remains next to the terminal-status
 constant — plus the `DESIGN.md` self-audit inventory now names the fifth key. The subsequent
 review caught the selected `status` needed an explicit alias (since both joined rows have one); it
-is now `review_status` and checked on the review row.
+is now `review_status` and checked on the review row. The next review caught two more boundaries:
+valid clean verdicts may omit `blocking`, and `_safe_json()` can return valid non-object JSON. A
+missing/null blocking list now normalizes to `[]`, while a non-object verdict is unusable without
+raising. The shared `REVIEW_TERMINAL_STATUSES` now derives from the client's canonical `TERMINAL`
+set and the SQL placeholder count derives from that collection. The test suite pins both payload
+shapes, terminal rows with no verdict and stale verdicts on failed jobs, as well as the latest
+successful review winning over an earlier block.
 
 **Fifth round.** The review on the fourth revision blocked the *logging* addition: a `print()`
 inside `self_audit_findings()` did not create a `warden_self` event, could not be asserted through

@@ -5842,7 +5842,11 @@ def _is_completed_review(verdict: dict[str, Any]) -> bool:
     finding's message. Each is unusable — never a pass that clears a code-blocked
     round — which is §115's blindness in another column on the one check that
     exists to notice a broken review gate."""
+    if not isinstance(verdict, dict):
+        return False
     blocking = verdict.get("blocking")
+    if blocking is None:
+        blocking = []
     schema_matches = verdict.get("schemaVersion") == _sideclaw.REVIEW_SCHEMA_VERSION
     outcome_is_known = verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
     findings_are_complete = (
@@ -5866,21 +5870,28 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     prior blocking review, and its missing result is a visible self-audit finding."""
     per_repo: dict[str, dict[int, bool]] = {}
     unusable: dict[str, int] = {}
-    for r in conn.execute(
+    terminal_status_placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
+    since_dt = _parse_ts(since)
+    if since_dt is None:
+        raise ValueError(f"invalid self-audit window start: {since!r}")
+    since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
+    sql = (
         "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json, "
         "r.status AS review_status "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' AND d.origin_event_id IS NOT NULL "
-        "AND d.created_at >= ? AND r.status IN (?,?,?,?) "
-        "ORDER BY r.created_at, r.id",
-        (since, *_sideclaw.REVIEW_TERMINAL_STATUSES),
-    ):
+        "AND d.created_at >= ? AND r.status IN (" + terminal_status_placeholders + ") "
+        "ORDER BY r.created_at, r.id"
+    )
+    rows = conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
+    for r in rows:
         verdict = _safe_json(r["verdict_json"])
         if r["review_status"] != "done" or not _is_completed_review(verdict):
             unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
             continue
+        blocking = verdict.get("blocking") or []
         per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(
-            _code_blocking_findings(verdict["blocking"]))
+            _code_blocking_findings(blocking))
     findings: list[dict[str, Any]] = []
     for repo, skipped in sorted(unusable.items()):
         findings.append({

@@ -64,7 +64,7 @@ REVIEW_OUTCOMES: tuple[str, ...] = ("clean", "actionable", "needs-human")
 # A review result speaks for an implement item only after sideclaw has reached
 # a terminal status. A terminal job may still lack a usable verdict; that case
 # is reported separately by the review self-audit, never mistaken for a pass.
-REVIEW_TERMINAL_STATUSES = ("done", "failed", "interrupted", "cancelled")
+REVIEW_TERMINAL_STATUSES = tuple(TERMINAL)
 
 
 def _base() -> str:
