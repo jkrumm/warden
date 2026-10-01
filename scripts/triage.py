@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, Protocol, TypeVar
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Protocol, TypeVar, cast
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
@@ -5934,30 +5934,72 @@ def _is_completed_review(verdict: Any) -> bool:
 ItemKey = int | str
 
 
-def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite3.Row]:
-    """Every implement→review pair in the window whose review reached a terminal status.
+def _pointer_identity_reason(row: sqlite3.Row) -> str | None:
+    """`None` when this row's pointer resolves to a REVIEW of this item; else why it does not.
+
+    ONE definition of the pair's identity. The join used to pin `r.tier='review'`,
+    `r.repo = d.repo` and `r.origin_event_id IS d.origin_event_id` and let an inner join
+    decide, which answered two different questions with one mechanism:
+
+    * ATTRIBUTION (§128) — a mismatched pointer must never be read as this item's review
+      verdict, or `review-always-blocks` can be fabricated or suppressed for an item that
+      never had that review.
+    * VISIBILITY (§129) — and it must not make the item disappear either. An inner join on
+      those predicates drops the implement row entirely, which shrinks the very denominator
+      `review-always-blocks` is computed over *and* hides the stale pointer that did it.
+
+    Same identity, two questions, so the pin is a predicate the caller can use both ways
+    rather than a join for one answer and Python for the other. `IS` semantics — two NULLs
+    match — are reproduced explicitly: a manual dispatch pair has no origin, and `NULL =
+    NULL` is not true, so `=` here (in SQL or Python) would stop reading those pairs at all.
+
+    Terminality is deliberately NOT part of this predicate: a pointer at this item's review
+    that has not finished yet is normal and belongs to no finding."""
+    if row["target_job"] is None:
+        return f"validation_job_id {row['pointer']!r} names no dispatch"
+    if row["target_tier"] != "review":
+        return (f"validation_job_id {row['pointer']!r} names a "
+                f"{row['target_tier']!r} dispatch, not a review")
+    if row["target_repo"] != row["repo"]:
+        return (f"validation_job_id {row['pointer']!r} names a review in repo "
+                f"{row['target_repo']!r}, not {row['repo']!r}")
+    target_origin, origin = row["target_event_id"], row["event_id"]
+    if not (target_origin == origin or (target_origin is None and origin is None)):
+        return (f"validation_job_id {row['pointer']!r} is another item's review "
+                f"(event {target_origin!r}, not {origin!r})")
+    return None
+
+
+class ReviewRows(NamedTuple):
+    """One query, two outcomes — and they must travel together: `terminal` are the rows that
+    ARE an item's terminal review, `mismatched` the rows whose pointer is not one, each with
+    the reason. One predicate decides which list a row lands in (§128/§129), so a caller
+    cannot take the attributed half and forget the other exists."""
+    terminal: list[sqlite3.Row]
+    mismatched: list[tuple[sqlite3.Row, str]]
+
+
+def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
+    """Every implement row in the window that has a `validation_job_id`, sorted into
+    `terminal` (the pointer resolves to this item's terminal review) and `mismatched`.
 
     The window is the IMPLEMENT job's `d.created_at`, as it always was; the row's
     `created_at` is the review's own, which is what the fold orders reviews by. A review
     result speaks for an implement item only after sideclaw reached a terminal status
-    (`_sideclaw.TERMINAL_STATUSES`); a terminal job may still lack a usable verdict, and
-    that case is reported by the review self-audit rather than mistaken for a pass.
+    (`_sideclaw.TERMINAL_STATUSES`); a terminal job may still lack a usable verdict, and that
+    case is reported by the review self-audit rather than mistaken for a pass. A pointer that
+    resolves to this item's review but has not finished is in neither list: there is nothing
+    to read yet and nothing wrong.
 
-    The join is pinned on the pair's identity, not only on the pointer: `r.tier='review'`,
-    `r.repo = d.repo` AND `r.origin_event_id IS d.origin_event_id` alongside
-    `d.validation_job_id`. The column is a pointer, and a stale or malformed one that names a
-    terminal dispatch of another tier (the live ledger has implement→investigate pairs),
-    another repo, or a *different item's* review in the same repo and tier would otherwise be
-    read as this item's review verdict — able to fabricate or suppress a merge-gating finding.
-    `IS` rather than `=` is the null-safe form: a manual dispatch pair has no origin, and
-    `NULL = NULL` is not true, so `=` would stop reading those pairs at all. Measured on the
-    live ledger before choosing it: 63 of 63 matched pairs share an origin, none differ, and
-    every implement row with a NULL origin carries no pointer — so the constraint is inert
-    today and closes the one identity case the pointer cannot prove.
+    The join resolves the pointer and nothing else — `LEFT JOIN dispatches r ON r.job_id =
+    d.validation_job_id`. Tier, repo and origin are decided by `_pointer_identity_reason()`,
+    so the second list can exist at all; a non-null pointer that resolves to nothing, to
+    another tier (the live ledger has implement→investigate pairs), to another repo, or to
+    another item's review is returned as a mismatch instead of being silently dropped.
 
-    The window compares INSTANTS, not text, and the comparison is the one below, in Python:
-    a stored `+HH:MM`/`Z`/naive timestamp is parsed, so a row cannot land in or out of the
-    window by its representation. The SQL pre-filter is only a cheap superset (widened for
+    The window compares INSTANTS, not text, and the comparison is the one at the tail, in
+    Python: a stored `+HH:MM`/`Z`/naive timestamp is parsed, so a row cannot land in or out of
+    the window by its representation. The SQL pre-filter is only a cheap superset (widened for
     real UTC offsets) that keeps `idx_dispatches_created` usable.
 
     No `ORDER BY`: `_fold_review_status()` orders its own input by parsed instant, and a
@@ -5975,19 +6017,18 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     widen = dt.timedelta(hours=26)
     naive_utc = ((since_dt - widen).astimezone(dt.timezone.utc).replace(tzinfo=None)
                  .isoformat())
-    placeholders = ",".join("?" for _ in _sideclaw.TERMINAL_STATUSES)
     sql = (
         f"SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
-        f"d.created_at AS implement_created_at, "
+        f"d.created_at AS implement_created_at, d.validation_job_id AS pointer, "
+        f"r.job_id AS target_job, r.tier AS target_tier, r.repo AS target_repo, "
+        f"r.origin_event_id AS target_event_id, "
         f"r.verdict_json AS verdict_json, "
         f"r.status AS review_status, r.created_at AS created_at, r.id AS id "
-        f"FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
-        f"WHERE d.tier='implement' AND r.tier='review' AND r.repo = d.repo "
-        f"AND r.origin_event_id IS d.origin_event_id "
+        f"FROM dispatches d LEFT JOIN dispatches r ON r.job_id = d.validation_job_id "
+        f"WHERE d.tier='implement' AND d.validation_job_id IS NOT NULL "
         f"AND (d.created_at >= ? OR datetime(d.created_at) IS NULL) "
-        f"AND r.status IN ({placeholders}) "
     )
-    rows = conn.execute(sql, (naive_utc, *_sideclaw.TERMINAL_STATUSES)).fetchall()
+    fetched = conn.execute(sql, (naive_utc,)).fetchall()
     # A row whose timestamp SQLite cannot read is admitted explicitly by the pre-filter
     # above: no comparison on a corrupt value can be a superset of anything, so without
     # that term the fail-visible rule below could never see one (§123). The price is that
@@ -5999,12 +6040,39 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     # timestamp will not parse is KEPT — a corrupt row must make the audit look at
     # something, not leave it out. The pre-filter cannot be the decision for either reason
     # (text comparison, and `>=` on a widened bound admits rows this drops).
-    # The window is the IMPLEMENT job's time, as it always was; `created_at` on the row is
-    # the review's, which is what the fold orders items' reviews by.
-    # `IS` on the origin pair is the whole identity now: pointer, tier, repo and origin, so
-    # a pointer can only ever produce the review of the item that owns it (§128).
-    return [r for r in rows
+    rows = [r for r in fetched
             if (when := _parse_ts(r["implement_created_at"])) is None or when >= since_dt]
+    terminal, mismatched = [], []
+    for r in rows:
+        reason = _pointer_identity_reason(r)
+        if reason is not None:
+            mismatched.append((r, reason))
+        elif r["review_status"] in _sideclaw.TERMINAL_STATUSES:
+            terminal.append(r)
+    return ReviewRows(terminal=terminal, mismatched=mismatched)
+
+
+def _review_fold_rows(rows: Iterable[sqlite3.Row],
+                      mismatched: Iterable[tuple[sqlite3.Row, str]]) -> list[_ReviewRow]:
+    """The fold's input: this item's terminal reviews, plus one row per mismatched pointer
+    with its verdict blanked, so §128's exclusion does not become §129's disappearance.
+
+    Blanking is the whole mechanism, and it reuses the rule already in the fold: a row with no
+    readable verdict sets `unusable` and retains an earlier readable review's `code_blocked`
+    through the same carry-forward an unreadable terminal row gets, while an item with nothing
+    readable left stays unjudged rather than entering `review-always-blocks`'s denominator.
+    Dropping the row instead would remove the item from the audit quietly — the denominator
+    shrinks and the stale pointer that caused it is never mentioned.
+
+    A mismatched row is ordered by the IMPLEMENT job's time: it has no review, so it has no
+    review time, and borrowing the target's would order this item by another item's clock."""
+    fold_rows = [dict(r) for r in rows]
+    fold_rows += [{**dict(r), "verdict_json": None, "review_status": reason,
+                   "created_at": r["implement_created_at"], "id": None}
+                  for r, reason in mismatched]
+    # The dicts satisfy `_ReviewRow` structurally (bracket access); the cast is what says so
+    # to a checker, since a plain `dict` is not also a `sqlite3.Row`.
+    return cast(list[_ReviewRow], fold_rows)
 
 
 class _ReviewRow(Protocol):
@@ -6061,13 +6129,20 @@ def _review_instant(r: _ReviewRow) -> dt.datetime | None:
     return _parse_ts(r["created_at"])
 
 
-def _review_order_key(r: _ReviewRow) -> tuple[dt.datetime, int]:
+def _review_order_key(r: _ReviewRow) -> tuple[dt.datetime, int, int]:
     """Order rows by the review's INSTANT, not its text: `created_at` is stored text, and
     two rows written with different offsets would otherwise sort by representation, so an
     item's "latest" review could be an earlier one. An unplaceable row gets the earliest
     key; the fold does not rely on that position for safety — it marks such an item
-    unusable (`_fold_review_status()`)."""
-    return (_review_instant(r) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), r["id"])
+    unusable (`_fold_review_status()`).
+
+    The middle element splits a real review (0) from a folded mismatched pointer (1), which
+    stands for an implement job and has no review id. At equal instants the unreadable
+    reading is the one to believe, so the mismatch sorts LAST and nothing gets cleared by a
+    tie-break; without the split, `r["id"]` is None for those rows and a tie would raise
+    comparing None to an int."""
+    return (_review_instant(r) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            0 if r["id"] is not None else 1, r["id"] or 0)
 
 
 def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _ReviewedItem]]:
@@ -6143,9 +6218,12 @@ def _unusable_verdict_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Re
             "title": f"{len(sorted_keys)} item(s) in {repo} have an unusable or missing step-7 review "
                      f"verdict in the last {SELF_AUDIT_WINDOW_DAYS} days",
             "detail": f"their latest terminal review stored no verdict at all (failed, interrupted or "
-                      f"cancelled before a result existed), or stored one that does not match sideclaw's "
-                      f"published schema, outcome and finding shape; item IDs: {sample}{suffix}. The "
-                      f"self-audit cannot read either as a pass",
+                      f"cancelled before a result existed), stored one that does not match sideclaw's "
+                      f"published schema, outcome and finding shape, or is a row whose "
+                      f"validation_job_id does not resolve to this item's own review (a stale pointer "
+                      f"— §129: reported here, never dropped, or the item would vanish from "
+                      f"review-always-blocks' denominator); item IDs: {sample}{suffix}. The self-audit "
+                      f"cannot read any of them as a pass",
         })
     return findings
 
@@ -6183,8 +6261,8 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     answers what the latest readable verdict did; `unusable` answers whether the latest
     terminal row can be read at all. A later unusable row does not clear a prior readable
     review's decision, but it remains visible in the fifth self-audit finding."""
-    rows = _fetch_terminal_reviews(conn, since)
-    status_by_repo = _fold_review_status(rows)
+    rows = _fetch_review_rows(conn, since)
+    status_by_repo = _fold_review_status(_review_fold_rows(rows.terminal, rows.mismatched))
     return (_unusable_verdict_findings(status_by_repo)
             + _always_blocks_findings(status_by_repo))
 

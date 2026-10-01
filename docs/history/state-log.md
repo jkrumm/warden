@@ -9822,7 +9822,26 @@ proved able to fail: one fails without the clause (it reads the foreign review),
 fails if the clause becomes `=` (the manual pair disappears). A test that cannot fail is the
 §125 finding, so the check is "remove the rule and watch it break", not "it passes".
 
-**Verified.** `tests/test_triage.py` at **393/393** (354 before, +39); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
+**Thirty-second round.** One blocker, and it is the *inverse* of the thirty-first: having pinned
+the pair's identity in the join, the inner join silently **dropped** the implement row when the
+pointer did not match. Same identity, opposite failure — §128 said a mismatched pointer must not
+be read as this item's verdict, §129 says it must not make the item disappear either, because the
+denominator `review-always-blocks` is computed over shrinks and the stale pointer that caused it
+is never mentioned. Both are right about different questions, so the pin stops being a join: the
+query resolves the pointer and nothing else (`LEFT JOIN`), and `_pointer_identity_reason()` is ONE
+predicate the audit uses both ways. Matching rows are the fold's input; mismatched ones are folded
+with their verdict blanked, which reuses the rule already in the fold — an unreadable row sets
+`unusable`, retains an earlier readable review's decision, and never enters the denominator — and
+they surface through the existing `review-verdicts-unusable-<repo>` key rather than a seventh one.
+Its order key is the implement job's time: a row with no review has no review time, and borrowing
+the target's would order this item by another item's clock. The two lists travel together in one
+`ReviewRows` tuple, so a caller cannot take the attributed half and forget the other exists.
+Measured: 0 mismatched in the live 14-day window, so the replay is unchanged at 39 items, and the
+query costs 0.185 ms (from 0.085 ms) — the tripwire, not a manual check, is what says if that ever
+matters. New tests: a mismatched pointer is reported (proved able to fail by folding only
+`rows.terminal`), and a pointer at a *running* review is neither a verdict nor a finding.
+
+**Verified.** `tests/test_triage.py` at **395/395** (354 before, +41); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean

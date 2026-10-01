@@ -788,15 +788,26 @@ they flag is already exactly one entry in the owner's list.
 | INV-7-owner-queue | anything waiting on the owner > 3 days (report only) | same |
 | TRIP (§103) | a Kuma push monitor marked `fixed` without proof it can still go DOWN | `test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding` |
 
-The self-audit reads an item's review through `d.validation_job_id`, pinned on the pair's
-whole identity — `r.tier='review'`, `r.repo = d.repo` and
-`r.origin_event_id IS d.origin_event_id`. The column is a pointer, and a stale one naming a
-terminal dispatch of another tier (the ledger has implement→investigate pairs), another
-repo, or a *different item's* review in the same repo and tier would otherwise be read as a
-verdict — able to fabricate or suppress a merge-gating finding (§121/§122/§128). `IS` is the
-null-safe form: a manual dispatch pair has no origin, and `NULL = NULL` is not true, so `=`
-would stop reading those pairs. No test in this suite can be the decision here, but both
-halves are pinned: one fails without the origin clause, one fails if it becomes `=`.
+The self-audit reads an item's review through `d.validation_job_id`, and the pointer decides
+TWO questions that must not share one mechanism:
+
+- **Attribution (§128).** Only a review whose tier, repo and origin all match the implement
+  row may be read as that item's verdict; otherwise a stale pointer naming a terminal dispatch
+  of another tier (the ledger has implement→investigate pairs), another repo, or a *different
+  item's* review fabricates or suppresses a merge-gating finding. The null-safe origin
+  comparison (`r.origin_event_id IS d.origin_event_id`) is what keeps a manual dispatch pair —
+  no origin on either side — readable at all.
+- **Visibility (§129).** The same mismatch may not make the item disappear. Deciding
+  attribution with an inner join dropped the implement row entirely, which shrinks the
+  denominator `review-always-blocks` is computed over *and* hides the stale pointer that did
+  it. So the query resolves the pointer and nothing else (`LEFT JOIN`), and the identity is a
+  predicate the audit uses both ways: matching rows are the fold's input, mismatched rows are
+  folded with their verdict blanked, which makes the item `unusable` through the same
+  carry-forward an unreadable terminal row gets — reported by
+  `review-verdicts-unusable-<repo>`, never judged.
+
+A pointer at this item's own review that has not finished yet is in neither list: nothing to
+read and nothing wrong.
 
 The window's SQL pre-filter compares the raw
 `created_at` column (keeping `idx_dispatches_created` usable) and is widened to a superset;

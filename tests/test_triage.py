@@ -8350,16 +8350,16 @@ def test_a_naive_audit_window_is_read_as_utc_not_host_local():
         aware = bound.astimezone(dt.timezone.utc).isoformat()
         # Exactly the in-window row: a host-local reading of the naive bound would add the
         # 2h-old row and make this 2.
-        assert len(triage._fetch_terminal_reviews(conn, naive)) == 1
-        assert len(triage._fetch_terminal_reviews(conn, aware)) == 1
+        assert len(triage._fetch_review_rows(conn, naive).terminal) == 1
+        assert len(triage._fetch_review_rows(conn, aware).terminal) == 1
         # The boundary is inclusive, on the implement job's own timestamp.
-        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(minutes=30)).isoformat())
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(minutes=30)).isoformat()).terminal
         assert len(rows) == 1 and rows[0]["implement_job_id"] == "impl-tz-inside"
 
 
 def _review_row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00+00:00",
                 row_id=0, implement_created_at=None):
-    """One `_fetch_terminal_reviews()` row. Both timestamps are present as the query
+    """One `_fetch_review_rows().terminal` row. Both timestamps are present as the query
     returns them: `created_at` is the review's (the fold's order key) and
     `implement_created_at` the implement job's (the window key)."""
     return {"repo": "demo-repo", "event_id": event_id, "implement_job_id": job,
@@ -8406,8 +8406,8 @@ def test_the_audit_window_is_microsecond_exact_and_never_drops_a_bad_timestamp()
 
         # The cutoff is half a second LATER: the row is outside the window, even though
         # second-truncated `datetime()` values compare equal.
-        assert triage._fetch_terminal_reviews(conn, "2026-10-01T06:00:00.500000+00:00") == []
-        assert len(triage._fetch_terminal_reviews(conn, "2026-10-01T06:00:00.000000+00:00")) == 1
+        assert triage._fetch_review_rows(conn, "2026-10-01T06:00:00.500000+00:00").terminal == []
+        assert len(triage._fetch_review_rows(conn, "2026-10-01T06:00:00.000000+00:00").terminal) == 1
 
         # A timestamp nothing can parse is KEPT, so it reaches the fold instead of
         # vanishing; the fold then orders it first. Both sides are exercised: the window
@@ -8418,7 +8418,7 @@ def test_the_audit_window_is_microsecond_exact_and_never_drops_a_bad_timestamp()
         conn.execute("UPDATE dispatches SET created_at='garbage' WHERE job_id=?",
                      ("val-precision-window",))
         conn.commit()
-        rows = triage._fetch_terminal_reviews(conn, "2026-10-01T23:59:59+00:00")
+        rows = triage._fetch_review_rows(conn, "2026-10-01T23:59:59+00:00").terminal
         assert len(rows) == 1 and rows[0]["implement_created_at"] == "garbage"
         assert triage._review_order_key(rows[0])[0] == dt.datetime.min.replace(tzinfo=dt.timezone.utc)
 
@@ -8490,11 +8490,11 @@ def test_a_pointer_at_another_tier_is_not_read_as_a_review_verdict():
                          "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                          "outcome": "clean", "blocking": []}), "val-wrong-tier"))
         conn.commit()
-        assert triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(days=1)).isoformat()) == []
+        assert triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=1)).isoformat()).terminal == []
         # It becomes visible again the moment the pointer names a real review.
         conn.execute("UPDATE dispatches SET tier='review' WHERE job_id=?", ("val-wrong-tier",))
         conn.commit()
-        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(days=1)).isoformat())
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=1)).isoformat()).terminal
         assert len(rows) == 1 and rows[0]["implement_job_id"] == "impl-wrong-tier"
 
 
@@ -8511,10 +8511,10 @@ def test_a_pointer_into_another_repo_is_not_read_as_this_review():
                          "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                          "outcome": "actionable", "blocking": [_CODE_FINDING]}), "val-cross-repo"))
         conn.commit()
-        assert triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(days=1)).isoformat()) == []
+        assert triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=1)).isoformat()).terminal == []
         conn.execute("UPDATE dispatches SET repo='demo-repo' WHERE job_id=?", ("val-cross-repo",))
         conn.commit()
-        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(days=1)).isoformat())
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(days=1)).isoformat()).terminal
         assert len(rows) == 1 and rows[0]["repo"] == "demo-repo"
 
 
@@ -8531,14 +8531,51 @@ def test_the_window_prefilter_is_an_index_friendly_superset():
             conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
                          ((NOW - age).isoformat(), f"impl-pf-{name}"))
         conn.commit()
-        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(hours=24)).isoformat())
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
         assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
         # A naive stored timestamp 2h before "now" is inside a 24h window read as UTC.
         conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
                      ((NOW - dt.timedelta(hours=2)).replace(tzinfo=None).isoformat(), "impl-pf-inside"))
         conn.commit()
-        rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(hours=24)).isoformat())
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
         assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
+
+
+def test_a_mismatched_pointer_is_reported_rather_than_dropped():
+    """§129: excluding the row (§128) must not remove the ITEM from the audit. An inner join on
+    the identity predicates dropped the implement row entirely, which shrinks the denominator
+    `review-always-blocks` is computed over and hides the stale pointer that caused it — so the
+    row is folded with its verdict blanked and the item is reported as unusable."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=42, suffix="foreign")
+        conn.execute("UPDATE dispatches SET origin_event_id=99 WHERE job_id='rev-foreign'")
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, since)
+        assert rows.terminal == []
+        assert [r["implement_job_id"] for r, _ in rows.mismatched] == ["impl-foreign"]
+        assert "another item's review" in rows.mismatched[0][1]
+        findings = triage._review_health_findings(conn, since)
+        unusable = [f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo"]
+        assert len(unusable) == 1, findings
+        assert "42" in unusable[0]["detail"], unusable[0]["detail"]
+        # Not judged: the broken pointer must not enter the always-blocks denominator.
+        assert triage._always_blocks_findings(
+            triage._fold_review_status(triage._review_fold_rows(rows.terminal, rows.mismatched))) == []
+
+
+def test_a_pointer_at_a_review_that_has_not_finished_is_neither_verdict_nor_finding():
+    """A review still running is normal: nothing to read yet and nothing wrong. Only a pointer
+    that cannot resolve to THIS item's review is a mismatch, or every in-flight review would
+    file an unusable-verdict finding."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=7, suffix="running")
+        conn.execute("UPDATE dispatches SET status='running' WHERE job_id='rev-running'")
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, since)
+        assert rows.terminal == [] and rows.mismatched == []
+        assert triage._review_health_findings(conn, since) == []
 
 
 def test_the_self_audit_summary_carries_its_schema_and_both_timings():
@@ -8598,7 +8635,7 @@ def test_a_pointer_at_another_items_review_is_not_read_as_this_items_verdict():
         # `foreign`'s review now belongs to another item; its pointer still names it.
         conn.execute("UPDATE dispatches SET origin_event_id=99 WHERE job_id='rev-foreign'")
         conn.commit()
-        rows = triage._fetch_terminal_reviews(conn, since)
+        rows = triage._fetch_review_rows(conn, since).terminal
         assert [r["event_id"] for r in rows] == [41], [dict(r) for r in rows]
 
 
@@ -8610,7 +8647,7 @@ def test_a_manual_dispatch_pair_without_an_origin_is_still_read():
     since = (NOW - dt.timedelta(days=14)).isoformat()
     with _triage_env() as (conn, ctx):
         _seed_blocking_review(conn, event_id=None, suffix="manual")
-        rows = triage._fetch_terminal_reviews(conn, since)
+        rows = triage._fetch_review_rows(conn, since).terminal
         assert [r["implement_job_id"] for r in rows] == ["impl-manual"]
         assert rows[0]["event_id"] is None
 
@@ -8629,7 +8666,7 @@ def test_a_corrupt_implement_timestamp_is_admitted_and_never_judged():
         conn.commit()
         # A window far in the FUTURE still returns it: the row's position is unknown, which
         # is exactly why it cannot be filtered by comparison.
-        rows = triage._fetch_terminal_reviews(conn, (NOW + dt.timedelta(days=365)).isoformat())
+        rows = triage._fetch_review_rows(conn, (NOW + dt.timedelta(days=365)).isoformat()).terminal
         assert [r["implement_job_id"] for r in rows] == ["impl-corrupt-window"], [
             dict(r) for r in rows]
         status = triage._fold_review_status(rows)
@@ -8711,13 +8748,13 @@ def test_the_audit_window_compares_instants_not_timestamp_text():
                      ("2026-10-01T09:35:00+00:00", "val-offset-window"))
         conn.commit()
         since = "2026-10-01T09:00:00+00:00"
-        assert len(triage._fetch_terminal_reviews(conn, since)) == 1
+        assert len(triage._fetch_review_rows(conn, since).terminal) == 1
 
         # Same text length, but the row is 09:00+01:00 == 08:00 UTC: outside the window.
         conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
                      ("2026-10-01T09:30:00+01:00", "impl-offset-window"))
         conn.commit()
-        assert triage._fetch_terminal_reviews(conn, since) == []
+        assert triage._fetch_review_rows(conn, since).terminal == []
 
 
 def test_a_failing_invariants_check_does_not_lose_the_rest_of_the_pass():

@@ -10,7 +10,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master` (00dc001), six LaunchAgents on the mini. **§116 and §117 are NOT on `master` — both ride PR #7**, branch `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`, waiting on the owner's Argo Merge click (`warden` is merge-approval gated, no `autoMergePaths`). The live loop therefore still runs the pre-§116 self-audit |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 393/393 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 395/395 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -321,15 +321,24 @@ loop.
   (`warden:skip` until this branch merges, so the two don't collide in the same
   file); the other review-round deferral, the expression index that would let the
   window query drop its non-sargable term, is issue #9 under the same label.
-- `_fetch_terminal_reviews()` self-joins `dispatches` every hour (§118/§122).
-  **The index existed; the query shape disabled it.** `idx_dispatches_created`
-  covers `created_at`, but wrapping it in `datetime(...)` forced a full scan. The
-  pre-filter now compares the raw column (widened 26h to stay a superset of the
-  window, with the exact instant comparison in Python) and `EXPLAIN QUERY PLAN`
-  reports `SEARCH d USING INDEX idx_dispatches_created`. No new index, no write
-  amplification. `self_audit_ms` in the cursor summary covers the whole tick —
-  invariants, the five sections and the event sync — so the number that would
-  justify more work is the tick's real cost.
+- `_fetch_review_rows()` resolves `dispatches.validation_job_id` against `dispatches` every
+  hour (§118/§122/§128/§129). Measured on the live copy after §129's `LEFT JOIN` and the extra
+  target columns: **0.185 ms** per call (min of 20, median 0.190), against 0.085 ms for the
+  inner-join shape — `EXPLAIN QUERY PLAN` still shows `SCAN d` for the same reason §123 added
+  the `IS NULL` term, and `self-audit-slow` is the tripwire that says when that matters.
+  **The index existed; one query shape disabled it.** `idx_dispatches_created`
+  covers `created_at`, but wrapping it in `datetime(...)` forced a full scan, so
+  the pre-filter compares the raw column (widened 26h to stay a superset of the
+  window, exact instant comparison in Python). That recovered
+  `SEARCH d USING INDEX idx_dispatches_created` in §122 — and §123's
+  corrupt-timestamp term (`OR datetime(d.created_at) IS NULL`) gave the scan back,
+  because no comparison on an unreadable value can be a superset of it. Both
+  shapes measured on the live copy: 0.085 ms each way at 379 `dispatches` rows.
+  That is the trade this branch chose knowingly — fail-visible beats an index —
+  and issue #9 is the expression index that would end it. `self_audit_ms` in the
+  cursor summary is the tick's own work (invariants + the five sections, the part
+  that grows with the ledger) and `event_sync_ms` is the sync beside it (§126);
+  `self-audit-slow` is the tripwire over the first.
 - The window's corrupt-timestamp term (`OR datetime(d.created_at) IS NULL`, §123)
   is the one predicate that puts that query back on a scan: no comparison on a
   value SQLite cannot read can be a superset of it, so a corrupt row could only
