@@ -9044,23 +9044,19 @@ def test_self_audit_turns_a_violation_into_one_event_and_resolves_it():
         assert conn.execute("SELECT resolved_at FROM events WHERE source='warden_self'").fetchone()[0] is None
 
 
+_NO_VERDICT = object()
+
+
 def _seed_blocking_review(conn, *, event_id: int, suffix: str, repo: str = "demo-repo",
                           outcome: str = "actionable", blocking: list[dict[str, Any]] | None = None,
-                          verdict_json: dict[str, Any] | None = None) -> None:
-    """One implement dispatch row plus the step-7 REVIEW row it links to — the
-    shape `self_audit_findings()` reads (`implement.validation_job_id ->
-    review.job_id`), rather than the folded `validation_status` column. The review
-    verdict lives top-level in `verdict_json`, exactly as `sync_record()` stores
-    it. `blocking` defaults to one concrete code finding; `verdict_json` replaces
-    the constructed payload outright, for a review that left no usable verdict
-    behind (no `outcome`, or one outside sideclaw's `REVIEW_OUTCOMES`). The folded
-    `validation_status` is derived the way `poll_validation_jobs()` folds it — a
-    seeded *accepted* revision should not carry `blocked` in a column this path no
-    longer reads."""
+                          verdict_json: Any = _NO_VERDICT) -> None:
+    """One implement dispatch row plus its step-7 REVIEW row. The `_NO_VERDICT`
+    sentinel distinguishes the normal constructed review from an explicit `None`
+    verdict, which is a failed terminal review with no stored payload."""
     impl_job, rev_job = f"impl-{suffix}", f"rev-{suffix}"
     blocking = blocking if blocking is not None else [
         {"file": "src/x.ts", "line": 12, "message": "the guard is gone"}]
-    if verdict_json is None:
+    if verdict_json is _NO_VERDICT:
         verdict_json = {"outcome": outcome, "blocking": blocking, "summary": "s",
                         "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION}
     if outcome == "needs-human":
@@ -9197,21 +9193,19 @@ def test_self_audit_completed_review_shape_handles_clean_and_non_object_payloads
 
 
 def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
-    """§117 — a parseable-but-INCOMPLETE stored verdict (`{"outcome": "actionable"}`
-    with no `blocking` key) must not read as a clean review just because the gate on
-    `outcome` alone let it through: `(verdict.get("blocking") or [])` collapses to
-    `[]`, which would silently overwrite a code-blocked round and suppress the
-    gate-failure the audit exists to report. A review speaks only when the stored
-    payload is a COMPLETE one — sideclaw's schema version, its published `outcome`,
-    and a `blocking` list."""
+    """§117 — a parseable-but-INCOMPLETE stored verdict with a non-clean outcome
+    and no `blocking` key must not read as a clean review or erase a prior block.
+    Clean outcomes alone may omit `blocking`; every other known outcome must
+    carry the list the reviewer publishes."""
     with _triage_env() as (conn, ctx):
         for i in range(3):
             _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-a")
             _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable"})
-        assert conn.execute("SELECT count(*) FROM dispatches WHERE tier='implement'").fetchone()[0] == 6
-        assert triage._review_health_findings(conn, NOW.isoformat()) == []
+        findings = triage._review_health_findings(conn, NOW.isoformat())
+        assert {f["key"] for f in findings} == {
+            "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
 
 
 def test_self_audit_skips_a_completed_review_with_malformed_findings():
@@ -9234,7 +9228,7 @@ def test_self_audit_skips_a_completed_review_with_malformed_findings():
         assert {f["key"] for f in findings} == {
             "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
-        assert "2 step-7 review verdict(s)" in bad["title"]
+        assert "3 step-7 review verdict(s)" in bad["title"]
 
 
 def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():

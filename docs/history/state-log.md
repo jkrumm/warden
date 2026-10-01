@@ -9469,10 +9469,12 @@ review caught the selected `status` needed an explicit alias (since both joined 
 is now `review_status` and checked on the review row. The next review caught two more boundaries:
 valid clean verdicts may omit `blocking`, and `_safe_json()` can return valid non-object JSON. A
 missing/null blocking list now normalizes to `[]`, while a non-object verdict is unusable without
-raising. The shared `REVIEW_TERMINAL_STATUSES` now derives from the client's canonical `TERMINAL`
-set and the SQL placeholder count derives from that collection. The test suite pins both payload
-shapes, terminal rows with no verdict and stale verdicts on failed jobs, as well as the latest
-successful review winning over an earlier block.
+raising. `_is_completed_review()` handles two compatibility boundaries the second review found:
+valid clean outcomes omit `blocking` (treated as empty), and `_safe_json()` can return valid
+non-object JSON (treated as unusable without raising). A non-clean outcome missing `blocking`
+is unusable and cannot clear a prior block. The terminal-status set is `tuple(TERMINAL)` from
+the same client module — one source of truth — and SQL placeholders derive from its length.
+The `DESIGN.md` self-audit inventory now names the fifth finding key.
 
 **Fifth round.** The review on the fourth revision blocked the *logging* addition: a `print()`
 inside `self_audit_findings()` did not create a `warden_self` event, could not be asserted through
