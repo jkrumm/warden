@@ -9503,11 +9503,23 @@ side. The regression drives both a scalar and a malformed-member `blocking` thro
 `poll_validation_jobs()` and asserts no merge call and `needs_human` on the row. The audit's
 per-item map collapsed to one boolean (`latest_unusable`, last write wins) in the same pass.
 
-**Verified.** `tests/test_triage.py` at **365/365** (354 before, +11); all 21 test files green.
+**Eleventh round.** The review reported a `dry_run` leak in the new branch. **Verified false, and
+pinned so it stays false:** `poll_validation_jobs()` returns before it reads a single item
+(`if dry_run: return`), so no branch of it — including the two that predate this change — can
+publish a card or move an item under a dry run. A new regression drives the fail-closed branch
+with `dry_run=True` and asserts the state, `validation_status` and Slack posts are all untouched,
+so the invariant is checked rather than assumed. The round's three refactors are in: the review
+reduce is split from the two finding formats (`_review_item_status()` → pure
+`_unusable_verdict_findings()` / `_always_blocks_findings()`), the terminal
+"set state, commit, re-render the card" sequence is one `_park_item()` the three branches share,
+and the fold no longer normalizes `blocking` twice.
+
+**Verified.** `tests/test_triage.py` at **366/366** (354 before, +12); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
-driven through `poll_validation_jobs()` (including that the merge gate fails closed on it),
+driven through `poll_validation_jobs()` (including that the merge gate fails closed on it and
+that a dry run is still a no-op),
 manual null-origin implements, mixed int/string item keys
 in one unusable report, an earlier unusable row superseded by a later clean one, and valid
 non-object input. Against a `VACUUM INTO` copy of the live ledger (53 in-window

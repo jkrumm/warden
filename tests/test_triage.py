@@ -9254,6 +9254,37 @@ def test_a_non_list_blocking_payload_does_not_crash_the_validation_tick():
             assert d["validation_status"] == "needs_human", d["validation_status"]
 
 
+def test_a_dry_run_validation_tick_is_a_no_op_even_for_an_unreadable_verdict():
+    """The dry-run contract (AGENTS.md): never touches Slack, never shells out,
+    everything else real. `poll_validation_jobs()` returns before it reads a single
+    item, so the new fail-closed branch — like the two terminal branches above it —
+    can never publish a card or move an item under `dry_run=True`."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-dry-run", investigate_job="investigate-dry")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-dry", "validation-job-dry",
+             "https://github.com/jkrumm/demo-repo/pull/12", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-dry")
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result("actionable", blocking=True, summary="malformed payload."),
+        }
+        merged: list[int] = []
+        triage._merge.plan_or_land = lambda *a, **kw: merged.append(1)
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=True)
+
+        assert merged == []
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_VALIDATING
+        assert ctx.posted == [], "a dry run must not publish a card"
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-dry",)).fetchone()
+        assert d["validation_status"] is None, d["validation_status"]
+
+
 def test_self_audit_reports_an_item_by_its_latest_row_not_an_earlier_unusable_one():
     """§117 — the unusable report follows the same "latest row wins" rule as the
     blocking count. An item whose earlier review was unusable but whose newest

@@ -5883,16 +5883,23 @@ def _is_finding_shape(finding: Any) -> bool:
             and isinstance(finding.get("message"), str) and bool(finding["message"].strip()))
 
 
-def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
-    """Report a review gate blocking every reviewed item, plus terminal review
-    rows whose results cannot safely count as passes. Last COMPLETE successful
-    review per item wins; a later unusable or non-successful job cannot erase a
-    prior blocking review, and its missing result is a visible self-audit finding."""
+def _review_item_status(conn: sqlite3.Connection, since: str) -> tuple[
+        dict[str, dict[Any, bool]], dict[str, dict[Any, bool]]]:
+    """The review-health reduce, split from the two finding formats it feeds.
+
+    Returns `(per_repo, latest_unusable)`:
+
+    - `per_repo` — repo -> item key -> did that item's LATEST COMPLETE review carry a
+      code finding. Items whose latest row is unreadable are absent (an item nobody
+      has judged must not dilute the `n >= 3` bar).
+    - `latest_unusable` — repo -> item key -> is that item's latest terminal row
+      unreadable. Every item with a terminal row appears here, so the caller can tell
+      "no applicable row" from "a row nobody can read".
+
+    Rows are ordered oldest-first, so the last write for an item wins: a later
+    unreadable row is reported, but it neither sets nor clears the item's status,
+    because only a COMPLETE review speaks for an item (§117)."""
     per_repo: dict[str, dict[Any, bool]] = {}
-    # repo -> item key -> is that item's LAST terminal review row unreadable. Last
-    # write wins (rows are ordered oldest-first), so this is a plain assignment: a
-    # later unusable row is reported, but it neither sets nor clears the item's
-    # status, because only a COMPLETE review speaks for an item (§117).
     latest_unusable: dict[str, dict[Any, bool]] = {}
     terminal_status_placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
     since_dt = _parse_ts(since)
@@ -5906,12 +5913,9 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' "
         "AND d.created_at >= ? AND r.status IN (" + terminal_status_placeholders + ") "
-        # Latest review per item wins: ascending order means the last write for an
-        # item is its newest review (the review's own created_at, then its row id).
         "ORDER BY r.created_at, r.id"
     )
-    rows = conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
-    for r in rows:
+    for r in conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)):
         # A manual `warden dispatch` has no triage event; its implement job is the
         # only identity it has, and it is a real row this audit must not drop.
         item_key: Any = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]
@@ -5922,10 +5926,16 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
             continue
         per_repo.setdefault(r["repo"], {})[item_key] = bool(
             _code_blocking_findings(verdict.get("blocking")))
-    unusable = {repo: [k for k, unreadable in by_item.items() if unreadable]
-                for repo, by_item in latest_unusable.items()}
+    return per_repo, latest_unusable
+
+
+def _unusable_verdict_findings(latest_unusable: dict[str, dict[Any, bool]]) -> list[dict[str, Any]]:
+    """One finding per repo whose items' latest stored review cannot be read — the
+    fifth self-audit key. A bounded sample of item IDs rides along so the operator can
+    open the offending row without an ad-hoc query."""
     findings: list[dict[str, Any]] = []
-    for repo, item_keys in sorted(unusable.items()):
+    for repo, by_item in sorted(latest_unusable.items()):
+        item_keys = [k for k, unreadable in by_item.items() if unreadable]
         if not item_keys:
             continue
         distinct = sorted(set(item_keys), key=str)
@@ -5939,9 +5949,17 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
             "detail": f"stored verdicts do not match sideclaw's published schema, outcome, or finding "
                       f"shape; item IDs: {sample}{suffix}. The self-audit cannot safely read them as passes",
         })
-    for repo, by_event in sorted(per_repo.items()):
-        n = len(by_event)
-        if n >= 3 and all(by_event.values()):
+    return findings
+
+
+def _always_blocks_findings(per_repo: dict[str, dict[Any, bool]]) -> list[dict[str, Any]]:
+    """One finding per repo whose review gate code-blocked EVERY reviewed item — a
+    gate refusing all work, not a repo with bad PRs. `n >= 3` keeps a two-item repo
+    from reading as a pattern."""
+    findings: list[dict[str, Any]] = []
+    for repo, by_item in sorted(per_repo.items()):
+        n = len(by_item)
+        if n >= 3 and all(by_item.values()):
             findings.append({"key": f"review-always-blocks-{repo}",
                              "title": f"the step-7 review blocked all {n} {repo} PRs in "
                                       f"{SELF_AUDIT_WINDOW_DAYS} days",
@@ -5950,23 +5968,39 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     return findings
 
 
+def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
+    """Both review-gate findings: a gate that blocks every reviewed item, and terminal
+    reviews whose stored results cannot safely count as passes."""
+    per_repo, latest_unusable = _review_item_status(conn, since)
+    return (_unusable_verdict_findings(latest_unusable)
+            + _always_blocks_findings(per_repo))
+
+
+def _park_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
+               policy: dict[str, Any], *, state: str, note: str) -> None:
+    """Set an item's state and re-render its card — the step-7 terminal sequence. Three
+    branches of `poll_validation_jobs()` end this way (a failed job, an unreadable
+    verdict, an unreadable result schema), and one function is why a future change to
+    the sequence cannot land in one of them and miss the others."""
+    _set_state(conn, item["event_id"], state, now, note=note)
+    conn.commit()
+    fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
+    if fresh_item is not None and fresh_event is not None:
+        sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+
+
 def _unreadable_verdict(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
                         policy: dict[str, Any]) -> None:
     """A terminal step-7 review whose payload is not a complete verdict (§117's rule,
     applied at the merge gate instead of a day later in the audit): a human, with the
     reason, and never a confirm. `validation_status` is set to `needs_human` so the
-    row reads the same way here as it does on the stored-payload side, and the item's
-    card is re-rendered like every other terminal branch in `poll_validation_jobs()`."""
+    row reads the same way here as it does on the stored-payload side."""
     conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
                  ("needs_human", item["implement_job"]))
-    _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=(
+    _park_item(conn, item, now, policy, state=STATE_NEEDS_HUMAN, note=(
         "step-7 validation (unreadable verdict): the review's result does not match "
         "sideclaw's published schema, outcome or finding shape, so its findings cannot "
         "be read — failing closed rather than treating it as 'no findings'"))
-    conn.commit()
-    fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-    if fresh_item is not None and fresh_event is not None:
-        sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 
 def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -6038,28 +6072,21 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             reason = resp.get("error") or ("cancelled" if status == "cancelled" else "no further detail")
             conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
                          ("error", item["implement_job"]))
-            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
+            _park_item(conn, item, now, policy, state=STATE_MERGE_BLOCKED,
                        note=f"step-7 validation (error): {reason}")
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
             continue
 
         try:
             _sideclaw.assert_result_schema(resp, _sideclaw.REVIEW_SCHEMA_VERSION, "review")
             _sideclaw.assert_outcome(resp, _sideclaw.REVIEW_OUTCOMES, "review")
         except RemoteError as e:
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=str(e))
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+            _park_item(conn, item, now, policy, state=STATE_NEEDS_HUMAN, note=str(e))
             continue
 
         # Same nested envelope as poll_implement_jobs() above — the verdict
         # lives in `result`, never at the top level.
-        verdict = resp.get("result") if isinstance(resp.get("result"), dict) else {}
+        result = resp.get("result")
+        verdict = result if isinstance(result, dict) else {}
         # FAIL CLOSED on a verdict the loop cannot read. Normalizing a corrupt
         # `blocking` (a scalar, a non-object member) to "no findings" would fold it
         # exactly like a clean verdict and let a merge through on a payload nobody
@@ -6071,13 +6098,14 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
 
         outcome = verdict.get("outcome")
-        blocking = _published_findings(verdict.get("blocking"))
         # §114: the wrapper class is not the implementer's — see
         # _is_process_only_finding(). It must not read as `blocked` (that is what
         # spends a revision) but it must not be dropped either, so it routes to a
         # human with the finding on the card.
-        code_blocking = _code_blocking_findings(blocking)
-        process_blocking = _process_only_findings(blocking)
+        code_blocking = _code_blocking_findings(verdict.get("blocking"))
+        process_blocking = _process_only_findings(verdict.get("blocking"))
+        # The published findings, in full: what a `blocked` note quotes.
+        blocking = code_blocking + process_blocking
         summary = verdict.get("summary") or "no further detail"
 
         unknown_outcome_note = None
