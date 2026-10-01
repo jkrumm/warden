@@ -5943,11 +5943,17 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     (`_sideclaw.TERMINAL_STATUSES`); a terminal job may still lack a usable verdict, and
     that case is reported by the review self-audit rather than mistaken for a pass.
 
-    The join is pinned on the pair's identity, not only on the pointer: `r.tier='review'`
-    AND `r.repo = d.repo` alongside `d.validation_job_id`. The column is a pointer, and a
-    stale or malformed one that names a terminal dispatch of another tier (the live ledger
-    has implement→investigate pairs) or another repo would otherwise be read as that item's
-    review verdict — able to fabricate or suppress a merge-gating finding.
+    The join is pinned on the pair's identity, not only on the pointer: `r.tier='review'`,
+    `r.repo = d.repo` AND `r.origin_event_id IS d.origin_event_id` alongside
+    `d.validation_job_id`. The column is a pointer, and a stale or malformed one that names a
+    terminal dispatch of another tier (the live ledger has implement→investigate pairs),
+    another repo, or a *different item's* review in the same repo and tier would otherwise be
+    read as this item's review verdict — able to fabricate or suppress a merge-gating finding.
+    `IS` rather than `=` is the null-safe form: a manual dispatch pair has no origin, and
+    `NULL = NULL` is not true, so `=` would stop reading those pairs at all. Measured on the
+    live ledger before choosing it: 63 of 63 matched pairs share an origin, none differ, and
+    every implement row with a NULL origin carries no pointer — so the constraint is inert
+    today and closes the one identity case the pointer cannot prove.
 
     The window compares INSTANTS, not text, and the comparison is the one below, in Python:
     a stored `+HH:MM`/`Z`/naive timestamp is parsed, so a row cannot land in or out of the
@@ -5977,6 +5983,7 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
         f"r.status AS review_status, r.created_at AS created_at, r.id AS id "
         f"FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         f"WHERE d.tier='implement' AND r.tier='review' AND r.repo = d.repo "
+        f"AND r.origin_event_id IS d.origin_event_id "
         f"AND (d.created_at >= ? OR datetime(d.created_at) IS NULL) "
         f"AND r.status IN ({placeholders}) "
     )
@@ -5994,6 +6001,8 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     # (text comparison, and `>=` on a widened bound admits rows this drops).
     # The window is the IMPLEMENT job's time, as it always was; `created_at` on the row is
     # the review's, which is what the fold orders items' reviews by.
+    # `IS` on the origin pair is the whole identity now: pointer, tier, repo and origin, so
+    # a pointer can only ever produce the review of the item that owns it (§128).
     return [r for r in rows
             if (when := _parse_ts(r["implement_created_at"])) is None or when >= since_dt]
 

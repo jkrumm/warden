@@ -9807,7 +9807,22 @@ until this branch merges: warden ingests every open issue by default, and an ext
 starting from master would rewrite the same functions this PR is hardening. The label did not
 exist in the repo — the code has read `GITHUB_SKIP_LABEL` for a while, so it was created.
 
-**Verified.** `tests/test_triage.py` at **391/391** (354 before, +37); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
+**Thirty-first round.** One blocker, from the adversary alone, and it is the sharpest of the
+series: the join pinned the pointer, the tier and the repo — but not the **item**. A stale
+`validation_job_id` naming a terminal review of a *different* item in the same repo and tier
+still matched, and the verdict was attributed to `d.origin_event_id`, which can fabricate or
+suppress `review-always-blocks` for an item that never had that review. The fix is the last
+piece of the pair's identity: `AND r.origin_event_id IS d.origin_event_id`. `IS` and not `=`,
+because a manual dispatch pair has no origin and `NULL = NULL` is not true. Measured on the
+live ledger *before* choosing it, since this is exactly the shape where a tidy-looking fix
+silently drops rows: 63 of 63 matched pairs share an origin, none differ, and all six
+implement rows with a NULL origin carry no pointer at all — so the clause is inert today and
+closes the one case the pointer cannot prove. Both halves are pinned by a test that was
+proved able to fail: one fails without the clause (it reads the foreign review), the other
+fails if the clause becomes `=` (the manual pair disappears). A test that cannot fail is the
+§125 finding, so the check is "remove the rule and watch it break", not "it passes".
+
+**Verified.** `tests/test_triage.py` at **393/393** (354 before, +39); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean

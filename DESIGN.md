@@ -789,10 +789,16 @@ they flag is already exactly one entry in the owner's list.
 | TRIP (§103) | a Kuma push monitor marked `fixed` without proof it can still go DOWN | `test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding` |
 
 The self-audit reads an item's review through `d.validation_job_id`, pinned on the pair's
-whole identity — `r.tier='review'` and `r.repo = d.repo`. The column is a pointer, and a
-stale one naming a terminal dispatch of another tier (the ledger has implement→investigate
-pairs) or another repo would otherwise be read as a verdict — able to fabricate or
-suppress a merge-gating finding (§121/§122). The window's SQL pre-filter compares the raw
+whole identity — `r.tier='review'`, `r.repo = d.repo` and
+`r.origin_event_id IS d.origin_event_id`. The column is a pointer, and a stale one naming a
+terminal dispatch of another tier (the ledger has implement→investigate pairs), another
+repo, or a *different item's* review in the same repo and tier would otherwise be read as a
+verdict — able to fabricate or suppress a merge-gating finding (§121/§122/§128). `IS` is the
+null-safe form: a manual dispatch pair has no origin, and `NULL = NULL` is not true, so `=`
+would stop reading those pairs. No test in this suite can be the decision here, but both
+halves are pinned: one fails without the origin clause, one fails if it becomes `=`.
+
+The window's SQL pre-filter compares the raw
 `created_at` column (keeping `idx_dispatches_created` usable) and is widened to a superset;
 the exact instant comparison happens in Python.
 

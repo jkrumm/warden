@@ -8585,6 +8585,36 @@ def test_a_slow_self_audit_tick_reports_itself():
         triage.SELF_AUDIT_SLOW_MS = original
 
 
+def test_a_pointer_at_another_items_review_is_not_read_as_this_items_verdict():
+    """§128: the join pins the pair's whole identity — pointer, tier, repo AND origin — so a
+    stale pointer naming a different item's review in the same repo and tier cannot be
+    attributed to this item. The tier and repo pins closed the cross-tier and cross-repo
+    cases; this closes the one the pointer cannot prove, where reading it would fabricate or
+    suppress a merge-gating finding for the wrong item."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=41, suffix="own")
+        _seed_blocking_review(conn, event_id=42, suffix="foreign")
+        # `foreign`'s review now belongs to another item; its pointer still names it.
+        conn.execute("UPDATE dispatches SET origin_event_id=99 WHERE job_id='rev-foreign'")
+        conn.commit()
+        rows = triage._fetch_terminal_reviews(conn, since)
+        assert [r["event_id"] for r in rows] == [41], [dict(r) for r in rows]
+
+
+def test_a_manual_dispatch_pair_without_an_origin_is_still_read():
+    """`IS` and not `=`: with no origin on either side the pair still matches, so the identity
+    pin does not quietly drop manual dispatches — `NULL = NULL` is not true, and the live
+    ledger has six implement rows with a NULL origin (all without a pointer today, which is
+    why the pin is inert there rather than load-bearing)."""
+    since = (NOW - dt.timedelta(days=14)).isoformat()
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=None, suffix="manual")
+        rows = triage._fetch_terminal_reviews(conn, since)
+        assert [r["implement_job_id"] for r in rows] == ["impl-manual"]
+        assert rows[0]["event_id"] is None
+
+
 def test_a_corrupt_implement_timestamp_is_admitted_and_never_judged():
     """§123: no comparison on a corrupt value can be a superset, so the SQL pre-filter
     admits unreadable timestamps explicitly. The row then reaches the fold, marks its item
