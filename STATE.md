@@ -307,6 +307,14 @@ loop.
 
 - `triage.py` stays one 6.6k-line file: 248 tests patch its globals by
   name, a split buys no behaviour (§66). Dead code: none (AST-verified, §65).
+- The review-verdict concern (fold, shape gates, self-audit findings, revision
+  brief — the §104–§117 block) is the one extractable module in `triage.py`,
+  and §118's reviewer asked for it a third time. **Deferred to its own PR, not
+  this hardening branch:** the tests reach those functions as `triage.<name>`
+  and monkeypatch `triage.check_invariants` / `_restore_drill_findings` /
+  `_audit_section`, so moving them moves the seam those 248 patchers sit on —
+  a behaviour-neutral refactor that nonetheless needs its own review round,
+  and growing a verified PR to do it is what §66 warns against.
 - `warden.py` still carries its own `_secrets_run_path` copy (left out of the
   §66 consolidation because the `close` verb landed in the same file at the
   same time).

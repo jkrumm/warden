@@ -9672,7 +9672,20 @@ real class), the `_partition_findings()` split derives both lists from one norma
 fallbacks are gone as unreachable behind the shape gate, and `_is_completed_review()` requires
 `1 <= version` — version 0 never existed, so a stored 0 is a corrupt payload, not an older format.
 
-**Verified.** `tests/test_triage.py` at **381/381** (354 before, +27); all 21 test files green.
+**Twenty-second round.** Zero blockers, three notes. One is a flip-flop worth naming: §114 asked
+`_partition_findings()` to delegate the split to the two helpers, §117's first pass then asked for
+one inline normalising pass, and §118 asks for the delegation back. Settled on **one definition**:
+the two helpers are the split, and the partition calls them on the already-normalised list. Their
+normalisation is idempotent, so this is the same partition plus an O(len(blocking)) filter over at
+most a handful of findings — a saved list comprehension is not worth a second copy of the
+classifier, which is the thing §114 was actually about. `REVIEW_TERMINAL_STATUSES` is renamed
+`TERMINAL_STATUSES`: the set is sideclaw's generic terminal set, not a review-only one, and the
+review framing now lives in `_fetch_terminal_reviews()`'s docstring where it applies. The two
+overlapping admission gates at the fail-closed call site carry a comment saying why both exist —
+the client asserts own the envelope and its wording, `_review_contract_matches()` owns the shape of
+`blocking` that the asserts do not check.
+
+**Verified.** `tests/test_triage.py` at **381/381**; all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload

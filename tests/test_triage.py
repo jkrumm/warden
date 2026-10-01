@@ -8485,11 +8485,11 @@ def test_the_unusable_verdict_finding_covers_a_missing_verdict_too():
         assert "demo-repo" in finding["key"]
 
 
-def test_the_review_terminal_statuses_are_deterministically_ordered():
+def test_the_terminal_statuses_constant_is_deterministically_ordered():
     """`TERMINAL` is a frozenset, so a raw `tuple()` of it varies with hash
     randomization — a public constant must not reorder between processes."""
-    assert triage._sideclaw.REVIEW_TERMINAL_STATUSES == tuple(sorted(triage._sideclaw.TERMINAL))
-    assert set(triage._sideclaw.REVIEW_TERMINAL_STATUSES) == set(triage._sideclaw.TERMINAL)
+    assert triage._sideclaw.TERMINAL_STATUSES == tuple(sorted(triage._sideclaw.TERMINAL))
+    assert set(triage._sideclaw.TERMINAL_STATUSES) == set(triage._sideclaw.TERMINAL)
 
 
 def test_a_revision_brief_never_quotes_a_finding_that_is_not_one():

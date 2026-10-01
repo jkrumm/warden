@@ -5854,16 +5854,14 @@ def _partition_findings(blocking: Any) -> tuple[list[dict[str, Any]], list[dict[
 
     `published` keeps the reviewer's own order — that is what a card, a brief or a note
     should quote, so a human reading them sees the same sequence the review published.
-    `code` and `process` split it by §114's single classifier, `_is_process_only_finding()`;
-    the payload is normalised ONCE here and the two lists are derived from that one list,
-    so they cannot disagree about what it contained. `_code_blocking_findings()` and
-    `_process_only_findings()` remain the entry points for callers that hold a raw
-    `blocking` value; they normalise first and are idempotent over an already-normalised
-    list, so this is the same partition either way."""
+    `code` and `process` delegate to `_code_blocking_findings()` /
+    `_process_only_findings()`, which hold the §114 split. Those helpers normalise their
+    input first, which is idempotent, so calling them on the already-normalised
+    `published` list is the same partition — one definition of the split, one extra
+    O(len(blocking)) filter pass over at most a handful of findings. Deriving the two
+    lists inline would be a second copy of that classifier, which is the thing to avoid."""
     published = _published_findings(blocking)
-    return (published,
-            [f for f in published if not _is_process_only_finding(f)],
-            [f for f in published if _is_process_only_finding(f)])
+    return published, _code_blocking_findings(published), _process_only_findings(published)
 
 
 def _review_verdict_shape(verdict: Any) -> tuple[bool, list[dict[str, Any]]]:
@@ -5938,6 +5936,12 @@ ItemKey = int | str
 def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite3.Row]:
     """Every implement→review pair in the window whose review reached a terminal status.
 
+    The window is the IMPLEMENT job's `d.created_at`, as it always was; the row's
+    `created_at` is the review's own, which is what the fold orders reviews by. A review
+    result speaks for an implement item only after sideclaw reached a terminal status
+    (`_sideclaw.TERMINAL_STATUSES`); a terminal job may still lack a usable verdict, and
+    that case is reported by the review self-audit rather than mistaken for a pass.
+
     The window compares INSTANTS, not text: `datetime()` normalises a stored
     `+HH:MM`/`Z`/naive timestamp to UTC before the comparison, so a row written with a
     non-UTC offset cannot land in or out of the window by its representation. (Every
@@ -5954,7 +5958,7 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
     # `_parse_ts()` has already made this UTC-aware; formatting it back to the ledger's
     # naive-UTC text is what the placeholder below is compared as.
     naive_utc = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
-    placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
+    placeholders = ",".join("?" for _ in _sideclaw.TERMINAL_STATUSES)
     sql = (
         f"SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
         f"d.created_at AS implement_created_at, "
@@ -5965,7 +5969,7 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
         f"AND (datetime(d.created_at) IS NULL OR datetime(d.created_at) >= datetime(?)) "
         f"AND r.status IN ({placeholders}) "
     )
-    rows = conn.execute(sql, (naive_utc, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
+    rows = conn.execute(sql, (naive_utc, *_sideclaw.TERMINAL_STATUSES)).fetchall()
     # SQLite's `datetime()` is a permissive pre-filter, not the decision: it truncates to
     # whole seconds (so a microsecond-precision `now` would pull in rows just outside the
     # window) and returns NULL for a timestamp it cannot parse (which would silently drop
@@ -6194,6 +6198,10 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
         result = resp.get("result")
         verdict = result if isinstance(result, dict) else {}
+        # The client helpers are sideclaw's own published contract for the whole envelope
+        # and they raise its exact wording; `_review_contract_matches()` below then guards
+        # the part they do not cover — the shape of `blocking` itself — so the fold can
+        # never read a malformed payload as "no findings". Two gates, different jobs.
         try:
             _sideclaw.assert_result_schema(resp, _sideclaw.REVIEW_SCHEMA_VERSION, "review")
             _sideclaw.assert_outcome(resp, _sideclaw.REVIEW_OUTCOMES, "review")
