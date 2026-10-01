@@ -823,6 +823,15 @@ The window's SQL pre-filter compares the raw
 `created_at` column (keeping `idx_dispatches_created` usable) and is widened to a superset;
 the exact instant comparison happens in Python.
 
+`is_review_finding()` mirrors a shape the producer publishes, so
+`check-schema-versions.py` compares that shape too — `version` and `outcomes` can agree while
+the finding object changes, and a renamed required field would leave warden reading a shape
+sideclaw no longer emits with every other check green. Only one direction is unsafe: requiring
+MORE than the producer means rejecting real findings, so warden's required set must be a subset
+of the published one, and the tolerated direction is reported rather than hidden (the live
+producer requires `angle`; warden deliberately does not). No readable published shape is itself
+a disagreement — the alternative is an unverifiable copy, which is the drift being caught.
+
 The self-audit adds five findings about the loop's own answers:
 `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>` (a terminal review row
 without a usable result, or one whose timestamp cannot be placed among its item's other

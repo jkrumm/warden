@@ -125,7 +125,13 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 - **The verdict schema is published by sideclaw**, not copied here. Copying it
   guarantees drift, and drift presents as "verdict silently ignored" — the exact
   failure warden exists to fix. A version mismatch is a loud refusal, never a
-  best-effort parse.
+  best-effort parse. `check-schema-versions.py` compares `version`, the
+  `outcomes` set AND the published **finding shape** (`is_review_finding()`'s
+  mirror of it, which is the one piece a version bump does not cover): warden may
+  require fewer fields than the producer — it requires `file` and `message` while
+  the live producer also requires `angle`, and that difference is printed, not
+  treated as a mismatch — but never more, because requiring more means rejecting
+  real findings.
 - **A dispatch names a repo, never a path.** That is what keeps a composed path
   out of the interface.
 - **The repo allowlist is enforced inside sideclaw**

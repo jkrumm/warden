@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, Protocol, TypedDict, TypeVar, cast
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, TypedDict, TypeVar, cast
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
@@ -6106,8 +6106,13 @@ def _review_fold_rows(rows: Iterable[sqlite3.Row],
     `review_status` stays whatever the target actually holds (None when there is no target):
     the reason travels in `mismatch_reason`, so a reader never finds a sentence where every
     other row has a status."""
+    # Both inputs are ONE-SHOT-iteration safe: `rows` is consumed for the column check and
+    # again for the conversion, and an `Iterable` is allowed to be an iterator, whose second
+    # pass yields nothing — an item's terminal reviews would drop out of the fold and
+    # `review-always-blocks` would undercount with nothing said (§131).
+    rows = list(rows)
     mismatched = list(mismatched)
-    for r in list(rows) + [r for r, _ in mismatched]:
+    for r in rows + [r for r, _ in mismatched]:
         missing = [c for c in REVIEW_QUERY_COLUMNS if c not in r.keys()]
         if missing:
             raise RuntimeError(
@@ -6268,7 +6273,11 @@ def _unusable_verdict_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Re
         # The pointer mismatches this run found, so the finding says WHY the verdict is
         # unreadable and not only which items are affected (§129).
         reasons = sorted({s.mismatch for s in by_item.values() if s.mismatch})
-        why = ("; pointer mismatches: " + "; ".join(reasons[:SELF_AUDIT_SAMPLE_LIMIT])) if reasons else ""
+        # Same truncation-visibility rule as the item-id sample above: a clipped list that
+        # does not say it was clipped reads as the whole list.
+        clipped = len(reasons) - min(len(reasons), SELF_AUDIT_SAMPLE_LIMIT)
+        why = (f"; pointer mismatches: {'; '.join(reasons[:SELF_AUDIT_SAMPLE_LIMIT])}"
+               f"{f' (+{clipped} more)' if clipped else ''}") if reasons else ""
         remainder = len(sorted_keys) - min(len(sorted_keys), SELF_AUDIT_SAMPLE_LIMIT)
         suffix = f" (+{remainder} more)" if remainder else ""
         findings.append({

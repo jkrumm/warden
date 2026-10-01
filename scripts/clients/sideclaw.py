@@ -68,6 +68,18 @@ REVIEW_OUTCOMES: tuple[str, ...] = ("clean", "actionable", "needs-human")
 TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(TERMINAL))
 
 
+# The two fields warden REQUIRES on a published review finding, named so `check_schema_versions()`
+# can compare them against sideclaw's own JSON schema (`/api/review-schema`'s
+# `output.properties.blocking.items`) instead of both sides copying by hand. The direction of a
+# disagreement is what matters, and only one direction is unsafe: requiring LESS than the
+# producer is tolerated (an unmodelled field is simply not read), requiring MORE means rejecting
+# real findings — a verdict silently ignored, the failure warden exists to fix. The live producer
+# requires `file`, `message` AND `angle`; warden deliberately does not require `angle`, because a
+# reader that only quotes what it is given should not refuse a finding over a missing reviewer
+# name — so that difference is reported, not treated as a mismatch.
+REVIEW_FINDING_REQUIRED = frozenset({"file", "message"})
+
+
 def is_review_finding(entry: Any) -> bool:
     """True when `entry` is one published review finding.
 
@@ -340,7 +352,7 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
         remote_version = parsed.get("version")
         remote_outcomes = tuple(parsed.get("outcomes") or ())
         ok = remote_version == expected_version and set(remote_outcomes) == set(expected_outcomes)
-        out[tool] = {
+        entry: dict[str, Any] = {
             "reachable": True,
             "ok": ok,
             "expectedVersion": expected_version,
@@ -348,7 +360,50 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
             "expectedOutcomes": expected_outcomes,
             "remoteOutcomes": remote_outcomes,
         }
+        if tool == "review":
+            # The finding shape is part of the same published contract and was the one piece
+            # nothing compared: `is_review_finding()` mirrors it in Python, so a renamed find
+            # shape would leave warden reading a shape the producer no longer emits, with the
+            # version number unchanged and every check green.
+            shape = _published_finding_shape(parsed)
+            if shape is None:
+                entry["findingShape"] = {"published": False}
+                entry["ok"] = ok = False
+            else:
+                required, properties = shape
+                missing_required = sorted(REVIEW_FINDING_REQUIRED - required)
+                missing_properties = sorted(REVIEW_FINDING_REQUIRED - properties)
+                entry["findingShape"] = {
+                    "published": True,
+                    "required": sorted(required),
+                    "properties": sorted(properties),
+                    "wardenRequires": sorted(REVIEW_FINDING_REQUIRED),
+                    "missingFromRequired": missing_required,
+                    "missingFromProperties": missing_properties,
+                }
+                if missing_required or missing_properties:
+                    entry["ok"] = ok = False
+        out[tool] = entry
     return out
+
+
+def _published_finding_shape(parsed: dict[str, Any]) -> tuple[frozenset[str], frozenset[str]] | None:
+    """`(required, properties)` of the finding object sideclaw publishes, or None when the
+    endpoint does not publish a readable one.
+
+    Read from `output.properties.blocking.items` — the four arrays (`blocking`,
+    `improvements`, `discussions`, `testGaps`) share this one object schema. `None` is a
+    finding in itself, not a reason to skip the check: warden's `is_review_finding()` would
+    then be an unverifiable copy, which is the drift this comparison exists to catch."""
+    blocking = ((parsed.get("output") or {}).get("properties") or {}).get("blocking")
+    items = (blocking or {}).get("items") if isinstance(blocking, dict) else None
+    if not isinstance(items, dict):
+        return None
+    properties = items.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    required = items.get("required")
+    return frozenset(required or ()), frozenset(properties)
 
 
 def classify_dispatch_outcome(status: str | None, verdict_json: str | None) -> tuple[str, str | None]:

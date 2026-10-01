@@ -54,6 +54,18 @@ def main(argv: list[str]) -> int:
                 f"outcomes={sorted(r.get('remoteOutcomes') or ())}, warden pins "
                 f"version={r.get('expectedVersion')} outcomes={sorted(r.get('expectedOutcomes') or ())}"
             )
+            shape = r.get("findingShape")
+            if shape and not shape.get("published"):
+                details.append(
+                    "  review: sideclaw publishes no readable finding shape — warden's "
+                    "is_review_finding() would be an unverifiable copy of it")
+            elif shape:
+                details.append(
+                    f"  review findings: sideclaw requires {shape['required']} with properties "
+                    f"{shape['properties']}; warden requires {shape['wardenRequires']}"
+                    + (f" — MISSING {shape['missingFromRequired'] or shape['missingFromProperties']}"
+                       if shape.get("missingFromRequired") or shape.get("missingFromProperties")
+                       else ""))
         print("✗ sideclaw schemas DISAGREE with warden's pinned versions:")
         for line in details:
             print(f"  {line}")
@@ -63,6 +75,14 @@ def main(argv: list[str]) -> int:
     for tool in ("dispatch", "review"):
         r = results.get(tool) or {}
         parts.append(f"{tool}={r['remoteVersion']}" if r.get("reachable") else f"{tool}=unreachable")
+        # A difference warden tolerates on purpose is still worth naming: the producer
+        # requiring more than warden does is safe, and hiding it would make the next real
+        # difference indistinguishable from this one.
+        shape = r.get("findingShape") or {}
+        if shape.get("published"):
+            extra = sorted(set(shape["required"]) - set(shape["wardenRequires"]))
+            if extra:
+                parts.append(f"(producer also requires: {', '.join(extra)})")
     print(f"✓ {' '.join(parts)}")
     return 0
 

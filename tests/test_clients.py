@@ -396,6 +396,24 @@ def test_assert_outcome_skips_non_done_jobs():
     sideclaw.assert_outcome({"status": "cancelled"}, sideclaw.REVIEW_OUTCOMES, "review")
 
 
+# `/api/review-schema`'s real body, abridged to what the check reads: the published finding
+# object lives at `output.properties.blocking.items`, and the producer requires `angle` while
+# warden deliberately does not (see `REVIEW_FINDING_REQUIRED`).
+_REVIEW_SCHEMA_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "outcome": {"type": "string", "enum": list(sideclaw.REVIEW_OUTCOMES)},
+        "blocking": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"file": {"type": "string"}, "line": {"type": "number"},
+                           "message": {"type": "string"}, "angle": {"type": "string"}},
+            "required": ["file", "message", "angle"],
+            "additionalProperties": False,
+        }},
+    },
+}
+
+
 def test_check_schema_versions_ok():
     srv = _StubServer({
         ("GET", "/api/dispatch-schema"): (200, {
@@ -405,6 +423,7 @@ def test_check_schema_versions_ok():
         ("GET", "/api/review-schema"): (200, {
             "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
             "outcomes": list(sideclaw.REVIEW_OUTCOMES),
+            "output": _REVIEW_SCHEMA_OUTPUT,
         }),
     })
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
@@ -425,6 +444,7 @@ def test_check_schema_versions_version_mismatch():
         ("GET", "/api/review-schema"): (200, {
             "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
             "outcomes": list(sideclaw.REVIEW_OUTCOMES),
+            "output": _REVIEW_SCHEMA_OUTPUT,
         }),
     })
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
@@ -448,6 +468,7 @@ def test_check_schema_versions_outcome_set_mismatch():
         ("GET", "/api/review-schema"): (200, {
             "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
             "outcomes": list(sideclaw.REVIEW_OUTCOMES),
+            "output": _REVIEW_SCHEMA_OUTPUT,
         }),
     })
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
@@ -456,6 +477,70 @@ def test_check_schema_versions_outcome_set_mismatch():
         assert results["dispatch"]["ok"] is False, results
     finally:
         srv.stop()
+
+
+def test_check_schema_versions_catches_a_finding_shape_that_lost_a_required_field():
+    """§131: version and outcomes can agree while the FINDING shape differs, and that was the one
+    piece of the published contract nothing compared — `is_review_finding()` mirrors it in Python,
+    so a producer that renamed `message` would leave warden reading a shape nobody emits, with
+    every other check green and the missing field only visible as an unusable verdict later."""
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))  # deep copy, no shared mutation
+    items = output["properties"]["blocking"]["items"]
+    items["required"] = ["file", "angle"]
+    items["properties"].pop("message")
+    srv = _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, {
+            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
+        }),
+        ("GET", "/api/review-schema"): (200, {
+            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": output,
+        }),
+    })
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+        assert review["ok"] is False, review
+        shape = review["findingShape"]
+        assert shape["missingFromProperties"] == ["message"], shape
+        assert shape["missingFromRequired"] == ["message"], shape
+        assert set(shape["wardenRequires"]) == {"file", "message"}, shape
+    finally:
+        srv.stop()
+
+
+def test_check_schema_versions_treats_an_unpublished_finding_shape_as_a_disagreement():
+    """No readable shape is a finding, not a reason to skip: the alternative is warden's copy
+    being unverifiable, which is exactly the drift the comparison exists to catch."""
+    srv = _StubServer({
+        ("GET", "/api/dispatch-schema"): (200, {
+            "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
+        }),
+        ("GET", "/api/review-schema"): (200, {
+            "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcomes": list(sideclaw.REVIEW_OUTCOMES),
+        }),
+    })
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+        assert review["ok"] is False and review["findingShape"] == {"published": False}, review
+    finally:
+        srv.stop()
+
+
+def test_the_warden_required_finding_fields_are_the_ones_the_live_schema_publishes():
+    """The comparison is only meaningful if both sides name the same fields, so this pins
+    warden's side against the stub's published shape rather than against prose."""
+    published = set(_REVIEW_SCHEMA_OUTPUT["properties"]["blocking"]["items"]["properties"])
+    assert set(sideclaw.REVIEW_FINDING_REQUIRED) <= published, sideclaw.REVIEW_FINDING_REQUIRED
+    # And the deliberately-lenient direction is explicit: the producer requires a field warden
+    # does not, and that is tolerated (reported, never a mismatch).
+    extra = set(_REVIEW_SCHEMA_OUTPUT["properties"]["blocking"]["items"]["required"]) \
+        - set(sideclaw.REVIEW_FINDING_REQUIRED)
+    assert extra == {"angle"}, extra
 
 
 def test_check_schema_versions_unreachable_never_raises():

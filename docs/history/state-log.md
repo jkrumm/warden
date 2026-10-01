@@ -9857,7 +9857,30 @@ key, and it goes one step further than the finding text did before: `_ReviewedIt
 `review-verdicts-unusable-<repo>` says WHY the verdict is unreadable, not only which items are
 affected.
 
-**Verified.** `tests/test_triage.py` at **396/396** (354 before, +42); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
+**Thirty-fourth round.** One blocker and two improvements, all three in code this branch added —
+and the blocker is a genuine class of bug, not polish: `_review_fold_rows()` type-hinted its input
+`Iterable[sqlite3.Row]` and then iterated it twice (the column check, then the conversion). An
+`Iterable` may be a one-shot iterator, whose second pass yields nothing — an item's terminal
+reviews would drop out of the fold and `review-always-blocks` would undercount silently. `rows` is
+normalized like `mismatched` already was, with the reason written down. The improvements: the
+`pointer mismatches` list clipped at the sample limit without saying so (the sibling item-id list
+has `(+N more)`; now both do — a clipped list that does not admit it reads as the whole list), and
+a stray `Protocol` import left by §130's migration.
+
+The discussion worth acting on was architect's: `is_review_finding()` mirrors the producer's
+finding shape, but `check-schema-versions.py` only compared `version` and `outcomes` — so a renamed
+required field would leave warden reading a shape sideclaw no longer emits, with every other check
+green. That is the drift AGENTS.md says the check exists to prevent, so it is now compared:
+`_published_finding_shape()` reads `output.properties.blocking.items` from the live endpoint, and
+only one direction is unsafe — requiring MORE than the producer means rejecting real findings,
+so warden's set must be a subset of the published one. The live producer requires `file`, `message`
+AND `angle`; warden deliberately requires only the first two (a reader that quotes what it is given
+should not refuse a finding over a missing reviewer name), and that tolerated difference is printed
+rather than hidden. Verified against the running sideclaw, not the stub: `✓ dispatch=3 review=1
+(producer also requires: angle)`, exit 0. A missing published shape is a disagreement, not a skip —
+the alternative is an unverifiable copy.
+
+**Verified.** `tests/test_triage.py` at **396/396** (354 before, +42), `tests/test_clients.py` at **118/118** (+3), all 21+ test files green. Live-ledger replay unchanged at 39 judged items.
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
