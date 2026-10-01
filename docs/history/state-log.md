@@ -9656,7 +9656,23 @@ call shape that does not exist yet; the parameter list is the honest signature o
 sites. Worth revisiting when a fourth flag appears — at that point callers stop mapping 1:1 onto
 arguments, which is the actual signal.
 
-**Verified.** `tests/test_triage.py` at **380/380** (354 before, +26); all 21 test files green.
+**Twenty-first round.** Zero blockers, six notes, all applied. The window's pre-filter is no
+longer the decision: SQLite's `datetime()` truncates to whole seconds (a microsecond-precision
+`now` pulled in rows just outside the window) and returns NULL for a timestamp it cannot parse
+(which silently *dropped* the row — the invisibility this file forbids). `datetime()` now only
+narrows the scan and the exact comparison happens on parsed instants in Python, where an
+unparseable timestamp is KEPT so a corrupt row makes the audit look at something rather than
+vanish. Writing the test for that caught a bug I had just introduced: the row carries **two**
+timestamps — the implement job's and the review's — and the new Python filter was reading the
+review's where the window has always been the implement job's. Hence `implement_created_at` as its
+own column, separate from the review's `created_at` that the fold orders by. The invariants guard
+also passes the original exception object now (the finding read "raised Exception" instead of the
+real class), the `_partition_findings()` split derives both lists from one normalised pass
+(`_published_findings()` was running three times per verdict), `_revision_findings()`'s `or "?"`
+fallbacks are gone as unreachable behind the shape gate, and `_is_completed_review()` requires
+`1 <= version` — version 0 never existed, so a stored 0 is a corrupt payload, not an older format.
+
+**Verified.** `tests/test_triage.py` at **381/381** (354 before, +27); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload

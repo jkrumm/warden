@@ -5854,10 +5854,16 @@ def _partition_findings(blocking: Any) -> tuple[list[dict[str, Any]], list[dict[
 
     `published` keeps the reviewer's own order — that is what a card, a brief or a note
     should quote, so a human reading them sees the same sequence the review published.
-    `code` and `process` split it by §114's rule for the decision; one partition pass
-    means the two lists cannot disagree about what the payload contained."""
+    `code` and `process` split it by §114's single classifier, `_is_process_only_finding()`;
+    the payload is normalised ONCE here and the two lists are derived from that one list,
+    so they cannot disagree about what it contained. `_code_blocking_findings()` and
+    `_process_only_findings()` remain the entry points for callers that hold a raw
+    `blocking` value; they normalise first and are idempotent over an already-normalised
+    list, so this is the same partition either way."""
     published = _published_findings(blocking)
-    return published, _code_blocking_findings(published), _process_only_findings(published)
+    return (published,
+            [f for f in published if not _is_process_only_finding(f)],
+            [f for f in published if _is_process_only_finding(f)])
 
 
 def _review_verdict_shape(verdict: Any) -> tuple[bool, list[dict[str, Any]]]:
@@ -5911,7 +5917,9 @@ def _is_completed_review(verdict: Any) -> bool:
     if not usable:
         return False
     version = _schema_version_of(verdict)
-    return version is not None and 0 <= version <= _sideclaw.REVIEW_SCHEMA_VERSION
+    # 1, not 0: `REVIEW_SCHEMA_VERSION` starts at 1 and no version 0 ever existed, so a
+    # stored 0 is a corrupt payload, not an older format this reader knows.
+    return version is not None and 1 <= version <= _sideclaw.REVIEW_SCHEMA_VERSION
 
 
 def _is_finding_shape(finding: Any) -> bool:
@@ -5945,17 +5953,29 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
         raise ValueError(f"invalid self-audit window start: {since!r}")
     # `_parse_ts()` has already made this UTC-aware; formatting it back to the ledger's
     # naive-UTC text is what the placeholder below is compared as.
-    since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
+    naive_utc = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
     placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
     sql = (
         f"SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
+        f"d.created_at AS implement_created_at, "
         f"r.verdict_json AS verdict_json, "
         f"r.status AS review_status, r.created_at AS created_at, r.id AS id "
         f"FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         f"WHERE d.tier='implement' "
-        f"AND datetime(d.created_at) >= datetime(?) AND r.status IN ({placeholders}) "
+        f"AND (datetime(d.created_at) IS NULL OR datetime(d.created_at) >= datetime(?)) "
+        f"AND r.status IN ({placeholders}) "
     )
-    return conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
+    rows = conn.execute(sql, (naive_utc, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
+    # SQLite's `datetime()` is a permissive pre-filter, not the decision: it truncates to
+    # whole seconds (so a microsecond-precision `now` would pull in rows just outside the
+    # window) and returns NULL for a timestamp it cannot parse (which would silently drop
+    # the row — the invisibility this file's "deferral must be visible" forbids). The exact
+    # comparison happens here on parsed instants, and a row whose timestamp will not parse
+    # is KEPT: a corrupt row must make the audit look at something, not leave it out.
+    # The window is the IMPLEMENT job's time, as it always was; `created_at` on the row is
+    # the review's, which is what the fold orders items' reviews by.
+    return [r for r in rows
+            if (when := _parse_ts(r["implement_created_at"])) is None or when >= since_dt]
 
 
 class _ReviewRow(Protocol):
@@ -6849,13 +6869,15 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     # the hour's `warden_self` reopen/resolve, and every finding the sections below had
     # already produced. Its failure is reported, not swallowed.
     violations: list[dict[str, Any]] = []
-    invariants_error: str | None = None
+    invariants_failure: BaseException | None = None
     try:
         violations = check_invariants(conn, now)
     except Exception as e:  # noqa: BLE001 — same isolation as _audit_section()
         print(f"triage: self-audit section 'invariants' failed: {type(e).__name__}: {e}", file=sys.stderr)
-        invariants_error = f"{type(e).__name__}: {e}"
-    findings = ([_section_failure_finding("invariants", Exception(invariants_error))] if invariants_error else [])
+        invariants_failure = e
+    # The original exception object, not a re-wrap: the finding names the real class.
+    findings = ([_section_failure_finding("invariants", invariants_failure)]
+                if invariants_failure is not None else [])
     findings.extend(self_audit_findings(conn, now, policy))
     by_inv: dict[str, list[dict[str, Any]]] = {}
     for v in violations:
@@ -6869,8 +6891,9 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
             "detail": "; ".join(f"event {v['event_id']}: {v['detail']}" for v in vs[:8]),
         })
     if dry_run:
-        print(f"[dry-run] self-audit: {len(violations)} invariant violation(s)"
-              f"{' (invariants FAILED: ' + invariants_error + ')' if invariants_error else ''}, "
+        failed = (f" (invariants FAILED: {type(invariants_failure).__name__}: {invariants_failure})"
+                  if invariants_failure is not None else "")
+        print(f"[dry-run] self-audit: {len(violations)} invariant violation(s){failed}, "
               f"{len(findings)} finding(s): {[f['key'] for f in findings]}")
         return
     now_iso = _now_iso(now)
@@ -6895,10 +6918,10 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     summary = {"checked_at": now_iso, "invariants": sorted(INVARIANTS),
                "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
                "findings": sorted(live_keys)}
-    if invariants_error:
+    if invariants_failure is not None:
         # An empty `violations` from a check that never ran is a fabricated zero, not a
         # clean bill — /health's reader gets the reason instead.
-        summary["invariants_error"] = invariants_error
+        summary["invariants_error"] = f"{type(invariants_failure).__name__}: {invariants_failure}"
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
@@ -6932,12 +6955,12 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
         blocking = _code_blocking_findings(verdict.get("blocking"))
         if not blocking:
             return None
+        # `_code_blocking_findings()` only yields shape-valid findings (see
+        # `_published_findings()`), so both fields are present and non-empty.
         lines = []
         for f in blocking:
-            loc = f.get("file") or "?"
-            if f.get("line") is not None:
-                loc = f"{loc}:{f.get('line')}"
-            lines.append(f"- {loc} — {f.get('message') or '?'}")
+            loc = f"{f['file']}:{f['line']}" if f.get("line") is not None else f["file"]
+            lines.append(f"- {loc} — {f['message']}")
         return "The independent review BLOCKED the previous attempt:\n" + "\n".join(lines)
     result = _safe_json(impl["verdict_json"])
     if result.get("outcome") == "checks_failed":

@@ -8376,7 +8376,42 @@ def test_the_latest_review_is_chosen_by_instant_not_by_timestamp_text():
     assert folded["demo-repo"][1] == triage._ReviewedItem(code_blocked=False, unusable=False)
 
 
+def test_the_audit_window_is_microsecond_exact_and_never_drops_a_bad_timestamp():
+    """SQLite's `datetime()` is only a pre-filter: it truncates to whole seconds and
+    returns NULL for a timestamp it cannot parse. The exact comparison happens on parsed
+    instants, and an unparseable timestamp is KEPT — a corrupt row must make the audit
+    look at something, never quietly leave the window."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="precision-window")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-precision-window", "impl-precision-window"))
+        conn.execute("UPDATE dispatches SET created_at='2026-10-01T06:00:00.000000+00:00' "
+                     "WHERE job_id=?", ("impl-precision-window",))
+        conn.execute("UPDATE dispatches SET created_at='2026-10-01T06:00:00.000000+00:00' "
+                     "WHERE job_id=?", ("val-precision-window",))
+        conn.commit()
+
+        # The cutoff is half a second LATER: the row is outside the window, even though
+        # second-truncated `datetime()` values compare equal.
+        assert triage._fetch_terminal_reviews(conn, "2026-10-01T06:00:00.500000+00:00") == []
+        assert len(triage._fetch_terminal_reviews(conn, "2026-10-01T06:00:00.000000+00:00")) == 1
+
+        # A timestamp nothing can parse is KEPT, so it reaches the fold instead of
+        # vanishing; the fold then orders it first. Both sides are exercised: the window
+        # reads the IMPLEMENT row's `implement_created_at`, the ordering key the REVIEW
+        # row's `created_at`.
+        conn.execute("UPDATE dispatches SET created_at='garbage' WHERE job_id=?",
+                     ("impl-precision-window",))
+        conn.execute("UPDATE dispatches SET created_at='garbage' WHERE job_id=?",
+                     ("val-precision-window",))
+        conn.commit()
+        rows = triage._fetch_terminal_reviews(conn, "2026-10-01T23:59:59+00:00")
+        assert len(rows) == 1 and rows[0]["implement_created_at"] == "garbage"
+        assert triage._review_order_key(rows[0])[0] == dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
 def test_a_review_row_with_an_unparseable_timestamp_is_never_the_latest():
+    """An ordering key nothing can parse must not read as an item's latest review."""
     blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                 "outcome": "actionable", "blocking": [_CODE_FINDING]}
     rows = [_review_row(1, "impl-1", blocking, created_at="not a timestamp", row_id=99),
@@ -9495,10 +9530,18 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
                          "outcome": "actionable", "blocking": [_CODE_FINDING]}
     complete_clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                       "outcome": "clean", "blocking": []}
-    legacy = dict(complete_clean, schemaVersion=max(0, triage._sideclaw.REVIEW_SCHEMA_VERSION - 1))
-    assert triage._is_completed_review(legacy)  # stored history remains parseable
-    assert not triage._review_contract_matches(legacy)  # new producer output is exact
+    # `REVIEW_SCHEMA_VERSION` starts at 1 and no version 0 ever existed, so a stored 0 is
+    # a corrupt payload rather than an older format this reader knows how to read.
+    assert not triage._is_completed_review(dict(complete_clean, schemaVersion=0))
+    assert not triage._is_completed_review(dict(complete_clean, schemaVersion=-1))
+    assert triage._is_completed_review(complete_clean)
     assert triage._review_contract_matches(complete_clean)
+    lower = triage._sideclaw.REVIEW_SCHEMA_VERSION - 1
+    if lower >= 1:
+        # A genuinely older version stays parseable for stored history, but a NEW result
+        # must carry today's exact version.
+        assert triage._is_completed_review(dict(complete_clean, schemaVersion=lower))
+        assert not triage._review_contract_matches(dict(complete_clean, schemaVersion=lower))
     for corrupt in (None, [], {**complete_clean, "blocking": None},
                     {**complete_clean, "blocking": [None]}):
         assert not triage._review_contract_matches(corrupt)
