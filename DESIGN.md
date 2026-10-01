@@ -803,7 +803,11 @@ rows — an unknown order must never resolve to an older readable review, and su
 is left OUT of `review-always-blocks`'s denominator rather than judged by a stale value;
 cannot count as a pass), `liveness-never-confirms-<repo>`,
 `fixed-reopened-<event>` (a verdict or fix proven wrong), and
-`revisions-exhausted-<event>`. Each section that produces them runs through
+`revisions-exhausted-<event>`. `run_self_audit()` adds `self-audit-slow` when the tick's
+own cost crosses `SELF_AUDIT_SLOW_MS` — the one finding that measures the auditor, because
+the window query carries a non-sargable term on a table that is never pruned (§126/§123).
+The stored summary carries `self_audit_schema` so a consumer can tell which generation of
+these semantics its numbers belong to. Each section that produces them runs through
 `_audit_section()`, so a section that raises reports `self-audit-section-failed-<name>`
 instead of taking the other four down with it for that hour. Enforced elsewhere, by name:
 the fail-closed

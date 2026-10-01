@@ -10,7 +10,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master` (00dc001), six LaunchAgents on the mini. **§116 and §117 are NOT on `master` — both ride PR #7**, branch `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`, waiting on the owner's Argo Merge click (`warden` is merge-approval gated, no `autoMergePaths`). The live loop therefore still runs the pre-§116 self-audit |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 389/389 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 391/391 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -308,13 +308,16 @@ loop.
 - `triage.py` stays one 6.6k-line file: 248 tests patch its globals by
   name, a split buys no behaviour (§66). Dead code: none (AST-verified, §65).
 - The review-verdict concern (fold, shape gates, self-audit findings, revision
-  brief — the §104–§119 block) is the one extractable module in `triage.py`,
-  and §118's reviewer asked for it a third time. **Deferred to its own PR, not
-  this hardening branch:** the tests reach those functions as `triage.<name>`
-  and monkeypatch `triage.check_invariants` / `_restore_drill_findings` /
-  `_audit_section`, so moving them moves the seam those 248 patchers sit on —
-  a behaviour-neutral refactor that nonetheless needs its own review round,
-  and growing a verified PR to do it is what §66 warns against.
+  brief — the §104–§126 block) is the one extractable module in `triage.py`, and
+  review rounds have now asked for it four times (§118, §126 ×2). The seam is
+  real and cheap: pure functions, `_ReviewRow` as its own Protocol instead of a
+  `sqlite3.Row` dependency, one entry point (`_review_health_findings`) plus
+  `_unusable_verdict_findings`. **Still deferred to its own PR, not this
+  hardening branch:** the tests reach those functions as `triage.<name>` and
+  monkeypatch `triage.check_invariants` / `_restore_drill_findings` /
+  `_audit_section`, so moving them moves the seam those 248 patchers sit on — a
+  behaviour-neutral refactor that needs its own review round, and growing a
+  verified PR to do it is what §66 warns against.
 - `_fetch_terminal_reviews()` self-joins `dispatches` every hour (§118/§122).
   **The index existed; the query shape disabled it.** `idx_dispatches_created`
   covers `created_at`, but wrapping it in `datetime(...)` forced a full scan. The

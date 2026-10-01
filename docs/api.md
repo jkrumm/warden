@@ -53,6 +53,20 @@ poller's heartbeat age against its own named threshold, and one `ok` boolean.
 | `com.jkrumm.warden-poll` | `watchdog_poll_last_run` | 1800s | 90 min |
 | `com.jkrumm.warden-sweep` | `dispatch_sweep_last_run` | 300s | 15 min |
 
+The hourly self-audit writes its summary into the `self_audit` cursor; `/health`
+serves that stored value as `self_audit` (it never runs the audit itself):
+
+| Field | Meaning |
+|-|-|
+| `self_audit_schema` | generation of the summary's semantics (currently `2`) — the same keys have meant different things across the review-health work, so compare counts only within one generation |
+| `checked_at` | when the audit ran |
+| `invariants` | the invariant ids the run checked |
+| `violations` | `[{id, count}]` — an empty list from a run whose check raised is reported as `invariants_error`, never as a clean zero |
+| `invariants_error` | present only when the invariant check itself raised |
+| `findings` | the live self-audit finding keys, e.g. `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>`, `liveness-never-confirms-<repo>`, `fixed-reopened-<event>`, `revisions-exhausted-<event>`, `self-audit-slow`, `self-audit-section-failed-<name>` |
+| `self_audit_ms` | cost of the tick's own work — invariants plus the five sections; the part that grows with the ledger's history |
+| `event_sync_ms` | cost of the event sync that follows it; scales with the number of live findings, not with history |
+
 ### `GET /metrics`
 
 JSON, not Prometheus text format, despite the name — matching DESIGN.md's own

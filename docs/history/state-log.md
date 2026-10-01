@@ -9777,7 +9777,23 @@ belong in this window at all → unusable and unjudged, reported by
 names the columns the fold reads — a test double missing `implement_created_at` is not a row this
 fold accepts, which is how four tests failed loudly rather than silently.
 
-**Verified.** `tests/test_triage.py` at **389/389** (354 before, +35); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
+**Twenty-ninth round.** **Zero blockers** — adversary and all five specialist angles clean on
+correctness. Four improvements and three discussions, all closed rather than parked. The substantive
+ones: (1) the growth path §126 named had no visible signal, so a tick crossing
+`SELF_AUDIT_SLOW_MS` (5 s, against sub-millisecond work today) now files `self-audit-slow` — built
+BEFORE the event sync, because a finding appended after it would be live in the summary JSON and
+nowhere else, which the test asserts; (2) the timing had to be split rather than widened: `self_audit_ms`
+is the tick's own work (invariants + the five sections — the part that grows with the ledger), and
+`event_sync_ms` is the sync that scales with live findings, so the tripwire watches the right
+number; (3) the summary now carries `self_audit_schema = 2`, because these keys have meant
+different things across this work and a diff of finding counts across generations is otherwise a
+silent misread; (4) `docs/api.md` never described `self_audit`'s shape at all — its fields, their
+meaning and the five-plus finding keys are now tabled there. Cleanups: `_review_verdict_shape()`'s
+`(usable, findings)` tuple had no production consumer of its second half, so it is gone and the
+three gates call `_review_verdict_problems()` directly; the fold's placeability test is a named
+predicate (`_row_is_placeable()`); the three stray blank lines are collapsed.
+
+**Verified.** `tests/test_triage.py` at **391/391** (354 before, +37); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean

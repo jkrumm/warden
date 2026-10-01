@@ -8541,6 +8541,50 @@ def test_the_window_prefilter_is_an_index_friendly_superset():
         assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
 
 
+def test_the_self_audit_summary_carries_its_schema_and_both_timings():
+    """§126: the summary's own generation is recorded (its keys have meant different things
+    across this work), and the two costs are separate — the one that grows with the ledger
+    is the number a tripwire can watch."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="schema-marker")
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["self_audit_schema"] == triage.SELF_AUDIT_SCHEMA
+        assert isinstance(summary["self_audit_ms"], int) and summary["self_audit_ms"] >= 0
+        assert isinstance(summary["event_sync_ms"], int) and summary["event_sync_ms"] >= 0
+        assert "self-audit-slow" not in summary["findings"]
+
+
+def test_a_slow_self_audit_tick_reports_itself():
+    """§126: the growth path has no other visible signal, so crossing the threshold becomes
+    a finding — and it must exist BEFORE the event sync, or the event it needs is never
+    written and the finding would be live only in the summary JSON. The threshold is moved
+    rather than the clock: this runner passes no fixtures, so the attribute is restored by
+    hand."""
+    original = triage.SELF_AUDIT_SLOW_MS
+    try:
+        with _triage_env() as (conn, ctx):
+            triage.SELF_AUDIT_SLOW_MS = -1
+            triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+            summary = json.loads(conn.execute(
+                "SELECT value FROM cursors WHERE key=?",
+                (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+            assert "self-audit-slow" in summary["findings"]
+            ev = conn.execute("SELECT id, resolved_at FROM events WHERE source=? AND external_id=?",
+                              (triage.SELF_SOURCE, "self-audit-slow")).fetchone()
+            assert ev is not None and ev["resolved_at"] is None
+            # And it clears when the tick is fast again.
+            triage.SELF_AUDIT_SLOW_MS = 10 ** 9
+            triage.run_self_audit(conn, triage.load_policy(),
+                                  NOW + dt.timedelta(hours=2), dry_run=False)
+            ev = conn.execute("SELECT resolved_at FROM events WHERE source=? AND external_id=?",
+                              (triage.SELF_SOURCE, "self-audit-slow")).fetchone()
+            assert ev is not None and ev["resolved_at"] is not None
+    finally:
+        triage.SELF_AUDIT_SLOW_MS = original
+
+
 def test_a_corrupt_implement_timestamp_is_admitted_and_never_judged():
     """§123: no comparison on a corrupt value can be a superset, so the SQL pre-filter
     admits unreadable timestamps explicitly. The row then reaches the fold, marks its item
@@ -8592,12 +8636,12 @@ def test_the_verdict_refusal_names_what_is_wrong():
     assert "not a list" in triage._review_verdict_problems(
         {"outcome": "clean", "blocking": True})[0]
     assert "is not an object" in triage._review_verdict_problems([])[0]
-    # One rule set: the boolean gate and the diagnostic cannot disagree.
+    # One rule set: the gate, the diagnostic and the stored-history reader cannot disagree.
     for verdict in (None, [], {}, {"blocking": []}, {"outcome": "clean", "blocking": [None]},
                     {"outcome": "banana", "blocking": []}):
-        usable, findings = triage._review_verdict_shape(verdict)
-        assert usable is False and findings == []
         assert triage._review_verdict_problems(verdict) != []
+        assert triage._review_contract_matches(verdict) is False
+        assert triage._is_completed_review(verdict) is False
     assert triage._review_contract_matches({"schemaVersion": current - 1, "outcome": "clean",
                                             "blocking": []}) is False
     assert triage._review_contract_matches({"schemaVersion": current, "outcome": "clean",
@@ -9489,7 +9533,6 @@ def test_self_audit_turns_a_violation_into_one_event_and_resolves_it():
 _NO_VERDICT = object()
 
 
-
 def _seed_blocking_review(conn, *, event_id: int | None, suffix: str, repo: str = "demo-repo",
                           outcome: str = "actionable", blocking: list[dict[str, Any]] | None = None,
                           verdict_json: Any = _NO_VERDICT) -> None:
@@ -9750,8 +9793,9 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
                     {**complete_clean, "blocking": [None]}):
         assert not triage._review_contract_matches(corrupt)
         assert not triage._is_completed_review(corrupt)
-    assert triage._review_verdict_shape(complete_clean) == (True, [])
-    assert triage._review_verdict_shape(complete_blocking) == (True, [_CODE_FINDING])
+    # The shape rule has one entry point; a complete payload passes it with nothing to say.
+    assert triage._review_verdict_problems(complete_clean) == []
+    assert triage._review_verdict_problems(complete_blocking) == []
 
     seq = itertools.count()
 

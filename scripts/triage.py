@@ -5868,8 +5868,9 @@ def _partition_findings(blocking: Any) -> tuple[list[dict[str, Any]], list[dict[
 def _review_verdict_problems(verdict: Any) -> list[str]:
     """Every reason the shared verdict-shape contract fails, NAMED.
 
-    `_review_verdict_shape()` answers "usable?" — which tells an operator nothing they can
-    act on — so the rule set lives here and that gate is expressed in terms of it. One
+    A bare "unusable" tells an operator nothing they can act on, so the rule set lives here
+    and every gate is expressed in terms of it — `_is_completed_review()`,
+    `_review_contract_matches()` and the park note below. One
     place defines the contract, so a rule added for the fold's benefit is automatically
     what the fail-closed park note reports about the payload it refused."""
     if not isinstance(verdict, dict):
@@ -5890,19 +5891,6 @@ def _review_verdict_problems(verdict: Any) -> list[str]:
     return problems
 
 
-def _review_verdict_shape(verdict: Any) -> tuple[bool, list[dict[str, Any]]]:
-    """`(usable, findings)` for the shared verdict-shape contract. Parameterize
-    schema-version policy at the two call sites; everything else — known outcome,
-    missing-`blocking`-only-for-clean, list type, finding shape — has exactly one
-    definition, `_review_verdict_problems()`. On failure, return an empty list because
-    callers must never fold the contents of a verdict they have already decided is
-    unusable."""
-    if _review_verdict_problems(verdict):
-        return False, []
-    findings = verdict.get("blocking", []) if isinstance(verdict, dict) else []
-    return True, findings
-
-
 def _schema_version_of(verdict: Any) -> int | None:
     """The verdict's schema version as a real integer, or None when it is absent,
     a bool (which `isinstance(…, int)` accepts), or any other type. One definition of
@@ -5915,8 +5903,9 @@ def _schema_version_of(verdict: Any) -> int | None:
 
 def _review_contract_matches(verdict: Any) -> bool:
     """Current sideclaw producer contract for a new result: exact schema version plus
-    the shared published review shape. `_is_completed_review()` uses the same shape
-    validator but accepts an older stored schema version the code can still parse."""
+    the shared published review shape. `_is_completed_review()` uses the same rule set
+    (`_review_verdict_problems()`) but accepts an older stored schema version the code can
+    still parse."""
     if _review_verdict_problems(verdict):
         return False
     return _schema_version_of(verdict) == _sideclaw.REVIEW_SCHEMA_VERSION
@@ -5931,8 +5920,7 @@ def _is_completed_review(verdict: Any) -> bool:
     result has no `blocking` key; `[null]` and `[{}]` are not findings because the
     reviewer must name both file and message. All are unusable — never passes clearing
     a code-blocked round — which closes §115's blindness in the audit of that gate."""
-    usable, _ = _review_verdict_shape(verdict)
-    if not usable:
+    if _review_verdict_problems(verdict):
         return False
     version = _schema_version_of(verdict)
     # 1, not 0: `REVIEW_SCHEMA_VERSION` starts at 1 and no version 0 ever existed, so a
@@ -6043,6 +6031,17 @@ def _carry_forward_code_blocked(verdict: dict[str, Any], readable: bool,
     return None
 
 
+def _row_is_placeable(r: _ReviewRow) -> bool:
+    """Whether this row can be POSITIONED — in the item's review sequence and in the window.
+
+    Both timestamps have to parse: the review's `created_at` is the fold's order key, and
+    the implement job's is the window key. An unreadable one means the row's place is
+    unknown, which is not the same as "old" — §123 admits such rows past the SQL pre-filter
+    precisely so the fold can see them and refuse to judge, rather than have them dropped
+    before anything looks."""
+    return _review_instant(r) is not None and _parse_ts(r["implement_created_at"]) is not None
+
+
 def _review_instant(r: _ReviewRow) -> dt.datetime | None:
     """The review's timestamp as an instant, or None when it cannot be placed.
 
@@ -6106,10 +6105,7 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
         # None as well as `unusable=True`: retaining a stale value would put the item into
         # `_always_blocks_findings()`'s denominator and, when it is False, suppress that
         # finding for the whole repo. An item we cannot place is not judged at all.
-        # Both timestamps count: the implement row's is the WINDOW key (an unreadable one
-        # means we cannot even say the item belongs in this window — §123 admits those rows
-        # for exactly this reason), the review's is the ORDER key.
-        if _review_instant(r) is None or _parse_ts(r["implement_created_at"]) is None:
+        if not _row_is_placeable(r):
             unplaceable.add((r["repo"], item_key))
         unplaceable_item = (r["repo"], item_key) in unplaceable
         status_by_repo.setdefault(r["repo"], {})[item_key] = _ReviewedItem(
@@ -6662,6 +6658,17 @@ def reconcile_stranded_prs(conn: sqlite3.Connection, policy: dict[str, Any], now
 SELF_SOURCE = "warden_self"
 SELF_AUDIT_CURSOR_KEY = "self_audit"
 SELF_AUDIT_INTERVAL_S = 3600
+# The stored summary's own generation, so a consumer of the cursor JSON can tell which
+# semantics its numbers carry: the same keys have meant different things across the
+# review-health work (the findings, and the window they are computed over), and a diff of
+# finding counts across generations is otherwise a silent misread (§126).
+SELF_AUDIT_SCHEMA = 2
+# A tripwire on this tick's own cost, not a performance target. The window query carries
+# one non-sargable term by necessity (§123) on a table that is never pruned, so its cost
+# grows with the ledger's lifetime; the tick's real cost is in the cursor summary, and this
+# turns that number into something visible instead of a note. Sized well above the work the
+# tick does today (< 1 ms measured at 379 rows) so it cannot fire on ordinary variance.
+SELF_AUDIT_SLOW_MS = 5000
 OWNER_QUEUE_STALE_DAYS = 3.0
 SELF_AUDIT_WINDOW_DAYS = 14
 # How many offending item ids a self-audit finding names before it summarises the
@@ -6956,6 +6963,8 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     row whose result cannot be read, or whose position among its item's rows cannot be
     placed), `liveness-never-confirms-<repo>`, `fixed-reopened-<event>` (the verdict or
     the fix was wrong), and `revisions-exhausted-<event>` (a revision budget used up).
+    `run_self_audit()` adds one more of its own, `self-audit-slow`, when this tick's own
+    cost crosses `SELF_AUDIT_SLOW_MS` — it is the only one that measures the auditor.
 
     Each section is isolated, so a section that raises reports `self-audit-section-failed-
     <name>` instead of taking the other four down with it."""
@@ -7016,8 +7025,21 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
         print(f"[dry-run] self-audit: {len(violations)} invariant violation(s){failed}, "
               f"{len(findings)} finding(s): {[f['key'] for f in findings]}")
         return
-    # Measured after the event sync below, just before the summary is built, so the tick's
-    # real cost is what lands in the cursor row that informs §118's index decision.
+    # The tick's own cost — invariants plus the five sections — is taken here, BEFORE the
+    # event sync, because that is the part that grows with the ledger (§118/§123) and
+    # because the finding built from it has to exist before the sync writes events. The
+    # sync's own cost is measured separately: it scales with the number of live findings,
+    # not with history, so folding it in would blur the number the tripwire watches.
+    self_audit_ms = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1000)
+    if self_audit_ms >= SELF_AUDIT_SLOW_MS:
+        findings.append({
+            "key": "self-audit-slow",
+            "title": f"the hourly self-audit tick took {self_audit_ms} ms "
+                     f"(threshold {SELF_AUDIT_SLOW_MS} ms)",
+            "detail": "the review-health window query carries a non-sargable term and "
+                      "`dispatches` is never pruned, so this grows with the ledger's "
+                      "lifetime — STATE.md names the expression index that removes it",
+        })
     now_iso = _now_iso(now)
     live_keys = {f["key"] for f in findings}
     for f in findings:
@@ -7033,14 +7055,17 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
                          (now_iso, f["title"][:300], payload, ev["id"]))
         else:
             conn.execute("UPDATE events SET title=?, payload_json=? WHERE id=?", (f["title"][:300], payload, ev["id"]))
+    sync_started = dt.datetime.now(dt.timezone.utc)
     for ev in conn.execute("SELECT id, external_id FROM events WHERE source=? AND resolved_at IS NULL",
                            (SELF_SOURCE,)).fetchall():
         if ev["external_id"] not in live_keys:
             conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
-    self_audit_ms = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1000)
-    summary = {"checked_at": now_iso, "invariants": sorted(INVARIANTS),
+    event_sync_ms = int((dt.datetime.now(dt.timezone.utc) - sync_started).total_seconds() * 1000)
+    summary = {"checked_at": now_iso, "self_audit_schema": SELF_AUDIT_SCHEMA,
+               "invariants": sorted(INVARIANTS),
                "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
                "self_audit_ms": self_audit_ms,
+               "event_sync_ms": event_sync_ms,
                "findings": sorted(live_keys)}
     if invariants_failure is not None:
         # An empty `violations` from a check that never ran is a fabricated zero, not a
