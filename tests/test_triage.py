@@ -9294,6 +9294,13 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
                          "outcome": "actionable", "blocking": [_CODE_FINDING]}
     complete_clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                       "outcome": "clean", "blocking": []}
+    legacy = dict(complete_clean, schemaVersion=max(0, triage._sideclaw.REVIEW_SCHEMA_VERSION - 1))
+    assert triage._is_completed_review(legacy)  # stored history remains parseable
+    assert not triage._review_contract_matches(legacy)  # new producer output is exact
+    assert triage._review_contract_matches(complete_clean)
+    for corrupt in (None, [], {**complete_clean, "blocking": None},
+                    {**complete_clean, "blocking": [None]}):
+        assert not triage._review_contract_matches(corrupt)
 
     seq = itertools.count()
 
@@ -9311,16 +9318,19 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
         row(4, "impl-4b", None, status="failed"),
         row(5, "impl-5", None, status="failed"),  # no complete review at all: absent
     ]
-    per_repo, latest = triage._fold_review_status(rows)
+    status_by_repo = triage._fold_review_status(rows)
     # The fold orders its own input: the same rows shuffled give the same answer.
     for shuffled in (list(reversed(rows)), rows[3:] + rows[:3]):
-        assert triage._fold_review_status(shuffled) == (per_repo, latest)
-    assert per_repo == {"demo-repo": {1: False, 2: True, 3: True, 4: True}}
-    assert latest == {"demo-repo": {1: False, 2: False, 3: False, 4: True, 5: True}}
+        assert triage._fold_review_status(shuffled) == status_by_repo
+    demo = status_by_repo["demo-repo"]
+    assert {k: v.code_blocked for k, v in demo.items()} == {
+        1: False, 2: True, 3: True, 4: True, 5: None}
+    assert {k: v.unusable for k, v in demo.items()} == {
+        1: False, 2: False, 3: False, 4: True, 5: True}
     # A manual dispatch has no triage event, so its implement job is the item key.
-    manual, manual_latest = triage._fold_review_status([row(None, "impl-manual", complete_blocking)])
-    assert manual == {"demo-repo": {"impl-manual": True}}
-    assert manual_latest == {"demo-repo": {"impl-manual": False}}
+    manual = triage._fold_review_status([row(None, "impl-manual", complete_blocking)])
+    assert manual["demo-repo"]["impl-manual"].code_blocked is True
+    assert manual["demo-repo"]["impl-manual"].unusable is False
 
 
 def test_a_persisted_non_object_verdict_cannot_crash_the_revision_brief():

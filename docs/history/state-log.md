@@ -9551,6 +9551,19 @@ described only one caller); and `_partition_findings()` delegates its split to
 `_code_blocking_findings()` / `_process_only_findings()` rather than re-deriving the filter, which
 restores the state-log's claim that they share one normalizer.
 
+**Fifteenth round.** Zero blockers; the two follow-ups converged on structure. First, the review
+fold now returns **one** repo → item map of `_ReviewedItem(code_blocked, unusable)` instead of
+two parallel dicts: a single record keeps the two facts about one review together while preserving
+the existing distinction between "no readable review" and `code_blocked=False`. Second, all three
+step-7 terminal branches now use one `_park_item()` for state, validation status, commit and card
+re-render; `validation_status` is an explicit argument, so failed/error rows, bad-schema rows and
+unreadable-finding rows cannot silently disagree about whether the dispatch itself is still
+"validating". The client assertions remain the sideclaw contract for a newly returned result; the
+new `_review_contract_matches()` checks that result's complete finding shape before the fold reads
+it, while `_is_completed_review()` deliberately remains the backwards-compatible reader for
+persisted history (older schema through the current version). They are not duplicate gates: one
+checks the new producer envelope and one checks that a stored historical payload is still readable.
+
 **Verified.** `tests/test_triage.py` at **369/369** (354 before, +15); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
