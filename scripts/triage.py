@@ -6469,20 +6469,34 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     # blocked" and went blind to exactly the reviews that keep raising them. One
     # item is one row here: a PR that took two revisions to block (weatherorb's
     # 23 implement rows / 11 items) counts once, not twice.
+    #
+    # §117: the row is the item, but WHICH of its reviews speaks for it is the
+    # LAST one. §116 added an item to `code_blocked` on any review of it that
+    # carried a code finding and never removed it, so a PR blocked on its first
+    # revision and accepted on its second still read as blocked — a repo that
+    # accepts its PRs after one revision round fired "the review blocked all N
+    # PRs" on items that were ultimately accepted. Ordered by the review's own
+    # created_at, then its row id (insertion order — the ordering the folded
+    # `validation_status` column never exposed), so each item ends on its latest
+    # review: a blocking one adds it, a clean one clears it.
     reviewed: dict[str, set[int]] = {}
     code_blocked: dict[str, set[int]] = {}
     for r in conn.execute(
         "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' AND d.origin_event_id IS NOT NULL "
-        "AND d.created_at >= ? AND r.verdict_json IS NOT NULL",
+        "AND d.created_at >= ? AND r.verdict_json IS NOT NULL "
+        "ORDER BY r.created_at, r.id",
         (since,),
     ):
         reviewed.setdefault(r["repo"], set()).add(r["event_id"])
         blocking = [f for f in (_safe_json(r["verdict_json"]).get("blocking") or [])
                     if not _is_process_only_finding(f)]
+        repo_blocked = code_blocked.setdefault(r["repo"], set())
         if blocking:
-            code_blocked.setdefault(r["repo"], set()).add(r["event_id"])
+            repo_blocked.add(r["event_id"])
+        else:
+            repo_blocked.discard(r["event_id"])
     for repo, items in reviewed.items():
         n = len(items)
         if n >= 3 and len(code_blocked.get(repo, set())) == n:

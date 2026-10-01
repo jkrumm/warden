@@ -9408,3 +9408,41 @@ not three. `make test` green with `test_triage.py` at **354/354** (352 before, +
 the live ledger the old query fires only for `research-gateway` (6 rows / 6 blocked)
 and the new one still fires there — now honestly, **6 items / 6 code-blocked** — while
 `weatherorb` reads 11 / 9, `dotfiles` 4 / 3, `warden` 2 / 1, `homelab` 7 / 4.
+
+## 117. The self-audit reads an item by its LATEST review, not any earlier one (2026-10-01)
+
+§116 keyed `review-always-blocks-<repo>` on the review verdict's own `blocking[]` and counted
+distinct items, but its per-item status was still an ACCUMULATION across that item's
+revisions: an event entered `code_blocked` on any review of it that carried a code finding and
+was never removed, so a PR whose first revision was blocked and whose second was accepted still
+read as blocked. The finding fires on `len(code_blocked) == n`, so a repo that accepts its PRs
+after one revision round — the healthy shape — fired "the review blocked all N PRs" on items
+that were ultimately accepted. It shipped as §116's deliberate judgment call ("any revision
+counts", flagged for the reviewer rather than decided); the step-7 review on PR #7's diff
+(sideclaw job `5233ae3b`, raised by the adversary angle alone) rejected it as a blocking
+correctness bug, and the owner's disposition was to fix it rather than settle it.
+
+**The change: the last row wins.** The implement→review join is ordered by the review's own
+`created_at`, then its row id (insertion order — the ordering the folded `validation_status`
+column never exposed), and each item ends on its LATEST review: a blocking one adds the event
+to `code_blocked`, a clean one removes it. The denominator (`n`, items with a completed review)
+and every other self-audit count are unchanged.
+
+**Verified.** Test first:
+`test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one` fails on the §116 code
+for the stated reason — three items, each blocked on round one and accepted on round two, fire
+the finding — and passes with the fix, which also pins the positive direction (three items
+blocked on their LATEST round still fire, two of them having come back clean earlier).
+`tests/test_triage.py` at **355/355** (354 before, +1); all other suites unchanged. On a
+`VACUUM INTO` copy of the live ledger the 14-day window's firing set is unchanged
+(`research-gateway` 6 items / 6 code-blocked, in both readings), while the per-item status moves
+where it should: `weatherorb` 9 any-review-blocked → 5 latest-review-blocked, `warden` 1 → 0 —
+the false positive is a live hazard, not a theory.
+
+**Landing.** §116 and §117 both ride PR #7 (branch
+`dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is
+merge-approval gated, so the owner's Argo Merge click is the outside. Item 1364 — the alert
+carrying the review's finding — was closed rather than carried: its investigate verdict was
+`implement`/high, but the auto-implement round is cut from the live checkout's `HEAD`, i.e.
+`master`, where `code_blocked` does not exist, so the correction was applied on the PR branch by
+hand instead of spending an episode on a tree that cannot show the defect.

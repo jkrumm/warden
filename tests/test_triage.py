@@ -9114,6 +9114,34 @@ def test_self_audit_counts_a_pr_once_across_its_revisions():
         assert "all 3 demo-repo PRs" in finding["title"]
 
 
+def test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one():
+    """§117 — §116 added an item to `code_blocked` on ANY of its reviews that
+    carried a code finding and never removed it, so a PR whose first revision was
+    blocked and whose latest revision passed still read as blocked: a repo that
+    accepts its PRs after one revision round fired "the review blocked all N PRs"
+    on items that were ultimately accepted. An item's status is its LATEST review's
+    — an earlier blocked round must not keep it counted."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=930 + i, suffix=f"late-{930 + i}-a")
+            _seed_blocking_review(conn, event_id=930 + i, suffix=f"late-{930 + i}-b",
+                                  outcome="actionable", blocking=[])
+        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
+        assert "review-always-blocks-demo-repo" not in keys
+
+    with _triage_env() as (conn, ctx):
+        # ...and the positive direction: three items blocked on their LATEST round,
+        # two of which had come back clean earlier — the earlier clean round must
+        # not clear them either.
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-a",
+                                  outcome="actionable", blocking=[])
+            _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-b")
+        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+
 def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review():
     """§111 — the finding keyed only on `revision_count` plus a parked state and
     hardcoded "the implementer cannot satisfy the review". For 1276/1277 that was

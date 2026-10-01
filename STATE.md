@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-30 (§116 — the self-audit's `review-always-blocks` finding reads the review verdict's own `blocking[]`, not the folded `validation_status` column §115 moved a needs-human review off, and counts distinct items, not implement rows, so a revised PR stops counting twice) |
+| Last updated | 2026-10-01 (§117 — the self-audit's `review-always-blocks` finding reads each item by its LATEST review, so a PR blocked on one revision and accepted on the next stops counting as blocked; §116 and §117 both ride PR #7, unmerged, owner-merge-gated) |
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
-| Repo state | `master`, six LaunchAgents on the mini |
+| Repo state | `master` (00dc001), six LaunchAgents on the mini. **§116 and §117 are NOT on `master` — both ride PR #7**, branch `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`, waiting on the owner's Argo Merge click (`warden` is merge-approval gated, no `autoMergePaths`). The live loop therefore still runs the pre-§116 self-audit |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 354/354 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 355/355 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -178,7 +178,9 @@ loop.
   the wrong mechanism is read as evidence, and names the rounds that each
   blocked on a different file (§114). `review-always-blocks` reads the review
   verdict's own `blocking[]` and counts distinct items, not implement rows, so
-  §115's needs-human fold cannot blind it and a revised PR counts once (§116).
+  §115's needs-human fold cannot blind it and a revised PR counts once (§116);
+  each item is read by its LATEST review, so a PR blocked on one revision and
+  accepted on the next is not counted as blocked at all (§117).
 - **A plan-gated rules read is "no rules" (§108).** `branch_rules()` returns
   `[]` for the 403 GitHub answers with on a private repo whose plan carries no
   rulesets ("Upgrade to GitHub Pro or make this repository public") — that repo
@@ -457,6 +459,7 @@ log's past sections.
   closing instruction — §114
 - A needs-human review never spends a revision, and its findings ride the card — §115
 - The self-audit reads the review's own verdict, and counts PRs not rows — §116
+- The self-audit reads an item by its latest review, not any earlier one — §117
 
 ### Next action
 
