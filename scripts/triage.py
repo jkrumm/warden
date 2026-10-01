@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Iterable, NamedTuple
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
@@ -5838,10 +5838,22 @@ def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
 
 def _process_only_findings(blocking: Any) -> list[dict[str, Any]]:
     """The complement of `_code_blocking_findings()` — the §114 wrapper class, which
-    must not read as `blocked` but must not be dropped either. Pairing them on one
-    normalizer is what keeps a malformed payload from crashing one list and not the
-    other."""
+    must not read as `blocked` but must not be dropped either."""
     return [f for f in _published_findings(blocking) if _is_process_only_finding(f)]
+
+
+def _partition_findings(blocking: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
+                                                list[dict[str, Any]]]:
+    """`(published, code, process)` from one verdict's `blocking` field.
+
+    `published` keeps the reviewer's own order — that is what a card, a brief or a note
+    should quote, so a human reading them sees the same sequence the review published.
+    `code` and `process` split it by §114's rule for the decision; one partition pass
+    means the two lists cannot disagree about what the payload contained."""
+    published = _published_findings(blocking)
+    code = [f for f in published if not _is_process_only_finding(f)]
+    process = [f for f in published if _is_process_only_finding(f)]
+    return published, code, process
 
 
 def _is_completed_review(verdict: Any) -> bool:
@@ -5889,11 +5901,32 @@ def _is_finding_shape(finding: Any) -> bool:
 ItemKey = int | str
 
 
-def _review_item_status(conn: sqlite3.Connection, since: str) -> tuple[
-        dict[str, dict[ItemKey, bool]], dict[str, dict[ItemKey, bool]]]:
-    """The review-health reduce, split from the two finding formats it feeds.
+def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite3.Row]:
+    """Every implement→review pair in the window whose review reached a terminal status,
+    oldest first. `since` is normalised to the ledger's own stored format first: the
+    window bound is compared as text, and the harness passes an offset-carrying
+    `isoformat()` where the ledger holds microsecond strings."""
+    since_dt = _parse_ts(since)
+    if since_dt is None:
+        raise ValueError(f"invalid self-audit window start: {since!r}")
+    since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
+    placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
+    sql = (
+        "SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
+        "r.verdict_json AS verdict_json, "
+        "r.status AS review_status "
+        "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
+        "WHERE d.tier='implement' "
+        "AND d.created_at >= ? AND r.status IN (" + placeholders + ") "
+        "ORDER BY r.created_at, r.id"
+    )
+    return conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
 
-    Returns `(per_repo, latest_unusable)`:
+
+def _fold_review_status(rows: Iterable[sqlite3.Row]) -> tuple[
+        dict[str, dict[ItemKey, bool]], dict[str, dict[ItemKey, bool]]]:
+    """The review-health fold — pure, so the latest-wins rule is testable without a
+    database. Returns `(per_repo, latest_unusable)`:
 
     - `per_repo` — repo -> item key -> did that item's LATEST COMPLETE review carry a
       code finding. An item with no complete review at all (every terminal row
@@ -5908,21 +5941,7 @@ def _review_item_status(conn: sqlite3.Connection, since: str) -> tuple[
     item, and an earlier complete review keeps speaking (§117)."""
     per_repo: dict[str, dict[ItemKey, bool]] = {}
     latest_unusable: dict[str, dict[ItemKey, bool]] = {}
-    terminal_status_placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
-    since_dt = _parse_ts(since)
-    if since_dt is None:
-        raise ValueError(f"invalid self-audit window start: {since!r}")
-    since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
-    sql = (
-        "SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
-        "r.verdict_json AS verdict_json, "
-        "r.status AS review_status "
-        "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
-        "WHERE d.tier='implement' "
-        "AND d.created_at >= ? AND r.status IN (" + terminal_status_placeholders + ") "
-        "ORDER BY r.created_at, r.id"
-    )
-    for r in conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)):
+    for r in rows:
         # A manual `warden dispatch` has no triage event; its implement job is the
         # only identity it has, and it is a real row this audit must not drop.
         item_key: ItemKey = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]
@@ -5978,7 +5997,7 @@ def _always_blocks_findings(per_repo: dict[str, dict[ItemKey, bool]]) -> list[di
 def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
     """Both review-gate findings: a gate that blocks every reviewed item, and terminal
     reviews whose stored results cannot safely count as passes."""
-    per_repo, latest_unusable = _review_item_status(conn, since)
+    per_repo, latest_unusable = _fold_review_status(_fetch_terminal_reviews(conn, since))
     return (_unusable_verdict_findings(latest_unusable)
             + _always_blocks_findings(per_repo))
 
@@ -6109,10 +6128,7 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # _is_process_only_finding(). It must not read as `blocked` (that is what
         # spends a revision) but it must not be dropped either, so it routes to a
         # human with the finding on the card.
-        code_blocking = _code_blocking_findings(verdict.get("blocking"))
-        process_blocking = _process_only_findings(verdict.get("blocking"))
-        # The published findings, in full: what a `blocked` note quotes.
-        blocking = code_blocking + process_blocking
+        blocking, code_blocking, process_blocking = _partition_findings(verdict.get("blocking"))
         summary = verdict.get("summary") or "no further detail"
 
         unknown_outcome_note = None

@@ -9529,7 +9529,18 @@ module. The seam is already split into five single-purpose functions here
 `_is_completed_review` / the reduce + two builders), and a module extraction would move code this
 change does not otherwise touch — its own commit, not a rider on a correctness fix.
 
-**Verified.** `tests/test_triage.py` at **366/366** (354 before, +12); all 21 test files green.
+**Thirteenth round.** The adversary reviewer's sole blocking finding — `_revision_findings()`
+calling `.get()` on a non-dict persisted verdict — is **verified false**: `_safe_json()` (line 1726)
+already returns `{}` for any payload that is not a JSON object, so a persisted scalar, array, string
+or garbage reduces to an empty dict before the call. Pinned with a test that persists `5`, `[]`,
+`"error"`, `true` and unparseable text on blocked items and drives the brief builder over each.
+Two improvements applied: the code/process split is now one `_partition_findings()` returning
+`(published, code, process)`, so a `blocked` note quotes the findings in the review's own published
+order (the previous commit regrouped them by type, renumbering what a human reads), and the query is
+split from the fold (`_fetch_terminal_reviews()` → pure `_fold_review_status()`), with a unit test
+that states the latest-wins rule in seven plain rows and no database.
+
+**Verified.** `tests/test_triage.py` at **369/369** (354 before, +15); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload

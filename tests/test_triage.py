@@ -9285,6 +9285,72 @@ def test_a_dry_run_validation_tick_is_a_no_op_even_for_an_unreadable_verdict():
         assert d["validation_status"] is None, d["validation_status"]
 
 
+def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
+    """§117 — the fold is separated from the query precisely so this rule can be
+    stated without a database: an item's status is its LATEST complete review's, and
+    a later unreadable row is reported without moving that status either way."""
+    complete_blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                         "outcome": "actionable", "blocking": [_CODE_FINDING]}
+    complete_clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                      "outcome": "clean", "blocking": []}
+
+    def row(event_id, job, verdict, status="done"):
+        return {"repo": "demo-repo", "event_id": event_id, "implement_job_id": job,
+                "verdict_json": None if verdict is None else json.dumps(verdict),
+                "review_status": status}
+
+    per_repo, latest = triage._fold_review_status([
+        row(1, "impl-1a", complete_blocking),   # blocked, then accepted: not blocked
+        row(1, "impl-1b", complete_clean),
+        row(2, "impl-2", complete_blocking),
+        row(3, "impl-3", complete_blocking),
+        row(4, "impl-4a", complete_blocking),   # blocked, then unreadable: still blocked
+        row(4, "impl-4b", None, status="failed"),
+        row(5, "impl-5", None, status="failed"),  # no complete review at all: absent
+    ])
+    assert per_repo == {"demo-repo": {1: False, 2: True, 3: True, 4: True}}
+    assert latest == {"demo-repo": {1: False, 2: False, 3: False, 4: True, 5: True}}
+    # A manual dispatch has no triage event, so its implement job is the item key.
+    manual, manual_latest = triage._fold_review_status([row(None, "impl-manual", complete_blocking)])
+    assert manual == {"demo-repo": {"impl-manual": True}}
+    assert manual_latest == {"demo-repo": {"impl-manual": False}}
+
+
+def test_a_persisted_non_object_verdict_cannot_crash_the_revision_brief():
+    """§117 — the recurring loop reads a blocked item's stored review verdict to build
+    the revision brief. `_safe_json()` reduces valid non-object JSON to `{}`, so a
+    persisted scalar/array/string verdict reads as an empty dict and the brief falls
+    through to `None` — it must never raise while the loop is mid-tick."""
+    with _triage_env() as (conn, ctx):
+        for idx, raw in enumerate(("5", "[]", '"error"', "true", "not json at all")):
+            raw_marker = f"raw-{idx}"
+            eid = _seed_blocked_item(conn, external_id=raw_marker)
+            conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id=?",
+                         (raw, f"val-{raw_marker}"))
+            conn.commit()
+            item = triage._get_item(conn, eid)
+            assert triage._revision_findings(conn, item) is None
+
+
+def test_the_blocked_note_keeps_the_reviews_own_finding_order():
+    """§117 — the split into code/process findings is a DECISION input, not a display
+    one: a `blocked` note must quote the findings in the order the review published
+    them, or the numbering a human reads stops matching the payload."""
+    with _triage_env() as (conn, ctx):
+        published, code, process = triage._partition_findings(
+            [_PROCESS_ONLY_FINDING, _CODE_FINDING])
+        assert published == [_PROCESS_ONLY_FINDING, _CODE_FINDING]
+        assert code == [_CODE_FINDING] and process == [_PROCESS_ONLY_FINDING]
+
+        eid = _seed_blocked_item(conn, external_id="note-order",
+                                 blocking=[_PROCESS_ONLY_FINDING, _CODE_FINDING])
+        brief = triage._revision_findings(conn, triage._get_item(conn, eid))
+        # The wrapper class is not handed to an episode (§114), so the brief carries
+        # the code finding — in the review's own position, not regrouped by type.
+        assert brief is not None and "src/weatherorb/serve/cache.py:334" in brief
+        assert "Closes #20" not in brief
+
+
 def test_self_audit_reports_an_item_by_its_latest_row_not_an_earlier_unusable_one():
     """§117 — the unusable report follows the same "latest row wins" rule as the
     blocking count. An item whose earlier review was unusable but whose newest
