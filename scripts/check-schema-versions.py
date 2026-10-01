@@ -98,8 +98,13 @@ def main(argv: list[str]) -> int:
         # A difference warden tolerates on purpose is still worth naming: the producer
         # requiring more than warden does is safe, and hiding it would make the next real
         # difference indistinguishable from this one.
-        shape = r.get("findingShape")
-        if shape and shape["published"]:
+        # `r` is `dict[str, Any]`, so the union arrives unannotated. Annotate it here too, and
+        # narrow on the DISCRIMINATOR rather than on truthiness (§139): `published` is
+        # `Literal[False]`/`Literal[True]`, and only the `is True` arm may read the comparison's
+        # keys — the unreadable arm carries `reason` alone, so a truthiness test leaves
+        # `required`/`wardenRequires` unchecked reads.
+        shape: sideclaw.FindingShapeReport | None = r.get("findingShape")
+        if shape is not None and shape["published"] is True:
             extra = sorted(set(shape["required"]) - set(shape["wardenRequires"]))
             if extra:
                 parts.append(f"(producer also requires: {', '.join(extra)})")

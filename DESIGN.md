@@ -880,6 +880,24 @@ there would only invalidate old rows. `_review_verdict_problems(require_blocking
 difference, spelled at one call site, and the refusal note is built with the same flag so it cannot
 report "unknown mismatch" about a payload it just refused.
 
+A raw-text admission is not a superset of an instant comparison (§139). `_fetch_review_rows()`
+pre-filters in SQL and decides in Python, and the pre-filter must never be the narrower of the
+two, or a row disappears before the window is ever applied to it — silently, in the one direction
+that hides work. A lexical compare against a bound is not that superset: `'2026-09-30 14:00:00
+-12:00'` sorts before `'2026-09-30T00:00:00'` (`' '` < `'T'`) although its instant is
+2026-10-01T02:00Z, and a bare `'2026-09-30'` sorts before any bound on the same date. What kept
+those rows visible was the 26-hour WIDENING of the bound — an in-window row's date is always a
+later date than a bound that far back, so the date prefix decided every in-window comparison before
+the separator could. Measured both ways on a copy of the live ledger: the raw-text form admits all
+three representations of an in-window row and drops only rows the window's own decision drops
+anyway, and `widen = timedelta(0)` would have made it drop space-separated in-window rows. The
+pre-filter now admits on `datetime(d.created_at)`, SQLite's own normalised parse — plus
+`datetime(...) IS NULL` for rows it cannot read, which stay visible as `corrupt_timestamps`. The
+slack stays for a smaller, real reason: SQLite truncates fractional seconds where Python keeps
+microseconds. `EXPLAIN QUERY PLAN` says `SCAN d` for both spellings (the `IS NULL` term already
+put the query on a scan), measured 10.4 ms against 14.6 ms for 200 runs over the live 379-row
+ledger, and the normalised form is the shape the planned expression index covers.
+
 The shape only matters where the producer PROMISES to publish it (§137). `blocking` must be
 listed in `output.required`, because that is the promise the runtime reads:
 `_review_verdict_problems()` refuses a non-clean verdict with no `blocking` list, and such a

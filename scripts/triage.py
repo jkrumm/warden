@@ -6031,23 +6031,45 @@ def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
     another tier (the live ledger has implement→investigate pairs), to another repo, or to
     another item's review is returned as a mismatch instead of being silently dropped.
 
-    The window compares INSTANTS, not text, and the comparison is the one at the tail, in
-    Python: a stored `+HH:MM`/`Z`/naive timestamp is parsed, so a row cannot land in or out of
-    the window by its representation. The SQL pre-filter is only a cheap superset (widened for
-    real UTC offsets) that keeps `idx_dispatches_created` usable.
+    The window compares INSTANTS, not text, and the decision is the one at the tail, in Python:
+    a stored `+HH:MM`/`Z`/naive/space-separated timestamp is parsed, so a row cannot land in or
+    out of the window by its REPRESENTATION. The SQL pre-filter admits on SQLite's own normalised
+    parse of the same column plus unparseable rows, so it is a superset of that decision rather
+    than a cheaper approximation of it — a lexical compare against a bound is not a superset, and
+    it dropped in-window rows whose text sorted low (a space separator, a date-only value).
 
     No `ORDER BY`: `_fold_review_status()` orders its own input by parsed instant, and a
     sort here would only imply a contract the fold does not rely on."""
     since_dt = _parse_ts(since)
     if since_dt is None:
         raise ValueError(f"invalid self-audit window start: {since!r}")
-    # The SQL pre-filter is a SUPERSET of the window, not the window itself, and it is
-    # deliberately widened: the exact comparison below is on parsed instants, so this only
-    # has to be cheap. `datetime(d.created_at)` would disable `idx_dispatches_created`
-    # (§118's discussion); comparing the column directly keeps the index usable, and the
-    # 26-hour slack covers any real UTC offset (-12:00 … +14:00) so a row written with one
-    # cannot fall out of the pre-filter by its text. Widening is safe in that direction
-    # because anything the pre-filter wrongly admits is removed below.
+    # The SQL pre-filter is a SUPERSET of the window, not the window itself: the exact
+    # comparison below is on parsed instants, so this only has to be permissive, and anything
+    # it wrongly admits is removed below.
+    #
+    # It admits on `datetime(d.created_at)` — SQLite's OWN normalised parse (§139). A raw-text
+    # compare is not a superset of an instant compare in general, because the REPRESENTATION
+    # decides it: `'2026-09-30 14:00:00-12:00'` sorts before `'2026-09-30T00:00:00'` (`' '` <
+    # `'T'`) although its instant is 2026-10-01T02:00Z, and a bare `'2026-09-30'` sorts before any
+    # bound on the same date. What kept those rows visible was the SLACK, not the compare: the
+    # bound handed in is the window start minus 26 hours, and an in-window row's date is always a
+    # later date than that, so the date prefix decided every in-window comparison before the
+    # separator could. Measured, both ways, over a live-ledger copy: the raw-text form admits all
+    # three representations of an in-window row, and it drops only rows the window's own Python
+    # decision drops anyway. The normalised form removes the dependence on that accident —
+    # `widen = timedelta(0)` would have made the raw-text version drop space-separated in-window
+    # rows, silently and in the one direction §129 forbids — while admitting at most the same
+    # slack-region rows, which the decision below removes.
+    #
+    # The 26-hour slack stays regardless: SQLite truncates fractional seconds, so a row under a
+    # second past the bound could compare as outside it while Python, which keeps microseconds,
+    # keeps it. Slack far larger than any such disagreement removes the question.
+    # Cost: `datetime(...)` on the column is non-sargable, and the query already scans
+    # `dispatches` because of the `IS NULL` term below — `EXPLAIN QUERY PLAN` says `SCAN d` for
+    # both spellings, and 200 runs over the live copy's 379 rows took 10.4 ms normalised against
+    # 14.6 ms raw. It also makes the planned revisit (an expression index on
+    # `datetime(created_at)`, STATE.md) cover this predicate exactly instead of needing a second
+    # shape.
     widen = dt.timedelta(hours=26)
     naive_utc = ((since_dt - widen).astimezone(dt.timezone.utc).replace(tzinfo=None)
                  .isoformat())
@@ -6060,7 +6082,7 @@ def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
         "r.status AS review_status, r.created_at AS created_at, r.id AS id "
         "FROM dispatches d LEFT JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' AND d.validation_job_id IS NOT NULL "
-        "AND (d.created_at >= ? OR datetime(d.created_at) IS NULL) "
+        "AND (datetime(d.created_at) >= datetime(?) OR datetime(d.created_at) IS NULL) "
     )
     fetched = conn.execute(sql, (naive_utc,)).fetchall()
     # A row whose timestamp SQLite cannot read is admitted explicitly by the pre-filter
@@ -6271,6 +6293,14 @@ def _fold_review_status(rows: Iterable[ReviewRow]) -> dict[str, dict[ItemKey, _R
     describes the latest terminal row, independently of which complete row spoke, and
     an item with ANY row it cannot place in time is unusable too: a corrupt timestamp
     must not let an older readable review stand in for the current one.
+
+    The loop stays ONE loop rather than a per-row `classify(row) -> _ReviewedItem` helper (§139).
+    Its inputs are accumulated state — the previous record for the key, and the `unplaceable` set
+    that has to survive across rows because a key can recur — so a helper would take that set as a
+    mutable parameter, which is the same bookkeeping moved one frame deeper, or re-derive the
+    ordering rule it exists to keep in one place. Each of the four things the body does landed as a
+    separate finding with a comment of its own; if a fifth rule ever lands here, split it then, with
+    the tests that pin these four still passing.
 
     A later unreadable row sets `unusable=True` but retains the last complete review's
     `code_blocked` value. If there was no complete review, that stays `None` so the

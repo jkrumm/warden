@@ -473,6 +473,28 @@ def _as_object(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+class _UnreadableShape(Exception):
+    """Internal: a `_require_object()` step that did not find its object.
+
+    Never escapes `_published_finding_shape()`: it exists so the seven-step descent can be
+    written as a descent instead of seven copies of the same two-line guard plus a return. Its
+    message IS the refusal reason, which is what keeps the wording of each step in one place
+    (§139)."""
+
+
+def _require_object(container: dict[str, Any], key: str, what: str) -> dict[str, Any]:
+    """The object at `container[key]`, or a refusal naming `what`.
+
+    The rule at every level is the same — a level that is not a non-empty object makes the shape
+    unreadable, and the reason has to name the level — so it is written once. `_as_object()` is
+    the type test; an empty object is treated as absent, because a schema with no fields at that
+    level says nothing either."""
+    value = _as_object(container.get(key))
+    if not value:
+        raise _UnreadableShape(f"no {what} in the published schema")
+    return value
+
+
 def _published_finding_shape(
         parsed: dict[str, Any]) -> PublishedFindingShape | UnreadableFindingShape:
     """The finding object sideclaw publishes, or WHY it could not be read.
@@ -495,64 +517,63 @@ def _published_finding_shape(
     list or tuple OF NAMES or it is nothing: `frozenset()` over a bare string would read as a
     set of its own characters (`{"f", "i", "l", "e"}` passing a name check it should fail) and
     a number would raise out of a function documented never to raise."""
-    # One guard per level, each returning "not published, and here is what moved" rather than
-    # raising: the body this has to survive is precisely the malformed one it exists to report.
-    output = _as_object(parsed.get("output"))
-    if not output:
-        return UnreadableFindingShape("no `output` object in the published schema")
-    container = _as_object(output.get("properties"))
-    if not container:
-        return UnreadableFindingShape("no `output.properties` object in the published schema")
-    # …and the shape only matters if a NON-CLEAN outcome promises to publish it (§137). The
-    # runtime reads that promise: `_review_verdict_problems()` reports `outcome 'actionable'
-    # publishes no `blocking` list`, and such a verdict is unusable, so a producer that made
-    # `blocking` optional in `output.required` while keeping this exact item schema would leave
-    # every field and container green here and have every actionable review parked as unusable.
-    # A conditional requirement (`if`/`then`) cannot be read as a plain promise, so it is refused
-    # rather than assumed.
-    output_required = output.get("required")
-    if not isinstance(output_required, (list, tuple)) or not all(
-            isinstance(name, str) for name in output_required):
-        return UnreadableFindingShape(
-            "`output.required` is not a list of names, so the promise that a non-clean outcome "
-            "publishes `blocking` cannot be read")
-    if "blocking" not in output_required:
-        return UnreadableFindingShape(
-            "a non-clean outcome must publish `blocking`, and `output.required` does not list "
-            "it (a conditional requirement is not readable here): the runtime refuses a "
-            "findings-shaped verdict without it, so every actionable review would be unusable")
-    blocking = _as_object(container.get("blocking"))
-    if not blocking:
-        return UnreadableFindingShape("no `output.properties.blocking` schema object")
-    if blocking.get("type") != "array":
-        return UnreadableFindingShape(
-            "`output.properties.blocking` is not exactly an array "
-            f"(type={blocking.get('type')!r}), and the runtime iterates it as a list")
-    items = _as_object(blocking.get("items"))
-    if not items:
-        return UnreadableFindingShape("no `output.properties.blocking.items` object schema")
-    if items.get("type") != "object":
-        return UnreadableFindingShape(
-            "`output.properties.blocking.items` is not exactly an object "
-            f"(type={items.get('type')!r}), and warden reads its fields by name")
-    properties = _as_object(items.get("properties"))
-    if not properties:
-        return UnreadableFindingShape(
-            "`output.properties.blocking.items` publishes no fields")
-    required = items.get("required", [])
-    if not isinstance(required, (list, tuple)):
-        # Catches `str` too, which is the case that matters: `frozenset("file")` is four
-        # characters, and an int raises. Both are unreadable shapes, not missing fields.
-        return UnreadableFindingShape(
-            f"`items.required` is a {type(required).__name__}, not a list of names")
-    if not all(isinstance(name, str) for name in list(required) + list(properties)):
-        return UnreadableFindingShape(
-            "`items.required`/`items.properties` carry non-string, non-field names")
-    return PublishedFindingShape(
-        frozenset(required),
-        frozenset(properties),
-        {name: (_as_object(subschema) or {}).get("type") for name, subschema in properties.items()},
-    )
+    # One guard per level, each saying "not published, and here is what moved" rather than letting
+    # anything out: the body this has to survive is precisely the malformed one it exists to
+    # report. `_UnreadableShape` is caught at the bottom and becomes that return value.
+    try:
+        output = _require_object(parsed, "output", "`output` object")
+        container = _require_object(output, "properties", "`output.properties` object")
+        # …and the shape only matters if a NON-CLEAN outcome promises to publish it (§137). The
+        # runtime reads that promise: `_review_verdict_problems()` reports `outcome 'actionable'
+        # publishes no `blocking` list`, and such a verdict is unusable, so a producer that made
+        # `blocking` optional in `output.required` while keeping this exact item schema would
+        # leave every field and container green here and have every actionable review parked as
+        # unusable. A conditional requirement (`if`/`then`) cannot be read as a plain promise, so
+        # it is refused rather than assumed.
+        output_required = output.get("required")
+        if not isinstance(output_required, (list, tuple)) or not all(
+                isinstance(name, str) for name in output_required):
+            raise _UnreadableShape(
+                "`output.required` is not a list of names, so the promise that a non-clean "
+                "outcome publishes `blocking` cannot be read")
+        if "blocking" not in output_required:
+            raise _UnreadableShape(
+                "a non-clean outcome must publish `blocking`, and `output.required` does not "
+                "list it (a conditional requirement is not readable here): the runtime refuses a "
+                "findings-shaped verdict without it, so every actionable review would be unusable")
+        blocking = _require_object(
+            container, "blocking", "`output.properties.blocking` schema object")
+        if blocking.get("type") != "array":
+            raise _UnreadableShape(
+                "`output.properties.blocking` is not exactly an array "
+                f"(type={blocking.get('type')!r}), and the runtime iterates it as a list")
+        items = _require_object(
+            blocking, "items", "`output.properties.blocking.items` object schema")
+        if items.get("type") != "object":
+            raise _UnreadableShape(
+                "`output.properties.blocking.items` is not exactly an object "
+                f"(type={items.get('type')!r}), and warden reads its fields by name")
+        properties = _as_object(items.get("properties"))
+        if not properties:
+            raise _UnreadableShape(
+                "`output.properties.blocking.items` publishes no fields")
+        required = items.get("required", [])
+        if not isinstance(required, (list, tuple)):
+            # Catches `str` too, which is the case that matters: `frozenset("file")` is four
+            # characters, and an int raises. Both are unreadable shapes, not missing fields.
+            raise _UnreadableShape(
+                f"`items.required` is a {type(required).__name__}, not a list of names")
+        if not all(isinstance(name, str) for name in list(required) + list(properties)):
+            raise _UnreadableShape(
+                "`items.required`/`items.properties` carry non-string, non-field names")
+        return PublishedFindingShape(
+            frozenset(required),
+            frozenset(properties),
+            {name: (_as_object(subschema) or {}).get("type")
+             for name, subschema in properties.items()},
+        )
+    except _UnreadableShape as exc:
+        return UnreadableFindingShape(str(exc))
 
 
 def classify_dispatch_outcome(status: str | None, verdict_json: str | None) -> tuple[str, str | None]:

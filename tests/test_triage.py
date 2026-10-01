@@ -8569,11 +8569,17 @@ def test_a_pointer_into_another_repo_is_not_read_as_this_review():
         assert len(rows) == 1 and rows[0]["repo"] == "demo-repo"
 
 
-def test_the_window_prefilter_is_an_index_friendly_superset():
-    """§122: the pre-filter compares the raw column (keeping `idx_dispatches_created`
-    usable) and is widened by 26h; the exact instant comparison is the decision, so a row
-    the pre-filter admits outside the window must still be dropped — and one inside kept,
-    including a naive timestamp an offset-reading would have misplaced."""
+def test_the_window_prefilter_is_a_superset_of_the_instant_decision():
+    """§122/§139: the pre-filter admits permissively and the exact instant comparison is the
+    decision, so a row it admits outside the window must still be dropped — and one inside kept,
+    including a naive timestamp an offset-reading would have misplaced.
+
+    §139 adds the property the pre-filter has to have whatever spelling it uses: the decision is
+    on INSTANTS, so an in-window row stays visible in whatever representation its writer chose.
+    The raw-text compare held that property only by accident (`datetime('2026-09-30 14:00:00
+    -12:00')` sorts below `'2026-09-30T00:00:00'` — `' '` < `'T'` — although its instant is
+    2026-10-01T02:00Z; what saved it was the 26h-widened bound, since an in-window row's date is
+    always a later date than the bound's). Admission is SQLite's own normalised parse now."""
     with _triage_env() as (conn, ctx):
         for name, age in (("inside", dt.timedelta(hours=2)), ("outside", dt.timedelta(hours=30))):
             _seed_blocked_item(conn, external_id=f"pf-{name}")
@@ -8590,6 +8596,32 @@ def test_the_window_prefilter_is_an_index_friendly_superset():
         conn.commit()
         rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
         assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
+        # §139: same instant, three other representations. None may fall out of the audit by its
+        # text — a row that vanishes here is a row the review-health numbers never see.
+        for name, rendered in (
+            # Space-separated with a real UTC offset: the text is local, the instant is not.
+            ("space", (NOW - dt.timedelta(hours=2))
+             .astimezone(dt.timezone(dt.timedelta(hours=2))).strftime("%Y-%m-%d %H:%M:%S") + "+02:00"),
+            ("date", (NOW - dt.timedelta(hours=2)).strftime("%Y-%m-%d")),
+            ("zulu", (NOW - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        ):
+            _seed_blocked_item(conn, external_id=f"pf-rep-{name}")
+            conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                         (f"val-pf-rep-{name}", f"impl-pf-rep-{name}"))
+            conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                         (rendered, f"impl-pf-rep-{name}"))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
+        assert sorted(r["implement_job_id"] for r in rows) == [
+            "impl-pf-inside", "impl-pf-rep-date", "impl-pf-rep-space", "impl-pf-rep-zulu"]
+        # §139: and the pre-filter is not narrower than the instant decision — a row it lets
+        # through out of the window (26h of slack) is still removed by the decision, not folded.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ((NOW - dt.timedelta(hours=25)).strftime("%Y-%m-%d %H:%M:%S"), "impl-pf-rep-space"))
+        conn.commit()
+        rows = triage._fetch_review_rows(conn, (NOW - dt.timedelta(hours=24)).isoformat()).terminal
+        assert sorted(r["implement_job_id"] for r in rows) == [
+            "impl-pf-inside", "impl-pf-rep-date", "impl-pf-rep-zulu"]
 
 
 def test_a_mismatched_pointer_is_reported_rather_than_dropped():
@@ -10329,6 +10361,44 @@ def test_warden_self_events_route_to_warden_by_the_real_policy():
     assert hit is not None and hit["repo"] == "warden"
     assert "warden_self" in triage.INGEST_SOURCES
     assert set(triage.INVARIANTS) >= triage.REPORT_ONLY_INVARIANTS
+
+
+def test_a_report_only_invariant_is_measured_but_never_alerted():
+    """§139 — the coupling between "report-only" and the resolve sweep, asserted instead of
+    implied. `REPORT_ONLY_INVARIANTS` are dropped before the finding dict is built, so their keys
+    never enter `live_keys`, and an event that existed for one would be RESOLVED by the sweep that
+    same pass. That is the intent (a second item about something already in front of the owner
+    breaks "one entry per thing that needs him"), but the violation still has to be measured, or
+    "report-only" would mean "not checked at all". Both halves are pinned here, so adding an id to
+    that set cannot silently change resolve-sweep behaviour without failing this test."""
+    with _triage_env() as (conn, ctx):
+        stale = (NOW - dt.timedelta(days=triage.OWNER_QUEUE_STALE_DAYS + 1)).isoformat()
+        parked = _seed_state(conn, external_id="stale-parked", state=triage.STATE_NEEDS_HUMAN,
+                             note="approve it",
+                             state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at, note) "
+                     "VALUES (?,?,?,?,?)",
+                     (parked, triage.STATE_NEW, triage.STATE_NEEDS_HUMAN, stale, "seed"))
+        # …and a violation of an invariant that is NOT report-only, for the contrast.
+        clocked = _seed_state(conn, external_id="no-clock", state=triage.STATE_VERDICT,
+                              state_deadline=None)
+        conn.commit()
+        assert ("INV-7-owner-queue", parked) in _ids(triage.check_invariants(conn, NOW))
+        assert ("INV-1-clock", clocked) in _ids(triage.check_invariants(conn, NOW))
+
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        cursor = json.loads(conn.execute("SELECT value FROM cursors WHERE key=?",
+                                         (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()["value"])
+        # Measured: the report-only violation is in the summary /health reads back.
+        assert {"id": "INV-7-owner-queue", "count": 1} in cursor["violations"]
+        # Not alerted: no finding, so no `warden_self` event for a sweep to keep alive or resolve.
+        assert "inv-7-owner-queue" not in cursor["findings"]
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE source=? AND external_id=?",
+                            (triage.SELF_SOURCE, "inv-7-owner-queue")).fetchone()[0] == 0
+        # The non-report-only violation does become one, which is the whole difference.
+        assert "inv-1-clock" in cursor["findings"]
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE source=? AND external_id=?",
+                            (triage.SELF_SOURCE, "inv-1-clock")).fetchone()[0] == 1
 
 
 

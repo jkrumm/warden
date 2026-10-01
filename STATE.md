@@ -364,7 +364,10 @@ loop.
   `SEARCH d USING INDEX idx_dispatches_created` in §122 — and §123's
   corrupt-timestamp term (`OR datetime(d.created_at) IS NULL`) gave the scan back,
   because no comparison on an unreadable value can be a superset of it. Both
-  shapes measured on the live copy: 0.085 ms each way at 379 `dispatches` rows.
+  shapes measured on the live copy: 0.085 ms each way at 379 `dispatches` rows. The
+  window's own term became `datetime(d.created_at) >= datetime(?)` in §139's round
+  (the representation must not decide admission), so the index below covers BOTH
+  terms of this predicate now.
   That is the trade this branch chose knowingly — fail-visible beats an index —
   and issue #9 is the expression index that would end it. `self_audit_ms` in the
   cursor summary is the tick's own work (invariants + the five sections, the part

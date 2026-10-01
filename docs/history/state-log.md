@@ -10045,6 +10045,61 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-third round.** `needs-human`: one blocker, two improvements, one discussion. Architect,
+senior-dev and resilience all approved clean.
+
+The blocker claimed the review-health pre-filter drops in-window rows by their TEXT: a
+space-separated or date-only timestamp sorting below a bound written with `T`, before `_parse_ts`
+ever ran. **Checked, and it does not reproduce.** The bound handed to the SQL is the window start
+minus 26 hours, and an in-window row's date is always a later date than that bound's date, so the
+date prefix decides every in-window comparison before the separator can — the slack, not the
+compare, is what kept those rows. Probed directly on a copy of the live ledger with the pre-fix SQL
+in hand: all three representations (space-separated with `+02:00`, date-only, `T` with `+00:00`) of
+a 2-hour-old row ARE admitted, and the only row the old form drops that the new one admits sits 25
+hours before the window start, which the window's own decision drops anyway. It is not reported as a
+fixed bug.
+
+What changed is that the admission no longer DEPENDS on that accident. It is `datetime(d.created_at)`
+— SQLite's own normalised parse — plus `datetime(...) IS NULL` for rows it cannot read, which stay
+visible as `corrupt_timestamps`. With `widen = timedelta(0)` the raw-text form WOULD have dropped
+space-separated in-window rows, silently, in the one direction §129 forbids; that dependence is
+gone. Cost measured rather than argued: `EXPLAIN QUERY PLAN` says `SCAN d` for both spellings (the
+`IS NULL` term had already put the query on a scan) and 200 runs over the live 379-row ledger took
+10.4 ms against 14.6 ms. It is also the shape issue #9's planned expression index covers, so the
+predicate and the index agree instead of needing a second form. The 26-hour slack stays for the one
+reason that survives: SQLite truncates fractional seconds where Python keeps microseconds.
+
+The property is a test now, and it is written as a property rather than a restatement of the
+implementation: in-window rows in three representations must stay visible, and a slack-region row
+must still be removed by the decision — which passes with EITHER spelling, and did before this
+change.
+
+The first improvement collapsed `_published_finding_shape()`'s repeated guard pair into
+`_require_object()` plus an internal `_UnreadableShape` caught at the bottom of the same function.
+Every refusal message is byte-identical on purpose: the tests assert the reason at each of the seven
+levels, so they are what holds the refactor to being a refactor.
+
+The second asked to split the fold's per-row classification into a helper. Declined with the reason
+recorded in the function: the loop's inputs are accumulated state — the previous record for the key
+and the `unplaceable` set that has to survive because a key can recur — so a helper takes that set
+as a mutable parameter, which is the same bookkeeping one frame deeper, or re-derives the ordering
+rule it exists to keep in one place.
+
+The third was the same scoping slip as the previous round's, one file over: the operator-facing
+preview narrowed the `FindingShapeReport` union on truthiness, leaving the comparison's keys as
+unproven reads. It is annotated and narrowed on the discriminator now.
+
+The discussion asked whether "report-only" and the resolve sweep are tied together by anything but
+convention. They are, and the tie is now asserted in both directions: a report-only invariant's
+violation is measured and reaches the summary `/health` reads back, while producing no finding and
+therefore no `warden_self` event for the sweep to keep alive or resolve — and the same tick's
+non-report-only violation does become one.
+
+**Verified.** `tests/test_triage.py` 403 → **404/404** (+1), `tests/test_clients.py` **123/123**,
+every suite green; live-ledger replay unchanged at 39 judged items; drift check green against the
+running sideclaw, still reporting the one tolerated `angle` difference. The pre-filter property test
+was run against BOTH spellings (old and new) before the change was kept.
+
 **Forty-second round.** `needs-human`: one blocker, two improvements, one discussion. Architect,
 senior-dev and resilience all approved clean.
 
