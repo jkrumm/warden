@@ -9045,24 +9045,39 @@ def test_self_audit_turns_a_violation_into_one_event_and_resolves_it():
 
 
 def _seed_blocking_review(conn, *, event_id: int, suffix: str, repo: str = "demo-repo",
-                          outcome: str = "actionable", blocking: list[dict[str, Any]] | None = None) -> None:
+                          outcome: str = "actionable", blocking: list[dict[str, Any]] | None = None,
+                          verdict_json: dict[str, Any] | None = None) -> None:
     """One implement dispatch row plus the step-7 REVIEW row it links to — the
     shape `self_audit_findings()` reads (`implement.validation_job_id ->
     review.job_id`), rather than the folded `validation_status` column. The review
     verdict lives top-level in `verdict_json`, exactly as `sync_record()` stores
-    it. `blocking` defaults to one concrete code finding."""
+    it. `blocking` defaults to one concrete code finding; `verdict_json` replaces
+    the constructed payload outright, for a review that left no usable verdict
+    behind (no `outcome`, or one outside sideclaw's `REVIEW_OUTCOMES`). The folded
+    `validation_status` is derived the way `poll_validation_jobs()` folds it — a
+    seeded *accepted* revision should not carry `blocked` in a column this path no
+    longer reads."""
     impl_job, rev_job = f"impl-{suffix}", f"rev-{suffix}"
     blocking = blocking if blocking is not None else [
         {"file": "src/x.ts", "line": 12, "message": "the guard is gone"}]
+    if verdict_json is None:
+        verdict_json = {"outcome": outcome, "blocking": blocking, "summary": "s"}
+    if outcome == "needs-human":
+        validation_status = "needs_human"
+    elif outcome == "clean" or not blocking:
+        validation_status = "confirmed"
+    else:
+        validation_status = "blocked"
     conn.execute(
         "INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id, "
         "validation_job_id, validation_status) VALUES (?,?,?,?,?,?,?,?,?)",
-        (impl_job, "implement", repo, "b", "done", NOW.isoformat(), event_id, rev_job, "blocked"))
+        (impl_job, "implement", repo, "b", "done", NOW.isoformat(), event_id, rev_job,
+         validation_status))
     conn.execute(
         "INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, origin_event_id, verdict_json) "
         "VALUES (?,?,?,?,?,?,?,?)",
         (rev_job, "review", repo, "review", "done", NOW.isoformat(), event_id,
-         json.dumps({"outcome": outcome, "blocking": blocking, "summary": "s"})))
+         json.dumps(verdict_json)))
     conn.commit()
 
 
@@ -9137,6 +9152,34 @@ def test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one():
             _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-a",
                                   outcome="actionable", blocking=[])
             _seed_blocking_review(conn, event_id=940 + i, suffix=f"latest-{940 + i}-b")
+        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+
+def test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item():
+    """§117 — only a COMPLETED review speaks for an item. A review that left no
+    usable verdict behind — a payload `_safe_json()` reduces to `{}`, or an
+    `outcome` outside sideclaw's published `REVIEW_OUTCOMES` — says nothing about
+    the item, so it must neither clear an earlier code-blocked round nor join the
+    denominator. Reading "no `blocking` key" as "passed" is §115's blindness in
+    another column, on the one check whose job is to notice a broken review gate."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=960 + i, suffix=f"unusable-{960 + i}-a")
+            _seed_blocking_review(conn, event_id=960 + i, suffix=f"unusable-{960 + i}-b",
+                                  outcome="error", blocking=[], verdict_json={"outcome": "error"})
+        finding = next(f for f in triage.self_audit_findings(conn, NOW)
+                       if f["key"] == "review-always-blocks-demo-repo")
+        assert "all 3 demo-repo PRs" in finding["title"]
+
+    with _triage_env() as (conn, ctx):
+        # ...and an item whose ONLY review is unusable is not part of the
+        # denominator either — the item count stays honest at 3.
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=970 + i, suffix=f"den-{970 + i}")
+        _seed_blocking_review(conn, event_id=973, suffix="den-973",
+                              outcome="error", blocking=[], verdict_json={"summary": "no verdict"})
         finding = next(f for f in triage.self_audit_findings(conn, NOW)
                        if f["key"] == "review-always-blocks-demo-repo")
         assert "all 3 demo-repo PRs" in finding["title"]

@@ -6471,16 +6471,24 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     # 23 implement rows / 11 items) counts once, not twice.
     #
     # §117: the row is the item, but WHICH of its reviews speaks for it is the
-    # LAST one. §116 added an item to `code_blocked` on any review of it that
-    # carried a code finding and never removed it, so a PR blocked on its first
-    # revision and accepted on its second still read as blocked — a repo that
-    # accepts its PRs after one revision round fired "the review blocked all N
-    # PRs" on items that were ultimately accepted. Ordered by the review's own
-    # created_at, then its row id (insertion order — the ordering the folded
-    # `validation_status` column never exposed), so each item ends on its latest
-    # review: a blocking one adds it, a clean one clears it.
-    reviewed: dict[str, set[int]] = {}
-    code_blocked: dict[str, set[int]] = {}
+    # LAST one that actually completed. §116 added an item to `code_blocked` on
+    # any review of it that carried a code finding and never removed it, so a PR
+    # blocked on its first revision and accepted on its second still read as
+    # blocked — a repo that accepts its PRs after one revision round fired "the
+    # review blocked all N PRs" on items that were ultimately accepted. Ordered by
+    # the review's own created_at, then its row id, so each later completed review
+    # overwrites the item's status: a blocking one counts it, a clean one does not.
+    #
+    # Only a COMPLETED review may do either. A review that errored, ran without a
+    # usable verdict, or stored a payload this build cannot read says nothing about
+    # the item: `_safe_json()` reduces it to `{}`, whose absent `blocking` key must
+    # not read as "passed" — that is §115's blindness in another column, on the one
+    # check that exists to notice a broken review gate — and it must not join the
+    # denominator either, or it dilutes the `n >= 3` bar with items nobody has
+    # judged. The vocabulary is sideclaw's own published `REVIEW_OUTCOMES`, the set
+    # `poll_validation_jobs()` refuses a verdict outside of, so the audit and the
+    # fold agree on what a review is.
+    per_repo: dict[str, dict[int, bool]] = {}
     for r in conn.execute(
         "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
@@ -6489,17 +6497,15 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
         "ORDER BY r.created_at, r.id",
         (since,),
     ):
-        reviewed.setdefault(r["repo"], set()).add(r["event_id"])
-        blocking = [f for f in (_safe_json(r["verdict_json"]).get("blocking") or [])
-                    if not _is_process_only_finding(f)]
-        repo_blocked = code_blocked.setdefault(r["repo"], set())
-        if blocking:
-            repo_blocked.add(r["event_id"])
-        else:
-            repo_blocked.discard(r["event_id"])
-    for repo, items in reviewed.items():
-        n = len(items)
-        if n >= 3 and len(code_blocked.get(repo, set())) == n:
+        verdict = _safe_json(r["verdict_json"])
+        if verdict.get("outcome") not in _sideclaw.REVIEW_OUTCOMES:
+            continue
+        code_blocking = [f for f in (verdict.get("blocking") or [])
+                         if not _is_process_only_finding(f)]
+        per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(code_blocking)
+    for repo, by_event in per_repo.items():
+        n = len(by_event)
+        if n >= 3 and all(by_event.values()):
             out.append({"key": f"review-always-blocks-{repo}",
                         "title": f"the step-7 review blocked all {n} {repo} PRs in {SELF_AUDIT_WINDOW_DAYS} days",
                         "detail": "either the implement briefs for this repo miss something the review keeps "

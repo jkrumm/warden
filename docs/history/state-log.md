@@ -9422,22 +9422,36 @@ counts", flagged for the reviewer rather than decided); the step-7 review on PR 
 (sideclaw job `5233ae3b`, raised by the adversary angle alone) rejected it as a blocking
 correctness bug, and the owner's disposition was to fix it rather than settle it.
 
-**The change: the last row wins.** The implement→review join is ordered by the review's own
-`created_at`, then its row id (insertion order — the ordering the folded `validation_status`
-column never exposed), and each item ends on its LATEST review: a blocking one adds the event
-to `code_blocked`, a clean one removes it. The denominator (`n`, items with a completed review)
-and every other self-audit count are unchanged.
+**The change: the last completed review wins.** The implement→review join is ordered by the
+review's own `created_at`, then its row id (insertion order — the ordering the folded
+`validation_status` column never exposed), so each item ends on its LAST review: a blocking one
+counts it, a clean one does not. Only a COMPLETED review may do either — a verdict whose
+`outcome` is outside sideclaw's published `REVIEW_OUTCOMES` (the set `poll_validation_jobs()`
+refuses a verdict outside of) is not a review at all: it neither clears an earlier blocked round
+nor joins the denominator, because `_safe_json()` reduces a corrupt payload to `{}` and an
+absent `blocking` key must not read as "passed". The `n >= 3` bar and every other self-audit
+count are unchanged.
 
-**Verified.** Test first:
+**Second round.** The step-7 review on the first revision of this fix (`b18deaee`, the same
+adversary angle) blocked it on exactly that second half: "any non-`NULL` `verdict_json` is
+treated as a completed, clean review whenever it lacks a non-process `blocking` entry", so an
+errored or partially-serialised verdict would clear a code-blocked item — a false all-clear on
+the one check whose job is to notice a broken review gate. The `outcome` gate above is that
+finding's fix, and "an item nobody has judged is not counted" is now pinned by its own case.
+
+**Verified.** Test first, both rounds:
 `test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one` fails on the §116 code
 for the stated reason — three items, each blocked on round one and accepted on round two, fire
-the finding — and passes with the fix, which also pins the positive direction (three items
-blocked on their LATEST round still fire, two of them having come back clean earlier).
-`tests/test_triage.py` at **355/355** (354 before, +1); all other suites unchanged. On a
-`VACUUM INTO` copy of the live ledger the 14-day window's firing set is unchanged
-(`research-gateway` 6 items / 6 code-blocked, in both readings), while the per-item status moves
-where it should: `weatherorb` 9 any-review-blocked → 5 latest-review-blocked, `warden` 1 → 0 —
-the false positive is a live hazard, not a theory.
+the finding — and pins the positive direction (three items blocked on their LATEST round still
+fire, two of them having come back clean earlier);
+`test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item` fails on this section's
+first revision — three items blocked on round one, each then carrying an `{"outcome": "error"}`
+review, went silent — and passes with the outcome gate, also pinning that an item whose only
+review is unusable stays out of the denominator. `tests/test_triage.py` at **356/356** (354
+before, +2); all other suites unchanged. On a `VACUUM INTO` copy of the live ledger the 14-day
+window's firing set is unchanged (`research-gateway` 6 items / 6 code-blocked, in every
+reading), while the per-item status moves where it should: `weatherorb` 9 any-review-blocked → 5
+latest-review-blocked, `warden` 1 → 0 — the false positive is a live hazard, not a theory.
 
 **Landing.** §116 and §117 both ride PR #7 (branch
 `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is
