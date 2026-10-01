@@ -8265,13 +8265,20 @@ def _seed_blocked_item(conn, *, external_id: str, blocking: list[Any] | None = N
          "https://github.com/jkrumm/demo-repo/pull/7", revision_count, eid),
     )
     _seed_implement_dispatch(conn, f"impl-{external_id}")
+    # The live loop stamps BOTH rows of a pair with the item's own event — step 7 opens the review
+    # with `Origin(event_id=event_id)` — and that shared, non-NULL origin IS the pair's identity
+    # (§133). A pair seeded without one would model a shape the loop does not produce, and would
+    # exercise the unverifiable-pointer path by accident instead of the path under test.
+    conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id=?",
+                 (eid, f"impl-{external_id}"))
     conn.execute("UPDATE dispatches SET validation_status='blocked', verdict_json=? WHERE job_id=?",
                  (json.dumps({"outcome": "pr_opened", "branch": "dispatch/prior-branch",
                               "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/7"}),
                   f"impl-{external_id}"))
-    conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, verdict_json) "
-                 "VALUES (?,?,?,?,?,?,?)",
+    conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, "
+                 "origin_event_id, verdict_json) VALUES (?,?,?,?,?,?,?,?)",
                  (f"val-{external_id}", "review", "demo-repo", "review PR #7", "done", NOW.isoformat(),
+                  eid,
                   json.dumps({"outcome": "actionable", "blocking": blocking if blocking is not None else [
                       {"file": "scripts/check.sh", "line": 808, "message": "exit 0 fails open on crash loops"}]})))
     conn.commit()
@@ -8686,6 +8693,37 @@ def test_the_summary_counts_the_rows_admitted_for_an_unreadable_timestamp():
         assert summary["unreadable_timestamps"] == 1
 
 
+def test_a_failed_review_health_section_reports_no_count_rather_than_a_clean_zero():
+    """§133 — the count is written by the section that measures it, so when that section raises
+    there IS no number. Writing `0` there would read as "no corrupt timestamps": a fabricated
+    clean bill in the exact field this work added to keep that cost visible, and the same
+    anti-pattern `invariants_error` already exists to prevent one key over. `None` says not
+    measured, and the reason says why."""
+    with _triage_env() as (conn, ctx):
+        real = triage._review_health_findings
+
+        def _raise(*_a, **_k):
+            raise RuntimeError("OperationalError: no such table: dispatches")
+
+        triage._review_health_findings = _raise
+        try:
+            triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        finally:
+            triage._review_health_findings = real
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["unreadable_timestamps"] is None, summary["unreadable_timestamps"]
+        assert "review-health" in summary["unreadable_timestamps_error"]
+        # The failure is a live finding too, so the hour is not a quiet one either way.
+        assert f"{triage.SECTION_FAILURE_PREFIX}review-health" in summary["findings"]
+        # And the next pass that runs the section measures again, without the error key.
+        triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=2), dry_run=False)
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["unreadable_timestamps"] == 0
+        assert "unreadable_timestamps_error" not in summary
+
+
 def test_a_slow_self_audit_tick_reports_itself():
     """§126: the growth path has no other visible signal, so crossing the threshold becomes
     a finding — and it must exist BEFORE the event sync, or the event it needs is never
@@ -8732,17 +8770,28 @@ def test_a_pointer_at_another_items_review_is_not_read_as_this_items_verdict():
         assert [r["event_id"] for r in rows] == [41], [dict(r) for r in rows]
 
 
-def test_a_manual_dispatch_pair_without_an_origin_is_still_read():
-    """`IS` and not `=`: with no origin on either side the pair still matches, so the identity
-    pin does not quietly drop manual dispatches — `NULL = NULL` is not true, and the live
-    ledger has six implement rows with a NULL origin (all without a pointer today, which is
-    why the pin is inert there rather than load-bearing)."""
+def test_an_origin_less_pair_is_unverifiable_rather_than_read():
+    """§133 — two NULL origins are not a match, they are the ABSENCE of one. A manual
+    `warden dispatch` pair has no origin, so the pointer is the only claim that its two rows are
+    one item, and the pointer is the thing in question: nothing can check it, so any manual
+    implement in the repo could name any manual review in it and a stale pointer would be read
+    as this item's verdict — fabricated or suppressed, with no alert. The live ledger has no
+    such pair today (the six NULL-origin implement rows carry no pointer), so this is a rule
+    for a shape the loop could start producing, not a description of the data."""
     since = (NOW - dt.timedelta(days=14)).isoformat()
     with _triage_env() as (conn, ctx):
         _seed_blocking_review(conn, event_id=None, suffix="manual")
-        rows = triage._fetch_review_rows(conn, since).terminal
-        assert [r["implement_job_id"] for r in rows] == ["impl-manual"]
-        assert rows[0]["event_id"] is None
+        rows = triage._fetch_review_rows(conn, since)
+        assert rows.terminal == [], [dict(r) for r in rows.terminal]
+        assert [r["implement_job_id"] for r, _ in rows.mismatched] == ["impl-manual"]
+        assert "carry no origin" in rows.mismatched[0][1]
+        assert rows.mismatched[0][0]["event_id"] is None
+        # Reported, not dropped: the item is named by the fifth finding, keyed on the implement
+        # job id because a manual dispatch has no event to be keyed on.
+        finding = next(f for f in triage._review_health_findings(conn, since)
+                       if f["key"] == "review-verdicts-unusable-demo-repo")
+        assert "impl-manual" in finding["detail"], finding["detail"]
+        assert "carry no origin" in finding["detail"], finding["detail"]
 
 
 def test_a_corrupt_implement_timestamp_is_admitted_and_never_judged():
@@ -9756,13 +9805,17 @@ def test_self_audit_sees_a_needs_human_review_that_carries_a_code_finding():
         assert "review-always-blocks-demo-repo" in keys
 
 
-def test_self_audit_keeps_manual_implement_reviews_with_null_origin():
+def test_self_audit_reports_an_origin_less_pair_instead_of_judging_it():
+    """§133 — the consequence of the rule above, at the finding level: three manual pairs whose
+    pointer nothing can verify must not be counted as a review gate that blocks every PR (that
+    would be a verdict no one could corroborate) and must not vanish either. They are the
+    unusable finding, and the gate finding says nothing about them."""
     with _triage_env() as (conn, ctx):
         for i in range(3):
             _seed_blocking_review(conn, event_id=None, suffix=f"manual-{i}")
-        finding = next(f for f in triage._review_health_findings(conn, NOW.isoformat())
-                       if f["key"] == "review-always-blocks-demo-repo")
-        assert "all 3 demo-repo PRs" in finding["title"]
+        keys = {f["key"] for f in triage._review_health_findings(conn, NOW.isoformat())}
+        assert "review-verdicts-unusable-demo-repo" in keys
+        assert "review-always-blocks-demo-repo" not in keys, keys
 
 
 def test_self_audit_counts_a_pr_once_across_its_revisions():

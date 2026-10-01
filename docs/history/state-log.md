@@ -9993,3 +9993,54 @@ all suites green; live-ledger replay unchanged at 39 judged items. The drift che
 against the RUNNING sideclaw (`✓ dispatch=3 review=1 (producer also requires: angle)`, exit 0) and
 against a stub serving each drift — a retyped `file`, an untyped `message`, and a shape whose two
 shortfall sets differ — with the pre-fix printer shown printing only one of them.
+
+**Thirty-seventh round.** `needs-human`: one blocker, four improvements, one discussion. The
+blocker was in the identity rule the thirty-first round wrote and the thirty-second generalised,
+and it was the round's real finding.
+
+The clause pinned tier, repo and origin, with `IS` semantics so that two NULL origins matched.
+That was the wrong reading of the same rule: two NULLs are not evidence that two rows are one
+item, they are the ABSENCE of evidence. A manual `warden dispatch` pair has no origin, so the
+pointer — `dispatches.validation_job_id` — is simultaneously the only claim linking the two rows
+and the thing being checked, and a claim cannot verify itself. Two manual pairs in one repo were
+therefore interchangeable: a stale pointer would be read as this item's verdict, fabricated or
+suppressed, with nothing reported. The identity is now a shared NON-NULL origin. An origin-less
+pair is unverifiable, which puts it on the path every other unverifiable pointer already takes:
+verdict blanked, item `unusable`, previous decision kept, and
+`review-verdicts-unusable-<repo>` naming the reason ("links two rows that carry no origin").
+
+Two things about this are worth stating plainly. First, the live ledger contains no such pair —
+the six NULL-origin implement rows carry no pointer at all — so this closes a shape the loop
+could produce, not a defect in today's data; the replay is unchanged at 39 items. Second, the
+real fix is a stable linkage the schema does not have, so it is now the first entry in STATE.md's
+carried debt: a back-pointer on the review row written when step 7 opens it, and/or the
+implement's `origin_channel`/`origin_thread_ts` carried onto the review's origin. That is a
+migration, and inventing a heuristic (nearest-in-time, unique-target) would have replaced an
+unverifiable identity with a wrong one.
+
+Fixing it exposed a second, quieter problem in the tests: `_seed_blocked_item()` — the helper
+that models a normal item's pair — never stamped an origin on either row, so seven tests were
+passing on a shape the live loop never produces, and would have gone on passing while the
+identity rule was unverifiable. The helper now stamps both rows with the item's event, exactly as
+step 7 does, and the two tests that genuinely model a manual pair assert the new refusal.
+
+The improvements: the `unreadable_timestamps` count — added last round so a cost could be seen —
+was written as `metrics.get(..., 0)`, so a raising review-health section published a clean `0`
+into the field and `/health`, which is the fabricated-clean-bill anti-pattern `invariants_error`
+exists to prevent one key over. It is now `null` plus an `unreadable_timestamps_error` naming the
+failure, and the docs say `null` means NOT MEASURED. The `findingShape` report became a
+discriminated union of two `TypedDict`s (`published: Literal[True|False]`), so the reader in
+`check-schema-versions.py` proves the comparison keys exist instead of bracket-reading a bare
+dict the way `ReviewRow` was promoted out of. And two costs inside the timed tick: `keys()` was
+rebuilt once per column per row in the fold's contract check, and each implement timestamp was
+parsed twice (once for the window, once for the corrupt count) — one `keys()` and one parse per
+row now.
+
+The discussion is the index-scan tradeoff on the review-health window, which is unchanged and
+stays where it was put: measured, tripwired by `self-audit-slow`, with the expression index
+tracked as issue #9 rather than a weaker predicate here.
+
+**Verified.** `tests/test_triage.py` at **400/400** (+1), `tests/test_clients.py` at **120/120**,
+all suites green; live-ledger replay unchanged at 39 judged items; drift check still green against
+the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
+the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.

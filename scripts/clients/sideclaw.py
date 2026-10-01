@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Literal, NamedTuple, TypedDict
 
 from .errors import PolicyError, RemoteError
 
@@ -367,7 +367,8 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
             # version number unchanged and every check green.
             shape = _published_finding_shape(parsed)
             if shape is None:
-                entry["findingShape"] = {"published": False}
+                unreadable: FindingShapeUnreadable = {"published": False}
+                entry["findingShape"] = unreadable
                 entry["ok"] = ok = False
             else:
                 missing_required = sorted(REVIEW_FINDING_REQUIRED - shape.required)
@@ -381,7 +382,7 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
                 mistyped = sorted(field for field in REVIEW_FINDING_REQUIRED
                                   if field in shape.properties
                                   and shape.types.get(field) != "string")
-                entry["findingShape"] = {
+                report: FindingShapeComparison = {
                     "published": True,
                     "required": sorted(shape.required),
                     "properties": sorted(shape.properties),
@@ -391,10 +392,41 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
                     "missingFromProperties": missing_properties,
                     "mistyped": mistyped,
                 }
+                entry["findingShape"] = report
                 if missing_required or missing_properties or mistyped:
                     entry["ok"] = ok = False
         out[tool] = entry
     return out
+
+
+class FindingShapeUnreadable(TypedDict):
+    """The endpoint publishes no readable finding shape, and then there is nothing to describe.
+
+    No empty lists here on purpose: `[]` reads as "the producer requires nothing", which is the
+    fabricated-clean-bill shape this branch keeps having to remove. An unreadable shape is a
+    disagreement, not an empty comparison."""
+
+    published: Literal[False]
+
+
+class FindingShapeComparison(TypedDict):
+    """What the published finding shape holds, against what warden requires of it."""
+
+    published: Literal[True]
+    required: list[str]
+    properties: list[str]
+    types: dict[str, Any]
+    wardenRequires: list[str]
+    missingFromRequired: list[str]
+    missingFromProperties: list[str]
+    mistyped: list[str]
+
+
+# `published` discriminates the union, so a reader that narrows on it can subscript the rest —
+# which is the point of typing this at all. It was a bare string-keyed dict written here and read
+# by bracket in two other modules, where a renamed key type-checked and failed only at the read:
+# the pattern `ReviewRow` was promoted out of on this branch.
+FindingShapeReport = FindingShapeUnreadable | FindingShapeComparison
 
 
 class PublishedFindingShape(NamedTuple):

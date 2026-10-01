@@ -791,12 +791,21 @@ they flag is already exactly one entry in the owner's list.
 The self-audit reads an item's review through `d.validation_job_id`, and the pointer decides
 TWO questions that must not share one mechanism:
 
-- **Attribution (§128).** Only a review whose tier, repo and origin all match the implement
+- **Attribution (§128/§133).** Only a review whose tier, repo and origin all match the implement
   row may be read as that item's verdict; otherwise a stale pointer naming a terminal dispatch
   of another tier (the ledger has implement→investigate pairs), another repo, or a *different
-  item's* review fabricates or suppresses a merge-gating finding. The null-safe origin
-  comparison (`r.origin_event_id IS d.origin_event_id`) is what keeps a manual dispatch pair —
-  no origin on either side — readable at all.
+  item's* review fabricates or suppresses a merge-gating finding. The origin must match AND be
+  present: **two NULL origins are a refusal, not a match.** A manual `warden dispatch` pair
+  carries no origin, so the pointer is the only claim linking its two rows — and the pointer is
+  what is in question, so any manual implement in that repo could name any manual review in it
+  and a stale pointer would be read as this item's verdict with no alert. `IS` semantics were
+  the earlier reading of this same clause (§132's discussion) and they made absence of evidence
+  into proof of identity; the row is now unverifiable like every other unverifiable pointer —
+  verdict blanked, item reported, previous decision kept. (The live ledger has no such pair: the
+  six NULL-origin implement rows carry no pointer at all, so this closes a shape the loop could
+  produce rather than a defect in the data. The real fix for manual pairs is a stable linkage
+  the schema does not have yet — a review back-pointer or the origin thread carried onto the
+  review row; tracked in STATE.md's carried debt.)
 - **Visibility (§129).** The same mismatch may not make the item disappear. Deciding
   attribution with an inner join dropped the implement row entirely, which shrinks the
   denominator `review-always-blocks` is computed over *and* hides the stale pointer that did

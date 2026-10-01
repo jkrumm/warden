@@ -63,9 +63,10 @@ serves that stored value as `self_audit` (it never runs the audit itself):
 | `invariants` | the invariant ids the run checked |
 | `violations` | `[{id, count}]` — an empty list from a run whose check raised is reported as `invariants_error`, never as a clean zero |
 | `invariants_error` | present only when the invariant check itself raised |
+| `unreadable_timestamps_error` | present only when the review-health section raised, so `unreadable_timestamps` is `null` — the reason, not a number nothing measured |
 | `findings` | the live self-audit finding keys, e.g. `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>`, `liveness-never-confirms-<repo>`, `fixed-reopened-<event>`, `revisions-exhausted-<event>`, `self-audit-slow`, `self-audit-section-failed-<name>` |
 | `self_audit_ms` | cost of the tick's own work — invariants plus the five sections; the part that grows with the ledger's history |
-| `unreadable_timestamps` | rows the review window admitted because `dispatches.created_at` cannot be read as an instant — rows whose true age is unknown cannot be dropped by a time bound without losing a recent one, so they recur every pass and this count keeps that recurrence visible (§123/§131) |
+| `unreadable_timestamps` | rows the review window admitted because `dispatches.created_at` cannot be read as an instant — rows whose true age is unknown cannot be dropped by a time bound without losing a recent one, so they recur every pass and this count keeps that recurrence visible (§123/§131). `null` means NOT MEASURED (the review-health section raised this pass), never "no corrupt rows" — a fabricated `0` would be a clean bill from a check that never ran |
 | `event_sync_ms` | cost of the whole event sync — per-finding upserts plus the sweep that resolves events whose finding is gone; scales with the number of live findings, not with history |
 
 ### `GET /metrics`

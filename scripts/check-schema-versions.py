@@ -54,8 +54,11 @@ def main(argv: list[str]) -> int:
                 f"outcomes={sorted(r.get('remoteOutcomes') or ())}, warden pins "
                 f"version={r.get('expectedVersion')} outcomes={sorted(r.get('expectedOutcomes') or ())}"
             )
-            shape = r.get("findingShape")
-            if shape and not shape.get("published"):
+            shape: sideclaw.FindingShapeReport | None = r.get("findingShape")
+            # `published` discriminates the union: below this line the other keys are proven
+            # present, which is why the report is a union of two TypedDicts and not one with
+            # optional fields.
+            if shape and not shape["published"]:
                 details.append(
                     "  review: sideclaw publishes no readable finding shape — warden's "
                     "is_review_finding() would be an unverifiable copy of it")
@@ -85,8 +88,8 @@ def main(argv: list[str]) -> int:
         # A difference warden tolerates on purpose is still worth naming: the producer
         # requiring more than warden does is safe, and hiding it would make the next real
         # difference indistinguishable from this one.
-        shape = r.get("findingShape") or {}
-        if shape.get("published"):
+        shape = r.get("findingShape")
+        if shape and shape["published"]:
             extra = sorted(set(shape["required"]) - set(shape["wardenRequires"]))
             if extra:
                 parts.append(f"(producer also requires: {', '.join(extra)})")

@@ -5949,9 +5949,15 @@ def _pointer_identity_reason(row: sqlite3.Row) -> str | None:
       `review-always-blocks` is computed over *and* hides the stale pointer that did it.
 
     Same identity, two questions, so the pin is a predicate the caller can use both ways
-    rather than a join for one answer and Python for the other. `IS` semantics — two NULLs
-    match — are reproduced explicitly: a manual dispatch pair has no origin, and `NULL =
-    NULL` is not true, so `=` here (in SQL or Python) would stop reading those pairs at all.
+    rather than a join for one answer and Python for the other. The identity it checks is a
+    shared NON-NULL origin, and two NULLs are a refusal rather than a match (§133): a NULL
+    origin on both rows is not evidence that they are one item, it is the absence of any
+    evidence. A manual `warden dispatch` pair has no origin, so the pointer is the only claim
+    linking the two rows and nothing can check it — any manual implement in the repo could
+    name any manual review in it, and a stale pointer would be read as this item's verdict,
+    fabricated or suppressed with no alert. Unverifiable is reported like every other
+    unverifiable pointer: the row is folded with its verdict blanked, the item keeps its
+    previous decision, and `review-verdicts-unusable-<repo>` names the reason.
 
     Terminality is deliberately NOT part of this predicate: a pointer at this item's review
     that has not finished yet is normal and belongs to no finding."""
@@ -5964,7 +5970,12 @@ def _pointer_identity_reason(row: sqlite3.Row) -> str | None:
         return (f"validation_job_id {row['pointer']!r} names a review in repo "
                 f"{row['target_repo']!r}, not {row['repo']!r}")
     target_origin, origin = row["target_event_id"], row["event_id"]
-    if not (target_origin == origin or (target_origin is None and origin is None)):
+    if target_origin is None and origin is None:
+        # Not a match: an absence of evidence read as proof of identity. Nothing but the
+        # pointer links two origin-less rows, and the pointer is what is in question.
+        return (f"validation_job_id {row['pointer']!r} links two rows that carry no origin, "
+                f"so the pointer is the only claim they are one item — unverifiable")
+    if target_origin != origin:
         return (f"validation_job_id {row['pointer']!r} is another item's review "
                 f"(event {target_origin!r}, not {origin!r})")
     return None
@@ -6045,8 +6056,12 @@ def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
     # timestamp will not parse is KEPT — a corrupt row must make the audit look at
     # something, not leave it out. The pre-filter cannot be the decision for either reason
     # (text comparison, and `>=` on a widened bound admits rows this drops).
-    rows = [r for r in fetched
-            if (when := _parse_ts(r["implement_created_at"])) is None or when >= since_dt]
+    # Parsed ONCE per row and kept: the window decision and the corrupt-timestamp count are two
+    # questions about the same instant, and answering the second by re-parsing would double the
+    # work inside the tick cost the tripwire watches (§133). `None` always passes the filter, so
+    # the pairs that keep `when is None` are exactly the admitted corrupt rows.
+    admissible = [(r, _parse_ts(r["implement_created_at"])) for r in fetched]
+    rows = [r for r, when in admissible if when is None or when >= since_dt]
     terminal, mismatched = [], []
     for r in rows:
         reason = _pointer_identity_reason(r)
@@ -6055,8 +6070,7 @@ def _fetch_review_rows(conn: sqlite3.Connection, since: str) -> ReviewRows:
         elif r["review_status"] in _sideclaw.TERMINAL_STATUSES:
             terminal.append(r)
     return ReviewRows(terminal=terminal, mismatched=mismatched,
-                      corrupt_timestamps=sum(
-                          1 for r in rows if _parse_ts(r["implement_created_at"]) is None))
+                      corrupt_timestamps=sum(1 for _, when in admissible if when is None))
 
 
 class ReviewRow(TypedDict):
@@ -6120,7 +6134,10 @@ def _review_fold_rows(rows: Iterable[sqlite3.Row],
     rows = list(rows)
     mismatched = list(mismatched)
     for r in rows + [r for r, _ in mismatched]:
-        missing = [c for c in REVIEW_QUERY_COLUMNS if c not in r.keys()]
+        # `keys()` builds a fresh list of 13 column names, so calling it inside the comprehension
+        # rebuilt it once per column per row (§133).
+        keys = r.keys()
+        missing = [c for c in REVIEW_QUERY_COLUMNS if c not in keys]
         if missing:
             raise RuntimeError(
                 f"_fetch_review_rows() did not project {missing} — the fold reads a row by "
@@ -7288,25 +7305,34 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
         })
     now_iso = _now_iso(now)
     live_keys = {f["key"] for f in findings}
+    failed_sections = _failed_section_names(findings)
     # Everything from here to the cursor write is the sync — the per-finding lookup and
     # insert/update AND the sweep that resolves events whose finding is gone. Timed as one
     # block: stopping the clock between them, as an earlier round did, stored a number that
     # matched neither half (§127).
     sync_started = dt.datetime.now(dt.timezone.utc)
     _sync_self_audit_events(conn, findings, live_keys, now_iso,
-                            _unrechecked_prefixes(_failed_section_names(findings)))
+                            _unrechecked_prefixes(failed_sections))
     event_sync_ms = int((dt.datetime.now(dt.timezone.utc) - sync_started).total_seconds() * 1000)
     summary = {"checked_at": now_iso, "self_audit_schema": SELF_AUDIT_SCHEMA,
                "invariants": sorted(INVARIANTS),
                "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
                "self_audit_ms": self_audit_ms,
                "event_sync_ms": event_sync_ms,
-               "unreadable_timestamps": metrics.get("unreadable_timestamps", 0),
+               "unreadable_timestamps": metrics.get("unreadable_timestamps"),
                "findings": sorted(live_keys)}
     if invariants_failure is not None:
         # An empty `violations` from a check that never ran is a fabricated zero, not a
         # clean bill — /health's reader gets the reason instead.
         summary["invariants_error"] = f"{type(invariants_failure).__name__}: {invariants_failure}"
+    if "review-health" in failed_sections:
+        # Same rule for the count: the section that measures it raised, so nothing measured it,
+        # and `0` would read as "no corrupt timestamps" — a fabricated clean bill in the exact
+        # field this work added to keep a cost visible. `None` says "not measured", and the
+        # reason says why, next to the section failure that is already a live finding.
+        summary["unreadable_timestamps_error"] = next(
+            f["title"] for f in findings
+            if f["key"] == f"{SECTION_FAILURE_PREFIX}review-health")
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",

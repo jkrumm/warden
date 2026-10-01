@@ -10,7 +10,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master` (00dc001), six LaunchAgents on the mini. **§116 and §117 are NOT on `master` — both ride PR #7**, branch `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`, waiting on the owner's Argo Merge click (`warden` is merge-approval gated, no `autoMergePaths`). The live loop therefore still runs the pre-§116 self-audit |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 399/399 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 400/400 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -305,6 +305,15 @@ loop.
 
 ## Carried debt
 
+- **A manual dispatch pair has no verifiable linkage** (§133). `dispatches.validation_job_id`
+  is the only thing tying an implement row to its review, and for a pair with no
+  `origin_event_id` — a manual `warden dispatch` — the pointer is simultaneously the claim and
+  the thing to be checked, so the row is now treated as unverifiable rather than read
+  (`_pointer_identity_reason()`; the live ledger has no such pair, so nothing regressed). The
+  fix is a stable per-item linkage the schema does not have: a back-pointer on the review row
+  (`parent_job_id`) written when step 7 opens it, and/or carrying the implement's
+  `origin_channel`/`origin_thread_ts` onto the review's origin. Own PR, needs a migration
+  (`~/.warden/warden.db`, schema 11).
 - `triage.py` stays one 6.6k-line file: 248 tests patch its globals by
   name, a split buys no behaviour (§66). Dead code: none (AST-verified, §65).
 - The review-verdict concern (fold, shape gates, self-audit findings, revision
