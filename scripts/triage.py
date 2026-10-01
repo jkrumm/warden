@@ -5819,14 +5819,29 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
     )
 
 
-def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
-    """The step-7 findings in a review's `blocking` list that are about the DIFF:
-    §114's wrapper class removed (see `_is_process_only_finding()`). Missing,
-    malformed and non-list payloads read as no actionable code findings; callers
-    that need to distinguish unusable verdicts validate the full envelope first."""
+def _published_findings(blocking: Any) -> list[dict[str, Any]]:
+    """The finding objects a verdict's `blocking` field actually carries. Sideclaw
+    publishes a list of objects, but a corrupt or hand-written payload can hold a
+    scalar, a non-list container, or members that are not objects — and the step-7
+    fold and the revision brief both iterate this value. Anything that is not one
+    of the published objects reads as "no finding", never as a crash mid-tick."""
     if not isinstance(blocking, list):
         return []
-    return [f for f in blocking if isinstance(f, dict) and not _is_process_only_finding(f)]
+    return [f for f in blocking if isinstance(f, dict)]
+
+
+def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
+    """The step-7 findings in a review's `blocking` list that are about the DIFF:
+    §114's wrapper class removed (see `_is_process_only_finding()`)."""
+    return [f for f in _published_findings(blocking) if not _is_process_only_finding(f)]
+
+
+def _process_only_findings(blocking: Any) -> list[dict[str, Any]]:
+    """The complement of `_code_blocking_findings()` — the §114 wrapper class, which
+    must not read as `blocked` but must not be dropped either. Pairing them on one
+    normalizer is what keeps a malformed payload from crashing one list and not the
+    other."""
+    return [f for f in _published_findings(blocking) if _is_process_only_finding(f)]
 
 
 def _is_completed_review(verdict: Any) -> bool:
@@ -5874,8 +5889,11 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     review per item wins; a later unusable or non-successful job cannot erase a
     prior blocking review, and its missing result is a visible self-audit finding."""
     per_repo: dict[str, dict[Any, bool]] = {}
-    reviewed_event_ids: dict[str, set[Any]] = {}
-    unusable: dict[str, list[int]] = {}
+    unusable: dict[str, list[Any]] = {}
+    # repo -> item key -> classification of its LAST terminal review row. A later
+    # unusable row is reported, but it neither sets nor clears the item's status:
+    # only a COMPLETE review speaks for an item, in either direction (§117).
+    latest: dict[str, dict[Any, str]] = {}
     terminal_status_placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
     since_dt = _parse_ts(since)
     if since_dt is None:
@@ -5883,44 +5901,46 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
     since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
     sql = (
         "SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
-        "r.job_id AS review_job_id, "
         "r.verdict_json AS verdict_json, "
         "r.status AS review_status "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' "
         "AND d.created_at >= ? AND r.status IN (" + terminal_status_placeholders + ") "
         # Latest review per item wins: ascending order means the last write for an
-        # implement row is its newest review (its own created_at, then row id).
+        # item is its newest review (the review's own created_at, then its row id).
         "ORDER BY r.created_at, r.id"
     )
     rows = conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
     for r in rows:
+        # A manual `warden dispatch` has no triage event; its implement job is the
+        # only identity it has, and it is a real row this audit must not drop.
+        item_key: Any = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]
         verdict = _safe_json(r["verdict_json"])
         if r["review_status"] != "done" or not _is_completed_review(verdict):
-            unusable.setdefault(r["repo"], []).append(
-                r["event_id"] if r["event_id"] is not None else r["review_job_id"])
+            latest.setdefault(r["repo"], {})[item_key] = "unusable"
             continue
-        blocking = verdict.get("blocking") or []
-        reviewed_event_ids.setdefault(r["repo"], set()).add(
-            r["event_id"] if r["event_id"] is not None else r["review_job_id"])
-        per_repo.setdefault(r["repo"], {})[
-            r["event_id"] if r["event_id"] is not None else r["implement_job_id"]] = bool(
-            _code_blocking_findings(blocking))
+        blocking = _code_blocking_findings(verdict.get("blocking"))
+        latest.setdefault(r["repo"], {})[item_key] = "blocking" if blocking else "clean"
+        per_repo.setdefault(r["repo"], {})[item_key] = bool(blocking)
+    for repo, by_item in sorted(latest.items()):
+        for item_key, classification in by_item.items():
+            if classification == "unusable":
+                unusable.setdefault(repo, []).append(item_key)
     findings: list[dict[str, Any]] = []
-    for repo, event_ids in sorted(unusable.items()):
-        distinct_ids = sorted(set(event_ids))
-        sample = ", ".join(str(event_id) for event_id in distinct_ids[:8])
-        remainder = len(distinct_ids) - min(len(distinct_ids), 8)
+    for repo, item_keys in sorted(unusable.items()):
+        distinct = sorted(set(item_keys), key=str)
+        sample = ", ".join(str(k) for k in distinct[:SELF_AUDIT_SAMPLE_LIMIT])
+        remainder = len(distinct) - min(len(distinct), SELF_AUDIT_SAMPLE_LIMIT)
         suffix = f" (+{remainder} more)" if remainder else ""
         findings.append({
             "key": f"review-verdicts-unusable-{repo}",
-            "title": f"{len(distinct_ids)} item(s) in {repo} have unusable step-7 review verdicts "
+            "title": f"{len(distinct)} item(s) in {repo} have unusable step-7 review verdicts "
                      f"in the last {SELF_AUDIT_WINDOW_DAYS} days",
             "detail": f"stored verdicts do not match sideclaw's published schema, outcome, or finding "
-                      f"shape; event IDs: {sample}{suffix}. The self-audit cannot safely read them as passes",
+                      f"shape; item IDs: {sample}{suffix}. The self-audit cannot safely read them as passes",
         })
     for repo, by_event in sorted(per_repo.items()):
-        n = len(reviewed_event_ids[repo])
+        n = len(by_event)
         if n >= 3 and all(by_event.values()):
             findings.append({"key": f"review-always-blocks-{repo}",
                              "title": f"the step-7 review blocked all {n} {repo} PRs in "
@@ -6028,8 +6048,7 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # spends a revision) but it must not be dropped either, so it routes to a
         # human with the finding on the card.
         code_blocking = _code_blocking_findings(blocking)
-        process_blocking = [f for f in blocking
-                            if isinstance(f, dict) and _is_process_only_finding(f)]
+        process_blocking = _process_only_findings(blocking)
         summary = verdict.get("summary") or "no further detail"
 
         unknown_outcome_note = None
@@ -6379,6 +6398,9 @@ SELF_AUDIT_CURSOR_KEY = "self_audit"
 SELF_AUDIT_INTERVAL_S = 3600
 OWNER_QUEUE_STALE_DAYS = 3.0
 SELF_AUDIT_WINDOW_DAYS = 14
+# How many offending item ids a self-audit finding names before it summarises the
+# rest as a count — enough to open the first one, bounded so the card stays a card.
+SELF_AUDIT_SAMPLE_LIMIT = 8
 # scripts/restore.py's drill result (§104) — the self-audit's only input from
 # outside the ledger. A failed drill, or none successful in this many days, is
 # a finding: a backup that has not been restored from is an assumption.

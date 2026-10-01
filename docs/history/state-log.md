@@ -9482,11 +9482,24 @@ manually-dispatched implements (real rows, per `scripts/api.py`); and a negative
 fixture so a terminal row with no stored payload is seedable, and a new case pinning that
 manual (null-origin) implements still reach the finding.
 
-**Verified.** `tests/test_triage.py` at **362/362** (354 before, +8); all 21 test files green.
+**Ninth round.** The review on the eighth revision found the same class one level down: the
+unguarded iteration was still there beside the guarded one, this time as `process_blocking`
+walking a raw `blocking` value, so a scalar payload (`blocking: true`) still raised mid-tick
+after the job was persisted — and sideclaw's cached terminal result makes every later poll
+re-crash on it. `_published_findings()` is now the one normalizer both lists are built from
+(`_code_blocking_findings` / `_process_only_findings`), so a malformed payload cannot crash one
+list and not the other. The unusable report now follows the same latest-row rule as the blocking
+count instead of accumulating rows: an item whose newest review is a complete clean one is not
+reported unusable, and comparing a loop-originated int id with a manual dispatch's job-id string
+sorts by string rather than raising. The sample bound is `SELF_AUDIT_SAMPLE_LIMIT`.
+
+**Verified.** `tests/test_triage.py` at **365/365** (354 before, +11); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
-and negative schema versions, non-list/non-dict `blocking` entries, manual null-origin implements,
-and valid non-object input. The live-ledger 14-day review firing set remains `research-gateway`
+and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
+driven through `poll_validation_jobs()`, manual null-origin implements, mixed int/string item keys
+in one unusable report, an earlier unusable row superseded by a later clean one, and valid
+non-object input. The live-ledger 14-day review firing set remains `research-gateway`
 6/6; no in-window stored verdict is unusable.
 
 **Landing.** §116 and §117 both ride PR #7 (branch

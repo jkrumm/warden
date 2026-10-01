@@ -9214,6 +9214,66 @@ def test_self_audit_completed_review_rejects_explicit_null_blocking_and_bool_sch
     })
 
 
+def test_a_non_list_blocking_payload_does_not_crash_the_validation_tick():
+    """§117 — sideclaw publishes `blocking` as a list of objects, but a corrupt or
+    hand-written payload can hold a scalar. The step-7 fold iterates it, so a
+    non-list value must read as "no finding" rather than raise mid-tick after the
+    job is already persisted (which would re-crash identically on every poll)."""
+    with _triage_env() as (conn, ctx):
+        for value in (True, 7, "a finding"):
+            assert triage._code_blocking_findings(value) == []
+            assert triage._process_only_findings(value) == []
+
+        eid = _seed_verdict_item(conn, external_id="sig-scalar-blocking")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-scalar", "validation-job-scalar",
+             "https://github.com/jkrumm/demo-repo/pull/11", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-scalar")
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result("actionable", blocking=True, summary="malformed payload."),
+        }
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        # The tick completed and the item reached a decision rather than wedging in
+        # STATE_VALIDATING for the next poll to crash on again.
+        assert triage._get_item(conn, eid)["state"] != triage.STATE_VALIDATING
+
+
+def test_self_audit_reports_an_item_by_its_latest_row_not_an_earlier_unusable_one():
+    """§117 — the unusable report follows the same "latest row wins" rule as the
+    blocking count. An item whose earlier review was unusable but whose newest
+    review is a complete clean one is healthy, and must not be reported as having
+    an unusable verdict for the rest of the window."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=950 + i, suffix=f"stale-{950 + i}-a",
+                                  verdict_json={"schemaVersion": 1, "outcome": "actionable"})
+            _seed_blocking_review(conn, event_id=950 + i, suffix=f"stale-{950 + i}-b",
+                                  outcome="clean", blocking=[])
+        findings = triage._review_health_findings(conn, NOW.isoformat())
+        assert findings == []
+
+
+def test_self_audit_handles_mixed_origin_unusable_keys_without_crashing():
+    """§117 — a loop-originated item keys its unusable report on an int event id,
+    a manual `warden dispatch` on its job-id string. Sorting the sample must not
+    compare the two types."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=960, suffix="mixed-loop",
+                              verdict_json={"schemaVersion": 1, "outcome": "actionable"})
+        _seed_blocking_review(conn, event_id=None, suffix="mixed-manual",
+                              verdict_json={"schemaVersion": 1, "outcome": "actionable"})
+        finding = next(f for f in triage._review_health_findings(conn, NOW.isoformat())
+                       if f["key"] == "review-verdicts-unusable-demo-repo")
+        assert "2 item(s)" in finding["title"]
+        assert "960" in finding["detail"] and "mixed-manual" in finding["detail"]
+
+
 def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
     """§117 — a parseable-but-INCOMPLETE stored verdict with a non-clean outcome
     and no `blocking` key must not read as a clean review or erase a prior block.
