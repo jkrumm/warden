@@ -5929,29 +5929,31 @@ ItemKey = int | str
 
 def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite3.Row]:
     """Every implement→review pair in the window whose review reached a terminal status.
-    `since` is normalised to the ledger's own stored format first: the window bound is
-    compared as text, and the harness passes an offset-carrying `isoformat()` where the
-    ledger holds microsecond strings.
 
-    No `ORDER BY`: `_fold_review_status()` sorts its own input, and a sort here would
-    only imply an ordering contract the fold does not rely on."""
+    The window compares INSTANTS, not text: `datetime()` normalises a stored
+    `+HH:MM`/`Z`/naive timestamp to UTC before the comparison, so a row written with a
+    non-UTC offset cannot land in or out of the window by its representation. (Every
+    deliberate writer here stores `+00:00`, where text and instant agree — this is what
+    keeps a future writer's format from being a silent correctness change.) The wrapper
+    forgoes `idx_dispatches_created`; the hourly pass over `dispatches` is small enough
+    that correctness is the better trade.
+
+    No `ORDER BY`: `_fold_review_status()` orders its own input by parsed instant, and a
+    sort here would only imply a contract the fold does not rely on."""
     since_dt = _parse_ts(since)
     if since_dt is None:
         raise ValueError(f"invalid self-audit window start: {since!r}")
-    # A naive bound is the ledger's own (naive UTC) format, not host-local: letting
-    # `astimezone()` infer the machine's zone would shift the window by the host's
-    # offset on any non-UTC box, silently widening or narrowing the audit.
-    if since_dt.tzinfo is None:
-        since_dt = since_dt.replace(tzinfo=dt.timezone.utc)
+    # `_parse_ts()` has already made this UTC-aware; formatting it back to the ledger's
+    # naive-UTC text is what the placeholder below is compared as.
     since = since_dt.astimezone(dt.timezone.utc).replace(tzinfo=None).isoformat()
     placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
     sql = (
-        "SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
-        "r.verdict_json AS verdict_json, "
-        "r.status AS review_status, r.created_at AS created_at, r.id AS id "
-        "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
-        "WHERE d.tier='implement' "
-        "AND d.created_at >= ? AND r.status IN (" + placeholders + ") "
+        f"SELECT d.repo AS repo, d.origin_event_id AS event_id, d.job_id AS implement_job_id, "
+        f"r.verdict_json AS verdict_json, "
+        f"r.status AS review_status, r.created_at AS created_at, r.id AS id "
+        f"FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
+        f"WHERE d.tier='implement' "
+        f"AND datetime(d.created_at) >= datetime(?) AND r.status IN ({placeholders}) "
     )
     return conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)).fetchall()
 
@@ -5967,6 +5969,14 @@ class _ReviewedItem(NamedTuple):
     unusable: bool             # latest terminal row's result cannot be safely read.
 
 
+def _review_order_key(r: _ReviewRow) -> tuple[dt.datetime, int]:
+    """Order rows by the review's INSTANT, not its text: `created_at` is stored text, and
+    two rows written with different offsets would otherwise sort by representation, so an
+    item's "latest" review could be an earlier one. A row whose timestamp will not parse
+    sorts first, so it can never be mistaken for an item's latest."""
+    return (_parse_ts(r["created_at"]) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), r["id"])
+
+
 def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _ReviewedItem]]:
     """The review-health fold — pure, so the latest-wins rule is testable without a
     database. It is typed by the small bracket-access protocol it reads: the query
@@ -5976,8 +5986,9 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
 
     Rows are **ordered here rather than assumed ordered**: "latest wins" is a
     sequential dict overwrite, so shuffled input would pick an arbitrary row as an
-    item's latest with no error anywhere. Sorting by `(created_at, id)` — the review's
-    own timestamp, then its row id — makes that impossible for any caller.
+    item's latest with no error anywhere. Sorting by the parsed instant, then the row
+    id, makes that impossible for any caller — including one whose timestamps carry
+    different UTC offsets.
 
     Returns a single repo -> item key -> `_ReviewedItem` map. `code_blocked=None`
     means that item has never had a readable complete review; an earlier readable
@@ -5988,7 +5999,7 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
     `code_blocked` value. If there was no complete review, that stays `None` so the
     item does not dilute the `n >= 3` bar; an earlier complete review keeps speaking."""
     status_by_repo: dict[str, dict[ItemKey, _ReviewedItem]] = {}
-    for r in sorted(rows, key=lambda r: (str(r["created_at"]), r["id"])):
+    for r in sorted(rows, key=_review_order_key):
         # A manual `warden dispatch` has no triage event; its implement job is the
         # only identity it has, and it is a real row this audit must not drop.
         item_key: ItemKey = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]
@@ -6774,6 +6785,14 @@ def _revisions_exhausted_findings(conn: sqlite3.Connection, policy: dict[str, An
     return out
 
 
+def _section_failure_finding(name: str, e: BaseException) -> dict[str, Any]:
+    """The finding a failed self-audit section reports in place of its own output."""
+    return {"key": f"self-audit-section-failed-{name}",
+            "title": f"the self-audit's {name} check raised {type(e).__name__}",
+            "detail": f"{e} — its findings are missing from this pass, so anything it would "
+                      f"have reported stays unseen until the cause is fixed"}
+
+
 def _audit_section(name: str, section: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
     """Run one self-audit section so its failure cannot hide the others.
 
@@ -6787,10 +6806,7 @@ def _audit_section(name: str, section: Callable[[], list[dict[str, Any]]]) -> li
         return section()
     except Exception as e:  # noqa: BLE001 — isolation is the point, not suppression
         print(f"triage: self-audit section '{name}' failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return [{"key": f"self-audit-section-failed-{name}",
-                 "title": f"the self-audit's {name} check raised {type(e).__name__}",
-                 "detail": f"{e} — its findings are missing from this pass, so anything it would "
-                           f"have reported stays unseen until the cause is fixed"}]
+        return [_section_failure_finding(name, e)]
 
 
 def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
@@ -6827,8 +6843,20 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     last = _parse_ts(row["updated_at"]) if row else None
     if last is not None and (now - last).total_seconds() < SELF_AUDIT_INTERVAL_S:
         return
-    violations = check_invariants(conn, now)
-    findings = self_audit_findings(conn, now, policy)
+    # Invariants run FIRST and are the same failure class the sections below are wrapped
+    # against: without this guard a raise here (a bad INVARIANTS rule, an OperationalError,
+    # a malformed row) propagates out of run_self_audit entirely — losing the cursor write,
+    # the hour's `warden_self` reopen/resolve, and every finding the sections below had
+    # already produced. Its failure is reported, not swallowed.
+    violations: list[dict[str, Any]] = []
+    invariants_error: str | None = None
+    try:
+        violations = check_invariants(conn, now)
+    except Exception as e:  # noqa: BLE001 — same isolation as _audit_section()
+        print(f"triage: self-audit section 'invariants' failed: {type(e).__name__}: {e}", file=sys.stderr)
+        invariants_error = f"{type(e).__name__}: {e}"
+    findings = ([_section_failure_finding("invariants", Exception(invariants_error))] if invariants_error else [])
+    findings.extend(self_audit_findings(conn, now, policy))
     by_inv: dict[str, list[dict[str, Any]]] = {}
     for v in violations:
         by_inv.setdefault(v["id"], []).append(v)
@@ -6841,8 +6869,9 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
             "detail": "; ".join(f"event {v['event_id']}: {v['detail']}" for v in vs[:8]),
         })
     if dry_run:
-        print(f"[dry-run] self-audit: {len(violations)} invariant violation(s), {len(findings)} finding(s): "
-              f"{[f['key'] for f in findings]}")
+        print(f"[dry-run] self-audit: {len(violations)} invariant violation(s)"
+              f"{' (invariants FAILED: ' + invariants_error + ')' if invariants_error else ''}, "
+              f"{len(findings)} finding(s): {[f['key'] for f in findings]}")
         return
     now_iso = _now_iso(now)
     live_keys = {f["key"] for f in findings}
@@ -6866,6 +6895,10 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     summary = {"checked_at": now_iso, "invariants": sorted(INVARIANTS),
                "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
                "findings": sorted(live_keys)}
+    if invariants_error:
+        # An empty `violations` from a check that never ran is a fabricated zero, not a
+        # clean bill — /health's reader gets the reason instead.
+        summary["invariants_error"] = invariants_error
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",

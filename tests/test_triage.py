@@ -8349,6 +8349,90 @@ def test_a_naive_audit_window_is_read_as_utc_not_host_local():
         assert triage._fetch_terminal_reviews(conn, aware) == []
 
 
+def _review_row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00+00:00",
+                row_id=0):
+    return {"repo": "demo-repo", "event_id": event_id, "implement_job_id": job,
+            "verdict_json": None if verdict is None else json.dumps(verdict),
+            "review_status": status, "created_at": created_at, "id": row_id}
+
+
+def test_the_latest_review_is_chosen_by_instant_not_by_timestamp_text():
+    """A stored timestamp is TEXT. Two rows for one item written with different UTC
+    offsets must be ordered by the instant they denote — `10:30+01:00` is EARLIER than
+    `10:00+00:00` even though its text sorts later. Ordering by text would pick the
+    wrong "latest" review, and so report or suppress `review-always-blocks` wrongly."""
+    blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                "outcome": "actionable", "blocking": [_CODE_FINDING]}
+    clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean",
+             "blocking": []}
+    # Text order says the +01:00 row is later; it is an hour EARLIER in real time.
+    rows = [_review_row(1, "impl-1", clean, created_at="2026-10-01T09:00:00+00:00", row_id=1),
+            _review_row(1, "impl-1", blocking, created_at="2026-10-01T10:30:00+01:00", row_id=2),
+            _review_row(1, "impl-1", clean, created_at="2026-10-01T10:00:00+00:00", row_id=3)]
+    assert [str(r["created_at"]) for r in sorted(rows, key=lambda r: str(r["created_at"]))] == [
+        "2026-10-01T09:00:00+00:00", "2026-10-01T10:00:00+00:00", "2026-10-01T10:30:00+01:00"]
+    folded = triage._fold_review_status(rows)
+    # The 10:00+00:00 clean row is the latest instant, so the item is not blocked.
+    assert folded["demo-repo"][1] == triage._ReviewedItem(code_blocked=False, unusable=False)
+
+
+def test_a_review_row_with_an_unparseable_timestamp_is_never_the_latest():
+    blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+                "outcome": "actionable", "blocking": [_CODE_FINDING]}
+    rows = [_review_row(1, "impl-1", blocking, created_at="not a timestamp", row_id=99),
+            _review_row(1, "impl-1", blocking, created_at="2026-10-01T06:00:00+00:00", row_id=1)]
+    assert triage._fold_review_status(rows)["demo-repo"][1].code_blocked is True
+
+
+def test_the_audit_window_compares_instants_not_timestamp_text():
+    """A row stored with a non-UTC offset must land in the window by its instant. As
+    text, `10:30+01:00` sorts after `10:00+00:00`; as an instant it is an hour earlier."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="offset-window")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-offset-window", "impl-offset-window"))
+        # The implement row is 09:30 UTC — inside the window that starts at 09:00 UTC.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ("2026-10-01T09:30:00+00:00", "impl-offset-window"))
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ("2026-10-01T09:35:00+00:00", "val-offset-window"))
+        conn.commit()
+        since = "2026-10-01T09:00:00+00:00"
+        assert len(triage._fetch_terminal_reviews(conn, since)) == 1
+
+        # Same text length, but the row is 09:00+01:00 == 08:00 UTC: outside the window.
+        conn.execute("UPDATE dispatches SET created_at=? WHERE job_id=?",
+                     ("2026-10-01T09:30:00+01:00", "impl-offset-window"))
+        conn.commit()
+        assert triage._fetch_terminal_reviews(conn, since) == []
+
+
+def test_a_failing_invariants_check_does_not_lose_the_rest_of_the_pass():
+    """The invariants call runs first and is the same failure class the findings sections
+    are wrapped against. Its raise must not discard the cursor write, the `warden_self`
+    sync, or the findings already produced — and /health must not read the empty
+    `violations` list as a clean bill."""
+    with _triage_env() as (conn, ctx):
+        marker = {"key": "restore-drill-marker", "title": "t", "detail": "d"}
+        original_inv, original_drill = triage.check_invariants, triage._restore_drill_findings
+        triage.check_invariants = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("bad INVARIANTS rule"))
+        triage._restore_drill_findings = lambda now: [marker]
+        try:
+            triage.run_self_audit(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        finally:
+            triage.check_invariants = original_inv
+            triage._restore_drill_findings = original_drill
+
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()["value"])
+        assert "self-audit-section-failed-invariants" in summary["findings"], summary["findings"]
+        assert "RuntimeError: bad INVARIANTS rule" in summary["invariants_error"]
+        # The cursor write and the self-source event both landed despite the failure.
+        assert conn.execute("SELECT 1 FROM events WHERE source=? AND external_id=?",
+                            ("warden_self", "self-audit-section-failed-invariants")).fetchone() is not None
+        assert marker["key"] in summary["findings"], "the other sections still reported"
+
+
 def test_the_unusable_verdict_finding_covers_a_missing_verdict_too():
     """A terminal `failed`/`cancelled` review stores no verdict at all — the finding
     must say so rather than describing a payload that does not exist."""

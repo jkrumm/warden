@@ -9626,7 +9626,37 @@ risk. Verified: they fall through to one shared `sync_card()` at the tail of
 in would render the same card twice per pass. `_park_item()` is for the early-exit branches only,
 and its docstring now says so — the seam is deliberate, not an oversight.
 
-**Verified.** `tests/test_triage.py` at **376/376** (354 before, +22); all 21 test files green.
+**Twentieth round.** Two blockers from the cross-family adversary, both real.
+
+*Verified live before fixing:* every `dispatches.created_at` in the ledger (379 rows) is stored
+`+00:00`, so the text-vs-instant defect was **latent, not currently firing** — text order and real
+order agree today. It is still a correctness defect: the fold ordered by `str(created_at)` and the
+window compared stored text against a normalised bound, so one row written with any other offset
+(e.g. `10:30+01:00`, which is an hour *earlier* than `10:00+00:00` but sorts after it) would pick
+the wrong "latest" review and could report or suppress `review-always-blocks` wrongly. The window
+now compares instants through `datetime()`, and the fold orders by parsed instant via
+`_review_order_key()` — an unparseable timestamp sorts first, so it can never read as "latest".
+
+*The second was a straight hole in round 19's own fix:* `run_self_audit()` called
+`check_invariants()` first and unguarded, so a raise there still took down the cursor write, the
+hour's `warden_self` reopen/resolve, and every finding the newly-wrapped sections had produced.
+It is now guarded like the sections, and its failure is visible in two places rather than none:
+a `self-audit-section-failed-invariants` finding, and `invariants_error` on the cursor summary —
+an empty `violations` list from a check that never ran is a fabricated zero, which is exactly what
+docs/api.md's honesty rule forbids.
+
+Two cleanups: `_fetch_terminal_reviews()` now uses the file's established
+`f"… IN ({placeholders})"` SQL shape, and round 18's `tzinfo is None` guard is gone — `_parse_ts()`
+already returns a UTC-aware datetime, so the guard was unreachable.
+
+**Discussion answered, not deferred.** `_park_item()`'s seven parameters: the three early-exit
+callers need exactly `state`, `note` and `validation_status`, and no fourth state-specific flag is
+on the table. Collapsing them into an outcome record now would be speculative infrastructure for a
+call shape that does not exist yet; the parameter list is the honest signature of the three call
+sites. Worth revisiting when a fourth flag appears — at that point callers stop mapping 1:1 onto
+arguments, which is the actual signal.
+
+**Verified.** `tests/test_triage.py` at **380/380** (354 before, +26); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
