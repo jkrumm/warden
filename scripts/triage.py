@@ -5858,12 +5858,12 @@ def _is_completed_review(verdict: Any) -> bool:
     exists to notice a broken review gate."""
     if not isinstance(verdict, dict):
         return False
-    blocking = verdict.get("blocking")
-    if "blocking" not in verdict:
-        if verdict.get("outcome") == "clean":
-            blocking = []
-        else:
-            return False
+    # A `clean` outcome legitimately omits `blocking` (the live fold reads that as
+    # empty); every other outcome must publish the list, because a missing one is
+    # indistinguishable from "no findings" and would clear a code-blocked round.
+    if "blocking" not in verdict and verdict.get("outcome") != "clean":
+        return False
+    blocking = verdict.get("blocking", [])
     schema_version = verdict.get("schemaVersion")
     schema_matches = (isinstance(schema_version, int)
                       and not isinstance(schema_version, bool)
@@ -5883,24 +5883,31 @@ def _is_finding_shape(finding: Any) -> bool:
             and isinstance(finding.get("message"), str) and bool(finding["message"].strip()))
 
 
+# The two things that can identify a reviewed item: its triage event, or — for a
+# manual `warden dispatch` that never had one — the implement job it was submitted
+# under. Named here because the self-audit keys its per-item maps on it.
+ItemKey = int | str
+
+
 def _review_item_status(conn: sqlite3.Connection, since: str) -> tuple[
-        dict[str, dict[Any, bool]], dict[str, dict[Any, bool]]]:
+        dict[str, dict[ItemKey, bool]], dict[str, dict[ItemKey, bool]]]:
     """The review-health reduce, split from the two finding formats it feeds.
 
     Returns `(per_repo, latest_unusable)`:
 
     - `per_repo` — repo -> item key -> did that item's LATEST COMPLETE review carry a
-      code finding. Items whose latest row is unreadable are absent (an item nobody
-      has judged must not dilute the `n >= 3` bar).
+      code finding. An item with no complete review at all (every terminal row
+      unreadable) is absent, because an item nobody has judged must not dilute the
+      `n >= 3` bar.
     - `latest_unusable` — repo -> item key -> is that item's latest terminal row
       unreadable. Every item with a terminal row appears here, so the caller can tell
       "no applicable row" from "a row nobody can read".
 
-    Rows are ordered oldest-first, so the last write for an item wins: a later
-    unreadable row is reported, but it neither sets nor clears the item's status,
-    because only a COMPLETE review speaks for an item (§117)."""
-    per_repo: dict[str, dict[Any, bool]] = {}
-    latest_unusable: dict[str, dict[Any, bool]] = {}
+    A later unreadable row is reported through `latest_unusable`, but it neither sets
+    nor clears the item's status in `per_repo`: only a COMPLETE review speaks for an
+    item, and an earlier complete review keeps speaking (§117)."""
+    per_repo: dict[str, dict[ItemKey, bool]] = {}
+    latest_unusable: dict[str, dict[ItemKey, bool]] = {}
     terminal_status_placeholders = ",".join("?" for _ in _sideclaw.REVIEW_TERMINAL_STATUSES)
     since_dt = _parse_ts(since)
     if since_dt is None:
@@ -5918,7 +5925,7 @@ def _review_item_status(conn: sqlite3.Connection, since: str) -> tuple[
     for r in conn.execute(sql, (since, *_sideclaw.REVIEW_TERMINAL_STATUSES)):
         # A manual `warden dispatch` has no triage event; its implement job is the
         # only identity it has, and it is a real row this audit must not drop.
-        item_key: Any = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]
+        item_key: ItemKey = r["event_id"] if r["event_id"] is not None else r["implement_job_id"]
         verdict = _safe_json(r["verdict_json"])
         readable = r["review_status"] == "done" and _is_completed_review(verdict)
         latest_unusable.setdefault(r["repo"], {})[item_key] = not readable
@@ -5929,7 +5936,7 @@ def _review_item_status(conn: sqlite3.Connection, since: str) -> tuple[
     return per_repo, latest_unusable
 
 
-def _unusable_verdict_findings(latest_unusable: dict[str, dict[Any, bool]]) -> list[dict[str, Any]]:
+def _unusable_verdict_findings(latest_unusable: dict[str, dict[ItemKey, bool]]) -> list[dict[str, Any]]:
     """One finding per repo whose items' latest stored review cannot be read — the
     fifth self-audit key. A bounded sample of item IDs rides along so the operator can
     open the offending row without an ad-hoc query."""
@@ -5938,7 +5945,7 @@ def _unusable_verdict_findings(latest_unusable: dict[str, dict[Any, bool]]) -> l
         item_keys = [k for k, unreadable in by_item.items() if unreadable]
         if not item_keys:
             continue
-        distinct = sorted(set(item_keys), key=str)
+        distinct = sorted(item_keys, key=str)
         sample = ", ".join(str(k) for k in distinct[:SELF_AUDIT_SAMPLE_LIMIT])
         remainder = len(distinct) - min(len(distinct), SELF_AUDIT_SAMPLE_LIMIT)
         suffix = f" (+{remainder} more)" if remainder else ""
@@ -5952,7 +5959,7 @@ def _unusable_verdict_findings(latest_unusable: dict[str, dict[Any, bool]]) -> l
     return findings
 
 
-def _always_blocks_findings(per_repo: dict[str, dict[Any, bool]]) -> list[dict[str, Any]]:
+def _always_blocks_findings(per_repo: dict[str, dict[ItemKey, bool]]) -> list[dict[str, Any]]:
     """One finding per repo whose review gate code-blocked EVERY reviewed item — a
     gate refusing all work, not a repo with bad PRs. `n >= 3` keeps a two-item repo
     from reading as a pattern."""

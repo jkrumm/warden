@@ -9514,6 +9514,21 @@ reduce is split from the two finding formats (`_review_item_status()` → pure
 "set state, commit, re-render the card" sequence is one `_park_item()` the three branches share,
 and the fold no longer normalizes `blocking` twice.
 
+**Twelfth round.** No blockers — `resilience`, `api-contract` and `adversary` all approved clean,
+for the first time on this change. Five non-blocking notes, all applied: the dual item identity is
+now the named `ItemKey = int | str` rather than `Any` (the `key=str` sort is no longer a workaround
+for an untyped union), the fold's missing-`blocking` case is a guard clause instead of a nested
+`if`, a no-op `set()` on already-unique dict keys is gone, `REVIEW_TERMINAL_STATUSES` carries the
+same `tuple[str, ...]` annotation as its neighbours, and `_review_item_status()`'s docstring now
+says what the code does — an earlier complete review **keeps** speaking after a later unreadable
+one, and only an item with no complete review at all is absent.
+
+**Deliberately not done:** the architect's proposal to lift this function family into its own
+module. The seam is already split into five single-purpose functions here
+(`_published_findings` / `_code_blocking_findings` / `_process_only_findings` /
+`_is_completed_review` / the reduce + two builders), and a module extraction would move code this
+change does not otherwise touch — its own commit, not a rider on a correctness fix.
+
 **Verified.** `tests/test_triage.py` at **366/366** (354 before, +12); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
