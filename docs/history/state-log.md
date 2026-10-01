@@ -9439,71 +9439,45 @@ errored or partially-serialised verdict would clear a code-blocked item — a fa
 the one check whose job is to notice a broken review gate. The `outcome` gate above is that
 finding's fix, and "an item nobody has judged is not counted" is now pinned by its own case.
 
-**Third round.** The review on the second revision (`4f48fc15`) blocked it once more, one step
-further in: the `outcome` gate alone still let a parseable but PARTIAL stored payload through —
-`{"outcome": "actionable"}` with no `blocking` key — whose `(verdict.get("blocking") or [])`
-collapses to `[]` and reads as a clean review, again clearing a code-blocked round. The gate is
-now the whole published shape, `_is_completed_review()`: sideclaw's `schemaVersion`, an `outcome`
-inside its published `REVIEW_OUTCOMES`, and a `blocking` list whose entries are all finding
-objects — what `assert_result_schema()` / `assert_outcome()` insist on in substance for a live
-response, applied to the stored payload because this audit reads stored payloads. A row that
-fails is skipped from numerator AND denominator (an item nobody has judged must not dilute the
-`n >= 3` bar) and counted, with one printed line per repo, so "no usable verdict" is visible in
-the loop's log. The same round asked for the wrapper-finding filter that had become triplicated
-to be extracted: `_code_blocking_findings()` now serves `poll_validation_jobs()`,
-`_revision_findings()` and this audit, so §114's rule has one home.
+**Third round.** The review on the second revision (`4f48fc15`) blocked it once more: a
+parseable but partial payload (`{"outcome": "actionable"}`) lacked the `blocking` key and
+was being read as clean. `_is_completed_review()` now requires a known stored schema version, a known outcome, and the
+expected blocking shape. A version at or below the current pin remains parseable for stored
+history; a non-integer or future version is reported unusable. Clean outcomes may omit
+`blocking`, since the live fold treats it as empty; a non-clean outcome cannot silently clear an
+earlier block.
+Valid non-object JSON is rejected without raising, and `_code_blocking_findings()` ignores
+non-list containers and non-object members so malformed stored values cannot crash revision
+brief construction. The review-health helper is extracted and reports unusable rows with a
+bounded event-ID sample.
 
+**Fourth round.** The next review found a malformed finding object could still crash the loop
+or be miscounted. `_is_completed_review()` now requires a non-empty `file` and `message` on
+every finding entry, and the regression covers `null`, `{}`, and a missing-message object.
 
-**Sixth round.** The review on the fifth revision blocked the exact missing-verdict case again:
-a terminal failed review with `verdict_json IS NULL` had to reach the unusable-verdict event,
-not disappear at a `verdict_json IS NOT NULL` filter. The query now includes every terminal
-review row regardless of verdict presence; a null payload normalizes to `{}` and is counted
-unusable. Non-`done` terminal jobs are visible as unusable, but cannot overwrite a prior
-completed review even if a stale verdict was stored alongside their failure. The review status
-is selected explicitly as `review_status` (the implement and review rows both have a `status`).
+**Fifth round.** The review on the fourth revision blocked the log-only diagnostic: a `print()`
+inside the formerly-pure `self_audit_findings()` would not create a `warden_self` event or
+surface through `/health.self_audit`. The unusable-verdict count now returns a bounded
+`review-verdicts-unusable-<repo>` finding through the existing event pipeline; it resolves when
+the affected window is clean. The DESIGN.md inventory now names this fifth key.
 
-**Seventh round.** The next review caught a false-positive regression in the previous guard:
-`clean` is the successful outcome that routinely omits `blocking`, so a missing/null list on
-that outcome is an empty list, not an unusable verdict. `_is_completed_review()` now treats
-missing `blocking` as empty ONLY for `clean`; a non-clean outcome without findings is still
-unusable and cannot erase an earlier code block. It also checks valid non-object JSON is
-rejected without raising. The live classifier `_code_blocking_findings()` now safely ignores
-non-list containers and non-object members, so a malformed stored list cannot crash a
-revision-brief read. Unusable findings include a bounded sample of event IDs for operators.
+**Sixth round.** The review on the fifth revision caught terminal failed reviews with
+`verdict_json IS NULL` being filtered out. The query now includes all terminal review rows,
+regardless of verdict presence; non-`done` terminal rows are reported unusable but cannot
+overwrite a previous completed review. The joined review status is explicitly `review_status`.
+
+**Seventh round.** The review on the sixth revision caught two boundaries: valid clean outcomes
+may omit `blocking`, and `_safe_json()` can return valid non-object JSON. Missing `blocking` is
+empty only for `clean`; a non-clean outcome without the list remains unusable. The terminal
+status list derives from sideclaw's canonical `TERMINAL` tuple, and SQL placeholders derive from
+its length. A later review found the partial-verdict test asserted the wrong result; it now
+asserts both `review-always-blocks` and `review-verdicts-unusable` findings. The shared test
+fixture also uses `_NO_VERDICT` to faithfully seed a terminal row with no stored payload.
 
 **Verified.** `tests/test_triage.py` at **360/360** (354 before, +6); all 21 test files green.
-The regression cases cover blocked-then-clean, blocked-then-partial-actionable, terminal failed
-review with no verdict, malformed findings (`null`, empty object, missing message), a clean
-verdict without `blocking`, and valid non-object input to the shape checker. The live-ledger
-14-day review firing set remains `research-gateway` 6/6; no in-window stored verdict is
-unusable.
-
-
-**Fifth round.** The review on the fourth revision blocked the *logging* addition: a `print()`
-inside `self_audit_findings()` did not create a `warden_self` event, could not be asserted through
-a structured return, and let a sideclaw schema bump silently drain all reviews from the
-14-day denominator. Moving the print out alone would leave the same gap; the audit must carry an
-honest signal when its input is no longer parseable. `_review_always_blocks_findings()` is now
-its own helper and returns **one bounded `review-verdicts-unusable-<repo>` finding per affected
-repo**, aggregating malformed stored rows in the same 14-day window. It goes through the existing
-`warden_self` event pipeline — visible on the board, in Slack and `/health.self_audit` — and
-resolves when the window has no unusable verdicts; no new endpoint, no log-only contract. No
-unusable rows today → no extra item.
-
-**Verified.** Test first, all five rounds:
-`test_self_audit_reads_an_item_by_its_latest_review_not_any_earlier_one` pins that an earlier
-block is forgotten only by a later complete pass;
-`test_self_audit_does_not_let_an_unusable_review_clear_a_blocked_item` and
-`test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item` cover error and missing
-`blocking`; `test_self_audit_skips_a_completed_review_with_malformed_findings` pins `[null]` as
-unusable. `test_self_audit_reports_unusable_stored_reviews_as_visible_findings` asserts the
-helper returns both the ordinary blocked finding and the unusable-verdict finding (row count in
-title and detail), then verifies `run_self_audit()` creates the `warden_self` event and resolves
-the same event after a valid pass. All five cases pass. `tests/test_triage.py` at **359/359**
-(354 before, +5); the full run is **21/21 files green**. On a `VACUUM INTO` copy of the live
-ledger, **0** of 15 in-window implement→review rows are unusable and the
-`review-always-blocks` firing set is unchanged (`research-gateway` 6/6); the new diagnostic
-creates no live event.
+Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
+verdict, malformed finding entries, clean without `blocking`, and non-object input. The live-ledger
+14-day firing set remains `research-gateway` 6/6; no in-window stored verdict is unusable.
 
 **Landing.** §116 and §117 both ride PR #7 (branch
 `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is

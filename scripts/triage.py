@@ -5846,7 +5846,9 @@ def _is_completed_review(verdict: dict[str, Any]) -> bool:
     blocking = verdict.get("blocking")
     if blocking is None and verdict.get("outcome") == "clean":
         blocking = []
-    schema_matches = verdict.get("schemaVersion") == _sideclaw.REVIEW_SCHEMA_VERSION
+    schema_version = verdict.get("schemaVersion")
+    schema_matches = (isinstance(schema_version, int)
+                      and schema_version <= _sideclaw.REVIEW_SCHEMA_VERSION)
     outcome_is_known = verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
     findings_are_complete = (
         isinstance(blocking, list)
