@@ -9201,7 +9201,7 @@ def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
             _seed_blocking_review(conn, event_id=980 + i, suffix=f"partial-{980 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable"})
-        findings = triage._review_always_blocks_findings(conn, NOW.isoformat())
+        findings = triage._review_health_findings(conn, NOW.isoformat())
         assert {f["key"] for f in findings} == {
             "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
@@ -9225,7 +9225,7 @@ def test_self_audit_skips_a_completed_review_with_malformed_findings():
             _seed_blocking_review(conn, event_id=990 + i, suffix=f"shape-{990 + i}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable", "blocking": malformed})
-        findings = triage._review_always_blocks_findings(conn, NOW.isoformat())
+        findings = triage._review_health_findings(conn, NOW.isoformat())
         assert {f["key"] for f in findings} == {
             "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
@@ -9252,7 +9252,7 @@ def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():
             _seed_blocking_review(conn, event_id=eid, suffix=f"visible-{eid}-b",
                                   verdict_json={"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                                                 "outcome": "actionable"})
-        findings = triage._review_always_blocks_findings(conn, NOW.isoformat())
+        findings = triage._review_health_findings(conn, NOW.isoformat())
         assert {f["key"] for f in findings} == {
             "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         triage.run_self_audit(conn, DEFAULT_POLICY, NOW, dry_run=False)

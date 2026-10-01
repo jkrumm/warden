@@ -788,8 +788,9 @@ they flag is already exactly one entry in the owner's list.
 | INV-7-owner-queue | anything waiting on the owner > 3 days (report only) | same |
 | TRIP (§103) | a Kuma push monitor marked `fixed` without proof it can still go DOWN | `test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding` |
 
-The self-audit adds four findings about the loop's own answers:
-`review-always-blocks-<repo>`, `liveness-never-confirms-<repo>`,
+The self-audit adds five findings about the loop's own answers:
+`review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>` (a terminal review row
+without a usable result; cannot count as a pass), `liveness-never-confirms-<repo>`,
 `fixed-reopened-<event>` (a verdict or fix proven wrong), and
 `revisions-exhausted-<event>`. Enforced elsewhere, by name: the fail-closed
 executor gate (`EXECUTOR_REPOS` in `merge.py`, §99/§107 — `NEVER_AUTO_MERGE`

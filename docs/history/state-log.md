@@ -9453,6 +9453,21 @@ the loop's log. The same round asked for the wrapper-finding filter that had bec
 to be extracted: `_code_blocking_findings()` now serves `poll_validation_jobs()`,
 `_revision_findings()` and this audit, so §114's rule has one home.
 
+**Sixth round.** The review on the fifth revision found that the query filtered on
+`verdict_json IS NOT NULL`: a terminal errored/failed review with no stored result vanished
+from both the audit and its unusable-verdict event, silently hiding the broken gate. The query
+now reads terminal review jobs regardless of verdict presence; a null payload folds to `{}` and
+is counted unusable. A terminal non-`done` job is reported as unusable but cannot overwrite an
+earlier completed review, even if a stale partial verdict happened to persist alongside its
+failure. The terminal-status set lives once in the sideclaw client; the audit selects the
+review's status explicitly rather than conflating it with the implement row.
+
+The same review suggested two consistency improvements — the review-health helper now owns
+both review-related finding kinds, and `REVIEW_OUTCOMES` remains next to the terminal-status
+constant — plus the `DESIGN.md` self-audit inventory now names the fifth key. The subsequent
+review caught the selected `status` needed an explicit alias (since both joined rows have one); it
+is now `review_status` and checked on the review row.
+
 **Fifth round.** The review on the fourth revision blocked the *logging* addition: a `print()`
 inside `self_audit_findings()` did not create a `warden_self` event, could not be asserted through
 a structured return, and let a sideclaw schema bump silently drain all reviews from the

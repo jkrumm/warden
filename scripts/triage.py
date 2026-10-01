@@ -5859,23 +5859,24 @@ def _is_finding_shape(finding: Any) -> bool:
             and isinstance(finding.get("message"), str) and bool(finding["message"].strip()))
 
 
-def _review_always_blocks_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
-    """A step-7 review gate that code-blocks every reviewed item in a repo, or
-    stored verdicts that are unusable and therefore cannot safely count as a pass.
-    Last COMPLETE review per item wins; a later unusable review cannot erase a
-    blocking one, and its missing result is a separate visible self-audit finding."""
+def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
+    """Report a review gate blocking every reviewed item, plus terminal review
+    rows whose results cannot safely count as passes. Last COMPLETE successful
+    review per item wins; a later unusable or non-successful job cannot erase a
+    prior blocking review, and its missing result is a visible self-audit finding."""
     per_repo: dict[str, dict[int, bool]] = {}
     unusable: dict[str, int] = {}
     for r in conn.execute(
-        "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json "
+        "SELECT d.repo AS repo, d.origin_event_id AS event_id, r.verdict_json AS verdict_json, "
+        "r.status AS review_status "
         "FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         "WHERE d.tier='implement' AND d.origin_event_id IS NOT NULL "
-        "AND d.created_at >= ? AND r.status IN ('done', 'failed', 'interrupted', 'cancelled') "
+        "AND d.created_at >= ? AND r.status IN (?,?,?,?) "
         "ORDER BY r.created_at, r.id",
-        (since,),
+        (since, *_sideclaw.REVIEW_TERMINAL_STATUSES),
     ):
         verdict = _safe_json(r["verdict_json"])
-        if not _is_completed_review(verdict):
+        if r["review_status"] != "done" or not _is_completed_review(verdict):
             unusable[r["repo"]] = unusable.get(r["repo"], 0) + 1
             continue
         per_repo.setdefault(r["repo"], {})[r["event_id"]] = bool(
@@ -6544,7 +6545,7 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     fix was wrong), and a revision budget used up."""
     since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
     out: list[dict[str, Any]] = []
-    out.extend(_review_always_blocks_findings(conn, since))
+    out.extend(_review_health_findings(conn, since))
     for r in conn.execute(
         "SELECT ti.repo, SUM(t.to_state='new') AS reopened, SUM(t.to_state='fixed') AS fixed "
         "FROM item_transitions t JOIN triage_items ti ON ti.event_id = t.event_id "
