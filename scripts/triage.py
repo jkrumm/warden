@@ -5860,19 +5860,35 @@ def _partition_findings(blocking: Any) -> tuple[list[dict[str, Any]], list[dict[
     input first, which is idempotent, so calling them on the already-normalised
     `published` list is the same partition — one definition of the split, one extra
     O(len(blocking)) filter pass over at most a handful of findings. Deriving the two
-    lists inline would be a second copy of that classifier, which is the thing to avoid."""
+    lists inline would be a second copy of that classifier, which is the thing to avoid.
+
+    Three passes over a verdict's OWN findings is the price of that single definition, and it
+    is deliberately paid (§138): the alternative considered was one partition loop, which needs
+    the §114 classifier exposed as a per-finding predicate — worth doing when the input can be
+    large, not worth a second classification rule for a list that is a handful of entries. If a
+    verdict ever carries a big `blocking` list, expose that predicate and loop once; never
+    re-implement the split here."""
     published = _published_findings(blocking)
     return published, _code_blocking_findings(published), _process_only_findings(published)
 
 
-def _review_verdict_problems(verdict: Any) -> list[str]:
+def _review_verdict_problems(verdict: Any, *, require_blocking: bool = False) -> list[str]:
     """Every reason the shared verdict-shape contract fails, NAMED.
 
     A bare "unusable" tells an operator nothing they can act on, so the rule set lives here
     and every gate is expressed in terms of it — `_is_completed_review()`,
     `_review_contract_matches()` and the park note below. One
     place defines the contract, so a rule added for the fold's benefit is automatically
-    what the fail-closed park note reports about the payload it refused."""
+    what the fail-closed park note reports about the payload it refused.
+
+    `require_blocking` separates the two readers this rule set serves, and it is the one
+    difference between them (§138). A FRESHLY RECEIVED result must carry `blocking`: the
+    producer's published schema lists it in `output.required` for every outcome — the drift
+    check reads exactly that promise — so a new result without it is a partially serialized
+    payload, not a clean review. Reading one as "clean, nothing to report" is the single
+    direction that MERGES code on data nobody could read, which is what §115 exists to stop.
+    The stored reader keeps the leniency: a clean verdict persisted before this contract may
+    simply have no list, and re-reading history merges nothing."""
     if not isinstance(verdict, dict):
         return ["result is not an object"]
     problems: list[str] = []
@@ -5880,7 +5896,7 @@ def _review_verdict_problems(verdict: Any) -> list[str]:
     if outcome not in _sideclaw.REVIEW_OUTCOMES:
         problems.append(f"unknown outcome {outcome!r}")
     blocking = verdict.get("blocking", [])
-    if "blocking" not in verdict and outcome != "clean":
+    if "blocking" not in verdict and (outcome != "clean" or require_blocking):
         problems.append(f"outcome {outcome!r} publishes no `blocking` list")
     elif not isinstance(blocking, list):
         problems.append(f"`blocking` is {type(blocking).__name__}, not a list")
@@ -5906,7 +5922,9 @@ def _review_contract_matches(verdict: Any) -> bool:
     the shared published review shape. `_is_completed_review()` uses the same rule set
     (`_review_verdict_problems()`) but accepts an older stored schema version the code can
     still parse."""
-    if _review_verdict_problems(verdict):
+    # A new result must publish `blocking` whatever its outcome (§138): see the flag's own
+    # note — this is the one reader whose verdict can send code to a merge.
+    if _review_verdict_problems(verdict, require_blocking=True):
         return False
     return _schema_version_of(verdict) == _sideclaw.REVIEW_SCHEMA_VERSION
 
@@ -6480,7 +6498,9 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # `_review_contract_matches()` IS the gate (no inline reimplementation of the
         # contract); the refusal note is built from the same rule set it decided with.
         if not _review_contract_matches(verdict):
-            problems = _review_verdict_problems(verdict)
+            # The same rule set the gate decided with, flag included: a note built from a
+            # narrower reading would say "unknown mismatch" about the payload it just refused.
+            problems = _review_verdict_problems(verdict, require_blocking=True)
             version = _schema_version_of(verdict)
             if version != _sideclaw.REVIEW_SCHEMA_VERSION:
                 problems.append(

@@ -68,7 +68,11 @@ def main(argv: list[str]) -> int:
                 details.append(
                     "no readable finding shape — warden's is_review_finding() would be an "
                     f"unverifiable copy of it ({shape['reason']})")
-            elif shape:
+            elif shape is not None and shape["published"] is True:
+                # `is True`, not a truthiness test: a TypedDict union does not narrow on
+                # `if shape:`, so the `required`/`wardenRequires` reads below would be unproven
+                # on the unreadable arm — the same rule the sibling branch states, for the same
+                # reason (§136).
                 # Both shortfalls are reported together: they are independent sets, and printing
                 # one of them when both are non-empty sends the operator back for a second run to
                 # learn the other — the diagnostic is the only thing this check produces.

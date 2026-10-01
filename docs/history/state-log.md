@@ -10045,6 +10045,44 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-second round.** `needs-human`: one blocker, two improvements, one discussion. Architect,
+senior-dev and resilience all approved clean.
+
+The blocker was in the merge gate, and it is the sharpest finding of the branch so far. The rule
+set required `blocking` only for a NON-clean outcome, so a freshly received
+`{"schemaVersion": 1, "outcome": "clean"}` with no `blocking` field at all passed
+`_review_contract_matches()` — and the gate then read it as "clean, nothing to report". The
+prover here is not an argument: reverting the fix makes the new test fail with `merge` actually
+called, i.e. code shipped on a partially serialized payload. The producer's published schema
+requires `blocking` for every outcome, which is the promise §137 added the drift check for, so a
+new result without one is a partial payload. `_review_verdict_problems()` now takes
+`require_blocking`, set by the fresh-result gate and by the park note that reports its refusal
+(built from the same rule set, or it would say "unknown mismatch" about the payload it refused),
+while `_is_completed_review()` keeps the leniency for a stored clean verdict that has no list at
+all: re-reading history merges nothing, and strictness there would only invalidate old rows. The
+existing test that asserted the old behaviour — a version-only check whose fixture happened to
+carry no `blocking` — now carries the list, with the reason written next to it.
+
+The first improvement was a real scoping slip in the diagnostic: the mismatch branch narrowed the
+`FindingShapeReport` union on a truthiness test, which does not narrow a TypedDict union, so the
+`required`/`wardenRequires` reads below were unproven on the unreadable arm — the same rule the
+sibling branch already states. It reads `shape is not None and shape["published"] is True` now.
+
+The second improvement asked to collapse `_partition_findings()`'s three passes into one loop.
+Declined with the reason recorded in the function itself (§138): the two extra passes are over a
+verdict's OWN findings, a handful of entries, and a single loop needs the §114 classifier exposed
+as a per-finding predicate — the honest version of that change, named in the docstring as the thing
+to do if a verdict ever carries a big `blocking` list, rather than a second copy of the split.
+
+The discussion (the non-sargable `datetime(created_at)` window term) is the same already-tracked
+issue as last round: STATE.md issue #9, expression index, `SELF_AUDIT_SLOW_MS` tripwire.
+
+**Verified.** `tests/test_triage.py` 402 → **403/403** (+1 at the gate, with the note and the
+persisted `validation_status` both checked), `tests/test_clients.py` **123/123**, every suite
+green; live-ledger replay unchanged at 39 judged items; drift check green against the running
+sideclaw; the merge-gate fix proven fail-capable by reverting it — the new test then fails because
+`merge` is invoked.
+
 **Forty-first round.** `needs-human`: one blocker, one extract-method improvement, two
 discussions. senior-dev, resilience and OCR all approved clean.
 

@@ -870,6 +870,16 @@ today are one place to change and one to forget, and forgetting the reader's cop
 comparison reporting a mismatch against a set the reader no longer uses — while the reader keeps
 accepting findings the schema calls wrong.
 
+The two readers of that contract are not the same reader (§138). A FRESHLY RECEIVED result must
+carry `blocking` whatever its outcome: the published schema lists it in `output.required` for every
+outcome, so a new result without one is a partially serialized payload, and reading it as "clean,
+nothing to report" is the single direction where an unreadable payload MERGES code — the item is
+parked with the missing list named instead. The STORED-verdict reader keeps the leniency for a
+`clean` verdict persisted with no list at all: re-reading history merges nothing, so being strict
+there would only invalidate old rows. `_review_verdict_problems(require_blocking=True)` is that
+difference, spelled at one call site, and the refusal note is built with the same flag so it cannot
+report "unknown mismatch" about a payload it just refused.
+
 The shape only matters where the producer PROMISES to publish it (§137). `blocking` must be
 listed in `output.required`, because that is the promise the runtime reads:
 `_review_verdict_problems()` refuses a non-clean verdict with no `blocking` list, and such a

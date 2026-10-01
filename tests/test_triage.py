@@ -3791,6 +3791,44 @@ def test_implement_pr_opened_with_unparseable_pr_url_is_merge_blocked():
         assert item["note"] == "could not parse the PR number", item["note"]
 
 
+def test_a_clean_review_result_with_no_blocking_list_is_parked_not_merged():
+    """§138 — the merge gate accepted `{"schemaVersion": 1, "outcome": "clean"}` with no
+    `blocking` field at all, because the rule set required the list only for a NON-clean outcome.
+    A partially serialized result therefore read as "clean, nothing to report" and the item
+    merged on it: the one direction where an unreadable payload ships code. The producer's
+    published schema requires `blocking` for every outcome, so a freshly received result without
+    one is a partial payload — parked with the reason named, never merged."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-val-partial-clean")
+        conn.execute(
+            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            (triage.STATE_VALIDATING, "implement-job-partial", "validation-job-partial",
+             "https://github.com/jkrumm/demo-repo/pull/11", eid),
+        )
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-partial")
+
+        partial = _review_result("clean")
+        del partial["blocking"]
+        triage._sideclaw.get = lambda job_id: {"status": "done", "result": partial}
+
+        def _unexpected_merge(*a, **kw):
+            raise AssertionError("a result with no `blocking` list must never reach merge")
+
+        triage._merge.plan_or_land = _unexpected_merge
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item
+        assert "blocking" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
+                         ("implement-job-partial",)).fetchone()
+        assert d["validation_status"] == "needs_human", d["validation_status"]
+        # …and the same payload READ BACK from history is still a complete review: the leniency
+        # is scoped to the stored-verdict reader, which merges nothing.
+        assert triage._is_completed_review(partial) is True
+
+
 def test_blocking_validation_blocks_the_merge():
     """A validation verdict carrying `blocking` findings blocks the merge and
     puts the findings on the card — `merge` must never even be called."""
@@ -8332,8 +8370,13 @@ def test_a_schema_version_must_be_a_real_int_for_either_gate():
     assert triage._schema_version_of({}) is None
     assert triage._schema_version_of("not a dict") is None
     assert not triage._review_contract_matches({"schemaVersion": True, "outcome": "clean"})
+    # The `blocking` list is present here because a NEW result must carry one whatever its
+    # outcome (§138) — this assertion used to read `{"schemaVersion": …, "outcome": "clean"}`
+    # with no `blocking` at all and pass, which was the merge-gate hole in miniature: a
+    # partially serialized clean result counted as a clean review.
     assert triage._review_contract_matches(
-        {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean"})
+        {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean",
+         "blocking": []})
 
 
 def test_a_naive_audit_window_is_read_as_utc_not_host_local():
