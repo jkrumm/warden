@@ -9499,8 +9499,11 @@ verdict, malformed finding entries, clean without `blocking`, explicit-null `blo
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
 driven through `poll_validation_jobs()`, manual null-origin implements, mixed int/string item keys
 in one unusable report, an earlier unusable row superseded by a later clean one, and valid
-non-object input. The live-ledger 14-day review firing set remains `research-gateway`
-6/6; no in-window stored verdict is unusable.
+non-object input. Against a `VACUUM INTO` copy of the live ledger (53 in-window
+implement→terminal-review rows, **0** null verdicts, **0** null `origin_event_id`): **39** judged
+items, **no** unusable verdict — the fifth finding emits nothing on real data — and the
+`review-always-blocks` firing set is `research-gateway` 6/6, the honest reading of a repo whose
+step-7 review has blocked every reviewed PR in the window.
 
 **Landing.** §116 and §117 both ride PR #7 (branch
 `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is
