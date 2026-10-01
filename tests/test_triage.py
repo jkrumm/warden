@@ -8418,18 +8418,22 @@ def test_a_review_row_with_an_unparseable_timestamp_is_never_the_latest():
                 "outcome": "actionable", "blocking": [_CODE_FINDING]}
     clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
              "outcome": "clean", "blocking": []}
-    # (a) an unparseable row ALONGSIDE a newer readable one: the item is unusable, not
-    # clean, even though the readable row sorts later.
+    # (a) an unparseable row ALONGSIDE a newer readable one: the item is unusable and
+    # unjudged, never clean, even though the readable row sorts later.
     rows = [_review_row(1, "impl-1", clean, created_at="not a timestamp", row_id=99),
             _review_row(1, "impl-1", clean, created_at="2026-10-01T06:00:00+00:00", row_id=1)]
     status = triage._fold_review_status(rows)["demo-repo"][1]
-    assert status.unusable is True and status.code_blocked is False
+    assert status.unusable is True and status.code_blocked is None
     # (b) an unparseable row that is itself a blocked review: still unusable — the audit
     # claims "cannot tell", not "not blocking".
     rows = [_review_row(1, "impl-1", blocking, created_at="garbage", row_id=99),
             _review_row(1, "impl-1", clean, created_at="2026-10-01T06:00:00+00:00", row_id=1)]
     status = triage._fold_review_status(rows)["demo-repo"][1]
     assert status.unusable is True
+    # (b2) and it is NOT judged: a stale `code_blocked=False` here would enter
+    # `_always_blocks_findings()`'s denominator and, being false, suppress that finding for
+    # the whole repo (§120). An item nobody can place carries no verdict at all.
+    assert status.code_blocked is None
     # (c) ordering among placeable rows is unaffected: latest readable wins.
     rows = [_review_row(1, "impl-1", blocking, created_at="2026-10-01T06:00:00+00:00", row_id=1),
             _review_row(1, "impl-1", clean, created_at="2026-10-01T07:00:00+00:00", row_id=2)]
@@ -8437,6 +8441,26 @@ def test_a_review_row_with_an_unparseable_timestamp_is_never_the_latest():
     assert status.unusable is False and status.code_blocked is False
     assert triage._review_order_key(_review_row(1, "impl-1", clean, created_at="garbage"))[0] == \
         dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def test_an_unplaceable_item_cannot_suppress_the_always_blocks_finding():
+    """§120: the fail-open in full — three genuinely blocking items plus ONE quietly
+    unplaceable one must still report `review-always-blocks`. Before the fix the stale
+    `code_blocked=False` put that item in the denominator and silenced the whole finding."""
+    def _blocking_row(event_id):
+        return _review_row(event_id, f"impl-{event_id}", {
+            "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+            "outcome": "actionable", "blocking": [_CODE_FINDING]}, row_id=event_id)
+    rows = [_blocking_row(i) for i in (1, 2, 3)]
+    rows.append(_review_row(4, "impl-4", {
+        "schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
+        "outcome": "clean", "blocking": []}, created_at="not a timestamp", row_id=4))
+    status = triage._fold_review_status(rows)
+    keys = [f["key"] for f in triage._always_blocks_findings(status)]
+    assert keys == ["review-always-blocks-demo-repo"], keys
+    # The unplaceable item is reported by the other section instead — visible, not silent.
+    unusable = triage._unusable_verdict_findings(status)
+    assert unusable and unusable[0]["key"] == "review-verdicts-unusable-demo-repo"
 
 
 def test_the_verdict_refusal_names_what_is_wrong():

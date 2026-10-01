@@ -6061,15 +6061,18 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
         code_blocked = (bool(_code_blocking_findings(verdict.get("blocking"))) if readable
                         else previous.code_blocked if previous is not None else None)
         # A row whose timestamp will not parse cannot be PLACED against the others, so
-        # "latest wins" cannot be decided for its item: reporting the older readable row's
-        # state as current would assert an order nobody knows, and a corrupt newer review
-        # would be erased by an older clean one — fail-open in the audit of a fail-closed
-        # gate. The item is unusable instead, which is visible and routes to a human.
+        # "latest wins" cannot be decided for its item: an older readable review reported as
+        # current would assert an order nobody knows, and a corrupt newer review would be
+        # erased by it — fail-open in the audit of a fail-closed gate. `code_blocked` becomes
+        # None as well as `unusable=True`: retaining a stale value would put the item into
+        # `_always_blocks_findings()`'s denominator and, when it is False, suppress that
+        # finding for the whole repo. An item we cannot place is not judged at all.
         if _parse_ts(r["created_at"]) is None:
             unplaceable.add((r["repo"], item_key))
-        unusable = (not readable) or (r["repo"], item_key) in unplaceable
+        unplaceable_item = (r["repo"], item_key) in unplaceable
         status_by_repo.setdefault(r["repo"], {})[item_key] = _ReviewedItem(
-            code_blocked=code_blocked, unusable=unusable)
+            code_blocked=None if unplaceable_item else code_blocked,
+            unusable=unplaceable_item or not readable)
     return status_by_repo
 
 
@@ -6245,20 +6248,21 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _park_item(conn, item, now, policy, state=STATE_NEEDS_HUMAN, note=str(e),
                        validation_status="needs_human")
             continue
-        # One rule set (`_review_verdict_problems()`) with the version policy applied here,
-        # exactly as `_review_contract_matches()` does — the gate is not weakened, the
-        # refusal just says why.
-        version = _schema_version_of(verdict)
-        problems = _review_verdict_problems(verdict)
-        if version != _sideclaw.REVIEW_SCHEMA_VERSION:
-            problems.append(f"schemaVersion {version!r} is not {_sideclaw.REVIEW_SCHEMA_VERSION}")
-        if problems:
+        # `_review_contract_matches()` IS the gate (no inline reimplementation of the
+        # contract); the refusal note is built from the same rule set it decided with.
+        if not _review_contract_matches(verdict):
+            problems = _review_verdict_problems(verdict)
+            version = _schema_version_of(verdict)
+            if version != _sideclaw.REVIEW_SCHEMA_VERSION:
+                problems.append(
+                    f"schemaVersion {version!r} is not {_sideclaw.REVIEW_SCHEMA_VERSION}")
+            detail = "; ".join(problems) or "unknown mismatch"
             _park_item(conn, item, now, policy, state=STATE_NEEDS_HUMAN,
                        validation_status="needs_human", note=(
                            "step-7 validation (unreadable verdict): the review's result does not "
                            "match sideclaw's published schema, outcome or finding shape, so its "
                            "findings cannot be read — failing closed rather than treating it as "
-                           f"'no findings'. Got: {'; '.join(problems)[:400]}"))
+                           f"'no findings'. Got: {detail}")[:600])
             continue
 
         outcome = verdict.get("outcome")

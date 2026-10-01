@@ -9700,7 +9700,20 @@ built from it (the version policy stays at the call site, so the gate is not wea
 `_fetch_terminal_reviews()` index question is answered as *measure first*: the cursor summary
 carries `self_audit_ms`.
 
-**Verified.** `tests/test_triage.py` at **383/383** (354 before, +29); all 21 test files green.
+**Twenty-fourth round.** One blocker — the second half of round 23's fix, which I stopped one step
+short of. Marking an unplaceable item `unusable` was not enough: it still carried the older readable
+row's `code_blocked=False`, and `_always_blocks_findings()` counts every non-`None` value into its
+`n >= 3` denominator. One quietly unplaceable clean-looking item could therefore falsify `all(...)`
+and silence `review-always-blocks` for its whole repo — the same fail-open, one layer down. An item
+whose ordering is unknowable is now **not judged at all**: `code_blocked=None`, which is the value
+that already means "do not dilute the bar". The test builds the full scenario (three blocking items
+plus one unplaceable) and asserts the `review-always-blocks` finding still appears while
+`review-verdicts-unusable` reports the bad row. Also folded in round 23's leftover: the stall comment
+at the fail-closed gate claimed `_review_contract_matches()` guarded below while the code had been
+inlined — the named contract function is the gate again, and the refusal note is built from the same
+rule set inside that branch.
+
+**Verified.** `tests/test_triage.py` at **384/384** (354 before, +30); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
 and negative schema versions, non-list/non-dict `blocking` entries, a scalar `blocking` payload
