@@ -10,7 +10,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master` (00dc001), six LaunchAgents on the mini. **§116 and §117 are NOT on `master` — both ride PR #7**, branch `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`, waiting on the owner's Argo Merge click (`warden` is merge-approval gated, no `autoMergePaths`). The live loop therefore still runs the pre-§116 self-audit |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 403/403 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 404/404 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -367,7 +367,13 @@ loop.
   shapes measured on the live copy: 0.085 ms each way at 379 `dispatches` rows. The
   window's own term became `datetime(d.created_at) >= datetime(?)` in §139's round
   (the representation must not decide admission), so the index below covers BOTH
-  terms of this predicate now.
+  terms of this predicate now. Growth measured rather than assumed so the timing
+  decision on #9 has a number: `dispatches` gains **6.3 rows/day** over the live
+  copy's 59.7-day window (379 rows) → ~2,300 rows/year, and the scan is linear at
+  **0.052 ms per call today → ~0.32 ms after a year → ~1 ms after three**, against a
+  tripwire over the whole tick. This is a years-not-weeks problem; the reviewer who
+  raised it again in §139's round called it "worth a deliberate decision on timing,
+  not a drive-by edit", and that is exactly where it stays.
   That is the trade this branch chose knowingly — fail-visible beats an index —
   and issue #9 is the expression index that would end it. `self_audit_ms` in the
   cursor summary is the tick's own work (invariants + the five sections, the part

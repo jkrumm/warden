@@ -10045,6 +10045,33 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-fourth round.** `needs-human`: no blockers, three improvements, one discussion — the first
+round on this branch with nothing blocking, from all three reviewer angles.
+
+The two doc-sync improvements were the gate count: `AGENTS.md` and `STATE.md` still said 403/403
+while the suite was at 404/404 after the previous round's test. Both files are the ones that carry
+the count as a claimed fact, and `AGENTS.md` states its own rule — a mismatched number is a finding
+to report, not a count to edit — so the finding is this round's and the fix is the sync, in the same
+pass as the test that moved it.
+
+The third was a dead store: `entry["ok"] = ok = False` in the schema client rebound a local nothing
+reads afterwards, in both branches, implying a read that does not exist. The cleanup is one line per
+branch — and it caught me: the first edit collapsed the unreadable branch too far and dropped its
+`entry["findingShape"]` assignment, which the clients suite refused before any commit. The test that
+caught it (`KeyError: 'findingShape'`) is one of the round-36 additions.
+
+The discussion re-raised the non-sargable window predicate §139's previous round introduced, as a
+deliberate timing decision rather than an edit — it is issue #9, and the reviewer's framing matches
+where it stays: an expression index against the live ledger's schema is the owner's call. What this
+round added is the number that decision needs: `dispatches` grows **6.3 rows/day** (379 rows over
+59.7 days on the live copy), so the scan is linear at ~2,300 rows/year — **0.052 ms per call today,
+~0.32 ms after a year, ~1 ms after three**, under a tripwire over the whole tick. Years, not weeks.
+
+**Verified.** `tests/test_triage.py` **404/404**, `tests/test_clients.py` **123/123**, every suite
+green; live-ledger replay unchanged at 39 judged items; drift check green against the running
+sideclaw. No behaviour changed in this round, so there is nothing to prove fail-capable: the two
+counts and the dead store are the whole diff.
+
 **Forty-third round.** `needs-human`: one blocker, two improvements, one discussion. Architect,
 senior-dev and resilience all approved clean.
 

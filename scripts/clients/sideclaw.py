@@ -376,7 +376,10 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
                 unreadable: FindingShapeUnreadable = {
                     "published": False, "reason": result.reason}
                 entry["findingShape"] = unreadable
-                entry["ok"] = ok = False
+                # `entry["ok"]` is the value the caller reads; the local `ok` was only ever
+                # a dead store here (nothing reads it after this line — the dict was built
+                # with it above).
+                entry["ok"] = False
             else:
                 shape = result
                 missing_required = sorted(REVIEW_FINDING_REQUIRED - shape.required)
@@ -402,7 +405,7 @@ def check_schema_versions() -> dict[str, dict[str, Any]]:
                 }
                 entry["findingShape"] = report
                 if missing_required or missing_properties or mistyped:
-                    entry["ok"] = ok = False
+                    entry["ok"] = False
         out[tool] = entry
     return out
 
