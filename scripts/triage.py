@@ -5989,14 +5989,21 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
         f"r.status AS review_status, r.created_at AS created_at, r.id AS id "
         f"FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
         f"WHERE d.tier='implement' AND r.tier='review' AND r.repo = d.repo "
-        f"AND d.created_at >= ? "
+        f"AND (d.created_at >= ? OR datetime(d.created_at) IS NULL) "
         f"AND r.status IN ({placeholders}) "
     )
     rows = conn.execute(sql, (naive_utc, *_sideclaw.TERMINAL_STATUSES)).fetchall()
+    # A row whose timestamp SQLite cannot read is admitted explicitly by the pre-filter
+    # above: no comparison on a corrupt value can be a superset of anything, so without
+    # that term the fail-visible rule below could never see one (§123). The price is that
+    # `OR datetime(...) IS NULL` puts SQLite on a scan of `dispatches` instead of
+    # `idx_dispatches_created` — measured at this size (379 rows, live ledger) both shapes
+    # run in 0.085 ms, so the trade is safety for nothing measurable; the revisit is an
+    # expression index on `datetime(created_at)`, not a weaker predicate (STATE.md).
     # The exact comparison: parsed instants, microsecond precision, and a row whose
     # timestamp will not parse is KEPT — a corrupt row must make the audit look at
-    # something, not leave it out. The pre-filter above cannot be the decision for either
-    # reason (text comparison, and `>=` on a widened bound admits rows this drops).
+    # something, not leave it out. The pre-filter cannot be the decision for either reason
+    # (text comparison, and `>=` on a widened bound admits rows this drops).
     # The window is the IMPLEMENT job's time, as it always was; `created_at` on the row is
     # the review's, which is what the fold orders items' reviews by.
     return [r for r in rows
@@ -6004,7 +6011,14 @@ def _fetch_terminal_reviews(conn: sqlite3.Connection, since: str) -> list[sqlite
 
 
 class _ReviewRow(Protocol):
-    """The bracket-access shape shared by sqlite3.Row and the fold's plain-dict tests."""
+    """The bracket-access shape shared by sqlite3.Row and the fold's plain-dict tests.
+
+    The columns the fold reads, one of which is only reachable through the query:
+    `repo`, `event_id`, `implement_job_id`, `verdict_json`, `review_status`,
+    `created_at` (the REVIEW's own time — the fold's order key) and
+    `implement_created_at` (the implement job's — the window key, which decides whether
+    the row could be placed in the window at all). A test double that omits the last one
+    is not a row this fold accepts."""
     def __getitem__(self, key: str) -> Any: ...
 
 
@@ -6092,7 +6106,10 @@ def _fold_review_status(rows: Iterable[_ReviewRow]) -> dict[str, dict[ItemKey, _
         # None as well as `unusable=True`: retaining a stale value would put the item into
         # `_always_blocks_findings()`'s denominator and, when it is False, suppress that
         # finding for the whole repo. An item we cannot place is not judged at all.
-        if _review_instant(r) is None:
+        # Both timestamps count: the implement row's is the WINDOW key (an unreadable one
+        # means we cannot even say the item belongs in this window — §123 admits those rows
+        # for exactly this reason), the review's is the ORDER key.
+        if _review_instant(r) is None or _parse_ts(r["implement_created_at"]) is None:
             unplaceable.add((r["repo"], item_key))
         unplaceable_item = (r["repo"], item_key) in unplaceable
         status_by_repo.setdefault(r["repo"], {})[item_key] = _ReviewedItem(
@@ -6933,13 +6950,15 @@ def _audit_section(name: str, section: Callable[[], list[dict[str, Any]]]) -> li
 
 def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
                         policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Gaps the loop can see in its own behaviour, each keyed so one finding
-    is one event: a review gate that blocks every PR in a repo, a liveness
-    probe that never confirms, a `fixed` that reopened (the verdict or the
-    fix was wrong), and a revision budget used up.
+    """Gaps the loop can see in its own behaviour, each keyed so one finding is one
+    event. Five kinds, one per section: `review-always-blocks-<repo>` (a review gate
+    that blocks every PR in a repo), `review-verdicts-unusable-<repo>` (a terminal review
+    row whose result cannot be read, or whose position among its item's rows cannot be
+    placed), `liveness-never-confirms-<repo>`, `fixed-reopened-<event>` (the verdict or
+    the fix was wrong), and `revisions-exhausted-<event>` (a revision budget used up).
 
-    Each section is isolated, so a section that raises reports itself instead of
-    taking the other four down with it."""
+    Each section is isolated, so a section that raises reports `self-audit-section-failed-
+    <name>` instead of taking the other four down with it."""
     since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
     out: list[dict[str, Any]] = []
     for name, section in (

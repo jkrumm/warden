@@ -10,7 +10,7 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 | Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
 | Repo state | `master` (00dc001), six LaunchAgents on the mini. **§116 and §117 are NOT on `master` — both ride PR #7**, branch `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`, waiting on the owner's Argo Merge click (`warden` is merge-approval gated, no `autoMergePaths`). The live loop therefore still runs the pre-§116 self-audit |
 | Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 388/388 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Tests | `tests/test_triage.py` 389/389 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -324,6 +324,13 @@ loop.
   amplification. `self_audit_ms` in the cursor summary covers the whole tick —
   invariants, the five sections and the event sync — so the number that would
   justify more work is the tick's real cost.
+- The window's corrupt-timestamp term (`OR datetime(d.created_at) IS NULL`, §123)
+  is the one predicate that puts that query back on a scan: no comparison on a
+  value SQLite cannot read can be a superset of it, so a corrupt row could only
+  otherwise be *silently dropped*. Measured on the live ledger both shapes run in
+  0.085 ms at 379 rows, so the term stays. **The revisit is an expression index —
+  `CREATE INDEX … ON dispatches(datetime(created_at))` — not a weaker predicate**;
+  that makes the `datetime()` form index-usable and lets both terms go.
 - `warden.py` still carries its own `_secrets_run_path` copy (left out of the
   §66 consolidation because the `close` verb landed in the same file at the
   same time).

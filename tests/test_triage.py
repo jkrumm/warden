@@ -8358,10 +8358,15 @@ def test_a_naive_audit_window_is_read_as_utc_not_host_local():
 
 
 def _review_row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00+00:00",
-                row_id=0):
+                row_id=0, implement_created_at=None):
+    """One `_fetch_terminal_reviews()` row. Both timestamps are present as the query
+    returns them: `created_at` is the review's (the fold's order key) and
+    `implement_created_at` the implement job's (the window key)."""
     return {"repo": "demo-repo", "event_id": event_id, "implement_job_id": job,
             "verdict_json": None if verdict is None else json.dumps(verdict),
-            "review_status": status, "created_at": created_at, "id": row_id}
+            "review_status": status, "created_at": created_at, "id": row_id,
+            "implement_created_at": implement_created_at if implement_created_at is not None
+            else created_at}
 
 
 def test_the_latest_review_is_chosen_by_instant_not_by_timestamp_text():
@@ -8534,6 +8539,30 @@ def test_the_window_prefilter_is_an_index_friendly_superset():
         conn.commit()
         rows = triage._fetch_terminal_reviews(conn, (NOW - dt.timedelta(hours=24)).isoformat())
         assert [r["implement_job_id"] for r in rows] == ["impl-pf-inside"]
+
+
+def test_a_corrupt_implement_timestamp_is_admitted_and_never_judged():
+    """§123: no comparison on a corrupt value can be a superset, so the SQL pre-filter
+    admits unreadable timestamps explicitly. The row then reaches the fold, marks its item
+    unusable and unjudged — the alternative was a corrupt row that evaded both
+    review-health findings by sorting below a text cutoff."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocked_item(conn, external_id="corrupt-window")
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-corrupt-window", "impl-corrupt-window"))
+        conn.execute("UPDATE dispatches SET created_at='2020-corrupt' WHERE job_id=?",
+                     ("impl-corrupt-window",))
+        conn.commit()
+        # A window far in the FUTURE still returns it: the row's position is unknown, which
+        # is exactly why it cannot be filtered by comparison.
+        rows = triage._fetch_terminal_reviews(conn, (NOW + dt.timedelta(days=365)).isoformat())
+        assert [r["implement_job_id"] for r in rows] == ["impl-corrupt-window"], [
+            dict(r) for r in rows]
+        status = triage._fold_review_status(rows)
+        item = status["demo-repo"][list(status["demo-repo"])[0]]
+        assert item.unusable is True and item.code_blocked is None
+        keys = [f["key"] for f in triage._unusable_verdict_findings(status)]
+        assert keys == ["review-verdicts-unusable-demo-repo"], keys
 
 
 def test_the_review_instant_has_one_definition():
@@ -9729,7 +9758,8 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
     def row(event_id, job, verdict, status="done", created_at="2026-10-01T06:00:00"):
         return {"repo": "demo-repo", "event_id": event_id, "implement_job_id": job,
                 "verdict_json": None if verdict is None else json.dumps(verdict),
-                "review_status": status, "created_at": created_at, "id": next(seq)}
+                "review_status": status, "created_at": created_at, "id": next(seq),
+                "implement_created_at": created_at}
 
     rows = [
         row(1, "impl-1a", complete_blocking),   # blocked, then accepted: not blocked

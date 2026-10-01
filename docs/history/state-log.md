@@ -9762,7 +9762,22 @@ schema constants and its `assert_*` siblings, verified against the producer's ow
 is deliberately stricter on blank strings because a finding warden cannot name is one it cannot
 report); and the fold's nested ternary into `_carry_forward_code_blocked()`.
 
-**Verified.** `tests/test_triage.py` at **388/388** (354 before, +34); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
+**Twenty-eighth round.** One blocker, and it was a hole my own index fix from round 27 opened: the
+sargable pre-filter dropped the `IS NULL` branch, so an implement row with a corrupt timestamp
+sorted below the text cutoff and never reached the fail-visible rule at all — the safety claim of
+round 25 silently bypassed by the performance fix of round 27. No comparison on a value SQLite
+cannot read can be a superset of it, so the term has to be explicit: `OR datetime(d.created_at) IS
+NULL`. Its cost is that this query scans `dispatches` again — measured on the live ledger, both
+shapes run in **0.085 ms** at 379 rows, so the term costs nothing measurable today and the revisit
+is an expression index (`CREATE INDEX … ON dispatches(datetime(created_at))`), not a weaker
+predicate; recorded in STATE.md with that trigger. The fold now applies the same rule to both
+timestamps: an unreadable implement timestamp is the WINDOW key, so such an item cannot be said to
+belong in this window at all → unusable and unjudged, reported by
+`review-verdicts-unusable-<repo>` instead of evading both findings. The `_ReviewRow` protocol now
+names the columns the fold reads — a test double missing `implement_created_at` is not a row this
+fold accepts, which is how four tests failed loudly rather than silently.
+
+**Verified.** `tests/test_triage.py` at **389/389** (354 before, +35); all 21 test files green. Live-ledger replay unchanged at 39 judged items.
 `scripts/dispatch-sweep.py` re-imported from source to prove the aliased constant still resolves.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
