@@ -5829,7 +5829,7 @@ def _code_blocking_findings(blocking: Any) -> list[dict[str, Any]]:
     return [f for f in blocking if isinstance(f, dict) and not _is_process_only_finding(f)]
 
 
-def _is_completed_review(verdict: dict[str, Any]) -> bool:
+def _is_completed_review(verdict: Any) -> bool:
     """True when a STORED review verdict is a complete one: sideclaw's published
     schema version, an `outcome` inside its published `REVIEW_OUTCOMES`, and a
     `blocking` list of finding objects with the published required fields.
@@ -5844,10 +5844,11 @@ def _is_completed_review(verdict: dict[str, Any]) -> bool:
     if not isinstance(verdict, dict):
         return False
     blocking = verdict.get("blocking")
-    if blocking is None and verdict.get("outcome") == "clean":
+    if "blocking" not in verdict and verdict.get("outcome") == "clean":
         blocking = []
     schema_version = verdict.get("schemaVersion")
     schema_matches = (isinstance(schema_version, int)
+                      and not isinstance(schema_version, bool)
                       and schema_version <= _sideclaw.REVIEW_SCHEMA_VERSION)
     outcome_is_known = verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
     findings_are_complete = (
@@ -5891,13 +5892,14 @@ def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[s
             _code_blocking_findings(blocking))
     findings: list[dict[str, Any]] = []
     for repo, event_ids in sorted(unusable.items()):
-        sample = ", ".join(str(event_id) for event_id in event_ids[:8])
-        remainder = len(event_ids) - min(len(event_ids), 8)
+        distinct_ids = sorted(set(event_ids))
+        sample = ", ".join(str(event_id) for event_id in distinct_ids[:8])
+        remainder = len(distinct_ids) - min(len(distinct_ids), 8)
         suffix = f" (+{remainder} more)" if remainder else ""
         findings.append({
             "key": f"review-verdicts-unusable-{repo}",
-            "title": f"{len(event_ids)} step-7 review verdict(s) in {repo} are unusable in "
-                     f"the last {SELF_AUDIT_WINDOW_DAYS} days",
+            "title": f"{len(distinct_ids)} item(s) in {repo} have unusable step-7 review verdicts "
+                     f"in the last {SELF_AUDIT_WINDOW_DAYS} days",
             "detail": f"stored verdicts do not match sideclaw's published schema, outcome, or finding "
                       f"shape; event IDs: {sample}{suffix}. The self-audit cannot safely read them as passes",
         })

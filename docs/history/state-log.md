@@ -9441,11 +9441,11 @@ finding's fix, and "an item nobody has judged is not counted" is now pinned by i
 
 **Third round.** The review on the second revision (`4f48fc15`) blocked it once more: a
 parseable but partial payload (`{"outcome": "actionable"}`) lacked the `blocking` key and
-was being read as clean. `_is_completed_review()` now requires a known stored schema version, a known outcome, and the
-expected blocking shape. A version at or below the current pin remains parseable for stored
-history; a non-integer or future version is reported unusable. Clean outcomes may omit
-`blocking`, since the live fold treats it as empty; a non-clean outcome cannot silently clear an
-earlier block.
+was being read as clean. `_is_completed_review()` now requires a known stored schema version,
+a known outcome, and the expected blocking shape. A version at or below the current pin remains
+parseable for stored history; a non-integer or future version is reported unusable. Clean
+outcomes may omit `blocking`, since the live fold treats it as empty; a non-clean outcome cannot
+silently clear an earlier block.
 Valid non-object JSON is rejected without raising, and `_code_blocking_findings()` ignores
 non-list containers and non-object members so malformed stored values cannot crash revision
 brief construction. The review-health helper is extracted and reports unusable rows with a
@@ -9474,10 +9474,11 @@ its length. A later review found the partial-verdict test asserted the wrong res
 asserts both `review-always-blocks` and `review-verdicts-unusable` findings. The shared test
 fixture also uses `_NO_VERDICT` to faithfully seed a terminal row with no stored payload.
 
-**Verified.** `tests/test_triage.py` at **360/360** (354 before, +6); all 21 test files green.
+**Verified.** `tests/test_triage.py` at **361/361** (354 before, +7); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
-verdict, malformed finding entries, clean without `blocking`, and non-object input. The live-ledger
-14-day firing set remains `research-gateway` 6/6; no in-window stored verdict is unusable.
+verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean
+schema version, and valid non-object input. The live-ledger 14-day review firing set remains
+`research-gateway` 6/6; no in-window stored verdict is unusable.
 
 **Landing.** §116 and §117 both ride PR #7 (branch
 `dispatch/a-prior-read-only-investigation-of-this-69b1b7bb`): the control plane's own repo is

@@ -9192,6 +9192,13 @@ def test_self_audit_completed_review_shape_handles_clean_and_non_object_payloads
         assert not triage._is_completed_review(value)
 
 
+def test_self_audit_completed_review_rejects_explicit_null_blocking_and_bool_schema():
+    clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION, "outcome": "clean"}
+    assert triage._is_completed_review(clean)
+    assert not triage._is_completed_review({**clean, "blocking": None})
+    assert not triage._is_completed_review({"schemaVersion": True, "outcome": "clean"})
+
+
 def test_self_audit_does_not_let_a_partial_verdict_clear_a_blocked_item():
     """§117 — a parseable-but-INCOMPLETE stored verdict with a non-clean outcome
     and no `blocking` key must not read as a clean review or erase a prior block.
@@ -9228,7 +9235,7 @@ def test_self_audit_skips_a_completed_review_with_malformed_findings():
         assert {f["key"] for f in findings} == {
             "review-always-blocks-demo-repo", "review-verdicts-unusable-demo-repo"}
         bad = next(f for f in findings if f["key"] == "review-verdicts-unusable-demo-repo")
-        assert "3 step-7 review verdict(s)" in bad["title"]
+        assert "3 item(s)" in bad["title"]
 
 
 def test_self_audit_reports_unusable_stored_reviews_as_visible_findings():
