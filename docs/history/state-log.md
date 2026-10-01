@@ -10045,6 +10045,32 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-seventh round.** `needs-human`: no blockers, one improvement, one discussion. Architect,
+resilience, api-contract and adversary all approved clean.
+
+The discussion was a claim in the walker's own docstring, and it was wrong: it said the four published
+arrays share the one object schema it reads from `blocking`. Measured against the live
+`/api/review-schema` — the body this branch has been comparing against for fifteen rounds — the four
+are NOT alike: `improvements` and `discussions` publish the identical item object, and `testGaps`
+publishes `{"items": {"type": "string"}}`. Both of the remedies the reviewer offered were considered
+against that fact: asserting structural identity across all four would refuse the shape sideclaw
+serves today, and extending the check to the three object arrays would police a shape nothing in
+warden reads — `_review_verdict_problems()` iterates `blocking` and nothing else, which
+`test_validation_actionable_with_empty_blocking_confirms` already states as behaviour. So the
+docstring says `blocking`, and the scope is now a test in both directions: a string-array
+`improvements` is not a mismatch, the same divergence in `blocking` is.
+
+The improvement was a type that promised less than it should: `types` was `dict[str, Any]` while every
+value is a JSON-Schema `type` string or nothing. `_as_schema_type()` enforces that rather than
+asserting it — `{"type": 7}` now reads as "no readable type", hence as mistyped, instead of comparing
+a number to `"string"` by accident — and both declarations are `dict[str, str | None]`. Reverting the
+coercion fails the assertion that walks the mapping's values.
+
+**Verified.** `tests/test_clients.py` 124 → **125/125** (+1: a diverging `improvements` tolerated, the
+same divergence in `blocking` caught), `tests/test_triage.py` **405/405**, every suite green;
+live-ledger replay unchanged at 39 judged items; drift check green against the running sideclaw,
+which still reads as a valid shape with the stricter `types` mapping.
+
 **Forty-sixth round.** `needs-human`: no blockers, one improvement, no discussions. senior-dev,
 resilience, performance and OCR all approved clean — and the adversary's claimed blocker was
 rejected on the evidence rather than by argument: it held that invariant events are keyed with an

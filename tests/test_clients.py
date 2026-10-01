@@ -589,6 +589,38 @@ def test_a_producer_that_stops_requiring_a_runtime_read_name_fails_the_schema_ch
     assert set(_REVIEW_SCHEMA_OUTPUT["required"]) > set(sideclaw.REVIEW_OUTPUT_REQUIRED)
 
 
+def test_a_diverging_improvements_shape_is_not_a_mismatch():
+    """§142 — the check reads `blocking.items` because `blocking` is the ONE array warden's runtime
+    reads: `_review_verdict_problems()` iterates it and filters every entry through
+    `is_review_finding()`, while `improvements`/`discussions`/`testGaps` are never inspected (an
+    empty `blocking` alongside a populated `improvements` still confirms and merges). Their shape is
+    therefore the producer's business, and the live producer proves the point: its `testGaps` is a
+    STRING array. A check demanding identity across all four would refuse the shape sideclaw
+    actually serves — while the same divergence in `blocking` is exactly what it must catch."""
+    output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    for divergent in ("improvements", "discussions", "testGaps"):
+        output["properties"][divergent] = {"type": "array", "items": {"type": "string"}}
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is True, review
+    assert review["findingShape"]["published"] is True, review
+
+    # …and the same divergence one array over, in `blocking`, is the mismatch.
+    output["properties"]["blocking"]["items"] = {"type": "string"}
+    srv = _stub_schemas(review_output=output)
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        review = sideclaw.check_schema_versions()["review"]
+    finally:
+        srv.stop()
+    assert review["ok"] is False, review
+    assert review["findingShape"]["published"] is False, review
+
+
 def test_is_review_finding_reads_the_required_set_from_the_one_constant():
     """§136 — `is_review_finding()` restated `{"file", "message"}` inline while
     `REVIEW_FINDING_REQUIRED` declared the same set for the drift comparison: two definitions
@@ -756,6 +788,16 @@ def test_check_schema_versions_catches_a_field_that_was_retyped_but_not_renamed(
         assert review["findingShape"]["missingFromProperties"] == []
     finally:
         srv.stop()
+
+    # A `type` that is not a string at all is not a readable type either: it is reported as None
+    # (and therefore as mistyped) rather than comparing a number to "string" by accident, and the
+    # mapping is typed so it cannot claim to hold a type nobody read (§142).
+    numeric = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+    numeric["properties"]["blocking"]["items"]["properties"]["file"] = {"type": 7}
+    shape = sideclaw._published_finding_shape({"output": numeric})
+    assert isinstance(shape, sideclaw.PublishedFindingShape), shape
+    assert shape.types["file"] is None, shape.types
+    assert all(isinstance(v, str) or v is None for v in shape.types.values()), shape.types
 
     # A published property with NO readable type is a disagreement too: warden reads a string,
     # and "any type" is not a promise it can rely on.

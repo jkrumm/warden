@@ -906,6 +906,24 @@ byte-identical would leave every field name and both containers green, and have 
 review parked as unusable with nothing saying why. A conditional requirement (`if`/`then`) cannot
 be read as a plain promise and is refused rather than assumed.
 
+The check reads the array the runtime reads (§142). `_published_finding_shape()` claimed in prose
+that the four published arrays — `blocking`, `improvements`, `discussions`, `testGaps` — "share this
+one object schema", which was never checked and is not true: measured against the live
+`/api/review-schema`, `improvements` and `discussions` do publish the identical item object, but
+`testGaps` publishes `{"items": {"type": "string"}}`. Asserting identity across all four would
+refuse the shape sideclaw actually serves, and policing the three object arrays would police a shape
+nothing in warden reads: `_review_verdict_problems()` iterates `blocking` and filters it through
+`is_review_finding()`, and the other three are never inspected — `test_validation_actionable_with_
+empty_blocking_confirms` is the executable statement. So the docstring says `blocking`, and
+`test_a_diverging_improvements_shape_is_not_a_mismatch` holds the scope in place from both sides: a
+string-array `improvements` is not a mismatch, the same divergence in `blocking` is.
+
+A `types` mapping holds schema types or nothing (§142). `PublishedFindingShape.types` and
+`FindingShapeComparison.types` were `dict[str, Any]` while every value is a JSON-Schema `type` string
+or `None`; `_as_schema_type()` enforces that instead of asserting it, so `{"type": 7}` reads as
+"no readable type" (and therefore as mistyped) rather than comparing a number to `"string"` by
+accident. Reverting the coercion fails the test that walks the mapping's values.
+
 A registry and the map it dispatches to are one structure or they drift (§141). `self_audit_findings()`
 kept `SELF_AUDIT_SECTIONS` (name → the finding-key prefixes it owns) beside a local map of the same
 names to their callables, and dispatched over their INTERSECTION: a section declared in the table

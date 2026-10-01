@@ -440,7 +440,7 @@ class FindingShapeComparison(TypedDict):
     published: Literal[True]
     required: list[str]
     properties: list[str]
-    types: dict[str, Any]
+    types: dict[str, str | None]
     wardenRequires: list[str]
     missingFromRequired: list[str]
     missingFromProperties: list[str]
@@ -465,17 +465,29 @@ class UnreadableFindingShape(NamedTuple):
     reason: str
 
 
+def _as_schema_type(value: Any) -> str | None:
+    """A JSON Schema `type` as a string, or None when it is not one.
+
+    `None` is the same answer the dict already gives for an absent subschema, and the only
+    consumer compares against `"string"`, so a `type` that is a number, a list or an object
+    already reads as a disagreement (§142). Coercing it here is what lets the field be typed
+    `str | None` instead of `Any`: the mapping never claims to hold a type it did not read, and
+    `{"type": 7}` reports the field as mistyped rather than comparing 7 to "string" by accident."""
+    return value if isinstance(value, str) else None
+
+
 class PublishedFindingShape(NamedTuple):
     """What the endpoint publishes about the review finding object.
 
     `types` maps each published property to its JSON Schema `type` (None when the property
-    carries no readable subschema), because the NAME of a field is not the whole contract: a
-    producer that keeps `file` and changes it from a string to an array of strings leaves
-    every name in place while `is_review_finding()` rejects every finding it emits."""
+    carries no readable subschema, or carries one that is not a string), because the NAME of a
+    field is not the whole contract: a producer that keeps `file` and changes it from a string to
+    an array of strings leaves every name in place while `is_review_finding()` rejects every
+    finding it emits."""
 
     required: frozenset[str]
     properties: frozenset[str]
-    types: dict[str, Any]
+    types: dict[str, str | None]
 
 
 def _as_object(value: Any) -> dict[str, Any] | None:
@@ -511,11 +523,21 @@ def _published_finding_shape(
         parsed: dict[str, Any]) -> PublishedFindingShape | UnreadableFindingShape:
     """The finding object sideclaw publishes, or WHY it could not be read.
 
-    Read from `output.properties.blocking.items` — the four arrays (`blocking`,
-    `improvements`, `discussions`, `testGaps`) share this one object schema. An unreadable
-    shape is a finding in itself, not a reason to skip the check: warden's
+    Read from `output.properties.blocking.items`, because `blocking` is the one array warden's
+    runtime READS: `_review_verdict_problems()` iterates it and filters every entry through
+    `is_review_finding()`, while `improvements`/`discussions`/`testGaps` are never inspected
+    (`test_validation_actionable_with_empty_blocking_confirms` is the executable statement of
+    that: they may be empty, or anything else, and the item still confirms and merges). An
+    unreadable shape is a finding in itself, not a reason to skip the check: warden's
     `is_review_finding()` would then be an unverifiable copy, which is the drift this
     comparison exists to catch.
+
+    This used to claim the four arrays "share this one object schema", which was never checked
+    and is not true of the live producer (§142): `improvements` and `discussions` do publish the
+    identical item object, but `testGaps` publishes `{"items": {"type": "string"}}` — strings,
+    not findings. Asserting structural identity across all four would therefore refuse the shape
+    sideclaw actually serves, and checking the three object arrays would police a shape nothing
+    in warden reads. The check is `blocking`'s item object, and the docstring now says so.
 
     The CONTAINERS are part of the contract, not only the field names inside them (§135):
     `blocking` must be exactly an array of objects, and not `["array", "null"]` either. A
@@ -589,7 +611,7 @@ def _published_finding_shape(
         return PublishedFindingShape(
             frozenset(required),
             frozenset(properties),
-            {name: (_as_object(subschema) or {}).get("type")
+            {name: _as_schema_type((_as_object(subschema) or {}).get("type"))
              for name, subschema in properties.items()},
         )
     except _UnreadableShape as exc:
