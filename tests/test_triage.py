@@ -9287,9 +9287,8 @@ def test_a_dry_run_validation_tick_is_a_no_op_even_for_an_unreadable_verdict():
 
 
 def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
-    """§117 — the fold is separated from the query precisely so this rule can be
-    stated without a database: an item's status is its LATEST complete review's, and
-    a later unreadable row is reported without moving that status either way."""
+    """The fold orders its own input, keeps one record per item, and the review
+    classifiers share exactly one payload-shape predicate."""
     complete_blocking = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
                          "outcome": "actionable", "blocking": [_CODE_FINDING]}
     complete_clean = {"schemaVersion": triage._sideclaw.REVIEW_SCHEMA_VERSION,
@@ -9301,6 +9300,9 @@ def test_the_review_health_fold_is_pure_and_its_latest_row_wins():
     for corrupt in (None, [], {**complete_clean, "blocking": None},
                     {**complete_clean, "blocking": [None]}):
         assert not triage._review_contract_matches(corrupt)
+        assert not triage._is_completed_review(corrupt)
+    assert triage._review_verdict_shape(complete_clean) == (True, [])
+    assert triage._review_verdict_shape(complete_blocking) == (True, [_CODE_FINDING])
 
     seq = itertools.count()
 

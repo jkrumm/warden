@@ -9564,6 +9564,15 @@ it, while `_is_completed_review()` deliberately remains the backwards-compatible
 persisted history (older schema through the current version). They are not duplicate gates: one
 checks the new producer envelope and one checks that a stored historical payload is still readable.
 
+**Sixteenth round.** The four reviewers independently agreed: a missing `Mapping` import is real
+(the future-annotations import masks it until `get_type_hints()` or a type checker resolves it), so
+it is added. One improvement converged on a shared `_review_verdict_shape()` predicate returning
+`(usable, blocking)`: the new-result contract requires the exact current schema version, while the
+stored-history reader accepts older parseable versions. Outcome vocabulary, required blocking
+presence, list type and finding fields now have one definition. The fold returns one structured
+per-item record, ordered its own inputs, and keeps the latest complete review's decision if a later
+terminal result is unreadable.
+
 **Verified.** `tests/test_triage.py` at **369/369** (354 before, +15); all 21 test files green.
 Tests cover blocked-then-clean, blocked-then-partial-actionable, terminal failed review with no
 verdict, malformed finding entries, clean without `blocking`, explicit-null `blocking`, boolean

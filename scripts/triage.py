@@ -283,7 +283,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable, NamedTuple, Protocol
+from typing import Any, Iterable, Mapping, NamedTuple, Protocol
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
@@ -5854,58 +5854,53 @@ def _partition_findings(blocking: Any) -> tuple[list[dict[str, Any]], list[dict[
     return published, _code_blocking_findings(published), _process_only_findings(published)
 
 
-def _review_contract_matches(verdict: Any) -> bool:
-    """The current sideclaw producer contract for a new `done` review: exact schema
-    version, known outcome, and the published complete finding shape. This is stricter
-    than `_is_completed_review()`, which is the backwards-compatible parser for stored
-    history and admits older schema versions it still knows how to read."""
+def _review_verdict_shape(verdict: Any) -> tuple[bool, list[dict[str, Any]]]:
+    """`(usable, findings)` for the shared verdict-shape contract. Parameterize
+    schema-version policy at the two call sites; everything else — known outcome,
+    missing-`blocking`-only-for-clean, list type, finding shape — has exactly one
+    definition. On failure, return an empty list because callers must never fold the
+    contents of a verdict they have already decided is unusable."""
     if not isinstance(verdict, dict):
+        return False, []
+    if verdict.get("outcome") not in _sideclaw.REVIEW_OUTCOMES:
+        return False, []
+    if "blocking" not in verdict and verdict.get("outcome") != "clean":
+        return False, []
+    blocking = verdict.get("blocking", [])
+    if not isinstance(blocking, list) or not all(_is_finding_shape(f) for f in blocking):
+        return False, []
+    return True, blocking
+
+
+def _review_contract_matches(verdict: Any) -> bool:
+    """Current sideclaw producer contract for a new result: exact schema version plus
+    the shared published review shape. `_is_completed_review()` uses the same shape
+    validator but accepts an older stored schema version the code can still parse."""
+    usable, _ = _review_verdict_shape(verdict)
+    if not usable:
         return False
     schema_version = verdict.get("schemaVersion")
-    if (not isinstance(schema_version, int) or isinstance(schema_version, bool)
-            or schema_version != _sideclaw.REVIEW_SCHEMA_VERSION):
-        return False
-    if verdict.get("outcome") not in _sideclaw.REVIEW_OUTCOMES:
-        return False
-    if "blocking" not in verdict and verdict.get("outcome") != "clean":
-        return False
-    blocking = verdict.get("blocking", [])
-    return isinstance(blocking, list) and all(_is_finding_shape(f) for f in blocking)
+    return (isinstance(schema_version, int)
+            and not isinstance(schema_version, bool)
+            and schema_version == _sideclaw.REVIEW_SCHEMA_VERSION)
 
 
 def _is_completed_review(verdict: Any) -> bool:
-    """True when a STORED review verdict is a complete one: sideclaw's published
-    schema version, an `outcome` inside its published `REVIEW_OUTCOMES`, and a
-    `blocking` list of finding objects with the published required fields.
+    """True when a STORED review verdict is a complete one: a schema version this
+    consumer can parse, and the shared published outcome and finding shape.
 
-    The self-audit reads stored payloads, so it re-checks the shape instead of
-    assuming it. A corrupt payload is `{}` after `_safe_json()`; a partial one like
-    `{"outcome": "actionable"}` has no `blocking` key at all. A list like `[null]`
-    or `[{}]` also isn't a verdict shape: the reviewer must name the file and the
-    finding's message. Each is unusable — never a pass that clears a code-blocked
-    round — which is §115's blindness in another column on the one check that
-    exists to notice a broken review gate.
-
-    The persisted-history reader remains backwards-compatible with an older schema
-    version that this code explicitly knows how to read; ingestion of a NEW result
-    uses `_review_contract_matches()` and requires today's exact producer contract."""
-    if not isinstance(verdict, dict):
+    The self-audit reads stored payloads, so it re-checks the shape instead of assuming
+    it. A corrupt payload becomes `{}` after `_safe_json()`; a partial actionable
+    result has no `blocking` key; `[null]` and `[{}]` are not findings because the
+    reviewer must name both file and message. All are unusable — never passes clearing
+    a code-blocked round — which closes §115's blindness in the audit of that gate."""
+    usable, _ = _review_verdict_shape(verdict)
+    if not usable:
         return False
-    # A `clean` outcome legitimately omits `blocking`; every other outcome must
-    # publish the list, because a missing one is indistinguishable from no findings.
-    if "blocking" not in verdict and verdict.get("outcome") != "clean":
-        return False
-    blocking = verdict.get("blocking", [])
     schema_version = verdict.get("schemaVersion")
-    schema_matches = (isinstance(schema_version, int)
-                      and not isinstance(schema_version, bool)
-                      and 0 <= schema_version <= _sideclaw.REVIEW_SCHEMA_VERSION)
-    outcome_is_known = verdict.get("outcome") in _sideclaw.REVIEW_OUTCOMES
-    findings_are_complete = (
-        isinstance(blocking, list)
-        and all(_is_finding_shape(finding) for finding in blocking)
-    )
-    return schema_matches and outcome_is_known and findings_are_complete
+    return (isinstance(schema_version, int)
+            and not isinstance(schema_version, bool)
+            and 0 <= schema_version <= _sideclaw.REVIEW_SCHEMA_VERSION)
 
 
 def _is_finding_shape(finding: Any) -> bool:
