@@ -7275,6 +7275,43 @@ def _sync_self_audit_events(conn: sqlite3.Connection, findings: list[dict[str, A
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
 
 
+def _self_audit_summary(now_iso: str, self_audit_ms: int, event_sync_ms: int,
+                        by_inv: Mapping[str, list[dict[str, Any]]], live_keys: Iterable[str],
+                        pipeline: SelfAuditFindings,
+                        invariants_failure: Exception | None) -> dict[str, Any]:
+    """The `self_audit` cursor document — the one place /health reads this tick back from.
+
+    Assembled apart from `run_self_audit()` because it is the order-independent part: it reads
+    values the tick has already measured and writes nothing, while everything left in the
+    orchestrator is sequencing that has to stay in one place (the clock, the finding list the
+    sync mutates, the cursor write). `live_keys` is passed in rather than recomputed from
+    `findings`, so "the findings this pass published" has one definition and not two that could
+    drift apart.
+
+    Both `*_error` fields are one rule: a zero or an empty list from a check that did NOT run is
+    a fabricated clean bill, so the field says "not measured, and why" instead. `violations: []`
+    beside `invariants_error`, and `unreadable_timestamps: null` beside
+    `unreadable_timestamps_error` — the count is `None` exactly when the fetch that measures it
+    raised (§134), and the reason names where the exception itself is rather than restating it
+    in wording that would drift from the finding's."""
+    summary: dict[str, Any] = {
+        "checked_at": now_iso, "self_audit_schema": SELF_AUDIT_SCHEMA,
+        "invariants": sorted(INVARIANTS),
+        "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
+        "self_audit_ms": self_audit_ms,
+        "event_sync_ms": event_sync_ms,
+        "unreadable_timestamps": pipeline.unreadable_timestamps,
+        "findings": sorted(live_keys),
+    }
+    if invariants_failure is not None:
+        summary["invariants_error"] = f"{type(invariants_failure).__name__}: {invariants_failure}"
+    if pipeline.unreadable_timestamps is None:
+        summary["unreadable_timestamps_error"] = (
+            "the review-health fetch raised, so nothing measured this count; the exception is "
+            f"reported as {SECTION_FAILURE_PREFIX}review-health")
+    return summary
+
+
 def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                    *, dry_run: bool) -> None:
     """Hourly: check INVARIANTS and self_audit_findings(), publish the result
@@ -7348,27 +7385,8 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     _sync_self_audit_events(conn, findings, live_keys, now_iso,
                             _unrechecked_prefixes(failed_sections))
     event_sync_ms = int((dt.datetime.now(dt.timezone.utc) - sync_started).total_seconds() * 1000)
-    summary = {"checked_at": now_iso, "self_audit_schema": SELF_AUDIT_SCHEMA,
-               "invariants": sorted(INVARIANTS),
-               "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
-               "self_audit_ms": self_audit_ms,
-               "event_sync_ms": event_sync_ms,
-               "unreadable_timestamps": pipeline.unreadable_timestamps,
-               "findings": sorted(live_keys)}
-    if invariants_failure is not None:
-        # An empty `violations` from a check that never ran is a fabricated zero, not a
-        # clean bill — /health's reader gets the reason instead.
-        summary["invariants_error"] = f"{type(invariants_failure).__name__}: {invariants_failure}"
-    if pipeline.unreadable_timestamps is None:
-        # Same rule for the count, and keyed on the VALUE rather than on "the section failed":
-        # the number is None exactly when the fetch that measures it raised (§134), so the error
-        # field explains this field and nothing else. A section that failed after a good fetch
-        # leaves a measured number standing — its failure is a finding, not a missing count —
-        # and the reason names where the exception itself is, instead of restating it here in
-        # wording that would drift from the finding's.
-        summary["unreadable_timestamps_error"] = (
-            "the review-health fetch raised, so nothing measured this count; the exception is "
-            f"reported as {SECTION_FAILURE_PREFIX}review-health")
+    summary = _self_audit_summary(now_iso, self_audit_ms, event_sync_ms, by_inv, live_keys,
+                                  pipeline, invariants_failure)
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",

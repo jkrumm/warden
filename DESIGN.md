@@ -870,6 +870,14 @@ today are one place to change and one to forget, and forgetting the reader's cop
 comparison reporting a mismatch against a set the reader no longer uses — while the reader keeps
 accepting findings the schema calls wrong.
 
+The shape only matters where the producer PROMISES to publish it (§137). `blocking` must be
+listed in `output.required`, because that is the promise the runtime reads:
+`_review_verdict_problems()` refuses a non-clean verdict with no `blocking` list, and such a
+verdict is unusable — so a producer that made `blocking` optional while keeping the item schema
+byte-identical would leave every field name and both containers green, and have every actionable
+review parked as unusable with nothing saying why. A conditional requirement (`if`/`then`) cannot
+be read as a plain promise and is refused rather than assumed.
+
 The CONTAINERS are part of that contract too (§135), not only the field names inside them.
 `blocking` must be exactly an array and its `items` exactly an object, because that is what the
 runtime does with them: `_review_verdict_problems()` iterates `blocking` as a list and reads

@@ -10045,6 +10045,46 @@ all suites green; live-ledger replay unchanged at 39 judged items; drift check s
 the running sideclaw. Each of the three behaviour changes was proven fail-capable by reverting it:
 the origin rule (both new tests red), the fabricated zero (red), and the type comparison before it.
 
+**Forty-first round.** `needs-human`: one blocker, one extract-method improvement, two
+discussions. senior-dev, resilience and OCR all approved clean.
+
+The blocker was the third layer of the same contract, and the adversary found it where the
+previous two rounds had not: after the field NAMES and TYPES (rounds 36/38) and the CONTAINERS
+(round 39), nothing checked that the producer still PROMISES to publish the findings at all. A
+producer that dropped `blocking` from `output.required` while keeping the item schema
+byte-identical stayed green here, and `_review_verdict_problems()` — which refuses a non-clean
+verdict with no `blocking` list — then reported every actionable review unusable, parking real
+reviews with nothing saying why. `output.required` must now list `blocking`, and a conditional
+requirement (`if`/`then`) is refused rather than assumed: a promise that is only conditional is
+not one this check can read. The live producer's own list does promise it, so this is a check and
+not a refusal of the real shape — and the test fixture, which had omitted `output.required`
+entirely, now carries the live list, which is what made the omission look harmless for three
+rounds.
+
+The improvement extracted `_self_audit_summary()` from `run_self_audit()`: the summary document is
+the order-independent half of the tick (it reads values already measured and writes nothing), while
+what stayed behind is sequencing that has to be in one place — the clock, the finding list the sync
+mutates, the cursor write. `live_keys` is passed in rather than recomputed from `findings`, so
+"the findings this pass published" keeps one definition, and the new test pins both `*_error` rules
+at that seam instead of only through a whole tick.
+
+The first discussion named three `tuple(sideclaw.TERMINAL)` call sites that had not migrated to
+`TERMINAL_STATUSES` — a drift the state-log records twice as a repeat incident. Two of the three do
+not exist: `scripts/warden.py:664/672` are membership tests (`status in sideclaw.TERMINAL`), where
+the frozenset is the right type and there is nothing to migrate. `scripts/lifecycle/dispatch.py:271`
+was real and is now the canonical tuple, which also fixes the order of the list that path renders.
+Checked rather than taken on faith, and fixed rather than deferred a third time.
+
+The second discussion (the non-sargable `datetime(created_at)` term in the review-health window
+query, with the expression index that removes it) is unchanged by this diff and already tracked in
+STATE.md's carried debt, still guarded by `SELF_AUDIT_SLOW_MS`.
+
+**Verified.** `tests/test_clients.py` 122 → **123/123** (+1: a producer that keeps the item schema
+and stops requiring `blocking` must fail the check), `tests/test_triage.py` 401 → **402/402** (+1:
+the summary's two `*_error` rules at the seam), every suite green; live-ledger replay unchanged at
+39 judged items; drift check green against the running sideclaw; the required-promise check proven
+fail-capable by reverting it.
+
 **Fortieth round.** Zero blockers, two improvements, two discussions. senior-dev, performance,
 adversary and OCR all approved clean.
 

@@ -268,7 +268,12 @@ def list_dispatches(conn: sqlite3.Connection, scope: str, now: dt.datetime) -> l
         raise UsageError(f"unknown list scope: {scope} (must be one of: open today all)")
 
     if scope == "open":
-        terminal = tuple(sideclaw.TERMINAL)
+        # The canonical order-stable tuple, not `tuple(sideclaw.TERMINAL)`: the source is a
+        # frozenset whose iteration order varies with hash randomization, and this list is
+        # rendered in usage output as well as bound into the IN-clause — one definition of
+        # "terminal, in a fixed order" (§137; the state-log twice records this same drift
+        # reappearing in a new caller).
+        terminal = sideclaw.TERMINAL_STATUSES
         placeholders = ",".join("?" for _ in terminal)
         rows = conn.execute(
             f"SELECT * FROM dispatches WHERE status NOT IN ({placeholders}) OR reported_at IS NULL "

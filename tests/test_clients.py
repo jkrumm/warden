@@ -403,6 +403,11 @@ def test_assert_outcome_skips_non_done_jobs():
 # warden deliberately does not (see `REVIEW_FINDING_REQUIRED`).
 _REVIEW_SCHEMA_OUTPUT = {
     "type": "object",
+    # The live producer's `output.required` (all seven names), which the fixture used to omit
+    # entirely — and the omission was the gap §137 is about: `blocking` is required there, and
+    # the runtime reads that promise.
+    "required": ["outcome", "blocking", "improvements", "discussions", "testGaps", "summary",
+                 "schemaVersion"],
     "properties": {
         "outcome": {"type": "string", "enum": list(sideclaw.REVIEW_OUTCOMES)},
         "blocking": {"type": "array", "items": {
@@ -537,6 +542,39 @@ def test_check_schema_versions_treats_an_unpublished_finding_shape_as_a_disagree
         srv.stop()
 
 
+def test_a_producer_that_stops_requiring_blocking_fails_the_schema_check():
+    """§137 — the same shape-only blind spot as the container check, one level up: keep the item
+    schema byte-identical and drop `blocking` from `output.required`. Every field name and both
+    containers stay green, `check_schema_versions()` reports success — and the runtime refuses
+    every non-clean verdict ("outcome 'actionable' publishes no `blocking` list"), so each real
+    review is parked as unusable and nothing says why."""
+    for required in ([], ["outcome", "summary", "schemaVersion"], "blocking"):
+        output = json.loads(json.dumps(_REVIEW_SCHEMA_OUTPUT))
+        output["required"] = required
+        srv = _StubServer({
+            ("GET", "/api/dispatch-schema"): (200, {
+                "ok": True, "version": sideclaw.DISPATCH_SCHEMA_VERSION,
+                "outcomes": list(sideclaw.DISPATCH_OUTCOMES),
+            }),
+            ("GET", "/api/review-schema"): (200, {
+                "ok": True, "version": sideclaw.REVIEW_SCHEMA_VERSION,
+                "outcomes": list(sideclaw.REVIEW_OUTCOMES), "output": output,
+            }),
+        })
+        os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+        try:
+            review = sideclaw.check_schema_versions()["review"]
+        finally:
+            srv.stop()
+        assert review["ok"] is False, (required, review)
+        shape = review["findingShape"]
+        assert shape["published"] is False, (required, shape)
+        assert "required" in shape["reason"], shape
+    # …and the live producer's own list, which does promise it, reads as a comparison.
+    live = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
+    assert isinstance(live, sideclaw.PublishedFindingShape), live
+
+
 def test_is_review_finding_reads_the_required_set_from_the_one_constant():
     """§136 — `is_review_finding()` restated `{"file", "message"}` inline while
     `REVIEW_FINDING_REQUIRED` declared the same set for the drift comparison: two definitions
@@ -621,18 +659,38 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     assert "`output`" in reason({"output": ["x"]})
     assert "`output`" in reason({"output": 7})
     assert "`output`" in reason({"output": None})
+    # The item shape is only worth reading if a NON-CLEAN outcome promises to publish it, so
+    # `output.required` is checked too (§137): the runtime refuses a findings-shaped verdict
+    # without `blocking`, so a producer that made it optional while keeping this exact item
+    # schema would leave every field and container green here and park every actionable review
+    # as unusable. A body that does not promise it, promises nothing, or promises it in a shape
+    # that is not a list of names — all three are refused rather than assumed, because a
+    # conditional requirement cannot be read as a plain one.
+    def unpromised(required: Any) -> Any:
+        output = {"properties": {"blocking": {
+            "type": "array", "items": {"type": "object",
+                                       "properties": {"file": {}, "message": {}}}}}}
+        if required is not None:
+            output["required"] = required
+        return {"output": output}
+
+    assert "required" in reason(unpromised(None))
+    assert "required" in reason(unpromised([]))
+    assert "required" in reason(unpromised(["outcome", "summary"]))
+    assert "required" in reason(unpromised("blocking"))
+    assert "required" in reason(unpromised(["blocking", 7]))
     assert "`output`" in reason({})
     # One level down, the same case the first guard covers: `properties` reached with `or {}`
     # raises on a truthy non-dict, and it is the level a drifted body is most likely to break.
     assert "properties" in reason({"output": {"properties": "yes"}})
-    assert "blocking" in reason({"output": {"properties": {"blocking": ["x"]}}})
+    assert "blocking" in reason({"output": {"required": ["blocking"], "properties": {"blocking": ["x"]}}})
     # `blocking` typed but its `items` unreadable: the guards reach the level below too.
     assert "items" in reason(
-        {"output": {"properties": {"blocking": {"type": "array", "items": "x"}}}})
+        {"output": {"required": ["blocking"], "properties": {"blocking": {"type": "array", "items": "x"}}}})
 
-    def body(blocking_type: Any, items_type: Any) -> Any:
+    def body(blocking_type: Any, items_type: Any, *, required: Any = ("outcome", "blocking")) -> Any:
         """A published body whose FIELD NAMES never change — only the containers around them."""
-        return {"output": {"properties": {"blocking": {
+        return {"output": {"required": list(required), "properties": {"blocking": {
             "type": blocking_type,
             "items": {"type": items_type,
                       "properties": {"file": {"type": "string"}, "message": {"type": "string"}},
@@ -657,14 +715,14 @@ def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
     # set of its own characters (silently passing a name check it should fail) and a number
     # would raise TypeError out of a function that is documented never to raise.
     for bad in ("file", 7, {"file": 1}, [7], ["file", 7]):
-        why = reason({"output": {"properties": {"blocking": {"type": "array", "items": {
+        why = reason({"output": {"required": ["blocking"], "properties": {"blocking": {"type": "array", "items": {
             "type": "object",
             "properties": {"file": {}, "message": {}}, "required": bad}}}}})
         assert "required" in why or "items" in why, (bad, why)
     # An empty `properties` carries no shape either — that is "not published", not "nothing
     # required".
     assert "publishes no fields" in reason(
-        {"output": {"properties": {"blocking": {"type": "array", "items": {
+        {"output": {"required": ["blocking"], "properties": {"blocking": {"type": "array", "items": {
             "type": "object", "properties": {}, "required": []}}}}})
     # …and the same shape read from a well-formed body still works, types included.
     shape = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})

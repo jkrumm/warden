@@ -503,6 +503,24 @@ def _published_finding_shape(
     container = _as_object(output.get("properties"))
     if not container:
         return UnreadableFindingShape("no `output.properties` object in the published schema")
+    # …and the shape only matters if a NON-CLEAN outcome promises to publish it (§137). The
+    # runtime reads that promise: `_review_verdict_problems()` reports `outcome 'actionable'
+    # publishes no `blocking` list`, and such a verdict is unusable, so a producer that made
+    # `blocking` optional in `output.required` while keeping this exact item schema would leave
+    # every field and container green here and have every actionable review parked as unusable.
+    # A conditional requirement (`if`/`then`) cannot be read as a plain promise, so it is refused
+    # rather than assumed.
+    output_required = output.get("required")
+    if not isinstance(output_required, (list, tuple)) or not all(
+            isinstance(name, str) for name in output_required):
+        return UnreadableFindingShape(
+            "`output.required` is not a list of names, so the promise that a non-clean outcome "
+            "publishes `blocking` cannot be read")
+    if "blocking" not in output_required:
+        return UnreadableFindingShape(
+            "a non-clean outcome must publish `blocking`, and `output.required` does not list "
+            "it (a conditional requirement is not readable here): the runtime refuses a "
+            "findings-shaped verdict without it, so every actionable review would be unusable")
     blocking = _as_object(container.get("blocking"))
     if not blocking:
         return UnreadableFindingShape("no `output.properties.blocking` schema object")

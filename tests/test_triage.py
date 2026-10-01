@@ -8714,6 +8714,29 @@ def test_the_fold_row_contract_carries_exactly_the_declared_keys():
         assert blanked[0]["mismatch_reason"] == "why" and blanked[0]["verdict_json"] is None
 
 
+def test_the_summary_document_names_a_check_that_did_not_run_instead_of_zeroing_it():
+    """§137 — `_self_audit_summary()` is the order-independent half of the tick (the caller keeps
+    the clock, the sync and the cursor write), and both `*_error` fields are one rule: a count or
+    an empty list from a check that did NOT run is a fabricated clean bill, so the field says
+    "not measured, and why". Pinned at that seam rather than through the tick, because it is the
+    part a caller can get wrong on its own."""
+    ok = triage._self_audit_summary(
+        "2026-10-01T00:00:00", 12, 3, {"clock": [{"id": "clock"}]}, ["a"],
+        triage.SelfAuditFindings([], 0), None)
+    assert ok["violations"] == [{"id": "clock", "count": 1}], ok
+    assert ok["unreadable_timestamps"] == 0, ok
+    assert ok["findings"] == ["a"] and ok["self_audit_ms"] == 12 and ok["event_sync_ms"] == 3
+    assert "invariants_error" not in ok and "unreadable_timestamps_error" not in ok
+
+    failed = triage._self_audit_summary(
+        "2026-10-01T00:00:00", 12, 3, {}, [], triage.SelfAuditFindings([], None),
+        RuntimeError("OperationalError: boom"))
+    assert failed["violations"] == [] and failed["findings"] == []
+    assert failed["invariants_error"].startswith("RuntimeError:"), failed
+    assert failed["unreadable_timestamps"] is None
+    assert "review-health" in failed["unreadable_timestamps_error"], failed
+
+
 def test_a_failed_review_health_fetch_reports_no_count_rather_than_a_clean_zero():
     """§133/§134 — the count comes from the FETCH, so when the fetch raises there IS no number.
     Writing `0` there would read as "no corrupt timestamps": a fabricated clean bill in the
