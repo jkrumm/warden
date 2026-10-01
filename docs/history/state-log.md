@@ -9902,3 +9902,48 @@ carrying the review's finding — was closed rather than carried: its investigat
 `implement`/high, but the auto-implement round is cut from the live checkout's `HEAD`, i.e.
 `master`, where `code_blocked` does not exist, so the correction was applied on the PR branch by
 hand instead of spending an episode on a tree that cannot show the defect.
+
+**Thirty-fifth round.** Two blockers, both fail-opens one level above the failures the
+thirty-fourth round closed, plus the two improvements they came with.
+
+The first is the sharper one, and it was in the resolve sweep rather than in a reader.
+The sweep resolves every `warden_self` event whose key is absent from this pass's findings —
+"the finding is gone, so close its event". That reading is only sound for a section that
+actually RAN this pass. Review health raises (`_audit_section()` catches it, reports
+`self-audit-section-failed-review-health`), its real findings are therefore missing, and the
+sweep took that absence as evidence: a database error cleared the live
+`review-always-blocks-*` alert it had just stopped checking, and the hour's card showed a
+clean bill with one broken check. The exemption is now owned by the same table that runs the
+sections — `SELF_AUDIT_SECTIONS` names each section with the finding-key prefixes it owns,
+the run loop iterates it (so a section cannot run without declaring them), and
+`_unrechecked_prefixes()` turns the failed names read back out of their own
+`SECTION_FAILURE_PREFIX` findings into the prefixes the sweep must leave alone. A section
+that raised keeps its alerts until a pass that re-checks them; the failure event itself
+still fires, so the hour reports a broken check rather than a quiet one. The regression test
+pins both halves: with the section raising, the alert survives and the failure event is
+live; on the next pass that runs the section, the failure event resolves and the alert (still
+holding) stays. Removing the exemption turns it red with "a section that raised cleared the
+alert it stopped checking".
+
+The second was mine, one round old: `_published_finding_shape()` guarded `parsed["output"]`
+with `or {}`, which survives `None` and `{}` but not a truthy non-dict — and the helper sits
+outside `check_schema_versions()`'s `try/except`, on the `make status` path, so a drifted
+schema would have raised `AttributeError: 'str' object has no attribute 'get'` instead of
+producing the "unreadable shape" refusal it documents. It now returns `None` for anything
+that is not an object, and the test drives `"yes"`, `["x"]`, `7`, `None` and `{}` through it:
+before the fix the first case raised, which is what the reviewer meant by "escapes a function
+that is documented never to raise".
+
+Two improvements. The event sync was extracted as `_sync_self_audit_events()` — it is a
+self-contained policy (insert, re-open, sweep) that was reached only by reading the middle
+of `run_self_audit()`, and the reviewer's point that a reviewer cannot see its boundary is
+the same point as the first blocker's: the sweep's rule was invisible precisely because it
+was three lines inside a god function. And the window's corrupt-timestamp term is no longer
+an invisible term: since a row whose `created_at` cannot be read cannot be dropped by any
+time bound without losing a recent one (§123), those rows recur every pass, so the count is
+now in the cursor summary as `unreadable_timestamps` — the cost the tripwire watches gets a
+number beside it. Documented in `docs/api.md` with the reason it cannot be bounded.
+
+**Verified.** `tests/test_triage.py` at **399/399** (396 before, +3), `tests/test_clients.py`
+at **119/119** (+1), all suites green. Live-ledger replay unchanged at 39 judged items, and
+the drift check still passes against the running sideclaw.

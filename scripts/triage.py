@@ -6313,6 +6313,19 @@ def _always_blocks_findings(status_by_repo: Mapping[str, Mapping[ItemKey, _Revie
     return findings
 
 
+def _unreadable_timestamp_count(conn: sqlite3.Connection) -> int:
+    """How many rows this pass admitted BECAUSE `created_at` cannot be read as an instant.
+
+    The window's corrupt-timestamp term cannot be time-bounded without dropping rows whose true
+    age is unknown, so these are re-admitted every pass — cost proportional to how many exist,
+    not to how old they are. That is the price of not dropping them (§123), and this number is
+    what keeps the price visible instead of silently growing: it rides in the cursor summary
+    beside the tick cost it feeds."""
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM dispatches WHERE tier='implement' "
+        "AND validation_job_id IS NOT NULL AND datetime(created_at) IS NULL").fetchone()["n"]
+
+
 def _review_health_findings(conn: sqlite3.Connection, since: str) -> list[dict[str, Any]]:
     """Both review-gate findings: a gate that blocks every reviewed item, and terminal
     reviews whose stored results cannot safely count as passes.
@@ -7070,9 +7083,45 @@ def _revisions_exhausted_findings(conn: sqlite3.Connection, policy: dict[str, An
 _T = TypeVar("_T")
 
 
+# The finding key a failed section reports, and the prefix the event sync reads back out of the
+# findings to learn WHICH sections did not run this pass (§132). One constant for both directions.
+SECTION_FAILURE_PREFIX = "self-audit-section-failed-"
+
+# What each section owns, by finding-key prefix. Named once because two readers depend on it:
+# `self_audit_findings()` runs exactly these sections, and the event sync may only resolve an
+# absent key for a section that actually COMPLETED. A section that raised has re-checked nothing,
+# so resolving its alerts would let a query failure silently clear the very alerts it stopped
+# checking — the fail-open twin of §124, one level up.
+_INVARIANT_PREFIXES = tuple(inv_id.lower() for inv_id in INVARIANTS)
+SELF_AUDIT_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("invariants", _INVARIANT_PREFIXES),
+    ("review-health", ("review-always-blocks-", "review-verdicts-unusable-")),
+    ("liveness", ("liveness-never-confirms-",)),
+    ("fixed-reopened", ("fixed-reopened-",)),
+    ("restore-drill", ("restore-drill-",)),
+    ("revisions-exhausted", ("revisions-exhausted-",)),
+)
+
+
+def _unrechecked_prefixes(failed_sections: Iterable[str]) -> tuple[str, ...]:
+    """The finding-key prefixes whose owning section did NOT run, so their events must survive.
+
+    An empty tuple is the ordinary case: every section ran, silence means "nothing to report".
+    For a failed one, silence means nothing at all, and the resolve sweep must not read it as a
+    clean bill — see `run_self_audit()`."""
+    owners = dict(SELF_AUDIT_SECTIONS)
+    return tuple(prefix for name in failed_sections for prefix in owners.get(name, ()))
+
+
+def _failed_section_names(findings: Iterable[dict[str, Any]]) -> list[str]:
+    """Which sections reported a failure in this pass, read back from their own findings."""
+    return [f["key"][len(SECTION_FAILURE_PREFIX):] for f in findings
+            if f["key"].startswith(SECTION_FAILURE_PREFIX)]
+
+
 def _section_failure_finding(name: str, e: Exception) -> dict[str, Any]:
     """The finding a failed self-audit section reports in place of its own output."""
-    return {"key": f"self-audit-section-failed-{name}",
+    return {"key": f"{SECTION_FAILURE_PREFIX}{name}",
             "title": f"the self-audit's {name} check raised {type(e).__name__}",
             "detail": f"{e} — its findings are missing from this pass, so anything it would "
                       f"have reported stays unseen until the cause is fixed"}
@@ -7123,16 +7172,57 @@ def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
     Each section is isolated, so a section that raises reports `self-audit-section-failed-
     <name>` instead of taking the other four down with it."""
     since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
+    # Keyed by the SAME names as `SELF_AUDIT_SECTIONS`, and the loop runs that table's order: a
+    # section cannot be added here without declaring the finding keys it owns, which is what the
+    # event sync needs to know whose silence may resolve an alert (§132). `invariants` is not in
+    # this map — it returns violations rather than findings, and `run_self_audit()` runs it.
+    sections: dict[str, Callable[[], list[dict[str, Any]]]] = {
+        "review-health": lambda: _review_health_findings(conn, since),
+        "liveness": lambda: _liveness_findings(conn, since),
+        "fixed-reopened": lambda: _fixed_reopened_findings(conn, since),
+        "restore-drill": lambda: _restore_drill_findings(now),
+        "revisions-exhausted": lambda: _revisions_exhausted_findings(conn, policy),
+    }
     out: list[dict[str, Any]] = []
-    for name, section in (
-        ("review-health", lambda: _review_health_findings(conn, since)),
-        ("liveness", lambda: _liveness_findings(conn, since)),
-        ("fixed-reopened", lambda: _fixed_reopened_findings(conn, since)),
-        ("restore-drill", lambda: _restore_drill_findings(now)),
-        ("revisions-exhausted", lambda: _revisions_exhausted_findings(conn, policy)),
-    ):
-        out.extend(_audit_section(name, section))
+    for name, _keys in SELF_AUDIT_SECTIONS:
+        if name in sections:
+            out.extend(_audit_section(name, sections[name]))
     return out
+
+
+def _sync_self_audit_events(conn: sqlite3.Connection, findings: list[dict[str, Any]],
+                            live_keys: set[str], now_iso: str,
+                            unrechecked: tuple[str, ...] = ()) -> None:
+    """Bring one `warden_self` event per finding in step with this pass: inserted or re-opened
+    while the finding holds, resolved the pass it stops holding.
+
+    `unrechecked` is the finding-key prefixes whose section did NOT complete this pass. Their
+    events are exempt from the resolve sweep, because an absent key is only evidence of
+    "nothing to report" when the section that owns it actually ran: a section that raised has
+    re-checked nothing, and resolving its alerts there would let a query failure silently clear
+    the very alerts it stopped checking (§132). The failure is still visible — it carries its own
+    `self-audit-section-failed-<name>` finding — so the hour reports a broken check instead of a
+    clean bill."""
+    for f in findings:
+        payload = json.dumps({"first_text": f"{f['title']} — {f['detail']}"[:1500]})
+        ev = conn.execute("SELECT id, resolved_at FROM events WHERE source=? AND external_id=?",
+                          (SELF_SOURCE, f["key"])).fetchone()
+        if ev is None:
+            conn.execute("INSERT INTO events(source, external_id, title, url, payload_json, first_seen) "
+                         "VALUES (?,?,?,?,?,?)", (SELF_SOURCE, f["key"], f["title"][:300], "", payload, now_iso))
+        elif ev["resolved_at"] is not None:
+            conn.execute("UPDATE events SET resolved_at=NULL, first_seen=?, notified_at=NULL, "
+                         "last_reminder_at=NULL, reminder_count=0, title=?, payload_json=? WHERE id=?",
+                         (now_iso, f["title"][:300], payload, ev["id"]))
+        else:
+            conn.execute("UPDATE events SET title=?, payload_json=? WHERE id=?", (f["title"][:300], payload, ev["id"]))
+    for ev in conn.execute("SELECT id, external_id FROM events WHERE source=? AND resolved_at IS NULL",
+                           (SELF_SOURCE,)).fetchall():
+        if ev["external_id"] in live_keys:
+            continue
+        if any(ev["external_id"].startswith(p) for p in unrechecked):
+            continue
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
 
 
 def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -7201,29 +7291,15 @@ def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.dat
     # block: stopping the clock between them, as an earlier round did, stored a number that
     # matched neither half (§127).
     sync_started = dt.datetime.now(dt.timezone.utc)
-    for f in findings:
-        payload = json.dumps({"first_text": f"{f['title']} — {f['detail']}"[:1500]})
-        ev = conn.execute("SELECT id, resolved_at FROM events WHERE source=? AND external_id=?",
-                          (SELF_SOURCE, f["key"])).fetchone()
-        if ev is None:
-            conn.execute("INSERT INTO events(source, external_id, title, url, payload_json, first_seen) "
-                         "VALUES (?,?,?,?,?,?)", (SELF_SOURCE, f["key"], f["title"][:300], "", payload, now_iso))
-        elif ev["resolved_at"] is not None:
-            conn.execute("UPDATE events SET resolved_at=NULL, first_seen=?, notified_at=NULL, "
-                         "last_reminder_at=NULL, reminder_count=0, title=?, payload_json=? WHERE id=?",
-                         (now_iso, f["title"][:300], payload, ev["id"]))
-        else:
-            conn.execute("UPDATE events SET title=?, payload_json=? WHERE id=?", (f["title"][:300], payload, ev["id"]))
-    for ev in conn.execute("SELECT id, external_id FROM events WHERE source=? AND resolved_at IS NULL",
-                           (SELF_SOURCE,)).fetchall():
-        if ev["external_id"] not in live_keys:
-            conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
+    _sync_self_audit_events(conn, findings, live_keys, now_iso,
+                            _unrechecked_prefixes(_failed_section_names(findings)))
     event_sync_ms = int((dt.datetime.now(dt.timezone.utc) - sync_started).total_seconds() * 1000)
     summary = {"checked_at": now_iso, "self_audit_schema": SELF_AUDIT_SCHEMA,
                "invariants": sorted(INVARIANTS),
                "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
                "self_audit_ms": self_audit_ms,
                "event_sync_ms": event_sync_ms,
+               "unreadable_timestamps": _unreadable_timestamp_count(conn),
                "findings": sorted(live_keys)}
     if invariants_failure is not None:
         # An empty `violations` from a check that never ran is a fabricated zero, not a

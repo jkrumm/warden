@@ -845,7 +845,14 @@ the window query carries a non-sargable term on a table that is never pruned (§
 The stored summary carries `self_audit_schema` so a consumer can tell which generation of
 these semantics its numbers belong to. Each section that produces them runs through
 `_audit_section()`, so a section that raises reports `self-audit-section-failed-<name>`
-instead of taking the other four down with it for that hour. Enforced elsewhere, by name:
+instead of taking the other four down with it for that hour — and a section that raised
+also keeps its own events through the resolve sweep (§132). The sweep reads an absent key
+as "nothing to report", which is only true of a section that actually RAN: without the
+exemption a query failure resolved the live alerts it had just stopped checking, so the
+hour's card showed a clean bill. `SELF_AUDIT_SECTIONS` names each section with the finding
+key PREFIXES it owns — the same table the run loop iterates, so a section cannot run
+without declaring them — and only a completed section's silence resolves anything.
+Enforced elsewhere, by name:
 the fail-closed
 executor gate (`EXECUTOR_REPOS` in `merge.py`, §99/§107 — `NEVER_AUTO_MERGE`
 itself was withdrawn in §107), GitHub's rules as the only review gate (§97),

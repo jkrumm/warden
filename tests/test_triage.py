@@ -8608,6 +8608,79 @@ def test_the_self_audit_summary_carries_its_schema_and_both_timings():
         assert isinstance(summary["self_audit_ms"], int) and summary["self_audit_ms"] >= 0
         assert isinstance(summary["event_sync_ms"], int) and summary["event_sync_ms"] >= 0
         assert "self-audit-slow" not in summary["findings"]
+        assert summary["unreadable_timestamps"] == 0
+
+
+def test_a_failed_section_does_not_resolve_the_alerts_it_stopped_checking():
+    """§132 — the resolve sweep reads "this key is absent" as "nothing to report", which is only
+    true for a section that actually RAN. Review health raising used to resolve its own live
+    `review-always-blocks-*` event, so the failure that stopped the check silently cleared the
+    very alert it was watching — fail-open one level above §124, and the reason a broken check
+    looked like a clean bill. The section's own failure finding still fires; the alerts it owns
+    simply survive until a pass that re-checks them."""
+    with _triage_env() as (conn, ctx):
+        for i in range(3):
+            _seed_blocking_review(conn, event_id=900 + i, suffix=f"blk-{i}")
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        live = "review-always-blocks-demo-repo"
+        assert conn.execute("SELECT resolved_at FROM events WHERE source=? AND external_id=?",
+                            (triage.SELF_SOURCE, live)).fetchone()["resolved_at"] is None
+
+        def _raise(*_a, **_k):
+            raise RuntimeError("OperationalError: no such column")
+
+        real = triage._review_health_findings
+        triage._review_health_findings = _raise
+        try:
+            triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=2),
+                                  dry_run=False)
+        finally:
+            triage._review_health_findings = real
+        rows = {r["external_id"]: r["resolved_at"] for r in conn.execute(
+            "SELECT external_id, resolved_at FROM events WHERE source=?", (triage.SELF_SOURCE,))}
+        assert rows[live] is None, "a section that raised cleared the alert it stopped checking"
+        assert rows[f"{triage.SECTION_FAILURE_PREFIX}review-health"] is None
+
+        # …and the exemption is not permanent: the next pass that runs the section again
+        # resolves the failure event itself, because the section did re-check that time.
+        triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(hours=4), dry_run=False)
+        rows = {r["external_id"]: r["resolved_at"] for r in conn.execute(
+            "SELECT external_id, resolved_at FROM events WHERE source=?", (triage.SELF_SOURCE,))}
+        assert rows[live] is None
+        assert rows[f"{triage.SECTION_FAILURE_PREFIX}review-health"] is not None
+
+
+def test_every_running_section_declares_the_keys_it_owns():
+    """§132 — the exemption table is only sound if it is complete: a section whose keys are not
+    declared there gets its alerts resolved the moment it raises, silently back to fail-open.
+    Read both sides off the module rather than a copy."""
+    declared = dict(triage.SELF_AUDIT_SECTIONS)
+    assert set(declared) == {"invariants", "review-health", "liveness", "fixed-reopened",
+                             "restore-drill", "revisions-exhausted"}
+    assert declared["review-health"] == ("review-always-blocks-", "review-verdicts-unusable-")
+    assert triage._unrechecked_prefixes(["review-health"]) == declared["review-health"]
+    assert triage._unrechecked_prefixes(["invariants"]) == tuple(i.lower() for i in triage.INVARIANTS)
+    # A name the table does not know protects nothing rather than raising: a section that was
+    # removed must not make the sweep refuse to run.
+    assert triage._unrechecked_prefixes(["gone"]) == ()
+    assert triage._failed_section_names(
+        [triage._section_failure_finding("liveness", RuntimeError("x"))]) == ["liveness"]
+
+
+def test_the_summary_counts_the_rows_admitted_for_an_unreadable_timestamp():
+    """§131's discussion — the corrupt-timestamp term of the review window cannot be bounded by
+    time without dropping rows of unknown age, so those rows are re-admitted every pass. The
+    count rides in the summary so that recurrence is a number someone can see, next to the tick
+    cost it feeds, instead of an invisible term that grows."""
+    with _triage_env() as (conn, ctx):
+        _seed_blocking_review(conn, event_id=901, suffix="corrupt")
+        conn.execute("UPDATE dispatches SET created_at='not-a-timestamp' WHERE job_id='impl-corrupt'")
+        conn.commit()
+        assert triage._unreadable_timestamp_count(conn) == 1
+        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
+        summary = json.loads(conn.execute(
+            "SELECT value FROM cursors WHERE key=?", (triage.SELF_AUDIT_CURSOR_KEY,)).fetchone()[0])
+        assert summary["unreadable_timestamps"] == 1
 
 
 def test_a_slow_self_audit_tick_reports_itself():

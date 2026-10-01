@@ -65,6 +65,7 @@ serves that stored value as `self_audit` (it never runs the audit itself):
 | `invariants_error` | present only when the invariant check itself raised |
 | `findings` | the live self-audit finding keys, e.g. `review-always-blocks-<repo>`, `review-verdicts-unusable-<repo>`, `liveness-never-confirms-<repo>`, `fixed-reopened-<event>`, `revisions-exhausted-<event>`, `self-audit-slow`, `self-audit-section-failed-<name>` |
 | `self_audit_ms` | cost of the tick's own work — invariants plus the five sections; the part that grows with the ledger's history |
+| `unreadable_timestamps` | rows the review window admitted because `dispatches.created_at` cannot be read as an instant — rows whose true age is unknown cannot be dropped by a time bound without losing a recent one, so they recur every pass and this count keeps that recurrence visible (§123/§131) |
 | `event_sync_ms` | cost of the whole event sync — per-finding upserts plus the sweep that resolves events whose finding is gone; scales with the number of live findings, not with history |
 
 ### `GET /metrics`

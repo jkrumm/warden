@@ -543,6 +543,21 @@ def test_the_warden_required_finding_fields_are_the_ones_the_live_schema_publish
     assert extra == {"angle"}, extra
 
 
+def test_the_published_finding_shape_never_raises_on_a_truthy_non_object():
+    """§132 — `parsed.get("output") or {}` survives `None` and `{}` but not a truthy non-dict,
+    and this helper sits OUTSIDE `check_schema_versions()`'s try/except on the operator-facing
+    `make status` path: an `AttributeError` there would turn a drifted schema into a traceback
+    instead of the "unreadable shape" refusal it is documented to produce."""
+    assert sideclaw._published_finding_shape({"output": "yes"}) is None
+    assert sideclaw._published_finding_shape({"output": ["x"]}) is None
+    assert sideclaw._published_finding_shape({"output": 7}) is None
+    assert sideclaw._published_finding_shape({"output": None}) is None
+    assert sideclaw._published_finding_shape({}) is None
+    # …and the same shape read from a well-formed body still works.
+    required, published = sideclaw._published_finding_shape({"output": _REVIEW_SCHEMA_OUTPUT})
+    assert required == frozenset({"file", "message", "angle"}) and "message" in published
+
+
 def test_check_schema_versions_unreachable_never_raises():
     os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
     results = sideclaw.check_schema_versions()

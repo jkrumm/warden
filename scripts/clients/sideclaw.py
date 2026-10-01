@@ -395,7 +395,13 @@ def _published_finding_shape(parsed: dict[str, Any]) -> tuple[frozenset[str], fr
     `improvements`, `discussions`, `testGaps`) share this one object schema. `None` is a
     finding in itself, not a reason to skip the check: warden's `is_review_finding()` would
     then be an unverifiable copy, which is the drift this comparison exists to catch."""
-    blocking = ((parsed.get("output") or {}).get("properties") or {}).get("blocking")
+    output = parsed.get("output")
+    if not isinstance(output, dict):
+        # Truthy-but-not-an-object included: this function's contract is that it never raises
+        # (it sits outside `check_schema_versions()`'s try/except, on the operator-facing
+        # `make status` path), so an unreadable shape is None, exactly like the guards below.
+        return None
+    blocking = (output.get("properties") or {}).get("blocking")
     items = (blocking or {}).get("items") if isinstance(blocking, dict) else None
     if not isinstance(items, dict):
         return None
