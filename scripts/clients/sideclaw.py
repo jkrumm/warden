@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import PolicyError, RemoteError
+from .errors import PolicyError, RemoteError, SubmitRefused
 
 _DEFAULT_BASE = "http://localhost:7705"
 _TIMEOUT_S = 30
@@ -85,22 +85,37 @@ def _request(method: str, path: str, body: dict[str, Any] | None) -> tuple[int, 
         return e.code, e.read().decode("utf-8", errors="replace")
 
 
+def _raise_for_submit_status(status: int, text: str) -> None:
+    """A 4xx on submit is sideclaw refusing (its repo allowlist, a tier above a
+    repo's ceiling, an unverified model, bad params): `SubmitRefused`, carrying
+    sideclaw's own `error` text, never retried. Anything else non-200 (5xx) is
+    a plain `RemoteError` and keeps its retry behaviour."""
+    if status == 200:
+        return
+    if 400 <= status < 500:
+        message = None
+        try:
+            parsed = json.loads(text)
+            message = parsed.get("error") if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            pass
+        raise SubmitRefused(
+            f"sideclaw refused the job (HTTP {status}): {message or text[:300]}", status=status,
+        )
+    raise RemoteError(f"sideclaw returned HTTP {status}: {text[:300]}")
+
+
 def submit(
     *,
     cwd: str,
     tier: str,
     brief: str,
     context: str | None = None,
-    sensitive: bool = False,
     model: str | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"cwd": cwd, "tier": tier, "brief": brief}
     if context:
         params["context"] = context
-    # Only ever set for a repo the policy names in `sensitive` — sideclaw
-    # re-checks the same investigate-only restriction independently.
-    if sensitive:
-        params["sensitive"] = True
     if model:
         params["model"] = model
     body = {"tool": "dispatch", "params": params}
@@ -114,8 +129,7 @@ def submit(
             maybe_mutated=True,
         )
 
-    if status != 200:
-        raise RemoteError(f"sideclaw returned HTTP {status}: {text[:300]}")
+    _raise_for_submit_status(status, text)
 
     try:
         parsed = json.loads(text)
@@ -147,8 +161,7 @@ def submit_review(*, cwd: Path, pr: int, context: str | None = None, model: str 
             maybe_mutated=True,
         )
 
-    if status != 200:
-        raise RemoteError(f"sideclaw returned HTTP {status}: {text[:300]}")
+    _raise_for_submit_status(status, text)
 
     try:
         parsed = json.loads(text)

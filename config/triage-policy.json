@@ -57,12 +57,11 @@
     "`op://vault/item/field` secret-scan pattern and get withheld, whereas env-check's output",
     "reaching the card directly does not.",
     "",
-    "Every `repo` value MUST resolve under `root` in config/dispatch-repos.json and MUST",
-    "NOT appear in that file's `deny` list \u2014 scripts/triage.py checks the deny list",
-    "itself before ever shelling out, so a rule naming a denied repo just silently never",
-    "escalates (logged to stderr) rather than crashing, but it is still a bug in this",
-    "file, not a feature. `homelab-private` is denied and 'shelfmark' below is why it is",
-    "in `ignore` rather than mapped to it: shelfmark is a third-party image",
+    "Every `repo` value MUST be a checkout directly under the repos root (~/SourceRoot by",
+    "default). Whether sideclaw lets an episode run in that repo is sideclaw's call: it",
+    "enforces its own allowlist and answers a refusal with a 4xx, which ends the item",
+    "`needs_human` with sideclaw's message and is never retried. 'shelfmark' below is in",
+    "`ignore` rather than mapped to `homelab-private`: shelfmark is a third-party image",
     "(ghcr.io/calibrain/shelfmark) running in the private compose file \u2014 nothing to",
     "dispatch an investigation against even if the repo were reachable.",
     "",
@@ -73,8 +72,7 @@
     "compose-managed manually inside `vps` (`apps/argo/compose.yml`, `make argo-up` \u2014",
     "nothing in argo's own repo redeploys it), so a downed argo container maps to `vps`.",
     "Most OTHER vps-hosted apps in this policy (audio-gateway, weatherorb,",
-    "image-gen, image-share) are the opposite: dispatch-repos.json's own comment documents",
-    "that they deploy to the VPS on every push to THEIR OWN repo's master (GitHub Actions ->",
+    "image-gen, image-share) are the opposite: they deploy to the VPS on every push to THEIR OWN repo's master (GitHub Actions ->",
     "RollHook), so a code fix in their own repo auto-redeploys \u2014 mapping those to their own",
     "repo is correct and deliberate, not an oversight to 'fix' the same way. Before adding a",
     "new vps-app rule, check `vps/apps/<name>/compose.yml` AND whether that app's own repo",
@@ -115,17 +113,10 @@
     "always says \"signal quiet since <time>\" or \"recovery message observed: \u2026\", never that.",
     "",
     "`repos` (object, keyed by repo name) is the DIFFERENT half of this file: it does not",
-    "route a signature, it governs what scripts/lifecycle/merge.py's `merge`/`deploy`/`liveness`",
-    "machinery is allowed to do once a triage-opened `implement` episode has a confirmed,",
-    "validated pull request. Per-repo entry:",
-    "  autoMergePaths  glob list \u2014 PRIMARY merge gate. EVERY changed path in the diff must",
-    "                  match one, or `merge` refuses outright; a repo absent from `repos` or",
-    "                  with no autoMergePaths refuses too \u2014 there is no implicit allow.",
-    "  noCiRequired    bool \u2014 an explicit acknowledgement that this repo has zero PR-time",
-    "                  required checks, so `merge` treats that as a KNOWN condition rather",
-    "                  than silently reading `mergeable_state: clean` as \"CI passed\" (it is",
-    "                  vacuously clean with nothing having run). Omit/false + zero check-runs",
-    "                  on the head commit = refused, on purpose \u2014 that inversion is the point.",
+    "route a signature, it governs what scripts/lifecycle/merge.py's `deploy`/`liveness`",
+    "machinery does after a triage-opened `implement` episode's pull request merged. The",
+    "merge gate itself (PR open, checks green or none, review confirmed, GitHub's own rules)",
+    "carries no per-repo keys. Per-repo entry:",
     "  deploy          a KEY from scripts/clients/rollout.py's own closed DEPLOY allowlist (ROLLOUTS),",
     "                  never a command \u2014 same closed-set principle as `verb`/`evidence` above.",
     "  autoDeploy      bool, default false. Ships OFF everywhere: the mechanism lands reviewed",
@@ -149,15 +140,7 @@
     "                  usable 40-char-hex mergeCommit \u2014 that falls through to `merged` with a",
     "                  reason, on purpose (a probe with nothing to compare against would just",
     "                  sit until liveness_deadline and reopen, worse than an honest `merged`).",
-    "`vps` is seeded below at the narrowest possible scope (`observability/**` only) \u2014 its",
-    "own compose files, apps and everything else stay outside every one of these gates.",
-    "`argo` is seeded with `deployOnMerge` + `liveness: argo-commit-live` and ONE canary path",
-    "in `autoMergePaths` (`docs/DEPLOY-VERIFICATION.md`, a file nothing in argo reads or builds): the",
-    "owner-authorized scope for the Wave 5 stop-condition exercise (dotfiles",
-    "docs/waves/PLAN.md header, 2026-09-10). Every other path in argo stays outside the",
-    "gate \u2014 merge_gate_check() in scripts/lifecycle/merge.py refuses it OUTOFSCOPE. Widening",
-    "past the canary is a separate operator decision \u2014 do not add paths here to \"complete\"",
-    "this entry.",
+    "`argo` is seeded with `deployOnMerge` + `liveness: argo-commit-live`.",
     "",
     "`hostVerbs` (list) is the FIFTH closed allowlist's own rule set \u2014 the owner's 2026-09-11",
     "decision that warden may run an idempotent host-level restart itself, rather than card",
@@ -207,57 +190,32 @@
   "ignoreUnstructuredSlackProse": true,
   "repos": {
     "vps": {
-      "autoMergePaths": [
-        "observability/**"
-      ],
-      "noCiRequired": true,
       "deploy": "hyperdx-apply",
       "autoDeploy": true,
       "liveness": "hyperdx-alert-state"
     },
     "argo": {
-      "_note": "autoMergePaths is the CANARY SCOPE ONLY \u2014 one file nothing in argo reads or builds, owner-authorized for the Wave 5 stop-condition exercise (2026-09-10, STATE.md \u00a754). merge_gate_check() in scripts/lifecycle/merge.py refuses every other path OUTOFSCOPE. Widening this list is a separate operator decision; do not add paths here to 'complete' this entry.",
-      "autoMergePaths": [
-        "docs/DEPLOY-VERIFICATION.md"
-      ],
       "deployOnMerge": true,
       "liveness": "argo-commit-live"
     },
     "hermes-agent": {
-      "_note": "No autoMergePaths \u2014 hermes-agent stays NOT auto-mergeable (FLOWS.md flow 5). `liveness` is here only so a host-verb restart (maybe_auto_remediate(), STATE_LIVENESS_PENDING) has a repo-scoped key to read; it is never reached via the merge/deploy chain because this repo never gets that far.",
+      "_note": "`liveness` is here only so a host-verb restart (maybe_auto_remediate(), STATE_LIVENESS_PENDING) has a repo-scoped key to read; hermes-agent has no deploy.",
       "liveness": "kuma-push-fresh"
     },
     "homelab": {
-      "_note": "\u00a793 \u2014 the Kuma monitor definitions are the one auto-merge scope: a monitor fix lands, `uk-sync` applies it on the homelab server, and the item's own monitor must report UP afterwards (kuma-push-fresh). sync.py, the Makefile and compose files stay outside \u2014 warden must not write the code it runs. homelab has no PR-time CI; the gate is the independent step-7 review, which blocks a change that loosens detection without evidence (VALIDATION_GATE_QUESTIONS).",
-      "autoMergePaths": [
-        "uptime-kuma/monitors.yaml"
-      ],
-      "noCiRequired": true,
+      "_note": "\u00a793 \u2014 a Kuma monitor fix lands, `uk-sync` applies it on the homelab server, and the item's own monitor must report UP afterwards (kuma-push-fresh). homelab has no PR-time CI; the gate is the independent step-7 review, which blocks a change that loosens detection without evidence (VALIDATION_GATE_QUESTIONS).",
       "deploy": "uk-sync",
       "autoDeploy": true,
       "liveness": "kuma-push-fresh"
     },
     "weatherorb": {
-      "_note": "\u00a7105 \u2014 fully unattended (landed 2026-09-28 by Hermes on the owner's standing directive that every PR be auto-reviewed, merged, deployed and verified \u2014 no separate owner decision was quoted for weatherorb: it is private and only he files its issues, the narrow watchdog/tests/docs scope of \u00a793 was friction). `**` is exactly the default unattended scope a repo with no entry gets (merge.py DEFAULT_REPO_ENTRY): every path NEVER_AUTO_MERGE does not name. Declared here rather than by omission so this file says it and a later change to the default cannot silently narrow this repo. `weatherorb-pull` fast-forwards the live checkout AND kickstarts tileserver/sync, so a merge is the rollout for the periodic jobs and the long-running ones alike; the WeatherOrb Watchdog push monitor reporting UP plus its synthetic trip (\u00a7103) is the proof for a uk-origin item, an issue-origin item lands `merged` with no monitor of its own. Since \u00a7107 (owner, 2026-09-29) no path class stops here: Makefile, ops/*.plist (reloaded by `make launchd-install` inside weatherorb-pull), .github/workflows (deploy-edge runs on the merge), Dockerfiles, package.json, bun.lock/uv.lock and pyproject.toml merge like any other file. No PR-time CI; the step-7 review is the gate.",
-      "autoMergePaths": [
-        "**"
-      ],
-      "noCiRequired": true,
+      "_note": "`weatherorb-pull` fast-forwards the live checkout AND kickstarts tileserver/sync, so a merge is the rollout for the periodic jobs and the long-running ones alike; the WeatherOrb Watchdog push monitor reporting UP plus its synthetic trip (\u00a7103) is the proof for a uk-origin item, an issue-origin item lands `merged` with no monitor of its own. No PR-time CI; the step-7 review is the gate.",
       "deploy": "weatherorb-pull",
       "autoDeploy": true,
       "liveness": "kuma-push-fresh"
     },
     "research-gateway": {
-      "_note": "\u00a793 \u2014 merge IS deploy: the mini's CI-gated, idle-gated poller (scripts/mini-deploy.sh) rolls master out, and mini-checkout-live confirms the poller's checkout carries the merge commit and /health answers ok. CI runs on push to master only (no PR checks), so noCiRequired here means the implement tier's own pre-push checks plus the step-7 review gate the merge, and CI still gates the deploy: a red master never reaches the checkout, liveness times out, the item reopens with the PR in its history. scripts/**, Makefile, launchd/**, package.json and bun.lock stay outside \u2014 deploy definitions and dependencies are never auto-merged.",
-      "autoMergePaths": [
-        "src/**",
-        "bin/**",
-        "docs/**",
-        "evals/**",
-        "README.md",
-        "AGENTS.md"
-      ],
-      "noCiRequired": true,
+      "_note": "\u00a793 \u2014 merge IS deploy: the mini's CI-gated, idle-gated poller (scripts/mini-deploy.sh) rolls master out, and mini-checkout-live confirms the poller's checkout carries the merge commit and /health answers ok. CI runs on push to master only (no PR checks), so the implement tier's own pre-push checks plus the step-7 review gate the merge, and CI still gates the deploy: a red master never reaches the checkout, liveness times out, the item reopens with the PR in its history.",
       "deployByPoller": true,
       "liveness": "mini-checkout-live"
     }
@@ -268,7 +226,7 @@
     {"match": "hermes_log:*session-is-closed*", "verb": "restart-hermes-gateway"}
   ],
   "rules": [
-    {"match": "warden_self:*", "repo": "warden", "_note": "\u00a7100 \u2014 the self-audit's findings are warden's own defects: investigated and implemented like any alert, merged only by the owner's Argo click (merge_approval)."},
+    {"match": "warden_self:*", "repo": "warden", "_note": "\u00a7100 \u2014 the self-audit's findings are warden's own defects: investigated and implemented like any alert."},
     {"match": "docker_*:unhealthy:garmin-*", "repo": "homelab"},
     {"match": "docker_*:restart:garmin-*", "repo": "homelab"},
     {"match": "docker_*:unhealthy:audio-gateway*", "repo": "audio-gateway"},

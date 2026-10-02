@@ -333,7 +333,7 @@ def _read_context(flags: Flags) -> str | None:
 
 
 def _plan_payload(
-    conn, *, name: str, tier: str, target: policy.RepoTarget, brief: str, now: dt.datetime,
+    conn, *, name: str, tier: str, brief: str, now: dt.datetime,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {
         "verb": "dispatch",
@@ -341,8 +341,7 @@ def _plan_payload(
         "dryRun": True,
         "repo": name,
         "tier": tier,
-        "repoMaxTier": target.max_tier,
-        "cwd": str(target.path),
+        "cwd": str(policy.repo_cwd(name)),
         "briefChars": len(brief),
         "wouldDo": _EFFECTS[tier],
         "wouldNeverDo": _NEVER,
@@ -376,6 +375,13 @@ def _result_payload(
     return out
 
 
+def _require_known_tier(tier: str) -> None:
+    """The flag's vocabulary only — which repo may run which tier is sideclaw's
+    call, answered as a 4xx."""
+    if tier not in policy.VALID_TIERS:
+        raise UsageError(f"unknown tier: {tier} (must be one of: {', '.join(policy.VALID_TIERS)})")
+
+
 def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
     if not positional:
         raise UsageError("usage: warden dispatch <repo> [--tier investigate] [--wait] [--json] <<'BRIEF' ... BRIEF")
@@ -387,9 +393,8 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> di
     if flags.confirm:
         raise UsageError("--confirm is a merge flag; dispatch has no confirmation step")
 
-    target = policy.resolve_repo(name)
     tier = flags.tier or "investigate"
-    policy.resolve_tier(tier, target)
+    _require_known_tier(tier)
     state.tier = tier
 
     linked_job: str | None = None
@@ -406,7 +411,7 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> di
     now = dt.datetime.now(dt.timezone.utc)
 
     if flags.dry_run:
-        return _plan_payload(conn, name=name, tier=tier, target=target, brief=brief, now=now)
+        return _plan_payload(conn, name=name, tier=tier, brief=brief, now=now)
 
     if flags.auto_from_item:
         policy.check_repo_not_in_flight(conn, repo=name)
@@ -419,7 +424,7 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> di
         channel=flags.origin_channel or None, thread_ts=flags.origin_thread or None, event_id=origin_event_int,
     )
     opened = dispatch.open_episode(
-        conn, target=target, tier=tier, brief=brief, context=context, why=flags.why, model=flags.model,
+        conn, repo=name, tier=tier, brief=brief, context=context, why=flags.why, model=flags.model,
         origin=origin, authorized_by=authorized_by, now=now,
     )
     state.did_mutate = True
@@ -451,11 +456,11 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> di
 # --- run (Wave 6.1: the `human` origin) --------------------------------------
 
 
-def _run_plan_payload(conn, *, name: str, tier: str, target: policy.RepoTarget, brief: str,
+def _run_plan_payload(conn, *, name: str, tier: str, brief: str,
                        why: str | None, now: dt.datetime) -> dict[str, Any]:
     out: dict[str, Any] = {
         "verb": "run", "ok": True, "dryRun": True, "repo": name, "tier": tier,
-        "repoMaxTier": target.max_tier, "cwd": str(target.path), "briefChars": len(brief),
+        "cwd": str(policy.repo_cwd(name)), "briefChars": len(brief),
         "why": why or None,
         "note": "nothing ran — no item was opened and no episode was dispatched",
     }
@@ -479,9 +484,8 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
     require_no_recursion()
     require_backend()
 
-    target = policy.resolve_repo(name)
     tier = flags.tier or "investigate"
-    policy.resolve_tier(tier, target)
+    _require_known_tier(tier)
     state.tier = tier
 
     if tier == "implement" and not flags.why:
@@ -500,7 +504,7 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
     now = dt.datetime.now(dt.timezone.utc)
 
     if flags.dry_run:
-        return _run_plan_payload(conn, name=name, tier=tier, target=target, brief=brief, why=flags.why, now=now)
+        return _run_plan_payload(conn, name=name, tier=tier, brief=brief, why=flags.why, now=now)
 
     event_id = triage.open_origin_item(
         conn, origin="human", repo=name, brief=brief, max_tier=max_tier,
@@ -923,7 +927,7 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
         if out.get("dryRun"):
             print("PLAN — nothing executed.")
             print(f"  repo:  {out['repo']} ({out.get('cwd', '')})")
-            print(f"  tier:  {out['tier']} (repo ceiling: {out.get('repoMaxTier')})")
+            print(f"  tier:  {out['tier']}")
             print(f"  brief: {out.get('briefChars')} chars")
             print("Re-invoke without --dry-run to open the episode.")
         elif out.get("waited"):
@@ -935,7 +939,7 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
         if out.get("dryRun"):
             print("PLAN — nothing executed.")
             print(f"  repo:  {out['repo']} ({out.get('cwd', '')})")
-            print(f"  tier:  {out['tier']} (repo ceiling: {out.get('repoMaxTier')})")
+            print(f"  tier:  {out['tier']}")
             print(f"  brief: {out.get('briefChars')} chars")
             if out.get("why"):
                 print(f"  why:   {out['why']}")

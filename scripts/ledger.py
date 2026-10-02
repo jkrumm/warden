@@ -376,7 +376,7 @@ ALTER TABLE triage_items ADD COLUMN revert_pr INTEGER;
 #     never sets it, so it rides the default) for the seven alert ones.
 #
 #   triage_items.max_tier     the ceiling THIS item may reach on its own —
-#     `implement` (the pre-Wave-6 behaviour: policy + autoMergePaths decide,
+#     `implement` (the pre-Wave-6 behaviour: the verdict decides,
 #     same as every alert item today) or `investigate` (maybe_auto_implement()
 #     and lifecycle/policy.py's require_auto_from_item() both refuse to cross
 #     it). DEFAULT 'implement' for the same backfill-free reason as `origin`:

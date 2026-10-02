@@ -126,30 +126,20 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   guarantees drift, and drift presents as "verdict silently ignored" — the exact
   failure warden exists to fix. A version mismatch is a loud refusal, never a
   best-effort parse.
-- **A dispatch names a repo, never a path.** That is what keeps a composed path
-  out of the interface.
-- **The repo allowlist is enforced inside sideclaw**
-  (`sideclaw/server/lib/dispatch-policy.ts`, `GET /api/dispatch-policy`). Warden's
-  copy is defence in depth; sideclaw's is the boundary. If the two disagree, the
-  boundary is quietly allowing something the control plane forbids — they must be
-  checked against each other, not assumed to agree.
-- **Warden no longer picks the worker model.** `triage.py`'s `AUTO_DISPATCH_MODEL` /
-  `AUTO_IMPLEMENT_MODEL` default to `None` — no `model` key is sent, and sideclaw
-  routes each tier per its own table (`server/lib/routing.ts`, live at
-  `GET /api/routing`): investigate/author to DeepSeek-V4-Flash, implement to
-  DeepSeek-V4-Pro. The env vars (`TRIAGE_AUTO_DISPATCH_MODEL`,
-  `TRIAGE_AUTO_IMPLEMENT_MODEL`) are the operator's escape hatch, and
-  `make check-routing` verifies any such override against the live table the same
-  way `check-schema-versions.py`/`check-dispatch-policy.py` do for the verdict
-  schema and the allowlist.
-- **Warden may never auto-merge on `sideclaw`, `warden` or `dotfiles`.**
-  Implement is allowed (a draft PR), but neither repo ever gets
-  `autoMergePaths`, and all three are now also in
-  `config/dispatch-repos.json`'s `merge_approval` — a clean step-7 validation
-  routes the item to `needs_human` carrying the PR URL instead of calling
-  `merge`, and the owner lands it with `warden merge <job> --confirm`.
-  Auto-merging PRs against your own executor closes a loop that has no
-  outside. The owner's Argo Merge click is that outside.
+- **sideclaw is the only boundary.** Warden carries no repo allowlist, tier
+  ceiling or model choice: a dispatch names a repo (`lifecycle.policy.repo_cwd()`
+  composes the one `cwd` the wire protocol still needs) and sends no `model` key —
+  sideclaw enforces its own allowlist (`GET /api/dispatch-policy`) and routes each
+  tier (`GET /api/routing`). A sideclaw **4xx on submit is a refusal**
+  (`clients.errors.SubmitRefused`): the item ends `needs_human` carrying sideclaw's
+  message (`triage._end_on_refusal()`) and is never retried; 5xx and connection
+  errors keep their retry behaviour. `warden dispatch --model` stays — it is the
+  owner's explicit choice, not policy.
+- **The merge gate is four facts**: PR open, checks green (or none exist), step-7
+  review `confirmed`, and GitHub's own rules allowing the merge call
+  (`lifecycle.merge.merge_gate_check()` / `plan_or_land()`). No path scope, size
+  ceiling, per-repo carve-out or executor-repo exception; `warden merge <job>
+  --confirm` goes through the same gate.
 - **An episode is not contained.** `readOnly` is three tool names on a CLI flag
   under `--dangerously-skip-permissions`; `Bash` is unrestricted and the brief is
   attacker-influenceable (public issues, alert text, log lines all reach it). A

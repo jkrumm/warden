@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from clients import argo, github, rollout, sideclaw  # noqa: E402
 from clients import slack as clients_slack  # noqa: E402
-from clients.errors import PolicyError, PreconditionError, RemoteError  # noqa: E402
+from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused  # noqa: E402
 
 
 # --- stub HTTP server ----------------------------------------------------------
@@ -103,10 +103,58 @@ def test_submit_body_shape_with_optional_keys_and_order():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "j2"}})})
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
     try:
-        sideclaw.submit(cwd="/repo", tier="implement", brief="b", context="ctx", sensitive=True, model="haiku")
+        sideclaw.submit(cwd="/repo", tier="implement", brief="b", context="ctx", model="haiku")
         params = srv.requests[0]["body"]["params"]
-        assert list(params.keys()) == ["cwd", "tier", "brief", "context", "sensitive", "model"], params
-        assert params["context"] == "ctx" and params["sensitive"] is True and params["model"] == "haiku"
+        assert list(params.keys()) == ["cwd", "tier", "brief", "context", "model"], params
+        assert params["context"] == "ctx" and params["model"] == "haiku"
+    finally:
+        srv.stop()
+
+
+def test_submit_4xx_raises_submit_refused_with_sideclaws_message():
+    """A 4xx is sideclaw REFUSING (allowlist, tier ceiling, bad model): its own
+    `error` text, the status, and a type callers can tell from a 5xx."""
+    srv = _StubServer({("POST", "/api/jobs"): (
+        400, {"ok": False, "error": "dispatch refused: cwd is not a repo directly under a dispatch root: /x"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit(cwd="/x", tier="implement", brief="b")
+        except SubmitRefused as e:
+            assert e.status == 400 and e.maybe_mutated is False, (e.status, e.maybe_mutated)
+            assert "dispatch refused: cwd is not a repo directly under a dispatch root: /x" in str(e), e
+        else:
+            raise AssertionError("expected SubmitRefused")
+    finally:
+        srv.stop()
+
+
+def test_submit_4xx_without_a_json_error_still_carries_the_body():
+    srv = _StubServer({("POST", "/api/jobs"): (422, "params invalid")})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit(cwd="/x", tier="implement", brief="b")
+        except SubmitRefused as e:
+            assert e.status == 422 and "params invalid" in str(e), e
+        else:
+            raise AssertionError("expected SubmitRefused")
+    finally:
+        srv.stop()
+
+
+def test_submit_5xx_is_a_plain_remote_error_not_a_refusal():
+    srv = _StubServer({("POST", "/api/jobs"): (503, {"error": "overloaded"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit(cwd="/x", tier="implement", brief="b")
+        except SubmitRefused:
+            raise AssertionError("a 5xx must keep its retry behaviour, not read as a refusal")
+        except RemoteError as e:
+            assert "503" in str(e), e
+        else:
+            raise AssertionError("expected RemoteError")
     finally:
         srv.stop()
 
@@ -303,6 +351,20 @@ def test_submit_review_omits_context_when_absent():
     try:
         sideclaw.submit_review(cwd=Path("/repo"), pr=5)
         assert srv.requests[0]["body"]["params"] == {"cwd": "/repo", "pr": 5}
+    finally:
+        srv.stop()
+
+
+def test_submit_review_4xx_raises_submit_refused():
+    srv = _StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": "dispatch refused: nope"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit_review(cwd=Path("/repo"), pr=1)
+        except SubmitRefused as e:
+            assert e.status == 400 and "dispatch refused: nope" in str(e), e
+        else:
+            raise AssertionError("expected SubmitRefused")
     finally:
         srv.stop()
 
@@ -978,15 +1040,6 @@ def test_parse_pr_url_good_and_bad():
     assert github.parse_pr_url("not a url") is None
 
 
-def test_required_approving_reviews_reads_the_ruleset():
-    assert github.required_approving_reviews([]) == 0
-    assert github.required_approving_reviews(
-        [{"type": "pull_request", "parameters": {"required_approving_review_count": 0}}]) == 0
-    assert github.required_approving_reviews(
-        [{"type": "deletion", "parameters": None},
-         {"type": "pull_request", "parameters": {"required_approving_review_count": 2}}]) == 2
-
-
 def test_pick_merge_method_honours_linear_history():
     repo = {"allow_merge_commit": True}
     assert github.pick_merge_method(repo) == "merge"
@@ -1017,11 +1070,10 @@ def test_branch_rules_plan_gated_403_is_no_rules_not_a_refusal():
     answers the rules read with 403 "Upgrade to GitHub Pro or make this
     repository public to enable this feature." on a private repo on a plan
     without them. The repo then cannot have a ruleset at all: `[]` is the
-    true answer, and refusing made weatherorb (private, `autoMergePaths:
-    ["**"]`, `autoDeploy`) permanently unmergeable — items 1276 and 1277
-    parked on this 403 while their reviews had confirmed. GitHub's own
-    `mergeable_state == "blocked"` and the merge call stay the enforcement
-    point, so an unreadable-but-real protection still cannot be ridden."""
+    true answer, and refusing made weatherorb (private, `autoDeploy`)
+    permanently unmergeable — items 1276 and 1277 parked on this 403 while
+    their reviews had confirmed. The merge call stays the enforcement point,
+    so an unreadable-but-real protection still cannot be ridden."""
     saved = github.api
     try:
         github.api = lambda method, path, body=None: (
@@ -1048,7 +1100,7 @@ def test_check_runs_token_403_is_its_own_refusal():
     private repository ("Resource not accessible by personal access token";
     the response's `x-accepted-github-permissions: checks=read`), which is a
     fact about the credential, not about the commit. It is its own exception
-    so the *caller* can weigh the repo's own `noCiRequired`; every other
+    so the *caller* decides what an unreadable CI read means; every other
     non-200 — and any 403 that is not this one — stays a plain RemoteError."""
     saved = github.api
     try:

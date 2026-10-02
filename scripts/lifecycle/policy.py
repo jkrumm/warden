@@ -1,32 +1,21 @@
-"""policy — repo/tier resolution and origin shape checks.
+"""policy — recursion guard, origin shape checks, the per-repo in-flight lock.
 
-The Python port of the retired bash CLI's `resolve_repo` (457-583), `resolve_tier`
-(589-606), `tier_rank` (624-631), `require_auto_from_item` (639-705),
-`valid_origin` (745-766) and the
-`repos.<repo>` half of `config/triage-policy.json` that
-`run_deploy_if_enabled` reads (1842-1856). The bash CLI's `budget_counts`/
-`check_budget`/`budget_json` (849-915) were ported too, then deleted
-entirely (`docs/waves/PLAN.md` Wave 2, 2026-09-15, owner: "absurd friction")
-— every daily count ceiling is gone; `MAX_OPEN_INVESTIGATIONS` (concurrency)
-and `check_repo_not_in_flight()` (the per-repo lock) are unrelated and stay.
+The Python port of the retired bash CLI's `require_auto_from_item` (639-705),
+`valid_origin` (745-766) and the `repos.<repo>` half of
+`config/triage-policy.json` that `run_deploy_if_enabled` reads (1842-1856).
 
-Two simplifications versus the bash version, both because this is now the
-ONE implementation instead of a shell script embedding a second one in
-Python for every call: `BUILT_TIERS` is gone (it always equalled
-`VALID_TIERS` by the time this was ported — there is no "not implemented
-yet" tier left to refuse), and `resolve_repo()` no longer re-validates the
-resolved tier against `VALID_TIERS` a second time after `load_dispatch_policy()`
-already refused a malformed one at load — one validating implementation,
-not two copies that could disagree.
+There is no repo/tier policy here: sideclaw is the only boundary (it enforces
+its own repo allowlist and tier ceilings and answers a refusal with a 4xx,
+which `clients.sideclaw` raises as `SubmitRefused`). A dispatch names the repo
+string; `repo_cwd()` composes the one path sideclaw's wire protocol still
+requires and decides nothing.
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 import os
 import sqlite3
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +27,6 @@ REPO = Path(__file__).resolve().parents[2]
 
 VALID_TIERS = ("investigate", "author", "implement")
 GATED_TIERS = ("implement",)
-
-TIER_RANK = {"investigate": 1, "author": 2, "implement": 3}
 
 
 def require_no_recursion() -> None:
@@ -61,195 +48,40 @@ def require_no_recursion() -> None:
         )
 
 
-def tier_rank(tier: str) -> int:
-    """99 for anything unrecognized — deliberately ABOVE every real tier, so
-    an unrecognized *request* is refused. See the retired bash CLI's own comment on
-    why this default is safe only on the left-hand side of the comparison,
-    which is why the ceiling itself is validated at policy-load time rather
-    than trusted here."""
-    return TIER_RANK.get(tier, 99)
-
-
-def dispatch_policy_path() -> Path:
-    if os.environ.get("WARDEN_DISPATCH_REPOS"):
-        return Path(os.environ["WARDEN_DISPATCH_REPOS"]).expanduser()
-    return REPO / "config" / "dispatch-repos.json"
-
-
 def triage_policy_path() -> Path:
     if os.environ.get("WARDEN_TRIAGE_POLICY"):
         return Path(os.environ["WARDEN_TRIAGE_POLICY"]).expanduser()
     return REPO / "config" / "triage-policy.json"
 
 
-@dataclass(frozen=True)
-class RepoTarget:
-    name: str
-    path: Path
-    max_tier: str
-    sensitive: bool
-
-
-def load_dispatch_policy(path: Path | None = None) -> dict[str, Any]:
-    """Parse `dispatch-repos.json` and run the five contradiction/shape
-    checks the retired bash CLI's embedded `resolve_repo` python ran inline — see
-    that block's own comments for why each one refuses rather than picks a
-    winner. Returns a normalized dict: `root` (resolved Path), `default_tier`,
-    `deny`/`sensitive`/`merge_approval` (sets), `overrides` (name -> tier)."""
-    p = path or dispatch_policy_path()
-    try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as err:
-        raise PreconditionError(f"dispatch policy at {p} could not parse: {err}")
-
-    root = Path(os.path.realpath(os.path.expanduser(raw.get("root", "~/SourceRoot"))))
-    default_tier = raw.get("defaultTier", "investigate")
-    deny = set(raw.get("deny") or [])
-    sensitive = set(raw.get("sensitive") or [])
-
-    merge_approval_raw = raw.get("merge_approval")
-    if merge_approval_raw is not None and not (
-        isinstance(merge_approval_raw, list)
-        and all(isinstance(r, str) for r in merge_approval_raw)
-    ):
-        raise PreconditionError(
-            f"dispatch policy at {p}: `merge_approval` is not a list of repo names"
-        )
-    merge_approval = set(merge_approval_raw or [])
-
-    overrides: dict[str, str] = {}
-    for tier, names in (raw.get("tiers") or {}).items():
-        if tier not in VALID_TIERS:
-            raise PreconditionError(
-                f"dispatch policy at {p}: unknown tier {tier!r} in `tiers` "
-                f"(must be one of: {', '.join(VALID_TIERS)})"
-            )
-        for n in names:
-            overrides[n] = tier
-
-    if default_tier not in VALID_TIERS:
-        raise PreconditionError(
-            f"dispatch policy at {p}: unrecognized defaultTier {default_tier!r} "
-            f"(must be one of: {', '.join(VALID_TIERS)})"
-        )
-
-    both = deny & set(overrides)
-    if both:
-        raise PreconditionError(
-            f"dispatch policy at {p}: named in both `deny` and `tiers`: {', '.join(sorted(both))}"
-        )
-
-    not_denied = sensitive - deny
-    if not_denied:
-        raise PreconditionError(
-            f"dispatch policy at {p}: named in `sensitive` but not in `deny`: {', '.join(sorted(not_denied))}"
-        )
-
-    both_sensitive = sensitive & set(overrides)
-    if both_sensitive:
-        raise PreconditionError(
-            f"dispatch policy at {p}: named in both `sensitive` and `tiers`: {', '.join(sorted(both_sensitive))}"
-        )
-
-    return {
-        "root": root,
-        "default_tier": default_tier,
-        "deny": deny,
-        "sensitive": sensitive,
-        "merge_approval": merge_approval,
-        "overrides": overrides,
-    }
-
-
-def merge_needs_approval(policy: dict[str, Any], repo: str) -> bool:
-    """True when `repo` is in the dispatch policy's `merge_approval` set — an
-    implement episode may run against it and open a draft PR, but the merge
-    into it is never self-authorized: the owner approves (see
-    config/dispatch-repos.json's own prose). Unknown repo -> False, because a
-    repo nobody listed is not gated, and the caller only ever asks about a
-    repo that has already been implemented."""
-    return repo in policy.get("merge_approval", set())
-
-
 _NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
 
 
-def _validate_repo_name(name: str) -> None:
+def repos_root() -> Path:
+    """Where the repo checkouts live: `WARDEN_REPOS_ROOT`, else `~/SourceRoot`."""
+    return Path(os.path.expanduser(os.environ.get("WARDEN_REPOS_ROOT") or "~/SourceRoot"))
+
+
+def repo_cwd(name: str) -> Path:
+    """`<root>/<name>` — the absolute `cwd` sideclaw's submit wire protocol
+    requires. Only the shape of the name is checked (no traversal out of the
+    root); whether the repo exists or may be dispatched into is sideclaw's call,
+    answered as a 4xx."""
     if not name or name in (".", "..") or name.startswith(".") or not set(name) <= _NAME_CHARS:
         raise UsageError(f"not a repo name: {name}")
+    return repos_root() / name
 
 
-def discoverable(root: Path, deny: set[str]) -> list[str]:
+def discoverable() -> list[str]:
+    """Git checkouts directly under the repos root — the vocabulary
+    `propose_mappings()` may map a signature to."""
+    root = repos_root()
     try:
         entries = sorted(os.listdir(root))
     except OSError:
         return []
-    out = []
-    for n in entries:
-        if n.startswith(".") or n in deny:
-            continue
-        p = root / n
-        if p.is_dir() and (p / ".git").exists():
-            out.append(n)
-    return out
-
-
-def resolve_repo(name: str, policy: dict[str, Any] | None = None) -> RepoTarget:
-    _validate_repo_name(name)
-
-    p = dispatch_policy_path()
-    if policy is None:
-        if not p.is_file():
-            raise PreconditionError(f"dispatch policy not found at {p}")
-        policy = load_dispatch_policy(p)
-
-    root: Path = policy["root"]
-    deny: set[str] = policy["deny"]
-    sensitive: set[str] = policy["sensitive"]
-    overrides: dict[str, str] = policy["overrides"]
-    default_tier: str = policy["default_tier"]
-
-    if name in deny and name not in sensitive:
-        raise PolicyError(f"repo '{name}' is not dispatchable: denied by policy")
-
-    path = root / name
-    real = Path(os.path.realpath(path))
-    if real.parent != root:
-        raise PolicyError(f"repo '{name}' resolves outside {root}")
-
-    if not real.is_dir() or not (real / ".git").exists():
-        if name in overrides:
-            raise PreconditionError(
-                f"repo '{name}' carries a tier in {p} but has no checkout under the dispatch root — "
-                "the policy names a repo this machine does not have"
-            )
-        raise UsageError(
-            f"repo '{name}' has no git checkout under the dispatch root "
-            f"(dispatchable: {', '.join(discoverable(root, deny))})"
-        )
-
-    tier = "investigate" if name in sensitive else overrides.get(name, default_tier)
-    return RepoTarget(name=name, path=real, max_tier=tier, sensitive=name in sensitive)
-
-
-def resolve_tier(requested: str, target: RepoTarget) -> str:
-    if requested not in VALID_TIERS:
-        raise UsageError(f"unknown tier: {requested} (must be one of: {', '.join(VALID_TIERS)})")
-
-    if target.sensitive and requested != "investigate":
-        raise PolicyError(
-            f"repo '{target.name}' is sensitive (secret-bearing) and only ever permits 'investigate'; "
-            f"'{requested}' was requested. A filed issue or a pushed branch has no safe artifact path "
-            "in a secret-bearing repo."
-        )
-
-    if tier_rank(requested) > tier_rank(target.max_tier):
-        raise PolicyError(
-            f"repo '{target.name}' is capped at tier '{target.max_tier}' by the dispatch policy; "
-            f"'{requested}' was requested"
-        )
-
-    return requested
+    return [n for n in entries
+            if not n.startswith(".") and (root / n).is_dir() and (root / n / ".git").exists()]
 
 
 def valid_origin(*, channel: str | None = None, thread_ts: str | None = None,

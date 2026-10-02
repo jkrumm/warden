@@ -148,9 +148,8 @@ def check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     A 403 carrying GitHub's own "Resource not accessible by personal access
     token" is raised as `CheckRunsUnreadable`, not a plain RemoteError: it means
     the credential lacks `Checks: read` (only reachable on a private repo), so
-    the caller — which is the only place that knows whether the repo's policy
-    declares `noCiRequired` — decides (§110). Every other non-200 stays a loud
-    refusal, and a token that cannot read checks must never read as green."""
+    the caller (`lifecycle/merge.py`) decides (§110). Every other non-200 stays a
+    loud refusal."""
     if not _SHA_RE.match(sha):
         raise PreconditionError(f"{sha!r} is not a 40-hex commit sha — refusing before the request")
     status, body = api("GET", f"/repos/{owner}/{repo}/commits/{sha}/check-runs")
@@ -282,7 +281,7 @@ def search_issues(*, owner: str, skip_label: str) -> list[dict[str, Any]]:
     `repo` in each returned dict is the SHORT name (`nameWithOwner`'s tail,
     read off `repository_url`, never the search hit's own `html_url`, which
     is not guaranteed to be parseable the same way) — the value
-    `open_origin_item()`/`policy.resolve_repo()` expect, not `owner/repo`.
+    `open_origin_item()` and `policy.repo_cwd()` expect, not `owner/repo`.
 
     `query` is percent-encoded before it ever reaches `api()` (`safe="+:"` so
     the `+` word-separators and `:` qualifier colons GitHub's search syntax
@@ -390,36 +389,26 @@ def create_issue_comment(repo_full: str, number: int, body: str) -> dict[str, An
 
 
 def branch_rules(owner: str, repo: str, branch: str) -> list[dict[str, Any]]:
-    """Every ruleset rule GitHub itself enforces on `branch` — the source of
-    truth for "does a human have to approve this", read instead of assumed
-    (§97: a local list saying a repo is PR-required was read as "needs human
-    review" while the ruleset required zero approvals).
+    """Every ruleset rule GitHub itself enforces on `branch` — read to pick a
+    merge method GitHub will accept (`pick_merge_method`), never to pre-empt
+    GitHub's own answer to the merge call.
 
     A `403` whose own text says the feature needs GitHub Pro on a private
     repository is not a refusal to read: rulesets are a paid feature there, so
     such a repo cannot have one and `[]` is the true answer, not a guess
-    (§108). Raising instead made `weatherorb` — private, `autoMergePaths:
-    ["**"]`, `autoDeploy` — permanently unmergeable: items 1276 and 1277
+    (§108). Raising instead made `weatherorb` — private, `autoDeploy` —
+    permanently unmergeable: items 1276 and 1277
     parked on this 403 while their step-7 reviews had already confirmed.
     Every other non-200 stays a loud refusal (a token that cannot read a
-    repository's rules must never read as "no rules"), and an unreadable
-    *classic* protection still cannot be ridden: `merge.plan_or_land()`
-    refuses `mergeable_state == "blocked"` and pins the head SHA on the merge
-    call, both read from GitHub's own verdict rather than this list."""
+    repository's rules must never read as "no rules"); an unreadable
+    *classic* protection is enforced by the merge call itself, which also
+    pins the head SHA."""
     status, body = api("GET", f"/repos/{owner}/{repo}/rules/branches/{branch}")
     if status == 403 and isinstance(body, dict) and _RULESETS_UNAVAILABLE_RE.search(body.get("message") or ""):
         return []
     if status != 200 or not isinstance(body, list):
         raise RemoteError(f"GitHub returned HTTP {status} reading the rules on {owner}/{repo}:{branch}")
     return body
-
-
-def required_approving_reviews(rules: list[dict[str, Any]]) -> int:
-    counts = [
-        int((r.get("parameters") or {}).get("required_approving_review_count") or 0)
-        for r in rules if r.get("type") == "pull_request"
-    ]
-    return max(counts, default=0)
 
 
 def pick_merge_method(repo_json: dict[str, Any], rules: list[dict[str, Any]] | None = None) -> str | None:

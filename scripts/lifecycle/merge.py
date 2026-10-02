@@ -3,9 +3,9 @@
 `run_deploy_if_enabled` (1839-1894).
 
 Land is the one door in this whole estate that changes what runs on a
-default branch, so it re-checks everything the episode was inspected under
-at dispatch time, against the CURRENT state of the pull request and the
-CURRENT policy — a stale record is a refusal, never a trust.
+default branch, so it re-checks the pull request's CURRENT state — a stale
+record is a refusal, never a trust. The gate itself is small: PR open, checks
+green (or none), review `confirmed`; GitHub's own rules answer at the merge call.
 
 `plan_or_land()` is confirm-gated: a plan (no `--confirm`) changes nothing.
 
@@ -19,7 +19,6 @@ their own external mutation with their own crash window.
 from __future__ import annotations
 
 import datetime as dt
-import fnmatch
 import json
 import os
 import re
@@ -30,16 +29,9 @@ from typing import Any, Callable
 
 from clients import github, rollout, sideclaw
 from clients.errors import (
-    CheckRunsUnreadable, PolicyError, PreconditionError, RemoteError, UsageError, WardenError,
+    CheckRunsUnreadable, PolicyError, PreconditionError, RemoteError, UsageError,
 )
 from lifecycle import chaos, operations, policy
-
-MAX_MERGE_FILES = 40
-MAX_MERGE_LINES = 2000
-
-# A dispatch may never change what runs in CI — merging one that does would
-# launder exactly that.
-_FORBIDDEN_PATH_RE = re.compile(r"^\.github/(workflows|actions)/")
 
 # `deployOnMerge` only fires once a real merge commit exists — a 40-hex sha,
 # never `None`/"" (both reject) nor a malformed one (present-but-wrong is a
@@ -99,10 +91,7 @@ class MergePlan:
             ],
             "wouldNeverDo": [
                 "never merge a pull request this bridge did not open",
-                "never merge where GitHub's own branch rules require an "
-                "approving review",
-                "never merge a fork branch, a retargeted base, or a change "
-                "touching .github/workflows",
+                "never merge a fork branch or a retargeted base",
                 "never override a failing check or a branch protection rule",
             ],
             "note": note,
@@ -147,112 +136,27 @@ class MergeResult:
         }
 
 
-# --- the merge gate: declared path scope, CI reality, step-7 validation ------
+# --- the merge gate: PR open, checks green, review confirmed ------------------
 #
-# Re-keyed off measured findings, not a redesign for its own sake (see the
-# bash version's own comment, 1711-1730, for the `mergeable_state == "clean"`
-# defect this replaced). The primary key is the policy entry's
-# `autoMergePaths` — EVERY changed path must match one, or refuse; no repo
-# gets an implicit allow by omission. `noCiRequired` is an explicit per-repo
-# acknowledgement that a repo has zero PR-time checks, so their absence is a
-# known condition rather than a silently-passed test.
-#
-# There is no path class an unattended merge may never touch any more. §99's
-# NEVER_AUTO_MERGE (Makefiles, CI, scripts, launchd, plists, Docker/compose,
-# manifests, lockfiles, env templates — "warden must not write the code it
-# then runs") was withdrawn by the owner on 2026-09-29, in words: the merge
-# must be effective, and a fix that stops at a draft PR because it touched a
-# Makefile is not (state-log §107). What is left of that invariant is the
-# one part he did not withdraw: the loop's own executor. `EXECUTOR_REPOS` is
-# code, not policy — an edit to `merge_approval` in the dispatch policy can
-# add a gated repo, never remove one of these three — and a gated repo gets
-# no scope at all, so nothing unattended ever lands there, whatever the path.
-EXECUTOR_REPOS: frozenset[str] = frozenset({"warden", "sideclaw", "dotfiles"})
-
-# What an unattended merge may touch in a repo whose policy entry declares no
-# `autoMergePaths` of its own and is not merge-approval gated (§99): anything.
-# The owner, twice on 2026-09-28 and again on 2026-09-29: fixes are reviewed,
-# merged, deployed and verified without him. The gate is the independent
-# step-7 review with the goal in hand, the implement tier's own pre-push
-# checks, CI where the repo has PR checks, GitHub's rules, and the liveness
-# probe plus synthetic trip after the deploy.
-DEFAULT_REPO_ENTRY: dict[str, Any] = {"autoMergePaths": ["**"], "noCiRequired": True}
+# That is all warden decides. GitHub's own rules (branch protection, rulesets,
+# required reviews and checks) are enforced by the merge API call itself and a
+# refusal there is reported (`github.merge_pr()` -> `PolicyError`), never
+# pre-empted by a local copy of the rule. No path scope, size ceiling, CI-file
+# rule or per-repo carve-out exists any more.
 
 
-def effective_repo_entry(repo: str) -> dict[str, Any]:
-    """The triage-policy entry a merge is judged against. Fails CLOSED on
-    the one fact that must never be guessed: a repo in `merge_approval`
-    (the loop's own executor — warden, sideclaw, dotfiles), or an unreadable
-    dispatch policy, gets NO default scope, so an unattended merge there is
-    refused by `merge_gate_check()` itself rather than only by triage's
-    routing (before §99 that routing was the only thing in the way, and it
-    failed open on an unreadable policy)."""
-    entry = policy.triage_repo_entry(repo)
-    if repo in EXECUTOR_REPOS:
-        gated = True
-    else:
-        try:
-            gated = policy.merge_needs_approval(policy.load_dispatch_policy(), repo)
-        except WardenError:
-            gated = True
-    if gated:
-        # Checked FIRST and unconditionally: an `autoMergePaths` someone adds
-        # for a gated repo later must not open the loop's own executor (§102).
-        return {k: v for k, v in entry.items() if k != "autoMergePaths"}
-    return entry if entry.get("autoMergePaths") else {**DEFAULT_REPO_ENTRY, **entry}
-
-
-# The authorizer that is Johannes himself: an Argo click (tailnet-only —
-# DESIGN.md § 2026-09-15 override). NOT `cli:confirm`: an episode's Bash can
-# run `warden merge --confirm` too — `require_no_recursion()`'s env markers are
-# one `env -u` away (AGENTS.md: "an episode is not contained") — so a CLI
-# confirmation is never allowed to skip the unattended gate.
-OWNER_AUTHORIZERS = ("owner:argo",)
-
-
-def merge_gate_check(
-    *, repo: str, entry: dict[str, Any], files: list[dict[str, Any]],
-    check_runs: list[dict[str, Any]], validation: str | None, owner_approved: bool = False,
-) -> None:
-    """`owner_approved` (§94): the owner merging stands in for the unattended
-    path scope (`autoMergePaths`) and the "zero check-runs needs
-    noCiRequired" acknowledgement — nothing else. A confirmed step-7 review
-    is still required of him, a failing check still refuses him, and the
-    CI-definition-path and size ceilings are enforced by plan_or_land()
-    before this function runs. Before §94 the documented approval path for
-    the merge-approval repos refused every time: none declares a scope."""
-    paths = entry.get("autoMergePaths")
-    if not owner_approved:
-        if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
-            raise PolicyError(
-                f"no autoMergePaths declared for '{repo}' — path scope is the primary "
-                f"merge gate now; nothing merges without an explicit declared scope."
-            )
-
-        filenames = [f.get("filename") for f in files if f.get("filename")]
-        bad = [fn for fn in filenames if not any(fnmatch.fnmatch(fn, p) for p in paths)]
-        if bad:
-            raise PolicyError(
-                f"{repo}'s pull request touches path(s) outside the auto-merge scope: "
-                f"{', '.join(bad)}."
-            )
-    if not check_runs:
-        if not entry.get("noCiRequired") and not owner_approved:
-            raise PolicyError(
-                f"{repo}'s head commit has zero CI check-runs and '{repo}' has no "
-                f"noCiRequired acknowledgement in the triage policy. A repo with no "
-                f"required checks must FAIL this gate, not pass it silently."
-            )
-    else:
-        bad_runs = [
-            str(r.get("name")) for r in check_runs
-            if r.get("status") != "completed"
-            or r.get("conclusion") not in ("success", "neutral", "skipped")
-        ]
-        if bad_runs:
-            raise PolicyError(
-                f"{repo}'s CI has not passed cleanly on the head commit: {', '.join(bad_runs)}."
-            )
+def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation: str | None) -> None:
+    """Checks green — or none exist, which passes — and the step-7 review
+    `confirmed`. "PR open" is read off the pull request by `plan_or_land()`."""
+    bad_runs = [
+        str(r.get("name")) for r in check_runs
+        if r.get("status") != "completed"
+        or r.get("conclusion") not in ("success", "neutral", "skipped")
+    ]
+    if bad_runs:
+        raise PolicyError(
+            f"{repo}'s CI has not passed cleanly on the head commit: {', '.join(bad_runs)}."
+        )
 
     if validation != "confirmed":
         raise PolicyError(
@@ -431,14 +335,6 @@ def plan_or_land(
             f"request in '{url_repo}'."
         )
 
-    target = policy.resolve_repo(repo)
-    if policy.tier_rank(target.max_tier) < policy.tier_rank("implement"):
-        raise PolicyError(
-            f"{repo}'s ceiling is now '{target.max_tier}', below the implement tier that "
-            f"produced this pull request. The policy changed after the episode ran; that "
-            f"is a refusal, not a stale record."
-        )
-
     pr = github.read_pr(owner, repo, pr_number)
     repo_json = github.read_repo(owner, repo)
 
@@ -467,17 +363,10 @@ def plan_or_land(
     if default_branch is None:
         raise RemoteError(f"GitHub's repo response for {owner}/{repo} has no default branch")
 
-    # A gate is what GitHub enforces, not what a list or a verdict says it
-    # does (§97). pr-required-repos.json means "no direct push to master" —
-    # a PR is exactly that workflow — and was read here as "a human must
-    # approve", parking rollhook#26 on a ruleset requiring zero approvals.
+    # The rules are read only to pick a merge method GitHub will accept
+    # (`pick_merge_method`). Whether they ALLOW this merge is GitHub's answer
+    # to the merge call, reported as-is — never pre-empted here (§97).
     rules = github.branch_rules(owner, repo, default_branch)
-    reviews_needed = github.required_approving_reviews(rules)
-    if reviews_needed > 0:
-        raise PolicyError(
-            f"GitHub's rules on {owner}/{repo}:{default_branch} require {reviews_needed} approving "
-            f"review(s) — read from the ruleset, not assumed. A human approves this one on GitHub."
-        )
 
     if pr_merged:
         raise PolicyError(f"{owner}/{repo}#{pr_number} is already merged.")
@@ -500,55 +389,22 @@ def plan_or_land(
             f"was never inspected by the episode and is never merged here."
         )
     lines = pr_add + pr_del
-    if pr_files_n > MAX_MERGE_FILES:
-        raise PolicyError(
-            f"{owner}/{repo}#{pr_number} touches {pr_files_n} files, over the "
-            f"{MAX_MERGE_FILES}-file ceiling. The episode was held to that ceiling, so "
-            f"something has been pushed to the branch since."
-        )
-    if lines > MAX_MERGE_LINES:
-        raise PolicyError(
-            f"{owner}/{repo}#{pr_number} is {lines} changed lines, over the "
-            f"{MAX_MERGE_LINES}-line ceiling. The episode was held to that ceiling, so "
-            f"something has been pushed to the branch since."
-        )
 
     files = github.pr_files(owner, repo, pr_number)
-    # CI definitions: refused for the loop's own executor even on the owner's
-    # click (an Actions change there is a change to what runs warden's own
-    # code); everywhere else a workflow is a fix like any other since §107.
-    forbidden = [
-        f.get("filename") for f in files
-        if repo in EXECUTOR_REPOS and f.get("filename") and _FORBIDDEN_PATH_RE.match(f["filename"])
-    ]
-    if forbidden:
-        raise PolicyError(
-            f"{owner}/{repo}#{pr_number} touches CI definitions ({', '.join(forbidden)}). "
-            f"A dispatch may never change what runs in CI, and merging one that does "
-            f"would launder exactly that."
-        )
 
     try:
         runs = github.check_runs(owner, repo, pr_head_sha)
     except CheckRunsUnreadable as e:
         # A fine-grained PAT without `Checks: read` cannot read a private
         # repository's check-runs at all (§110: `weatherorb`), so this is the
-        # credential's limit, not a verdict on the diff. Only the repo's own
-        # `noCiRequired` acknowledgement may read it as "no CI gate here" —
-        # without that declaration the refusal stands exactly as before — and
-        # GitHub's own `mergeable_state == "blocked"` below still catches a
-        # required check that is unmet, which is why this cannot ride one.
-        if not effective_repo_entry(repo).get("noCiRequired"):
-            raise
+        # credential's limit, not a verdict on the diff. Read as "no checks to
+        # gate on", recorded in the merge receipt; GitHub's own required checks
+        # are still enforced by the merge call below.
         runs = []
         checks_unreadable = str(e)
     else:
         checks_unreadable = None
-    merge_gate_check(
-        repo=repo, entry=effective_repo_entry(repo), files=files,
-        check_runs=runs, validation=validation_status,
-        owner_approved=authorized_by in OWNER_AUTHORIZERS,
-    )
+    merge_gate_check(repo=repo, check_runs=runs, validation=validation_status)
 
     method = github.pick_merge_method(repo_json, rules)
     if method is None:
@@ -647,17 +503,6 @@ def plan_or_land(
             f"{owner}/{repo}#{pr_number} is not mergeable (state: {state_now}) — usually "
             f"a conflict with {default_branch}."
         )
-    if state_now == "blocked":
-        # GitHub's own verdict on every protection that applies, classic
-        # branch protection included — which the rulesets endpoint read above
-        # does not report (§102). A required review or check that is unmet
-        # shows here, whatever produced it.
-        operations.complete(conn, merge_op, outcome="failed")
-        raise PolicyError(
-            f"{owner}/{repo}#{pr_number} is blocked by GitHub (mergeable_state=blocked): a required "
-            f"review or status check is unmet. Read from GitHub, not assumed."
-        )
-
     # The head SHA is pinned: every check above was made against it, so a
     # push that lands between the inspection and this call must fail the
     # merge, not ride it.
@@ -699,9 +544,8 @@ def plan_or_land(
     operations.complete(conn, merge_op, outcome="done", receipt=json.dumps({
         "pullRequest": pr_number, "mergeCommit": merge_sha, "branch": pr_head,
         "branchDeleted": deleted, "mergeMethod": method, "title": pr_title,
-        # Only set when the checks read was refused by the credential and the
-        # repo's own `noCiRequired` carried the gate (§110). A skipped gate is
-        # recorded, never silent.
+        # Only set when the checks read was refused by the credential (§110).
+        # A skipped gate is recorded, never silent.
         "checkRunsUnreadable": checks_unreadable,
     }))
 

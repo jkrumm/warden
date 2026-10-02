@@ -26,7 +26,6 @@ import tempfile
 import traceback
 import types
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -38,8 +37,7 @@ try:
     import lifecycle.policy  # noqa: F401, E402
 except ModuleNotFoundError:
     _stub = types.ModuleType("lifecycle.policy")
-    for _name in ("resolve_repo", "tier_rank", "triage_repo_entry", "triage_policy_path",
-                  "load_dispatch_policy", "merge_needs_approval"):
+    for _name in ("triage_repo_entry", "triage_policy_path"):
         def _unset(*_a, _n=_name, **_k):
             raise NotImplementedError(f"lifecycle.policy.{_n} stub called without a test override")
         setattr(_stub, _name, _unset)
@@ -118,15 +116,6 @@ _DEFAULT_REPO = {
     "default_branch": "master",
     "allow_squash_merge": True, "allow_rebase_merge": True, "allow_merge_commit": True,
 }
-_TIER_RANK = {"none": 0, "investigate": 1, "implement": 2, "admin": 3}
-
-
-@dataclass
-class _RepoTarget:
-    name: str
-    path: str
-    max_tier: str
-    sensitive: bool
 
 
 @contextmanager
@@ -146,11 +135,8 @@ def fakes(**overrides):
         "contents": {},
         "actions_runs": [],
         "actions_runs_error": None,
-        "entry": {"autoMergePaths": ["**"], "noCiRequired": True},
-        "max_tier": "implement",
+        "entry": {},
         "branch_rules": [],
-        "gated": False,
-        "dispatch_policy_error": None,
         "mark_ready_error": None,
         "mark_ready_fn": None,
         "merge_pr_error": None,
@@ -213,24 +199,9 @@ def fakes(**overrides):
             return state["rollout_run_fn"](key, timeout_s=timeout_s)
         return state["rollout_result"]
 
-    def _resolve_repo(repo):
-        record("resolve_repo", repo)
-        return _RepoTarget(name=repo, path=f"/tmp/{repo}", max_tier=state["max_tier"], sensitive=False)
-
-    def _tier_rank(name):
-        return _TIER_RANK.get(name, -1)
-
     def _branch_rules(owner, repo, branch):
         record("branch_rules", owner, repo, branch)
         return list(state["branch_rules"])
-
-    def _load_dispatch_policy(path=None):
-        if state["dispatch_policy_error"]:
-            raise state["dispatch_policy_error"]
-        return {"merge_approval": {"gamma"} if state["gated"] else set()}
-
-    def _merge_needs_approval(pol, repo):
-        return repo in pol.get("merge_approval", set())
 
     def _triage_repo_entry(repo):
         record("triage_repo_entry", repo)
@@ -250,12 +221,8 @@ def fakes(**overrides):
         (github, "contents", _contents),
         (github, "actions_runs", _actions_runs),
         (rollout, "run", _rollout_run),
-        (lifecycle.policy, "resolve_repo", _resolve_repo),
-        (lifecycle.policy, "tier_rank", _tier_rank),
         (github, "branch_rules", _branch_rules),
         (lifecycle.policy, "triage_repo_entry", _triage_repo_entry),
-        (lifecycle.policy, "load_dispatch_policy", _load_dispatch_policy),
-        (lifecycle.policy, "merge_needs_approval", _merge_needs_approval),
         (lifecycle.policy, "triage_policy_path", _triage_policy_path),
     ]
     saved = [(m, n, getattr(m, n)) for m, n, _ in patches]
@@ -290,7 +257,23 @@ def _assert_refuses(*, exc_type, msg, job_id=JOB_ID, seed=None, fake=None):
         conn.close()
 
 
-# --- (a) the 18 one-condition refusals, each inert -----------------------------
+def _assert_refuses_as(authorized_by, *, msg, seed=None, fake=None):
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, **(seed or {}))
+        with fakes(**(fake or {})) as fx:
+            try:
+                _land(conn, authorized_by=authorized_by)
+            except PolicyError as e:
+                assert msg in str(e), f"{msg!r} not in {e!r}"
+            else:
+                raise AssertionError(f"expected PolicyError containing {msg!r}")
+            assert "merge_pr" not in fx.calls
+    finally:
+        conn.close()
+
+
+# --- (a) the one-condition refusals, each inert -----------------------------
 
 def test_unknown_job_id_refuses():
     _assert_refuses(exc_type=PreconditionError, msg="no dispatch recorded with job id",
@@ -324,13 +307,28 @@ def test_record_disagrees_with_itself_refuses():
                      seed={"artifact": "https://github.com/jkrumm/alpha/pull/7"})
 
 
-def test_repo_ceiling_below_implement_refuses():
-    _assert_refuses(exc_type=PolicyError, msg="ceiling is now", fake={"max_tier": "investigate"})
-
-
-def test_github_ruleset_requiring_a_review_refuses():
+def test_github_ruleset_requiring_a_review_is_githubs_call_not_a_local_pre_check():
+    """GitHub's rules are enforced by the merge call itself and a refusal there is
+    reported as-is. warden no longer reads the ruleset to pre-empt it: the merge is
+    attempted, GitHub's 405 comes back as a PolicyError and the operation is failed."""
     rules = [{"type": "pull_request", "parameters": {"required_approving_review_count": 1}}]
-    _assert_refuses(exc_type=PolicyError, msg="require 1 approving review", fake={"branch_rules": rules})
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        refusal = PolicyError("GitHub refused the merge (405): the pull request is not mergeable under "
+                              "this repo's rules. Nothing was merged.")
+        with fakes(branch_rules=rules, merge_pr_error=refusal) as fx:
+            try:
+                _land(conn)
+            except PolicyError as e:
+                assert "GitHub refused the merge (405)" in str(e), e
+            else:
+                raise AssertionError("expected GitHub's refusal to be reported")
+        assert fx.calls.get("merge_pr"), "the merge call is the check — it must be made"
+        assert _op_row(conn)["outcome"] == "failed"
+        assert _merged_at(conn) is None
+    finally:
+        conn.close()
 
 
 def test_github_ruleset_requiring_zero_reviews_is_not_a_human_gate():
@@ -346,18 +344,17 @@ def test_github_ruleset_requiring_zero_reviews_is_not_a_human_gate():
     assert fx.calls["merge_pr"][0][1]["method"] != "merge", "linear history rules out a merge commit"
 
 
-def test_unreadable_check_runs_merges_when_the_repo_declares_no_ci():
+def test_unreadable_check_runs_read_as_no_checks_and_are_recorded():
     """§110 — `weatherorb` is private and the loop's fine-grained PAT carries no
     `Checks: read`, so the read 403s for a reason that belongs to the credential,
-    not to the diff. Where the repo's own policy declares `noCiRequired` the CI
-    gate is GitHub's own `mergeable_state` (still enforced below), so the merge
-    proceeds — and the operations receipt records that the read was unavailable,
-    because a gate that was skipped must never look like one that passed."""
+    not to the diff. It reads as "no checks to gate on" (GitHub's own required
+    checks still decide at the merge call), and the operations receipt records
+    that the read was unavailable, because a gate that was skipped must never look
+    like one that passed."""
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn, validation_status="confirmed")
-        with fakes(check_runs_error=github.CheckRunsUnreadable("GitHub returned HTTP 403 reading check-runs"),
-                   entry={"autoMergePaths": ["**"], "noCiRequired": True}) as fx:
+        with fakes(check_runs_error=github.CheckRunsUnreadable("GitHub returned HTTP 403 reading check-runs")) as fx:
             result = _land(conn, why="w", authorized_by="owner:argo")
         assert result.merged
         assert fx.calls["merge_pr"]
@@ -365,15 +362,6 @@ def test_unreadable_check_runs_merges_when_the_repo_declares_no_ci():
         assert receipt.get("checkRunsUnreadable"), "the audit trail must record the unreadable read"
     finally:
         conn.close()
-
-
-def test_unreadable_check_runs_refuses_without_a_no_ci_acknowledgement():
-    """§110 — the tolerance is the repo's own declaration, never the token's
-    convenience: without `noCiRequired` an unreadable CI read refuses exactly as
-    a generic remote failure would, and nothing is marked ready or merged."""
-    _assert_refuses(exc_type=github.CheckRunsUnreadable, msg="403",
-                    fake={"check_runs_error": github.CheckRunsUnreadable("GitHub returned HTTP 403"),
-                          "entry": {"autoMergePaths": ["**"]}})
 
 
 def test_pull_request_closed_refuses():
@@ -401,32 +389,22 @@ def test_head_is_fork_refuses():
                                                             "repo": {"full_name": "someone-else/gamma"}}}})
 
 
-def test_over_file_ceiling_refuses():
-    _assert_refuses(exc_type=PolicyError, msg="over the", fake={"pr": {**_DEFAULT_PR, "changed_files": 99}})
-
-
-def test_over_line_ceiling_refuses():
-    _assert_refuses(exc_type=PolicyError, msg="over the", fake={"pr": {**_DEFAULT_PR, "additions": 4000}})
-
-
-def test_touches_ci_definitions_refuses_only_for_the_executor_repos():
-    """§107: a workflow change merges in any other repo (the owner withdrew the
-    CI-path rule with NEVER_AUTO_MERGE); in warden/sideclaw/dotfiles it still
-    refuses, and refuses the owner's own click too — that part he kept."""
-    for repo in sorted(merge.EXECUTOR_REPOS):
-        pr = {**_DEFAULT_PR, "head": {**_DEFAULT_PR["head"], "repo": {"full_name": f"jkrumm/{repo}"}}}
-        _assert_refuses(exc_type=PolicyError, msg="CI definitions",
-                         seed={"repo": repo, "artifact": f"https://github.com/jkrumm/{repo}/pull/7"},
-                         fake={"pr": pr, "files": [{"filename": ".github/workflows/ci.yml"}],
-                               "gated": True})
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn, validation_status="confirmed")
-        with fakes(files=[{"filename": ".github/workflows/ci.yml"}]) as fx:
-            assert _land(conn, why="w", authorized_by="auto-from-item").merged
-        assert "merge_pr" in fx.calls
-    finally:
-        conn.close()
+def test_size_and_ci_definition_changes_are_not_gates_in_any_repo():
+    """No diff-size ceiling and no `.github` path rule: a large diff touching CI
+    definitions merges in any repo, the loop's own executors included, when the
+    PR is open, checks are green and the review confirmed."""
+    for repo in ("gamma", "warden", "sideclaw", "dotfiles"):
+        conn = _fresh_ledger()
+        try:
+            _seed_pr_dispatch(conn, repo=repo, validation_status="confirmed",
+                              artifact=f"https://github.com/jkrumm/{repo}/pull/7")
+            pr = {**_DEFAULT_PR, "changed_files": 99, "additions": 4000,
+                  "head": {**_DEFAULT_PR["head"], "repo": {"full_name": f"jkrumm/{repo}"}}}
+            with fakes(pr=pr, files=[{"filename": ".github/workflows/ci.yml"}]) as fx:
+                assert _land(conn, why="w", authorized_by="auto-from-item").merged, repo
+            assert "merge_pr" in fx.calls, repo
+        finally:
+            conn.close()
 
 
 def test_no_merge_method_allowed_refuses():
@@ -571,11 +549,10 @@ def test_happy_path_merges():
         conn.close()
 
 
-def test_owner_cli_confirm_lands_a_merge_approval_gated_repo_without_revalidating():
+def test_owner_cli_confirm_lands_a_confirmed_dispatch_without_revalidating():
     """The owner's manual land path (`warden merge <job> --why --confirm`, i.e.
     `plan_or_land(authorized_by="cli:confirm")`) lands a dispatch whose
-    `validation_status` is already `confirmed` — the exact state the
-    merge-approval gate leaves a gated repo in. It re-checks the merge gate
+    `validation_status` is already `confirmed`. It re-checks the merge gate
     (which reads the stored `validation_status`) and never re-opens a review,
     and the merge operation records `authorized_by="cli:confirm"`."""
     conn = _fresh_ledger()
@@ -633,50 +610,24 @@ def test_merge_operation_recorded_before_mark_ready_for_review():
 
 # --- merge_gate_check, direct -------------------------------------------------------
 
-def test_gate_refuses_without_autoMergePaths():
-    try:
-        merge.merge_gate_check(repo="gamma", entry={}, files=[], check_runs=[], validation="confirmed")
-    except PolicyError as e:
-        assert "no autoMergePaths declared" in str(e)
-    else:
-        raise AssertionError("expected PolicyError")
+def test_gate_no_checks_passes():
+    """No check-runs at all is not a refusal — there is nothing to be red."""
+    merge.merge_gate_check(repo="gamma", check_runs=[], validation="confirmed")
 
 
-def test_gate_refuses_path_outside_scope():
-    try:
-        merge.merge_gate_check(
-            repo="gamma", entry={"autoMergePaths": ["docs/**"]},
-            files=[{"filename": "src/x.py"}],
-            check_runs=[{"name": "build", "status": "completed", "conclusion": "success"}],
-            validation="confirmed",
-        )
-    except PolicyError as e:
-        assert "outside the auto-merge scope" in str(e)
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_gate_refuses_zero_ci_without_ack():
-    try:
-        merge.merge_gate_check(repo="gamma", entry={"autoMergePaths": ["**"]}, files=[],
-                                check_runs=[], validation="confirmed")
-    except PolicyError as e:
-        assert "zero CI check-runs" in str(e)
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_gate_zero_ci_with_ack_passes():
-    merge.merge_gate_check(repo="gamma", entry={"autoMergePaths": ["**"], "noCiRequired": True},
-                            files=[], check_runs=[], validation="confirmed")
+def test_gate_green_checks_pass():
+    merge.merge_gate_check(
+        repo="gamma", validation="confirmed",
+        check_runs=[{"name": "a", "status": "completed", "conclusion": "success"},
+                    {"name": "b", "status": "completed", "conclusion": "skipped"},
+                    {"name": "c", "status": "completed", "conclusion": "neutral"}])
 
 
 def test_gate_refuses_failing_check_run():
     try:
         merge.merge_gate_check(
-            repo="gamma", entry={"autoMergePaths": ["**"], "noCiRequired": True}, files=[],
+            repo="gamma", validation="confirmed",
             check_runs=[{"name": "build", "status": "completed", "conclusion": "failure"}],
-            validation="confirmed",
         )
     except PolicyError as e:
         assert "has not passed cleanly" in str(e)
@@ -684,10 +635,19 @@ def test_gate_refuses_failing_check_run():
         raise AssertionError("expected PolicyError")
 
 
+def test_gate_refuses_pending_check_run():
+    try:
+        merge.merge_gate_check(repo="gamma", validation="confirmed",
+                               check_runs=[{"name": "build", "status": "in_progress", "conclusion": None}])
+    except PolicyError as e:
+        assert "has not passed cleanly" in str(e) and "build" in str(e)
+    else:
+        raise AssertionError("expected PolicyError")
+
+
 def test_gate_refuses_validation_disagreed():
     try:
-        merge.merge_gate_check(repo="gamma", entry={"autoMergePaths": ["**"], "noCiRequired": True},
-                                files=[], check_runs=[], validation="disagreed")
+        merge.merge_gate_check(repo="gamma", check_runs=[], validation="disagreed")
     except PolicyError as e:
         assert "has not confirmed" in str(e) and "disagreed" in str(e)
     else:
@@ -696,8 +656,7 @@ def test_gate_refuses_validation_disagreed():
 
 def test_gate_refuses_validation_missing():
     try:
-        merge.merge_gate_check(repo="gamma", entry={"autoMergePaths": ["**"], "noCiRequired": True},
-                                files=[], check_runs=[], validation=None)
+        merge.merge_gate_check(repo="gamma", check_runs=[], validation=None)
     except PolicyError as e:
         assert "(none)" in str(e)
     else:
@@ -706,67 +665,30 @@ def test_gate_refuses_validation_missing():
 
 # --- the gate, wired through plan_or_land -------------------------------------------
 
-def test_plan_or_land_refuses_no_autoMergePaths():
-    """A merge-approval repo (the loop's own executor) never gets the default
-    scope, so an unattended merge there is refused by the gate itself (§99)."""
-    _assert_refuses(exc_type=PolicyError, msg="no autoMergePaths declared", fake={"entry": {}, "gated": True})
-
-
-def test_unreadable_dispatch_policy_fails_closed():
-    _assert_refuses(exc_type=PolicyError, msg="no autoMergePaths declared",
-                     fake={"entry": {}, "dispatch_policy_error": PreconditionError("unreadable")})
-
-
-def test_ungated_repo_without_an_entry_gets_the_default_scope():
-    conn = _fresh_ledger()
-    _seed_pr_dispatch(conn, validation_status="confirmed")
-    with fakes(entry={}, files=[{"filename": "src/x.py"}]):
-        result = _land(conn, why="w", authorized_by="auto-from-item")
-    assert result.merged
-
-
-def test_deploy_definitions_merge_unattended_in_an_ungated_repo():
-    """§107 — the owner withdrew NEVER_AUTO_MERGE on 2026-09-29: a Makefile,
-    a CI workflow, a plist, a lockfile or a manifest is a fix like any other
-    in a repo that is not the loop's own executor. Until then every one of
-    these paths refused with 'NEVER_AUTO_MERGE' inside an explicit `**` scope;
-    that expectation is the old rule, not a weakened test."""
+def test_any_path_merges_without_a_per_repo_policy_entry():
+    """No declared scope, no per-repo carve-out: a Makefile, a CI workflow, a
+    plist, a lockfile or a manifest is a fix like any other, in every repo, for
+    an unattended merge and for the owner's alike."""
     for path in ("Makefile", "scripts/deploy.sh", "package.json", "bun.lock", "launchd/x.plist",
                  "compose.yml", "apps/api/Dockerfile", ".env.tpl", ".github/workflows/ci.yml",
-                 "pyproject.toml", "ops/com.example.job.plist"):
-        conn = _fresh_ledger()
-        try:
-            _seed_pr_dispatch(conn, validation_status="confirmed")
-            with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True},
-                       files=[{"filename": path}]) as fx:
-                result = _land(conn, why="w", authorized_by="auto-from-item")
-            assert result.merged, path
-            assert "merge_pr" in fx.calls, path
-        finally:
-            conn.close()
+                 "pyproject.toml", "ops/com.example.job.plist", "src/x.py"):
+        for authorized_by in ("auto-from-item", "owner:argo", "cli:confirm"):
+            conn = _fresh_ledger()
+            try:
+                _seed_pr_dispatch(conn, validation_status="confirmed")
+                with fakes(entry={}, files=[{"filename": path}]) as fx:
+                    result = _land(conn, why="w", authorized_by=authorized_by)
+                assert result.merged, (path, authorized_by)
+                assert "merge_pr" in fx.calls, (path, authorized_by)
+            finally:
+                conn.close()
 
 
-def test_owner_merge_passes_any_path():
-    merge.merge_gate_check(repo="gamma", entry={}, files=[{"filename": "Makefile"}], check_runs=[],
-                           validation="confirmed", owner_approved=True)
-
-
-def test_plan_or_land_refuses_path_outside_scope():
-    _assert_refuses(exc_type=PolicyError, msg="outside the auto-merge scope",
-                     fake={"entry": {"autoMergePaths": ["docs/**"], "noCiRequired": True},
-                           "files": [{"filename": "src/x.py"}]})
-
-
-def test_plan_or_land_refuses_zero_ci_no_ack():
-    _assert_refuses(exc_type=PolicyError, msg="zero CI check-runs",
-                     fake={"entry": {"autoMergePaths": ["**"]}, "check_runs": []})
-
-
-def test_plan_or_land_zero_ci_with_ack_merges():
+def test_plan_or_land_zero_ci_merges():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True}, check_runs=[]):
+        with fakes(check_runs=[]):
             result = _land(conn)
         assert result.merged is True
     finally:
@@ -793,7 +715,7 @@ def test_plan_or_land_double_confirm_race_two_connections():
     conn2 = ledger.connect(db_path, migrate=False)
     conn2.execute("PRAGMA busy_timeout=200")  # fail fast rather than hang the suite
     try:
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True}, check_runs=[]):
+        with fakes(check_runs=[]):
             try:
                 _land(conn2)
             except sqlite3.OperationalError as e:
@@ -808,7 +730,7 @@ def test_plan_or_land_double_confirm_race_two_connections():
 
     conn3 = ledger.connect(db_path, migrate=False)
     try:
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True}, check_runs=[]):
+        with fakes(entry={}, check_runs=[]):
             try:
                 _land(conn3)
             except PolicyError as e:
@@ -824,19 +746,19 @@ def test_plan_or_land_double_confirm_race_two_connections():
 def test_plan_or_land_refuses_failing_ci():
     _assert_refuses(
         exc_type=PolicyError, msg="has not passed cleanly",
-        fake={"entry": {"autoMergePaths": ["**"], "noCiRequired": True},
+        fake={"entry": {},
               "check_runs": [{"name": "build", "status": "completed", "conclusion": "failure"}]},
     )
 
 
 def test_plan_or_land_refuses_validation_disagreed():
     _assert_refuses(exc_type=PolicyError, msg="has not confirmed", seed={"validation_status": "disagreed"},
-                     fake={"entry": {"autoMergePaths": ["**"], "noCiRequired": True}})
+                     fake={"entry": {}})
 
 
 def test_plan_or_land_refuses_validation_missing():
     _assert_refuses(exc_type=PolicyError, msg="(none)", seed={"validation_status": None},
-                     fake={"entry": {"autoMergePaths": ["**"], "noCiRequired": True}})
+                     fake={"entry": {}})
 
 
 # --- deploy: autoDeploy --------------------------------------------------------------
@@ -845,7 +767,7 @@ def test_autodeploy_runs_rollout_with_key():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "autoDeploy": True,
+        with fakes(entry={"autoDeploy": True,
                            "deploy": "hyperdx-apply"}) as fx:
             result = _land(conn)
         assert fx.calls["rollout_run"][0][0][0] == "hyperdx-apply"
@@ -869,7 +791,7 @@ def test_autodeploy_operation_recorded_before_rollout_runs():
             seen["exists_open"] = row is not None and row["outcome"] is None
             return rollout.RolloutResult(True, 0, "ok")
 
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "autoDeploy": True,
+        with fakes(entry={"autoDeploy": True,
                            "deploy": "hyperdx-apply"}, rollout_run_fn=_spy):
             _land(conn)
         assert seen.get("exists_open") is True
@@ -882,7 +804,7 @@ def test_autodeploy_expected_alerts_from_contents():
     try:
         _seed_pr_dispatch(conn)
         alert_bytes = json.dumps({"name": "cpu-high", "threshold": 90, "thresholdType": "gt"}).encode()
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "autoDeploy": True,
+        with fakes(entry={"autoDeploy": True,
                            "deploy": "hyperdx-apply"},
                    files=[{"filename": "observability/alerts/cpu.json"}],
                    contents={"observability/alerts/cpu.json": alert_bytes}):
@@ -897,7 +819,7 @@ def test_autodeploy_rollout_failure_marks_op_failed():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "autoDeploy": True,
+        with fakes(entry={"autoDeploy": True,
                            "deploy": "hyperdx-apply"},
                    rollout_result=rollout.RolloutResult(False, 1, "boom")):
             result = _land(conn)
@@ -911,7 +833,7 @@ def test_autodeploy_no_key_declared():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "autoDeploy": True}):
+        with fakes(entry={"autoDeploy": True}):
             result = _land(conn)
         assert result.deploy["attempted"] is False
         assert "no deploy key is declared" in result.deploy["reason"]
@@ -924,7 +846,7 @@ def test_autodeploy_key_not_in_allowlist():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "autoDeploy": True,
+        with fakes(entry={"autoDeploy": True,
                            "deploy": "not-a-real-key"}):
             result = _land(conn)
         assert result.deploy["attempted"] is False
@@ -940,7 +862,7 @@ def test_deploy_on_merge_queries_actions_runs():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "deployOnMerge": True},
+        with fakes(entry={"deployOnMerge": True},
                    merge_resp={"sha": _FULL_SHA},
                    actions_runs=[{"id": 1, "name": "deploy", "status": "completed",
                                    "conclusion": "success", "html_url": "https://x"}]):
@@ -957,7 +879,7 @@ def test_deploy_on_merge_no_runs_leaves_op_open():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "deployOnMerge": True},
+        with fakes(entry={"deployOnMerge": True},
                    merge_resp={"sha": _FULL_SHA}, actions_runs=[]):
             result = _land(conn)
         assert result.deploy.get("note") == "no Actions run visible yet"
@@ -970,7 +892,7 @@ def test_deploy_on_merge_actions_runs_remote_error():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "deployOnMerge": True},
+        with fakes(entry={"deployOnMerge": True},
                    merge_resp={"sha": _FULL_SHA}, actions_runs_error=RemoteError("timeout")):
             result = _land(conn)
         assert result.deploy["attempted"] is False
@@ -985,7 +907,7 @@ def test_deploy_on_merge_ignored_without_full_sha():
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True, "deployOnMerge": True}):
+        with fakes(entry={"deployOnMerge": True}):
             result = _land(conn)
         assert result.deploy["attempted"] is False
         assert "autoDeploy is false" in result.deploy["reason"]
@@ -1095,7 +1017,7 @@ def test_merge_plan_to_json_shape():
     assert data["needsConfirm"] is True
     assert data["mergeMethod"] == "squash"
     assert len(data["wouldDo"]) == 3
-    assert len(data["wouldNeverDo"]) == 4
+    assert len(data["wouldNeverDo"]) == 3
     assert "Re-invoke with --confirm" in data["note"]
     assert "verb" not in data and "ok" not in data
 
@@ -1163,79 +1085,38 @@ def main() -> int:
 
 
 
-def test_owner_approved_merge_skips_only_scope_and_zero_ci():
-    """§94, narrowed on review: the owner stands in for the auto-merge scope
-    and the zero-CI acknowledgement — never for the step-7 review or a failing
-    check. Before §94 a merge-approval repo (no scope by design) refused every
-    owner merge."""
-    merge.merge_gate_check(repo="dotfiles", entry={}, files=[{"filename": "scripts/x.sh"}],
-                           check_runs=[], validation="confirmed", owner_approved=True)
-    for runs, validation, needle in (
-        ([], "blocked", "validation has not confirmed"),
-        ([{"name": "ci", "status": "completed", "conclusion": "failure"}], "confirmed", "CI has not passed"),
-    ):
-        try:
-            merge.merge_gate_check(repo="dotfiles", entry={}, files=[], check_runs=runs,
-                                   validation=validation, owner_approved=True)
-        except PolicyError as e:
-            assert needle in str(e), str(e)
-        else:
-            raise AssertionError(f"owner merge must still refuse: {needle}")
-    try:
-        merge.merge_gate_check(repo="dotfiles", entry={}, files=[], check_runs=[], validation="confirmed")
-    except PolicyError as e:
-        assert "no autoMergePaths" in str(e)
-    else:
-        raise AssertionError("an unattended merge without scope must refuse")
-    assert merge.OWNER_AUTHORIZERS == ("owner:argo",), (
-        "only the Argo click is the owner: an episode can run `warden merge --confirm` itself")
+def test_owner_confirm_gets_the_same_shrunk_gate_not_a_bypass():
+    """`warden merge --confirm` (cli) and the Argo click (`owner:argo`) go through
+    exactly the gate an unattended merge does: a missing/unconfirmed review or a
+    failing check still refuses, whoever asks."""
+    for authorized_by in ("cli:confirm", "owner:argo"):
+        _assert_refuses_as(authorized_by, msg="has not confirmed", seed={"validation_status": "blocked"})
+        _assert_refuses_as(authorized_by, msg="has not passed cleanly",
+                           fake={"check_runs": [{"name": "ci", "status": "completed", "conclusion": "failure"}]})
 
 
-def test_gated_repo_with_an_explicit_scope_still_refuses_unattended():
-    """§102: the executor gate is checked before any autoMergePaths."""
-    _assert_refuses(exc_type=PolicyError, msg="no autoMergePaths declared",
-                     fake={"entry": {"autoMergePaths": ["**"], "noCiRequired": True}, "gated": True})
-
-
-def test_github_blocked_state_refuses_whatever_produced_it():
-    """Classic branch protection is not in the rulesets endpoint; GitHub's
-    mergeable_state=blocked is, and it refuses the land."""
+def test_github_blocked_state_is_reported_from_the_merge_call_not_pre_empted():
+    """A `blocked` mergeable_state (classic branch protection, an unmet required
+    review or check) is no longer refused by a local pre-check: the merge call is
+    made, GitHub refuses it (405) and that refusal is reported, op failed."""
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn)
-        with fakes(pr={**_DEFAULT_PR, "mergeable": True, "mergeable_state": "blocked"}) as fx:
+        refusal = PolicyError("GitHub refused the merge (405): the pull request is not mergeable under "
+                              "this repo's rules. Nothing was merged.")
+        with fakes(pr={**_DEFAULT_PR, "mergeable": True, "mergeable_state": "blocked"},
+                   merge_pr_error=refusal) as fx:
             try:
                 _land(conn)
             except PolicyError as e:
-                assert "mergeable_state=blocked" in str(e), str(e)
+                assert "GitHub refused the merge (405)" in str(e), str(e)
             else:
                 raise AssertionError("a blocked PR must not merge")
-            # A draft only reports `blocked` once it is ready for review, so the
-            # check runs after that mutation — and before any merge.
-            assert "merge_pr" not in fx.calls
+        assert fx.calls.get("merge_pr"), "the merge call is the check"
+        assert _op_row(conn)["outcome"] == "failed"
     finally:
         conn.close()
 
-
-def test_executor_repos_are_gated_in_code_not_only_in_the_dispatch_policy():
-    """§107: with NEVER_AUTO_MERGE gone, the executor gate is the one invariant
-    left, and it must not depend on `merge_approval` in a policy file staying
-    intact. Even when the dispatch policy gates nothing, warden, sideclaw and
-    dotfiles get no scope — an explicit `**` in their triage entry included."""
-    assert merge.EXECUTOR_REPOS == frozenset({"warden", "sideclaw", "dotfiles"})
-    for repo in sorted(merge.EXECUTOR_REPOS):
-        with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True}, gated=False):
-            entry = merge.effective_repo_entry(repo)
-        assert "autoMergePaths" not in entry, repo
-        try:
-            merge.merge_gate_check(repo=repo, entry=entry, files=[{"filename": "README.md"}],
-                                   check_runs=[], validation="confirmed")
-        except PolicyError as e:
-            assert "no autoMergePaths" in str(e), str(e)
-        else:
-            raise AssertionError(f"{repo} must never merge unattended")
-    with fakes(entry={"autoMergePaths": ["**"], "noCiRequired": True}, gated=False):
-        assert merge.effective_repo_entry("gamma").get("autoMergePaths") == ["**"]
 
 if __name__ == "__main__":
     sys.exit(main())

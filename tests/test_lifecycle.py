@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from lifecycle import dispatch, operations, policy  # noqa: E402
 from clients import sideclaw  # noqa: E402
-from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError  # noqa: E402
+from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError  # noqa: E402
 
 _ledger_spec = importlib.util.spec_from_file_location("ledger", REPO / "scripts" / "ledger.py")
 ledger = importlib.util.module_from_spec(_ledger_spec)
@@ -103,21 +103,6 @@ def _write_json(data) -> Path:
     return p
 
 
-def _dispatch_root_with_repo(name: str = "warden", tier: str = "implement"):
-    root = _tmp_dir("lifecycle-root-")
-    (root / name / ".git").mkdir(parents=True)
-    policy_path = root / "dispatch-repos.json"
-    policy_path.write_text(
-        json.dumps({"root": str(root), "defaultTier": tier, "deny": [], "sensitive": [], "tiers": {}}),
-        encoding="utf-8",
-    )
-    return root, policy_path
-
-
-def _target(name="warden", tier="implement", sensitive=False, path=None) -> policy.RepoTarget:
-    return policy.RepoTarget(name=name, path=path or Path(f"/tmp/{name}"), max_tier=tier, sensitive=sensitive)
-
-
 def _seed_triage_item(conn, event_id, *, repo, state, dispatch_job=None, max_tier=None):
     now = _now().isoformat()
     if max_tier is None:
@@ -164,263 +149,44 @@ def _expect(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"expected {exc_type.__name__} from {fn}")
 
 
-# --- policy: load_dispatch_policy() malformed shapes --------------------------
+# --- policy: repo_cwd() / discoverable() ---------------------------------------
+# No repo/tier policy lives here any more: sideclaw is the only boundary. These
+# only pin the one path the wire protocol still needs and its name-shape guard.
 
-def test_load_dispatch_policy_unknown_tier_key():
-    p = _write_json({"root": "/tmp", "tiers": {"bogus": ["x"]}})
-    try:
-        policy.load_dispatch_policy(p)
-    except PreconditionError as e:
-        assert "unknown tier" in str(e), e
-    else:
-        raise AssertionError("expected PreconditionError")
+def test_repo_cwd_is_root_slash_name():
+    with _env(WARDEN_REPOS_ROOT="/tmp/repos-root"):
+        assert policy.repo_cwd("warden") == Path("/tmp/repos-root/warden")
 
 
-def test_load_dispatch_policy_bad_default_tier():
-    p = _write_json({"root": "/tmp", "defaultTier": "bogus"})
-    try:
-        policy.load_dispatch_policy(p)
-    except PreconditionError as e:
-        assert "unrecognized defaultTier" in str(e), e
-    else:
-        raise AssertionError("expected PreconditionError")
+def test_repo_cwd_default_root_is_source_root():
+    with _env(WARDEN_REPOS_ROOT=None):
+        assert policy.repo_cwd("warden") == Path(os.path.expanduser("~/SourceRoot")) / "warden"
 
 
-def test_load_dispatch_policy_deny_and_tiers_contradiction():
-    p = _write_json({"root": "/tmp", "deny": ["x"], "tiers": {"investigate": ["x"]}})
-    try:
-        policy.load_dispatch_policy(p)
-    except PreconditionError as e:
-        assert "named in both `deny` and `tiers`" in str(e), e
-    else:
-        raise AssertionError("expected PreconditionError")
+def test_repo_cwd_does_not_check_existence_or_allowlist():
+    """Whether the repo exists / may be dispatched is sideclaw's call (a 4xx)."""
+    with _env(WARDEN_REPOS_ROOT="/nonexistent-root"):
+        assert policy.repo_cwd("homelab-private") == Path("/nonexistent-root/homelab-private")
 
 
-def test_load_dispatch_policy_sensitive_not_in_deny():
-    p = _write_json({"root": "/tmp", "deny": [], "sensitive": ["x"]})
-    try:
-        policy.load_dispatch_policy(p)
-    except PreconditionError as e:
-        assert "named in `sensitive` but not in `deny`" in str(e), e
-    else:
-        raise AssertionError("expected PreconditionError")
+def test_repo_cwd_rejects_dot_dotdot_hidden_and_traversal_names():
+    for bad in ("", ".", "..", ".hidden", "a/b", "../x", "a b", "x\n"):
+        _expect(UsageError, policy.repo_cwd, bad)
 
 
-# NOTE: a `sensitive`+`tiers` contradiction on the SAME name is unreachable
-# through this function given the two checks ahead of it: `sensitive` must be
-# a subset of `deny` (or the "not in `deny`" check above fires first), and
-# `deny`+`tiers` on the same name fires before this one ever gets a chance to
-# — so a name cannot reach the `both_sensitive` check without one of the
-# earlier two already having refused it. This mirrors the retired bash CLI's own
-# check order exactly (the same three checks, same sequence); it is not a
-# porting defect, and no fixture exists that exercises the third branch on
-# its own.
-
-
-def test_load_dispatch_policy_unparseable_json_says_could_not_parse():
-    p = _tmp_dir("lifecycle-badjson-") / "f.json"
-    p.write_text("{not json", encoding="utf-8")
-    try:
-        policy.load_dispatch_policy(p)
-    except PreconditionError as e:
-        assert "could not parse" in str(e), e
-    else:
-        raise AssertionError("expected PreconditionError")
-
-
-def test_load_dispatch_policy_merge_approval_non_list_rejects():
-    p = _write_json({"root": "/tmp", "merge_approval": "warden"})
-    try:
-        policy.load_dispatch_policy(p)
-    except PreconditionError as e:
-        assert "`merge_approval` is not a list of repo names" in str(e), e
-    else:
-        raise AssertionError("expected PreconditionError")
-
-
-def test_load_dispatch_policy_merge_approval_non_string_entry_rejects():
-    p = _write_json({"root": "/tmp", "merge_approval": ["warden", 3]})
-    try:
-        policy.load_dispatch_policy(p)
-    except PreconditionError as e:
-        assert "`merge_approval` is not a list of repo names" in str(e), e
-    else:
-        raise AssertionError("expected PreconditionError")
-
-
-def test_load_dispatch_policy_merge_approval_parses_into_set():
-    p = _write_json({"root": "/tmp", "merge_approval": ["sideclaw", "warden", "dotfiles"]})
-    pol = policy.load_dispatch_policy(p)
-    assert pol["merge_approval"] == {"sideclaw", "warden", "dotfiles"}, pol["merge_approval"]
-
-
-def test_load_dispatch_policy_merge_approval_in_deny_is_not_a_contradiction():
-    """A repo named in BOTH `merge_approval` and `deny`/`tiers` is allowed —
-    the two lists answer different questions (what tier an episode runs at vs
-    whether the LAND step is self-authorized). Only a malformed value refuses."""
-    p = _write_json({"root": "/tmp", "deny": ["dotfiles"], "merge_approval": ["dotfiles"]})
-    pol = policy.load_dispatch_policy(p)
-    assert "dotfiles" in pol["merge_approval"] and "dotfiles" in pol["deny"]
-
-
-def test_merge_needs_approval_listed_repo_is_true_unknown_is_false():
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": "/tmp", "merge_approval": ["sideclaw", "warden", "dotfiles"]})
-    )
-    assert policy.merge_needs_approval(pol, "warden") is True
-    assert policy.merge_needs_approval(pol, "sideclaw") is True
-    assert policy.merge_needs_approval(pol, "some-other-repo") is False
-
-
-def test_merge_needs_approval_handles_policy_without_the_key():
-    """A hand-built policy dict (no `merge_approval` key at all) must read as
-    'not gated', not raise."""
-    empty = {"root": Path("/tmp"), "default_tier": "investigate", "deny": set(),
-             "sensitive": set(), "overrides": {}}
-    assert policy.merge_needs_approval(empty, "warden") is False
-
-
-# --- policy: resolve_repo() / resolve_tier() -----------------------------------
-
-def test_resolve_repo_discovers_undeclared_repo_with_default_tier():
+def test_discoverable_lists_git_checkouts_under_the_root():
     root = _tmp_dir("lifecycle-root-")
     (root / "alpha" / ".git").mkdir(parents=True)
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": str(root), "defaultTier": "author", "deny": [], "sensitive": [], "tiers": {}})
-    )
-    target = policy.resolve_repo("alpha", pol)
-    assert target.max_tier == "author", target
-    assert target.sensitive is False
-    assert target.path == Path(os.path.realpath(root / "alpha"))
+    (root / "beta").mkdir()                       # no .git
+    (root / ".hidden" / ".git").mkdir(parents=True)
+    (root / "file.txt").write_text("x")
+    with _env(WARDEN_REPOS_ROOT=str(root)):
+        assert policy.discoverable() == ["alpha"]
 
 
-def test_resolve_repo_denied_by_policy():
-    root = _tmp_dir("lifecycle-root-")
-    (root / "secret" / ".git").mkdir(parents=True)
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": str(root), "defaultTier": "implement", "deny": ["secret"], "sensitive": [], "tiers": {}})
-    )
-    try:
-        policy.resolve_repo("secret", pol)
-    except PolicyError as e:
-        assert "denied by policy" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_resolve_repo_unknown_name_lists_dispatchable():
-    root = _tmp_dir("lifecycle-root-")
-    (root / "alpha" / ".git").mkdir(parents=True)
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": str(root), "defaultTier": "implement", "deny": [], "sensitive": [], "tiers": {}})
-    )
-    try:
-        policy.resolve_repo("ghost", pol)
-    except UsageError as e:
-        assert "dispatchable: alpha" in str(e), e
-    else:
-        raise AssertionError("expected UsageError")
-
-
-def test_resolve_repo_ghost_named_in_tiers_raises_precondition():
-    root = _tmp_dir("lifecycle-root-")
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": str(root), "defaultTier": "implement", "deny": [], "sensitive": [],
-                     "tiers": {"investigate": ["ghost"]}})
-    )
-    try:
-        policy.resolve_repo("ghost", pol)
-    except PreconditionError as e:
-        assert "does not have" in str(e), e
-    else:
-        raise AssertionError("expected PreconditionError")
-
-
-def test_resolve_repo_rejects_dot_dotdot_hidden_and_traversal_names():
-    empty_policy = {"root": Path("/tmp"), "default_tier": "investigate", "deny": set(),
-                     "sensitive": set(), "overrides": {}}
-    for bad in (".", "..", ".git", "../x", "a/b", "a b", ""):
-        try:
-            policy.resolve_repo(bad, empty_policy)
-        except UsageError:
-            continue
-        raise AssertionError(f"expected UsageError for {bad!r}")
-
-
-def test_resolve_repo_symlink_outside_root_is_denied():
-    root = _tmp_dir("lifecycle-root-")
-    outside = _tmp_dir("lifecycle-outside-")
-    (outside / ".git").mkdir(parents=True)
-    (root / "linked").symlink_to(outside, target_is_directory=True)
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": str(root), "defaultTier": "implement", "deny": [], "sensitive": [], "tiers": {}})
-    )
-    try:
-        policy.resolve_repo("linked", pol)
-    except PolicyError as e:
-        assert "resolves outside" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_resolve_repo_policy_missing_raises_precondition():
-    missing = _tmp_dir("lifecycle-nopolicy-") / "nope.json"
-    with _env(WARDEN_DISPATCH_REPOS=str(missing)):
-        try:
-            policy.resolve_repo("warden")
-        except PreconditionError as e:
-            assert "dispatch policy not found" in str(e), e
-        else:
-            raise AssertionError("expected PreconditionError")
-
-
-def test_resolve_tier_beta_capped_via_tiers():
-    root = _tmp_dir("lifecycle-root-")
-    (root / "beta" / ".git").mkdir(parents=True)
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": str(root), "defaultTier": "implement", "deny": [], "sensitive": [],
-                     "tiers": {"investigate": ["beta"]}})
-    )
-    target = policy.resolve_repo("beta", pol)
-    assert target.max_tier == "investigate"
-    try:
-        policy.resolve_tier("implement", target)
-    except PolicyError as e:
-        assert "capped at tier" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_resolve_tier_sensitive_repo_above_investigate_refused():
-    root = _tmp_dir("lifecycle-root-")
-    (root / "vault" / ".git").mkdir(parents=True)
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": str(root), "defaultTier": "implement", "deny": ["vault"], "sensitive": ["vault"], "tiers": {}})
-    )
-    target = policy.resolve_repo("vault", pol)
-    assert target.sensitive is True and target.max_tier == "investigate"
-    try:
-        policy.resolve_tier("author", target)
-    except PolicyError as e:
-        assert "sensitive" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-    assert policy.resolve_tier("investigate", target) == "investigate"
-
-
-def test_resolve_tier_unknown_tier_raises_usage_error():
-    target = _target(tier="implement")
-    _expect(UsageError, policy.resolve_tier, "bogus", target)
-
-
-def test_resolve_tier_default_tier_used_for_undeclared_name():
-    root = _tmp_dir("lifecycle-root-")
-    (root / "gamma" / ".git").mkdir(parents=True)
-    pol = policy.load_dispatch_policy(
-        _write_json({"root": str(root), "defaultTier": "implement", "deny": [], "sensitive": [], "tiers": {}})
-    )
-    target = policy.resolve_repo("gamma", pol)
-    assert policy.resolve_tier("implement", target) == "implement"
+def test_discoverable_missing_root_is_empty():
+    with _env(WARDEN_REPOS_ROOT="/nonexistent-root"):
+        assert policy.discoverable() == []
 
 
 # --- policy: valid_origin() ----------------------------------------------------
@@ -718,7 +484,7 @@ def test_open_episode_ungated_has_no_operation_row():
     conn, _ = _fresh_ledger()
     with _patch(sideclaw, "submit", lambda **kw: {"id": "j-invest", "status": "running"}):
         opened = dispatch.open_episode(
-            conn, target=_target(tier="investigate"), tier="investigate", brief="do it", context=None,
+            conn, repo="warden", tier="investigate", brief="do it", context=None,
             why=None, model=None, origin=dispatch.Origin(), authorized_by=None,
         )
     assert opened.op_id is None
@@ -742,7 +508,7 @@ def test_open_episode_refuses_inside_a_claude_code_session():
         with _patch(sideclaw, "submit", _unexpected_submit):
             try:
                 dispatch.open_episode(
-                    conn, target=_target(tier="investigate"), tier="investigate", brief="do it",
+                    conn, repo="warden", tier="investigate", brief="do it",
                     context=None, why=None, model=None, origin=dispatch.Origin(), authorized_by=None,
                 )
             except PolicyError as e:
@@ -778,7 +544,7 @@ def test_open_episode_per_repo_lock_race_two_connections():
     conn2.execute("PRAGMA busy_timeout=200")  # fail fast rather than hang the suite
     try:
         dispatch.open_episode(
-            conn2, target=_target(), tier="implement", brief="do it", context=None, why="w",
+            conn2, repo="warden", tier="implement", brief="do it", context=None, why="w",
             model=None, origin=dispatch.Origin(), authorized_by="U2",
         )
     except sqlite3.OperationalError as e:
@@ -798,7 +564,7 @@ def test_open_episode_per_repo_lock_race_two_connections():
     try:
         try:
             dispatch.open_episode(
-                conn3, target=_target(), tier="implement", brief="do it", context=None, why="w",
+                conn3, repo="warden", tier="implement", brief="do it", context=None, why="w",
                 model=None, origin=dispatch.Origin(), authorized_by="U3",
             )
         except PolicyError as e:
@@ -816,7 +582,7 @@ def test_open_episode_gated_requires_authorized_by():
     conn, _ = _fresh_ledger()
     try:
         dispatch.open_episode(
-            conn, target=_target(), tier="implement", brief="do it", context=None, why="w",
+            conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
             model=None, origin=dispatch.Origin(), authorized_by=None,
         )
     except ValueError as e:
@@ -835,7 +601,7 @@ def test_open_episode_gated_records_operation_before_submit():
 
     with _patch(sideclaw, "submit", fake_submit):
         opened = dispatch.open_episode(
-            conn, target=_target(), tier="implement", brief="do it", context=None, why="w",
+            conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
             model=None, origin=dispatch.Origin(), authorized_by="U1",
         )
     assert seen["ops"] == 1, "the operation row must exist before submit() is called"
@@ -849,7 +615,7 @@ def test_open_episode_remote_error_marks_operation_failed():
     with _patch(sideclaw, "submit", _raiser(RemoteError("boom"))):
         try:
             dispatch.open_episode(
-                conn, target=_target(), tier="implement", brief="do it", context=None, why="w",
+                conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
                 model=None, origin=dispatch.Origin(), authorized_by="U1",
             )
         except RemoteError:
@@ -865,7 +631,7 @@ def test_open_episode_remote_error_maybe_mutated_marks_operation_unknown():
     with _patch(sideclaw, "submit", _raiser(RemoteError("boom", maybe_mutated=True))):
         try:
             dispatch.open_episode(
-                conn, target=_target(), tier="implement", brief="do it", context=None, why="w",
+                conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
                 model=None, origin=dispatch.Origin(), authorized_by="U1",
             )
         except RemoteError:
@@ -876,11 +642,47 @@ def test_open_episode_remote_error_maybe_mutated_marks_operation_unknown():
     assert op["outcome"] == "unknown", dict(op)
 
 
+def test_open_episode_submits_the_composed_cwd_and_no_sensitive_or_model_key():
+    """A dispatch names the repo; warden composes only the cwd and sends no
+    `sensitive` (sideclaw derives it) and no `model` unless the owner passed one."""
+    conn, _ = _fresh_ledger()
+    sent: list[dict] = []
+
+    def _submit(**kw):
+        sent.append(kw)
+        return {"id": "j-cwd", "status": "running"}
+
+    with _env(WARDEN_REPOS_ROOT="/tmp/repos-root"), _patch(sideclaw, "submit", _submit):
+        dispatch.open_episode(
+            conn, repo="warden", tier="investigate", brief="do it", context=None, why=None,
+            origin=dispatch.Origin(), authorized_by=None,
+        )
+    assert sent == [{"cwd": "/tmp/repos-root/warden", "tier": "investigate", "brief": "do it",
+                     "context": None, "model": None}], sent
+
+
+def test_open_episode_submit_refused_marks_operation_failed_not_unknown():
+    conn, _ = _fresh_ledger()
+    with _patch(sideclaw, "submit", _raiser(SubmitRefused("sideclaw refused the job (HTTP 400): nope", status=400))):
+        try:
+            dispatch.open_episode(
+                conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
+                origin=dispatch.Origin(), authorized_by="U1",
+            )
+        except SubmitRefused as e:
+            assert e.status == 400 and "nope" in str(e), e
+        else:
+            raise AssertionError("expected SubmitRefused")
+    op = conn.execute("SELECT * FROM operations WHERE repo='warden'").fetchone()
+    assert op["outcome"] == "failed", dict(op)
+    assert conn.execute("SELECT COUNT(*) FROM dispatches").fetchone()[0] == 0
+
+
 def test_open_episode_status_comes_from_job_not_a_literal():
     conn, _ = _fresh_ledger()
     with _patch(sideclaw, "submit", lambda **kw: {"id": "j-status", "status": "pending"}):
         dispatch.open_episode(
-            conn, target=_target(tier="investigate"), tier="investigate", brief="do it", context=None,
+            conn, repo="warden", tier="investigate", brief="do it", context=None,
             why=None, model=None, origin=dispatch.Origin(), authorized_by=None,
         )
     row = conn.execute("SELECT status FROM dispatches WHERE job_id='j-status'").fetchone()

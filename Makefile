@@ -140,16 +140,6 @@ unload:
 # status
 # ---------------------------------------------------------------------------
 
-# The two copies of the dispatch policy — sideclaw's, which is the boundary, and
-# hermes-agent's, which is defence in depth — are meant to agree, and nothing
-# else notices when they stop. Drift here does not read as an error; it reads as
-# working, right up until the boundary admits something the control plane
-# believes it forbids.
-.PHONY: check-policy
-check-policy:
-	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
-	@"$(PY)" "$(WARDEN_REPO)/scripts/check-dispatch-policy.py"
-
 # The dispatch/review verdict schema versions this warden pins
 # (clients/sideclaw.py) against what the running sideclaw actually serves —
 # see check-schema-versions.py's own docstring for why "unreachable" is not a
@@ -158,16 +148,6 @@ check-policy:
 check-schemas:
 	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
 	@"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py"
-
-# Any operator-set model override (triage.py's AUTO_DISPATCH_MODEL /
-# TRIAGE_VALIDATION_DISPATCH_MODEL — both default to None, "sideclaw routes
-# the tier") against what sideclaw's live routing table (server/lib/routing.ts,
-# GET /api/routing) actually routes those tools to — same honesty rule:
-# unreachable is not a failure, a genuine model mismatch is.
-.PHONY: check-routing
-check-routing:
-	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
-	@"$(PY)" "$(WARDEN_REPO)/scripts/check-routing.py"
 
 .PHONY: status
 status:
@@ -213,16 +193,8 @@ status:
 	else \
 		echo "✗ unreachable (is com.jkrumm.warden-api loaded?)"; \
 	fi
-	@printf '  %-24s ' "policy"; \
-	if out=$$("$(PY)" "$(WARDEN_REPO)/scripts/check-dispatch-policy.py" 2>&1); then \
-		echo "$$out" | grep -E '^(✓|✗)' | head -1 | sed 's/^ *//'; \
-	else \
-		echo "DISAGREES with sideclaw — run 'make check-policy'"; \
-	fi
 	@printf '  %-24s ' "sideclaw schemas"; \
 	"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py" 2>&1 | head -1
-	@printf '  %-24s ' "routing"; \
-	"$(PY)" "$(WARDEN_REPO)/scripts/check-routing.py" 2>&1 | head -1
 	@printf '  %-24s ' "ledger"; \
 	if [ -f "$(WARDEN_HOME)/warden.db" ]; then \
 		ls -lh "$(WARDEN_HOME)/warden.db" | awk '{print $$5, $$6, $$7, $$8}'; \

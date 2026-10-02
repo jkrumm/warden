@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 # scripts/ (this file's own directory) onto sys.path so `clients` is
-# importable as a real package, same pattern check-dispatch-policy.py uses.
+# importable as a real package.
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))

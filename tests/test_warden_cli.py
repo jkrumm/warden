@@ -60,7 +60,6 @@ class Harness:
         self.pr_required_json = self._write_json(
             "pr-required.json", {"repos": []}
         )
-        self.repos_json = self._write_repos_json()
         self.triage_policy_json = self._write_triage_policy()
 
         for name in ("alpha", "gamma", "secretrepo", "capped"):
@@ -92,19 +91,10 @@ class Harness:
         p.write_text(text, encoding="utf-8")
         return p
 
-    def _write_repos_json(self) -> Path:
-        return self._write_json("dispatch-repos.json", {
-            "root": str(self.repos_root),
-            "defaultTier": "investigate",
-            "deny": ["secretrepo"],
-            "sensitive": ["secretrepo"],
-            "tiers": {"implement": ["gamma"]},
-        })
-
     def _write_triage_policy(self) -> Path:
         return self._write_json("triage-policy.json", {
             "repos": {
-                "gamma": {"autoMergePaths": ["**"], "noCiRequired": True, "autoDeploy": False},
+                "gamma": {"autoDeploy": False},
             }
         })
 
@@ -128,7 +118,7 @@ class Harness:
             "HOME": str(self.home),
             "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
             "WARDEN_DB": str(db or self.new_db()),
-            "WARDEN_DISPATCH_REPOS": str(self.repos_json),
+            "WARDEN_REPOS_ROOT": str(self.repos_root),
             "WARDEN_TRIAGE_POLICY": str(self.triage_policy_json),
             "WARDEN_CLI_LOG": str(log or self.new_log("audit")),
             "WARDEN_SECRETS_RUN": str(self.secrets_run),
@@ -325,13 +315,6 @@ def test_brief_file_is_read_instead_of_stdin():
 # --- repo resolution -------------------------------------------------------------
 
 
-def test_unknown_repo_lists_dispatchable():
-    h = Harness()
-    proc = h.run(["dispatch", "does-not-exist", "--json"], stdin=VALID_BRIEF)
-    out = _json_or_fail(proc)
-    assert proc.returncode == 64 and "alpha" in out["error"], out
-
-
 def test_repo_name_traversal_is_rejected():
     h = Harness()
     proc = h.run(["dispatch", "../etc", "--json"], stdin=VALID_BRIEF)
@@ -339,27 +322,53 @@ def test_repo_name_traversal_is_rejected():
     assert proc.returncode == 64 and "not a repo name" in out["error"], out
 
 
-def test_denied_and_sensitive_repo_permits_investigate_only():
+def test_dispatch_names_the_repo_and_sends_cwd_only_no_policy_keys():
+    """warden decides nothing about repo/tier: any name is submitted as
+    `<root>/<name>`, with no `sensitive` and no `model` key."""
     h = Harness()
     srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-s", "status": "running"}})})
     try:
-        ok = h.run(["dispatch", "secretrepo", "--json"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
-        refused = h.run(["dispatch", "secretrepo", "--tier", "author", "--json"], stdin=VALID_BRIEF)
+        proc = h.run(["dispatch", "secretrepo", "--tier", "author", "--json"],
+                     env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
-    assert ok.returncode == 0, ok.stderr
-    ref_out = _json_or_fail(refused)
-    assert refused.returncode == 4 and "sensitive" in ref_out["error"], ref_out
+    assert proc.returncode == 0, proc.stderr
+    params = srv.requests[0]["body"]["params"]
+    assert params == {"cwd": str(h.repos_root / "secretrepo"), "tier": "author", "brief": VALID_BRIEF}, params
 
 
-# --- tier gating -----------------------------------------------------------------
-
-
-def test_tier_over_repo_ceiling_is_refused():
+def test_dispatch_dry_run_carries_no_repo_ceiling():
     h = Harness()
-    proc = h.run(["dispatch", "alpha", "--tier", "implement", "--json"], stdin=VALID_BRIEF)
+    proc = h.run(["dispatch", "alpha", "--tier", "implement", "--dry-run", "--json"], stdin=VALID_BRIEF)
     out = _json_or_fail(proc)
-    assert proc.returncode == 4 and "capped at tier" in out["error"], out
+    assert proc.returncode == 0 and out["dryRun"] is True and "repoMaxTier" not in out, out
+    assert out["cwd"] == str(h.repos_root / "alpha"), out
+
+
+# --- tier vocabulary + sideclaw is the only boundary ------------------------------
+
+
+def test_unknown_tier_is_a_usage_error():
+    h = Harness()
+    proc = h.run(["dispatch", "alpha", "--tier", "bogus", "--json"], stdin=VALID_BRIEF)
+    out = _json_or_fail(proc)
+    assert proc.returncode == 64 and "unknown tier" in out["error"], out
+
+
+def test_sideclaw_refusal_is_reported_verbatim_and_exits_4():
+    """A 4xx on submit is sideclaw refusing (allowlist / tier ceiling): its own
+    message reaches the caller, exit 4 — and warden never decided it locally."""
+    h = Harness()
+    msg = "dispatch refused: tier 'implement' exceeds the ceiling 'investigate' for repo 'alpha'"
+    srv = stubs.StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": msg})})
+    try:
+        proc = h.run(["dispatch", "alpha", "--tier", "implement", "--json"],
+                     env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 4 and msg in out["error"], out
+    assert len(srv.requests) == 1, "a refusal is never retried"
 
 
 # --- json contract ---------------------------------------------------------------
@@ -399,8 +408,12 @@ def test_audit_log_gets_one_line_per_invocation():
 def test_audit_log_records_refused_dispatch():
     h = Harness()
     log = h.new_log("audit-refused")
-    env = h.base_env(log=log)
-    h.run(["dispatch", "alpha", "--tier", "implement", "--json"], env=env, stdin=VALID_BRIEF)
+    srv = stubs.StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": "dispatch refused: nope"})})
+    try:
+        h.run(["dispatch", "alpha", "--tier", "implement", "--json"],
+              env=h.base_env(log=log, sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
     line = log.read_text(encoding="utf-8").strip()
     assert "verb=dispatch" in line and "mode=refused" in line and "rc=4" in line, line
 

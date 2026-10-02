@@ -164,7 +164,7 @@ def _available_actions(state: str, mergeable: bool = False) -> list[str]:
     if state in _IMPLEMENT_STATES:
         actions.append("implement")
     # `mergeable`: a PR whose step-7 review confirmed — the one needs_human
-    # shape an owner merge can land (a merge-approval repo's fix).
+    # shape an owner merge can land.
     if state in _MERGE_STATES or (mergeable and state == _ledger.STATE_NEEDS_HUMAN):
         actions.append("merge")
     if state in _DISMISS_STATES:

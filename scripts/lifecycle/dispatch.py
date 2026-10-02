@@ -97,14 +97,14 @@ def _insert_dispatch_row(
 def open_episode(
     conn: sqlite3.Connection,
     *,
-    target: policy.RepoTarget,
+    repo: str,
     tier: str,
     brief: str,
     context: str | None,
     why: str | None,
-    model: str | None,
     origin: Origin,
     authorized_by: str | None,
+    model: str | None = None,
     now: dt.datetime | None = None,
 ) -> Opened:
     """Submit one sideclaw episode and record it.
@@ -137,12 +137,12 @@ def open_episode(
             # The loop's own claimed item (already flipped to `implementing`
             # by the caller, e.g. maybe_auto_implement()'s compare-and-set,
             # BEFORE it calls this function) must not refuse itself.
-            policy.check_repo_not_in_flight(conn, repo=target.name, exclude_event_id=origin.event_id)
+            policy.check_repo_not_in_flight(conn, repo=repo, exclude_event_id=origin.event_id)
             opened_op_id = operations.record(
                 conn,
                 event_id=origin.event_id,
                 kind="implement",
-                repo=target.name,
+                repo=repo,
                 authorized_by=authorized_by,
                 commit=False,
             )
@@ -154,11 +154,10 @@ def open_episode(
 
     try:
         job = sideclaw.submit(
-            cwd=str(target.path),
+            cwd=str(policy.repo_cwd(repo)),
             tier=tier,
             brief=brief,
             context=context,
-            sensitive=target.sensitive,
             model=model,
         )
     except RemoteError as exc:
@@ -175,7 +174,7 @@ def open_episode(
 
     job_id = job["id"]
     status = job.get("status") or "unknown"
-    _insert_dispatch_row(conn, job_id=job_id, tier=tier, repo=target.name, brief=brief, why=why,
+    _insert_dispatch_row(conn, job_id=job_id, tier=tier, repo=repo, brief=brief, why=why,
                          origin=origin, status=status, now=now)
     conn.commit()
 
@@ -188,7 +187,7 @@ def open_episode(
 def open_review(
     conn: sqlite3.Connection,
     *,
-    target: policy.RepoTarget,
+    repo: str,
     pr: int,
     context: str | None,
     origin: Origin,
@@ -214,10 +213,10 @@ def open_review(
     instead."""
     policy.require_no_recursion()
     now = now or dt.datetime.now(dt.timezone.utc)
-    job = sideclaw.submit_review(cwd=target.path, pr=pr, context=context, model=model)
+    job = sideclaw.submit_review(cwd=policy.repo_cwd(repo), pr=pr, context=context, model=model)
     job_id = job["id"]
     status = job.get("status") or "unknown"
-    _insert_dispatch_row(conn, job_id=job_id, tier="review", repo=target.name,
+    _insert_dispatch_row(conn, job_id=job_id, tier="review", repo=repo,
                          brief=f"review PR #{pr}", why=None, origin=origin, status=status, now=now)
     conn.commit()
     return Opened(job=job, job_id=job_id, op_id=None)

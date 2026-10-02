@@ -56,10 +56,24 @@ class CheckRunsUnreadable(RemoteError):
     `weatherorb`).
 
     Its own class because this is a fact about the token, not about the commit,
-    and the *caller* owns the answer: only a repo whose own policy declares
-    `noCiRequired` may read an unreadable CI read as "there is no CI gate here"
-    (`lifecycle/merge.py`). Everywhere else it refuses exactly like any other
-    non-200."""
+    and the *caller* owns the answer: `lifecycle/merge.py` reads it as "no
+    checks to gate on" and records the skip in the merge receipt — GitHub's own
+    required checks still decide at the merge call."""
+
+
+class SubmitRefused(RemoteError):
+    """sideclaw answered a job submit with a 4xx: it REFUSED (repo outside its
+    allowlist, tier above the repo's ceiling, unknown model, bad params). The
+    same submit will be refused again, so a caller ends the item with
+    `str(exc)` and never retries; a 5xx or a connection failure stays a plain
+    `RemoteError` and keeps its retry behaviour. Exits 4 like any other
+    refusal, so the CLI contract for "refused" does not move."""
+
+    exit_code = 4
+
+    def __init__(self, *args: object, status: int) -> None:
+        super().__init__(*args)
+        self.status = status
 
 
 class PolicyError(WardenError):

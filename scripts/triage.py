@@ -144,9 +144,8 @@ get wrong), `map` (append a rule — a wrong mapping costs at most one wasted
 read-only `investigate` episode, bounded and visible), or `unsure` (leave
 unmapped, and record the attempt so it is not re-billed on every run for
 `PROPOSE_UNSURE_COOLDOWN_DAYS`). A `map` proposal's repo is re-validated
-against the SAME discovery hermes-cc.sh's own `resolve_repo()` uses (must
-resolve under `root`, must not be `deny`d) — never trusted from the model's
-own claim alone, see BOUNDS THAT DO NOT MOVE. Every applied entry is stamped
+against the git checkouts under the repos root (`_discoverable_repos()`) —
+never trusted from the model's own claim alone, see BOUNDS THAT DO NOT MOVE. Every applied entry is stamped
 `proposedAt`/`proposedBy: "triage-auto"` plus the model's one-line reason,
 written back into config/triage-policy.json (preserving `_readme` and key
 order), then `git add` + `git commit` — never `git push` — that ONE file, in
@@ -292,6 +291,7 @@ from clients.errors import (  # noqa: E402
     PolicyError,
     PreconditionError,
     RemoteError,
+    SubmitRefused,
     UsageError,
     WardenError,
 )
@@ -315,25 +315,13 @@ WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
 DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
            if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
-# Same env-var-first, documented-absolute-default-second shape DISPATCH_REPOS_JSON
-# below uses, and for the same reason: reconcile_operations() shells out to `gh`
-# under a LaunchAgent, and launchd hands a job a minimal PATH with no
-# guarantee `gh` is on it — a bare `gh` would work fine in an interactive
+# Env-var-first, documented-absolute-default-second: reconcile_operations()
+# shells out to `gh` under a LaunchAgent, and launchd hands a job a minimal PATH
+# with no guarantee `gh` is on it — a bare `gh` would work fine in an interactive
 # shell and fail silently under the agent, which is exactly the class of
 # defect this project keeps finding (see docs/triage.md and STATE.md).
 _env_gh_bin = os.environ.get("GH_BIN")
 GH_BIN = Path(_env_gh_bin).expanduser() if _env_gh_bin else Path("/opt/homebrew/bin/gh")
-
-# WARDEN_DISPATCH_REPOS — the same env var lifecycle/policy.py's own
-# dispatch_policy_path() reads (one override reaches both this file's own
-# pre-checks and the real resolver in lifecycle/policy.py; a test sets this
-# directly). Resolved relative to this file's parent's parent (the repo
-# root) for the same reason a moved checkout must not need a grep-and-replace.
-_env_repos_json = os.environ.get("WARDEN_DISPATCH_REPOS")
-DISPATCH_REPOS_JSON = (
-    Path(_env_repos_json).expanduser() if _env_repos_json
-    else (Path(__file__).resolve().parent.parent / "config" / "dispatch-repos.json")
-)
 
 # This repo's own config/, not ~/.hermes/config/, since the extraction. That is
 # not cosmetic: propose_mappings() writes this file and then `git commit`s it
@@ -1185,71 +1173,6 @@ PROPOSE_UNSURE_COOLDOWN_DAYS = 7.0
 # below, not by temperature.
 PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "deepseek-v4.1-flash")
 
-# Automatic investigate episodes (loop-driven, not human-typed) send no model
-# id by default. Both knobs below default to None, so sideclaw routes the tier
-# per its own table (server/lib/routing.ts, live at GET /api/routing):
-# investigate/author to DeepSeek-V4-Flash, implement to DeepSeek-V4-Pro.
-# Warden used to hardcode exactly those ids here — a third copy of a fact
-# sideclaw owns — so the next time sideclaw re-routed a tier, warden would
-# silently pin the old model. Setting the env var (the operator escape hatch)
-# restores a per-tier override; a Claude id would land the episode on
-# sideclaw's Max-backed JUDGE route, caught loudly by the loop below. Manual
-# `warden run --model` calls carry their own model and are unaffected; step-7 review validation carries its own
-# knob, TRIAGE_VALIDATION_DISPATCH_MODEL below.
-AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL") or None
-
-# The implement-tier counterpart to AUTO_DISPATCH_MODEL above: same default-
-# to-None shape, same env-var escape hatch. sideclaw routes implement on
-# DeepSeek-V4-Pro (`dispatch_implement` in routing.ts) unless the operator
-# pins TRIAGE_AUTO_IMPLEMENT_MODEL.
-AUTO_IMPLEMENT_MODEL = os.environ.get("TRIAGE_AUTO_IMPLEMENT_MODEL") or None
-
-# Both knobs default to None ("sideclaw routes the tier" — the healthy, silent
-# case), so this loop is warning-only: it stays quiet unless the operator sets
-# a Claude id, which would route automatic episodes back onto sideclaw's
-# Max-backed JUDGE route.
-for _knob, _model in (("TRIAGE_AUTO_DISPATCH_MODEL", AUTO_DISPATCH_MODEL),
-                      ("TRIAGE_AUTO_IMPLEMENT_MODEL", AUTO_IMPLEMENT_MODEL)):
-    if _model and _model.startswith("claude"):
-        # A Claude id would route automatic episodes back onto sideclaw's
-        # Max-backed JUDGE route — the cost regression §58 fixed. Loud, not
-        # fatal: the loop must keep ticking, the operator must notice.
-        print(f"triage: WARNING {_knob}={_model!r} routes automatic "
-              "dispatches onto Max — expected a non-Claude IU model id", file=sys.stderr)
-
-# Step-7 review validation (_open_validation_dispatch() below) had no model knob
-# at all and always took sideclaw's own JUDGE route. It now has one — but it
-# deliberately defaults to `None`, i.e. that same JUDGE route, rather than to
-# the cheap IU tier sideclaw routes investigate/implement on.
-#
-# Why review is the exception, and it is NOT the same call as implement /
-# investigate: measured 2026-09-11 on this machine, with
-# SIDECLAW_MODEL_REVIEW=glm-5.3-flash a review of a ~1000-line diff looped its
-# senior-dev angle on a single grep/sed for 17 minutes across 80,000+ turns and
-# never produced a synthesis; it was cancelled and the route reverted. Multi-
-# angle review over a large diff is a different workload shape from the 10-task
-# agentic coding suite that scored glm-5.3-flash 10/10 — and it is the one tool
-# where the cheap tier has actually been measured failing. sideclaw's own
-# routing.ts carries the same exclusion and the same reason.
-#
-# The failure shape is the worst available here: `validating` carries a
-# deadline, so a review that never returns lands the item in `merge_blocked`
-# with no signal about why. A non-Claude id additionally drops sideclaw's Max
-# fallback for `review` entirely (Max serves only Claude ids), leaving a failing
-# review nowhere to go. So the knob exists for experimentation — set it once a
-# cheap model has been measured completing a multi-angle review — and until then
-# the default stays on the route that works. Max is a flat subscription, so
-# unlike the implement/investigate lanes this costs nothing per run.
-TRIAGE_VALIDATION_DISPATCH_MODEL = os.environ.get("TRIAGE_VALIDATION_DISPATCH_MODEL") or None
-if TRIAGE_VALIDATION_DISPATCH_MODEL and not TRIAGE_VALIDATION_DISPATCH_MODEL.startswith("claude"):
-    # Inverted relative to AUTO_DISPATCH_MODEL's guard above, on purpose: for
-    # review the cheap tier is the unproven choice, not the safe one. Loud, not
-    # fatal: the loop must keep ticking, the operator must notice.
-    print(f"triage: WARNING TRIAGE_VALIDATION_DISPATCH_MODEL={TRIAGE_VALIDATION_DISPATCH_MODEL!r} routes "
-          "automatic review validation onto a cheap IU model and drops the Max fallback — "
-          "glm-5.3-flash was measured looping without synthesis on a large diff (2026-09-11)",
-          file=sys.stderr)
-
 # Mirrors .env.tpl's own OPENAI_API_KEY ref exactly — never a plaintext key.
 _OPENAI_API_KEY_REF = "op://common/anthropic/API_KEY"
 
@@ -1394,7 +1317,7 @@ def update_blocks(channel: str, ts: str, blocks: list[dict[str, Any]], text_fall
     )
 
 
-# --- policy + repo-deny loading -----------------------------------------------
+# --- policy loading -----------------------------------------------
 
 def _valid_rule(r: Any) -> bool:
     """A rule needs a `match` and EITHER `repo` (escalate to an episode) OR
@@ -1550,9 +1473,8 @@ def load_policy() -> dict[str, Any]:
         # as if they were alerts (297 signatures, ~30 permanently open) —
         # routed to STATE_NOTE, never STATE_IGNORED (see classify()).
         "ignoreUnstructuredSlackProse": bool(data.get("ignoreUnstructuredSlackProse")),
-        # Per-repo merge/deploy/liveness policy (autoMergePaths, noCiRequired,
-        # deploy, autoDeploy, liveness) — hermes-cc.sh's `merge` reads its own
-        # half straight from this same file; this file only reads `liveness`
+        # Per-repo deploy/liveness policy (deploy, autoDeploy, deployOnMerge,
+        # deployByPoller, liveness) — this file reads `liveness`
         # (maybe_check_liveness()). Malformed entries are left as-is here and
         # validated at the point each key is actually used, matching `verb`/
         # `evidence`'s own load_policy()-time-vs-use-time split above.
@@ -1565,37 +1487,6 @@ def load_policy() -> dict[str, Any]:
 
 def _card_channel(policy: dict[str, Any]) -> str:
     return policy["cardChannel"]
-
-
-def _denied_repos() -> set[str]:
-    """The dispatch bridge's own deny list (config/dispatch-repos.json) —
-    checked here BEFORE ever calling `_dispatch.open_episode()`, so a stale
-    or mistaken policy rule naming a denied repo produces a loud stderr line
-    and zero dispatches, never a dispatch that `_policy.resolve_repo()` then
-    refuses anyway. Reads through `lifecycle.policy.load_dispatch_policy()`
-    — one parser/validator for this file, not two — rather than re-parsing
-    the JSON here."""
-    try:
-        policy = _policy.load_dispatch_policy(DISPATCH_REPOS_JSON)
-    except WardenError:
-        return set()
-    return set(policy["deny"])
-
-
-def _merge_needs_approval(repo: str) -> bool:
-    """The dispatch bridge's own `merge_approval` list (config/dispatch-repos.json)
-    — a repo that may be implemented automatically but whose merge is never
-    self-authorized, so a clean step-7 validation routes to `needs_human`
-    instead of calling `plan_or_land()` (the owner lands it with `warden
-    merge`). Read through `lifecycle.policy.load_dispatch_policy()` — one
-    parser/validator for this file, not two. False on an unreadable policy:
-    the refusal that matters is `plan_or_land()`'s own `resolve_repo()`, and
-    False here only skips the gate, never opens one."""
-    try:
-        policy = _policy.load_dispatch_policy(DISPATCH_REPOS_JSON)
-    except WardenError:
-        return False
-    return _policy.merge_needs_approval(policy, repo)
 
 
 def _match_targets(event_row: sqlite3.Row) -> list[str]:
@@ -3399,6 +3290,24 @@ def _sync_cards(conn: sqlite3.Connection, items: list[sqlite3.Row], policy: dict
             sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 
+def _end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: SubmitRefused, *,
+                    tier: str, now: dt.datetime, policy: dict[str, Any], **columns: Any) -> None:
+    """sideclaw answered the submit with a 4xx — a refusal (repo outside its
+    allowlist, tier above the repo's ceiling, bad params). The same submit is
+    refused again, so every item the dispatch was for ends here, carrying
+    sideclaw's own message, and is never retried: `needs_human` is the path a
+    dispatch that ended terminal with no verdict already takes (see
+    fold_dispatch_verdict()). A 5xx or a connection failure is not this — it
+    keeps its retry behaviour at each call site."""
+    note = _cap_brief(f"{tier} episode not started — {exc}")
+    for m in members:
+        _set_state(conn, m["event_id"], STATE_NEEDS_HUMAN, now, note=note, **columns)
+    conn.commit()
+    print(f"triage: {tier} dispatch refused by sideclaw, ending {[m['signature'] for m in members]}: {exc}",
+          file=sys.stderr)
+    _sync_cards(conn, members, policy)
+
+
 def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, brief: str,
                                        members: list[sqlite3.Row], now: dt.datetime,
                                        policy: dict[str, Any], dry_run: bool) -> str | None:
@@ -3431,14 +3340,15 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
     own_channel = primary["origin_channel"]
     own_thread = primary["origin_thread_ts"]
     try:
-        target = _policy.resolve_repo(repo)
         opened = _dispatch.open_episode(
-            conn, target=target, tier="investigate", brief=brief, context=None, why=None,
-            model=AUTO_DISPATCH_MODEL,
+            conn, repo=repo, tier="investigate", brief=brief, context=None, why=None,
             origin=_dispatch.Origin(channel=own_channel or channel, thread_ts=own_thread,
                                      event_id=primary["event_id"]),
             authorized_by=None,
         )
+    except SubmitRefused as e:
+        _end_on_refusal(conn, members, e, tier="investigate", now=now, policy=policy)
+        return None
     except WardenError as e:
         print(f"triage: dispatch failed for {repo}: {e}", file=sys.stderr)
         return None
@@ -3502,7 +3412,7 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     sideclaw dispatch per repo per run (a cluster — see module docstring),
     capped at MAX_CLUSTER_SIGNATURES members per brief. A `split` item (see
     STATE_SPLIT) is ALSO an escalation candidate, gated by the exact same
-    checks (snoozed_until, denied repo, _is_escalation_eligible(),
+    checks (snoozed_until, _is_escalation_eligible(),
     _cooldown_ok()) — but it escalates as a SINGLETON, never grouped with
     another `split` item or with `new` items: grouping it would re-fuse the
     very cluster _dissolve_cluster() just took apart, which its own Slack
@@ -3522,7 +3432,6 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     Concurrency is checked once per run, decremented as clusters are opened,
     so later repos (and later, `new`, attempts) in the same run correctly
     see an exhausted cap."""
-    denied = _denied_repos()
     open_investigations = _count_open_investigation_clusters(conn)
 
     candidates = conn.execute(
@@ -3535,10 +3444,6 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
         if item["snoozed_until"]:
             continue
         repo = item["repo"]
-        if repo in denied:
-            print(f"triage: repo {repo!r} for {item['signature']} is denied in dispatch-repos.json "
-                  f"— fix the policy rule, this will never escalate", file=sys.stderr)
-            continue
         if not _is_escalation_eligible(item, policy, now):
             continue
         if not _cooldown_ok(conn, item, policy, now):
@@ -4703,14 +4608,6 @@ def _run_gh_run_list(owner: str, repo: str, sha: str) -> list[dict[str, Any]] | 
     return data if isinstance(data, list) else None
 
 
-# How many times a merge operation may resolve `failed` + `untouched` (the
-# pull request still OPEN after a crash before the PUT) before reconciliation
-# stops handing the item back to `validating` for another attempt. One retry
-# covers the crash the canary exercise reproduced; a second identical outcome
-# is a deterministic failure and lands `merge_blocked` where a human sees it.
-_MERGE_RETRY_CAP = 1
-
-
 def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step -1 (see the module docstring) — runs FIRST in run(), before
@@ -4881,17 +4778,6 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 else:
                     outcome = "failed"
                     new_receipt = {"pullRequest": pr, "state": gh_resp.get("state"), "reconciled": True}
-                    if gh_resp.get("state") == "OPEN":
-                        # Still open means NOTHING LANDED: a PUT that succeeded
-                        # reads MERGED, so whatever ran before the crash
-                        # (nothing, the idempotent ready-for-review, or a PUT
-                        # GitHub rejected) left the pull request where a retry
-                        # can safely try again — GitHub will not merge the same
-                        # head twice. Observed live in the Wave 5 canary
-                        # exercise (kill `after-merge-op`): without this flag
-                        # the item read `merge_blocked` for a pull request
-                        # nobody had touched. The retry is CAPPED below.
-                        new_receipt["untouched"] = True
         elif row["kind"] == "host":
             # A host verb (`launchctl kickstart`, an ssh `docker restart`)
             # has no remote receipt to ask for — same shape as the ssh
@@ -4985,35 +4871,10 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if row["kind"] != "merge":
             continue
         if outcome == "failed":
-            item_row = _get_item(conn, row["event_id"])
-            untouched_attempts = conn.execute(
-                "SELECT COUNT(*) FROM operations WHERE event_id=? AND kind='merge' AND outcome='failed' "
-                "AND receipt_json LIKE '%\"untouched\": true%'",
-                (row["event_id"],),
-            ).fetchone()[0]
-            if ((new_receipt or {}).get("untouched") and item_row is not None
-                    and item_row["state"] == STATE_VALIDATING
-                    and untouched_attempts <= _MERGE_RETRY_CAP):
-                # The pull request is open and untouched: the loop died between
-                # recording the merge operation and mutating anything. A
-                # confirmed validation is still confirmed — leave the item in
-                # `validating` so poll_validation_jobs() retries the merge this
-                # same pass, and say so on the card. `merge_blocked` here would
-                # report a refusal that never happened.
-                _set_state(conn, row["event_id"], STATE_VALIDATING, now,
-                           note="reconciled from GitHub: the pull request is still open and untouched — "
-                                "the loop stopped before the merge; retrying")
-                conn.commit()
-                continue
-            # GitHub is authoritative and says it did not merge (closed, not
-            # open any more, or open but the retry cap is spent — a crash that
-            # repeats at the same point every pass would otherwise retry
-            # forever, each `validating` write resetting its own 1 h deadline).
-            # Same destination the live path uses for a definite refusal.
+            # GitHub is authoritative and says it did not merge (closed, or
+            # open and untouched by whatever the crash interrupted). Same
+            # destination the live path uses for a definite refusal.
             detail = note or f"see operation {row['op_id']}"
-            if (new_receipt or {}).get("untouched"):
-                detail = (f"still open after {untouched_attempts} merge attempts that never reached a PUT — "
-                          f"the loop keeps stopping before the merge; not retrying again")
             _set_state(conn, row["event_id"], STATE_MERGE_BLOCKED, now,
                        note=f"reconciled from GitHub: the pull request is not merged ({detail})")
             conn.commit()
@@ -5330,24 +5191,8 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         try:
             _policy.require_auto_from_item(conn, event_id=item["event_id"], repo=item["repo"], tier="implement")
             _policy.check_repo_not_in_flight(conn, repo=item["repo"])
-            target = _policy.resolve_repo(item["repo"])
         except (PolicyError, PreconditionError, UsageError) as e:
             _set_state(conn, item["event_id"], STATE_VERDICT, now, note=f"deferred: {e}")
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
-            continue
-
-        # A repo capped below `implement` (dispatch-repos.json `tiers`) is not a
-        # deferral: the cap never lifts on its own, and sideclaw refuses the same
-        # dispatch at its boundary. Checked locally so the verdict reaches a human
-        # instead of a claim/refuse/rollback cycle every tick (item 543, §67).
-        try:
-            _policy.resolve_tier("implement", target)
-        except PolicyError as e:
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
-                       note=f"investigation concluded implement, but {e} — apply the fix by hand")
             conn.commit()
             fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
             if fresh_item is not None and fresh_event is not None:
@@ -5381,12 +5226,18 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         _chaos.crash_point("before-implement-open")
         try:
             opened = _dispatch.open_episode(
-                conn, target=target, tier="implement", brief=brief,
+                conn, repo=item["repo"], tier="implement", brief=brief,
                 context=_verdict_as_context(item["dispatch_job"], verdict),
                 why="triage auto-implement: investigation concluded implement at high confidence",
-                model=AUTO_IMPLEMENT_MODEL, origin=_dispatch.Origin(event_id=item["event_id"]),
+                origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
             )
+        except SubmitRefused as exc:
+            # open_episode() already completed the operation `failed`. A
+            # refusal is final: end the item, never hand the claim back to
+            # `verdict` for the next tick to submit the same thing again.
+            _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy)
+            continue
         except RemoteError as exc:
             if exc.maybe_mutated:
                 # sideclaw MAY have accepted the job. Do NOT roll back: that
@@ -5477,18 +5328,20 @@ def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: 
 
     Returns `(job_id, None)` on success, `(None, reason)` otherwise — the PR
     number could not be parsed out of `pr_url`, or the review dispatch itself
-    raised a WardenError (logged either way)."""
+    raised a WardenError (logged either way). A sideclaw refusal (`SubmitRefused`,
+    a 4xx) is NOT folded into that tuple: it propagates so the caller ends the
+    item instead of parking it for a retry that is refused the same way."""
     match = _PR_NUMBER_RE.search(pr_url)
     if not match:
         return None, "could not parse the PR number"
     pr_number = int(match.group(1))
     try:
-        target = _policy.resolve_repo(repo)
         opened = _dispatch.open_review(
-            conn, target=target, pr=pr_number, context=context,
+            conn, repo=repo, pr=pr_number, context=context,
             origin=_dispatch.Origin(event_id=event_id),
-            model=TRIAGE_VALIDATION_DISPATCH_MODEL,
         )
+    except SubmitRefused:
+        raise
     except WardenError as e:
         print(f"triage: validation dispatch failed for {repo}: {e}", file=sys.stderr)
         return None, str(e)
@@ -5608,9 +5461,13 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         if result.get("nextAction") == "human":
             _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=f"implement {job_id}: {summary}")
         elif outcome == "pr_opened" and artifact_url:
-            val_job, val_err = _open_validation_dispatch(conn, repo=item["repo"], event_id=item["event_id"],
-                                                           implement_job=job_id, pr_url=artifact_url,
-                                                           context=_validation_context(conn, item))
+            try:
+                val_job, val_err = _open_validation_dispatch(
+                    conn, repo=item["repo"], event_id=item["event_id"], implement_job=job_id,
+                    pr_url=artifact_url, context=_validation_context(conn, item))
+            except SubmitRefused as e:
+                _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=artifact_url)
+                continue
             if val_job is None:
                 _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
                            note=val_err or "could not open the step-7 validation episode", pr_url=artifact_url)
@@ -5757,12 +5614,8 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     `"actionable"` with an EMPTY `blocking` list, confirms and calls `merge`
     (via lifecycle/merge.py's `plan_or_land()`, which owns its own
     `merge`/`deploy` operations and receipts end to end); its own outcome
-    (landed, or refused by the merge gate) decides the next state. ONE
-    exception: a repo in config/dispatch-repos.json's `merge_approval`
-    (`sideclaw`/`warden`/`dotfiles`) does NOT auto-merge — `confirmed` still
-    lands in `dispatches.validation_status`, but the item routes to
-    `needs_human` carrying the PR and the `warden merge` call the owner runs
-    to approve it. A non-empty `blocking` list refuses the merge outright —
+    (landed, or refused by the merge gate or by GitHub) decides the next
+    state. A non-empty `blocking` list refuses the merge outright —
     never read as a pass, the brief's own words — with ONE precedence above
     it (§115): `"needs-human"` routes to a human even when it carries
     findings, because that outcome says the REVIEW is incomplete and a
@@ -5899,20 +5752,6 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             conn.commit()
         elif _already_merged(conn, item["implement_job"]):
             _land_already_merged_item(conn, policy, item, now)
-        elif _merge_needs_approval(item["repo"]):
-            # The repo is merge-approval-gated (config/dispatch-repos.json's
-            # `merge_approval`): validation confirmed and the PR would land,
-            # but a merge into the executor, the control plane or the
-            # machine-wide agent config is never self-authorized. Route to a
-            # human exactly like every other needs_human item; `warden merge`
-            # is how the owner lands it from here (validation_status is
-            # already `confirmed`, so that path re-checks, never re-validates).
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=(
-                f"step-7 review confirmed {item['pr_url']}; {item['repo']} is merge-approval gated "
-                f"(warden never merges its own executor) — click Merge in Argo "
-                f"(job {item['implement_job']})"
-            ))
-            conn.commit()
         else:
             _merge_and_rollout(conn, policy, item, now)
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
@@ -5924,9 +5763,7 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
                       now: dt.datetime, *, authorized_by: str = "auto-from-item",
                       why: str = "triage auto-merge: step-7 validation confirmed") -> str:
     """Land a validation-confirmed PR and route the item on the merge/deploy
-    outcome — the tail of poll_validation_jobs(), shared with
-    retry_policy_refused_merges() so a merge refused only by the policy
-    file lands the moment the policy covers it (§93).
+    outcome — the tail of poll_validation_jobs(), and the owner's Argo merge.
 
     Returns "merged", "refused" or "ambiguous" — callers starting from a
     parked state cannot read the outcome off the item's state (§96).
@@ -6040,69 +5877,6 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
 MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
 
 
-def _merge_gate_mtime() -> dt.datetime | None:
-    """The newest mtime among the things that decide a merge: the policy file
-    and the two modules carrying the gate (`lifecycle/merge.py`,
-    `clients/github.py`).
-
-    §109: the retry below watched the policy file alone, so a *code* fix to the
-    gate took effect only at the next policy edit — two confirmed weatherorb
-    PRs sat in `merge_blocked` from the §108 defect after it was fixed, which is
-    the same "settled forever" shape the retry exists to prevent. The property
-    kept: an item is retried when the thing that refused it has changed, never
-    on a timer."""
-    stamps: list[dt.datetime] = []
-    for path in (POLICY_PATH, Path(_merge.__file__ or ""), Path(_github.__file__ or "")):
-        try:
-            stamps.append(dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc))
-        except OSError:
-            continue
-    return max(stamps) if stamps else None
-
-
-def retry_policy_refused_merges(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
-                                *, dry_run: bool) -> None:
-    """A PR the review confirmed but the merge gate refused sits in
-    `merge_blocked` forever — even after the policy file grows the scope that
-    would admit it (homelab#9, item 1170: refused for "no autoMergePaths
-    declared for 'homelab'"). Re-attempt the merge once per change to the thing
-    that refused: eligible when the item parked on a `merge refused:` note, its
-    implement dispatch is `confirmed` and unmerged, and the gate
-    (`_merge_gate_mtime()` — the policy file *or* the gate's own code, §109) is
-    newer than the item's last update. A refusal the changed gate still makes
-    lands the same note again with a fresh `updated_at`, so it waits for the
-    next change instead of retrying every pass."""
-    gate_mtime = _merge_gate_mtime()
-    if gate_mtime is None:
-        return
-    rows = conn.execute(
-        "SELECT ti.* FROM triage_items ti JOIN dispatches d ON d.job_id = ti.implement_job "
-        "WHERE ti.state=? AND ti.note LIKE ? AND d.validation_status='confirmed' AND d.merged_at IS NULL",
-        (STATE_MERGE_BLOCKED, MERGE_REFUSED_NOTE_PREFIX + "%"),
-    ).fetchall()
-    for item in rows:
-        updated = _parse_ts(item["updated_at"])
-        if updated is None or gate_mtime <= updated:
-            continue
-        if _merge_needs_approval(item["repo"]):
-            continue
-        if dry_run:
-            print(f"[dry-run] would retry the merge of {item['pr_url']} ({item['signature']}) — policy changed")
-            continue
-        # Claim before the slow merge: the 300 s sweep and the 600 s loop both
-        # reach this, and only the pass that moves updated_at owns the attempt.
-        claimed = conn.execute(
-            "UPDATE triage_items SET updated_at=? WHERE event_id=? AND state=? AND updated_at=?",
-            (_now_iso(now), item["event_id"], STATE_MERGE_BLOCKED, item["updated_at"]),
-        ).rowcount
-        conn.commit()
-        if not claimed:
-            continue
-        _merge_and_rollout(conn, policy, item, now)
-        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-        if fresh_item is not None and fresh_event is not None:
-            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
-
 STRANDED_PRS_CURSOR_KEY = "stranded_prs"
 STRANDED_PRS_INTERVAL_S = 3600
 STRANDED_PRS_LOOKBACK_DAYS = 60
@@ -6188,8 +5962,7 @@ def reconcile_stranded_prs(conn: sqlite3.Connection, policy: dict[str, Any], now
 # every hour against the live ledger, published on /health, and — together
 # with the self-audit findings — turned into work: one `warden_self` event
 # per finding, mapped to repo `warden` by the policy, escalated like any alert
-# (investigate → implement → the owner's Argo merge, since warden is
-# merge-approval gated). A finding that stops holding resolves its event.
+# (investigate → implement → review → merge, like any other item). A finding that stops holding resolves its event.
 
 SELF_SOURCE = "warden_self"
 SELF_AUDIT_CURSOR_KEY = "self_audit"
@@ -6567,8 +6340,6 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                   f"(attempt {attempt}/{max_attempts})")
             continue
         try:
-            target = _policy.resolve_repo(item["repo"])
-            _policy.resolve_tier("implement", target)
             _policy.check_repo_not_in_flight(conn, repo=item["repo"], exclude_event_id=item["event_id"])
         except (PolicyError, PreconditionError, UsageError) as e:
             print(f"triage: revision of {item['signature']} deferred: {e}", file=sys.stderr)
@@ -6609,11 +6380,20 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
         try:
             opened = _dispatch.open_episode(
-                conn, target=target, tier="implement", brief=brief, context=context,
+                conn, repo=item["repo"], tier="implement", brief=brief, context=context,
                 why=f"triage revision {attempt}: the step-7 review blocked the previous attempt",
-                model=AUTO_IMPLEMENT_MODEL, origin=_dispatch.Origin(event_id=item["event_id"]),
+                origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
             )
+        except SubmitRefused as exc:
+            # Refused for good: end the item, and spend the remaining revision
+            # budget so the next tick cannot pick it up and submit it again.
+            conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?",
+                         (max_attempts, item["event_id"]))
+            _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy,
+                            implement_job=item["implement_job"], validation_job=item["validation_job"],
+                            pr_url=item["pr_url"])
+            continue
         except RemoteError as exc:
             if exc.maybe_mutated:
                 # Same as maybe_auto_implement(): the job may exist; the
@@ -6693,7 +6473,6 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     the 600s tick already covers it with room to spare — see docs/history/state-log.md
     §87 for the measurement this rests on."""
     maybe_revise_blocked(conn, policy, now, dry_run=dry_run)
-    retry_policy_refused_merges(conn, policy, now, dry_run=dry_run)
     maybe_auto_implement(conn, policy, now, dry_run=dry_run)
     poll_implement_jobs(conn, policy, now, dry_run=dry_run)
     poll_validation_jobs(conn, policy, now, dry_run=dry_run)
@@ -7294,20 +7073,12 @@ def _resolve_openai_api_key() -> str:
 
 
 def _discoverable_repos() -> set[str]:
-    """Every top-level entry directly under `root` that is not dotted, not
-    `deny`d, is a directory, and carries a `.git` subdirectory. A `map`
-    proposal naming anything outside this set is dropped at apply time —
-    never trusted from the model's own claim, or from the prompt's own
-    list, alone (see BOUNDS THAT DO NOT MOVE in the module docstring).
-    Delegates to `lifecycle.policy`'s own `load_dispatch_policy()`/
-    `discoverable()` — the SAME discovery `_policy.resolve_repo()` uses —
-    rather than a second, hand-rolled directory walk that could silently
-    disagree with the real resolver."""
-    try:
-        policy = _policy.load_dispatch_policy(DISPATCH_REPOS_JSON)
-    except WardenError:
-        return set()
-    return set(_policy.discoverable(policy["root"], policy["deny"]))
+    """Every git checkout directly under the repos root (`lifecycle.policy.
+    discoverable()`). A `map` proposal naming anything outside this set is
+    dropped at apply time — never trusted from the model's own claim, or from
+    the prompt's own list, alone (see BOUNDS THAT DO NOT MOVE in the module
+    docstring)."""
+    return set(_policy.discoverable())
 
 
 def _signature_first_seen(row: sqlite3.Row) -> dt.datetime | None:
@@ -7535,9 +7306,8 @@ def _apply_propose_mappings(conn: sqlite3.Connection, now: dt.datetime, response
                              valid_repos: set[str]) -> list[dict[str, str]]:
     """Applies each decision for a signature actually in THIS batch (a
     signature the model invents is ignored — it was never asked about). A
-    `map` repo is re-checked against `valid_repos` (the SAME discovery
-    hermes-cc.sh's own resolve_repo() uses) AND the deny list — never
-    trusted from the model alone. `unsure` writes a cooldown marker directly
+    `map` repo is re-checked against `valid_repos` (`_discoverable_repos()`)
+    — never trusted from the model alone. `unsure` writes a cooldown marker directly
     to triage_items; `map`/`ignore` write NOTHING to triage_items here —
     they only ever become policy entries, picked up by classify() on a
     LATER run, exactly like a hand-written rule would be. Returns the
@@ -7545,7 +7315,6 @@ def _apply_propose_mappings(conn: sqlite3.Connection, now: dt.datetime, response
     `unsure` is not "applied", it is deferred)."""
     applied: list[dict[str, str]] = []
     now_iso = _now_iso(now)
-    denied = _denied_repos()
     for sig, decision in response.items():
         row = candidates_by_sig.get(sig)
         if row is None:
@@ -7559,9 +7328,9 @@ def _apply_propose_mappings(conn: sqlite3.Connection, now: dt.datetime, response
             applied.append({"signature": sig, "action": "ignore", "reason": reason})
         elif action == "map":
             repo = decision.get("repo")
-            if not isinstance(repo, str) or repo not in valid_repos or repo in denied:
+            if not isinstance(repo, str) or repo not in valid_repos:
                 print(f"triage: propose_mappings — dropping map proposal for {sig!r}: repo "
-                      f"{repo!r} does not resolve under the dispatch root or is denied", file=sys.stderr)
+                      f"{repo!r} does not resolve under the repos root", file=sys.stderr)
                 continue
             applied.append({"signature": sig, "action": "map", "repo": repo, "reason": reason})
         elif action == "unsure":
@@ -7881,12 +7650,6 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
     if item["state"] not in (STATE_VERDICT, STATE_NEEDS_HUMAN):
         return "rejected", None, f"item is in state {item['state']!r}, not verdict/needs_human"
 
-    try:
-        target = _policy.resolve_repo(item["repo"])
-        _policy.resolve_tier("implement", target)
-    except (PolicyError, PreconditionError, UsageError) as e:
-        return "rejected", None, str(e)
-
     # No `expect_null=("implement_job",)` here (unlike maybe_auto_implement()'s
     # own claim): that function's own SELECT already filters to
     # `implement_job IS NULL`, so the invariant holds by construction. This
@@ -7921,10 +7684,13 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
 
     try:
         opened = _dispatch.open_episode(
-            conn, target=target, tier="implement", brief=brief, context=context,
-            why="argo owner action: implement", model=AUTO_IMPLEMENT_MODEL,
+            conn, repo=item["repo"], tier="implement", brief=brief, context=context,
+            why="argo owner action: implement",
             origin=_dispatch.Origin(event_id=event_id), authorized_by="owner:argo",
         )
+    except SubmitRefused as exc:
+        _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=load_policy())
+        return "failed", None, str(exc)
     except RemoteError as exc:
         if exc.maybe_mutated:
             print(f"triage: argo implement for event {event_id} may have reached sideclaw "
@@ -7955,9 +7721,8 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
 
 def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                        now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
-    """The owner's one-click merge. Accepted from `merge_blocked` and — since
-    §94 — from `needs_human` carrying a PR, which is where a merge-approval
-    repo's confirmed fix waits. Goes through _merge_and_rollout() with
+    """The owner's one-click merge. Accepted from `merge_blocked` and from
+    `needs_human` carrying a PR. Goes through _merge_and_rollout() with
     `authorized_by="owner:argo"`, so an owner merge deploys and verifies
     exactly like an automatic one (before §94 a successful Argo merge left the
     item sitting in `merge_blocked`)."""
@@ -7995,11 +7760,6 @@ def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event
                                now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
     if item["state"] not in _ARGO_REINVESTIGATE_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, reinvestigate not allowed"
-    try:
-        target = _policy.resolve_repo(item["repo"])
-    except (PolicyError, PreconditionError, UsageError) as e:
-        return "rejected", None, str(e)
-
     claimed = _set_state(conn, event_id, STATE_INVESTIGATING, now, expect_state=item["state"])
     conn.commit()
     if not claimed:
@@ -8013,10 +7773,13 @@ def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event
 
     try:
         opened = _dispatch.open_episode(
-            conn, target=target, tier="investigate", brief=brief, context=None,
-            why="owner requested re-investigation via Argo", model=AUTO_DISPATCH_MODEL,
+            conn, repo=item["repo"], tier="investigate", brief=brief, context=None,
+            why="owner requested re-investigation via Argo",
             origin=_dispatch.Origin(event_id=event_id), authorized_by="owner:argo",
         )
+    except SubmitRefused as exc:
+        _end_on_refusal(conn, [item], exc, tier="investigate", now=now, policy=load_policy())
+        return "failed", None, str(exc)
     except RemoteError as exc:
         if exc.maybe_mutated:
             return "applied", {"note": "submitted, outcome ambiguous"}, None
