@@ -6,11 +6,11 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-10-02 (§116 — agent-platform Wave 1: the trust/approval/policy gates are deleted; see the banner under *What is live*) |
-| Current wave | agent-platform rewrite — `docs/waves/PLAN.md`, Wave 1 done (§116), Wave 2 next. Spec: `~/SourceRoot/dotfiles/docs/agent-platform.md` |
+| Last updated | 2026-10-02 (§117 — agent-platform Wave 2: nine states, one retry rule, one-line Slack; see the banners under *What is live*) |
+| Current wave | agent-platform rewrite — `docs/waves/PLAN.md`, Waves 1–2 done (§116, §117), Wave 3 next (needs sideclaw Wave 1). Spec: `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
-| Ledger | `~/.warden/warden.db`, schema 12 in code (migration 12 drops `dispatch_approvals`); the live file stays at 11 until the loop boots on the new code |
-| Tests | `tests/test_triage.py` 302/302 is the gate; `make test` runs all 15 suites |
+| Ledger | `~/.warden/warden.db`, schema 13 in code (12 drops `dispatch_approvals`, 13 maps the old states — table on the migration); the live file stays at 11 until the loop boots on the new code |
+| Tests | `tests/test_triage.py` — the gate count lives in AGENTS.md; `make test` runs all 15 suites |
 | Next action | see § Next action (bottom) |
 
 ---
@@ -24,6 +24,14 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 > `propose_mappings`, the env-check verb, `warden_self`, `require_no_recursion`,
 > and the high-confidence auto-implement gate. Text below that describes them is
 > history until Wave 5 rewrites this file.
+>
+> **Superseded in part by agent-platform Wave 2 (§117).** States are now
+> `new, triaged, working, merging, verifying, needs_decision, failed` + terminal
+> `fixed, quiet, closed(close_reason)`. Gone: `STATE_DEADLINES`/`sweep_deadlines`,
+> `needs_human`, `merge_blocked`, snooze, the Slack card stack and the daily
+> digest of non-actionable items, watchdog-poll's raw-event Slack digest. Infra
+> failures strike (10/30 min backoff, third → `failed`); Slack hears one line on
+> `fixed`/`needs_decision` only.
 
 Six LaunchAgents run the whole control plane; no `hermes cron` job is in the
 loop.
@@ -464,6 +472,15 @@ log's past sections.
 - A needs-human review never spends a revision, and its findings ride the card — §115
 
 ### Next action
+
+**§117 (Wave 2) is committed but not live.** Redeploy is the orchestrator's:
+boot the loop once on this code (migration 11→13 on the live ledger — 15
+`needs_human` rows become `failed`, visible in Argo), kickstart warden-api, then
+push argo master (b9258fb, one commit ahead of origin) so Argo reads the new snapshot. Push Argo *with*
+the redeploy, not before: the old snapshot's `needs_human` rows would render
+only in Argo's "unknown" bucket. Then Wave 3 — it requires sideclaw Wave 1.
+
+The paragraphs below predate the agent-platform rewrite and are history.
 
 **§87 just landed** (advance on completion — verdict → implementing →
 validating → merge/merge_blocked no longer waits for the loop's 600s tick;

@@ -57,7 +57,7 @@ make status    # what is loaded, what ran last, is the ledger reachable
 make unload    # stop the agents
 ```
 
-**Never start a second loop.** Two loops against one ledger double every card and
+**Never start a second loop.** Two loops against one ledger double every post and
 every dispatch. Before loading an agent, check nothing else is already running the
 same script — during the extraction that means `com.jkrumm.warden-loop` in
 particular.
@@ -126,9 +126,9 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   composes the one `cwd` the wire protocol still needs) and sends no `model` key —
   sideclaw enforces its own allowlist (`GET /api/dispatch-policy`) and routes each
   tier (`GET /api/routing`). A sideclaw **4xx on submit is a refusal**
-  (`clients.errors.SubmitRefused`): the item ends `needs_human` carrying sideclaw's
+  (`clients.errors.SubmitRefused`): the item ends `failed` carrying sideclaw's
   message (`triage._end_on_refusal()`) and is never retried; 5xx and connection
-  errors keep their retry behaviour. `warden dispatch --model` stays — it is the
+  errors strike (`triage._strike()`: 10/30 min backoff, third strike → `failed`). `warden dispatch --model` stays — it is the
   owner's explicit choice, not policy.
 - **The merge gate is four facts**: PR open, checks green (or none exist), step-7
   review `confirmed`, and GitHub's own rules allowing the merge call
@@ -155,10 +155,14 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   decision — DESIGN.md § The host-verb carve-out).
 - **Deferral must be visible.** A budget hit that only reaches a `.err` file is
   indistinguishable from a broken loop.
-- **A dispatch that ends terminal with no verdict is not a verdict.** It folds
-  to `needs_human` carrying `dispatches.error`, never into `verdict` — a
-  verdict-less `verdict` row is the same invisibility in a different column
-  (§64). It is never retried automatically.
+- **A dispatch that ends terminal with no verdict is not a verdict.** It is an
+  infrastructure failure: it strikes and retries, and the third strike is
+  `failed` carrying `dispatches.error` — never a verdict-less `working` row (§64).
+- **`needs_decision` is the only human exit**, and only a verdict with
+  `nextAction=human` reaches it. `needs_decision` and `failed` never expire.
+- **Two crons drive one ledger** (loop and sweep). Every act on a row they can
+  both reach — a submit, a handoff, a Slack post — is a compare-and-set claim
+  first (§117).
 - **An action pulled from Argo's queue is the owner, full stop.**
   `apply_argo_actions()` records `authorized_by="owner:argo"` and acts — Argo
   is reachable only over his own tailnet, which is the trust boundary.

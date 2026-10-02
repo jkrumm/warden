@@ -9405,3 +9405,42 @@ trust/approval/policy gates. Commits 405aee5..64b4f7a:
 test_triage 352 → 302 (deleted with the code they tested). Not done here: the
 loop/poll/sweep stay paused; the installed `com.jkrumm.warden-restore-drill`
 plist (if bootstrapped) needs a `bootout` + `rm` at redeploy.
+
+## 117. Agent-platform Wave 2 — nine states, terse output, one queue (2026-10-02)
+
+Commits 1946f04, 31fc33b, 79da5d6 here; argo b9258fb (unpushed — ships with the
+redeploy).
+
+- **States.** `new, triaged, working, merging, verifying, needs_decision, failed`
+  + terminal `fixed, quiet, closed(close_reason ∈ duplicate|fixed_by|ignored|resolved)`.
+  Migration 13 maps every old state (table on `_STATE_MAP_13`), rewrites
+  `item_transitions` the same way (funnel metrics and chronic counts read it),
+  adds `close_reason`/`strikes`/`retry_at`, drops the eight dead W1 columns. On a
+  copy of the live ledger: closed 184 → closed/resolved, ignored+note 23 →
+  closed/ignored, dismissed 5 → closed/resolved (deadline expiry, not a human
+  judgement — recurrences resurface), needs_human 15 → failed, quiet/fixed unchanged.
+- **One retry rule** replaces the 12-row `STATE_DEADLINES`: `_strike()` — infra
+  failure (no-verdict terminal, 5xx, review synthesis error, pruned job, PR-less
+  implement, ambiguous submit after a 30 min grace) backs off 10 then 30 min; the
+  third strike is `failed`. A sideclaw 4xx is `failed` at once. No timer on a
+  running episode.
+- **Verdict fold:** `implement`/`issue` → `working` (auto-implement), `human` →
+  `needs_decision` with `decisionQuestion` (summary fallback), `none` or an
+  author-tier artifact → `closed(resolved)`.
+- **Output.** The card stack is deleted. Slack hears one line —
+  `<icon> <repo>: <summary> — <state> <Argo>` — on entering `fixed` or
+  `needs_decision`, once per entry; origin-thread items get their line (and an
+  investigate answer) in their own thread; the digest is one `:x: N failed` line,
+  silent at zero. Notes ≤200 chars centrally, GitHub comment-back ≤3 lines.
+  watchdog-poll's raw New/Resolved digest is gone; its blindness alarms stay.
+- **Claims.** Two reviews flagged cross-cron races (loop 600s and sweep 300s on
+  one ledger, plus `warden run`): the implement→merging handoff, review-result
+  act, Slack post and origin-item escalation are now compare-and-set claims with
+  stale-claim recovery; reconcile leaves a queued/running implement op open.
+- **Argo** reads the new snapshot: one "Needs you" list (`needs_decision`), a
+  quieter Failed list, an "Unknown state" bucket instead of silent drops; the
+  intents/approvals UI is deleted.
+
+test_triage 302 → 318. Rejected review findings: "migration 13 already ran live"
+(live ledger is still schema 11 — the loop is paused); a claim on alert-cluster
+`escalate()` (loop-only; launchd never overlaps a job with itself).
