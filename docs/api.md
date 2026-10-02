@@ -77,7 +77,7 @@ consumer (Argo, a human reading the JSON) tell the two apart.
 | 1 | `verdicts_recorded_disposition` | numerator/denominator (both **dispatch counts**) plus an `item_states` breakdown for investigate-tier dispatches with a recorded verdict AND `origin_event_id IS NOT NULL` (loop-originated — see below), reaching a state DESIGN.md counts as a recorded disposition (the implement chain, `needs_human`, or `dismissed`). `quiet` does **not** count — DESIGN.md principle 5, silence is never an outcome. `item_states` counts `triage_items` rows, **not** dispatches, so its total may legitimately exceed the denominator — one clustered dispatch joins several items (see `item_states_note`). Verdict-carrying investigate dispatches with `origin_event_id IS NULL` are interactive Slack dispatches a human asked `warden` to run directly; they never entered warden's funnel as an item and never will, so they're excluded from the ratio and reported separately as `excluded_interactive` (with `excluded_interactive_note`) rather than silently dropped. | all-time |
 | 2 | `verified_fixes_vs_silence` | `fixed`/`quiet`/`closed`/`dismissed` counts and `fixed / (fixed + quiet)`, restricted to mapped signatures (`triage_items.repo IS NOT NULL`). | all-time |
 | 3 | `median_needs_human_to_decision_hours` | median hours between a transition into `needs_human` and the item's next transition, **excluding** pairs whose exit is `dismissed` (that is the 7-day expiry clock, not a human deciding — REVIEW.md's C3 Goodhart concern). | windowed on entry |
-| 4 | `verified_unattended_fixes_per_week` | **derivable as of schema 5** — an item that transitioned to `fixed` in the window counts as unattended unless one of its `operations` rows carries `authorized_by LIKE 'signed:%'` (see DESIGN.md § Crash recovery, docs/history/state-log.md §46 Correction 1: the unattended door, `--auto-from-item`, structurally never produces a `dispatch_approvals` row, so `operations` — written on both doors — is the only table that can answer this). `fixed_in_window`/`unattended_in_window` are the raw counts; `value` is `unattended_in_window`. Still reads `null` today, for a different and correct reason than before: zero `fixed` transitions have ever occurred in production (docs/history/state-log.md §46 Correction 3), so either the window predates `history_since` or there is simply nothing to count — the derivation becoming *possible* is what changed; the number moving needs the auto-implement chain to actually run. | windowed |
+| 4 | `verified_unattended_fixes_per_week` | the count of distinct items that entered `fixed` in the window (`item_transitions.to_state='fixed'`, deduplicated by `event_id` — an item reopened by a failed liveness probe and fixed again counts once). With the signed-approval gate gone every fix is unattended, so there is no `operations`/`authorized_by` filter any more. `fixed_in_window`/`unattended_in_window` are the raw counts (equal); `value` is `unattended_in_window`. Reads `null` with a named reason when the window predates `history_since` or holds no `fixed` transition — "no basis", never a fabricated `0`. | windowed |
 | 5 | `poller_ages` | per-poller age in minutes plus the worst case across all three, named individually. | current (not windowed) |
 | 6 | `reverts_and_reopens` | `reopen_after_fixed` (real count, transitions with `from_state='fixed'`) and `reverts` (always `null` — no revert primitive exists before `warden revert`, DESIGN.md § Abort and revert, Wave 3). | windowed |
 
@@ -145,8 +145,8 @@ TERMINAL_STATES`) and `updated_at` is within the last 24 hours.
 
 `availableActions` is zero or more of `implement`/`merge`/`dismiss`/
 `reinvestigate`/`note`, computed from `state` alone (never `max_tier` — the
-real per-repo/per-tier gate is enforced server-side, in `apply_argo_actions()`,
-when an action is actually applied, not here). This list is only what the UI
+action is validated and applied server-side, in `apply_argo_actions()`, not
+here, and the repo/tier boundary is sideclaw's). This list is only what the UI
 offers to click; a `verdict` row, for example, carries
 `["implement", "dismiss", "reinvestigate", "note"]`. `issue` is `null` for
 every item except `origin: "github_issue"`, where it is `{"repo", "number",
@@ -155,6 +155,12 @@ GitHub payload — `trusted` is `author == clients.github.GH_OWNER`. A
 `github_issue` item with a missing or unparsable payload still gets
 `issue: null` rather than a 500.
 
+The payload also carries an `awaiting_owner` array — every `needs_human`/
+`merge_blocked` item, oldest first, with `age_days`, `reason` and
+`availableActions`. Its entries still emit `parked_recurrences` (the stored
+column value) only because Argo's entry schema requires it until Wave 2;
+`items` entries do not carry it.
+
 ```bash
 curl -s http://127.0.0.1:7735/board | jq .
 ```
@@ -162,7 +168,7 @@ curl -s http://127.0.0.1:7735/board | jq .
 ### `GET /items/<event_id>`
 
 The full detail behind one item: itself, its parent event, and every
-dispatch/operation/approval/transition that names it. `<event_id>` must be
+dispatch/operation/transition that names it. `<event_id>` must be
 all-digits — `GET /items/abc` is `400 {"error": "event_id must be an
 integer"}`; an id with no matching row is `404 {"error": "no item <id>"}`.
 `/items/` is a path-prefix match ahead of the exact-path table, so
@@ -189,10 +195,6 @@ captured by it.
                      "repo": "warden", "authorized_by": "auto-from-item",
                      "started_at": "...", "outcome": "ok", "outcome_at": "...",
                      "receipt_json": null, "reconciled_at": null, "note": null } ],
-  "approvals": [ { "id": 7, "verb": "implement", "repo": "warden", "tier": "implement",
-                    "created_at": "...", "expires_at": "...", "decided_at": null,
-                    "decision": null, "decided_by": null, "spent_at": null,
-                    "spent_job_id": null, "spend_error": null } ],
   "transitions": [ { "id": 100, "event_id": 42, "from_state": "new",
                       "to_state": "investigating", "at": "...", "note": null } ],
   "transitions_total": 1,
@@ -208,22 +210,17 @@ event, OR whose `job_id` is one of the item's own `dispatch_job` /
 `implement_job` / `validation_job`, `ORDER BY created_at`; `verdict` is
 `null` when `verdict_json` is `null`, otherwise the six named fields parsed
 out of it. `operations` and `transitions` key off `event_id` directly
-(`item_transitions` oldest-first). `dispatch_approvals` has no `event_id`
-column at all — an approval links to an item only through
-`params_json.origin_event_id` (the closed parameter dict the spend replays,
-schema 7) — so `approvals` is derived from that, keyed by SQLite's own
-`rowid` as a stable, non-secret `id` since the table's real primary key
-(`nonce`) is never returned. `stdin_text`/`context_text` are never returned
-either — see this file's own secrets note above.
+(`item_transitions` oldest-first). There is no `approvals` key: the
+signed-approval table is gone (schema 12). `stdin_text`/`context_text` are
+never returned — see this file's own secrets note above.
 
 `event.reminder_count`/`event.last_reminder_at` are watchdog-poll.py's
 grouped-source alert reminders — how many times, and when most recently,
 Slack was reminded about this alert recurring — and are a different counter
-from `item.reminder_count`/`item.last_reminder_at` (schema 9), which count
-the `needs_human`/`merge_blocked` "still waiting on you" reminders instead.
-Same shape, deliberately different tables/columns: see `scripts/ledger.py`'s
-migration 9 comment for why reusing one counter for both would answer two
-unrelated questions with one number.
+from `item.reminder_count`/`item.last_reminder_at` (schema 9), the columns
+that counted the `needs_human`/`merge_blocked` "still waiting on you"
+reminders. That reminder feature is gone: the `item` columns remain in the
+schema but nothing writes them, so they read their defaults (`0`/`null`).
 
 ```bash
 curl -s http://127.0.0.1:7735/items/42 | jq .
@@ -284,16 +281,7 @@ The pushed payload is `build_argo_snapshot()`'s output: `machine`,
 `board_payload()` verbatim, `items` (`item_payload()` detail for the first 50 board items,
 keyed by event_id as a string, each bounded to its newest 50 transitions/operations via
 `history_limit=ARGO_SNAPSHOT_HISTORY_LIMIT` — see `GET /items/<event_id>`'s own
-`history_limit` note above) with `itemsTruncated` alongside it, and
-`intents` (spooled-intent state from `~/.warden/intents`: full `pending`/
-`rejected` counts, but at most 20 per-status file entries — `entriesTruncated`
-says whether either status is currently over that cap. Because `rejected/`
-files are never deleted, this cap is what stops the intents section from
-growing the whole snapshot past `clients.argo.MAX_BODY_BYTES` and silently
-taking health/metrics/board down with it. An entry never carries `signature`/
-`nonce` (the fields that carry authority in an `approval_decision` intent),
-and a rejected entry carries `has_error: bool` only — never its `.err`
-sibling's text, which can itself embed the raw rejected signature/nonce).
+`history_limit` note above) with `itemsTruncated` alongside it.
 
 Every board item under `items`/`board.items` also carries `availableActions`
 — what the owner can click for this item, mirroring `apply_argo_actions()`'s
@@ -308,7 +296,7 @@ can carry, and what an operator does about it:
 |-|-|-|
 | `ok` | 2xx from Argo. | None — this is the steady state. |
 | `no-secret` | `ARGO_API_SECRET`/`op://common/api/SECRET` did not resolve; nothing was sent. | Re-seed the secrets cache (`make secrets-seed` in dotfiles, biometric, MacBook-only). |
-| `too-large` | The encoded snapshot exceeds `clients.argo.MAX_BODY_BYTES` (1 MB); nothing was sent. | Check `board`/`items`/`intents` sizing — one of the caps above is not holding. |
+| `too-large` | The encoded snapshot exceeds `clients.argo.MAX_BODY_BYTES` (1 MB); nothing was sent. | Check `board`/`items` sizing — one of the caps above is not holding. |
 | `encode-error` | The snapshot was not JSON-serializable; nothing was sent. | A bug in a builder — check the most recent code change to `build_argo_snapshot()`. |
 | `http-error:<code>` | Argo answered with a non-2xx. `404` is expected and a non-event until `POST /warden/snapshot` deploys on the Argo side. | `404`: none, this is expected pre-deploy. Any other code: check the Argo side. |
 | `network-error` | Unreachable host, timeout, or any other transport failure. | Check Argo's own health/connectivity from the mini. |

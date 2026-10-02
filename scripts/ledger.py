@@ -407,8 +407,10 @@ ALTER TABLE triage_items ADD COLUMN origin_thread_ts TEXT;
 # Versions 9 and 11 below added the needs_human/merge_blocked reminder and
 # parked-recurrence columns on `triage_items` (reminder_count, last_reminder_at,
 # parked_mark, parked_recurrences, recurrence_reminded_at). The reminder feature
-# is gone; the columns stay, unused — dropping them would be a destructive
-# migration of the live ledger for no behavioural gain. Do not read them.
+# is gone; the columns stay — dropping them would be a destructive migration
+# of the live ledger for no behavioural gain. Nothing writes them any more and
+# only api.py's `awaiting_owner()` still reads `parked_recurrences`, to satisfy
+# Argo's entry schema until Wave 2. Do not read them elsewhere.
 #
 # Version 9 — the `needs_human`/`merge_blocked` reminder (DESIGN.md:247's
 # "7d, reminder at 1d", the one row of its own deadline table triage.py's
@@ -537,8 +539,8 @@ _VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
 # triage_items.state vocabulary, mirrored from scripts/triage.py's own
 # STATE_* constants (triage.py:332-427) and its TERMINAL_STATES (triage.py:531).
 # ledger.py is the schema owner, so it is the home for the state names that
-# OTHER files (api.py, warden.py, which must not import triage.py by path) need
-# without pulling in triage.py itself. triage.py does not import these back yet
+# OTHER files need without pulling in triage.py itself — chiefly api.py, which
+# triage.py imports and so cannot import back. triage.py does not import these back yet
 # (STATE.md follow-up).
 STATE_NEEDS_HUMAN = "needs_human"
 STATE_FIXED = "fixed"

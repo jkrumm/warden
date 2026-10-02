@@ -393,15 +393,13 @@ def plan_or_land(
     try:
         runs = github.check_runs(owner, repo, pr_head_sha)
     except CheckRunsUnreadable as e:
-        # A fine-grained PAT without `Checks: read` cannot read a private
-        # repository's check-runs at all (§110: `weatherorb`), so this is the
-        # credential's limit, not a verdict on the diff. Read as "no checks to
-        # gate on", recorded in the merge receipt; GitHub's own required checks
-        # are still enforced by the merge call below.
-        runs = []
-        checks_unreadable = str(e)
-    else:
-        checks_unreadable = None
+        # Unreadable is not "none exist": an unknown CI state must never pass
+        # the green-or-none gate. Typically a fine-grained PAT without
+        # `Checks: read` on a private repository (§110: `weatherorb`).
+        raise PolicyError(
+            f"{owner}/{repo}'s check runs on the head commit are unreadable ({e}); "
+            f"the token may lack Checks: read. CI state is unknown, so the merge is refused."
+        ) from e
     merge_gate_check(repo=repo, check_runs=runs, validation=validation_status)
 
     method = github.pick_merge_method(repo_json, rules)
@@ -534,9 +532,6 @@ def plan_or_land(
     operations.complete(conn, merge_op, outcome="done", receipt=json.dumps({
         "pullRequest": pr_number, "mergeCommit": merge_sha, "branch": pr_head,
         "branchDeleted": deleted, "mergeMethod": method, "title": pr_title,
-        # Only set when the checks read was refused by the credential (§110).
-        # A skipped gate is recorded, never silent.
-        "checkRunsUnreadable": checks_unreadable,
     }))
 
     deploy, deploy_op = rollout_after_merge(

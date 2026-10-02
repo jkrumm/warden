@@ -168,7 +168,6 @@ def open_episode(
             )
         raise
 
-
     job_id = job["id"]
     status = job.get("status") or "unknown"
     _insert_dispatch_row(conn, job_id=job_id, tier=tier, repo=repo, brief=brief, why=why,

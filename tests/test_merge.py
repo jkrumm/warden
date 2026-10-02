@@ -343,24 +343,14 @@ def test_github_ruleset_requiring_zero_reviews_is_not_a_human_gate():
     assert fx.calls["merge_pr"][0][1]["method"] != "merge", "linear history rules out a merge commit"
 
 
-def test_unreadable_check_runs_read_as_no_checks_and_are_recorded():
-    """§110 — `weatherorb` is private and the loop's fine-grained PAT carries no
-    `Checks: read`, so the read 403s for a reason that belongs to the credential,
-    not to the diff. It reads as "no checks to gate on" (GitHub's own required
-    checks still decide at the merge call), and the operations receipt records
-    that the read was unavailable, because a gate that was skipped must never look
-    like one that passed."""
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn, validation_status="confirmed")
-        with fakes(check_runs_error=github.CheckRunsUnreadable("GitHub returned HTTP 403 reading check-runs")) as fx:
-            result = _land(conn, why="w", authorized_by="owner:argo")
-        assert result.merged
-        assert fx.calls["merge_pr"]
-        receipt = json.loads(_op_row(conn)["receipt_json"] or "{}")
-        assert receipt.get("checkRunsUnreadable"), "the audit trail must record the unreadable read"
-    finally:
-        conn.close()
+def test_unreadable_check_runs_refuse_the_merge():
+    """§110 — `weatherorb` is private and a fine-grained PAT without `Checks: read`
+    403s the check-runs read. Unreadable is not "none exist": an unknown CI state
+    must not pass the green-or-none gate, so the merge is refused and the item
+    takes the not-mergeable-yet path."""
+    _assert_refuses(exc_type=PolicyError, msg="Checks: read",
+                    seed={"validation_status": "confirmed"},
+                    fake={"check_runs_error": github.CheckRunsUnreadable("GitHub returned HTTP 403 reading check-runs")})
 
 
 def test_pull_request_closed_refuses():
@@ -1066,7 +1056,6 @@ def main() -> int:
             print(f"  {f}")
         return 1
     return 0
-
 
 
 def test_owner_confirm_gets_the_same_shrunk_gate_not_a_bypass():

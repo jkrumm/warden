@@ -6605,7 +6605,7 @@ def test_reconcile_closed_pr_still_lands_merge_blocked():
 
 
 # =============================================================================
-# The fifth closed allowlist — HOST_VERB_ALLOWLIST / maybe_auto_remediate()
+# The host-verb allowlist — HOST_VERB_ALLOWLIST / maybe_auto_remediate()
 # (the owner's 2026-09-11 decision, STATE.md/docs/history/state-log.md §59): "if warden is
 # confident in a fix it must do it, even a host-level action like restarting
 # a process." Same client-boundary-faking shape the auto-implement chain
@@ -6994,8 +6994,7 @@ def test_auto_remediate_dry_run_prints_and_does_nothing():
 
 
 def test_unknown_host_verb_key_is_rejected_at_policy_load():
-    """Same closed-key-set contract as VERB_ALLOWLIST's own
-    test_unknown_verb_key_is_rejected_at_policy_load — a `hostVerbs` entry
+    """Closed-key-set contract: a `hostVerbs` entry
     naming a verb outside HOST_VERB_ALLOWLIST must be dropped at load, not
     passed through to a function that would otherwise KeyError on it."""
     policy = dict(DEFAULT_POLICY, hostVerbs=[{"match": "uk:hermes-agent", "verb": "rm-rf-the-mini"}])
@@ -7022,7 +7021,7 @@ def _write_kuma_stub(tmp_dir: Path, *, monitors: list[dict[str, Any]] | None = N
     both against the SAME binary (`_HERMES_OPS_BIN`) — so one stub dispatches
     on `sys.argv[1]` rather than needing two allowlist entries the real
     function never goes through (it builds its argv directly, not via
-    VERB_ALLOWLIST, since it needs a monitor id only the FIRST call
+    HOST_VERB_ALLOWLIST, since it needs a monitor id only the FIRST call
     resolves)."""
     stub_path = tmp_dir / "hermes-ops-kuma-stub.py"
     monitors_json = json.dumps({"verb": "monitors", "ok": True, "tier": "A", "monitors": monitors or []})
@@ -8100,9 +8099,6 @@ def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline(
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEW and "unproven, not fixed" in item["note"]
         assert ("stop", ("906",)) in TRIP_CALLS
-
-
-# --- the restore drill as a self-audit input (§104) ---------------------------
 
 
 if __name__ == "__main__":

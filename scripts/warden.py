@@ -79,7 +79,6 @@ _EFFECTS = {
 _NEVER = [
     "never merges anything",
     "never pushes to a default branch, in any repo, including direct-to-master ones",
-    "never touches .github/workflows or .github/actions",
     "never mutates infrastructure — that is hermes-ops.sh, not this",
 ]
 

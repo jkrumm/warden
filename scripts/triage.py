@@ -364,7 +364,7 @@ STATE_VALIDATING = "validating"          # sideclaw's own `review` job reviewing
 STATE_MERGE_BLOCKED = "merge_blocked"    # implement failed, validation blocked/errored, or merge itself refused
 STATE_MERGED = "merged"                  # landed; no deploy configured/enabled for this repo
 STATE_LIVENESS_PENDING = "liveness_pending"  # deployed; waiting on a positive liveness signal
-# The host-verb sibling of STATE_IMPLEMENTING, added 2026-09-11 for the fifth
+# The host-verb sibling of STATE_IMPLEMENTING, added 2026-09-11 for the host-verb
 # closed allowlist (HOST_VERB_ALLOWLIST — see that constant's own docstring
 # for the owner decision this exists to serve). maybe_auto_remediate() claims
 # an item into this state with the SAME compare-and-set shape
@@ -740,7 +740,7 @@ DAILY_DIGEST_CURSOR_KEY = "triage_unmapped_digest_date"
 _env_ops_bin = os.environ.get("WARDEN_HERMES_OPS_BIN")
 _HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_HOME / "scripts" / "hermes-ops.sh")
 
-# --- host verbs — the FIFTH closed allowlist ----------------------------------
+# --- host verbs — a closed allowlist -------------------------------------------
 #
 # The owner's decision (2026-09-11, STATE.md, docs/history/state-log.md §59): "if warden is
 # confident in a fix it must do it, even a host-level action like restarting
@@ -751,8 +751,8 @@ _HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_H
 # command (see DESIGN.md § Security model — the episode is not contained,
 # `Bash` unrestricted but a restart still needs judgement about WHICH host and
 # WHICH process, not just an open shell). This is that judgement, encoded
-# once, in code, the same shape VERB_ALLOWLIST/EVIDENCE_ALLOWLIST/
-# LIVENESS_ALLOWLIST/the deploy allowlist already use: a policy rule (see
+# once, in code, the same shape EVIDENCE_ALLOWLIST/LIVENESS_ALLOWLIST
+# already use: a policy rule (see
 # `hostVerbs` in load_policy()) may SELECT a key from this dict, never
 # express an argv of its own — a launchd label or a container/host name
 # reaching config would be DESIGN.md's own C2 in a different costume (see
@@ -822,10 +822,10 @@ if _missing_liveness_monitor:
 # loop has run so far came back `nextAction: human` citing exactly that: no
 # runtime state (var/health.json, watchdog-alerts.log, live OTel) was
 # reachable from inside the checkout. A policy rule can now declare an
-# `evidence` list — but, same closed-set principle as VERB_ALLOWLIST just
+# `evidence` list — but, same closed-set principle as HOST_VERB_ALLOWLIST just
 # above, ONLY a key from EVIDENCE_ALLOWLIST, never an arbitrary command: a
 # policy file must never be able to name an arbitrary argv (or, here, an
-# arbitrary probe). Unlike VERB_ALLOWLIST these four run IN-PROCESS rather
+# arbitrary probe). Unlike HOST_VERB_ALLOWLIST these four run IN-PROCESS rather
 # than via subprocess.run on a fixed argv: three are bounded local file
 # reads, and the fourth (kuma-push-last) needs both a secret
 # (HOMELAB_API_KEY, which must never cross an argv/`ps` boundary) and
@@ -980,7 +980,7 @@ def _gather_argo_commit_live(expected: list[dict[str, Any]]) -> tuple[bool, str]
     return True, f"commit {want[:12]} live"
 
 
-# Same closed-set principle as VERB_ALLOWLIST/EVIDENCE_ALLOWLIST above: a
+# Same closed-set principle as HOST_VERB_ALLOWLIST/EVIDENCE_ALLOWLIST above: a
 # repo's `config/triage-policy.json` entry names a `liveness` KEY, never a
 # probe. Seeded with the original `deploy` key plus `argo-commit-live` (item
 # 1b) for the merge-is-deploy path.
@@ -1228,7 +1228,7 @@ def load_policy() -> dict[str, Any]:
             data.get("revisionMaxAttempts"), key="revisionMaxAttempts",
             default=DEFAULT_REVISION_MAX_ATTEMPTS, cast=int),
         "rules": [r for r in (data.get("rules") or []) if _valid_rule(r)],
-        # The fifth closed allowlist's own rule set (HOST_VERB_ALLOWLIST) —
+        # The host-verb allowlist's own rule set (HOST_VERB_ALLOWLIST) —
         # same match-target/first-match-wins shape as `rules` above (see
         # maybe_auto_remediate()), validated the same way at load time, never
         # at use time, so a typo'd verb key is a loud stderr line here
@@ -2050,7 +2050,7 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
     POSITIVE PROBE (not an inbound message, not silence) confirms a change
     that actually shipped — see STATE_QUIET's own comment."""
     if dry_run:
-        # Mirrors escalate_cluster()/run_verbs(): --dry-run makes NO outbound
+        # Mirrors escalate_cluster(): --dry-run makes NO outbound
         # call, Slack reads included, so a preview against a throwaway DB
         # copy never depends on live credentials or network.
         placeholders = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
@@ -2350,7 +2350,7 @@ def _wp_module() -> Any | None:
 def _run_bounded(fn: Any, *args: Any, timeout: int = EVIDENCE_TIMEOUT) -> tuple[bool, str]:
     """Runs fn(*args) with a hard wall-clock timeout. Every evidence gatherer
     below is read-only and side-effect-free, so this is the in-process
-    equivalent of the `timeout=` subprocess.run() already gives VERB_ALLOWLIST
+    equivalent of the `timeout=` subprocess.run() already gives HOST_VERB_ALLOWLIST
     commands — a hang (a stuck network mount, a slow argo API call) can't
     stall a 10-minute cron. A timeout or ANY exception folds into a returned
     error string rather than raising — a failing evidence command must never
@@ -4561,7 +4561,6 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         conn.commit()
 
 
-
 def _verdict_as_context(job_id: str, verdict: dict[str, Any]) -> str:
     """The investigate verdict, handed to the implement episode as its
     `context`. The brief tells the episode to re-read "that investigation's
@@ -4582,7 +4581,7 @@ def _verdict_as_context(job_id: str, verdict: dict[str, Any]) -> str:
 
 def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
-    """The fifth closed allowlist's own poller (STATE.md's 2026-09-11 owner
+    """The host-verb allowlist's own poller (STATE.md's 2026-09-11 owner
     decision, docs/history/state-log.md §59): "if warden is confident in a fix it must do
     it, even a host-level action like restarting a process. `needs_human` for
     a restart is friction." Modelled line for line on maybe_auto_implement()
@@ -4783,11 +4782,11 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     dispatch_job) reads nextAction=implement, at ANY confidence (review is
     the gate, not the investigator's self-assessment) AND it has
     not already been auto-implemented (implement_job IS NULL) AND its own
-    `max_tier` is `implement` — the same "runs at most once" shape
-    run_verbs() already uses, for the same reason: the outcome falls out of
-    the state machine (a re-triggered item is no longer in STATE_VERDICT
-    once this fires). `max_tier != 'implement'` (a human's `warden run
-    --tier investigate`, or any GitHub issue not the owner's own) never
+    `max_tier` is `implement`. "Runs at most once" is guaranteed by exactly
+    that eligibility: only STATE_VERDICT items with `implement_job IS NULL`
+    are picked up, and the claim moves the item out of STATE_VERDICT, so a
+    re-triggered item is never picked up again. `max_tier != 'implement'`
+    (a human's `warden run --tier investigate`, or any GitHub issue not the owner's own) never
     reaches this loop at all — fold_dispatch_verdict() already routed its
     verdict straight to `closed` instead of `verdict`, so it structurally
     cannot appear in the eligibility query below; the clause is defence in
@@ -5135,7 +5134,6 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
         if fresh_item is not None and fresh_event is not None:
             sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
-
 
 
 def _already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
@@ -6282,7 +6280,7 @@ ARGO_SNAPSHOT_ITEMS_CAP = 50
 ARGO_SNAPSHOT_HISTORY_LIMIT = 50
 
 # The five owner-facing verbs Argo's own action queue may ever name — a
-# closed set for the same reason VERB_ALLOWLIST/HOST_VERB_ALLOWLIST are: the
+# closed set for the same reason HOST_VERB_ALLOWLIST is: the
 # string reaches a dispatcher below that branches on it, and an unrecognized
 # value must be a loud, acked rejection, never a silent drop or a guess.
 ARGO_ACTION_VERBS = frozenset({"implement", "merge", "dismiss", "reinvestigate", "note"})
@@ -6650,7 +6648,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     escalate_origin_items(conn, now, dry_run=dry_run)
     escalate(conn, policy, now, dry_run=dry_run)
 
-    # The fifth closed allowlist's own poller (STATE.md's 2026-09-11 owner
+    # The host-verb allowlist's own poller (STATE.md's 2026-09-11 owner
     # decision) — BEFORE the implement chain, on purpose: a verdict/
     # needs_human row this claims moves straight to `remediating`, which is
     # neither `verdict` nor `needs_human` any more, so maybe_auto_implement()

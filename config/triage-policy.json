@@ -130,7 +130,7 @@
     "                  sit until liveness_deadline and reopen, worse than an honest `merged`).",
     "`argo` is seeded with `deployOnMerge` + `liveness: argo-commit-live`.",
     "",
-    "`hostVerbs` (list) is the FIFTH closed allowlist's own rule set \u2014 the owner's 2026-09-11",
+    "`hostVerbs` (list) is the host-verb allowlist's own rule set \u2014 the owner's 2026-09-11",
     "decision that warden may run an idempotent host-level restart itself, rather than card",
     "`needs_human` for a fix it is already confident in (STATE.md, docs/history/state-log.md \u00a759). Same",
     "match-target/first-match-wins shape as `rules` above: each entry is",

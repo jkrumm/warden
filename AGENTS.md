@@ -69,8 +69,7 @@ Pinned to **3.11.15** via `python3.11` (uv-managed). The box's default `python3`
 the extracted loop was written and proven against 3.11 and an interpreter change
 is its own verifiable step.
 
-**The loop is pure stdlib.** `requirements.txt` has one entry, `cryptography`, for
-the Ed25519 verifier. Keep it that way: a dependency here is a dependency in the
+**The loop is pure stdlib.** `requirements.txt` has no entries. Keep it that way: a dependency here is a dependency in the
 thing that decides whether to touch production.
 
 ## Tests
@@ -143,7 +142,7 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 ## Things that are load-bearing and look like they are not
 
 - **A signal going quiet may cancel the need to *start* work. It may never
-  discharge a verdict, a pending approval, or an in-flight operation.**
+  discharge a verdict or an in-flight operation.**
   Silence-resolve applies to `new` and to nothing else.
 - **Overflow waits, never drops.** Cluster members past the cap stay `new`.
 - **The dry-run contract**: never touches Slack, never shells out, everything else
@@ -159,25 +158,17 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   to `needs_human` carrying `dispatches.error`, never into `verdict` — a
   verdict-less `verdict` row is the same invisibility in a different column
   (§64). It is never retried automatically.
-- **An action pulled from Argo's queue is the owner, full stop** (owner
-  decision, 2026-09-15 — DESIGN.md § *2026-09-15 override*, REVIEW.md's C1
-  disposition update, §71). `apply_argo_actions()` passes
-  `authorized_by="owner:argo"` into the same plain truthy-string gate a
-  signed Slack approval satisfies — no signing key touches Argo, and
-  `require_signed_approval()`/`execute_approved()` are unchanged and remain
-  the only path for anything reachable off the tailnet. This is not a second
-  signing oracle; it is because Argo is reachable only over his own tailnet.
+- **An action pulled from Argo's queue is the owner, full stop.**
+  `apply_argo_actions()` records `authorized_by="owner:argo"` and acts — Argo
+  is reachable only over his own tailnet, which is the trust boundary.
 
 ## Cross-repo facts
 
-`hermes-ops.sh`, `agents-overview.py`, `plugins/dispatch-approval/` and a
+`hermes-ops.sh`, `agents-overview.py` and a
 six-line dispatch-shim script (which `exec`s into this repo's `scripts/warden`)
 live in `hermes-agent` and are reached, not vendored.
 `~/.hermes/{scripts,config}` are **whole-directory symlinks** into that repo, which
-is why the extraction was never a `git mv`. The Ed25519 signing key exists only in
-the gateway's RAM, is minted fresh at every start, and is never serialized — only
-a Slack interaction payload can cause a signature to exist. Prompt injection
-reaching a brief produces words, and words cannot mint a signature.
+is why the extraction was never a `git mv`.
 
 ## Git
 

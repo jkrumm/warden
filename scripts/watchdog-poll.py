@@ -1146,8 +1146,8 @@ def _github_author(item: dict[str, Any]) -> str | None:
     return payload.get("author")
 
 
-def _render_bullet(item: dict[str, Any], kind: str, now: dt.datetime) -> str:
-    """kind ∈ {'new', 'resolved'}. Returns a single Slack-mrkdwn line, no leading dash."""
+def _render_bullet(item: dict[str, Any], now: dt.datetime) -> str:
+    """Returns a single Slack-mrkdwn line, no leading dash."""
     src = item.get("source", "?")
     emoji = SOURCE_EMOJI.get(src, ":grey_question:")
     title = (item.get("title") or "?").strip()
@@ -1191,7 +1191,7 @@ def _render_bullet(item: dict[str, Any], kind: str, now: dt.datetime) -> str:
     return body
 
 
-def _render_section(label: str, header_emoji: str, items: list[dict[str, Any]], kind: str,
+def _render_section(label: str, header_emoji: str, items: list[dict[str, Any]],
                     now: dt.datetime) -> list[str]:
     if not items:
         return []
@@ -1199,7 +1199,7 @@ def _render_section(label: str, header_emoji: str, items: list[dict[str, Any]], 
     capped = items[:SECTION_CAP]
     overflow = len(items) - len(capped)
     for it in capped:
-        lines.append(f"- {_render_bullet(it, kind, now)}")
+        lines.append(f"- {_render_bullet(it, now)}")
     if overflow > 0:
         lines.append(f"- … and {overflow} more")
     return lines
@@ -1226,9 +1226,9 @@ def compose_slack_body(
 
     sections: list[list[str]] = []
     if new:
-        sections.append(_render_section("New", ":rotating_light:", new, "new", now))
+        sections.append(_render_section("New", ":rotating_light:", new, now))
     if resolved:
-        sections.append(_render_section("Resolved", ":white_check_mark:", resolved, "resolved", now))
+        sections.append(_render_section("Resolved", ":white_check_mark:", resolved, now))
 
     return "\n\n".join("\n".join(sec) for sec in sections)
 

@@ -389,7 +389,7 @@ def _metric_median_needs_human_to_decision(
 
 # Mirrored from triage.py by literal value, not by import — same reasoning as
 # DISPOSITION_STATES above: this module stays a read-only, dependency-free
-# reader of the ledger, and copying two string literals that change on the
+# reader of the ledger, and copying one string literal that change on the
 # same rare cadence as the schema itself is a smaller risk than importing the
 # whole 4000-line act-loop module just to read a constant. "fixed" is
 # triage.py's own STATE_FIXED.
