@@ -307,40 +307,6 @@ def finished_at_iso(job: dict[str, Any], *, fallback: dt.datetime) -> str:
     return fallback.isoformat()
 
 
-def check_schema_versions() -> dict[str, dict[str, Any]]:
-    """GET /api/dispatch-schema and /api/review-schema, compare `version` AND
-    the published `outcomes` set against this module's pinned constants.
-    Never raises — a connection failure is reported as `reachable: False` so
-    `make status` can print `unreachable` rather than failing outright; only
-    an actual version/outcome-set MISMATCH is `ok: False` with `reachable`
-    True, the loud-refusal case `assert_result_schema()` enforces per-job."""
-    out: dict[str, dict[str, Any]] = {}
-    for tool, path, expected_version, expected_outcomes in (
-        ("dispatch", "/api/dispatch-schema", DISPATCH_SCHEMA_VERSION, DISPATCH_OUTCOMES),
-        ("review", "/api/review-schema", REVIEW_SCHEMA_VERSION, REVIEW_OUTCOMES),
-    ):
-        try:
-            status, text = _request("GET", path, None)
-            parsed = json.loads(text) if status == 200 else None
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
-            parsed = None
-        if not isinstance(parsed, dict):
-            out[tool] = {"reachable": False, "ok": False}
-            continue
-        remote_version = parsed.get("version")
-        remote_outcomes = tuple(parsed.get("outcomes") or ())
-        ok = remote_version == expected_version and set(remote_outcomes) == set(expected_outcomes)
-        out[tool] = {
-            "reachable": True,
-            "ok": ok,
-            "expectedVersion": expected_version,
-            "remoteVersion": remote_version,
-            "expectedOutcomes": expected_outcomes,
-            "remoteOutcomes": remote_outcomes,
-        }
-    return out
-
-
 def classify_dispatch_outcome(status: str | None, verdict_json: str | None) -> tuple[str, str | None]:
     """Classify a finished dispatch's outcome from sideclaw's own published
     verdict shape — the ladder `scripts/watchdog-poll.py`'s `_dispatch_summary()`

@@ -19,7 +19,6 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
-import os
 import sqlite3
 import sys
 import tempfile
@@ -1046,34 +1045,19 @@ def test_merge_result_to_json_shape():
 
 # --- runner --------------------------------------------------------------------------------
 
-# This suite runs INSIDE a Claude Code session; lifecycle.policy's
-# require_no_recursion() (called at plan_or_land()'s LAND step) refuses
-# unconditionally when any of these are set. Popped for the whole run,
-# restored after, so the suite exercises the real land path.
-_RECURSION_MARKERS = ("CLAUDE_CODE_SESSION", "CLAUDECODE", "CLAUDE_SESSION_ID", "CLAUDE_ENTRYPOINT")
-
-
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
     passed = 0
     failures: list[str] = []
-    saved_recursion_markers = {m: os.environ.pop(m, None) for m in _RECURSION_MARKERS}
-    try:
-        for name, fn in tests:
-            try:
-                fn()
-                passed += 1
-            except AssertionError as e:
-                failures.append(f"{name}: {e}")
-            except Exception:
-                failures.append(f"{name}: unexpected exception\n{traceback.format_exc()}")
-    finally:
-        for m, v in saved_recursion_markers.items():
-            if v is None:
-                os.environ.pop(m, None)
-            else:
-                os.environ[m] = v
+    for name, fn in tests:
+        try:
+            fn()
+            passed += 1
+        except AssertionError as e:
+            failures.append(f"{name}: {e}")
+        except Exception:
+            failures.append(f"{name}: unexpected exception\n{traceback.format_exc()}")
 
     print(f"{passed}/{len(tests)} passed")
     if failures:

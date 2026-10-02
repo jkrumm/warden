@@ -35,7 +35,6 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import threading
@@ -60,7 +59,6 @@ _wp_spec = importlib.util.spec_from_file_location("watchdog_poll", WATCHDOG_POLL
 assert _wp_spec is not None and _wp_spec.loader is not None
 watchdog_poll = importlib.util.module_from_spec(_wp_spec)
 _wp_spec.loader.exec_module(watchdog_poll)
-
 
 
 # --- fixtures ------------------------------------------------------------------
@@ -104,12 +102,6 @@ def _default_fake_submit_review(*, cwd, pr, context=None, model=None):
     return {"id": "review-unused-000000", "status": "queued"}
 
 
-# lifecycle.policy.require_no_recursion()'s own markers — this suite runs
-# INSIDE a Claude Code session, so `_triage_env()` pops these for the
-# duration of every test and restores them on exit.
-_RECURSION_MARKERS = ("CLAUDE_CODE_SESSION", "CLAUDECODE", "CLAUDE_SESSION_ID", "CLAUDE_ENTRYPOINT")
-
-
 # The real `_kuma_trip`, for the argument-validation test (it returns before
 # any ssh on a refused argument). Every other test gets a fake.
 ORIGINAL_KUMA_TRIP = triage._kuma_trip
@@ -140,7 +132,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         "update_blocks": triage.update_blocks,
         "LIVENESS_ALLOWLIST": dict(triage.LIVENESS_ALLOWLIST),
         "MAX_OPEN_INVESTIGATIONS": triage.MAX_OPEN_INVESTIGATIONS,
-        "VERB_ALLOWLIST": dict(triage.VERB_ALLOWLIST),
         "_HERMES_OPS_BIN": triage._HERMES_OPS_BIN,
         "HOST_VERB_ALLOWLIST": dict(triage.HOST_VERB_ALLOWLIST),
         "_watchdog_poll": triage._watchdog_poll,
@@ -148,11 +139,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         "GATEWAY_STARTS_LOG": triage.GATEWAY_STARTS_LOG,
         "HERMES_ERROR_LOG": triage.HERMES_ERROR_LOG,
         "TRIAGE_REPO_DIR": triage.TRIAGE_REPO_DIR,
-        "_call_propose_mappings_model": triage._call_propose_mappings_model,
         "_kuma_trip": triage._kuma_trip,
-        "RESTORE_DRILL_FILE": triage.RESTORE_DRILL_FILE,
-        "_resolve_openai_base_url": triage._resolve_openai_base_url,
-        "_resolve_openai_api_key": triage._resolve_openai_api_key,
     }
     # The client-boundary modules: the SAME module objects `lifecycle`
     # itself imports (`from clients import sideclaw`, `from lifecycle import
@@ -178,13 +165,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_argo", "ack_action"): triage._argo.ack_action,
     }
     saved_repos_root = os.environ.get("WARDEN_REPOS_ROOT")
-    # This suite runs INSIDE a Claude Code session (CLAUDECODE etc. are set
-    # in the real environment), and lifecycle.policy.require_no_recursion()
-    # (called from open_episode() and plan_or_land()'s LAND step) refuses
-    # unconditionally when any of these are set — popped for the duration of
-    # every test in this file, restored on exit, so the suite exercises the
-    # real dispatch/merge path rather than the guard's own refusal.
-    saved_recursion_markers = {m: os.environ.pop(m, None) for m in _RECURSION_MARKERS}
     try:
         triage.DB_PATH = tmp_dir / "watchdog.db"
         triage.POLICY_PATH = tmp_dir / "triage-policy.json"
@@ -209,11 +189,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
         triage._github.branch_rules = lambda owner, repo, branch: []
-        # A fresh, passing restore drill (§104) unless a test says otherwise —
-        # never the real ~/.warden/restore-drill.json.
-        triage.RESTORE_DRILL_FILE = tmp_dir / "restore-drill.json"
-        triage.RESTORE_DRILL_FILE.write_text(json.dumps({"ok": True, "at": NOW.isoformat(),
-                                                         "snapshot": "test-snapshot"}))
         # The synthetic trip's only door to the real Kuma (§103): never reached
         # from a test. A trip test registers its own fake.
         TRIP_CALLS.clear()
@@ -307,11 +282,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
             os.environ.pop("WARDEN_REPOS_ROOT", None)
         else:
             os.environ["WARDEN_REPOS_ROOT"] = saved_repos_root
-        for m, v in saved_recursion_markers.items():
-            if v is None:
-                os.environ.pop(m, None)
-            else:
-                os.environ[m] = v
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -428,39 +398,6 @@ def _env(**kv):
 NOW = dt.datetime.now(dt.timezone.utc)
 OLD = NOW - dt.timedelta(hours=1)
 VERY_OLD = NOW - dt.timedelta(days=10)
-
-
-def _init_policy_git_repo(tmp_dir: Path, policy_data: dict[str, Any]) -> Path:
-    """Sets up a throwaway git checkout shaped like this repo's own
-    (`config/triage-policy.json` under a repo root, one clean initial
-    commit) and points triage.TRIAGE_REPO_DIR / triage.POLICY_PATH at it —
-    the fixture propose_mappings()'s git-commit path needs, since it always
-    resolves POLICY_PATH relative to TRIAGE_REPO_DIR before ever touching
-    git. Caller must be inside a `with _triage_env()` block (or otherwise
-    responsible for restoring these two module globals) — _triage_env's own
-    `saved` dict already covers TRIAGE_REPO_DIR."""
-    repo_dir = tmp_dir / "policy-repo"
-    (repo_dir / "config").mkdir(parents=True)
-    policy_path = repo_dir / "config" / "triage-policy.json"
-    policy_path.write_text(triage._dump_policy_json(policy_data))
-    subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
-    subprocess.run(["git", "-C", str(repo_dir), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repo_dir), "commit", "-q", "-m", "initial"], check=True)
-    triage.TRIAGE_REPO_DIR = repo_dir
-    triage.POLICY_PATH = policy_path
-    return repo_dir
-
-
-def _setup_discoverable_repos(ctx, names: list[str]) -> Path:
-    """Points the repos root (`WARDEN_REPOS_ROOT`, restored by `_triage_env()`) at
-    a throwaway directory containing one fake `.git` checkout per name in
-    `names`, so propose_mappings() tests never depend on this dev machine's real
-    ~/SourceRoot layout."""
-    root_dir = ctx.tmp_dir / "fake-source-root"
-    for n in names:
-        (root_dir / n / ".git").mkdir(parents=True)
-    os.environ["WARDEN_REPOS_ROOT"] = str(root_dir)
-    return root_dir
 
 
 def _insert_dispatch_row(conn: sqlite3.Connection, job_id: str, created_at: dt.datetime, *,
@@ -2304,40 +2241,6 @@ def test_fold_dispatch_verdict_updates_every_cluster_member():
             assert item["artifact_url"] == "https://github.com/jkrumm/demo-repo/pull/3"
 
 
-def _write_env_check_stub(tmp_dir: Path, *, dangling_homelab: list[str] | None = None,
-                           dangling_vps: list[str] | None = None,
-                           error_homelab: str | None = None,
-                           error_vps: str | None = None) -> Path:
-    """A stub standing in for hermes-ops.sh's `env-check --json`, returning
-    exactly its documented shape.
-
-    `error_homelab`/`error_vps` model the SECOND failure shape `parse()` can
-    emit: `ok: false` with an EMPTY `danglingItems` and the raw `op run`
-    output in `error` (a rate-limited probe, a network failure, an expired
-    service-account token). `cmd_env_check` exits 3 for both shapes and
-    `_run_verb()` accepts 0 and 3, so both reach the renderer — see
-    `_render_env_check_note()`'s own docstring."""
-    stub_path = tmp_dir / "env-check-stub.py"
-    hl_ok = not dangling_homelab and not error_homelab
-    vps_ok = not dangling_vps and not error_vps
-    payload = {
-        "verb": "env-check", "ok": hl_ok and vps_ok, "tier": "A",
-        "homelab": {"ok": hl_ok, "exitCode": 0 if hl_ok else 3,
-                    "danglingItems": dangling_homelab or [], "error": error_homelab},
-        "vps": {"ok": vps_ok, "exitCode": 0 if vps_ok else 3,
-                "danglingItems": dangling_vps or [], "error": error_vps},
-    }
-    stub_path.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json\n"
-        f"print(json.dumps({payload!r}))\n"
-        "import sys\n"
-        f"sys.exit({0 if (hl_ok and vps_ok) else 3})\n"
-    )
-    stub_path.chmod(0o755)
-    return stub_path
-
-
 def test_op_refs_sources_are_ingested():
     """Correction #2: op_refs_homelab/op_refs_vps must not be structurally
     excluded from ingest — a dead 1Password ref must at minimum reach the
@@ -2350,146 +2253,6 @@ def test_op_refs_sources_are_ingested():
         triage.ingest(conn, NOW)
         item = triage._get_item(conn, eid)
         assert item is not None, "op_refs_homelab must produce a triage_items row"
-
-
-def test_op_refs_route_to_env_check_verb_not_episode():
-    """Correction #2: a dead 1Password ref must reach a deterministic VERB
-    (hermes-ops.sh env-check), never a sideclaw episode — cheaper and safer
-    (a bare item name in the output doesn't trip sideclaw's own secret-scan
-    the way a dispatched verdict would)."""
-    policy = dict(DEFAULT_POLICY, minOccurrences=1, minOpenMinutes=0,
-                  rules=[{"match": "op_refs_homelab:*", "verb": "env-check"},
-                         {"match": "op_refs_vps:*", "verb": "env-check"}])
-    with _triage_env(policy=policy) as (conn, ctx):
-        stub = _write_env_check_stub(ctx.tmp_dir, dangling_homelab=["gateway-secret"])
-        triage.VERB_ALLOWLIST = {"env-check": [str(stub)]}
-
-        eid = _insert_event(conn, source="op_refs_homelab", external_id="raw:some-error",
-                             title="1Password refs unresolved on homelab", first_seen=OLD)
-        calls: list[dict[str, Any]] = []
-        triage._sideclaw.submit = _fake_submit(calls)
-        triage.run(conn, dry_run=False)
-
-        assert calls == [], "a verb-routed item must never open a sideclaw episode"
-        item = triage._get_item(conn, eid)
-        assert item["repo"] is None
-        assert item["verb"] == "env-check"
-        assert item["state"] == triage.STATE_NEEDS_HUMAN
-        assert "gateway-secret" in item["note"]
-        assert "make secrets-seed" in item["note"]
-        assert item["dispatch_job"] is None
-
-        event_row = triage._get_event(conn, eid)
-        assert event_row["dispatch_id"] is None, "a verb outcome never touches the dispatch bridge"
-
-        # The card carries the dangling item + remediation inline.
-        assert len(ctx.posted) == 1
-        blocks_text = json.dumps(ctx.posted[0]["blocks"])
-        assert "gateway-secret" in blocks_text
-        assert "make secrets-seed" in blocks_text
-
-
-def test_op_refs_no_dangling_item_still_reaches_needs_human():
-    policy = dict(DEFAULT_POLICY, minOccurrences=1, minOpenMinutes=0,
-                  rules=[{"match": "op_refs_vps:*", "verb": "env-check"}])
-    with _triage_env(policy=policy) as (conn, ctx):
-        stub = _write_env_check_stub(ctx.tmp_dir)  # nothing dangling — ok: true
-        triage.VERB_ALLOWLIST = {"env-check": [str(stub)]}
-        eid = _insert_event(conn, source="op_refs_vps", external_id="some-item", title="unresolved",
-                             first_seen=OLD)
-        triage.run(conn, dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_NEEDS_HUMAN
-        assert "no dangling item" in item["note"]
-
-
-def test_op_refs_failure_without_dangling_item_renders_the_cause_not_transient():
-    """jkrumm/hermes-agent#2: `ok: false` with an EMPTY `danglingItems` is a
-    real failure — a rate-limited probe, a network failure, an expired
-    service-account token — and the renderer used to print "likely transient;
-    will disappearance-resolve on its own" for all of them, discarding the one
-    line (`error`) that named the cause. The transient wording is correct ONLY
-    for a clean pass."""
-    rate_limit = ("[ERROR] 2026/09/15 18:31:57 Too many requests. Your client has been "
-                  "rate-limited. Try again in  seconds")
-    policy = dict(DEFAULT_POLICY, minOccurrences=1, minOpenMinutes=0,
-                  rules=[{"match": "op_refs_homelab:*", "verb": "env-check"}])
-    with _triage_env(policy=policy) as (conn, ctx):
-        stub = _write_env_check_stub(ctx.tmp_dir, error_homelab=rate_limit)
-        triage.VERB_ALLOWLIST = {"env-check": [str(stub)]}
-        eid = _insert_event(conn, source="op_refs_homelab", external_id="raw:rate-limited",
-                             title="1Password refs unresolved on homelab", first_seen=OLD)
-        triage.run(conn, dry_run=False)
-
-        item = triage._get_item(conn, eid)
-        note = item["note"]
-        assert item["state"] == triage.STATE_NEEDS_HUMAN
-        assert "likely transient" not in note, note
-        assert "Too many requests" in note, "the raw op stderr is the whole point"
-        assert "homelab" in note
-        assert triage._RATE_LIMIT_HINT in note, "a rate-limit gets its own remediation"
-
-        # The card carries the same text — the note is not the only surface.
-        assert len(ctx.posted) == 1
-        blocks_text = json.dumps(ctx.posted[0]["blocks"])
-        assert "Too many requests" in blocks_text
-        assert "likely transient" not in blocks_text
-
-
-def test_op_refs_non_rate_limit_failure_still_renders_the_cause_without_the_hint():
-    """The non-rate-limit half of the same shape: any other `op run` failure
-    must also surface its own text, and must NOT be handed the rate-limit
-    remediation — a wrong hint is worse than none."""
-    policy = dict(DEFAULT_POLICY, minOccurrences=1, minOpenMinutes=0,
-                  rules=[{"match": "op_refs_vps:*", "verb": "env-check"}])
-    with _triage_env(policy=policy) as (conn, ctx):
-        stub = _write_env_check_stub(ctx.tmp_dir, error_vps="[ERROR] connection refused")
-        triage.VERB_ALLOWLIST = {"env-check": [str(stub)]}
-        eid = _insert_event(conn, source="op_refs_vps", external_id="raw:conn-refused",
-                             title="1Password refs unresolved on vps", first_seen=OLD)
-        triage.run(conn, dry_run=False)
-        note = triage._get_item(conn, eid)["note"]
-        assert "likely transient" not in note, note
-        assert "connection refused" in note, note
-        assert triage._RATE_LIMIT_HINT not in note
-
-
-def test_render_env_check_note_transient_wording_only_for_a_clean_pass():
-    """Direct unit coverage of the three shapes, independent of the verb path:
-    clean pass -> transient wording; dangling item -> the dangling remediation;
-    ok:false with no dangling item -> the cause. Also pins the fail-safe for a
-    top-level `ok: false` carrying no per-host detail at all — it must not fall
-    through to the transient wording."""
-    clean = {"ok": True, "homelab": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None},
-             "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
-    assert "likely transient" in triage._render_env_check_note(clean)
-
-    dangling = {"ok": False, "homelab": {"ok": False, "exitCode": 3,
-                                         "danglingItems": ["gateway-secret"], "error": "x"},
-                "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
-    assert "make secrets-seed" in triage._render_env_check_note(dangling)
-
-    failed = {"ok": False, "homelab": {"ok": False, "exitCode": 1, "danglingItems": [],
-                                       "error": "[ERROR] boom"},
-              "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
-    note = triage._render_env_check_note(failed)
-    assert "likely transient" not in note and "[ERROR] boom" in note
-
-    # A host that failed with no error text at all still renders as a failure.
-    silent = {"ok": False, "homelab": {"ok": False, "exitCode": 1, "danglingItems": [],
-                                       "error": None},
-              "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
-    assert "likely transient" not in triage._render_env_check_note(silent)
-
-    # Top-level ok:false with both hosts claiming ok is contradictory, but the
-    # renderer must fail SAFE (report it) rather than print "transient".
-    contradictory = {"ok": False, "homelab": {"ok": True, "exitCode": 0, "danglingItems": [],
-                                              "error": None},
-                     "vps": {"ok": True, "exitCode": 0, "danglingItems": [], "error": None}}
-    assert "likely transient" not in triage._render_env_check_note(contradictory)
-
-    # A probe that never ran keeps its own wording.
-    assert "probe failed to run" in triage._render_env_check_note({"_error": "timeout"})
 
 
 def test_op_refs_raw_fallback_dedups_across_timestamps():
@@ -2528,15 +2291,6 @@ def test_watchdog_poll_alerts_read_token_pinned_to_hermes():
     finally:
         os.environ.pop("WARDEN_SLACK_BOT_TOKEN", None)
         os.environ.pop("SLACK_BOT_TOKEN", None)
-
-
-def test_unknown_verb_key_is_rejected_at_policy_load():
-    """A policy rule must never be able to name an arbitrary command — only
-    a key in the code-side VERB_ALLOWLIST is accepted."""
-    policy = dict(DEFAULT_POLICY, rules=[{"match": "op_refs_homelab:*", "verb": "rm-rf-everything"}])
-    with _triage_env(policy=policy) as (conn, ctx):
-        loaded = triage.load_policy()
-        assert loaded["rules"] == [], "an unknown verb key must be dropped, not passed through"
 
 
 # --- evidence commands (declared runtime-state probes) -----------------------
@@ -4571,9 +4325,7 @@ class _FakeHealthResp:
 
 
 def _stub_argo_health(body_obj: Any = None, *, raise_exc: Exception | None = None):
-    """Same pattern test_propose_mappings_unparseable_response_is_non_fatal
-    already uses for triage.urllib.request.urlopen — this is the second
-    caller, not a new one."""
+    """Stubs triage.urllib.request.urlopen for the Argo health probe."""
     def _fake_urlopen(_req, timeout=None):
         if raise_exc is not None:
             raise raise_exc
@@ -4689,406 +4441,6 @@ def test_deploy_on_merge_liveness_confirmed_produces_a_fixed_row():
         assert item["state"] == triage.STATE_FIXED
         assert item["note"].startswith(triage.LIVENESS_CONFIRMED_NOTE_PREFIX)
         assert len(ctx.updated) == 1 and len(ctx.posted) == 0
-
-
-# --- propose_mappings() — the one LLM call in this file ---------------------
-
-def test_propose_mappings_request_body_has_no_max_tokens_or_temperature():
-    """House rule for every OpenAI-leg call this file makes: `max_completion_
-    tokens`, never `max_tokens`; no `temperature` at all; a top-level
-    `reasoning_effort` — see PROPOSE_MAPPINGS_MODEL's own comment."""
-    body = triage._propose_mappings_request_body("a prompt")
-    assert body["model"] == triage.PROPOSE_MAPPINGS_MODEL
-    assert body["max_completion_tokens"] == triage.PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS
-    assert body["reasoning_effort"] == triage.PROPOSE_MAPPINGS_REASONING_EFFORT
-    assert "max_tokens" not in body
-    assert "temperature" not in body
-
-
-def test_propose_mappings_model_and_budget_constants():
-    """Pins the 2026-09-13 estate-wide model rollout for this slot: deepseek-
-    v4.1-flash, `reasoning_effort: "high"`, a 16000-token budget (this model's
-    thinking expands to fill whatever it is given, and returns empty below
-    ~1000), and a 1800s hang guard (this is a single non-streaming request, so
-    per the agent-limits rule it needs a guard, not a tight budget)."""
-    assert triage.PROPOSE_MAPPINGS_MODEL == "deepseek-v4.1-flash"
-    assert triage.PROPOSE_MAPPINGS_REASONING_EFFORT == "high"
-    assert triage.PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS == 16000
-    assert triage.PROPOSE_MAPPINGS_TIMEOUT == 1800
-
-
-class _FakeCompletionResp:
-    def __init__(self, body: bytes):
-        self._body = body
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-
-def test_propose_mappings_model_call_empty_content_is_non_fatal_and_logs_finish_reason():
-    """An under-budgeted reasoning model returns HTTP 200 with empty content
-    and `finish_reason: "length"`, silently — this must never be read as a
-    successful empty proposal, and finish_reason must be visible on stderr."""
-    triage._resolve_openai_base_url = lambda: "https://example.test/v1"
-    triage._resolve_openai_api_key = lambda: "test-key"
-
-    body = json.dumps({
-        "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
-    }).encode()
-    saved_urlopen = triage.urllib.request.urlopen
-    triage.urllib.request.urlopen = lambda _req, timeout=None: _FakeCompletionResp(body)
-    err = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(err):
-            result = triage._call_propose_mappings_model("a prompt")
-    finally:
-        triage.urllib.request.urlopen = saved_urlopen
-
-    assert result is None
-    assert "finish_reason='length'" in err.getvalue()
-
-
-def test_propose_mappings_model_call_truncated_nonempty_content_is_discarded():
-    """`finish_reason: "length"` is a failure even when SOME content came
-    back — a truncated completion is not trustworthy JSON, so it must be
-    discarded rather than handed to the parser."""
-    triage._resolve_openai_base_url = lambda: "https://example.test/v1"
-    triage._resolve_openai_api_key = lambda: "test-key"
-
-    body = json.dumps({
-        "choices": [{"message": {"content": '{"sig-1": {"acti'}, "finish_reason": "length"}],
-    }).encode()
-    saved_urlopen = triage.urllib.request.urlopen
-    triage.urllib.request.urlopen = lambda _req, timeout=None: _FakeCompletionResp(body)
-    err = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(err):
-            result = triage._call_propose_mappings_model("a prompt")
-    finally:
-        triage.urllib.request.urlopen = saved_urlopen
-
-    assert result is None
-    assert "finish_reason=length" in err.getvalue()
-
-
-def test_propose_candidates_age_reads_the_signature_not_the_row():
-    """Age must come from the payload's ts_first, not events.first_seen.
-
-    reconcile() rewrites first_seen every time it reopens a resolved row, so for a
-    grouped source the two differ by months. Measured on the live DB:
-    homelab-temperature-above-threshold carries ts_first = 2026-04-30 while
-    first_seen reads 2026-09-04 — a 130-day-old recurring signature that looked
-    five days old and sat under every age floor, permanently invisible to this
-    pass. Regression test for that exact shape."""
-    with _triage_env() as (conn, ctx):
-        _insert_event(
-            conn, source="slack_alert", external_id="reopened-old-sig",
-            title="Recurring for months, row reopened two days ago",
-            first_seen=NOW - dt.timedelta(days=2),
-            payload={
-                "first_text": "Recurring for months",
-                "ts_first": str((NOW - dt.timedelta(days=130)).timestamp()),
-                "ts_last": str(NOW.timestamp()),
-            },
-        )
-        triage.ingest(conn, NOW)
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        sigs = {c["signature"] for c in triage._propose_mapping_candidates(conn, policy, NOW)}
-        assert "slack_alert:reopened-old-sig" in sigs, (
-            f"age must come from the payload's ts_first, not the reopened row's "
-            f"first_seen — got {sigs}")
-
-
-def test_propose_mappings_24h_cursor_prevents_second_run():
-    with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="slack_alert", external_id="cursor-sig", title="Cursor test",
-                       first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        _init_policy_git_repo(ctx.tmp_dir, {"_readme": [], "rules": [], "ignore": []})
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        calls = {"n": 0}
-
-        def _stub(_prompt):
-            calls["n"] += 1
-            return {"slack_alert:cursor-sig": {"action": "ignore", "reason": "test"}}
-
-        triage._call_propose_mappings_model = _stub
-
-        applied1 = triage.propose_mappings(conn, policy, NOW, dry_run=False)
-        assert calls["n"] == 1
-        assert len(applied1) == 1
-
-        applied2 = triage.propose_mappings(conn, policy, NOW + dt.timedelta(hours=1), dry_run=False)
-        assert calls["n"] == 1, "within 24h of the last run, the model must not be called again"
-        assert applied2 == []
-
-        applied3 = triage.propose_mappings(conn, policy, NOW + dt.timedelta(hours=25), dry_run=False)
-        assert calls["n"] == 2, "past 24h, the next run must call the model again"
-        assert len(applied3) == 1
-
-
-def test_propose_mappings_age_threshold_excludes_young_signatures():
-    with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="slack_alert", external_id="young-sig", title="Too young",
-                       first_seen=NOW - dt.timedelta(days=1))
-        _insert_event(conn, source="slack_alert", external_id="old-sig", title="Old enough",
-                       first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        candidates = triage._propose_mapping_candidates(conn, policy, NOW)
-        sigs = {c["signature"] for c in candidates}
-        assert sigs == {"slack_alert:old-sig"}, (
-            "a signature younger than proposeMappingsAgeDays must never be a candidate")
-
-
-def test_propose_mappings_skips_signatures_the_policy_already_covers():
-    """A signature that already has a rule — or an `ignore` entry — is mapped,
-    whatever state its row is in. Without this the pass re-proposed the same
-    family every day: a `note`-frozen signature never escalates, so classify()
-    never applies the rule, so it keeps looking unmapped and another duplicate
-    entry lands in the policy file (measured live: 134 rule entries for 61
-    unique match values, 41 ignore entries for 12)."""
-    with _triage_env() as (conn, ctx):
-        for ext in ("covered-by-rule", "covered-by-ignore", "genuinely-unmapped"):
-            _insert_event(conn, source="slack_alert", external_id=ext,
-                           title=f"HomeLab bare sentence {ext}", first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        policy = {
-            "proposeMappingsAgeDays": 7.0,
-            "rules": [{"match": "slack_alert:covered-by-rule", "repo": "homelab"}],
-            "ignore": ["slack_alert:covered-by-ignore"],
-        }
-        sigs = {c["signature"] for c in triage._propose_mapping_candidates(conn, policy, NOW)}
-        assert sigs == {"slack_alert:genuinely-unmapped"}, (
-            f"a signature the policy file already covers must never be re-proposed — got {sigs}")
-
-
-def test_propose_mappings_coverage_check_uses_the_title_target_too():
-    """`_match_targets()`'s second candidate is `source:normalize_title(title)`
-    — the only way a `uk` monitor id is matchable at all (see the module
-    docstring's MATCH TARGETS paragraph). The coverage check must run through
-    that same helper rather than comparing the literal signature, or a rule
-    written against the title counts as absent and gets proposed again."""
-    with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="uk", external_id="204", title="MacMini Dev Host - Push",
-                       first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        policy = {
-            "proposeMappingsAgeDays": 7.0,
-            "rules": [{"match": "uk:macmini-dev-host-push", "repo": "dotfiles"}],
-            "ignore": [],
-        }
-        sigs = {c["signature"] for c in triage._propose_mapping_candidates(conn, policy, NOW)}
-        assert sigs == set(), f"a title-matched rule already covers this signature — got {sigs}"
-
-
-def test_propose_mappings_unparseable_response_is_non_fatal():
-    with _triage_env() as (conn, ctx):
-        eid = _insert_event(conn, source="slack_alert", external_id="bad-json-sig", title="Bad json",
-                             first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        _init_policy_git_repo(ctx.tmp_dir, {"_readme": [], "rules": [], "ignore": []})
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        triage._resolve_openai_base_url = lambda: "https://example.test/v1"
-        triage._resolve_openai_api_key = lambda: "test-key"
-
-        class _FakeResp:
-            def __init__(self, body: bytes):
-                self._body = body
-
-            def read(self):
-                return self._body
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_a):
-                return False
-
-        def _fake_urlopen(_req, timeout=None):
-            body = json.dumps({"choices": [{"message": {"content": "not json at all {{{"}}]}).encode()
-            return _FakeResp(body)
-
-        saved_urlopen = triage.urllib.request.urlopen
-        triage.urllib.request.urlopen = _fake_urlopen
-        try:
-            applied = triage.propose_mappings(conn, policy, NOW, dry_run=False)
-        finally:
-            triage.urllib.request.urlopen = saved_urlopen
-
-        assert applied == [], "an unparseable model response must never raise or apply anything"
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_NEW
-        assert item["repo"] is None
-
-
-def test_propose_mappings_drops_repo_that_does_not_resolve():
-    with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="slack_alert", external_id="maps-ok", title="Maps ok", first_seen=VERY_OLD)
-        _insert_event(conn, source="slack_alert", external_id="maps-bad", title="Maps bad", first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        _setup_discoverable_repos(ctx, ["real-repo"])
-        _init_policy_git_repo(ctx.tmp_dir, {"_readme": [], "rules": [], "ignore": []})
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        def _stub(_prompt):
-            return {
-                "slack_alert:maps-ok": {"action": "map", "repo": "real-repo", "reason": "matches"},
-                "slack_alert:maps-bad": {"action": "map", "repo": "not-a-real-repo", "reason": "hallucinated"},
-            }
-
-        triage._call_propose_mappings_model = _stub
-
-        applied = triage.propose_mappings(conn, policy, NOW, dry_run=False)
-        applied_sigs = {a["signature"] for a in applied}
-        assert applied_sigs == {"slack_alert:maps-ok"}, (
-            "a repo that does not resolve under the dispatch root must be dropped, never applied")
-
-        data = json.loads(triage.POLICY_PATH.read_text())
-        matches = [r["match"] for r in data["rules"]]
-        assert "slack_alert:maps-ok" in matches
-        assert "slack_alert:maps-bad" not in matches
-
-
-def test_propose_mappings_drops_a_repo_that_is_not_a_checkout_under_the_root():
-    with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="slack_alert", external_id="maps-denied", title="Maps denied",
-                       first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        _setup_discoverable_repos(ctx, ["some-other-repo"])
-        _init_policy_git_repo(ctx.tmp_dir, {"_readme": [], "rules": [], "ignore": []})
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        triage._call_propose_mappings_model = lambda _prompt: {
-            "slack_alert:maps-denied": {"action": "map", "repo": "denied-repo", "reason": "test"},
-        }
-
-        applied = triage.propose_mappings(conn, policy, NOW, dry_run=False)
-        assert applied == [], "a repo that is not a checkout under the repos root must be dropped"
-
-
-def test_propose_mappings_unsure_suppresses_reproposal_for_7_days():
-    with _triage_env() as (conn, ctx):
-        eid = _insert_event(conn, source="slack_alert", external_id="unsure-sig", title="Ambiguous",
-                             first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        _init_policy_git_repo(ctx.tmp_dir, {"_readme": [], "rules": [], "ignore": []})
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        calls: list[str] = []
-        triage._call_propose_mappings_model = lambda prompt: (
-            calls.append(prompt) or {"slack_alert:unsure-sig": {"action": "unsure"}}
-        )
-
-        applied = triage.propose_mappings(conn, policy, NOW, dry_run=False)
-        assert applied == []
-        assert len(calls) == 1
-        item = triage._get_item(conn, eid)
-        assert item["propose_unsure_at"] is not None
-
-        # 3 days later — still inside the cooldown.
-        candidates = triage._propose_mapping_candidates(conn, policy, NOW + dt.timedelta(days=3))
-        assert candidates == [], "an `unsure` signature must not be re-proposed within 7 days"
-
-        # 8 days later — cooldown has expired.
-        candidates = triage._propose_mapping_candidates(conn, policy, NOW + dt.timedelta(days=8))
-        assert len(candidates) == 1 and candidates[0]["signature"] == "slack_alert:unsure-sig"
-
-
-def test_propose_mappings_policy_round_trip_preserves_readme_and_key_order():
-    with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="slack_alert", external_id="round-trip-sig", title="Round trip",
-                       first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        original = {
-            "_readme": ["line one", "line two"],
-            "cardChannel": "C0TESTCHAN01",
-            "minOccurrences": 3,
-            "minOpenMinutes": 30,
-            "cooldownHours": 6,
-            "quietResolveHours": 2,
-            "ignoreUnstructuredSlackProse": True,
-            "repos": {},
-            "rules": [{"match": "slack_alert:existing-*", "repo": "existing-repo"}],
-            "ignore": ["slack_alert:ignoreme-*"],
-        }
-        _init_policy_git_repo(ctx.tmp_dir, original)
-        _setup_discoverable_repos(ctx, ["mapped-repo"])
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        triage._call_propose_mappings_model = lambda _prompt: {
-            "slack_alert:round-trip-sig": {"action": "map", "repo": "mapped-repo", "reason": "matched"},
-        }
-
-        applied = triage.propose_mappings(conn, policy, NOW, dry_run=False)
-        assert len(applied) == 1
-
-        data = json.loads(triage.POLICY_PATH.read_text())
-        assert list(data.keys()) == list(original.keys()), "top-level key order must survive"
-        assert data["_readme"] == original["_readme"]
-        assert len(data["rules"]) == 2
-        new_rule = next(r for r in data["rules"] if r["match"] == "slack_alert:round-trip-sig")
-        assert new_rule["repo"] == "mapped-repo"
-        assert new_rule["proposedBy"] == "triage-auto"
-        assert new_rule["reason"] == "matched"
-        assert "proposedAt" in new_rule
-        assert data["ignore"] == original["ignore"], "an unrelated section must round-trip untouched"
-
-
-def test_propose_mappings_commit_skipped_when_policy_path_already_dirty():
-    with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="slack_alert", external_id="dirty-sig", title="Dirty path",
-                       first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        repo_dir = _init_policy_git_repo(ctx.tmp_dir, {"_readme": [], "rules": [], "ignore": []})
-        # An uncommitted edit already sitting in the working tree, simulating
-        # a human's in-progress change to this exact file.
-        triage.POLICY_PATH.write_text(triage.POLICY_PATH.read_text() + "\n// pending human edit\n")
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        triage._call_propose_mappings_model = lambda _prompt: {
-            "slack_alert:dirty-sig": {"action": "ignore", "reason": "test"},
-        }
-
-        before_log = subprocess.run(["git", "-C", str(repo_dir), "log", "--oneline"],
-                                     capture_output=True, text=True, check=True).stdout
-
-        applied = triage.propose_mappings(conn, policy, NOW, dry_run=False)
-        assert applied == [], "a dirty policy path must skip applying this run's proposals entirely"
-
-        after_log = subprocess.run(["git", "-C", str(repo_dir), "log", "--oneline"],
-                                    capture_output=True, text=True, check=True).stdout
-        assert before_log == after_log, "no new commit must be created when the path is already dirty"
-
-        status = subprocess.run(["git", "-C", str(repo_dir), "status", "--porcelain"],
-                                 capture_output=True, text=True, check=True).stdout
-        assert "triage-policy.json" in status, "the pre-existing dirty edit must remain, untouched by us"
-
-
-def test_propose_mappings_dry_run_makes_zero_calls():
-    with _triage_env() as (conn, ctx):
-        _insert_event(conn, source="slack_alert", external_id="dry-run-sig", title="Dry run",
-                       first_seen=VERY_OLD)
-        triage.ingest(conn, NOW)
-        _init_policy_git_repo(ctx.tmp_dir, {"_readme": [], "rules": [], "ignore": []})
-        policy = {"proposeMappingsAgeDays": 7.0}
-
-        calls = {"n": 0}
-        triage._call_propose_mappings_model = lambda _prompt: calls.__setitem__("n", calls["n"] + 1) or {}
-
-        applied = triage.propose_mappings(conn, policy, NOW, dry_run=True)
-        assert applied == []
-        assert calls["n"] == 0, "--dry-run must never call the model"
 
 
 # --- Argo actions — owner-pulled implement/merge/dismiss/reinvestigate/note ---
@@ -6752,13 +6104,12 @@ def test_reconcile_operations_runs_before_anything_that_could_retry():
     the item stays `implementing` throughout the whole pass, never bounces
     back to `verdict` and out again in the same run."""
     import inspect
-    # Comment lines are stripped first — the step's own explanatory comment
-    # mentions run_self_audit() by name before the call it precedes, which
-    # would otherwise make a naive substring search find the wrong occurrence.
+    # Comment lines are stripped first so a step's explanatory comment cannot
+    # make a naive substring search find the wrong occurrence.
     code_lines = [ln for ln in inspect.getsource(triage.run).splitlines() if not ln.strip().startswith("#")]
     code = "\n".join(code_lines)
-    assert code.index("reconcile_operations(") < code.index("run_self_audit("), (
-        "reconcile_operations() must be called before run_self_audit() in run()")
+    assert code.index("reconcile_operations(") < code.index("ingest(conn, now)"), (
+        "reconcile_operations() must be called before ingest() in run()")
 
     with _triage_env() as (conn, _ctx):
         eid = _seed_verdict_item(conn, external_id="sig-reconcile-order", confidence="high",
@@ -7018,7 +6369,7 @@ def test_auto_implement_hands_the_verdict_to_the_episode_as_context():
 
 
 def test_implementing_with_no_job_and_no_operation_is_reclaimed_to_verdict():
-    """WARDEN_KILL_AT=before-implement-open: the compare-and-set claim landed,
+    """A crash before the implement operation record: the compare-and-set claim landed,
     the process died before open_episode() recorded anything. Without this
     the item would sit `implementing` for the 2 h deadline and then read
     `merge_blocked` for a fix nobody ever attempted. An item whose crash was
@@ -7043,7 +6394,7 @@ def test_implementing_with_no_job_and_no_operation_is_reclaimed_to_verdict():
 
 
 def test_validating_item_already_merged_lands_from_the_receipt_without_a_second_merge():
-    """WARDEN_KILL_AT=after-merge-before-state: `plan_or_land()` merged and
+    """A crash after merge, before state write: `plan_or_land()` merged and
     stamped `merged_at`, the item's own state write never ran. Calling merge
     again would refuse "already merged" and the item would read
     `merge_blocked` for a pull request that is merged and deploying — the
@@ -7089,7 +6440,7 @@ def _seed_validating_with_open_merge_op(conn, *, external_id, job, pr_url):
 
 
 def test_reconcile_open_pr_after_a_crash_before_the_put_lands_merge_blocked():
-    """WARDEN_KILL_AT=after-merge-op: the merge operation was recorded and the
+    """A crash after the merge operation record: the merge operation was recorded and the
     process died before ready-for-review or the PUT. GitHub says OPEN, so nothing
     landed. There is no automatic "untouched" retry (and no retry cap) any more:
     the operation resolves `failed` and the item lands `merge_blocked` where a
@@ -7122,17 +6473,13 @@ def test_reconcile_closed_pr_still_lands_merge_blocked():
         assert op["outcome"] == "failed" and "untouched" not in (op["receipt_json"] or "")
 
 
-
-
-
 # =============================================================================
 # The fifth closed allowlist — HOST_VERB_ALLOWLIST / maybe_auto_remediate()
 # (the owner's 2026-09-11 decision, STATE.md/docs/history/state-log.md §59): "if warden is
 # confident in a fix it must do it, even a host-level action like restarting
 # a process." Same client-boundary-faking shape the auto-implement chain
 # tests above use — HOST_VERB_ALLOWLIST is stubbed with a REAL executable
-# script (same pattern test_op_refs_route_to_env_check_verb_not_episode uses
-# for VERB_ALLOWLIST), so these tests exercise the real subprocess boundary
+# script, so these tests exercise the real subprocess boundary
 # (`_run_host_verb()`) rather than mocking it away.
 # =============================================================================
 
@@ -7185,7 +6532,7 @@ def _write_host_verb_stub(tmp_dir: Path, *, exit_code: int = 0, output: str = "r
     """A stub standing in for a HOST_VERB_ALLOWLIST argv (`launchctl
     kickstart`, an ssh `docker restart`) — plain text output, never JSON:
     _run_host_verb() deliberately does not parse stdout as JSON the way
-    _run_verb()'s own env-check stub's output is parsed (see that
+    _run_verb() parses a hermes-ops.sh `--json` stdout (see that
     function's own docstring for why reusing _run_verb() here would be
     wrong). `calls_file`, when given, gets one appended line per invocation
     — the only way to assert "ran exactly once" against the REAL subprocess
@@ -7722,139 +7069,6 @@ def test_reconcile_crashed_host_operation_lands_needs_human():
             "a cooldown-refused pass must leave the item exactly where it was")
 
 
-# =============================================================================
-# remind_needs_human() — DESIGN.md:247's "7d, reminder at 1d", the one
-# deadline-table row STATE_DEADLINES' own comment and docs/api.md's
-# carried-debt note both flagged NOT built.
-# =============================================================================
-
-def _seed_needs_human_reminder_item(conn, *, signature="uk:rem-1", entered_at: dt.datetime,
-                                     note: str = "read the verdict and decide",
-                                     state: str = None, card_ts: str | None = "1000.000777") -> int:
-    """A carded `needs_human` (or `merge_blocked`) row whose LAST REAL
-    transition into that state landed at `entered_at` — via a real
-    `_set_state()` call, so it lands an `item_transitions` row the same way
-    a live transition would, rather than hand-inserting one and risking a
-    shape remind_needs_human()'s own query does not actually match."""
-    state = state or triage.STATE_NEEDS_HUMAN
-    external_id = signature.split(":", 1)[1]
-    eid = _insert_event(conn, source="uk", external_id=external_id, title="t", first_seen=entered_at)
-    conn.execute(
-        "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, last_seen, "
-        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (eid, signature, None, triage.STATE_NEW, 1, entered_at.isoformat(), entered_at.isoformat(),
-         entered_at.isoformat(), entered_at.isoformat()),
-    )
-    conn.commit()
-    triage._set_state(conn, eid, state, entered_at, note=note, card_channel="C0TESTCHAN01", card_ts=card_ts)
-    conn.commit()
-    return eid
-
-
-def test_remind_needs_human_fires_at_24h_not_23h():
-    with _triage_env() as (conn, ctx):
-        entered_at = NOW - dt.timedelta(hours=23)
-        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at)
-        triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=False)
-        assert ctx.posted == [], "must not remind before the 24h threshold"
-        assert triage._get_item(conn, eid)["reminder_count"] == 0
-
-        triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0},
-                                   entered_at + dt.timedelta(hours=24), dry_run=False)
-        assert len(ctx.posted) == 1, ctx.posted
-        post = ctx.posted[0]
-        assert post["thread_ts"] == "1000.000777"
-        assert post["channel"] == "C0TESTCHAN01"
-        assert "Do this:" in post["text"], post["text"]
-        assert "read the verdict and decide" in post["text"]
-        item = triage._get_item(conn, eid)
-        assert item["reminder_count"] == 1, item["reminder_count"]
-        assert item["last_reminder_at"] is not None
-
-
-def test_remind_needs_human_second_at_72h_never_a_third():
-    policy = DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}
-    with _triage_env() as (conn, ctx):
-        entered_at = NOW
-        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at)
-
-        triage.remind_needs_human(conn, policy, entered_at + dt.timedelta(hours=25), dry_run=False)
-        assert len(ctx.posted) == 1
-        assert triage._get_item(conn, eid)["reminder_count"] == 1
-
-        # Short of 72h — the second, final reminder must not fire early.
-        triage.remind_needs_human(conn, policy, entered_at + dt.timedelta(hours=71), dry_run=False)
-        assert len(ctx.posted) == 1, "second reminder must not fire before 3x the interval"
-
-        triage.remind_needs_human(conn, policy, entered_at + dt.timedelta(hours=72), dry_run=False)
-        assert len(ctx.posted) == 2, ctx.posted
-        assert triage._get_item(conn, eid)["reminder_count"] == 2
-
-        # Never a third, no matter how much later this runs.
-        triage.remind_needs_human(conn, policy, entered_at + dt.timedelta(hours=1000), dry_run=False)
-        assert len(ctx.posted) == 2, "must never send a third reminder"
-        assert triage._get_item(conn, eid)["reminder_count"] == 2
-
-
-def test_remind_needs_human_skips_canary_signature():
-    with _triage_env() as (conn, ctx):
-        entered_at = NOW - dt.timedelta(hours=48)
-        eid = _seed_needs_human_reminder_item(conn, signature="warden_canary:probe-1", entered_at=entered_at)
-        triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=False)
-        assert ctx.posted == [], "a warden_canary: item must never be reminded"
-        assert triage._get_item(conn, eid)["reminder_count"] == 0
-
-
-def test_remind_needs_human_dry_run_posts_nothing():
-    with _triage_env() as (conn, ctx):
-        entered_at = NOW - dt.timedelta(hours=48)
-        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=True)
-        assert ctx.posted == [], "dry-run must never post"
-        assert "[dry-run] would remind uk:rem-1" in buf.getvalue(), buf.getvalue()
-        assert triage._get_item(conn, eid)["reminder_count"] == 0, "dry-run must never write state"
-
-
-def test_remind_needs_human_skips_item_with_no_card_ts_and_counts_it():
-    with _triage_env() as (conn, ctx):
-        entered_at = NOW - dt.timedelta(hours=48)
-        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at, card_ts=None)
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=False)
-        assert ctx.posted == [], "nothing to thread under — must not post"
-        assert triage._get_item(conn, eid)["reminder_count"] == 0
-        assert "no card_ts" in buf.getvalue(), buf.getvalue()
-
-
-def test_remind_needs_human_applies_to_merge_blocked_too():
-    with _triage_env() as (conn, ctx):
-        entered_at = NOW - dt.timedelta(hours=25)
-        eid = _seed_needs_human_reminder_item(conn, entered_at=entered_at, state=triage.STATE_MERGE_BLOCKED,
-                                               note="merge by hand via the PR")
-        triage.remind_needs_human(conn, DEFAULT_POLICY | {"needsHumanReminderHours": 24.0}, NOW, dry_run=False)
-        assert len(ctx.posted) == 1, ctx.posted
-        assert "merge_blocked" in ctx.posted[0]["text"]
-        assert triage._get_item(conn, eid)["reminder_count"] == 1
-
-
-def test_needs_human_reminder_hours_rejects_zero_and_negative():
-    """Same closed-key stderr-fallback contract as
-    test_host_verb_cooldown_and_max_attempts_reject_zero_and_negative — a
-    configured `0` must not silently disable the threshold (which would
-    read as `hours_in_state >= 0`, i.e. remind on every single pass)."""
-    for bad_value in (0, -1):
-        policy = dict(DEFAULT_POLICY, needsHumanReminderHours=bad_value)
-        with _triage_env(policy=policy) as (conn, ctx):
-            buf = io.StringIO()
-            with contextlib.redirect_stderr(buf):
-                loaded = triage.load_policy()
-            assert loaded["needsHumanReminderHours"] == triage.DEFAULT_NEEDS_HUMAN_REMINDER_HOURS
-            assert str(bad_value) in buf.getvalue(), buf.getvalue()
-
-
 # --- chronic recurrence (§91) -------------------------------------------------
 
 def _seed_reopens(conn, event_id: int, n: int, *, days_ago: float = 1.0) -> None:
@@ -8296,43 +7510,6 @@ def test_a_revision_brief_carries_the_closing_instruction_only_for_a_trusted_iss
         assert triage.ISSUE_CLOSING_INSTRUCTION not in calls[0]["brief"], calls[0]["brief"]
 
 
-def test_revisions_exhausted_names_a_non_convergent_review():
-    """§113 — rounds that each blocked on a *different file* are a review that found
-    something new every time; the card describes that instead of asserting an
-    implementer failure it cannot evidence."""
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="non-convergent", state=triage.STATE_MERGE_BLOCKED,
-                          note="step-7 validation (blocked): src/x.py:12 — the guard is gone",
-                          revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
-        for note in ("step-7 validation (blocked): tests/a_test.py:395 — covers only the fixture",
-                     "step-7 validation (blocked): src/x.py:12 — the guard is gone"):
-            conn.execute(
-                "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
-                (eid, triage.STATE_VALIDATING, triage.STATE_MERGE_BLOCKED, NOW.isoformat(), note))
-        conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
-        detail = details[f"revisions-exhausted-{eid}"]
-        assert "each blocking a different file" in detail, detail
-        assert "cannot satisfy the review" not in detail, detail
-
-
-def test_a_review_that_re_flagged_the_same_location_still_blames_the_review():
-    """The other side of §113: rounds that keep blocking on the *same* location are a
-    review doing its job and an implementer that did not fix it — unchanged."""
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="converging", state=triage.STATE_MERGE_BLOCKED,
-                          note="step-7 validation (blocked): src/x.py:12 — the guard is gone",
-                          revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
-        for note in ("step-7 validation (blocked): src/x.py:12 — the guard is still gone",
-                     "step-7 validation (blocked): src/x.py:12 — the guard is gone"):
-            conn.execute(
-                "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
-                (eid, triage.STATE_VALIDATING, triage.STATE_MERGE_BLOCKED, NOW.isoformat(), note))
-        conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
-        assert "cannot satisfy the review" in details[f"revisions-exhausted-{eid}"]
-
-
 # --- recurrences while parked (§92) -------------------------------------------
 
 def _seed_parked(conn, *, external_id: str, state: str = "merge_blocked") -> int:
@@ -8347,44 +7524,6 @@ def _recur(conn, eid: int, n: int) -> None:
     conn.execute("UPDATE events SET payload_json=? WHERE id=?",
                  (json.dumps({"ts_last": f"17000{n:05d}.000001"}), eid))
     conn.commit()
-
-
-def test_parked_item_counts_recurrences_and_reminds_once_at_threshold():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_parked(conn, external_id="sig-parked")
-        policy = triage.load_policy()
-        triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)  # baseline
-        assert triage._get_item(conn, eid)["parked_recurrences"] == 0
-        for n in range(1, triage.DEFAULT_PARKED_RECURRENCE_REMINDER + 2):
-            _recur(conn, eid, n)
-            triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["parked_recurrences"] == triage.DEFAULT_PARKED_RECURRENCE_REMINDER + 1
-        reminders = [p for p in ctx.posted if p["thread_ts"] == "1000.000001"]
-        assert len(reminders) == 1, reminders
-        assert "fired again 5×" in reminders[0]["text"]
-
-
-def test_parked_recurrence_count_resets_when_the_item_moves_on():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_parked(conn, external_id="sig-moves")
-        policy = triage.load_policy()
-        triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)
-        _recur(conn, eid, 1)
-        triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)
-        assert triage._get_item(conn, eid)["parked_recurrences"] == 1
-        triage._set_state(conn, eid, triage.STATE_CLOSED, NOW, note="done")
-        conn.commit()
-        triage.track_parked_recurrences(conn, policy, NOW, dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["parked_recurrences"] == 0 and item["parked_mark"] is None
-
-
-def test_card_shows_recurrences_since_parked():
-    block = triage._action_required_block(triage.STATE_MERGE_BLOCKED, "merge by hand", None, 7)
-    assert "Recurred 7× since it parked here" in block["text"]["text"]
-    assert "Recurred" not in triage._action_required_block(
-        triage.STATE_MERGE_BLOCKED, "merge by hand", None)["text"]["text"]
 
 
 # --- the last mile: deploy + liveness for more repos (§93) --------------------
@@ -8518,48 +7657,18 @@ def _seed_pr_item(conn, *, external_id: str, state: str, pr: int, note: str = "n
     return eid
 
 
-def test_stranded_pr_reconciler_lands_outside_merges_and_lists_open_orphans():
-    with _triage_env() as (conn, ctx):
-        merged = _seed_pr_item(conn, external_id="sig-merged-by-hand", state=triage.STATE_MERGE_BLOCKED, pr=9)
-        orphan = _seed_pr_item(conn, external_id="sig-orphan", state=triage.STATE_DISMISSED, pr=26,
-                               note="deadline expired")
-        prs = {9: {"merged": True, "merged_at": "2026-09-27T10:00:00Z", "state": "closed"},
-               26: {"merged": False, "state": "open", "title": "fix(e2e): bump traefik",
-                    "created_at": "2026-09-15T12:08:29Z"}}
-        triage._github.read_pr = lambda owner, repo, number: prs[number]
-
-        triage.reconcile_stranded_prs(conn, triage.load_policy(), NOW, dry_run=False)
-
-        assert triage._get_item(conn, merged)["state"] == triage.STATE_MERGED
-        assert conn.execute("SELECT merged_at FROM dispatches WHERE job_id='impl-sig-merged-by-hand'"
-                            ).fetchone()[0] == "2026-09-27T10:00:00Z"
-        cur = json.loads(conn.execute("SELECT value FROM cursors WHERE key='stranded_prs'").fetchone()[0])
-        assert [c["event_id"] for c in cur] == [orphan]
-        assert "ended `dismissed`" in cur[0]["reason"]
-
-        prs[26]["state"] = "closed"
-        triage.reconcile_stranded_prs(conn, triage.load_policy(), NOW + dt.timedelta(minutes=5), dry_run=False)
-        cur = json.loads(conn.execute("SELECT value FROM cursors WHERE key='stranded_prs'").fetchone()[0])
-        assert len(cur) == 1, "throttled: no second GitHub pass inside the hour"
-
-
-def test_awaiting_owner_lists_parked_items_and_stranded_prs_oldest_first():
+def test_awaiting_owner_lists_parked_items():
     with _triage_env() as (conn, ctx):
         parked = _seed_pr_item(conn, external_id="sig-waiting", state=triage.STATE_NEEDS_HUMAN, pr=3,
                                note="approve the merge")
         conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
                      (parked, "validating", "needs_human", (NOW - dt.timedelta(days=2)).isoformat()))
-        conn.execute("INSERT INTO cursors(key, value, updated_at) VALUES ('stranded_prs', ?, ?)",
-                     (json.dumps([{"event_id": 99, "repo": "rollhook", "pr_url": "https://x/pull/26",
-                                   "title": "t", "opened_at": (NOW - dt.timedelta(days=13)).isoformat(),
-                                   "item_state": "dismissed", "reason": "ended"}]), NOW.isoformat()))
         conn.commit()
         rows = triage._api.awaiting_owner(conn, NOW)
-        assert [r["kind"] for r in rows] == ["stranded_pr", "item"]
-        assert rows[0]["age_days"] == 13.0 and rows[1]["age_days"] == 2.0
-        assert rows[1]["reason"] == "approve the merge"
-        assert "merge" in rows[1]["availableActions"], "a parked item with a PR is one click from merged"
-
+        assert [r["kind"] for r in rows] == ["item"]
+        assert rows[0]["age_days"] == 2.0
+        assert rows[0]["reason"] == "approve the merge"
+        assert "merge" in rows[0]["availableActions"], "a parked item with a PR is one click from merged"
 
 
 def test_argo_merge_of_a_needs_human_item_with_a_pr_merges_and_routes_like_auto():
@@ -8648,7 +7757,6 @@ def test_new_evidence_keys_are_allowlisted_and_wired():
     assert "beszel-alerts" in first["slack_alert:homelab-temperature-above-threshold"]["evidence"]
 
 
-
 def test_argo_merge_that_may_have_reached_github_is_not_reported_refused():
     with _triage_env() as (conn, ctx):
         eid = _seed_pr_item(conn, external_id="sig-ambiguous", state=triage.STATE_NEEDS_HUMAN, pr=12)
@@ -8681,192 +7789,6 @@ def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
         assert outcome == "refused"
         fresh = triage._get_item(conn, eid)
         assert fresh["state"] == triage.STATE_MERGED and fresh["note"] == "landed by the other pass"
-
-
-# --- executable invariants and the self-audit (§100) --------------------------
-
-def _seed_state(conn, *, external_id: str, state: str, **cols) -> int:
-    eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
-    sets = ", ".join(f"{k}=?" for k in ("state", *cols))
-    conn.execute(f"UPDATE triage_items SET {sets} WHERE event_id=?", (state, *cols.values(), eid))
-    conn.commit()
-    return eid
-
-
-def _ids(violations):
-    return {(v["id"], v["event_id"]) for v in violations}
-
-
-def test_invariants_clean_ledger_has_no_violations():
-    with _triage_env() as (conn, ctx):
-        _seed_state(conn, external_id="ok-parked", state=triage.STATE_NEEDS_HUMAN, note="approve it",
-                    state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
-        assert triage.check_invariants(conn, NOW) == []
-
-
-def test_inv1_a_state_without_its_clock():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="no-clock", state=triage.STATE_VERDICT, state_deadline=None)
-        assert ("INV-1-clock", eid) in _ids(triage.check_invariants(conn, NOW))
-
-
-def test_inv2_parked_without_a_reason():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="no-reason", state=triage.STATE_MERGE_BLOCKED, note="  ",
-                          state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
-        assert ("INV-2-reason", eid) in _ids(triage.check_invariants(conn, NOW))
-
-
-def test_inv3_in_flight_without_an_episode():
-    settled = (NOW - dt.timedelta(hours=1)).isoformat()
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="no-episode", state=triage.STATE_VALIDATING, validation_job=None,
-                          state_deadline=(NOW + dt.timedelta(hours=1)).isoformat(), updated_at=settled)
-        impl = _seed_state(conn, external_id="no-impl-job", state=triage.STATE_IMPLEMENTING, implement_job=None,
-                           state_deadline=(NOW + dt.timedelta(hours=1)).isoformat(), updated_at=settled)
-        fresh = _seed_state(conn, external_id="just-claimed", state=triage.STATE_IMPLEMENTING, implement_job=None,
-                            state_deadline=(NOW + dt.timedelta(hours=1)).isoformat(), updated_at=NOW.isoformat())
-        ids = _ids(triage.check_invariants(conn, NOW))
-        assert ("INV-3-episode", eid) in ids and ("INV-3-episode", impl) in ids
-        assert ("INV-3-episode", fresh) not in ids, "a claim a moment before its job id is written is not a violation"
-
-
-def test_a_failing_self_audit_never_takes_the_pass_down():
-    with _triage_env() as (conn, ctx):
-        with _patched(triage, run_self_audit=lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))):
-            assert triage.run(conn, dry_run=False) == 0
-
-
-def test_self_audit_never_audits_its_own_items():
-    with _triage_env() as (conn, ctx):
-        eid = _insert_event(conn, source="warden_self", external_id="inv-1-clock", title="x", first_seen=OLD)
-        conn.execute("INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
-                     "last_seen, created_at, updated_at, revision_count, note) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                     (eid, "warden_self:inv-1-clock", "warden", triage.STATE_MERGE_BLOCKED, 1, OLD.isoformat(),
-                      OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), 9, "blocked"))
-        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
-                     (eid, "liveness_pending", "new", NOW.isoformat()))
-        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
-                     (eid, "liveness_pending", "new", NOW.isoformat()))
-        conn.commit()
-        assert triage.self_audit_findings(conn, NOW, triage.load_policy()) == []
-
-
-def test_inv4_a_finished_investigation_without_effect():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="no-effect", state=triage.STATE_INVESTIGATING,
-                          dispatch_job="inv-no-effect", state_deadline=(NOW + dt.timedelta(hours=1)).isoformat())
-        conn.execute("UPDATE dispatches SET finished_at=? WHERE job_id='inv-no-effect'",
-                     ((NOW - dt.timedelta(hours=2)).isoformat(),))
-        conn.commit()
-        assert ("INV-4-verdict-effect", eid) in _ids(triage.check_invariants(conn, NOW))
-
-
-def test_inv5_a_card_that_was_never_rendered():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="no-render", state=triage.STATE_NEEDS_HUMAN, note="n",
-                          card_ts="1000.1", card_hash=None,
-                          state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
-        assert ("INV-5-card", eid) in _ids(triage.check_invariants(conn, NOW))
-
-
-def test_inv6_and_inv7_report_but_never_become_work():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="old-parked", state=triage.STATE_NEEDS_HUMAN, note="restart window",
-                          state_deadline=(NOW + dt.timedelta(days=1)).isoformat())
-        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
-                     (eid, "verdict", "needs_human", (NOW - dt.timedelta(days=4)).isoformat()))
-        conn.execute("INSERT INTO cursors(key, value, updated_at) VALUES ('stranded_prs', ?, ?)",
-                     (json.dumps([{"event_id": 9, "pr_url": "https://x/pull/1",
-                                   "opened_at": (NOW - dt.timedelta(days=5)).isoformat()}]), NOW.isoformat()))
-        conn.commit()
-        ids = {v["id"] for v in triage.check_invariants(conn, NOW)}
-        assert {"INV-6-dead-draft", "INV-7-owner-queue"} <= ids
-        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
-        assert conn.execute("SELECT COUNT(*) FROM events WHERE source='warden_self'").fetchone()[0] == 0
-        audit = json.loads(conn.execute("SELECT value FROM cursors WHERE key='self_audit'").fetchone()[0])
-        assert {"id": "INV-7-owner-queue", "count": 1} in audit["violations"]
-
-
-def test_self_audit_turns_a_violation_into_one_event_and_resolves_it():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_state(conn, external_id="audit-me", state=triage.STATE_VERDICT, state_deadline=None)
-        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
-        ev = conn.execute("SELECT * FROM events WHERE source='warden_self'").fetchone()
-        assert ev["external_id"] == "inv-1-clock" and ev["resolved_at"] is None
-        assert f"event {eid}" in json.loads(ev["payload_json"])["first_text"]
-
-        triage.run_self_audit(conn, triage.load_policy(), NOW + dt.timedelta(minutes=10), dry_run=False)
-        assert conn.execute("SELECT COUNT(*) FROM events WHERE source='warden_self'").fetchone()[0] == 1
-
-        conn.execute("UPDATE triage_items SET state_deadline=? WHERE event_id=?",
-                     ((NOW + dt.timedelta(days=1)).isoformat(), eid))
-        conn.commit()
-        later = NOW + dt.timedelta(hours=2)
-        triage.run_self_audit(conn, triage.load_policy(), later, dry_run=False)
-        assert conn.execute("SELECT resolved_at FROM events WHERE source='warden_self'").fetchone()[0]
-
-        conn.execute("UPDATE triage_items SET state_deadline=NULL WHERE event_id=?", (eid,))
-        conn.commit()
-        triage.run_self_audit(conn, triage.load_policy(), later + dt.timedelta(hours=2), dry_run=False)
-        assert conn.execute("SELECT resolved_at FROM events WHERE source='warden_self'").fetchone()[0] is None
-
-
-def test_self_audit_findings_catch_its_own_wrong_answers():
-    with _triage_env() as (conn, ctx):
-        for i in range(3):
-            conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, validation_status) "
-                         "VALUES (?,?,?,?,?,?,?)", (f"blk-{i}", "implement", "demo-repo", "b", "done",
-                                                    NOW.isoformat(), "blocked"))
-        fixed = _seed_state(conn, external_id="came-back", state=triage.STATE_NEW)
-        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
-                     (fixed, "fixed", "new", NOW.isoformat()))
-        _seed_state(conn, external_id="out-of-revisions", state=triage.STATE_MERGE_BLOCKED, note="blocked",
-                    revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
-        conn.commit()
-        keys = {f["key"] for f in triage.self_audit_findings(conn, NOW)}
-        assert "review-always-blocks-demo-repo" in keys
-        assert f"fixed-reopened-{fixed}" in keys
-        assert any(k.startswith("revisions-exhausted-") for k in keys)
-
-
-def test_revisions_exhausted_reads_the_park_note_instead_of_blaming_the_review():
-    """§111 — the finding keyed only on `revision_count` plus a parked state and
-    hardcoded "the implementer cannot satisfy the review". For 1276/1277 that was
-    false: both had cleared review (`actionable`, empty `blocking`) and parked on
-    a merge-time 403, so the card sent its reader after a review failure that did
-    not exist. The detail now comes from the item's own park note."""
-    with _triage_env() as (conn, ctx):
-        on_the_gate = _seed_state(conn, external_id="parked-on-the-gate",
-                                  state=triage.STATE_MERGE_BLOCKED,
-                                  note="merge refused: GitHub returned HTTP 403 reading check-runs for "
-                                       "jkrumm/demo-repo@abc",
-                                  revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
-        on_the_review = _seed_state(conn, external_id="parked-on-the-review",
-                                    state=triage.STATE_MERGE_BLOCKED,
-                                    note="step-7 validation (blocked): src/x.ts:12 — the guard is gone",
-                                    revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
-        on_the_pipeline = _seed_state(conn, external_id="parked-on-the-pipeline",
-                                      state=triage.STATE_NEEDS_HUMAN,
-                                      note="step-7 validation (needs-human): synthesis failed to "
-                                           "serialize a structured verdict",
-                                      revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
-        conn.commit()
-        details = {f["key"]: f["detail"] for f in triage.self_audit_findings(conn, NOW)}
-        gate_detail = details[f"revisions-exhausted-{on_the_gate}"]
-        assert "merge gate" in gate_detail and "403" in gate_detail
-        assert "cannot satisfy the review" not in gate_detail
-        assert "cannot satisfy the review" in details[f"revisions-exhausted-{on_the_review}"]
-        assert "review pipeline" in details[f"revisions-exhausted-{on_the_pipeline}"]
-
-
-def test_warden_self_events_route_to_warden_by_the_real_policy():
-    rules = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
-    hit = triage._match_rule(["warden_self:inv-1-clock"], rules)
-    assert hit is not None and hit["repo"] == "warden"
-    assert "warden_self" in triage.INGEST_SOURCES
-    assert set(triage.INVARIANTS) >= triage.REPORT_ONLY_INVARIANTS
-
 
 
 # --- the synthetic trip (§103) ------------------------------------------------
@@ -9033,7 +7955,6 @@ def test_the_poller_never_turns_a_trip_shadow_into_an_event():
     assert [o["title"] for o in out] == ["Brain Sync - Push"]
 
 
-
 def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline():
     with _triage_env() as (conn, ctx):
         armed = {"status": "armed", "shadowId": 906, "window": 780, "armedAt": NOW.isoformat(),
@@ -9050,29 +7971,7 @@ def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline(
         assert ("stop", ("906",)) in TRIP_CALLS
 
 
-
 # --- the restore drill as a self-audit input (§104) ---------------------------
-
-def test_a_failed_restore_drill_becomes_a_warden_item():
-    with _triage_env() as (conn, ctx):
-        triage.RESTORE_DRILL_FILE.write_text(json.dumps({
-            "ok": False, "at": NOW.isoformat(), "snapshot": "homelab:/mnt/hdd/backups/warden/backups/w.db",
-            "error": "AssertionError: integrity_check: row 7 missing from index"}))
-        triage.run_self_audit(conn, triage.load_policy(), NOW, dry_run=False)
-        ev = conn.execute("SELECT * FROM events WHERE source='warden_self' AND external_id='restore-drill-failed'"
-                          ).fetchone()
-        assert ev is not None and "FAILED" in ev["title"]
-        text = json.loads(ev["payload_json"])["first_text"]
-        assert "integrity_check" in text and "homelab:/mnt/hdd/backups/warden/backups/w.db" in text
-
-
-def test_a_stale_or_missing_restore_drill_is_a_finding_and_a_fresh_pass_is_not():
-    with _triage_env() as (conn, ctx):
-        assert triage._restore_drill_findings(NOW) == []
-        triage.RESTORE_DRILL_FILE.write_text(json.dumps({"ok": True, "at": (NOW - dt.timedelta(days=40)).isoformat()}))
-        assert [f["key"] for f in triage._restore_drill_findings(NOW)] == ["restore-drill-stale"]
-        triage.RESTORE_DRILL_FILE.unlink()
-        assert [f["key"] for f in triage._restore_drill_findings(NOW)] == ["restore-drill-missing"]
 
 
 if __name__ == "__main__":

@@ -32,7 +32,6 @@ against a ledger that had stopped receiving signals.
 | `com.jkrumm.warden-poll` | ingest | 1800s |
 | `com.jkrumm.warden-sweep` | `scripts/dispatch-sweep.py` | 300s |
 | `com.jkrumm.warden-backup` | `scripts/warden-backup.sh` | daily 03:10 |
-| `com.jkrumm.warden-restore-drill` | `scripts/warden-restore.sh` (restore the newest off-box snapshot into a temp dir, verify, clean up) | monthly, 1st 04:10 |
 | `com.jkrumm.warden-api` | `scripts/api.py --serve` (GET /metrics, /health) | long-running, `KeepAlive` |
 
 `warden-api` is the odd shape: a long-running server, not a periodic job — see
@@ -55,7 +54,6 @@ see `slack/README.md` for creating and seeding it.
 make setup     # venv + plists + load the agents
 make test      # every tests/*.py
 make status    # what is loaded, what ran last, is the ledger reachable
-make restore-drill  # restore the newest off-box snapshot into a temp dir, verify, clean up
 make unload    # stop the agents
 ```
 
@@ -87,7 +85,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **352/352**. Any other number is a
+`tests/test_triage.py` is the regression gate at **296/296**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -112,10 +110,7 @@ truth; Slack cards and Argo pages are projections.
   that captures the main file and its `-wal` at different instants and restores
   as either stale or corrupt with nothing saying which), shipped to
   `homelab:/mnt/hdd/backups/warden/`, which the existing restic container already
-  walks on its way to B2. The restore is **drilled, not assumed**:
-  `make restore-drill` (and monthly, `com.jkrumm.warden-restore-drill`) restores
-  the newest off-box snapshot into a temp dir and verifies it; it can never write
-  `~/.warden/warden.db`. A failed drill becomes a `warden_self` item (§104).
+  walks on its way to B2.
 
 ## Talking to sideclaw
 
@@ -154,9 +149,10 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 - **The dry-run contract**: never touches Slack, never shells out, everything else
   real. With no staging environment it is the only pre-production surface there is.
 - **A policy file may name and parameterise, never express.** Config carries
-  validated values; code owns the argv array. The five closed allowlists are one
-  principle in five instances (a fifth, `HOST_VERB_ALLOWLIST`, added 2026-09-11
-  for the owner's host-restart decision — DESIGN.md § The host-verb carve-out).
+  validated values; code owns the argv array. The four closed allowlists
+  (evidence, liveness, deploy, `HOST_VERB_ALLOWLIST`) are one principle in four
+  instances (the host-verb one added 2026-09-11 for the owner's host-restart
+  decision — DESIGN.md § The host-verb carve-out).
 - **Deferral must be visible.** A budget hit that only reaches a `.err` file is
   indistinguishable from a broken loop.
 - **A dispatch that ends terminal with no verdict is not a verdict.** It folds

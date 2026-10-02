@@ -149,7 +149,7 @@ def _expect(exc_type, fn, *args, **kwargs):
     raise AssertionError(f"expected {exc_type.__name__} from {fn}")
 
 
-# --- policy: repo_cwd() / discoverable() ---------------------------------------
+# --- policy: repo_cwd() ---------------------------------------
 # No repo/tier policy lives here any more: sideclaw is the only boundary. These
 # only pin the one path the wire protocol still needs and its name-shape guard.
 
@@ -172,21 +172,6 @@ def test_repo_cwd_does_not_check_existence_or_allowlist():
 def test_repo_cwd_rejects_dot_dotdot_hidden_and_traversal_names():
     for bad in ("", ".", "..", ".hidden", "a/b", "../x", "a b", "x\n"):
         _expect(UsageError, policy.repo_cwd, bad)
-
-
-def test_discoverable_lists_git_checkouts_under_the_root():
-    root = _tmp_dir("lifecycle-root-")
-    (root / "alpha" / ".git").mkdir(parents=True)
-    (root / "beta").mkdir()                       # no .git
-    (root / ".hidden" / ".git").mkdir(parents=True)
-    (root / "file.txt").write_text("x")
-    with _env(WARDEN_REPOS_ROOT=str(root)):
-        assert policy.discoverable() == ["alpha"]
-
-
-def test_discoverable_missing_root_is_empty():
-    with _env(WARDEN_REPOS_ROOT="/nonexistent-root"):
-        assert policy.discoverable() == []
 
 
 # --- policy: valid_origin() ----------------------------------------------------
@@ -491,38 +476,6 @@ def test_open_episode_ungated_has_no_operation_row():
     assert conn.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
 
 
-def test_open_episode_refuses_inside_a_claude_code_session():
-    """require_no_recursion() lives in open_episode() itself now, not only
-    behind the CLI — a dispatched episode may never dispatch, and this must
-    refuse BEFORE ever touching sideclaw."""
-    conn, _ = _fresh_ledger()
-    submit_calls: list[dict] = []
-
-    def _unexpected_submit(**kwargs):
-        submit_calls.append(kwargs)
-        raise AssertionError("open_episode must refuse before calling submit()")
-
-    saved = os.environ.get("CLAUDECODE")
-    os.environ["CLAUDECODE"] = "1"
-    try:
-        with _patch(sideclaw, "submit", _unexpected_submit):
-            try:
-                dispatch.open_episode(
-                    conn, repo="warden", tier="investigate", brief="do it",
-                    context=None, why=None, model=None, origin=dispatch.Origin(), authorized_by=None,
-                )
-            except PolicyError as e:
-                assert "CLAUDECODE" in str(e), e
-            else:
-                raise AssertionError("expected PolicyError")
-    finally:
-        if saved is None:
-            os.environ.pop("CLAUDECODE", None)
-        else:
-            os.environ["CLAUDECODE"] = saved
-    assert submit_calls == [], "sideclaw must never be touched when the guard refuses"
-
-
 def test_open_episode_per_repo_lock_race_two_connections():
     """check_repo_not_in_flight() is a bare SELECT; the operations row that
     IS the lock is written after it returns — two connections could both
@@ -790,37 +743,19 @@ def test_list_dispatches_pops_brief_and_verdict():
 
 # --- runner ------------------------------------------------------------------
 
-# This suite runs INSIDE a Claude Code session; lifecycle.policy's
-# require_no_recursion() (called from open_episode() and plan_or_land()'s
-# LAND step) refuses unconditionally when any of these are set. Popped for
-# the whole run — restored after — so the suite exercises the real
-# dispatch/merge path. A test that specifically wants the guard's own
-# refusal (see test_open_episode_refuses_inside_a_claude_code_session) sets
-# one back itself, locally, and restores it.
-_RECURSION_MARKERS = ("CLAUDE_CODE_SESSION", "CLAUDECODE", "CLAUDE_SESSION_ID", "CLAUDE_ENTRYPOINT")
-
-
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
     passed = 0
     failures: list[str] = []
-    saved_recursion_markers = {m: os.environ.pop(m, None) for m in _RECURSION_MARKERS}
-    try:
-        for name, fn in tests:
-            try:
-                fn()
-                passed += 1
-            except AssertionError as e:
-                failures.append(f"{name}: {e}")
-            except Exception:
-                failures.append(f"{name}: unexpected exception\n{traceback.format_exc()}")
-    finally:
-        for m, v in saved_recursion_markers.items():
-            if v is None:
-                os.environ.pop(m, None)
-            else:
-                os.environ[m] = v
+    for name, fn in tests:
+        try:
+            fn()
+            passed += 1
+        except AssertionError as e:
+            failures.append(f"{name}: {e}")
+        except Exception:
+            failures.append(f"{name}: unexpected exception\n{traceback.format_exc()}")
 
     print(f"{passed}/{len(tests)} passed")
     if failures:

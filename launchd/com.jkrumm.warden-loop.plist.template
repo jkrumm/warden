@@ -12,7 +12,7 @@
        repo is built on: a gateway cron job is scheduled and run INSIDE the
        ai.hermes.gateway process, so the loop whose job is noticing Hermes is broken
        cannot run when Hermes is down. That was not theoretical — four hermes_log
-       rows sat open in the ledger, one for 11 days with reminder_count 5 and no
+       rows sat open in the ledger, one for 11 days with no
        action ever taken, because the only delivery path a gateway-scheduled job has
        is the same Slack connection those rows say is broken.
 

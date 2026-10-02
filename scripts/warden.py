@@ -3,7 +3,7 @@
 
 The Python successor to the retired bash dispatch bridge: same closed verb
 set, same "a dispatch names a repo, never a path" rule, same brief-is-data
-rule, same recursion guard, same --json contract and audit log shape — now a
+rule, same --json contract and audit log shape — now a
 thin argument-parsing and JSON-rendering layer over `scripts/clients/` and
 `scripts/lifecycle/`, which own everything this file used to embed as
 `python3 -c '...'` fragments.
@@ -176,15 +176,6 @@ def _write_audit(state: _State, rc: int, args_str: str, why: str | None) -> None
 
 
 # --- preconditions ------------------------------------------------------------
-
-
-# require_no_recursion() itself now lives in lifecycle/policy.py — called at
-# the top of open_episode() and at the LAND step of plan_or_land(), the two
-# places that actually mutate, so the guard holds even for a caller that
-# skips this CLI. Re-exported here (not just imported at call sites) so
-# every early `require_no_recursion()` call below still reads a clear error
-# BEFORE this process reads stdin, rather than failing deeper in.
-require_no_recursion = policy.require_no_recursion
 
 
 def _secrets_run_path() -> Path:
@@ -387,7 +378,6 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> di
         raise UsageError("usage: warden dispatch <repo> [--tier investigate] [--wait] [--json] <<'BRIEF' ... BRIEF")
     name = positional[0]
 
-    require_no_recursion()
     require_backend()
 
     if flags.confirm:
@@ -481,7 +471,6 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
         )
     name = positional[0]
 
-    require_no_recursion()
     require_backend()
 
     tier = flags.tier or "investigate"
@@ -626,7 +615,6 @@ def cmd_merge(conn, flags: Flags, positional: list[str], state: _State) -> dict[
         raise UsageError('usage: warden merge <job-id> --why "<reason>" --confirm [--json]')
     job_id = positional[0]
 
-    require_no_recursion()
     require_backend()
 
     if not sideclaw.valid_job_id(job_id):
@@ -654,7 +642,6 @@ def cmd_merge(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 
 
 def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
-    require_no_recursion()
     # No require_backend(): abort only ever reaches sideclaw's cancel
     # endpoint, never GitHub — no token to resolve.
     if not positional:
@@ -764,7 +751,6 @@ _REVERTABLE_STATES = ("merged", "liveness_pending", "fixed")
 
 
 def cmd_revert(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
-    require_no_recursion()
     require_backend()  # reads the pull request via GitHub below — needs the token
     if not positional:
         raise UsageError('usage: warden revert <event-id> --pr <number> --why "<reason>" [--json]')
@@ -848,7 +834,6 @@ def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     needs no further action. Writes through the same `items.transition()`
     every other CLI-only transition uses, so the state change and its
     `item_transitions` row are the loop's own shape, not a hand-rolled UPDATE."""
-    require_no_recursion()
     # No require_backend(): close only ever writes triage_items/item_transitions
     # in the local ledger — no GitHub or sideclaw call to authenticate for.
     if not positional:

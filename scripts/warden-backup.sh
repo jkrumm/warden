@@ -16,10 +16,6 @@
 # monthly 12 / yearly 5. So this needs no homelab-side change at all — a new
 # subdirectory under a path restic already walks is covered the moment it exists.
 # 03:10 is chosen to land after hermes-backup (03:00) and before restic (03:30).
-#
-# The second half — getting a running warden back from these bytes — is
-# scripts/warden-restore.sh, drilled monthly by com.jkrumm.warden-restore-drill
-# against the off-box copy this script ships (state-log §104).
 
 set -u
 

@@ -530,7 +530,7 @@ def test_board_counts_items_shape_ordering_and_terminal_24h():
     assert set(one.keys()) == {
         "event_id", "origin", "repo", "state", "state_deadline", "max_tier", "title", "note",
         "pr_url", "dispatch_job", "implement_job", "validation_job", "occurrences",
-        "parked_recurrences", "revision_count", "created_at", "updated_at", "origin_channel", "origin_thread_ts",
+        "revision_count", "created_at", "updated_at", "origin_channel", "origin_thread_ts",
         "availableActions", "issue",
     }
     assert one["title"] == "title1"
@@ -727,8 +727,7 @@ def test_item_payload_synthetic_created_entry_falls_back_to_item_state():
 
 def test_item_payload_event_reminder_fields_present():
     """`event.reminder_count`/`event.last_reminder_at` are watchdog-poll.py's
-    grouped-source alert reminders, distinct from `item.reminder_count`/
-    `item.last_reminder_at` (the needs_human reminder cadence)."""
+    grouped-source re-emit clock (the occurrence count triage reads)."""
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
@@ -1085,16 +1084,6 @@ def main() -> int:
             print(f"  {f}")
         return 1
     return 0
-
-
-
-def test_health_carries_the_self_audit_summary_and_null_before_the_first_audit():
-    conn, _path = _fresh_conn()
-    assert api.health_payload(conn)["self_audit"] is None
-    summary = {"checked_at": "2026-09-28T12:00:00+00:00", "violations": [{"id": "INV-1-clock", "count": 2}],
-               "findings": ["inv-1-clock"]}
-    _cursor(conn, "self_audit", dt.datetime(2026, 9, 28, 12, tzinfo=dt.timezone.utc), json.dumps(summary))
-    assert api.health_payload(conn)["self_audit"] == summary
 
 
 if __name__ == "__main__":

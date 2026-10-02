@@ -724,9 +724,9 @@ def test_v5_database_migrates_to_v6_matching_a_fresh_one():
 
 
 def test_migration_9_adds_reminder_columns():
-    """See _MIGRATION_9 — the needs_human/merge_blocked reminder
-    (scripts/triage.py's remind_needs_human()). `reminder_count` defaults to
-    0 so every pre-existing row reads as never-reminded."""
+    """See _MIGRATION_9 — the columns still exist (unused since the reminder
+    feature was removed). `reminder_count` defaults to 0 on every pre-existing
+    row."""
     conn = ledger.connect(_tmp_path(), migrate=True)
     cols = _table_columns(conn, "triage_items")
     assert "reminder_count" in cols, cols

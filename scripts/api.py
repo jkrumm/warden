@@ -577,13 +577,7 @@ def health_payload(conn: sqlite3.Connection) -> dict[str, Any]:
             "threshold_minutes": threshold_minutes, "ok": ok,
         }
 
-    audit_row = conn.execute("SELECT value FROM cursors WHERE key='self_audit'").fetchone()
-    try:
-        self_audit = json.loads(audit_row["value"]) if audit_row else None
-    except (TypeError, ValueError):
-        self_audit = None
     return {
-        "self_audit": self_audit,
         "ok": schema_ok and all_pollers_ok,
         "schema_version": version,
         "schema_version_expected": _ledger.LEDGER_SCHEMA_VERSION,
@@ -671,11 +665,7 @@ def _age_days(since: str | None, now: dt.datetime) -> float | None:
 def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str, Any]]:
     """Everything that is waiting on Johannes and nothing else, oldest first:
     every parked item (`needs_human`/`merge_blocked`) with how long it has sat
-    there, why, and how often its signal fired since — plus every PR warden
-    opened whose item ended while the PR stayed open (triage.py's
-    reconcile_stranded_prs() writes those to the `stranded_prs` cursor; this
-    process never calls GitHub). Before §94 the second kind existed nowhere
-    but GitHub's own PR list."""
+    there and why."""
     placeholders = ",".join("?" for _ in AWAITING_OWNER_STATES)
     out: list[dict[str, Any]] = []
     for row in conn.execute(
@@ -689,24 +679,11 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
         out.append({
             "kind": "item", "event_id": row["event_id"], "repo": row["repo"], "title": row["title"],
             "state": row["state"], "pr_url": row["pr_url"], "age_days": _age_days(row["entered_at"], now),
+            # Argo's AwaitingOwnerEntrySchema requires it; drop with the Argo rewrite in Wave 2.
             "reason": row["note"], "parked_recurrences": row["parked_recurrences"],
             "revision_count": row["revision_count"],
             "availableActions": _available_actions(
                 row["state"], bool(row["pr_url"]) and row["validation_status"] == "confirmed"),
-        })
-    cursor = conn.execute("SELECT value FROM cursors WHERE key='stranded_prs'").fetchone()
-    try:
-        stranded = json.loads(cursor["value"]) if cursor else []
-    except (TypeError, ValueError):
-        stranded = []
-    for pr in stranded if isinstance(stranded, list) else []:
-        if not isinstance(pr, dict):
-            continue
-        out.append({
-            "kind": "stranded_pr", "event_id": pr.get("event_id"), "repo": pr.get("repo"),
-            "title": pr.get("title"), "state": pr.get("item_state"), "pr_url": pr.get("pr_url"),
-            "age_days": _age_days(pr.get("opened_at"), now), "reason": pr.get("reason"),
-            "parked_recurrences": 0, "revision_count": 0, "availableActions": [],
         })
     out.sort(key=lambda x: (x["age_days"] is None, -(x["age_days"] or 0)))
     return out
@@ -756,7 +733,6 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "implement_job": row["implement_job"],
         "validation_job": row["validation_job"],
         "occurrences": row["occurrences"],
-        "parked_recurrences": row["parked_recurrences"],
         "revision_count": row["revision_count"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],

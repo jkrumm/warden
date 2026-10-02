@@ -80,7 +80,7 @@ conn = wp.db_connect()
 now = dt.datetime(2026, 9, 9, 12, 5, tzinfo=dt.timezone.utc)
 stale = [{"external_id": "jkrumm/basalt-ui#51", "title": "t", "url": "",
           "payload": {"repo": "jkrumm/basalt-ui", "author": "jkrumm"}}]
-wp.reconcile(conn, "github_pr", stale, now, 0, wp.REM_HOURS["github_pr"], deliver=False)
+wp.reconcile(conn, "github_pr", stale, now, 0, deliver=False)
 conn.commit()
 
 for name in ("poll_uk", "poll_docker", "poll_hermes_cron", "poll_stray_skills"):

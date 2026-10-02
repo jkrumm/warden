@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from clients import sideclaw
 from clients.errors import PolicyError, RemoteError, UsageError
 
-from . import chaos, operations, policy
+from . import operations, policy
 
 MAX_BRIEF_CHARS = 8000
 MAX_CONTEXT_CHARS = 16000
@@ -112,7 +112,6 @@ def open_episode(
     A gated tier (`implement`) is covered by an `operations` row committed
     BEFORE the submit — DESIGN.md § Crash recovery. `authorized_by` is the
     audit label that row records and is required for a gated tier."""
-    policy.require_no_recursion()
     now = now or dt.datetime.now(dt.timezone.utc)
     gated = tier in policy.GATED_TIERS
 
@@ -150,7 +149,6 @@ def open_episode(
             conn.rollback()
             raise
         conn.commit()
-        chaos.crash_point("after-implement-op")
 
     try:
         job = sideclaw.submit(
@@ -170,7 +168,6 @@ def open_episode(
             )
         raise
 
-    chaos.crash_point("after-implement-submit")
 
     job_id = job["id"]
     status = job.get("status") or "unknown"
@@ -211,7 +208,6 @@ def open_review(
     `model` mirrors `open_episode()`'s own parameter — `None` leaves the job
     on sideclaw's own routing, a non-Claude IU model id pins it there
     instead."""
-    policy.require_no_recursion()
     now = now or dt.datetime.now(dt.timezone.utc)
     job = sideclaw.submit_review(cwd=policy.repo_cwd(repo), pr=pr, context=context, model=model)
     job_id = job["id"]

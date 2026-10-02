@@ -48,8 +48,8 @@ from clients import sideclaw as _sideclaw  # noqa: E402
 
 # "Overnight" for the morning briefing: a dispatch that finished within this
 # many hours of the poll is still worth mentioning; older ones have already
-# been seen (delivered into their origin thread by dispatch-sweep.py, or
-# folded into a watchdog reminder) and would just be noise here.
+# been seen (delivered into their origin thread by dispatch-sweep.py) and
+# would just be noise here.
 DISPATCH_RECENT_HOURS = 18
 
 
@@ -64,9 +64,8 @@ def fmt_age(now: dt.datetime, iso: str) -> str:
 
 
 def _dispatch_outcome_note(status: str, verdict_json: str | None) -> str:
-    """Same rendering intent as watchdog-poll.py's _dispatch_summary — both
-    now share clients/sideclaw.py's classify_dispatch_outcome() for the
-    classification; this function owns only its own wording."""
+    """Renders clients/sideclaw.py's classify_dispatch_outcome() into the
+    briefing's own wording."""
     kind, detail = _sideclaw.classify_dispatch_outcome(status, verdict_json)
     if kind == "failed":
         return detail or status
@@ -136,7 +135,7 @@ def main() -> int:
     now = dt.datetime.now(dt.timezone.utc)
 
     open_rows = conn.execute(
-        "SELECT source, external_id, title, url, first_seen, notified_at, reminder_count "
+        "SELECT source, external_id, title, url, first_seen, notified_at "
         "FROM events WHERE resolved_at IS NULL AND notified_at IS NOT NULL "
         "ORDER BY source, first_seen"
     ).fetchall()
@@ -157,9 +156,7 @@ def main() -> int:
         for r in open_rows:
             age = fmt_age(now, r["first_seen"])
             url_part = f" {r['url']}" if r["url"] else ""
-            rc = r["reminder_count"] or 0
-            rc_part = f" (reminders={rc})" if rc else ""
-            print(f"  - [{r['source']}] {r['title']} (open {age}){rc_part}{url_part}")
+            print(f"  - [{r['source']}] {r['title']} (open {age}){url_part}")
         print("]")
 
     if not resolved_7d:

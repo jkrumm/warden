@@ -134,7 +134,7 @@ conn.commit()
 
 # main() must turn that into a non-zero exit so watchdog-slack.py withholds the
 # UptimeKuma heartbeat. Stub the poll itself — the wiring is what is under test.
-wp._run_poll = lambda *a, **k: ([], [], [])
+wp._run_poll = lambda *a, **k: ([], [])
 wp.load_env = lambda: ENV
 wp.load_state = lambda: {}
 check("main() exits 1 while blind", wp.main(["--slack-body"]), 1)

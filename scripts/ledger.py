@@ -62,8 +62,8 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # Named LEDGER_SCHEMA_VERSION, not SCHEMA_VERSION, deliberately: it pins this
 # module's own SQLite schema, distinct from scripts/clients/sideclaw.py's
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
-# verdict schemas and are asserted per job by assert_result_schema and by
-# `make check-schemas` — two independent pins that must never be conflated.
+# verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
+# never be conflated.
 LEDGER_SCHEMA_VERSION = 12
 
 
@@ -404,6 +404,12 @@ ALTER TABLE triage_items ADD COLUMN origin_channel TEXT;
 ALTER TABLE triage_items ADD COLUMN origin_thread_ts TEXT;
 """
 
+# Versions 9 and 11 below added the needs_human/merge_blocked reminder and
+# parked-recurrence columns on `triage_items` (reminder_count, last_reminder_at,
+# parked_mark, parked_recurrences, recurrence_reminded_at). The reminder feature
+# is gone; the columns stay, unused — dropping them would be a destructive
+# migration of the live ledger for no behavioural gain. Do not read them.
+#
 # Version 9 — the `needs_human`/`merge_blocked` reminder (DESIGN.md:247's
 # "7d, reminder at 1d", the one row of its own deadline table triage.py's
 # STATE_DEADLINES comment and docs/api.md's carried-debt note both flagged
@@ -531,11 +537,9 @@ _VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
 # triage_items.state vocabulary, mirrored from scripts/triage.py's own
 # STATE_* constants (triage.py:332-427) and its TERMINAL_STATES (triage.py:531).
 # ledger.py is the schema owner, so it is the home for the state names that
-# OTHER files (watchdog-poll.py, which must not import triage.py by path — see
-# that file's reminder branch in reconcile() and docs/history/state-log.md §49) need without
-# pulling in triage.py itself. triage.py does not import these back yet
-# (STATE.md follow-up); tests/test_watchdog_reminders.py asserts the two
-# tuples stay identical so this copy cannot silently drift from the original.
+# OTHER files (api.py, warden.py, which must not import triage.py by path) need
+# without pulling in triage.py itself. triage.py does not import these back yet
+# (STATE.md follow-up).
 STATE_NEEDS_HUMAN = "needs_human"
 STATE_FIXED = "fixed"
 STATE_QUIET = "quiet"

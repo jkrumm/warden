@@ -6,7 +6,7 @@
   <!-- The ingest poller. Polls UptimeKuma, Docker (homelab + vps), GitHub,
        Slack #alerts/#updates, Hermes self-state, 1Password ref health, and
        stray agent-created skills; reconciles into the ledger and composes the
-       NEW/REMINDERS/RESOLVED digest.
+       NEW/RESOLVED digest.
 
        Was gateway cron job 4b1faabda97d ("Watchdog", */30, no_agent: true):
        the gateway invoked watchdog-slack.py, which loaded this module, called

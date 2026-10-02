@@ -21,7 +21,7 @@ BASE_PY     := python3.11
 
 WARDEN_PLISTS := com.jkrumm.warden-loop com.jkrumm.warden-poll \
                  com.jkrumm.warden-sweep com.jkrumm.warden-backup \
-                 com.jkrumm.warden-api com.jkrumm.warden-restore-drill
+                 com.jkrumm.warden-api
 
 .DEFAULT_GOAL := help
 
@@ -29,7 +29,6 @@ WARDEN_PLISTS := com.jkrumm.warden-loop com.jkrumm.warden-poll \
 help:
 	@echo "warden"
 	@echo "  make setup     venv + plists + load the agents"
-	@echo "  make restore-drill [SNAPSHOT=latest|local-latest|<path>]  prove a backup restores"
 	@echo "  make venv      create .venv from $(BASE_PY) and install requirements"
 	@echo "  make test      run every tests/*.py (hand-rolled runners, not pytest)"
 	@echo "  make status    what is loaded, what ran last, is the ledger reachable"
@@ -123,12 +122,6 @@ agents: render-plists
 			|| echo "  ✗ $$name [bootstrap failed]"; \
 	done
 
-# The restore drill by hand (the LaunchAgent runs it monthly): newest off-box
-# snapshot -> temp dir -> verified -> removed. Never touches ~/.warden/warden.db.
-.PHONY: restore-drill
-restore-drill:
-	@env -u CLAUDECODE "$(WARDEN_REPO)/scripts/warden-restore.sh" $(SNAPSHOT)
-
 .PHONY: unload
 unload:
 	@for name in $(WARDEN_PLISTS); do \
@@ -139,15 +132,6 @@ unload:
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
-
-# The dispatch/review verdict schema versions this warden pins
-# (clients/sideclaw.py) against what the running sideclaw actually serves —
-# see check-schema-versions.py's own docstring for why "unreachable" is not a
-# failure here but a version/outcome-set mismatch is.
-.PHONY: check-schemas
-check-schemas:
-	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
-	@"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py"
 
 .PHONY: status
 status:
@@ -193,8 +177,6 @@ status:
 	else \
 		echo "✗ unreachable (is com.jkrumm.warden-api loaded?)"; \
 	fi
-	@printf '  %-24s ' "sideclaw schemas"; \
-	"$(PY)" "$(WARDEN_REPO)/scripts/check-schema-versions.py" 2>&1 | head -1
 	@printf '  %-24s ' "ledger"; \
 	if [ -f "$(WARDEN_HOME)/warden.db" ]; then \
 		ls -lh "$(WARDEN_HOME)/warden.db" | awk '{print $$5, $$6, $$7, $$8}'; \

@@ -1,4 +1,4 @@
-"""policy — recursion guard, origin shape checks, the per-repo in-flight lock.
+"""policy — origin shape checks, the per-repo in-flight lock.
 
 The Python port of the retired bash CLI's `require_auto_from_item` (639-705),
 `valid_origin` (745-766) and the `repos.<repo>` half of
@@ -29,25 +29,6 @@ VALID_TIERS = ("investigate", "author", "implement")
 GATED_TIERS = ("implement",)
 
 
-def require_no_recursion() -> None:
-    """A dispatched episode may never dispatch. Moved here from warden.py so
-    the two places that actually mutate — `lifecycle.dispatch.open_episode()`
-    and the LAND step of `lifecycle.merge.plan_or_land()` — refuse on their
-    own, not only when reached through the CLI. Planning (a dry-run or an
-    unconfirmed merge) stays allowed; only the write is guarded."""
-    for marker in ("CLAUDE_CODE_SESSION", "CLAUDECODE", "CLAUDE_SESSION_ID"):
-        if os.environ.get(marker):
-            raise PolicyError(
-                f"refusing to run inside a Claude Code session ({marker} is set): "
-                "a dispatched episode may never dispatch"
-            )
-    if os.environ.get("CLAUDE_ENTRYPOINT") == "worker":
-        raise PolicyError(
-            "refusing to run inside a sideclaw worker session (CLAUDE_ENTRYPOINT=worker): "
-            "a dispatched episode may never dispatch"
-        )
-
-
 def triage_policy_path() -> Path:
     if os.environ.get("WARDEN_TRIAGE_POLICY"):
         return Path(os.environ["WARDEN_TRIAGE_POLICY"]).expanduser()
@@ -70,18 +51,6 @@ def repo_cwd(name: str) -> Path:
     if not name or name in (".", "..") or name.startswith(".") or not set(name) <= _NAME_CHARS:
         raise UsageError(f"not a repo name: {name}")
     return repos_root() / name
-
-
-def discoverable() -> list[str]:
-    """Git checkouts directly under the repos root — the vocabulary
-    `propose_mappings()` may map a signature to."""
-    root = repos_root()
-    try:
-        entries = sorted(os.listdir(root))
-    except OSError:
-        return []
-    return [n for n in entries
-            if not n.startswith(".") and (root / n).is_dir() and (root / n / ".git").exists()]
 
 
 def valid_origin(*, channel: str | None = None, thread_ts: str | None = None,

@@ -7,7 +7,7 @@ the failure class behind the 2026-08-01 outage, instead of inferring it hours
 later from silent heartbeats), and stray agent-created skills under
 ~/.hermes/skills/ (untracked, unreviewed — the failure class behind the
 2026-08-02 skill-sprawl cleanup). Reconciles against ~/.hermes/watchdog.db
-(SQLite). Emits NEW=, REMINDERS=, RESOLVED= blocks for the LLM cron prompt.
+(SQLite). Emits NEW=, RESOLVED= blocks for the LLM cron prompt.
 
 Source of truth: ~/SourceRoot/warden/scripts/watchdog-poll.py
 ~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
@@ -72,7 +72,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from clients import secrets as _secrets, sideclaw as _sideclaw  # noqa: E402
+from clients import secrets as _secrets  # noqa: E402
 
 STATE_PATH = HERMES_HOME / "scripts" / "briefing-state.json"
 JOBS_PATH = HERMES_HOME / "cron" / "jobs.json"
@@ -92,7 +92,7 @@ TRUSTED_GH_LOGIN = GH_OWNER
 CH_ALERTS = "C0AS1LAUQ3C"
 CH_UPDATES = "C0ARZJD824W"
 
-# Where the composed NEW/REMINDERS/RESOLVED digest itself is delivered — not one
+# Where the composed NEW/RESOLVED digest itself is delivered — not one
 # of the two channels polled above. Matches the retiring gateway cron job's
 # `"deliver": "slack:C0ASRULFTSS"` (hermes-agent cron/jobs.json, job
 # 4b1faabda97d, "Watchdog"); this constant is what replaces that gateway-side
@@ -125,35 +125,6 @@ GROUPED_SOURCES = ("slack_alert", "slack_update", "hermes_log")
 SLACK_FAIL_STREAK_ALERT = 3
 GROUPED_TTL_DAYS = 7
 
-REM_HOURS = {
-    "uk": 6,
-    "docker_homelab": 6,
-    "docker_vps": 6,
-    "github_pr": 72,
-    "hermes_cron": 6,
-    "hermes_log": 24,
-    "op_refs_homelab": 6,
-    "op_refs_vps": 6,
-    # Governance backlog, not an outage — a weekly cadence rather than
-    # uk/docker/op_refs's 6h operational urgency. Still needs to recur (not
-    # go silent for weeks): that silence is exactly how the 2026-08-02 stray
-    # (89 patches, 20x growth over 18 days) went unnoticed. `github_issue`
-    # used to share this exact cadence for the same reason — it no longer
-    # appears in this dict at all (docs/waves/PLAN.md Wave 1): every open
-    # issue is now a warden triage item with its own investigate/implement
-    # verdict and its own deadlines, which supersedes this reminder-digest
-    # cadence entirely.
-    "stray_skill": 168,
-}
-
-# docs/history/state-log.md §49 — an event whose triage_items row is STATE_NEEDS_HUMAN carries a
-# real outstanding decision (a verdict with a 7-day deadline), which is a
-# different thing than "still down/unresolved on the source's own cadence".
-# 24h, not the source's REM_HOURS entry — §41 known-open item 3 scoped
-# "reminder at 1d" for exactly this state and left the notification path
-# unowned, which is the gap this closes.
-REM_HOURS_NEEDS_HUMAN = 24
-
 HERMES_LOG_FILES = [
     ("hermes_errors_log_offset", "logs/errors.log"),
     ("hermes_gw_error_log_offset", "logs/gateway.error.log"),
@@ -179,9 +150,7 @@ QUIET_END_H = 7
 # 1Password item goes missing (e.g. deleted as part of a service retirement),
 # taking every cron sharing that template down at once. This detects the cause
 # directly instead of waiting hours for it to surface as silent heartbeats.
-# Mirrors scripts/hermes-ops.sh's `env-check` verb (same `op run -- true` probe,
-# same stderr parse) but is reimplemented here rather than shelled out to, so the
-# watchdog stays a self-contained script with no dependency on that file's shape.
+# Self-contained: no dependency on hermes-ops.sh's shape.
 #
 # Each command sources the host profile FIRST, behind the `[ -r ]` guard, because
 # the crons it stands in for do: every op-wrapped homelab cron line begins
@@ -373,64 +342,6 @@ def db_connect() -> sqlite3.Connection:
     raises a clear schema-version error rather than this file inventing its
     own tables the way it used to."""
     return _ledger.connect(DB_PATH)
-
-
-def _dispatch_status(conn: sqlite3.Connection, dispatch_id: int | None) -> sqlite3.Row | None:
-    """Look up one dispatches row for the watchdog projection. None whenever
-    there's nothing to project: no dispatch_id set, the dispatches table
-    doesn't exist yet (the CLI / dispatch-sweep.py may never have run on
-    a fresh mini), or the row is gone. Every caller treats None as "behave
-    exactly as before the dispatch bridge existed" — this must never raise,
-    since watchdog-poll.py is a 30-min production cron and a regression here
-    is an alerting outage, not a cosmetic miss.
-    """
-    if not dispatch_id:
-        return None
-    try:
-        return conn.execute(
-            "SELECT status, reported_at, verdict_json FROM dispatches WHERE id=?",
-            (dispatch_id,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return None
-
-
-def _triage_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
-    """Look up one triage_items row for the reminder path's own state check
-    (docs/history/state-log.md §49 — the reminder branch never read the ledger's own
-    classification of the event it was about to remind on). None whenever
-    there's nothing to project: the triage_items table doesn't exist yet
-    (triage.py may never have run against a fresh ledger), or no row for this
-    event — every caller treats None as "behave exactly as before this lookup
-    existed", the same contract _dispatch_status already uses and for the
-    same reason: this is a 30-min production cron and a regression here is an
-    alerting outage, not a cosmetic miss.
-    """
-    try:
-        return conn.execute(
-            "SELECT state, note FROM triage_items WHERE event_id=?",
-            (event_id,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return None
-
-
-def _dispatch_summary(status: str | None, verdict_json: str | None) -> str:
-    """Render a completed dispatch's outcome for the reminder digest, in place
-    of a bare 'reminder #N'. Deterministic, no LLM — verdict_json is sideclaw's
-    own schema-shaped result object, persisted verbatim by dispatch-sweep.py.
-    Classification lives once, in clients/sideclaw.py's classify_dispatch_outcome();
-    this function owns only the wording."""
-    kind, detail = _sideclaw.classify_dispatch_outcome(status, verdict_json)
-    if kind == "failed":
-        return f"dispatch {detail}"
-    if kind == "no_verdict":
-        return "dispatch finished, no verdict"
-    if kind == "unreadable":
-        return "dispatch finished, verdict unreadable"
-    if kind == "degraded":
-        return "dispatch degraded (tool failure, not a repo finding)"
-    return detail or "dispatch finished, no summary"
 
 
 def cursor_get(conn: sqlite3.Connection, key: str) -> str | None:
@@ -952,10 +863,10 @@ def poll_stray_skills() -> list[dict[str, Any]]:
 
 
 def reconcile(conn: sqlite3.Connection, source: str, observed: list[dict[str, Any]],
-              now: dt.datetime, gate_min: int, reminder_h: int | None,
+              now: dt.datetime, gate_min: int,
               track_resolution: bool = True,
-              deliver: bool = True) -> tuple[list[dict], list[dict], list[dict]]:
-    """Fold `observed` into the events table and return (new, reminders, resolved).
+              deliver: bool = True) -> tuple[list[dict], list[dict]]:
+    """Fold `observed` into the events table and return (new, resolved).
 
     `deliver=False` means the caller already knows the digest will be suppressed
     (quiet hours or vacation). Rows are still inserted, refreshed and resolved —
@@ -1000,7 +911,6 @@ def reconcile(conn: sqlite3.Connection, source: str, observed: list[dict[str, An
             )
 
     new_events: list[dict] = []
-    reminder_events: list[dict] = []
     for row in cur.execute(
         "SELECT * FROM events WHERE source=? AND resolved_at IS NULL", (source,),
     ).fetchall():
@@ -1013,56 +923,6 @@ def reconcile(conn: sqlite3.Connection, source: str, observed: list[dict[str, An
                 continue  # stays un-notified; fires as NEW on the first delivering poll
             new_events.append(dict(row))
             cur.execute("UPDATE events SET notified_at=? WHERE id=?", (now.isoformat(), row["id"]))
-        elif reminder_h:
-            # Ledger projection (docs/history/state-log.md §49): the reminder path used to
-            # anchor purely on events/REM_HOURS and never look at the ledger's
-            # own classification of the event. A triage_items row in a
-            # TERMINAL_STATES state (ignored/note included) is a settled
-            # verdict — remind on it is pure noise, and skipping here doesn't
-            # even bump the anchor, so a later reopen (triage.py's own
-            # reopen/unsnooze pass) is re-checked cheaply next poll instead of
-            # going quiet for a full reminder_h window. item is None (no
-            # table, no row) behaves exactly as before this projection
-            # existed. See _triage_item.
-            item = _triage_item(conn, row["id"])
-            if item is not None and item["state"] in _ledger.TERMINAL_STATES:
-                continue
-            effective_reminder_h = reminder_h
-            if item is not None and item["state"] == _ledger.STATE_NEEDS_HUMAN:
-                # A real outstanding decision, not an ongoing outage — its own
-                # cadence, REM_HOURS_NEEDS_HUMAN, regardless of the source's.
-                effective_reminder_h = REM_HOURS_NEEDS_HUMAN
-            anchor = row["last_reminder_at"] or row["notified_at"]
-            if (now - dt.datetime.fromisoformat(anchor)).total_seconds() >= effective_reminder_h * 3600:
-                # Dispatch-bridge projection (Phase 3): an event with an OPEN
-                # dispatch already has an investigation in flight, so
-                # re-reminding is noise — skip silently (don't bump the
-                # anchor either, so this just re-checks cheaply next poll
-                # instead of going quiet for a full reminder_h window). An
-                # event whose dispatch has CLOSED gets the outcome folded into
-                # the reminder instead of a bare "reminder #N" — see
-                # _dispatch_summary. dispatch is None (no dispatch_id, no
-                # table, row gone) behaves exactly as before this projection
-                # existed.
-                dispatch = _dispatch_status(conn, row["dispatch_id"])
-                if dispatch is not None and dispatch["reported_at"] is None:
-                    continue
-                if not deliver:
-                    continue  # anchor untouched — re-checked cheaply next poll
-                d = dict(row)
-                if dispatch is not None:
-                    d["dispatch_summary"] = _dispatch_summary(dispatch["status"], dispatch["verdict_json"])
-                elif item is not None and item["state"] == _ledger.STATE_NEEDS_HUMAN and item["note"]:
-                    # No dispatch outcome to show yet — fold in the triage
-                    # verdict itself, the way dispatch_summary is folded in
-                    # above, so the reminder carries the actual pending
-                    # decision instead of a bare "reminder #N".
-                    d["triage_note"] = item["note"]
-                reminder_events.append(d)
-                cur.execute(
-                    "UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
-                    (now.isoformat(), row["id"]),
-                )
 
     resolved_events: list[dict] = []
     if track_resolution:
@@ -1078,7 +938,7 @@ def reconcile(conn: sqlite3.Connection, source: str, observed: list[dict[str, An
                     d["resolved_at"] = now.isoformat()
                     resolved_events.append(d)
 
-    return new_events, reminder_events, resolved_events
+    return new_events, resolved_events
 
 
 _DEDUP_NORMALIZE = re.compile(r"[^a-z0-9]+")
@@ -1189,7 +1049,6 @@ def upsert_grouped(conn: sqlite3.Connection, source: str, groups: list[dict[str,
                 "external_id": g["external_id"],
                 "title": display_title,
                 "url": "",
-                "reminder_count": (row["reminder_count"] or 0) + (1 if row["notified_at"] else 0),
             })
         else:
             # Silent record — bump cumulative count but don't surface
@@ -1288,7 +1147,7 @@ def _github_author(item: dict[str, Any]) -> str | None:
 
 
 def _render_bullet(item: dict[str, Any], kind: str, now: dt.datetime) -> str:
-    """kind ∈ {'new', 'reminder', 'resolved'}. Returns a single Slack-mrkdwn line, no leading dash."""
+    """kind ∈ {'new', 'resolved'}. Returns a single Slack-mrkdwn line, no leading dash."""
     src = item.get("source", "?")
     emoji = SOURCE_EMOJI.get(src, ":grey_question:")
     title = (item.get("title") or "?").strip()
@@ -1329,23 +1188,6 @@ def _render_bullet(item: dict[str, Any], kind: str, now: dt.datetime) -> str:
         if url:
             body += f" (<{url}>)"
 
-    # kind-specific suffixes
-    if kind == "reminder":
-        dispatch_summary = item.get("dispatch_summary")
-        triage_note = item.get("triage_note")
-        if dispatch_summary:
-            # Dispatch-bridge projection: the investigation closed, so report
-            # its outcome instead of a bare "reminder #N".
-            body += f" — {dispatch_summary}"
-        elif triage_note:
-            # Ledger projection (docs/history/state-log.md §49): needs_human carries a real
-            # verdict already — report it instead of a bare "reminder #N".
-            body += f" — needs human: {triage_note}"
-        else:
-            rc = item.get("reminder_count") or 0
-            if rc:
-                body += f" — reminder #{rc}"
-
     return body
 
 
@@ -1365,7 +1207,6 @@ def _render_section(label: str, header_emoji: str, items: list[dict[str, Any]], 
 
 def compose_slack_body(
     new: list[dict[str, Any]],
-    reminders: list[dict[str, Any]],
     resolved: list[dict[str, Any]],
     *,
     quiet: bool,
@@ -1380,14 +1221,12 @@ def compose_slack_body(
     """
     if quiet or vacation:
         return ""
-    if not new and not reminders and not resolved:
+    if not new and not resolved:
         return ""
 
     sections: list[list[str]] = []
     if new:
         sections.append(_render_section("New", ":rotating_light:", new, "new", now))
-    if reminders:
-        sections.append(_render_section("Reminders", ":bell:", reminders, "reminder", now))
     if resolved:
         sections.append(_render_section("Resolved", ":white_check_mark:", resolved, "resolved", now))
 
@@ -1402,26 +1241,15 @@ def fmt_block(label: str, items: list[dict[str, Any]]) -> str:
         src = it.get("source", "?")
         title = it.get("title", "?")
         url = it.get("url") or ""
-        rc = it.get("reminder_count")
-        dispatch_summary = it.get("dispatch_summary")
-        suffix_parts = []
-        if url:
-            suffix_parts.append(url)
-        if dispatch_summary:
-            # Dispatch-bridge projection: surfaces in the raw block too, so the
-            # cron prompt's LLM sees the closed investigation, not just a count.
-            suffix_parts.append(f"dispatch: {dispatch_summary}")
-        elif rc:
-            suffix_parts.append(f"reminder#{rc}")
-        suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+        suffix = f" ({url})" if url else ""
         lines.append(f"  - [{src}] {title}{suffix}")
     lines.append("]")
     return "\n".join(lines)
 
 
 def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
-              deliver: bool = True) -> tuple[list[dict], list[dict], list[dict]]:
-    """Run the full polling pipeline against `conn`. Returns (new, reminders, resolved).
+              deliver: bool = True) -> tuple[list[dict], list[dict]]:
+    """Run the full polling pipeline against `conn`. Returns (new, resolved).
 
     `deliver=False` when the caller already knows the digest will be suppressed
     (quiet hours / vacation). The poll still runs in full — cursors advance, rows
@@ -1457,18 +1285,17 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
     """
     now_iso = now.isoformat()
     all_new: list[dict] = []
-    all_rem: list[dict] = []
     all_res: list[dict] = []
 
-    n, r, res = reconcile(conn, "uk", poll_uk(env), now, UK_DOWN_GATE_MIN, REM_HOURS["uk"], deliver=deliver)
-    all_new += n; all_rem += r; all_res += res
+    n, res = reconcile(conn, "uk", poll_uk(env), now, UK_DOWN_GATE_MIN, deliver=deliver)
+    all_new += n; all_res += res
     conn.commit()
 
     for host in ("homelab", "vps"):
         src = f"docker_{host}"
-        n, r, res = reconcile(conn, src, poll_docker(env, host), now,
-                              DOCKER_UNHEALTHY_GATE_MIN, REM_HOURS[src], deliver=deliver)
-        all_new += n; all_rem += r; all_res += res
+        n, res = reconcile(conn, src, poll_docker(env, host), now,
+                           DOCKER_UNHEALTHY_GATE_MIN, deliver=deliver)
+        all_new += n; all_res += res
         conn.commit()
 
     for host, remote_cmd in OP_REF_HOSTS.items():
@@ -1482,8 +1309,8 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
             # Network blip / unreachable host this cycle — skip reconciling so it
             # can neither page as a missing secret nor auto-resolve a real one.
             continue
-        n, r, res = reconcile(conn, src, observed, now, 0, REM_HOURS[src], deliver=deliver)
-        all_new += n; all_rem += r; all_res += res
+        n, res = reconcile(conn, src, observed, now, 0, deliver=deliver)
+        all_new += n; all_res += res
         conn.commit()
 
     resolve_stale_github_issue_events(conn, now)
@@ -1495,23 +1322,22 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
             # Search failed this cycle — skip reconciling, same as an
             # unreachable op_refs host: a blind poll must not resolve anything.
             continue
-        n, r, res = reconcile(conn, kind, gh[kind], now, 0, REM_HOURS[kind], deliver=deliver)
-        all_new += n; all_rem += r; all_res += res
+        n, res = reconcile(conn, kind, gh[kind], now, 0, deliver=deliver)
+        all_new += n; all_res += res
         conn.commit()
 
-    n, r, res = reconcile(conn, "hermes_cron", poll_hermes_cron(), now, 0, REM_HOURS["hermes_cron"], deliver=deliver)
-    all_new += n; all_rem += r; all_res += res
+    n, res = reconcile(conn, "hermes_cron", poll_hermes_cron(), now, 0, deliver=deliver)
+    all_new += n; all_res += res
     conn.commit()
 
-    n, r, res = reconcile(conn, "stray_skill", poll_stray_skills(), now, 0, REM_HOURS["stray_skill"], deliver=deliver)
-    all_new += n; all_rem += r; all_res += res
+    n, res = reconcile(conn, "stray_skill", poll_stray_skills(), now, 0, deliver=deliver)
+    all_new += n; all_res += res
     conn.commit()
 
     log_groups = poll_hermes_logs(conn, now, now_iso)
     if log_groups:
         all_new += upsert_grouped(conn, "hermes_log", log_groups, now,
-                                  flap_threshold=1, cooldown_hours=REM_HOURS["hermes_log"],
-                                  deliver=deliver)
+                                  flap_threshold=1, deliver=deliver)
     conn.commit()
 
     for cur_key, ch_id, src, skip_uk in [
@@ -1544,7 +1370,7 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
 
     sweep_stale_grouped(conn, now)
 
-    return all_new, all_rem, all_res
+    return all_new, all_res
 
 
 def slack_poll_failure(conn: sqlite3.Connection) -> str | None:
@@ -1585,7 +1411,7 @@ def _push_uptime_heartbeat() -> None:
 # Mirrors triage.py's record_heartbeat() exactly — same key shape, same
 # "unconditional row per COMPLETED pass, skipped under --dry-run" contract, for
 # the same reason: every other write in this file only happens when something
-# CHANGED, so an idle pass (nothing new, nothing to remind, nothing resolved)
+# CHANGED, so an idle pass (nothing new, nothing resolved)
 # leaves no trace at all, and "the poller ran and found nothing" becomes
 # indistinguishable from "the poller did not run." This is what /metrics'
 # per-poller age (warden/scripts/api.py) reads to answer that question for
@@ -1594,13 +1420,13 @@ HEARTBEAT_CURSOR_KEY = "watchdog_poll_last_run"
 
 
 def record_heartbeat(conn: sqlite3.Connection, *,
-                     new_count: int, reminder_count: int, resolved_count: int,
+                     new_count: int, resolved_count: int,
                      slack_blind: bool) -> None:
     # No timestamp argument — see triage.py's record_heartbeat() for why the
     # write clock is read here rather than accepted from a caller holding the
     # pass's START time.
     value = json.dumps({
-        "new": new_count, "reminders": reminder_count, "resolved": resolved_count,
+        "new": new_count, "resolved": resolved_count,
         "slack_blind": slack_blind,
     }, sort_keys=True)
     conn.execute(
@@ -1632,8 +1458,8 @@ def main(argv: list[str] | None = None) -> int:
     now_iso = now.isoformat()
 
     if dry_run:
-        # Run poll against a temp copy of the DB so we don't advance notified_at /
-        # last_reminder_at on operator-driven invocations.
+        # Run poll against a temp copy of the DB so we don't advance notified_at
+        # on operator-driven invocations.
         import shutil
         import tempfile
         global DB_PATH
@@ -1645,7 +1471,7 @@ def main(argv: list[str] | None = None) -> int:
         DB_PATH = tmp_db
         try:
             conn = db_connect()
-            all_new, all_rem, all_res = _run_poll(conn, now, env, deliver=deliver)
+            all_new, all_res = _run_poll(conn, now, env, deliver=deliver)
             conn.commit()
             slack_blind = slack_poll_failure(conn)
             conn.close()
@@ -1664,10 +1490,10 @@ def main(argv: list[str] | None = None) -> int:
             if post and not dry_run:
                 _push_uptime_heartbeat()
             return 0
-        all_new, all_rem, all_res = _run_poll(conn, now, env, deliver=deliver)
+        all_new, all_res = _run_poll(conn, now, env, deliver=deliver)
         conn.commit()
         slack_blind = slack_poll_failure(conn)
-        record_heartbeat(conn, new_count=len(all_new), reminder_count=len(all_rem),
+        record_heartbeat(conn, new_count=len(all_new),
                          resolved_count=len(all_res), slack_blind=bool(slack_blind))
         conn.close()
 
@@ -1677,7 +1503,7 @@ def main(argv: list[str] | None = None) -> int:
         print(slack_blind, file=sys.stderr)
 
     if emit_slack_body:
-        body = compose_slack_body(all_new, all_rem, all_res,
+        body = compose_slack_body(all_new, all_res,
                                   quiet=quiet, vacation=vacation, now=now)
         rc = 1 if slack_blind else 0
 
@@ -1718,7 +1544,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"VACATION={'true' if vacation else 'false'}")
     print(f"NOW={now_iso}")
     print(fmt_block("NEW", all_new))
-    print(fmt_block("REMINDERS", all_rem))
     print(fmt_block("RESOLVED", all_res))
     return 1 if slack_blind else 0
 

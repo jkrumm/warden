@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import os
 import re
 import stat
 import subprocess
@@ -213,13 +212,6 @@ def test_bare_invocation_prints_help_and_exits_zero():
     proc = h.run([])
     assert proc.returncode == 0, proc
     assert "dispatch <repo>" in proc.stdout
-
-
-def test_help_works_inside_a_claude_code_session():
-    """help is not a mutating verb — it must never trip the recursion guard."""
-    h = Harness()
-    proc = h.run(["help"], env_extra={"CLAUDECODE": "1"})
-    assert proc.returncode == 0, proc
 
 
 # --- argument bounding ---------------------------------------------------------
@@ -418,27 +410,20 @@ def test_audit_log_records_refused_dispatch():
     assert "verb=dispatch" in line and "mode=refused" in line and "rc=4" in line, line
 
 
-# --- recursion guard -----------------------------------------------------------------
+# --- agents may dispatch ---------------------------------------------------------------
 
 
-def test_recursion_guard_blocks_dispatch():
+def test_dispatch_works_inside_an_agent_session():
+    """A Claude Code / OpenCode session may open an episode: no env marker is
+    a reason for warden to refuse."""
     h = Harness()
-    proc = h.run(["dispatch", "alpha", "--json"], env_extra={"CLAUDECODE": "1"}, stdin=VALID_BRIEF)
-    out = _json_or_fail(proc)
-    assert proc.returncode == 4 and "CLAUDECODE" in out["error"], out
-
-
-def test_recursion_guard_blocks_merge():
-    h = Harness()
-    proc = h.run(["merge", "job-x", "--why", "w", "--json"], env_extra={"CLAUDE_CODE_SESSION": "1"})
-    out = _json_or_fail(proc)
-    assert proc.returncode == 4 and "CLAUDE_CODE_SESSION" in out["error"], out
-
-
-def test_recursion_guard_does_not_block_read_verbs():
-    h = Harness()
-    proc = h.run(["list", "--json"], env_extra={"CLAUDECODE": "1"})
-    assert proc.returncode == 0, proc
+    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-s", "status": "running"}})})
+    try:
+        proc = h.run(["dispatch", "alpha", "--json"], env=h.base_env(sideclaw=srv.base),
+                     env_extra={"CLAUDECODE": "1", "CLAUDE_ENTRYPOINT": "worker"}, stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    assert proc.returncode == 0, proc.stderr
 
 
 # --- dispatch record / status / list ------------------------------------------------

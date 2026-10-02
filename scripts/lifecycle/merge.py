@@ -31,7 +31,7 @@ from clients import github, rollout, sideclaw
 from clients.errors import (
     CheckRunsUnreadable, PolicyError, PreconditionError, RemoteError, UsageError,
 )
-from lifecycle import chaos, operations, policy
+from lifecycle import operations, policy
 
 # `deployOnMerge` only fires once a real merge commit exists — a 40-hex sha,
 # never `None`/"" (both reject) nor a malformed one (present-but-wrong is a
@@ -222,7 +222,6 @@ def rollout_after_merge(
             return {"attempted": False, "reason": f"deploy key {key} is not in the allowlist"}, None
 
         op = operations.record(conn, event_id=event_id, kind="deploy", repo=repo, authorized_by=authorized_by)
-        chaos.crash_point("after-deploy-op")
         timeout_s = int(os.environ.get("WARDEN_DEPLOY_TIMEOUT", "180"))
         res = rollout.run(key, timeout_s=timeout_s)
         expected = collect_expected_alerts(owner, repo, files, merge_sha) if res.ok else []
@@ -235,7 +234,6 @@ def rollout_after_merge(
 
     if entry.get("deployOnMerge") and isinstance(merge_sha, str) and _FULL_SHA_RE.match(merge_sha):
         op = operations.record(conn, event_id=event_id, kind="deploy", repo=repo, authorized_by=authorized_by)
-        chaos.crash_point("after-deploy-op")
         try:
             runs = github.actions_runs(owner, repo, head_sha=merge_sha)
         except RemoteError as e:
@@ -423,11 +421,6 @@ def plan_or_land(
         )
 
     # --- land it -----------------------------------------------------------
-    # A dispatched episode may never land a merge — planning (the MergePlan
-    # branch above) stays allowed inside a Claude Code session, only the
-    # write is guarded.
-    policy.require_no_recursion()
-
     # The double `--confirm` race: two concurrent lands of the SAME job_id
     # would both have passed the `merged_at IS NULL` check from the row this
     # function read at the top, long before either write-locked anything.
@@ -465,7 +458,6 @@ def plan_or_land(
         conn.rollback()
         raise
     conn.commit()
-    chaos.crash_point("after-merge-op")
 
     # Ready-for-review first: a draft cannot be merged. Done AFTER every
     # check above, so a PR that fails one is never un-drafted as a side
@@ -515,7 +507,6 @@ def plan_or_land(
         operations.complete(conn, merge_op, outcome="unknown", receipt=json.dumps({"error": str(e)}))
         raise
     merge_sha = resp.get("sha")
-    chaos.crash_point("after-merge-put")
 
     # The record is stamped before the branch delete, which is cleanup and
     # is allowed to fail: a merged commit with a leftover branch is untidy,
@@ -531,7 +522,6 @@ def plan_or_land(
         raise PreconditionError(
             f"MERGED {owner}/{repo}#{pr_number} but could not stamp the dispatch record: {e}"
         )
-    chaos.crash_point("after-merged-at")
 
     try:
         deleted = github.delete_branch(owner, repo, pr_head)

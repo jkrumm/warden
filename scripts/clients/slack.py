@@ -48,7 +48,7 @@ _SLACK_TOKEN_REF = "op://hermes/slack/bot-token"
 
 # Warden's own app (slack/app-manifest.json) — chat:write/chat:write.public
 # only, no incoming-webhook, no socket mode. Tried FIRST so triage cards,
-# remediation receipts and reminders are attributable to Warden rather than
+# remediation receipts are attributable to Warden rather than
 # riding under the Hermes bot's username.
 _WARDEN_SLACK_TOKEN_REF = "op://common/slack/WARDEN_BOT_TOKEN"
 

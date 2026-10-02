@@ -5,9 +5,7 @@ investigation attached once a signature repeats or stays open. THE ACT PATH
 CALL AT ALL (the dispatched sideclaw `investigate` episode itself runs Claude
 Code, which is inherent to what "investigate" means — that is a property of
 sideclaw's dispatch tier, reached here via scripts/clients/sideclaw.py, not of
-this script). The ONE exception in the whole file is `propose_mappings()` — a
-bounded, once-a-day maintenance pass, batched, never in the act path itself —
-see PROPOSE MAPPINGS below.
+this script).
 
 Runs every 600 s as the `com.jkrumm.warden-loop` LaunchAgent (`scripts/triage.py
 --run`).
@@ -37,9 +35,7 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                     below) against config/triage-policy.json, in order: the
                     explicit `ignore` list (genuine recoveries/known-benign —
                     route to `ignored`, terminal, invisible), then `rules`
-                    (resolve EITHER `repo`, escalate to an episode, OR
-                    `verb`, run a declared local command — see VERB OUTCOMES
-                    below), and ONLY for a row no rule matched the structural
+                    (resolve `repo`, escalate to an episode), and ONLY for a row no rule matched the structural
                     `ignoreUnstructuredSlackProse` fallback (route to
                     STATE_NOTE — terminal, but VISIBLE in the digest, see that
                     state's own docstring for why). The prose filter runs LAST
@@ -89,9 +85,6 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    repo per run (a cluster), not one per item; a `split` item
                    escalates too, but always as a SINGLETON, ahead of that
                    repo's `new` clusters — see escalate()'s own comment.
-  6b. Verbs       — every `new`+`verb`-mapped+eligible item runs its
-                   allowlisted local command once (see VERB OUTCOMES) — never
-                   an episode, never clustered with repo-mapped items.
   6c. Deadlines   — every non-terminal state names its poller and how long a
                    row may sit in it (STATE_DEADLINES); sweep_deadlines() is
                    what happens when the poller did not deliver. Runs after
@@ -99,21 +92,13 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    before the card (so the expiry is visible in the same pass).
                    An expiry is never silent: it writes the reason into `note`
                    and prints it.
-  7. Card         — one Slack card per cluster (or per verb outcome), posted
+  7. Card         — one Slack card per cluster, posted
                    once state leaves `new` (an unescalated item, mapped or
                    not, is carried silently — see CARDED STATES below) and
                    updated in place after, no-op when the rendered content
                    hasn't changed.
-  8. Propose      — at most once per 24h (see PROPOSE MAPPINGS below), one
-                   batched LLM call over signatures that have stayed `new`
-                   with no `repo`/`verb` for longer than
-                   `proposeMappingsAgeDays`, proposing `map`/`ignore`/`unsure`
-                   per signature. Applied outcomes land ONLY in
-                   config/triage-policy.json (never triage_items directly),
-                   committed (never pushed) in this repo's own checkout.
-  9. Once a day, one digest message with up to three sections: signatures
-     that matched no policy rule, STATE_NOTE rows (see step 3), and whatever
-     step 8 just auto-added this run.
+  9. Once a day, one digest message with up to two sections: signatures
+     that matched no policy rule and STATE_NOTE rows (see step 3).
   9.5. Argo actions — pulls the owner's queued Argo actions (implement/merge/
                    dismiss/reinvestigate/note) and applies each one before
                    this same pass's own Push step reflects the outcome — see
@@ -123,37 +108,6 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    `/warden/snapshot`, because Argo cannot reach this box to
                    probe it directly. The ledger stays the one source of
                    truth; Argo only ever holds a pushed-to projection of it.
-
-PROPOSE MAPPINGS — the one LLM call in this file. `config/triage-policy.json`
-was designed to grow only by a human reading the daily unmapped digest and
-hand-editing the file — measurably not happening: a signature that fired, got
-hand-fixed once, then reappeared four months later matched nothing, because
-the fix was never turned into a rule. `propose_mappings()` closes that loop
-as cheaply as this problem allows: at most once per 24h (a cursor in
-`cursors`, the same table the digest already uses), batched into ONE request
-against the Hermes brain over the same OpenAI-compatible endpoint
-config.yaml already configures (`OPENAI_BASE_URL`/`OPENAI_API_KEY`, model
-`deepseek-v4.1-flash`), secrets resolved the same way every other secret in this
-file is — never a plaintext key. At most `PROPOSE_MAPPINGS_MAX_SIGNATURES`
-candidates per run: every `new` item with no `repo`/`verb` whose event has
-been open longer than `proposeMappingsAgeDays` (policy knob, default 7 — a
-signature younger than that may still be a one-off, and mapping it wastes a
-whole investigate episode). The model returns strict JSON, one of three
-shapes per signature: `ignore` (append to the ignore list — safe and cheap to
-get wrong), `map` (append a rule — a wrong mapping costs at most one wasted
-read-only `investigate` episode, bounded and visible), or `unsure` (leave
-unmapped, and record the attempt so it is not re-billed on every run for
-`PROPOSE_UNSURE_COOLDOWN_DAYS`). A `map` proposal's repo is re-validated
-against the git checkouts under the repos root (`_discoverable_repos()`) —
-never trusted from the model's own claim alone, see BOUNDS THAT DO NOT MOVE. Every applied entry is stamped
-`proposedAt`/`proposedBy: "triage-auto"` plus the model's one-line reason,
-written back into config/triage-policy.json (preserving `_readme` and key
-order), then `git add` + `git commit` — never `git push` — that ONE file, in
-this repo's own checkout. Skipped outright, loudly, if that path already
-carries a pending change, rather than sweeping an unrelated edit into an
-auto-authored commit. A failed, timed-out, or unparseable model call is
-logged to stderr and otherwise a no-op — this loop must never depend on it
-succeeding, exactly like every other externally-visible call in this file.
 
 `scripts/dispatch-sweep.py` closes the other half: when a dispatch tied to a
 triage cluster (dispatches.origin_event_id) reaches a terminal status, it
@@ -209,32 +163,14 @@ see maybe_post_daily_digest()). This is what keeps an empty or partial policy
 from turning into dozens of cards of noise on day one. STATE_NOTE is
 deliberately excluded too — see that state's own docstring.
 
-VERB OUTCOMES. A policy rule can name `verb` instead of `repo` — routes to a
-declared, code-side ALLOWLISTED local command instead of a sideclaw episode.
-The rule names a KEY (e.g. `"env-check"`), never a command — a policy file
-must never be able to name an arbitrary argv, the same closed-verb-set
-principle hermes-cc.sh's own dispatch/status/list/merge/cancel verbs use.
-Seeded with exactly one: `env-check` (hermes-ops.sh's ssh-based 1Password
-ref-health probe), which op_refs_homelab/op_refs_vps route to. Cheaper than a
-dispatch AND safer: a bare 1Password item name in the output doesn't match
-sideclaw's `op://vault/item/field` secret-scan pattern the way a dispatched
-verdict would, so the useful answer survives onto the card instead of being
-withheld. Terminal state is `needs_human`; run_verbs() runs the command at
-most once per item (see that function's own docstring for why no cooldown
-tracking is needed) and the card's note IS the whole verdict — the dangling
-item name plus the exact remediation, so no further investigation is needed.
-
 DRY-RUN CONTRACT. `--dry-run` never touches Slack (no chat.postMessage/
 chat.update), never shells out to hermes-cc.sh, never shells out to `gh`,
 never runs a HOST_VERB_ALLOWLIST verb (maybe_auto_remediate() prints
 `[dry-run] would run host verb <key> for <signature>` and does nothing
-else — the same shape run_verbs() already uses for VERB_ALLOWLIST, applied
-to the more sensitive fifth allowlist), never posts a needs_human/
-merge_blocked reminder reply (remind_needs_human() prints `[dry-run] would
-remind <signature>` and posts nothing), never polls Argo for pending owner
+else), never polls Argo for pending owner
 actions (apply_argo_actions() prints `[dry-run] would poll Argo for pending
 owner actions` and does nothing else), and never pushes to Argo — those
-seven are the only externally-visible actions this script can take.
+six are the only externally-visible actions this script can take.
 (`gh` is the newest of them and the only READ-ONLY one: reconcile_operations()
 uses `gh pr view` to ask GitHub whether a merge it lost the answer to
 actually landed. It is still a shell-out to a remote system, so it is named
@@ -296,7 +232,6 @@ from clients.errors import (  # noqa: E402
     WardenError,
 )
 from lifecycle import (  # noqa: E402
-    chaos as _chaos,
     dispatch as _dispatch,
     merge as _merge,
     operations as _operations,
@@ -323,16 +258,11 @@ DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
 _env_gh_bin = os.environ.get("GH_BIN")
 GH_BIN = Path(_env_gh_bin).expanduser() if _env_gh_bin else Path("/opt/homebrew/bin/gh")
 
-# This repo's own config/, not ~/.hermes/config/, since the extraction. That is
-# not cosmetic: propose_mappings() writes this file and then `git commit`s it
-# inside TRIAGE_REPO_DIR, and while the file lived outside this checkout that
-# whole path returned early — the signature map could not extend itself at all.
+# This repo's own config/, not ~/.hermes/config/, since the extraction.
 # lifecycle/policy.py's own `triage_policy_path()` reads the same file, for the
 # merge/deploy half of it, via the same `WARDEN_TRIAGE_POLICY` env var this
 # file's own POLICY_PATH honors. One file, two readers, as it always was.
-# This repo's root: the `git -C` target for propose_mappings()'s policy
-# auto-commit, and the anchor POLICY_PATH resolves against. Defined here,
-# above its first use, rather than twice in one file.
+# TRIAGE_REPO_DIR is this repo's root, the anchor POLICY_PATH resolves against.
 TRIAGE_REPO_DIR = Path(__file__).resolve().parent.parent
 _env_policy = os.environ.get("WARDEN_TRIAGE_POLICY") or os.environ.get("HERMES_TRIAGE_POLICY")
 POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
@@ -344,9 +274,8 @@ POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
 # governance-cadence, not the reactive-alert-channel firehose this exists to
 # stop. op_refs_homelab/op_refs_vps ARE included: a dead 1Password ref blocks
 # every future reseal of the mini's offline secrets cache (dotfiles' own
-# AGENTS.md §Secrets) — it must reach at least the unmapped digest, and
-# routes to the `env-check` VERB (see VERB_ALLOWLIST below), never an
-# episode. See docs/triage.md.
+# AGENTS.md §Secrets) — it must reach at least the unmapped digest. See
+# docs/triage.md.
 #
 # Wave 6.1 adds two MORE origins that also open a `triage_items` row and
 # never go through here: `human` (via `warden run`, CLI-only — see
@@ -356,7 +285,7 @@ POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
 # alert-source door, and both new origins insert their `triage_items` row
 # directly.
 INGEST_SOURCES = ("slack_alert", "uk", "docker_homelab", "docker_vps", "hermes_log",
-                   "op_refs_homelab", "op_refs_vps", "warden_self")
+                   "op_refs_homelab", "op_refs_vps")
 
 # The two INGEST_SOURCES that are grouped (upsert_grouped()-based, append-only)
 # rather than state (reconcile()-based, disappearance-resolved) — mirrors
@@ -632,13 +561,6 @@ _STATE_DEADLINE_COLUMN = "state_deadline"
 #     every other verdict sits in `verdict` with nothing scheduled to touch it
 #     again. 24h -> needs_human. An ADDITION to the design's table, not a
 #     contradiction of it.
-#   * `needs_human`'s "reminder at 1d" is NOT built HERE, deliberately: a
-#     reminder is a notification feature, not a deadline — it changes
-#     nothing about when the row may stop existing. It is built as its own
-#     step, remind_needs_human(), run right after sweep_deadlines() in
-#     run() — see that function's own docstring. `merge_blocked` gets the
-#     same reminder, for the same reason it shares this row's 168h/operator
-#     shape below.
 #   * `split` is the same third addition as `verdict` above, for the same
 #     reason: post-verdict, nothing scheduled to touch it unless a specific
 #     condition is met (here: escalate() finding it a free per-repo slot —
@@ -719,7 +641,7 @@ DEFAULT_COOLDOWN_HOURS = 6
 # doesn't trigger a notification burst). 2h is the triage-side fix's
 # default: comfortably past the 30-min watchdog-poll cadence (4+ consecutive
 # misses before a false resolve) and short of either grouped source's own
-# reminder window (6h/24h in REM_HOURS), so a signature that is GENUINELY
+# re-emit window (6h/24h), so a signature that is GENUINELY
 # still flapping gets re-noticed well before this would ever fire — while a
 # fixed-and-deployed alert still closes the same day instead of sitting
 # open for a week. See resolve_quiet_grouped().
@@ -744,12 +666,6 @@ DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 # episode itself (rules/agent-limits.md).
 DEFAULT_REVISION_MAX_ATTEMPTS = 2
 
-# track_parked_recurrences(): the recurrence count at which a parked item
-# posts one extra reminder, independent of REMINDER_MAX_COUNT — a signal that
-# keeps firing while its fix waits is new information every time.
-DEFAULT_PARKED_RECURRENCE_REMINDER = 5
-PARKED_STATES = ("needs_human", "merge_blocked")
-
 # maybe_auto_remediate()'s own cooldown/attempt-cap defaults — same shape as
 # DEFAULT_COOLDOWN_HOURS above but against `operations`, not `dispatches`
 # (see _host_verb_cooldown_ok()): a flapping signal must not restart a live
@@ -757,20 +673,6 @@ PARKED_STATES = ("needs_human", "merge_blocked")
 # THIS item is a deterministic failure, not a third try waiting to happen.
 DEFAULT_HOST_VERB_COOLDOWN_HOURS = 6.0
 DEFAULT_HOST_VERB_MAX_ATTEMPTS = 2
-
-# remind_needs_human()'s own knob — DESIGN.md:247's "7d, reminder at 1d" for
-# `needs_human`, applied to `merge_blocked` too (same shape: a human-owned
-# state with a 168h dismiss clock and nothing else polling it). The second,
-# FINAL reminder fires at REMINDER_SECOND_MULTIPLIER times this, never
-# separately configurable — two knobs for one cadence would let a policy
-# edit decouple them into something that reads as a bug (a second reminder
-# BEFORE the first, or the reverse). Validated the same
-# stderr-fallback-on-a-bad-value shape as hostVerbCooldownHours
-# (_valid_host_verb_positive_number(), reused as-is — it was already generic
-# over `key`/`default`/`cast`, not actually hostVerb-specific).
-DEFAULT_NEEDS_HUMAN_REMINDER_HOURS = 24.0
-REMINDER_SECOND_MULTIPLIER = 3
-REMINDER_MAX_COUNT = 2
 
 # The owner's follow-up decision, 2026-09-11: `confidence: high` was the
 # wrong bar for THIS mechanism specifically. A restart from
@@ -830,28 +732,12 @@ SECTION_TEXT_MAX = 3000  # Block Kit section text hard limit
 
 DAILY_DIGEST_CURSOR_KEY = "triage_unmapped_digest_date"
 
-# A policy rule names a KEY, never a command — a policy file must never be
-# able to name an arbitrary argv. This is the closed allowlist code maps a
-# `"verb"` rule outcome to; same closed-verb-set principle as hermes-cc.sh's
-# own dispatch/status/list/merge/cancel verbs, applied to a single-purpose
-# LOCAL health probe instead of a sideclaw episode — cheaper than a dispatch
-# and safer: `env-check`'s bare 1Password item names don't match sideclaw's
-# `op://vault/item/field` secret pattern the way a dispatched verdict would,
-# so the useful answer survives onto the card instead of being withheld.
-# hermes-ops.sh (62 KB) deliberately stayed behind in hermes-agent — this is
-# a live cross-repo argv, not an oversight. Same env-override shape as
-# GH_BIN above: env var first, documented default second.
+# hermes-ops.sh (62 KB) deliberately stayed behind in hermes-agent — the
+# evidence/liveness gatherers shell out to it as a live cross-repo argv, not an
+# oversight. Same env-override shape as GH_BIN above: env var first,
+# documented default second.
 _env_ops_bin = os.environ.get("WARDEN_HERMES_OPS_BIN")
 _HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_HOME / "scripts" / "hermes-ops.sh")
-VERB_ALLOWLIST: dict[str, list[str]] = {
-    "env-check": [str(_HERMES_OPS_BIN), "env-check", "--json"],
-}
-# env-check runs TWO sequential ssh_run() probes (homelab, then vps), each
-# individually bounded by hermes-ops.sh's own SSH_TIMEOUT=120 — so the outer
-# bound here has to clear 240s, not just one call's worth, or this would kill
-# a legitimately slow-but-healthy probe before hermes-ops.sh's own timeout
-# ever got a chance to fire.
-VERB_TIMEOUT = 260
 
 # --- host verbs — the FIFTH closed allowlist ----------------------------------
 #
@@ -1102,81 +988,6 @@ LIVENESS_ALLOWLIST = {
     "argo-commit-live": _gather_argo_commit_live,
 }
 
-# --- propose_mappings() — the one LLM call in this file (see module docstring
-# PROPOSE MAPPINGS) --------------------------------------------------------
-
-# Same table/pattern DAILY_DIGEST_CURSOR_KEY already uses, but this one stores
-# a full timestamp (not a bare date) so the gate is a genuine rolling 24h,
-# checked before the model is ever called — a run that fires at 00:05 today
-# must not fire again at 00:05 tomorrow just because the calendar date rolled.
-PROPOSE_MAPPINGS_CURSOR_KEY = "triage_propose_mappings_last_run"
-
-# How many candidates ride in ONE batched request. The rest simply wait for a
-# later day's run — never dropped, never silently expanded into a second call
-# (this loop makes at most one model call per run, full stop).
-# A signature this many occurrences deep has proven it is not a one-off,
-# whatever its age — see _propose_mapping_candidates() for why age alone
-# is insufficient.
-PROPOSE_MAPPINGS_MIN_OCCURRENCES = int(os.environ.get("TRIAGE_PROPOSE_MIN_OCCURRENCES", "5"))
-PROPOSE_MAPPINGS_MAX_SIGNATURES = 25
-
-# A batch of at most 25 short JSON decisions (one action + one one-line reason
-# each) comfortably fits well under this; the cap exists so a misbehaving
-# endpoint can't turn one daily maintenance call into an open-ended generation.
-# 16000, not the historic 2000: deepseek-v4.1-flash's thinking expands to fill
-# whatever budget it is given and returns empty with finish_reason "length"
-# below ~1000 tokens — the reasoning tokens come out of this SAME budget, they
-# are not billed/counted separately (completion_tokens_details.reasoning_tokens
-# is misreported as 0 on this endpoint).
-PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS = 16000
-
-# Top-level `reasoning_effort`, sent alongside the model on every call — the
-# only effort knob this endpoint honours for this model (`{"reasoning": {...}}`
-# extra_body is rejected on /chat/completions). "high" per the 2026-09-13
-# estate-wide model rollout; this file's batched daily maintenance call is not
-# latency-critical, so there is no reason to trade quality for speed here.
-PROPOSE_MAPPINGS_REASONING_EFFORT = "high"
-
-# The call itself, separate from SUBPROCESS_TIMEOUT (which bounds a hermes-cc.sh
-# subprocess, not an HTTP request this file makes directly). 1800s (30 min), not
-# the historic 90s: this is a single non-agentic HTTP request with no streaming,
-# so per this estate's agent-limits rule it needs a hang guard of at least 30
-# min rather than a tight budget — a reasoning model spending minutes on a
-# `high`-effort batch is not a hang, and this call is once-a-day maintenance,
-# never on any latency-sensitive path.
-PROPOSE_MAPPINGS_TIMEOUT = int(os.environ.get("TRIAGE_PROPOSE_TIMEOUT", "1800"))
-
-# A signature younger than this may still be a one-off (a transient blip that
-# resolves on its own before anyone would ever hand-map it) — mapping it this
-# early wastes a whole investigate episode on something that might never
-# recur. Policy knob: config/triage-policy.json's `proposeMappingsAgeDays`.
-DEFAULT_PROPOSE_MAPPINGS_AGE_DAYS = 7.0
-
-# How long an `unsure` verdict suppresses re-proposing THE SAME signature —
-# long enough that a genuinely ambiguous signature is not re-billed into the
-# model on every single day's run, short enough that it is reconsidered
-# occasionally rather than permanently stuck.
-PROPOSE_UNSURE_COOLDOWN_DAYS = 7.0
-
-# Mid-size, single-shot maintenance call — this estate's 2026-09-13 model
-# rollout puts it on deepseek-v4.1-flash, chat_completions only
-# (`/openai/v1/chat/completions` — `/responses` 404s "No suitable backend"
-# for this model despite `/models` listing it), over the SAME OpenAI-
-# compatible endpoint config.yaml already points the Hermes brain at
-# (OPENAI_BASE_URL/OPENAI_API_KEY) — never the Responses-API leg the main
-# agent uses (codex_responses), which this file has no reason to touch.
-# Measured directly against the endpoint: this model accepts `reasoning_effort`
-# (low/high/xhigh/max) and tolerates `temperature`/`max_tokens`, but this file
-# sends `max_completion_tokens` and no `temperature` regardless — the house
-# rule, and portable to the other models this endpoint hosts (gpt-5.6-luna
-# 503s on both). Strict JSON is enforced by the system prompt and the parse
-# below, not by temperature.
-PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "deepseek-v4.1-flash")
-
-# Mirrors .env.tpl's own OPENAI_API_KEY ref exactly — never a plaintext key.
-_OPENAI_API_KEY_REF = "op://common/anthropic/API_KEY"
-
-
 # scripts/ledger.py — loaded by path, the same mechanism used elsewhere in
 # this file (see the watchdog-poll.py borrow below) because the sibling
 # filenames here are not importable. ledger.py now owns the schema and the
@@ -1299,8 +1110,7 @@ def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, st
 def post_blocks(channel: str, blocks: list[dict[str, Any]], text_fallback: str, token: str, *,
                  thread_ts: str | None = None) -> tuple[bool, str | None]:
     """`thread_ts`, when given, posts as a reply under an existing message
-    (e.g. remind_needs_human()'s own reminder, threaded under the item's
-    card) rather than a new top-level message — every other caller leaves it
+    (a reply threaded under the item's card) rather than a new top-level message — every other caller leaves it
     unset and gets today's behaviour unchanged."""
     payload: dict[str, Any] = {"channel": channel, "blocks": blocks, "text": text_fallback, "unfurl_links": False}
     if thread_ts:
@@ -1320,27 +1130,10 @@ def update_blocks(channel: str, ts: str, blocks: list[dict[str, Any]], text_fall
 # --- policy loading -----------------------------------------------
 
 def _valid_rule(r: Any) -> bool:
-    """A rule needs a `match` and EITHER `repo` (escalate to an episode) OR
-    `verb` (run a declared local command — see VERB_ALLOWLIST). A `verb` not
-    in the allowlist is rejected here, loudly, rather than silently matching
-    nothing at classify() time — a policy file names a KEY, never a command,
-    and a typo'd key is a policy bug worth surfacing immediately. An optional
-    `evidence` list is validated the same way, against EVIDENCE_ALLOWLIST —
-    see that constant's own comment."""
-    if not (isinstance(r, dict) and r.get("match")):
-        return False
-    has_target = False
-    if r.get("repo"):
-        has_target = True
-    else:
-        verb = r.get("verb")
-        if verb:
-            if verb in VERB_ALLOWLIST:
-                has_target = True
-            else:
-                print(f"triage: policy rule {r.get('match')!r} names verb {verb!r}, not in VERB_ALLOWLIST "
-                      f"{sorted(VERB_ALLOWLIST)} — dropping this rule", file=sys.stderr)
-    if not has_target:
+    """A rule needs a `match` and a `repo` (escalate to an episode). An
+    optional `evidence` list is validated against EVIDENCE_ALLOWLIST — see
+    that constant's own comment."""
+    if not (isinstance(r, dict) and r.get("match") and r.get("repo")):
         return False
     evidence = r.get("evidence")
     if evidence is not None:
@@ -1358,12 +1151,8 @@ def _valid_rule(r: Any) -> bool:
 
 def _valid_host_verb_rule(r: Any) -> bool:
     """A `hostVerbs` rule needs `match` and a `verb` FROM HOST_VERB_ALLOWLIST
-    — same closed-key-set contract as `_valid_rule()`'s own `verb` branch,
-    split into its own function because a hostVerbs rule has no `repo`/
-    `evidence` shape to also validate, and because HOST_VERB_ALLOWLIST is a
-    genuinely different, more sensitive allowlist (a host-level restart, not
-    a read-only local probe) that deserves its own loud rejection message
-    rather than sharing VERB_ALLOWLIST's."""
+    — a closed key set: a policy file names a KEY, never a command, and a
+    typo'd key is a policy bug worth surfacing loudly at load time."""
     if not (isinstance(r, dict) and r.get("match") and r.get("verb")):
         return False
     verb = r["verb"]
@@ -1434,9 +1223,6 @@ def load_policy() -> dict[str, Any]:
         "quietResolveHours": float(data.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS),
         "chronicRecurrences": int(data.get("chronicRecurrences") or DEFAULT_CHRONIC_RECURRENCES),
         "chronicWindowDays": float(data.get("chronicWindowDays") or DEFAULT_CHRONIC_WINDOW_DAYS),
-        "parkedRecurrenceReminder": _valid_host_verb_positive_number(
-            data.get("parkedRecurrenceReminder"), key="parkedRecurrenceReminder",
-            default=DEFAULT_PARKED_RECURRENCE_REMINDER, cast=int),
         "revisionMaxAttempts": _valid_host_verb_positive_number(
             data.get("revisionMaxAttempts"), key="revisionMaxAttempts",
             default=DEFAULT_REVISION_MAX_ATTEMPTS, cast=int),
@@ -1454,15 +1240,9 @@ def load_policy() -> dict[str, Any]:
             data.get("hostVerbMaxAttempts"), key="hostVerbMaxAttempts",
             default=DEFAULT_HOST_VERB_MAX_ATTEMPTS, cast=int),
         "hostVerbMinConfidence": _valid_host_verb_min_confidence(data.get("hostVerbMinConfidence")),
-        "needsHumanReminderHours": _valid_host_verb_positive_number(
-            data.get("needsHumanReminderHours"), key="needsHumanReminderHours",
-            default=DEFAULT_NEEDS_HUMAN_REMINDER_HOURS, cast=float),
-        # `ignore` entries are usually a bare pattern string (hand-authored).
-        # propose_mappings() instead appends a stamped object
-        # ({"match", "proposedAt", "proposedBy", "reason"}) so an auto-added
-        # entry carries its own provenance in the file itself — only the
-        # `match` string is ever used for fnmatch, so both shapes classify()
-        # identically.
+        # `ignore` entries are a bare pattern string or an object with a
+        # `match` string (the shape the auto-proposed entries already in the
+        # file carry) — only `match` is ever used for fnmatch.
         "ignore": [
             p if isinstance(p, str) else p["match"]
             for p in (data.get("ignore") or [])
@@ -1479,9 +1259,6 @@ def load_policy() -> dict[str, Any]:
         # validated at the point each key is actually used, matching `verb`/
         # `evidence`'s own load_policy()-time-vs-use-time split above.
         "repos": data.get("repos") if isinstance(data.get("repos"), dict) else {},
-        # propose_mappings()'s own age gate — see DEFAULT_PROPOSE_MAPPINGS_AGE_DAYS's
-        # own comment for why a signature younger than this is left alone.
-        "proposeMappingsAgeDays": float(data.get("proposeMappingsAgeDays") or DEFAULT_PROPOSE_MAPPINGS_AGE_DAYS),
     }
 
 
@@ -1511,10 +1288,8 @@ def _fnmatch_any(targets: list[str], patterns: list[str]) -> bool:
 
 
 def _match_rule(targets: list[str], rules: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """First rule (already validated by _valid_rule — `repo` XOR a
-    VERB_ALLOWLIST-known `verb`) whose `match` fnmatches any target. The
-    caller reads whichever of `repo`/`verb` is present to decide the
-    outcome — see classify()."""
+    """First rule (already validated by _valid_rule) whose `match` fnmatches
+    any target."""
     for rule in rules:
         for t in targets:
             if fnmatch.fnmatch(t, rule["match"]):
@@ -2113,7 +1888,7 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime,
             continue
         # note=NULL is safe BECAUSE the row is `new`: a `new` row carries no
         # obligation and therefore no prior-phase text worth keeping (a
-        # needs_human blocker, an env-check remediation, ...) — those states
+        # needs_human blocker, a host-verb receipt, ...) — those states
         # are not reachable from here at all any more. What clearing it does
         # do is stop a stale QUIET_RESOLVE_NOTE_PREFIX/
         # RECOVERY_PAIRED_NOTE_PREFIX note from a much earlier quiet-resolve
@@ -2393,7 +2168,7 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
 
 
 def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> set[str]:
-    """Resolve `repo`/`verb` (fnmatch against BOTH match targets — see
+    """Resolve `repo` (fnmatch against BOTH match targets — see
     _match_targets()) and apply, in order: the explicit `ignore` list (same
     targets — a deliberate human call that THIS signature is a genuine
     recovery or known-benign pattern, checked first so it always wins), then
@@ -2410,14 +2185,13 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
     on every occurrence, however real the alert. Run first, it routed that
     whole family to the terminal `note` state before rule matching was ever
     consulted, so the ~15 rules `config/triage-policy.json` had accumulated
-    for exactly those signatures (appended by _propose_mapping_candidates()
-    on seven consecutive days) were dead on arrival: a rule added after a row
+    for exactly those signatures were dead on arrival: a rule added after a row
     is `note` can never reach it, and a `note` row itself never escalates.
     The documented purpose of the filter — an un-prefixed, rule-LESS Slack
     diagnosis stays visible-but-quiet instead of being dropped — is
     unchanged: that is exactly the `not rule_matched` case below."""
     rows = conn.execute(
-        "SELECT event_id, signature, repo, verb, origin FROM triage_items WHERE state=?",
+        "SELECT event_id, signature, repo, origin FROM triage_items WHERE state=?",
         (STATE_NEW,),
     ).fetchall()
     unmapped: set[str] = set()
@@ -2447,25 +2221,16 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
         # not the policy's — and a rule that still says what the row already
         # carries is not a rewrite (no churn in `updated_at`).
         rule: dict[str, Any] | None = None
-        if row["repo"] is None and row["verb"] is None:
+        if row["repo"] is None:
             rule = _match_rule(targets, policy["rules"])
         elif row["origin"] == "alert":
             candidate = _match_rule(targets, policy["rules"])
-            if candidate is not None and not (
-                (candidate.get("repo") is not None and candidate["repo"] == row["repo"])
-                or (candidate.get("verb") is not None and candidate["verb"] == row["verb"])
-            ):
+            if candidate is not None and candidate["repo"] != row["repo"]:
                 rule = candidate
-        if rule is not None and rule.get("repo"):
+        if rule is not None:
             conn.execute(
-                "UPDATE triage_items SET repo=?, verb=NULL, updated_at=? WHERE event_id=?",
+                "UPDATE triage_items SET repo=?, updated_at=? WHERE event_id=?",
                 (rule["repo"], now_iso, row["event_id"]),
-            )
-            continue
-        if rule is not None and rule.get("verb"):
-            conn.execute(
-                "UPDATE triage_items SET verb=?, repo=NULL, updated_at=? WHERE event_id=?",
-                (rule["verb"], now_iso, row["event_id"]),
             )
             continue
 
@@ -2474,7 +2239,7 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
         # recurred with its repo intact. A mapped signal is never the prose
         # filter's to route: falling through froze item 121 in `note` again
         # six hours after the ordering fix above landed (§77).
-        if row["repo"] is not None or row["verb"] is not None:
+        if row["repo"] is not None:
             continue
 
         # No rule matched this row.
@@ -2486,9 +2251,7 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
             # Not reported as unmapped: this row has its own digest section
             # (see maybe_post_daily_digest()'s STATE_NOTE half), and listing
             # the same signature under both headings is the noise this
-            # ordering exists to remove. Nothing is lost for the mapping pass
-            # either — _propose_mapping_candidates() reads the ledger, not
-            # this return value, and deliberately includes `note` rows.
+            # ordering exists to remove.
             unmapped.discard(row["signature"])
             continue
     conn.commit()
@@ -3770,10 +3533,10 @@ def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, ev
     conn.commit()
 
 
-# --- verb outcomes — a deterministic local probe, never an episode -----------
+# --- verbs — deterministic local commands, never an episode ----------------------
 
 def _run_verb(argv: list[str], *, timeout: int) -> dict[str, Any] | None:
-    """Run one VERB_ALLOWLIST-resolved argv, parse its --json stdout. Never
+    """Run one hermes-ops.sh argv, parse its --json stdout. Never
     raises — a spawn failure, timeout, non-zero exit, or unparseable stdout
     all fold into a small dict with an `_error` key so the caller can render
     something on the card either way, rather than the row silently getting
@@ -3787,9 +3550,8 @@ def _run_verb(argv: list[str], *, timeout: int) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return {"_error": f"non-JSON output (rc={r.returncode}): {r.stdout.strip()[:300] or '(empty)'}"}
     if r.returncode not in (0, 3):
-        # hermes-ops.sh's own convention: env-check exits 3 for "ok: false",
-        # which is a normal, expected outcome here (that IS the dangling ref
-        # this verb exists to surface) — only something else is a real error.
+        # hermes-ops.sh's own convention: exit 3 is "ok: false", a normal,
+        # expected outcome — only something else is a real error.
         return {"_error": f"unexpected exit {r.returncode}: {json.dumps(obj)[:300]}"}
     return obj if isinstance(obj, dict) else {"_error": f"non-object JSON: {r.stdout[:300]}"}
 
@@ -3797,7 +3559,7 @@ def _run_verb(argv: list[str], *, timeout: int) -> dict[str, Any] | None:
 def _run_host_verb(argv: list[str], *, timeout: int) -> dict[str, Any]:
     """Run one HOST_VERB_ALLOWLIST-resolved argv and report its raw outcome —
     deliberately NOT `_run_verb()` above: that helper's whole contract is
-    parsing a `--json` stdout (env-check's own shape), and a host verb
+    parsing a `--json` stdout, and a host verb
     (`launchctl kickstart`, an ssh `docker restart`) prints little or nothing
     on a SUCCESSFUL run, which would read as `_run_verb()`'s own "non-JSON
     output" error on every single success. Never raises — a spawn failure or
@@ -3811,120 +3573,6 @@ def _run_host_verb(argv: list[str], *, timeout: int) -> dict[str, Any]:
         return {"exitCode": -1, "output": str(e)}
     output = ((r.stdout or "") + (r.stderr or "")).strip()
     return {"exitCode": r.returncode, "output": output[:2000]}
-
-
-# `op` reports the shared service-account budget being exhausted as a plain
-# stderr line, not a distinct exit code — the ONE failure shape where the
-# remediation is "wait for the budget window", not "restore an item". Matched
-# so the card can say that instead of handing the reader the raw text alone.
-_RATE_LIMIT_RE = re.compile(r"too many requests|rate-limited|rate limit", re.IGNORECASE)
-_RATE_LIMIT_HINT = (
-    "This is the shared 1Password service-account budget (1000 requests/24h, "
-    "account-wide across every host), not a missing item — there is nothing to "
-    "restore. It clears as the oldest requests age out of the rolling window "
-    "(~04:24 UTC); if errors persist past that, restart the op daemon, which "
-    "caches the 4026. The durable fix is fewer op invocations per day (the "
-    "homelab OP_SOCK cache-daemon pin), not a 1Password change."
-)
-
-
-def _render_env_check_note(output: dict[str, Any] | None) -> str:
-    """Deterministic prose for the needs_human card — no LLM, straight from
-    hermes-ops.sh's own --json shape: {"ok", "homelab": {"ok", "exitCode",
-    "danglingItems": [...], "error"}, "vps": {...}}. The dangling item name and
-    the exact remediation are inlined so the card is the whole answer — no
-    further investigation should be needed.
-
-    `danglingItems` is only ONE of the two failure shapes. `cmd_env_check`'s
-    parse() also carries the raw `op run` output in each host's `error`, and
-    `_run_verb()` passes exit 3 through untouched — so an `ok: false` with an
-    EMPTY `danglingItems` (a rate-limited probe, a network failure, an expired
-    service-account token) reaches this function intact. Reading only the
-    dangling list rendered every such failure as "likely transient", which is
-    the one wording that is wrong: nothing is clearing on its own and the line
-    naming the cause was discarded (jkrumm/hermes-agent#2, 2026-09-15). The
-    transient wording is correct only for a genuine clean pass (both hosts
-    ok)."""
-    if output is None or "_error" in output:
-        err = (output or {}).get("_error", "no output")
-        return f"env-check probe failed to run: {err}. Retry manually: `hermes-ops.sh env-check`."
-    dangling: list[str] = []
-    failures: list[str] = []
-    for host_key in ("homelab", "vps"):
-        host = output.get(host_key)
-        if not isinstance(host, dict):
-            continue
-        for item in host.get("danglingItems") or []:
-            dangling.append(f"{host_key}: `{item}`")
-        # `ok: false` with an EMPTY `danglingItems` is a real failure the
-        # renderer used to swallow: cmd_env_check's parse() already puts the
-        # raw `op run` output in `error`, and `_run_verb()` passes exit 3
-        # through untouched, so the only thing that ever lost the cause was
-        # this function never reading either field (2026-09-15: a rate-limited
-        # probe rendered as "likely transient", jkrumm/hermes-agent#2).
-        if not host.get("ok", True):
-            detail = str(host.get("error") or "").strip() or "(no error text)"
-            failures.append(f"{host_key} (rc={host.get('exitCode')}): {detail}")
-    if not dangling:
-        if not failures and output.get("ok", True):
-            return ("env-check ran and found no dangling item on this pass — likely transient; the "
-                    "underlying event will disappearance-resolve on its own if it clears.")
-        if not failures:
-            failures.append("env-check reported ok:false with no per-host detail")
-        hint = ""
-        if any(_RATE_LIMIT_RE.search(f) for f in failures):
-            hint = ("\n" + _RATE_LIMIT_HINT)
-        return ("env-check ran but FAILED — no dangling 1Password item on either host, so the cause "
-                "is NOT a missing item and this is not the transient case:\n"
-                + "\n".join(f"- {f}" for f in failures) + hint
-                + "\nRetry manually: `hermes-ops.sh env-check`.")
-    items_text = "; ".join(dangling)
-    return (
-        f"Dangling 1Password item(s) — {items_text}. `op run` fails WHOLESALE on the shared "
-        f".env.tpl until this is fixed, taking every cron sharing that template down at once. "
-        f"Fix: restore/rename the item in 1Password, then run `make secrets-seed` (biometric "
-        f"1Password prompt — MacBook only, this cannot be done headlessly on the mini)."
-    )
-
-
-def run_verbs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
-    """Every `new` item routed to a `verb` (never a `repo` — see classify())
-    runs its allowlisted local command once eligibility is met, same
-    minOccurrences/minOpenMinutes gate as an episode escalation. No
-    concurrency cap: a verb is a bounded local probe, not a sideclaw
-    episode, and doesn't compete with MAX_OPEN_INVESTIGATIONS. No cooldown
-    tracking either — a verb-routed item runs at most ONCE, because its
-    terminal state (`needs_human`) falls out of STATE_NEW candidates
-    permanently; if the underlying condition later clears, the normal
-    resolve path (events.resolved_at) closes it out without needing a
-    re-run, and if it recurs after a reopen, running the probe again is
-    exactly correct."""
-    candidates = conn.execute(
-        "SELECT * FROM triage_items WHERE state=? AND verb IS NOT NULL AND repo IS NULL ORDER BY event_id",
-        (STATE_NEW,),
-    ).fetchall()
-    for item in candidates:
-        if item["snoozed_until"]:
-            continue
-        if not _is_escalation_eligible(item, policy, now):
-            continue
-        verb = item["verb"]
-        argv = VERB_ALLOWLIST.get(verb)
-        if argv is None:
-            print(f"triage: verb {verb!r} for {item['signature']} is not in VERB_ALLOWLIST — "
-                  f"skipping (policy/code drifted after load_policy() validated it)", file=sys.stderr)
-            continue
-        if dry_run:
-            print(f"[dry-run] would run verb {verb!r} for {item['signature']}")
-            continue
-        output = _run_verb(argv, timeout=VERB_TIMEOUT)
-        note = _render_env_check_note(output) if verb == "env-check" else json.dumps(output)[:SECTION_TEXT_MAX]
-        _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
-        conn.commit()
-        fresh_item = _get_item(conn, item["event_id"])
-        event_row = _get_event(conn, item["event_id"])
-        if fresh_item is not None and event_row is not None:
-            sync_card(conn, [fresh_item], [event_row], policy, dry_run=False)
 
 
 # --- dissolve — a cluster the episode itself says is unrelated ----------------
@@ -4049,8 +3697,7 @@ _ACTION_REQUIRED: dict[str, _ActionRequired] = {
 }
 
 
-def _action_required_block(state: str, note: str | None, state_deadline: str | None,
-                           recurrences: int = 0) -> dict[str, Any]:
+def _action_required_block(state: str, note: str | None, state_deadline: str | None) -> dict[str, Any]:
     """The `needs_human` / `merge_blocked` card body: a `section` block (not
     `context`) so it reads as an instruction, not a footnote. The countdown is
     deliberately day-granularity only (see sync_card()'s card_hash
@@ -4061,8 +3708,6 @@ def _action_required_block(state: str, note: str | None, state_deadline: str | N
     never push the countdown off the card."""
     copy = _ACTION_REQUIRED[state]
     lines = [copy.heading]
-    if recurrences:
-        lines.append(f"Recurred {recurrences}× since it parked here — the underlying fault is still live.")
     tail: list[str] = []
     deadline = _parse_ts(state_deadline)
     if deadline is not None:
@@ -4097,8 +3742,6 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
     ctx_text = "\n".join(member_lines)
     if primary["repo"]:
         ctx_text += f"\nrepo `{primary['repo']}`"
-    elif primary["verb"]:
-        ctx_text += f"\nverb `{primary['verb']}`"
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ctx_text[:SECTION_TEXT_MAX]}})
 
     if state == STATE_INVESTIGATING and primary["dispatch_job"]:
@@ -4129,14 +3772,11 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
         if artifact_url:
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Artifact:* <{artifact_url}>"}})
         if state == STATE_NEEDS_HUMAN:
-            blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"],
-                                                 primary["parked_recurrences"] or 0))
+            blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
     elif state == STATE_NEEDS_HUMAN:
-        # A verb outcome (run_verbs()) — no dispatch_job at all, since no
-        # sideclaw episode was ever opened. The note IS the whole verdict: a
-        # deterministic local probe's output, not an episode's.
-        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"],
-                                                 primary["parked_recurrences"] or 0))
+        # No dispatch_job at all (a host-verb receipt, a reconcile failure):
+        # the note IS the whole verdict.
+        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
     elif state == STATE_SNOOZED:
         blocks.append({
             "type": "context",
@@ -4187,8 +3827,7 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
             text += f"\nPull request: <{primary['pr_url']}>"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}})
     elif state == STATE_MERGE_BLOCKED:
-        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"],
-                                                 primary["parked_recurrences"] or 0))
+        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
     elif state == STATE_MERGED:
         text = f"Merged: <{primary['pr_url']}>" if primary["pr_url"] else "Merged"
         if primary["note"]:
@@ -4279,9 +3918,8 @@ def sync_card(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: 
             # `token` now (e.g. a pre-cutover Hermes-posted card, Warden's
             # token now seeded). Post a fresh card instead of leaving this
             # cluster stuck re-failing the same update every pass. Anything
-            # threaded under the old card (remind_needs_human()'s
-            # reminders) is orphaned — Slack has no "move a thread" call —
-            # so those replies are simply lost.
+            # threaded under the old card is orphaned — Slack has no "move a
+            # thread" call — so those replies are simply lost.
             print(f"triage: cant_update_message for cluster {[m['signature'] for m in members]} "
                   f"(old card_ts {primary['card_ts']}) — reposting as a new card", file=sys.stderr)
             ok, result = post_blocks(channel, blocks, fallback, token)
@@ -4747,8 +4385,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                     sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else merge_commit
                     outcome = "done"
                     # The live path stamps `dispatches.merged_at` right after
-                    # the PUT; a crash between the two (WARDEN_KILL_AT=
-                    # after-merge-put, observed live in the Wave 5 canary) left
+                    # the PUT; a crash between the two left
                     # it NULL — and `merged_at` is what the daily merge budget
                     # and the "already merged" guard read. Stamp it here so a
                     # reconciled merge counts like a live one.
@@ -5110,7 +4747,6 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if not claimed:
             continue
 
-        _chaos.crash_point("before-host-verb")
         primary = claimed[0]
         op_id = record_operation(conn, event_id=primary["event_id"], kind="host", repo=primary["repo"] or "",
                                   authorized_by="auto-remediate", note=f"verb={verb_key}")
@@ -5223,7 +4859,6 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if not claimed:
             continue
 
-        _chaos.crash_point("before-implement-open")
         try:
             opened = _dispatch.open_episode(
                 conn, repo=item["repo"], tier="implement", brief=brief,
@@ -5378,7 +5013,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
     for item in orphans:
         # Claimed, never dispatched, and no operation covering it: the loop died
         # between the compare-and-set claim and open_episode()'s operation
-        # record (WARDEN_KILL_AT=before-implement-open is exactly this). An open
+        # record. An open
         # operation for the event means the crash was AFTER the record, and
         # that is reconcile_operations()'s case, not this one.
         open_ops = conn.execute(
@@ -5514,8 +5149,7 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
                               now: dt.datetime) -> None:
     """A `validating` item whose implement dispatch already carries
     `merged_at`: the loop died after `plan_or_land()` merged and stamped the
-    row but before the item's own state write (WARDEN_KILL_AT=
-    after-merge-before-state). Calling merge again would refuse with "already
+    row but before the item's own state write. Calling merge again would refuse with "already
     merged" and land the item `merge_blocked` for a pull request that is
     merged and deploying — the exact misreport docs/history/state-log.md §46 measured. So the
     post-merge state is derived from the merge operation's receipt instead,
@@ -5791,7 +5425,6 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
         if impl_resp is not None:
             _dispatch.sync_record(conn, impl_resp, reported=False, now=now)
             conn.commit()
-    _chaos.crash_point("before-merge")
     try:
         result = _merge.plan_or_land(
             conn, job_id=item["implement_job"], why=why,
@@ -5825,7 +5458,6 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
         # lifecycle/merge.py, by the time control returns here.
         deploy = result.deploy or {}
         repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
-        _chaos.crash_point("after-merge-before-state")
         kuma_title = (_kuma_monitor_title(_get_event(conn, item["event_id"]))
                       if repo_entry.get("liveness") == "kuma-push-fresh" else None)
         if deploy.get("attempted") and deploy.get("ok") and repo_entry.get("liveness") == "kuma-push-fresh" \
@@ -5877,174 +5509,6 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
 MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
 
 
-STRANDED_PRS_CURSOR_KEY = "stranded_prs"
-STRANDED_PRS_INTERVAL_S = 3600
-STRANDED_PRS_LOOKBACK_DAYS = 60
-_PR_PARKED_OR_TERMINAL = (*PARKED_STATES, *TERMINAL_STATES)
-
-
-def reconcile_stranded_prs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
-                           *, dry_run: bool) -> None:
-    """Every pull request warden opened that is neither merged nor moving:
-    the draft that outlived its item (the 7-day `needs_human` deadline
-    dismissed rollhook#26's item while the confirmed PR stayed open) and the PR
-    someone merged by hand while its item still sat parked (homelab#9, item
-    1170). At most once an hour, one GitHub read per unmerged implement PR of
-    the last 60 days whose item is parked or terminal:
-
-    - merged on GitHub → stamp `dispatches.merged_at`; a parked item moves to
-      `merged` ("merged outside the loop") instead of waiting on a merge that
-      already happened.
-    - still open while its item is terminal → recorded in the
-      `stranded_prs` cursor, which `/board`'s `awaiting_owner` list (and so
-      Argo) shows with its age and the reason its item ended. Nothing is
-      closed automatically: an open PR a human closed the item around may be
-      exactly the fix he still wants (dotfiles#6)."""
-    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (STRANDED_PRS_CURSOR_KEY,)).fetchone()
-    last = _parse_ts(row["updated_at"]) if row else None
-    if last is not None and (now - last).total_seconds() < STRANDED_PRS_INTERVAL_S:
-        return
-    since = (now - dt.timedelta(days=STRANDED_PRS_LOOKBACK_DAYS)).isoformat()
-    placeholders = ",".join("?" * len(_PR_PARKED_OR_TERMINAL))
-    rows = conn.execute(
-        f"SELECT d.job_id, d.repo, d.artifact_url, d.created_at, d.validation_status, d.origin_event_id, "
-        f"ti.state, ti.note, e.title FROM dispatches d "
-        f"JOIN triage_items ti ON ti.implement_job = d.job_id JOIN events e ON e.id = ti.event_id "
-        f"WHERE d.tier='implement' AND d.merged_at IS NULL AND d.artifact_url LIKE '%/pull/%' "
-        f"AND d.created_at >= ? AND ti.state IN ({placeholders}) ORDER BY d.created_at",
-        (since, *_PR_PARKED_OR_TERMINAL),
-    ).fetchall()
-    stranded: list[dict[str, Any]] = []
-    for r in rows:
-        parsed = _github.parse_pr_url(r["artifact_url"])
-        if parsed is None:
-            continue
-        owner, repo_name, number = parsed
-        try:
-            pr = _github.read_pr(owner, repo_name, number)
-        except RemoteError as e:
-            print(f"triage: stranded-PR check could not read {r['artifact_url']}: {e}", file=sys.stderr)
-            continue
-        if pr.get("merged"):
-            if dry_run:
-                print(f"[dry-run] would record {r['artifact_url']} as merged outside the loop")
-                continue
-            conn.execute("UPDATE dispatches SET merged_at=? WHERE job_id=?",
-                         (pr.get("merged_at") or _now_iso(now), r["job_id"]))
-            if r["state"] in PARKED_STATES:
-                _set_state(conn, r["origin_event_id"], STATE_MERGED, now, expect_state=r["state"],
-                           note=f"merged outside the loop: {r['artifact_url']}")
-            conn.commit()
-            continue
-        if pr.get("state") != "open" or r["state"] in PARKED_STATES:
-            continue
-        stranded.append({
-            "event_id": r["origin_event_id"], "repo": r["repo"], "pr_url": r["artifact_url"],
-            "title": pr.get("title") or r["title"], "opened_at": pr.get("created_at") or r["created_at"],
-            "validation_status": r["validation_status"], "item_state": r["state"],
-            "reason": f"its item ended `{r['state']}` while the PR stayed open: {(r['note'] or '')[:240]}",
-        })
-    if dry_run:
-        print(f"[dry-run] would record {len(stranded)} stranded PR(s)")
-        return
-    conn.execute(
-        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (STRANDED_PRS_CURSOR_KEY, json.dumps(stranded), _now_iso(now)),
-    )
-    conn.commit()
-
-
-# --- executable invariants and the self-audit (§100) --------------------------
-#
-# The class of failure the owner names first: a state in which nobody knows
-# what happens next. Each invariant below is one such state, named, checked
-# every hour against the live ledger, published on /health, and — together
-# with the self-audit findings — turned into work: one `warden_self` event
-# per finding, mapped to repo `warden` by the policy, escalated like any alert
-# (investigate → implement → review → merge, like any other item). A finding that stops holding resolves its event.
-
-SELF_SOURCE = "warden_self"
-SELF_AUDIT_CURSOR_KEY = "self_audit"
-SELF_AUDIT_INTERVAL_S = 3600
-OWNER_QUEUE_STALE_DAYS = 3.0
-SELF_AUDIT_WINDOW_DAYS = 14
-# scripts/restore.py's drill result (§104) — the self-audit's only input from
-# outside the ledger. A failed drill, or none successful in this many days, is
-# a finding: a backup that has not been restored from is an assumption.
-RESTORE_DRILL_FILE = WARDEN_HOME / "restore-drill.json"
-RESTORE_DRILL_STALE_DAYS = 35
-
-INVARIANTS: dict[str, str] = {
-    "INV-1-clock": "every non-terminal state past `new` carries the clock its STATE_DEADLINES rule names",
-    "INV-2-reason": "every item waiting on the owner carries a reason (a non-empty note)",
-    "INV-3-episode": "every in-flight state names the episode it is waiting on",
-    "INV-4-verdict-effect": "a finished investigation never leaves its item in `investigating` past an hour",
-    "INV-5-card": "every carded item's card was rendered (card_ts implies card_hash)",
-    "INV-6-dead-draft": f"no PR outlives its item for more than {OWNER_QUEUE_STALE_DAYS:g} days",
-    "INV-7-owner-queue": f"nothing waits on the owner for more than {OWNER_QUEUE_STALE_DAYS:g} days",
-}
-
-# Invariants that report but never become a `warden_self` item: what they
-# flag is already exactly one entry in the owner's list (a stranded PR, a
-# parked item), and a second item about the first would break "one entry
-# per thing that needs him". /health and Argo's stale highlight carry them.
-REPORT_ONLY_INVARIANTS = frozenset({"INV-6-dead-draft", "INV-7-owner-queue"})
-
-
-def check_invariants(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str, Any]]:
-    """Every violation of INVARIANTS in the live ledger, as
-    `{"id", "event_id", "detail"}`. Pure read. `warden_self` rows are left
-    out so a finding about the audit can never feed the audit."""
-    out: list[dict[str, Any]] = []
-    rows = conn.execute(
-        "SELECT ti.* FROM triage_items ti JOIN events e ON e.id = ti.event_id WHERE e.source != ?",
-        (SELF_SOURCE,),
-    ).fetchall()
-    stale_before = now - dt.timedelta(days=OWNER_QUEUE_STALE_DAYS)
-    for it in rows:
-        state, eid = it["state"], it["event_id"]
-        if state in TERMINAL_STATES:
-            continue
-        rule = STATE_DEADLINES.get(state)
-        if state != STATE_NEW and (rule is None or (rule.deadline_column and not it[rule.deadline_column])):
-            out.append({"id": "INV-1-clock", "event_id": eid,
-                        "detail": f"`{state}` with no {rule.deadline_column if rule else 'deadline rule'}"})
-        if state in PARKED_STATES and not (it["note"] or "").strip():
-            out.append({"id": "INV-2-reason", "event_id": eid, "detail": f"`{state}` with no note"})
-        job_col = {STATE_INVESTIGATING: "dispatch_job", STATE_IMPLEMENTING: "implement_job",
-                   STATE_VALIDATING: "validation_job"}.get(state)
-        # 10 min of grace: implementing is claimed a moment before its job id
-        # is written (maybe_auto_implement's claim-before-dispatch).
-        settled = (_parse_ts(it["updated_at"]) or now) < now - dt.timedelta(minutes=10)
-        if job_col and not it[job_col] and settled:
-            out.append({"id": "INV-3-episode", "event_id": eid, "detail": f"`{state}` with no {job_col}"})
-        if state == STATE_INVESTIGATING and it["dispatch_job"]:
-            d = conn.execute("SELECT status, finished_at FROM dispatches WHERE job_id=?",
-                             (it["dispatch_job"],)).fetchone()
-            fin = _parse_ts(d["finished_at"]) if d else None
-            if d and d["status"] in ("done", "failed", "cancelled", "interrupted") and fin \
-                    and (now - fin).total_seconds() > 3600:
-                out.append({"id": "INV-4-verdict-effect", "event_id": eid,
-                            "detail": f"episode {it['dispatch_job'][:8]} finished {d['status']} {_fmt_ts(d['finished_at'])}"})
-        if state in CARDED_STATES and it["card_ts"] and not it["card_hash"]:
-            out.append({"id": "INV-5-card", "event_id": eid, "detail": f"card {it['card_ts']} never rendered"})
-        if state in PARKED_STATES:
-            entered = conn.execute("SELECT MAX(at) AS at FROM item_transitions WHERE event_id=? AND to_state=?",
-                                   (eid, state)).fetchone()
-            since = _parse_ts(entered["at"]) if entered else None
-            if since is not None and since < stale_before:
-                out.append({"id": "INV-7-owner-queue", "event_id": eid,
-                            "detail": f"`{state}` since {_fmt_ts(entered['at'])}: {(it['note'] or '')[:160]}"})
-    cursor = conn.execute("SELECT value FROM cursors WHERE key=?", (STRANDED_PRS_CURSOR_KEY,)).fetchone()
-    for pr in _safe_json_list(cursor["value"] if cursor else None):
-        opened = _parse_ts(pr.get("opened_at"))
-        if opened is not None and opened < stale_before:
-            out.append({"id": "INV-6-dead-draft", "event_id": pr.get("event_id"),
-                        "detail": f"{pr.get('pr_url')} open since {_fmt_ts(pr.get('opened_at'))}"})
-    return out
-
-
 def _safe_json_list(raw: str | None) -> list[dict[str, Any]]:
     try:
         val = json.loads(raw) if raw else []
@@ -6052,219 +5516,6 @@ def _safe_json_list(raw: str | None) -> list[dict[str, Any]]:
         return []
     return [v for v in val if isinstance(v, dict)] if isinstance(val, list) else []
 
-
-def _restore_drill_findings(now: dt.datetime) -> list[dict[str, Any]]:
-    """The restore drill's last result as a finding, or none. Missing counts:
-    a ledger that has never been restored from is exactly the blind spot."""
-    try:
-        rec = json.loads(RESTORE_DRILL_FILE.read_text())
-    except (OSError, ValueError):
-        return [{"key": "restore-drill-missing",
-                 "title": "the ledger backup has never been restore-drilled",
-                 "detail": f"no result at {RESTORE_DRILL_FILE} — run `make restore-drill`"}]
-    if not rec.get("ok"):
-        return [{"key": "restore-drill-failed",
-                 "title": f"the ledger restore drill FAILED on {rec.get('snapshot') or rec.get('source')}",
-                 "detail": f"{rec.get('error')} (at {rec.get('at')}); snapshot {rec.get('snapshot')} — "
-                           f"the backup may not restore; re-run `make restore-drill` after fixing"}]
-    at = _parse_ts(rec.get("at"))
-    if at is None or now - at > dt.timedelta(days=RESTORE_DRILL_STALE_DAYS):
-        return [{"key": "restore-drill-stale",
-                 "title": f"no successful restore drill for {RESTORE_DRILL_STALE_DAYS}+ days",
-                 "detail": f"last success {rec.get('at')} on {rec.get('snapshot')} — is "
-                           f"com.jkrumm.warden-restore-drill loaded?"}]
-    return []
-
-
-_FINDING_LOCATION_RE = re.compile(r"([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+):(\d+)")
-
-
-def _blocked_round_files(conn: sqlite3.Connection, event_id: int) -> list[set[str]]:
-    """The files each `step-7 validation (blocked):` round blocked on, oldest first.
-
-    `item_transitions` is append-only, so it is the real record of what each round
-    said — the item's own `note` only ever holds the latest one. Compared by *file*,
-    not `file:line`: two rounds that block on lines 62 and 63 of one script are
-    re-reading the same spot, not chasing a moving target."""
-    rounds: list[set[str]] = []
-    for r in conn.execute(
-        "SELECT note FROM item_transitions WHERE event_id=? AND to_state=? ORDER BY id",
-        (event_id, STATE_MERGE_BLOCKED),
-    ):
-        note = (r["note"] or "").strip()
-        if not note.startswith("step-7 validation (blocked):"):
-            continue
-        rounds.append({m.group(1) for m in _FINDING_LOCATION_RE.finditer(note)})
-    return rounds
-
-
-def _rounds_blocked_different_files(rounds: list[set[str]]) -> bool:
-    """True when every blocked round named a file no earlier round had (§114).
-
-    This is a *description* of the item's own history, not a verdict on the review:
-    weatherorb#20's rounds went test coverage → guard ordering → a wrapper finding,
-    each fixed before the next round — while a two-round item that blocked on a test
-    gap and then on the regression its own fix introduced looks the same from here.
-    Rounds whose files were truncated away (the park note is capped at 600 chars)
-    are ignored, and fewer than two comparable rounds is never a claim, because a
-    wrong diagnosis is worse than a vague one (§111)."""
-    comparable = [r for r in rounds if r]
-    if len(comparable) < 2:
-        return False
-    seen: set[str] = set()
-    for r in comparable:
-        if r & seen:
-            return False
-        seen |= r
-    return True
-
-
-def _revision_exhaustion_detail(state: str, note: str | None, repo: str, *,
-                                conn: sqlite3.Connection | None = None,
-                                event_id: int | None = None) -> str:
-    """Why an item with its revisions spent is parked — from its own park note,
-    never assumed (§111).
-
-    This finding keys on `revision_count` plus a parked state alone, and it used
-    to hardcode "the implementer cannot satisfy the review". For the two items it
-    fired on that sentence was false: 1276/1277 had each cleared step-7 review
-    (`actionable` with an empty `blocking` list is `confirmed`) and parked on a
-    merge-time 403 reading branch rules, and the card sent its reader after a
-    review failure that did not exist. A finding that names the wrong mechanism
-    is worse than a vague one — it is read as evidence.
-
-    §114 adds the other direction: when no file was blocked on twice, the note says
-    what actually happened — each round blocked somewhere new — instead of asserting
-    an implementer failure. The decision to park or not stays where it was; this is
-    the card's own text, which is the only thing a reader has."""
-    text = (note or "").strip()
-    if text.startswith("step-7 validation (blocked):"):
-        rounds = _blocked_round_files(conn, event_id) if (conn is not None and event_id is not None) else []
-        if _rounds_blocked_different_files(rounds):
-            files = ", ".join(sorted(set().union(*rounds)))
-            return (f"{len(rounds)} step-7 rounds in {repo}, each blocking a different file "
-                    f"({files}) — every round found something new, so read the last head before "
-                    f"blaming the implementer")
-        return f"the implementer cannot satisfy the review in {repo}; the brief or the gate is wrong"
-    if text.startswith(MERGE_REFUSED_NOTE_PREFIX):
-        return (f"{repo}'s merge gate refused the confirmed PR — "
-                f"{text[len(MERGE_REFUSED_NOTE_PREFIX):].strip()}; "
-                f"revisions cannot change that, the gate is the blocker")
-    if text.startswith("step-7 validation (needs-human):"):
-        return (f"the step-7 review ran but produced no usable verdict in {repo} "
-                f"({text}); the review pipeline, not the implementer, is the blocker")
-    return (f"{repo} parked in '{state}' with its revisions spent and no review block "
-            f"recorded{' — ' + text if text else ''}; read the park note before blaming the review")
-
-
-def self_audit_findings(conn: sqlite3.Connection, now: dt.datetime,
-                        policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Gaps the loop can see in its own behaviour, each keyed so one finding
-    is one event: a review gate that blocks every PR in a repo, a liveness
-    probe that never confirms, a `fixed` that reopened (the verdict or the
-    fix was wrong), and a revision budget used up."""
-    since = (now - dt.timedelta(days=SELF_AUDIT_WINDOW_DAYS)).isoformat()
-    out: list[dict[str, Any]] = []
-    for r in conn.execute(
-        "SELECT repo, COUNT(*) AS n, SUM(validation_status='blocked') AS blocked FROM dispatches "
-        "WHERE tier='implement' AND validation_status IS NOT NULL AND created_at >= ? GROUP BY repo", (since,),
-    ):
-        if r["n"] >= 3 and r["blocked"] == r["n"]:
-            out.append({"key": f"review-always-blocks-{r['repo']}",
-                        "title": f"the step-7 review blocked all {r['n']} {r['repo']} PRs in {SELF_AUDIT_WINDOW_DAYS} days",
-                        "detail": "either the implement briefs for this repo miss something the review keeps "
-                                  "finding, or the review gate is miscalibrated for it"})
-    for r in conn.execute(
-        "SELECT ti.repo, SUM(t.to_state='new') AS reopened, SUM(t.to_state='fixed') AS fixed "
-        "FROM item_transitions t JOIN triage_items ti ON ti.event_id = t.event_id "
-        "JOIN events e ON e.id = t.event_id "
-        "WHERE t.from_state='liveness_pending' AND t.at >= ? AND e.source != ? GROUP BY ti.repo",
-        (since, SELF_SOURCE),
-    ):
-        if (r["reopened"] or 0) >= 2 and not r["fixed"]:
-            out.append({"key": f"liveness-never-confirms-{r['repo']}",
-                        "title": f"{r['repo']}'s liveness probe timed out {r['reopened']}× and never confirmed a fix",
-                        "detail": "the probe may be checking the wrong thing, or the deploy never lands"})
-    for r in conn.execute(
-        "SELECT DISTINCT t.event_id, ti.signature, ti.repo FROM item_transitions t "
-        "JOIN triage_items ti ON ti.event_id = t.event_id JOIN events e ON e.id = t.event_id "
-        "WHERE t.from_state='fixed' AND t.to_state='new' AND t.at >= ? AND e.source != ?", (since, SELF_SOURCE),
-    ):
-        out.append({"key": f"fixed-reopened-{r['event_id']}",
-                    "title": f"{r['signature']} came back after warden marked it fixed",
-                    "detail": f"the verdict or the fix in {r['repo']} was wrong — event {r['event_id']}"})
-    out.extend(_restore_drill_findings(now))
-    max_rev = int((policy or {}).get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
-    for r in conn.execute(
-        f"SELECT ti.event_id, ti.signature, ti.repo, ti.state, ti.note FROM triage_items ti "
-        f"JOIN events e ON e.id = ti.event_id "
-        f"WHERE ti.revision_count >= ? AND e.source != ? "
-        f"AND ti.state IN ({','.join('?' * len(PARKED_STATES))})", (max_rev, SELF_SOURCE, *PARKED_STATES),
-    ):
-        out.append({"key": f"revisions-exhausted-{r['event_id']}",
-                    "title": f"{r['signature']} still blocked after {max_rev} revisions",
-                    "detail": _revision_exhaustion_detail(r["state"], r["note"], r["repo"],
-                                                          conn=conn, event_id=r["event_id"])})
-    return out
-
-
-def run_self_audit(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
-                   *, dry_run: bool) -> None:
-    """Hourly: check INVARIANTS and self_audit_findings(), publish the result
-    in the `self_audit` cursor (read by /health), and keep one `warden_self`
-    event per finding in step with it — inserted or re-opened while the
-    finding holds, resolved the pass it stops holding (a state source, so the
-    ordinary silence path closes a still-`new` item and reopen_if_needed()
-    reopens a closed one on recurrence)."""
-    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (SELF_AUDIT_CURSOR_KEY,)).fetchone()
-    last = _parse_ts(row["updated_at"]) if row else None
-    if last is not None and (now - last).total_seconds() < SELF_AUDIT_INTERVAL_S:
-        return
-    violations = check_invariants(conn, now)
-    findings = self_audit_findings(conn, now, policy)
-    by_inv: dict[str, list[dict[str, Any]]] = {}
-    for v in violations:
-        by_inv.setdefault(v["id"], []).append(v)
-    for inv_id, vs in by_inv.items():
-        if inv_id in REPORT_ONLY_INVARIANTS:
-            continue
-        findings.append({
-            "key": inv_id.lower(),
-            "title": f"invariant {inv_id} violated by {len(vs)} item(s): {INVARIANTS[inv_id]}",
-            "detail": "; ".join(f"event {v['event_id']}: {v['detail']}" for v in vs[:8]),
-        })
-    if dry_run:
-        print(f"[dry-run] self-audit: {len(violations)} invariant violation(s), {len(findings)} finding(s): "
-              f"{[f['key'] for f in findings]}")
-        return
-    now_iso = _now_iso(now)
-    live_keys = {f["key"] for f in findings}
-    for f in findings:
-        payload = json.dumps({"first_text": f"{f['title']} — {f['detail']}"[:1500]})
-        ev = conn.execute("SELECT id, resolved_at FROM events WHERE source=? AND external_id=?",
-                          (SELF_SOURCE, f["key"])).fetchone()
-        if ev is None:
-            conn.execute("INSERT INTO events(source, external_id, title, url, payload_json, first_seen) "
-                         "VALUES (?,?,?,?,?,?)", (SELF_SOURCE, f["key"], f["title"][:300], "", payload, now_iso))
-        elif ev["resolved_at"] is not None:
-            conn.execute("UPDATE events SET resolved_at=NULL, first_seen=?, notified_at=NULL, "
-                         "last_reminder_at=NULL, reminder_count=0, title=?, payload_json=? WHERE id=?",
-                         (now_iso, f["title"][:300], payload, ev["id"]))
-        else:
-            conn.execute("UPDATE events SET title=?, payload_json=? WHERE id=?", (f["title"][:300], payload, ev["id"]))
-    for ev in conn.execute("SELECT id, external_id FROM events WHERE source=? AND resolved_at IS NULL",
-                           (SELF_SOURCE,)).fetchall():
-        if ev["external_id"] not in live_keys:
-            conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, ev["id"]))
-    summary = {"checked_at": now_iso, "invariants": sorted(INVARIANTS),
-               "violations": [{"id": k, "count": len(v)} for k, v in sorted(by_inv.items())],
-               "findings": sorted(live_keys)}
-    conn.execute(
-        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (SELF_AUDIT_CURSOR_KEY, json.dumps(summary), now_iso),
-    )
-    conn.commit()
 
 REVISION_NOTE_PREFIX = "revision "
 
@@ -6457,7 +5708,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     already tolerated before dispatch-sweep.py called it too.
 
     Why the sweep, not a shorter loop interval: everything else in `run()`
-    (GitHub ingest, `classify()`, `propose_mappings()`'s LLM call, the digest,
+    (GitHub ingest, `classify()`, the digest,
     the Argo snapshot) has no latency complaint against it and gains nothing
     from running every 300s instead of 600s — shortening the loop's own
     tick would pay that cost on every step for a benefit only this chain
@@ -6681,7 +5932,6 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # landed (merged + deployed) AND a live probe confirmed it, the
             # one place a POSITIVE PROBE — not silence, not an inbound
             # message — backs the claim.
-            _chaos.crash_point("before-fixed")
             _set_state(conn, item["event_id"], STATE_FIXED, now, note=note)
             conn.commit()
             fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
@@ -6766,7 +6016,7 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
     once. So THIS ONE CASE appends the expiry note to the existing one
     instead of replacing it. Deliberately NOT generalised to every state's
     prior note — the other five expiry paths' prior notes are HISTORICAL
-    (an old written fix, a stale env-check remediation), not a pending
+    (an old written fix, a stale receipt), not a pending
     obligation being handed to the deadline for the first time, and
     preserving them too is a different, unasked-for change."""
     now_iso = _now_iso(now)
@@ -6860,661 +6110,6 @@ def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool
     conn.commit()
 
 
-# --- remind_needs_human() — the needs_human/merge_blocked reminder ----------
-#
-# DESIGN.md:247's "7d, reminder at 1d" — the one row of the deadline table
-# this module's own STATE_DEADLINES comment and docs/api.md's carried-debt
-# note both flagged NOT built. Runs immediately after sweep_deadlines(), on
-# the same reasoning: a row that just expired THIS pass must never also get
-# a reminder in the same tick (sweep_deadlines() already moved it out of
-# `needs_human`/`merge_blocked` by the time this runs), and a row about to
-# expire should be reminded right up to the moment it is.
-
-_CANARY_SIGNATURE_PREFIX = "warden_canary:"
-
-
-def track_parked_recurrences(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
-                             *, dry_run: bool) -> None:
-    """A parked item (`needs_human`/`merge_blocked`) absorbs every recurrence
-    of its signal: reopen_if_needed() only touches terminal rows, so the alert
-    keeps paging #alerts while the card says nothing new (item 543: 16 Dev Host
-    pages in three days, all folded silently into a draft PR, §92).
-
-    Counts observed recurrences per parking — every pass whose event
-    _occurrence_mark() moved since the last one — onto the card and the board,
-    and posts one reminder under the card when the count reaches
-    `parkedRecurrenceReminder`, regardless of REMINDER_MAX_COUNT. Leaving the
-    parked states resets the count, so the next parking starts from zero.
-    Local bookkeeping runs under --dry-run; only the Slack post does not."""
-    conn.execute(
-        f"UPDATE triage_items SET parked_mark=NULL, parked_recurrences=0, recurrence_reminded_at=NULL "
-        f"WHERE state NOT IN ({','.join('?' * len(PARKED_STATES))}) "
-        f"AND (parked_mark IS NOT NULL OR parked_recurrences != 0 OR recurrence_reminded_at IS NOT NULL)",
-        PARKED_STATES,
-    )
-    rows = conn.execute(
-        f"SELECT ti.event_id, ti.parked_mark, ti.parked_recurrences, e.* FROM triage_items ti "
-        f"JOIN events e ON e.id = ti.event_id WHERE ti.state IN ({','.join('?' * len(PARKED_STATES))})",
-        PARKED_STATES,
-    ).fetchall()
-    for row in rows:
-        mark = _occurrence_mark(row)
-        if row["parked_mark"] is None:
-            conn.execute("UPDATE triage_items SET parked_mark=? WHERE event_id=?", (mark, row["event_id"]))
-        elif mark != row["parked_mark"]:
-            conn.execute("UPDATE triage_items SET parked_mark=?, parked_recurrences=parked_recurrences+1 "
-                         "WHERE event_id=?", (mark, row["event_id"]))
-    conn.commit()
-
-    threshold = int(policy.get("parkedRecurrenceReminder") or DEFAULT_PARKED_RECURRENCE_REMINDER)
-    due = conn.execute(
-        f"SELECT * FROM triage_items WHERE state IN ({','.join('?' * len(PARKED_STATES))}) "
-        f"AND parked_recurrences >= ? AND recurrence_reminded_at IS NULL",
-        (*PARKED_STATES, threshold),
-    ).fetchall()
-    token: str | None = None
-    for row in due:
-        if not row["card_ts"]:
-            continue
-        text = (f"This signal fired again {row['parked_recurrences']}× while this item waited in "
-                f"`{row['state']}` — the fault is still live. "
-                f"{_escape((row['note'] or '').strip())[:300]}")
-        if dry_run:
-            print(f"[dry-run] would post a recurrence reminder for {row['signature']}")
-            continue
-        if token is None:
-            token = resolve_slack_token() or ""
-        if not token:
-            print(f"triage: no Slack token, cannot post recurrence reminder for {row['signature']}",
-                  file=sys.stderr)
-            continue
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}}]
-        ok, result = post_blocks(row["card_channel"] or _card_channel(policy), blocks, text, token,
-                                  thread_ts=row["card_ts"])
-        if not ok:
-            print(f"triage: recurrence reminder failed for {row['signature']}: {result}", file=sys.stderr)
-            continue
-        conn.execute("UPDATE triage_items SET recurrence_reminded_at=? WHERE event_id=?",
-                     (_now_iso(now), row["event_id"]))
-        conn.commit()
-
-
-def remind_needs_human(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
-    """One thread reply under the item's own card for every `needs_human`/
-    `merge_blocked` row whose LAST REAL transition into that state is older
-    than `needsHumanReminderHours` (default 24h) and has not yet been
-    reminded, then a second, FINAL one at REMINDER_SECOND_MULTIPLIER times
-    that interval (default 72h) — never a third (REMINDER_MAX_COUNT).
-
-    "Last transition into that state", read from `item_transitions`
-    (append-only, one row per REAL state change — ledger.py migration 4),
-    not from `state_deadline` or `updated_at`: `state_deadline` is
-    RECOMPUTED to `now + 168h` by every _set_state() call that re-enters the
-    SAME state (a merge retry, a deferred verdict note) even when
-    `prior_state == state` — see that function's own docstring, the
-    item_transitions paragraph — so it answers "when does this expire NEXT",
-    not "when did this begin". `updated_at` is rewritten by ingest() on
-    every open row on every pass regardless of state. Only
-    `item_transitions` answers the actual question.
-
-    Never reminds a `warden_canary:`-prefixed signature (self-test items —
-    see _CANARY_SIGNATURE_PREFIX) and never an item with no `card_ts` —
-    nothing to thread a reply under — counting the latter on one aggregate
-    stderr line rather than dropping it silently. `reminder_count` is never
-    reset on a later re-entry into the same state: "never more than two" is
-    a lifetime cap on this mechanism per item, not per episode, the simplest
-    reading of the brief and the one that cannot loop a chronically
-    re-opening item into an unbounded reminder stream."""
-    reminder_hours = policy["needsHumanReminderHours"]
-    second_hours = reminder_hours * REMINDER_SECOND_MULTIPLIER
-    rows = conn.execute(
-        "SELECT * FROM triage_items WHERE state IN (?, ?) ORDER BY event_id",
-        (STATE_NEEDS_HUMAN, STATE_MERGE_BLOCKED),
-    ).fetchall()
-    no_thread = 0
-    token: str | None = None
-    for row in rows:
-        if row["signature"].startswith(_CANARY_SIGNATURE_PREFIX):
-            continue
-        reminder_count = row["reminder_count"] or 0
-        if reminder_count >= REMINDER_MAX_COUNT:
-            continue
-        threshold = reminder_hours if reminder_count == 0 else second_hours
-        entered = conn.execute(
-            "SELECT at FROM item_transitions WHERE event_id=? AND to_state=? ORDER BY id DESC LIMIT 1",
-            (row["event_id"], row["state"]),
-        ).fetchone()
-        entered_at = _parse_ts(entered["at"]) if entered is not None else None
-        if entered_at is None:
-            continue
-        hours_in_state = (now - entered_at).total_seconds() / 3600
-        if hours_in_state < threshold:
-            continue
-        if not row["card_ts"]:
-            no_thread += 1
-            continue
-        note_text = (row["note"] or "").strip()
-        do_body = _escape(note_text)[:300] if note_text else "no note recorded"
-        text = (f"Still waiting on you — {int(hours_in_state)}h in `{row['state']}`. "
-                f"Do this: {do_body}. Auto-dismissed {_fmt_ts(row['state_deadline'])} if untouched.")
-        if dry_run:
-            print(f"[dry-run] would remind {row['signature']}")
-            continue
-        if token is None:
-            token = resolve_slack_token() or ""
-        if not token:
-            print(f"triage: no Slack token, cannot post reminder for {row['signature']}", file=sys.stderr)
-            continue
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}}]
-        ok, result = post_blocks(row["card_channel"] or _card_channel(policy), blocks, text, token,
-                                  thread_ts=row["card_ts"])
-        if not ok:
-            # Same treatment as sync_card()'s cant_update_message case, one
-            # level down: a thread reply under a card this app cannot see
-            # (cant_update_message/message_not_found — the parent was
-            # reposted under a new ts, or predates this app entirely) is
-            # skipped, logged, and never counted as a reminder — there is no
-            # "post under the new card instead," the whole point of a
-            # reminder is being threaded under the specific card it answers.
-            print(f"triage: reminder post failed for {row['signature']}: {result}", file=sys.stderr)
-            continue
-        conn.execute(
-            "UPDATE triage_items SET reminder_count=reminder_count+1, last_reminder_at=?, updated_at=? "
-            "WHERE event_id=?",
-            (_now_iso(now), _now_iso(now), row["event_id"]),
-        )
-        conn.commit()
-    if no_thread:
-        print(f"triage: {no_thread} needs_human/merge_blocked item(s) eligible for a reminder have no "
-              f"card_ts to thread under — skipped", file=sys.stderr)
-
-
-# --- propose_mappings() — step 8, the one LLM call in this file --------------
-#
-# See the module docstring's PROPOSE MAPPINGS paragraph for the full contract.
-
-def _resolve_openai_base_url() -> str:
-    """OPENAI_BASE_URL is a plain literal in .env.tpl (not a secret — it is
-    already committed to this repo), so this only ever needs the inherited
-    process env or that same template file, never secrets-run."""
-    val = os.environ.get("OPENAI_BASE_URL", "")
-    if val:
-        return val
-    try:
-        text = (HERMES_HOME / ".env.tpl").read_text()
-    except OSError:
-        return ""
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("OPENAI_BASE_URL="):
-            return line.split("=", 1)[1].split("#", 1)[0].strip()
-    return ""
-
-
-def _resolve_openai_api_key() -> str:
-    """Mirrors resolve_slack_token()'s own hand-fallback shape exactly (env
-    var first, else the secrets-run shim against the SAME op:// ref .env.tpl
-    declares for OPENAI_API_KEY) — never a plaintext key, and never crosses
-    an argv/`ps` boundary."""
-    val = os.environ.get("OPENAI_API_KEY", "")
-    if val:
-        return val
-    env = os.environ.copy()
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
-    secrets_run = Path.home() / ".local" / "bin" / "secrets-run"
-    try:
-        r = subprocess.run(
-            [str(secrets_run), "read", _OPENAI_API_KEY_REF],
-            capture_output=True, text=True, timeout=15, env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
-
-
-def _discoverable_repos() -> set[str]:
-    """Every git checkout directly under the repos root (`lifecycle.policy.
-    discoverable()`). A `map` proposal naming anything outside this set is
-    dropped at apply time — never trusted from the model's own claim, or from
-    the prompt's own list, alone (see BOUNDS THAT DO NOT MOVE in the module
-    docstring)."""
-    return set(_policy.discoverable())
-
-
-def _signature_first_seen(row: sqlite3.Row) -> dt.datetime | None:
-    """When this SIGNATURE was first seen, not when its current open period began.
-
-    A grouped source's payload carries `ts_first` — a unix timestamp set the very
-    first time the dedup key appeared and never reset — while `events.first_seen`
-    is rewritten every time reconcile() reopens a resolved row. Any question of
-    the form "has this been going on a while" must read the former; the latter
-    answers a different question and understates it badly."""
-    payload = _safe_json(row["payload_json"] if "payload_json" in row.keys() else None)
-    raw = payload.get("ts_first")
-    if raw is None:
-        return None
-    try:
-        return dt.datetime.fromtimestamp(float(raw), dt.timezone.utc)
-    except (TypeError, ValueError):
-        return None
-
-
-def _propose_mapping_candidates(conn: sqlite3.Connection, policy: dict[str, Any],
-                                 now: dt.datetime) -> list[sqlite3.Row]:
-    """Every item classify() found no rule for, whose event is at least
-    `proposeMappingsAgeDays` old, excluding anything the model already said
-    `unsure` about within PROPOSE_UNSURE_COOLDOWN_DAYS — oldest first, capped
-    at PROPOSE_MAPPINGS_MAX_SIGNATURES.
-
-    **A signature the policy file already covers — in `rules` OR in
-    `ignore` — is never a candidate**, whatever its current state: what this
-    pass asks is "has this signature ever been mapped", and a rule or ignore
-    entry IS that mapping, so expecting the item's own lifecycle to show it
-    inverts the question. Without this the pass re-proposed the same
-    signatures every day, because no state-based exclusion can see a rule
-    classify() never had the chance to apply — the prose filter used to run
-    before rule matching (see classify()'s own docstring), so a
-    `note`-frozen signature looked permanently unmapped while 134 rule
-    entries piled up for 61 unique match values (41 ignore entries for 12).
-    The comparison runs through `_match_targets()` plus `_fnmatch_any()` —
-    the same two helpers classify() itself uses — so a title-derived match
-    (a `uk` monitor id, see the module docstring's MATCH TARGETS paragraph)
-    counts as covered too, not just the literal signature string.
-
-    Deliberately NOT restricted to `state = new`. Keying the pool on current
-    state made this whole pass inert: resolve_quiet_grouped() runs earlier in
-    the same cycle, so a grouped `slack_alert` signature flips to `resolved` on
-    the 2h quiet timer long before this query sees it. Measured against the
-    live DB, 16 of 19 unmapped signatures vanished that way and the other 3
-    were younger than the age floor — zero candidates, permanently.
-
-    A signature that resolved quietly is still unmapped and will fire again;
-    that is precisely the case worth mapping. `ignored` is the one state
-    excluded — a human or a rule already decided it deliberately, and
-    re-proposing it would relitigate a settled call. Items are collapsed per
-    signature, since the same signature can own several rows over time."""
-    age_days = policy["proposeMappingsAgeDays"]
-    # Age alone is the wrong test on its own. The floor exists to avoid spending a
-    # proposal on a one-off, but a signature that has already fired many times is
-    # demonstrably not one — `homelab-temperature-above-threshold` had 25
-    # occurrences in 5 days and would have sat under a 7-day floor while paging
-    # the whole time. Either signal qualifies it: old enough to have proven
-    # persistent, OR frequent enough to have proven the same thing faster.
-    min_occurrences = PROPOSE_MAPPINGS_MIN_OCCURRENCES
-    unsure_cutoff = now - dt.timedelta(days=PROPOSE_UNSURE_COOLDOWN_DAYS)
-    # Every `match` value the policy file already carries, in both halves —
-    # `rules` entries are validated {match, repo|verb} dicts, `ignore` is
-    # already flattened to plain patterns by load_policy(). Read with .get():
-    # tests call this function with a minimal {"proposeMappingsAgeDays": …}.
-    covered: list[str] = [
-        r["match"] for r in (policy.get("rules") or []) if isinstance(r.get("match"), str)
-    ] + [p for p in (policy.get("ignore") or []) if isinstance(p, str)]
-    rows = conn.execute(
-        "SELECT ti.event_id, ti.signature, ti.occurrences, ti.first_seen, ti.last_seen, "
-        "ti.propose_unsure_at, e.title, e.payload_json, e.source, e.external_id "
-        "FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state != ? AND ti.repo IS NULL AND ti.verb IS NULL "
-        "GROUP BY ti.signature ORDER BY MIN(ti.first_seen) ASC",
-        (STATE_IGNORED,),
-    ).fetchall()
-    candidates: list[sqlite3.Row] = []
-    for row in rows:
-        # `e.source`/`e.external_id` are in the SELECT for this one test:
-        # _match_targets() needs both, plus the title, and it is the same
-        # helper classify() matches rules with — so "already covered" here
-        # means exactly what it means there.
-        if _fnmatch_any(_match_targets(row), covered):
-            continue
-        # Age must be measured from when the SIGNATURE was first seen, not from
-        # when this row's current open period began. For a grouped source those
-        # differ by months: `homelab-temperature-above-threshold` carries
-        # ts_first = 2026-04-30 in its payload while events.first_seen reads
-        # 2026-09-04, because reconcile() reopens a resolved row with a fresh
-        # first_seen. Reading the row's own column made a 132-day-old recurring
-        # signature look five days old and kept it under every floor.
-        first_seen = _signature_first_seen(row) or _parse_ts(row["first_seen"])
-        old_enough = first_seen is not None and now - first_seen >= dt.timedelta(days=age_days)
-        # occurrences is the LAST poll's batch count, not a cumulative total, so
-        # it cannot stand in for persistence on its own — it is a fast path for a
-        # signature that fired hard in one window, nothing more.
-        frequent_enough = (row["occurrences"] or 0) >= min_occurrences
-        if not (old_enough or frequent_enough):
-            continue
-        unsure_at = _parse_ts(row["propose_unsure_at"])
-        if unsure_at is not None and unsure_at > unsure_cutoff:
-            continue
-        candidates.append(row)
-        if len(candidates) >= PROPOSE_MAPPINGS_MAX_SIGNATURES:
-            break
-    return candidates
-
-
-def _build_propose_mappings_prompt(candidates: list[sqlite3.Row], repo_names: list[str]) -> str:
-    lines = [
-        "You maintain a signature -> repo mapping table for an infrastructure alert "
-        "triage system. Each signature below has fired repeatedly for at least a week "
-        "with no owning repo, so it never escalates and never gets a card.",
-        "",
-        "For EACH signature, decide exactly ONE of:",
-        '  {"action": "ignore", "reason": "<one line>"}  — a known-benign pattern or a '
-        "genuine recovery, safe to silence forever",
-        '  {"action": "map", "repo": "<repo name>", "reason": "<one line>"}  — future '
-        "occurrences should open a read-only investigation of this repo",
-        '  {"action": "unsure"}  — you cannot confidently decide either way',
-        "",
-        "Valid repo names — a name outside this list is dropped, never applied:",
-        ", ".join(repo_names) if repo_names else "(none discoverable)",
-        "",
-        "Respond with STRICT JSON ONLY: a single JSON object keyed by the EXACT signature "
-        "string, each value one of the three shapes above. No prose, no markdown fences, "
-        "no extra keys, no signatures other than the ones listed below.",
-        "",
-        "Signatures:",
-    ]
-    for c in candidates:
-        lines.append(
-            f"- signature: {c['signature']}\n"
-            f"  title: {c['title'] or ''}\n"
-            f"  occurrences: {c['occurrences']}\n"
-            f"  first_seen: {c['first_seen']}\n"
-            f"  last_seen: {c['last_seen']}"
-        )
-    return "\n".join(lines)
-
-
-def _propose_mappings_request_body(prompt: str) -> dict[str, Any]:
-    """The request body `_call_propose_mappings_model` sends, extracted so a
-    test can assert its shape without a network round-trip. `max_completion_
-    tokens`, never `max_tokens`, NO `temperature` key at all, and a top-level
-    `reasoning_effort` — see PROPOSE_MAPPINGS_MODEL's own comment for what is
-    and isn't negotiable on this endpoint."""
-    return {
-        "model": PROPOSE_MAPPINGS_MODEL,
-        "messages": [
-            {"role": "system", "content": "You output strict JSON only — no prose, no markdown fences."},
-            {"role": "user", "content": prompt},
-        ],
-        "max_completion_tokens": PROPOSE_MAPPINGS_MAX_OUTPUT_TOKENS,
-        "reasoning_effort": PROPOSE_MAPPINGS_REASONING_EFFORT,
-    }
-
-
-def _call_propose_mappings_model(prompt: str) -> dict[str, Any] | None:
-    """The ONLY LLM call in this file. One request, strict JSON, hard-bounded
-    on every axis this loop can bound (timeout, output tokens, and the
-    caller's own cap on how many signatures went into the prompt). ANY
-    failure — unresolved secrets, network, timeout, non-2xx, unexpected
-    response shape, empty content, a truncated (`finish_reason: "length"`)
-    completion, or unparseable JSON — is caught here and returns None;
-    propose_mappings() logs to stderr and moves on. This loop must never
-    depend on this call succeeding."""
-    base_url = _resolve_openai_base_url()
-    api_key = _resolve_openai_api_key()
-    if not base_url or not api_key:
-        print("triage: propose_mappings — OPENAI_BASE_URL/OPENAI_API_KEY unresolved, skipping",
-              file=sys.stderr)
-        return None
-    body = json.dumps(_propose_mappings_request_body(prompt)).encode()
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/chat/completions",
-        data=body,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=PROPOSE_MAPPINGS_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, OSError) as e:
-        print(f"triage: propose_mappings — model call failed: {e}", file=sys.stderr)
-        return None
-    try:
-        choice = data["choices"][0]
-        content = choice["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        print(f"triage: propose_mappings — unexpected response shape: {str(data)[:300]}", file=sys.stderr)
-        return None
-    finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
-    content = (content or "").strip()
-    # An under-budgeted reasoning model returns HTTP 200 with empty content and
-    # finish_reason "length", silently — never trust an empty body, and always
-    # surface finish_reason so an empty/truncated response is diagnosable from
-    # stderr alone rather than read as "the model said nothing".
-    if not content:
-        print(f"triage: propose_mappings — empty content (finish_reason={finish_reason!r})", file=sys.stderr)
-        return None
-    if finish_reason == "length":
-        print(f"triage: propose_mappings — response truncated (finish_reason=length), discarding",
-              file=sys.stderr)
-        return None
-    if content.startswith("```"):
-        content = content.strip("`")
-        if content[:4].lower() == "json":
-            content = content[4:]
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as e:
-        print(f"triage: propose_mappings — response was not valid JSON: {e}", file=sys.stderr)
-        return None
-    if not isinstance(parsed, dict):
-        print("triage: propose_mappings — response JSON was not an object, skipping", file=sys.stderr)
-        return None
-    return parsed
-
-
-def _apply_propose_mappings(conn: sqlite3.Connection, now: dt.datetime, response: dict[str, Any],
-                             candidates_by_sig: dict[str, sqlite3.Row],
-                             valid_repos: set[str]) -> list[dict[str, str]]:
-    """Applies each decision for a signature actually in THIS batch (a
-    signature the model invents is ignored — it was never asked about). A
-    `map` repo is re-checked against `valid_repos` (`_discoverable_repos()`)
-    — never trusted from the model alone. `unsure` writes a cooldown marker directly
-    to triage_items; `map`/`ignore` write NOTHING to triage_items here —
-    they only ever become policy entries, picked up by classify() on a
-    LATER run, exactly like a hand-written rule would be. Returns the
-    applied `map`/`ignore` decisions only (for the policy file + digest —
-    `unsure` is not "applied", it is deferred)."""
-    applied: list[dict[str, str]] = []
-    now_iso = _now_iso(now)
-    for sig, decision in response.items():
-        row = candidates_by_sig.get(sig)
-        if row is None:
-            continue
-        if not isinstance(decision, dict):
-            print(f"triage: propose_mappings — malformed decision for {sig!r}, dropping", file=sys.stderr)
-            continue
-        action = decision.get("action")
-        reason = decision.get("reason") if isinstance(decision.get("reason"), str) else ""
-        if action == "ignore":
-            applied.append({"signature": sig, "action": "ignore", "reason": reason})
-        elif action == "map":
-            repo = decision.get("repo")
-            if not isinstance(repo, str) or repo not in valid_repos:
-                print(f"triage: propose_mappings — dropping map proposal for {sig!r}: repo "
-                      f"{repo!r} does not resolve under the repos root", file=sys.stderr)
-                continue
-            applied.append({"signature": sig, "action": "map", "repo": repo, "reason": reason})
-        elif action == "unsure":
-            conn.execute(
-                "UPDATE triage_items SET propose_unsure_at=?, updated_at=? WHERE event_id=?",
-                (now_iso, now_iso, row["event_id"]),
-            )
-        else:
-            print(f"triage: propose_mappings — unknown action {action!r} for {sig!r}, dropping", file=sys.stderr)
-    conn.commit()
-    return applied
-
-
-def _dump_policy_json(data: dict[str, Any]) -> str:
-    """Serializes the policy file preserving top-level key order, rendering
-    `_readme`/`rules`/`ignore` one array element per line (the file's own
-    hand-authored style) rather than json.dump's default fully-expanded
-    nesting, which would rewrite every untouched rule and turn one new line
-    into a whole-file diff."""
-    parts = []
-    for key, value in data.items():
-        if isinstance(value, list):
-            if not value:
-                rendered = "[]"
-            else:
-                items = ",\n    ".join(json.dumps(v) for v in value)
-                rendered = "[\n    " + items + "\n  ]"
-        else:
-            rendered = json.dumps(value, indent=2).replace("\n", "\n  ")
-        parts.append(f"  {json.dumps(key)}: {rendered}")
-    return "{\n" + ",\n".join(parts) + "\n}\n"
-
-
-def _write_policy_additions(applied: list[dict[str, str]], now: dt.datetime) -> bool:
-    """Reads the RAW policy JSON (never load_policy()'s normalized/defaulted
-    view — that would drop unknown keys and reorder nothing back), appends
-    one stamped rules/ignore entry per applied proposal, and writes it back
-    preserving `_readme` and key order. False (no-op) on any read/parse
-    failure or an empty `applied` list."""
-    if not applied:
-        return False
-    try:
-        data = json.loads(POLICY_PATH.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"triage: propose_mappings — cannot read policy file to apply proposals: {e}", file=sys.stderr)
-        return False
-    stamp = _now_iso(now)
-    rules = list(data.get("rules") or [])
-    ignore = list(data.get("ignore") or [])
-    for item in applied:
-        if item["action"] == "map":
-            rules.append({
-                "match": item["signature"],
-                "repo": item["repo"],
-                "proposedAt": stamp,
-                "proposedBy": "triage-auto",
-                "reason": item["reason"],
-            })
-        elif item["action"] == "ignore":
-            ignore.append({
-                "match": item["signature"],
-                "proposedAt": stamp,
-                "proposedBy": "triage-auto",
-                "reason": item["reason"],
-            })
-    data["rules"] = rules
-    data["ignore"] = ignore
-    POLICY_PATH.write_text(_dump_policy_json(data))
-    return True
-
-
-def _policy_git_rel_path() -> Path | None:
-    try:
-        return POLICY_PATH.resolve().relative_to(TRIAGE_REPO_DIR.resolve())
-    except (OSError, ValueError):
-        return None
-
-
-def _policy_path_is_dirty(rel: Path) -> bool:
-    """True if config/triage-policy.json ALREADY carries a pending
-    staged-or-unstaged change before this run's own write — checked before
-    _write_policy_additions() ever touches the file, so a human's own
-    in-progress edit is never swept into an auto-authored commit. Also true
-    (fail closed) if `git status` itself cannot be run at all."""
-    try:
-        res = subprocess.run(
-            ["git", "-C", str(TRIAGE_REPO_DIR), "status", "--porcelain", "--", str(rel)],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return True
-    if res.returncode != 0:
-        return True
-    return bool(res.stdout.strip())
-
-
-def _git_commit_policy_file(rel: Path, applied: list[dict[str, str]]) -> None:
-    """`git add` + `git commit` ONLY config/triage-policy.json, in this
-    repo's own checkout — never `git add -A`, never `git push` (a human
-    sends anything further). The file is symlinked live into
-    ~/.hermes/config/, so the change already took effect the moment
-    _write_policy_additions() returned; committing turns that into a
-    reviewable diff instead of the dirty-working-tree drift this repo has
-    been bitten by before (see CLAUDE.md "After any edit: commit here"). No
-    lock is taken — this is the only writer of this file — the dirtiness
-    check the caller already did before writing is what keeps this from
-    sweeping an unrelated pending edit into an auto-authored commit."""
-    repo_dir = str(TRIAGE_REPO_DIR)
-    summary = "; ".join(
-        f"{a['signature']} -> {a['repo']}" if a["action"] == "map" else f"{a['signature']} -> ignore"
-        for a in applied
-    )
-    msg = f"chore(triage-policy): auto-propose {len(applied)} mapping(s)\n\n{summary}"
-    add = subprocess.run(["git", "-C", repo_dir, "add", "--", str(rel)],
-                          capture_output=True, text=True, timeout=30)
-    if add.returncode != 0:
-        print(f"triage: propose_mappings — git add failed: {add.stderr.strip()}", file=sys.stderr)
-        return
-    commit = subprocess.run(["git", "-C", repo_dir, "commit", "-m", msg, "--", str(rel)],
-                             capture_output=True, text=True, timeout=30)
-    if commit.returncode != 0:
-        print(f"triage: propose_mappings — git commit failed: {commit.stderr.strip()}", file=sys.stderr)
-
-
-def propose_mappings(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
-                      *, dry_run: bool) -> list[dict[str, str]]:
-    """Step 8 — see the module docstring's PROPOSE MAPPINGS paragraph for the
-    full contract. Returns the applied map/ignore proposals (possibly
-    empty), so run() can hand them to maybe_post_daily_digest() for
-    announcement the same day. Under --dry-run this makes zero calls of any
-    kind (model, git) and returns []  — matching every other externally
-    visible action in this file's DRY-RUN CONTRACT."""
-    if dry_run:
-        return []
-
-    row = conn.execute("SELECT value FROM cursors WHERE key=?", (PROPOSE_MAPPINGS_CURSOR_KEY,)).fetchone()
-    if row is not None:
-        last_run = _parse_ts(row["value"])
-        if last_run is not None and now - last_run < dt.timedelta(hours=24):
-            return []
-
-    candidates = _propose_mapping_candidates(conn, policy, now)
-    # The cursor is a once-per-24h BUDGET, not a "keep retrying until it
-    # succeeds" loop — stamped here, before the call, so a failed call still
-    # counts against today's attempt rather than hammering the endpoint on
-    # every 10-minute cycle until one happens to succeed.
-    now_iso = _now_iso(now)
-    conn.execute(
-        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (PROPOSE_MAPPINGS_CURSOR_KEY, now_iso, now_iso),
-    )
-    conn.commit()
-    if not candidates:
-        return []
-
-    valid_repos = _discoverable_repos()
-    prompt = _build_propose_mappings_prompt(candidates, sorted(valid_repos))
-    response = _call_propose_mappings_model(prompt)
-    if response is None:
-        return []  # already logged by the call itself
-
-    candidates_by_sig = {c["signature"]: c for c in candidates}
-    applied = _apply_propose_mappings(conn, now, response, candidates_by_sig, valid_repos)
-    if not applied:
-        return []
-
-    rel = _policy_git_rel_path()
-    if rel is None:
-        print(f"triage: propose_mappings — {POLICY_PATH} is outside the repo checkout at "
-              f"{TRIAGE_REPO_DIR}, skipping this run's proposals entirely (not written, not "
-              "committed)", file=sys.stderr)
-        return []
-    if _policy_path_is_dirty(rel):
-        print(f"triage: propose_mappings — {rel} already has a pending change, skipping this "
-              "run's proposals entirely rather than sweeping it into an auto-authored commit",
-              file=sys.stderr)
-        return []
-    if not _write_policy_additions(applied, now):
-        return []
-    _git_commit_policy_file(rel, applied)
-    return applied
-
-
 # --- unmapped-signature digest -------------------------------------------------
 
 def _fetch_note_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -7537,19 +6132,14 @@ def _fetch_note_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], unmapped: set[str],
-                             now: dt.datetime, *, dry_run: bool,
-                             auto_mapped: list[dict[str, str]] | None = None) -> None:
-    """One Slack message, at most once per UTC day, with up to three
-    sections: unmapped signatures (no policy rule matched — see classify()),
-    STATE_NOTE rows (unstructured #alerts prose that might be an unactioned
-    root cause — see that state's own docstring), and whatever
-    propose_mappings() just auto-added THIS run (see PROPOSE MAPPINGS) — the
-    latter is how an auto-authored policy commit gets ANNOUNCED rather than
-    only discovered later in `git log`. All three are silent by default;
-    this is the only place any of them becomes visible."""
-    auto_mapped = auto_mapped or []
+                             now: dt.datetime, *, dry_run: bool) -> None:
+    """One Slack message, at most once per UTC day, with up to two
+    sections: unmapped signatures (no policy rule matched — see classify())
+    and STATE_NOTE rows (unstructured #alerts prose that might be an
+    unactioned root cause — see that state's own docstring). Both are silent
+    by default; this is the only place either becomes visible."""
     notes = _fetch_note_rows(conn)
-    if not unmapped and not notes and not auto_mapped:
+    if not unmapped and not notes:
         return
     today = now.date().isoformat()
     row = conn.execute("SELECT value FROM cursors WHERE key=?", (DAILY_DIGEST_CURSOR_KEY,)).fetchone()
@@ -7557,16 +6147,7 @@ def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], un
         return
 
     lines: list[str] = []
-    if auto_mapped:
-        lines.append("*Auto-proposed triage-policy changes* — added to `triage-policy.json` and "
-                      "committed this run (`proposedBy: triage-auto`):")
-        for a in auto_mapped:
-            target = f"repo `{a['repo']}`" if a["action"] == "map" else "`ignore`"
-            reason = a.get("reason") or "(no reason given)"
-            lines.append(f"- `{a['signature']}` -> {target} — {reason}")
     if unmapped:
-        if lines:
-            lines.append("")
         sigs = sorted(unmapped)
         lines.append("*Unmapped triage signatures* — no rule in `triage-policy.json`, so these never escalate:")
         lines.extend(f"- `{s}`" for s in sigs[:20])
@@ -7586,8 +6167,7 @@ def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], un
     text = "\n".join(lines)
     channel = _card_channel(policy)
     if dry_run:
-        print(f"[dry-run] would post daily digest ({len(unmapped)} unmapped, {len(notes)} notes, "
-              f"{len(auto_mapped)} auto-mapped) to {channel}")
+        print(f"[dry-run] would post daily digest ({len(unmapped)} unmapped, {len(notes)} notes) to {channel}")
         return
     token = resolve_slack_token()
     if not token:
@@ -7978,13 +6558,6 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # step -1.
     reconcile_operations(conn, policy, now, dry_run=dry_run)
 
-    # Never takes the tick down: the audit reports on the loop, it must not
-    # be able to stop it (§102).
-    try:
-        run_self_audit(conn, policy, now, dry_run=dry_run)
-    except Exception as e:  # noqa: BLE001 — a report must not kill the pass it reports on
-        conn.rollback()
-        print(f"triage: self-audit failed, pass continues: {type(e).__name__}: {e}", file=sys.stderr)
     ingest(conn, now)
     ingest_github_issues(conn, now)
     reopen_if_needed(conn, now)
@@ -7997,7 +6570,6 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     escalate_origin_items(conn, now, dry_run=dry_run)
     escalate(conn, policy, now, dry_run=dry_run)
-    run_verbs(conn, policy, now, dry_run=dry_run)
 
     # The fifth closed allowlist's own poller (STATE.md's 2026-09-11 owner
     # decision) — BEFORE the implement chain, on purpose: a verdict/
@@ -8025,14 +6597,6 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # in the same pass it happens.
     sweep_deadlines(conn, now, dry_run=dry_run)
 
-    # Right after sweep_deadlines(), for the same reason: a row that just
-    # expired out of `needs_human`/`merge_blocked` this pass must never also
-    # get a reminder threaded under a card that no longer describes its
-    # current state.
-    remind_needs_human(conn, policy, now, dry_run=dry_run)
-    track_parked_recurrences(conn, policy, now, dry_run=dry_run)
-    reconcile_stranded_prs(conn, policy, now, dry_run=dry_run)
-
     for _key, members in _cluster_groups(conn).items():
         members = sorted(members, key=lambda r: r["event_id"])
         event_rows = [_get_event(conn, m["event_id"]) for m in members]
@@ -8040,13 +6604,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
             continue
         sync_card(conn, members, event_rows, policy, dry_run=dry_run)
 
-    # Step 8 — the one LLM call in this file, at most once per 24h. Runs
-    # AFTER classify() so `unmapped` above already reflects this run's own
-    # rule matching, and its result feeds directly into today's digest below
-    # rather than waiting for a separate delivery mechanism.
-    auto_mapped = propose_mappings(conn, policy, now, dry_run=dry_run)
-
-    maybe_post_daily_digest(conn, policy, unmapped, now, dry_run=dry_run, auto_mapped=auto_mapped)
+    maybe_post_daily_digest(conn, policy, unmapped, now, dry_run=dry_run)
 
     # No timestamp argument, deliberately — see record_heartbeat().
     record_heartbeat(conn, dry_run=dry_run)
@@ -8228,7 +6786,7 @@ def cmd_list(conn: sqlite3.Connection) -> int:
         print("no open triage items")
         return 0
     for r in rows:
-        print(f"{r['state']:<13} {r['signature']:<70} repo={r['repo'] or r['verb'] or '-'} "
+        print(f"{r['state']:<13} {r['signature']:<70} repo={r['repo'] or '-'} "
               f"occurrences={r['occurrences']} since={r['first_seen']}")
     return 0
 

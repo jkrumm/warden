@@ -98,7 +98,7 @@ def post_env(*, run_poll_result=None, quiet: bool = False, vacation: bool = Fals
     posts: list[dict] = []
     heartbeats = {"n": 0}
     secrets = {"SLACK_BOT_TOKEN": token, "UPTIME_PUSH_WATCHDOG": "https://push.example/x"}
-    result = run_poll_result if run_poll_result is not None else ([], [], [])
+    result = run_poll_result if run_poll_result is not None else ([], [])
 
     def _fake_run_poll(conn, now, env, deliver=True):
         return result
@@ -149,25 +149,17 @@ print("\n1. reconcile — quiet hours defer rather than burn")
 conn = fresh_db()
 t0 = dt.datetime(2026, 8, 24, 3, 44, tzinfo=dt.timezone.utc)
 
-new, rem, res = wp.reconcile(conn, "uk", observed(), t0, 0, 6, deliver=False)
+new, res = wp.reconcile(conn, "uk", observed(), t0, 0, deliver=False)
 check("no NEW emitted while suppressed", len(new), 0)
 check("row exists anyway", conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"], 1)
 check("notified_at NOT stamped", notified_at(conn), None)
 
 # 07:00, quiet window over — the backlog must fire now.
 t1 = t0 + dt.timedelta(hours=3, minutes=16)
-new, rem, res = wp.reconcile(conn, "uk", observed(), t1, 0, 6, deliver=True)
+new, res = wp.reconcile(conn, "uk", observed(), t1, 0, deliver=True)
 check("fires as NEW on first delivering poll", len(new), 1)
 check("notified_at stamped once delivered", notified_at(conn) is not None, True)
 
-# A reminder must likewise not consume its anchor while suppressed.
-t2 = t1 + dt.timedelta(hours=7)
-new, rem, res = wp.reconcile(conn, "uk", observed(), t2, 0, 6, deliver=False)
-check("no reminder emitted while suppressed", len(rem), 0)
-anchor = conn.execute("SELECT last_reminder_at FROM events WHERE external_id='sig-a'").fetchone()
-check("reminder anchor untouched", anchor["last_reminder_at"], None)
-new, rem, res = wp.reconcile(conn, "uk", observed(), t2, 0, 6, deliver=True)
-check("reminder fires on the next delivering poll", len(rem), 1)
 conn.close()
 
 print("\n2. upsert_grouped — quiet hours defer rather than burn")
@@ -206,7 +198,7 @@ conn.close()
 
 print("\n4. delivering polls are unchanged (the default path)")
 conn = fresh_db()
-new, rem, res = wp.reconcile(conn, "uk", observed(), t0, 0, 6)
+new, res = wp.reconcile(conn, "uk", observed(), t0, 0)
 check("reconcile still emits NEW by default", len(new), 1)
 out = wp.upsert_grouped(conn, "hermes_log", grouped(), t0, flap_threshold=1, cooldown_hours=24)
 check("upsert_grouped still emits by default", len(out), 1)
@@ -214,15 +206,15 @@ conn.close()
 
 print("\n5. resolution still tracked while suppressed")
 conn = fresh_db()
-wp.reconcile(conn, "uk", observed(), t0, 0, 6, deliver=True)
+wp.reconcile(conn, "uk", observed(), t0, 0, deliver=True)
 # The condition clears during quiet hours — the row must still close.
-wp.reconcile(conn, "uk", [], t0 + dt.timedelta(hours=1), 0, 6, deliver=False)
+wp.reconcile(conn, "uk", [], t0 + dt.timedelta(hours=1), 0, deliver=False)
 row = conn.execute("SELECT resolved_at FROM events WHERE external_id='sig-a'").fetchone()
 check("disappearance still resolves under suppression", row["resolved_at"] is not None, True)
 conn.close()
 
 print("\n6. --post with a non-empty body posts once, right channel and body")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
     rc = wp.main(["--post"])
     check("rc == 0", rc, 0)
     check("post_text called exactly once", len(ctx.posts), 1)
@@ -231,7 +223,7 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("no heartbeat call skipped on clean run", ctx.heartbeats["n"], 1)
 
 print("\n7. --post with an empty body (quiet hours) posts nothing")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], []),
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], []),
               quiet=True) as ctx:
     rc = wp.main(["--post"])
     check("rc == 0", rc, 0)
@@ -244,7 +236,7 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("heartbeat STILL fires on a quiet poll", ctx.heartbeats["n"], 1)
 
 print("\n8. --post --dry-run makes zero Slack calls and zero heartbeat calls")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
     # main()'s --dry-run branch still runs the full temp-copy-then-poll path
     # (see main(): "Run poll against a temp copy of the DB…") before it ever
     # reaches delivery — a clean rc here is evidence that path completed.
@@ -254,7 +246,7 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("zero heartbeat calls under dry-run", ctx.heartbeats["n"], 0)
 
 print("\n9. an unresolvable token returns non-zero and posts nothing")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], []),
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], []),
               token=None) as ctx:
     rc = wp.main(["--post"])
     check("rc != 0", rc == 0, False)
@@ -262,7 +254,7 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("zero heartbeat calls", ctx.heartbeats["n"], 0)
 
 print("\n10. a failing post_text returns non-zero")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], []),
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], []),
               post_ok=False) as ctx:
     rc = wp.main(["--post"])
     check("rc != 0", rc == 0, False)
@@ -270,7 +262,7 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("no heartbeat on a failed post", ctx.heartbeats["n"], 0)
 
 print("\n11. the heartbeat fires on rc == 0 and not on a non-zero rc")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
     _seed_slack_blind(ctx.db_path)
     rc = wp.main(["--post"])
     check("rc != 0 (slack polling blind)", rc == 0, False)
@@ -278,7 +270,7 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("no heartbeat on a non-zero rc", ctx.heartbeats["n"], 0)
 
 print("\n12. --slack-body alone still prints to stdout and posts nothing")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = wp.main(["--slack-body"])
@@ -288,7 +280,7 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("zero heartbeat calls", ctx.heartbeats["n"], 0)
 
 print("\n13. ledger behind this process's schema, --post — pass skipped, heartbeat still fires")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
     behind_conn = sqlite3.connect(ctx.db_path)
     behind_conn.execute("UPDATE schema_version SET version = ?", (wp._ledger.LEDGER_SCHEMA_VERSION - 1,))
     behind_conn.commit()
@@ -305,7 +297,7 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     check("stderr names the skip", "ledger behind this process's schema" in stderr.getvalue(), True)
 
 print("\n14. ledger behind this process's schema, no --post — heartbeat NOT pushed")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [], [])) as ctx:
+with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
     behind_conn = sqlite3.connect(ctx.db_path)
     behind_conn.execute("UPDATE schema_version SET version = ?", (wp._ledger.LEDGER_SCHEMA_VERSION - 1,))
     behind_conn.commit()
