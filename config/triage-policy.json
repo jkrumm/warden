@@ -141,7 +141,7 @@
     "OR ABOVE `hostVerbMinConfidence` (default \"medium\" \u2014 validated at load to one of",
     "high/medium/low, anything else falls back to \"medium\" with a stderr line) before it will",
     "ever run one of these \u2014 a `hostVerbs` match alone is not enough. `high` is deliberately NOT",
-    "the floor here (unlike auto-implement's own confidence gate): a restart from",
+    "the floor here: a restart from",
     "HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE liveness probe before the item is",
     "ever marked done, and capped at `hostVerbMaxAttempts` \u2014 so a wrong guess costs one restart",
     "and a `needs_human` card carrying the receipt, which is cheaper than a human running that",

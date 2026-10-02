@@ -355,7 +355,8 @@ STATE_SNOOZED = "snoozed"
 STATE_IGNORED = "ignored"
 # --- the auto-implement chain (verdict -> implement -> validate -> merge ->
 # deploy -> verify), all downstream of a STATE_VERDICT item whose folded
-# investigate verdict already said nextAction=implement at confidence=high.
+# investigate verdict said nextAction=implement, at any confidence — review
+# is the gate, not the investigator's self-assessment.
 # See maybe_auto_implement()/poll_implement_jobs()/poll_validation_jobs()/
 # maybe_check_liveness() and their own docstrings for the state machine.
 STATE_IMPLEMENTING = "implementing"      # implement episode dispatched, awaiting a PR
@@ -556,11 +557,11 @@ _STATE_DEADLINE_COLUMN = "state_deadline"
 # check:
 #
 #   * `verdict` is not in DESIGN.md's table at all, and it is non-terminal.
-#     maybe_auto_implement() only advances it when the repo has auto-implement
-#     enabled AND the verdict reads nextAction=implement at confidence=high;
-#     every other verdict sits in `verdict` with nothing scheduled to touch it
-#     again. 24h -> needs_human. An ADDITION to the design's table, not a
-#     contradiction of it.
+#     maybe_auto_implement() advances it on the next tick whenever the verdict
+#     reads nextAction=implement, whatever its confidence; every other verdict
+#     (and one deferred by the per-repo lock) sits in `verdict` with nothing
+#     else scheduled to touch it. 24h -> needs_human. An ADDITION to the
+#     design's table, not a contradiction of it.
 #   * `split` is the same third addition as `verdict` above, for the same
 #     reason: post-verdict, nothing scheduled to touch it unless a specific
 #     condition is met (here: escalate() finding it a free per-repo slot —
@@ -680,9 +681,9 @@ DEFAULT_HOST_VERB_MAX_ATTEMPTS = 2
 # before the item is ever marked done, and capped at `hostVerbMaxAttempts` —
 # so a wrong guess costs one restart and a `needs_human` card with the
 # receipt attached, which is cheaper than a human running the exact same
-# restart by hand. `high` stayed the right bar for auto-IMPLEMENT (a
-# multi-file code change, no positive probe, no cheap undo); it is the wrong
-# bar for a bounded, reversible, verified host verb. Ranked so a policy may
+# restart by hand. auto-IMPLEMENT has no confidence bar at all any
+# more (review is its gate); a host verb keeps one because it has no review
+# step, only a positive liveness probe. Ranked so a policy may
 # only ever choose a LOWER bar than `high`, never something outside this
 # vocabulary — same closed-set shape as every other policy-selectable value
 # in this file.
@@ -4116,7 +4117,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 # --- -> deploy -> verify (steps 6-10) -----------------------------------------
 #
 # Everything below is downstream of a STATE_VERDICT item whose folded
-# investigate verdict already said nextAction=implement at confidence=high.
+# investigate verdict said nextAction=implement, at any confidence.
 # Every step calls straight into the `clients`/`lifecycle` packages now (no
 # subprocess, no hermes-cc.sh — that script is retired, see docs/history/state-log.md's Wave
 # 5 entries) and re-derives what it needs from the ledger every run, same as
@@ -4624,15 +4625,13 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
          `policy["hostVerbMinConfidence"]` (default `medium` —
          DEFAULT_HOST_VERB_MIN_CONFIDENCE, see _CONFIDENCE_RANK) AND
          `nextAction in ("human", "implement")`. `high` is deliberately NOT
-         the floor here, unlike maybe_auto_implement()'s own confidence gate
-         below — the owner's follow-up decision, 2026-09-11: a restart from
-         HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE liveness
-         probe before the item is ever marked done, and capped at
+         the floor — the owner's follow-up decision, 2026-09-11: a restart
+         from HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE
+         liveness probe before the item is ever marked done, and capped at
          `hostVerbMaxAttempts`, so a wrong guess costs one restart and a
          `needs_human` card carrying the receipt — cheaper than a human
-         running that exact same restart by hand. A multi-file code change
-         (maybe_auto_implement()) has no such cheap, verified undo, which is
-         why `high` stays the right bar THERE and not here.
+         running that exact same restart by hand. (maybe_auto_implement()
+         has no confidence bar at all: its gate is the step-7 review.)
 
     Phase 2 — one decision PER VERB KEY, never per item:
       5. cooldown — `_host_verb_cooldown_ok()`, now keyed by verb: a flapping
@@ -4781,7 +4780,8 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                           *, dry_run: bool) -> None:
     """Step 6. A STATE_VERDICT item is eligible once, the moment its folded
     investigate verdict (dispatches.verdict_json, keyed by its own
-    dispatch_job) reads nextAction=implement at confidence=high AND it has
+    dispatch_job) reads nextAction=implement, at ANY confidence (review is
+    the gate, not the investigator's self-assessment) AND it has
     not already been auto-implemented (implement_job IS NULL) AND its own
     `max_tier` is `implement` — the same "runs at most once" shape
     run_verbs() already uses, for the same reason: the outcome falls out of
@@ -4817,8 +4817,6 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         verdict = _safe_json(d["verdict_json"])
         if (verdict.get("nextAction") or "").strip().lower() != "implement":
             continue
-        if (verdict.get("confidence") or "").strip().lower() != "high":
-            continue
         if dry_run:
             print(f"[dry-run] would auto-implement {item['signature']} in {item['repo']} "
                   f"(event {item['event_id']})")
@@ -4837,7 +4835,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
         brief = (
             "A prior read-only investigation of this repo (dispatched by the alert triage loop) "
-            "already concluded, at high confidence, that the fix should be implemented — re-read "
+            "concluded that the fix should be implemented — re-read "
             "that investigation's own verdict and evidence yourself (it ran against this exact "
             "repo) before writing anything, then implement the fix it described. If what you find "
             "on re-reading no longer supports that conclusion, say so in your own verdict and stop "
@@ -4863,7 +4861,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             opened = _dispatch.open_episode(
                 conn, repo=item["repo"], tier="implement", brief=brief,
                 context=_verdict_as_context(item["dispatch_job"], verdict),
-                why="triage auto-implement: investigation concluded implement at high confidence",
+                why="triage auto-implement: investigation concluded nextAction=implement",
                 origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
             )
@@ -5239,6 +5237,78 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
     )
 
 
+# Step 8 of the target spec: an infrastructure failure of the review job
+# (failed/interrupted, or a `done` job whose result is empty/unparseable) is
+# retried, never routed to a human on the first strike.
+REVIEW_INFRA_MAX_STRIKES = 3
+
+
+def _review_row_lacks_verdict(row: sqlite3.Row) -> bool:
+    """True for a `review` dispatches row that ended with no verdict — the
+    infra-failure shape poll_validation_jobs() retries. A real verdict (any
+    non-empty result), a cancel, or anything still running is not a strike."""
+    if row["status"] not in ("failed", "interrupted", "done"):
+        return False
+    return not _safe_json(row["verdict_json"])
+
+
+def _consecutive_review_failures(conn: sqlite3.Connection, *, event_id: int,
+                                  current_job: str) -> int:
+    """Strikes against this item's review, current job included. Counted from
+    the ledger — the item's `review` dispatches rows, newest first, excluding
+    the job being polled (its row may be absent) — and stopped by the first
+    row that is not a no-verdict failure, so a blocked/confirmed round resets
+    the count. No column of its own: the dispatches table already is the
+    attempt history."""
+    rows = conn.execute(
+        "SELECT status, verdict_json FROM dispatches WHERE tier='review' AND origin_event_id=? "
+        "AND job_id != ? ORDER BY id DESC", (event_id, current_job),
+    ).fetchall()
+    prior = 0
+    for row in rows:
+        if not _review_row_lacks_verdict(row):
+            break
+        prior += 1
+    return prior + 1
+
+
+def _retry_review_or_escalate(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                               now: dt.datetime, *, reason: str) -> None:
+    """A review job ended with no verdict. Below REVIEW_INFRA_MAX_STRIKES
+    consecutive failures, open a fresh review on the same PR and keep the item
+    in `validating` pointing at it. At the cap, land `needs_human` carrying the
+    last error. A sideclaw refusal on the re-submit is final (`_end_on_refusal`).
+    A re-submit that fails without a job (5xx, unreachable) leaves the item
+    untouched: the next poll sees the same failed job and tries again, bounded
+    by `validating`'s own 1h deadline."""
+    strikes = _consecutive_review_failures(conn, event_id=item["event_id"], current_job=item["validation_job"])
+    if strikes >= REVIEW_INFRA_MAX_STRIKES:
+        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
+                     ("error", item["implement_job"]))
+        _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
+                   note=f"step-7 validation (error): the review failed {strikes} times in a row "
+                        f"with no verdict — last error: {reason}")
+    else:
+        try:
+            val_job, val_err = _open_validation_dispatch(
+                conn, repo=item["repo"], event_id=item["event_id"], implement_job=item["implement_job"],
+                pr_url=item["pr_url"] or "", context=_validation_context(conn, item))
+        except SubmitRefused as e:
+            _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=item["pr_url"])
+            return
+        if val_job is None:
+            print(f"triage: review retry for {item['signature']} could not be submitted: {val_err}",
+                  file=sys.stderr)
+            return
+        _set_state(conn, item["event_id"], STATE_VALIDATING, now, expect_state=STATE_VALIDATING,
+                   validation_job=val_job,
+                   note=f"step-7 review retry {strikes}/{REVIEW_INFRA_MAX_STRIKES - 1} after: {reason}")
+    conn.commit()
+    fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
+    if fresh_item is not None and fresh_event is not None:
+        sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+
+
 def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step 7 -> 8. Polls every STATE_VALIDATING item once against sideclaw's
@@ -5256,8 +5326,12 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     revision would be spent on findings its own reviewer would not stand
     behind. A finding about the PR's own *wrapper* (§114) never
     blocks-and-revises either — no episode can satisfy it — so it routes to
-    a human with the finding on the card. A FAILED, ERRORED or CANCELLED
-    review job blocks the merge the same way.
+    a human with the finding on the card. A review job that ends with NO
+    verdict (failed/interrupted, or `done` with an empty result) is an
+    infrastructure failure and is re-submitted
+    (`_retry_review_or_escalate()`); the third consecutive one lands
+    `needs_human` carrying the last error. A CANCELLED review, or a
+    non-`done` one that still carries a result, blocks the merge.
     `dispatches.validation_status` lands one of
     `confirmed | blocked | needs_human | error`.
 
@@ -5299,6 +5373,11 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # never left stale waiting on dispatch-sweep.py's own cadence either.
         _dispatch.sync_record(conn, resp, reported=False, now=now)
         conn.commit()
+
+        if status != "cancelled" and not resp.get("result"):
+            reason = resp.get("error") or f"review job {status} with no verdict"
+            _retry_review_or_escalate(conn, policy, item, now, reason=reason)
+            continue
 
         if status != "done":
             reason = resp.get("error") or ("cancelled" if status == "cancelled" else "no further detail")

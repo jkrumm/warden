@@ -337,16 +337,12 @@ def test_require_auto_from_item_next_action_not_implement():
         raise AssertionError("expected PolicyError")
 
 
-def test_require_auto_from_item_confidence_not_high():
-    conn, _ = _fresh_ledger()
-    _seed_dispatch_row(conn, "job-1", status="done", verdict={"nextAction": "implement", "confidence": "medium"})
-    _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job="job-1")
-    try:
-        policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
-    except PolicyError as e:
-        assert "confidence='medium'" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
+def test_require_auto_from_item_accepts_any_confidence():
+    for confidence in ("low", "medium", "high"):
+        conn, _ = _fresh_ledger()
+        _seed_dispatch_row(conn, "job-1", status="done", verdict={"nextAction": "implement", "confidence": confidence})
+        _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job="job-1")
+        assert policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement") == "job-1"
 
 
 def test_require_auto_from_item_positive():

@@ -2945,27 +2945,40 @@ def _fake_repo_json(*, default_branch="master") -> dict[str, Any]:
             "allow_rebase_merge": False, "allow_merge_commit": False}
 
 
-def test_auto_implement_fires_only_at_high_confidence():
+def test_auto_implement_fires_at_any_confidence_with_no_wait():
+    """Review is the gate, not the investigator's self-assessment: a
+    nextAction=implement verdict goes to implement on the very next tick at
+    low and medium confidence too — nothing but this one call sits between a
+    freshly folded `verdict` item and its episode."""
     with _triage_env() as (conn, ctx):
-        eid_hi = _seed_verdict_item(conn, external_id="sig-hi", confidence="high",
-                                     investigate_job="investigate-hi")
-        eid_med = _seed_verdict_item(conn, external_id="sig-med", confidence="medium",
-                                      investigate_job="investigate-med")
+        eids = {c: _seed_verdict_item(conn, external_id=f"sig-{c}", confidence=c, repo=f"repo-{c}",
+                                       investigate_job=f"investigate-{c}")
+                for c in ("high", "medium", "low")}
 
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
         triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        assert len(calls) == 1, f"expected exactly the high-confidence item, got {len(calls)} submit call(s)"
-        assert calls[0]["model"] is None, (
-            "auto-implement must send no model override by default, so sideclaw "
-            f"routes the implement tier itself — got {calls[0]['model']!r}"
-        )
-        item_hi = triage._get_item(conn, eid_hi)
-        assert item_hi["state"] == triage.STATE_IMPLEMENTING
-        assert item_hi["implement_job"] is not None
-        item_med = triage._get_item(conn, eid_med)
-        assert item_med["state"] == triage.STATE_VERDICT, "a medium-confidence verdict must never auto-implement"
+        assert len(calls) == 3, f"every confidence must auto-implement, got {len(calls)} submit call(s)"
+        assert all(c["model"] is None for c in calls), (
+            "auto-implement must send no model override by default, so sideclaw routes the implement tier itself")
+        for conf, eid in eids.items():
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_IMPLEMENTING, f"{conf}: {item['state']}"
+            assert item["implement_job"] is not None, f"{conf}-confidence item was never implemented"
+
+
+def test_auto_implement_ignores_a_verdict_that_does_not_say_implement():
+    with _triage_env() as (conn, ctx):
+        eids = [_seed_verdict_item(conn, external_id=f"sig-na-{na}", next_action=na, repo=f"repo-{na}",
+                                    confidence="high", investigate_job=f"investigate-na-{na}")
+                for na in ("none", "review", "monitor", "human")]
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert calls == [], f"only nextAction=implement may auto-implement, got {calls}"
+        for eid in eids:
+            assert triage._get_item(conn, eid)["state"] == triage.STATE_VERDICT
 
 
 def test_auto_implement_claims_the_item_before_dispatching():
@@ -3508,6 +3521,124 @@ def test_cancelled_validation_job_blocks_the_merge():
         assert merge_calls == [], "a cancelled validation must never call merge"
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGE_BLOCKED
+
+
+def _seed_validating_item(conn, *, external_id: str, implement_job: str, review_job: str) -> int:
+    """A `validating` item with its implement row and the review dispatch row
+    `open_review()` would have written for `review_job`."""
+    eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
+    conn.execute(
+        "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+        (triage.STATE_VALIDATING, implement_job, review_job, "https://github.com/jkrumm/demo-repo/pull/10", eid),
+    )
+    _seed_implement_dispatch(conn, implement_job)
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,origin_event_id,created_at) VALUES(?,?,?,?,?,?,?)",
+        (review_job, "review", "demo-repo", "review PR #10", "running", eid, NOW.isoformat()),
+    )
+    conn.commit()
+    return eid
+
+
+def test_failed_review_is_resubmitted_and_the_third_failure_goes_to_needs_human():
+    """An infrastructure failure of the review (no verdict) retries; three in
+    a row land `needs_human` carrying the last error. Never `merge`."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-infra", implement_job="impl-rv-infra",
+                                    review_job="review-job-first")
+        triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "failed",
+                                               "error": "synthesis failed: could not serialize"}
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_review = _fake_submit_review(calls)
+
+        def _unexpected_merge(*a, **kw):
+            raise AssertionError("a review with no verdict must never call merge")
+
+        triage._merge.plan_or_land = _unexpected_merge
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert len(calls) == 1 and calls[0]["pr"] == 10, calls
+        assert item["state"] == triage.STATE_VALIDATING and item["validation_job"] == "review-job-000001", dict(item)
+        assert "retry 1/2" in item["note"] and "could not serialize" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_job_id FROM dispatches WHERE job_id='impl-rv-infra'").fetchone()
+        assert d["validation_job_id"] == "review-job-000001"
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert len(calls) == 2, calls
+        assert item["state"] == triage.STATE_VALIDATING and item["validation_job"] == "review-job-000002"
+
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert len(calls) == 2, "the third consecutive failure must not submit a fourth review"
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "3 times in a row" in item["note"] and "could not serialize" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-rv-infra'").fetchone()
+        assert d["validation_status"] == "error"
+
+
+def test_done_review_with_no_result_is_an_infra_failure_too():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-empty", implement_job="impl-rv-empty",
+                                    review_job="review-job-empty")
+        triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": None}
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_review = _fake_submit_review(calls)
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_VALIDATING
+
+
+def test_a_review_with_a_verdict_resets_the_strike_count():
+    """Strikes are CONSECUTIVE: an earlier round that returned a real verdict
+    (here a blocked one) ends the run, so two older failures behind it do not
+    push the next failure to the cap."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-reset", implement_job="impl-rv-reset",
+                                    review_job="review-job-now")
+        for i, (status, verdict) in enumerate([("failed", None), ("failed", None),
+                                               ("done", json.dumps(_review_result("actionable")))]):
+            conn.execute(
+                "INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,origin_event_id,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (f"review-old-{i}", "review", "demo-repo", "b", status, verdict, eid, OLD.isoformat()))
+        # ids ascend with insertion: the verdict row is the newest, the two failures sit behind it
+        conn.commit()
+        assert triage._consecutive_review_failures(conn, event_id=eid, current_job="review-job-now") == 1
+
+
+def test_review_resubmit_refused_by_sideclaw_ends_the_item_without_retry():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-refused", implement_job="impl-rv-refused",
+                                    review_job="review-job-refused")
+        triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "interrupted", "error": "idle"}
+
+        def _refuse(*, cwd, pr, context=None, model=None):
+            raise triage.SubmitRefused("sideclaw refused the job (HTTP 400): nope", status=400)
+
+        triage._sideclaw.submit_review = _refuse
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_NEEDS_HUMAN, item["state"]
+        assert "nope" in (item["note"] or ""), item["note"]
+
+
+def test_real_blocked_review_is_not_retried():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-blocked", implement_job="impl-rv-blocked",
+                                    review_job="review-job-blocked")
+        triage._sideclaw.get = lambda job_id: {
+            "id": job_id, "status": "done",
+            "result": _review_result("actionable", blocking=[
+                {"file": "scripts/x.py", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}]),
+        }
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_review = _fake_submit_review(calls)
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert calls == [], "a review that returned a verdict must never be re-submitted"
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGE_BLOCKED and "wrong comparator" in item["note"], dict(item)
 
 
 def test_validation_outcome_needs_human_routes_to_needs_human():
@@ -4954,7 +5085,7 @@ def test_investigating_expires_to_needs_human():
 
 def test_verdict_expires_to_needs_human():
     """Not in DESIGN.md's table, and deliberately added: maybe_auto_implement()
-    only advances a verdict that reads nextAction=implement at confidence=high,
+    only advances a verdict that reads nextAction=implement (any confidence),
     so every other verdict has nothing scheduled to touch it ever again."""
     with _triage_env() as (conn, _ctx):
         item = _expire(conn, triage.STATE_VERDICT, "sig-dl-verdict")

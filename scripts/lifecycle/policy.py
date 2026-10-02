@@ -77,7 +77,7 @@ def valid_origin(*, channel: str | None = None, thread_ts: str | None = None,
 
 def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, repo: str, tier: str) -> str:
     """Port of the retired bash CLI's `require_auto_from_item` (639-705). Returns the
-    linked done investigate job id, or raises one of the nine refusals it
+    linked done investigate job id, or raises one of the refusals it
     names verbatim.
 
     A note on `authorized_by` (the gate `dispatch.open_episode()`/
@@ -144,16 +144,10 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
     if not isinstance(verdict_obj, dict):
         raise PolicyError(f"triage item {event_id_int}'s dispatch recorded no parseable verdict")
     next_action = str(verdict_obj.get("nextAction") or "")
-    confidence = str(verdict_obj.get("confidence") or "")
     if next_action != "implement":
         raise PolicyError(
             f"triage item {event_id_int}'s verdict says nextAction='{next_action}', not 'implement' — "
             "--auto-from-item only fires on an investigation that concluded implement is warranted"
-        )
-    if confidence != "high":
-        raise PolicyError(
-            f"triage item {event_id_int}'s verdict says confidence='{confidence}', not 'high' — a "
-            "medium/low-confidence verdict needs a human, not an unattended implement"
         )
     return job_id
 
