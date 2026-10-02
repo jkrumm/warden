@@ -100,15 +100,6 @@ def _cursor(conn, key: str, at: dt.datetime, value: str = "{}") -> None:
     )
 
 
-def _approval(conn, nonce: str, *, spent_at: dt.datetime | None) -> None:
-    conn.execute(
-        "INSERT INTO dispatch_approvals (nonce, verb, repo, tier, payload_hash, created_at, expires_at, spent_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (nonce, "implement", "r", "implement", "hash", _iso(dt.datetime.now(dt.timezone.utc)),
-         _iso(dt.datetime.now(dt.timezone.utc)), _iso(spent_at) if spent_at else None),
-    )
-
-
 def _operation(conn, op_id: str, *, event_id: int, kind: str = "implement", repo: str = "r",
               authorized_by: str = "auto-from-item", now: dt.datetime) -> None:
     conn.execute(
@@ -323,12 +314,10 @@ def test_metric3_null_with_history_reason_when_table_is_young():
 #
 # Schema 5's `operations` table makes the "unattended" qualifier derivable —
 # see state-log.md §46 Correction 1 and api.py's own docstring on this metric.
-# An item counts as unattended if none of the `operations` rows tied to its
-# event_id carries a `signed:` authorized_by. In production today this chain
-# has only ever produced the literal "auto-from-item" (state-log.md §46
-# Correction 1), so these seeds are what the real ledger would actually hold.
+# With the signed-approval gate gone, every item that entered `fixed` in the
+# window is unattended.
 
-def test_metric4_counts_a_fixed_item_with_no_signed_operation_as_unattended():
+def test_metric4_counts_a_fixed_item_as_unattended():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)
@@ -346,48 +335,23 @@ def test_metric4_counts_a_fixed_item_with_no_signed_operation_as_unattended():
     conn.close()
 
 
-def test_metric4_excludes_a_fixed_item_whose_operation_was_signed():
-    conn, _ = _fresh_conn()
-    now = dt.datetime.now(dt.timezone.utc)
-    _seed_old_history_anchor(conn, now)
-    _event(conn, 1, now)
-    _event(conn, 2, now, source="s2")
-    _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=1))
-    _transition(conn, 2, "implementing", "fixed", now - dt.timedelta(hours=1))
-    _operation(conn, "op1", event_id=1, authorized_by="auto-from-item", now=now - dt.timedelta(hours=2))
-    _operation(conn, "op2", event_id=2, authorized_by="signed:deadbeef", now=now - dt.timedelta(hours=2))
-    conn.commit()
-
-    history_since = api._item_transitions_history_since(conn)
-    m = api._metric_verified_unattended_fixes_per_week(conn, now, history_since)
-    assert m["fixed_in_window"] == 2, m
-    assert m["value"] == 1, "the signed-operation item must be excluded from the unattended count"
-    assert m["unattended_in_window"] == 1, m
-    conn.close()
-
-
 def test_metric4_counts_an_item_once_even_if_it_reaches_fixed_twice():
-    """The numerator is a count of ITEMS, and the signed set it is reduced
-    by is a set of ITEMS — so the `fixed` transitions must be DISTINCT on
-    event_id or the two sides count different things. An item can genuinely
-    enter `fixed` more than once in one window (`fixed` -> a failed liveness
-    probe reopens it to `new` -> `fixed` again), and without DISTINCT that
-    item would contribute 2 to the numerator while its signed operation
-    could only ever remove 1. That is the exact shape of the metric-1 defect
-    the Wave 2 boundary review caught (state-log.md §42 defect 1)."""
+    """The numerator is a count of ITEMS, so the `fixed` transitions must be
+    DISTINCT on event_id. An item can genuinely enter `fixed` more than once
+    in one window (`fixed` -> a failed liveness probe reopens it to `new` ->
+    `fixed` again) and still counts once."""
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)
     _event(conn, 1, now)
     _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=5))
     _transition(conn, 1, "new", "fixed", now - dt.timedelta(hours=1))
-    _operation(conn, "op1", event_id=1, authorized_by="signed:deadbeef", now=now - dt.timedelta(hours=6))
     conn.commit()
 
     history_since = api._item_transitions_history_since(conn)
     m = api._metric_verified_unattended_fixes_per_week(conn, now, history_since)
     assert m["fixed_in_window"] == 1, f"one item, twice fixed, counts once: {m}"
-    assert m["value"] == 0, f"its only operation was signed, so nothing is unattended: {m}"
+    assert m["value"] == 1, m
     conn.close()
 
 
@@ -690,7 +654,6 @@ def test_item_payload_full_shape():
     assert payload["transitions_total"] == 1
     assert payload["operations_total"] == 1
 
-    assert payload["approvals"] == []
     conn.close()
 
 
@@ -705,30 +668,6 @@ def test_item_payload_brief_truncated_at_2000_chars():
     payload = api.item_payload(conn, 1)
     assert payload["item"]["brief_truncated"] is True
     assert len(payload["item"]["brief"]) == 2000
-    conn.close()
-
-
-def test_item_payload_approval_linked_via_params_json_origin_event_id():
-    conn, _ = _fresh_conn()
-    now = dt.datetime.now(dt.timezone.utc)
-    _event(conn, 1, now)
-    _item(conn, 1, state="needs_human", now=now)
-    conn.execute(
-        "INSERT INTO dispatch_approvals (nonce, verb, repo, tier, payload_hash, created_at, expires_at, "
-        "params_json) VALUES (?,?,?,?,?,?,?,?)",
-        ("secret-nonce", "implement", "r", "implement", "hash", _iso(now), _iso(now),
-         json.dumps({"origin_event_id": 1, "why": "test"})),
-    )
-    conn.commit()
-
-    payload = api.item_payload(conn, 1)
-    assert len(payload["approvals"]) == 1, payload["approvals"]
-    approval = payload["approvals"][0]
-    assert approval["verb"] == "implement"
-    assert "nonce" not in approval
-    assert "stdin_text" not in approval
-    assert "context_text" not in approval
-    assert "params_json" not in approval
     conn.close()
 
 
@@ -901,7 +840,7 @@ def test_items_by_id_is_200_over_http():
     try:
         status, body = handle.get("/items/1")
         assert status == 200, body
-        for key in ("item", "event", "dispatches", "operations", "approvals", "transitions"):
+        for key in ("item", "event", "dispatches", "operations", "transitions"):
             assert key in body, f"missing {key}"
     finally:
         handle.stop()

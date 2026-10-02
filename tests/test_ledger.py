@@ -153,16 +153,16 @@ def _row_counts(conn: sqlite3.Connection, tables) -> dict[str, int]:
 def test_fresh_migrate_creates_all_tables_and_indexes():
     conn = ledger.connect(_tmp_path(), migrate=True)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    for t in ("events", "cursors", "dispatches", "dispatch_approvals", "triage_items", "schema_version",
+    for t in ("events", "cursors", "dispatches", "triage_items", "schema_version",
               "item_transitions", "operations"):
         assert t in tables, f"missing table {t}"
+    assert "dispatch_approvals" not in tables, "the signed-approval table is gone from the fresh schema"
     indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
     expected = {
         "idx_events_open",
         "idx_events_resolved_at",
         "idx_dispatches_open",
         "idx_dispatches_created",
-        "idx_approvals_hash",
         "idx_triage_state",
         "idx_triage_state_deadline",   # version 2
         "idx_item_transitions_event",  # version 4
@@ -822,6 +822,44 @@ def test_v9_database_migrates_to_v10_matching_a_fresh_one():
     for table in ledger._VERSIONED_TABLES:
         assert _table_columns(fresh, table) == _table_columns(conn, table), (
             f"{table}: a v9-upgraded schema diverges from a fresh one")
+    fresh.close()
+    conn.close()
+
+
+def test_v11_database_migrates_to_v12_without_dispatch_approvals():
+    """Migration 12 drops the signed-approval table and its index from a real
+    v11 ledger (the one place it still exists), leaves every other table and
+    row alone, and lands on a schema identical to a fresh database's."""
+    path = _tmp_path()
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    for version in range(2, 12):
+        conn.executescript(ledger.MIGRATIONS[version])
+    # What a live v11 ledger carries and a fresh one no longer creates.
+    conn.executescript(
+        "CREATE TABLE dispatch_approvals (nonce TEXT PRIMARY KEY, payload_hash TEXT NOT NULL);"
+        "CREATE INDEX idx_approvals_hash ON dispatch_approvals(payload_hash);"
+        "INSERT INTO dispatch_approvals(nonce, payload_hash) VALUES ('n1', 'h1');"
+    )
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (11, 'test')")
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) "
+        "VALUES ('pre-v12-job','investigate','r','b','done','2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 12 == ledger.LEDGER_SCHEMA_VERSION
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    assert "dispatch_approvals" not in names and "idx_approvals_hash" not in names, names
+    assert conn.execute("SELECT COUNT(*) FROM dispatches WHERE job_id='pre-v12-job'").fetchone()[0] == 1
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    for table in ledger._VERSIONED_TABLES:
+        assert _table_columns(fresh, table) == _table_columns(conn, table), (
+            f"{table}: a v11-upgraded schema diverges from a fresh one")
     fresh.close()
     conn.close()
 

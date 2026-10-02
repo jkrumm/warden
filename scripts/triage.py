@@ -46,7 +46,7 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                     deliberately — see classify()'s own docstring for the
                     family it froze when it ran first. Only ever touches a row
                     still in state `new`.
-  -1. Reconcile   — runs FIRST, before even Drain, over `operations` rows
+  -1. Reconcile   — runs FIRST, over `operations` rows
                    with `outcome IS NULL` — an operation this process
                    recorded as STARTED (before the external call it covers:
                    `hermes-cc.sh dispatch --tier implement` or
@@ -63,13 +63,6 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    reconciled before any retry — never silently read as
                    failure." Must run before anything else in THE LOOP
                    could act on the item underneath an in-flight operation.
-  0. Drain        — apply anything a surface spooled into ~/.warden/intents
-                   since the last pass (see drain_intents() and
-                   scripts/intents.py). The loop is the BACKSTOP drainer, not
-                   the only one: the Slack approval plugin drains synchronously
-                   because a click must land before `hermes-cc.sh --confirm`
-                   runs. This is what stops an intent nobody else drained from
-                   sitting in the spool forever.
   4. Resolve      — an event whose events.resolved_at is now set flips its
                    triage_items row to `quiet` — but ONLY a row still in
                    `new`. events.resolved_at is set by disappearance from
@@ -126,7 +119,7 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    this same pass's own Push step reflects the outcome — see
                    apply_argo_actions().
   10. Push        — the last step of every pass: POST the whole projection
-                   (health, metrics, board, intents) to Argo's
+                   (health, metrics, board) to Argo's
                    `/warden/snapshot`, because Argo cannot reach this box to
                    probe it directly. The ledger stays the one source of
                    truth; Argo only ever holds a pushed-to projection of it.
@@ -253,10 +246,9 @@ it runs for real even under --dry-run: that is what lets a dry run against a
 throwaway copy of watchdog.db print a meaningful "what would be carded and
 dispatched" preview instead of nothing at all.
 
-Three steps are carve-outs that do NOT run under --dry-run, each for its own
-stated reason: drain_intents() (the spool is not part of the database),
-sweep_deadlines() (it can move an item TERMINALLY, and a preview must not be
-able to end an item), and reconcile_operations() (both of its branches
+Two steps are carve-outs that do NOT run under --dry-run, each for its own
+stated reason: sweep_deadlines() (it can move an item TERMINALLY, and a preview
+must not be able to end an item), and reconcile_operations() (both of its branches
 shell out — see the paragraph above; a preview that cannot ask sideclaw or
 GitHub what happened has nothing to reconcile with, and guessing is the one
 thing that function exists not to do).
@@ -287,7 +279,7 @@ from typing import Any, NamedTuple
 
 # scripts/ (this file's own directory) onto sys.path so `clients` and
 # `lifecycle` are importable as real packages — this file otherwise loads
-# every sibling by path (see the ledger.py/intents.py/slack_client.py loads
+# every sibling by path (see the ledger.py/slack_client.py loads
 # below), but those two are packages with their own internal `from . import`
 # and `from clients import` statements, which only work through a normal
 # import, not exec_module().
@@ -304,7 +296,6 @@ from clients.errors import (  # noqa: E402
     WardenError,
 )
 from lifecycle import (  # noqa: E402
-    approvals as _approvals,
     chaos as _chaos,
     dispatch as _dispatch,
     merge as _merge,
@@ -1203,8 +1194,7 @@ PROPOSE_MAPPINGS_MODEL = os.environ.get("TRIAGE_PROPOSE_MODEL", "deepseek-v4.1-f
 # silently pin the old model. Setting the env var (the operator escape hatch)
 # restores a per-tier override; a Claude id would land the episode on
 # sideclaw's Max-backed JUDGE route, caught loudly by the loop below. Manual
-# `warden run --model` calls and Slack approval-click dispatches carry their
-# own model and are unaffected; step-7 review validation carries its own
+# `warden run --model` calls carry their own model and are unaffected; step-7 review validation carries its own
 # knob, TRIAGE_VALIDATION_DISPATCH_MODEL below.
 AUTO_DISPATCH_MODEL = os.environ.get("TRIAGE_AUTO_DISPATCH_MODEL") or None
 
@@ -1276,21 +1266,7 @@ assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
 _ledger = importlib.util.module_from_spec(_ledger_spec)
 _ledger_spec.loader.exec_module(_ledger)
 
-# scripts/intents.py — same by-path load, same reason. The loop is the backstop
-# drainer: a surface that spools an intent may be unable to drain it (Argo has
-# no ledger access at all by design), and the one that CAN — the Slack approval
-# plugin, which drains synchronously because a click must take effect before
-# `hermes-cc.sh --confirm` runs — can still fail at it. Without a drain here an
-# intent nobody drained sits in the spool forever, which is precisely the silent
-# discard this control plane exists to remove. DESIGN.md § The ledger: "intents
-# go through the loop's queue."
-_INTENTS_PATH = Path(__file__).resolve().parent / "intents.py"
-_intents_spec = importlib.util.spec_from_file_location("intents", _INTENTS_PATH)
-assert _intents_spec and _intents_spec.loader, "Failed to load scripts/intents.py"
-_intents = importlib.util.module_from_spec(_intents_spec)
-_intents_spec.loader.exec_module(_intents)
-
-# scripts/api.py — same by-path load as ledger.py/intents.py above. Its
+# scripts/api.py — same by-path load as ledger.py above. Its
 # `health_payload()`/`metrics_payload()`/`board_payload()`/`item_payload()`
 # take an already-open connection and return a plain dict; importing it has
 # no side effect beyond that (its HTTP server only starts behind `main()`'s
@@ -1302,52 +1278,6 @@ _api_spec = importlib.util.spec_from_file_location("warden_api", _API_PATH)
 assert _api_spec and _api_spec.loader, "Failed to load scripts/api.py"
 _api = importlib.util.module_from_spec(_api_spec)
 _api_spec.loader.exec_module(_api)
-
-
-def drain_intents(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
-    """Step 0 — apply anything a surface spooled since the last pass, then
-    retry any signed approval that decided `approve` but never spent (a
-    prior spend refused on the per-repo in-flight lock — see
-    lifecycle/approvals.py's `pending_approved()`).
-
-    Runs FIRST, before ingest(), so a decision recorded between two passes is
-    already on the row by the time anything in this file reads state.
-
-    Under --dry-run this reports and does nothing — never drains, never
-    spends — which is a DEPARTURE from this file's usual "local bookkeeping
-    runs for real" rule (apply_resolutions, classify). The reason is that
-    the spool is not part of the database: a dry-run is pointed at a COPY of
-    the ledger, but there is only one ~/.warden/intents, so draining here
-    would consume — permanently — intents the live loop still needs, and
-    apply them to a database nobody reads. Spending an approval is the same
-    shape of one-way door: it opens a real sideclaw episode. The dry-run
-    contract is "never touches Slack, never shells out, never calls a
-    remote service"; eating the live system's queue or spending a live
-    approval is worse than either.
-    """
-    if dry_run:
-        pending = sorted(_intents.INTENTS_DIR.glob("*.json")) if _intents.INTENTS_DIR.exists() else []
-        if pending:
-            print(f"[dry-run] would drain {len(pending)} spooled intent(s) (skipped under --dry-run)")
-        approved = _approvals.pending_approved(conn, now)
-        if approved:
-            print(f"[dry-run] would retry {len(approved)} decided-approve, unspent approval(s) "
-                  f"(skipped under --dry-run)")
-        return
-    result = _intents.drain(conn)
-    if result["applied"] or result["rejected"]:
-        print(f"triage: drained {result['applied']} intent(s), "
-              f"rejected {result['rejected']}", file=sys.stderr)
-
-    for row in _approvals.pending_approved(conn, now):
-        try:
-            spend = _approvals.execute_approved(conn, row["nonce"], now=now)
-        except WardenError as e:
-            print(f"triage: retrying approval {row['nonce']} raised: {e}", file=sys.stderr)
-            continue
-        print(f"triage: approval retry {row['nonce']}: {spend.status}"
-              + (f" (job {spend.job_id})" if spend.job_id else "")
-              + (f" — {spend.reason}" if spend.reason else ""), file=sys.stderr)
 
 
 def db_connect() -> sqlite3.Connection:
@@ -1378,7 +1308,7 @@ def _apply_db_override(argv: list[str]) -> None:
 # --- resolve_slack_token() -----------------------------------------------
 #
 # Now lives in scripts/slack_client.py, loaded by path — the same mechanism
-# the ledger.py/intents.py loads above use (the sibling filenames here are
+# the ledger.py load above uses (the sibling filenames here are
 # not importable, and this repo's convention is to load every sibling that
 # way, including the ones that would technically import). `resolve_slack_token`
 # is re-bound as a plain module global immediately below so it stays a thin
@@ -4669,8 +4599,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 # calling `_operations.record`/`.complete` at every call site) because
 # api.py and this file's own tests still reference them by name, and
 # `event_id` stays a required `int` here (never `int | None`) — every
-# caller in this file always has a real triage_items.event_id to hand,
-# unlike lifecycle/approvals.py's signed-approval path, which may not.
+# caller in this file always has a real triage_items.event_id to hand.
 _OPERATION_KINDS = _operations.KINDS
 _OPERATION_OUTCOMES = _operations.OUTCOMES
 
@@ -4784,8 +4713,8 @@ _MERGE_RETRY_CAP = 1
 
 def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
-    """Step -1 (see the module docstring) — runs FIRST in run(), before even
-    drain_intents(). Every `operations` row with `outcome IS NULL` is an
+    """Step -1 (see the module docstring) — runs FIRST in run(), before
+    anything else. Every `operations` row with `outcome IS NULL` is an
     operation this process recorded as STARTED (record_operation(), before
     the external call it covers) but never recorded the result of — either a
     genuine process crash, or a call site (maybe_auto_implement(),
@@ -7924,82 +7853,6 @@ ARGO_SNAPSHOT_ITEMS_CAP = 50
 # ~780B/tick, 232KB before this cap). See item_payload()'s own docstring.
 ARGO_SNAPSHOT_HISTORY_LIMIT = 50
 
-# `rejected/` is never cleaned (intents.py's own "nothing is silently
-# discarded" docstring) — so unlike `pending`, which drains to near-zero
-# every pass, `rejected` only ever grows. Without a per-status cap here the
-# whole snapshot — health/metrics/board included, not just intents — would
-# eventually cross clients.argo.MAX_BODY_BYTES and Argo would silently stop
-# receiving ANY of it. `pending`/`rejected` below stay full, honest counts;
-# only `entries` (the per-file detail) is capped.
-ARGO_SNAPSHOT_INTENTS_CAP = 20
-
-
-def _argo_intents_snapshot() -> dict[str, Any]:
-    """The spooled-intent state Argo cannot otherwise see: files still
-    waiting for this loop's own drain (INTENTS_DIR), and files a previous
-    drain already rejected (parked in `intents.REJECTED_SUBDIR`, never
-    deleted — see intents.py's own docstring). Reads the spool directly,
-    the same glob drain_intents()'s own --dry-run branch already uses.
-
-    Never ships `signature`/`nonce` — the two fields that carry authority in
-    an `approval_decision` intent — and never ships a rejected file's `.err`
-    content at all: `intents.py`'s own validators embed the raw offending
-    value (a fake signature, a nonce) directly in that exception text (see
-    `_validate_approval_decision()`), so even a single line of it is not
-    safe to publish. `has_error` (a bool) is all a rejected entry carries
-    about its own failure."""
-    pending_dir = _intents.INTENTS_DIR
-    rejected_dir = pending_dir / _intents.REJECTED_SUBDIR
-
-    def _entry(path: Path, *, status: str) -> dict[str, Any]:
-        try:
-            intent = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            intent = {}
-        entry: dict[str, Any] = {
-            "file": path.name,
-            "kind": intent.get("kind"),
-            "created_at": intent.get("created_at"),
-            "source": intent.get("source"),
-            "status": status,
-        }
-        if "decision" in intent:
-            entry["decision"] = intent["decision"]
-        if status == "rejected":
-            entry["has_error"] = path.with_name(path.name + ".err").exists()
-        return entry
-
-    def _files(directory: Path) -> list[Path]:
-        return [p for p in directory.glob("*.json") if p.is_file()] if directory.exists() else []
-
-    def _newest_first(paths: list[Path]) -> list[Path]:
-        # mtime, not the filename's own timestamp prefix: drain() moves a
-        # rejected file with os.replace(), which preserves the original
-        # spool name (and its lexical/chronological order) but this is a
-        # SEPARATE directory being read fresh each pass, so mtime is the one
-        # honest "most recently landed here" ordering for either directory.
-        return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
-
-    pending_files = _files(pending_dir)
-    rejected_files = _files(rejected_dir)
-    pending_entries = [
-        _entry(p, status="pending")
-        for p in _newest_first(pending_files)[:ARGO_SNAPSHOT_INTENTS_CAP]
-    ]
-    rejected_entries = [
-        _entry(p, status="rejected")
-        for p in _newest_first(rejected_files)[:ARGO_SNAPSHOT_INTENTS_CAP]
-    ]
-    return {
-        "pending": len(pending_files),
-        "rejected": len(rejected_files),
-        "entries": pending_entries + rejected_entries,
-        "entriesTruncated": (
-            len(pending_files) > ARGO_SNAPSHOT_INTENTS_CAP or len(rejected_files) > ARGO_SNAPSHOT_INTENTS_CAP
-        ),
-    }
-
-
 # The five owner-facing verbs Argo's own action queue may ever name — a
 # closed set for the same reason VERB_ALLOWLIST/HOST_VERB_ALLOWLIST are: the
 # string reaches a dispatcher below that branches on it, and an unrecognized
@@ -8311,7 +8164,6 @@ def build_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
         "board": board,
         "items": items,
         "itemsTruncated": len(board["items"]) > ARGO_SNAPSHOT_ITEMS_CAP,
-        "intents": _argo_intents_snapshot(),
     }
 
 
@@ -8355,16 +8207,14 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     now = dt.datetime.now(dt.timezone.utc)
     policy = load_policy()
 
-    # Step -1 — MUST run before anything else in this pass, including
-    # drain_intents(): an item sitting under an in-flight operation (a
-    # process that crashed, or an ambiguous hermes-cc.sh return the call
+    # Step -1 — MUST run before anything else in this pass: an item sitting
+    # under an in-flight operation (a process that crashed, or an ambiguous hermes-cc.sh return the call
     # site deliberately left unresolved) must be reconciled before any
     # poller gets a chance to retry the same external call. See
     # reconcile_operations()'s own docstring and the module docstring's
     # step -1.
     reconcile_operations(conn, policy, now, dry_run=dry_run)
 
-    drain_intents(conn, now, dry_run=dry_run)
     # Never takes the tick down: the audit reports on the loop, it must not
     # be able to stop it (§102).
     try:

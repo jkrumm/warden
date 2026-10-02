@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
 # verdict schemas and are asserted per job by assert_result_schema and by
 # `make check-schemas` — two independent pins that must never be conflated.
-LEDGER_SCHEMA_VERSION = 11
+LEDGER_SCHEMA_VERSION = 12
 
 
 class LedgerBehind(RuntimeError):
@@ -143,26 +143,6 @@ CREATE TABLE IF NOT EXISTS dispatches (
 );
 CREATE INDEX IF NOT EXISTS idx_dispatches_open ON dispatches(status) WHERE reported_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_dispatches_created ON dispatches(created_at);
-
-CREATE TABLE IF NOT EXISTS dispatch_approvals (
-    nonce TEXT PRIMARY KEY,
-    verb TEXT NOT NULL,
-    repo TEXT NOT NULL,
-    tier TEXT NOT NULL,
-    payload_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    channel TEXT,
-    decision TEXT,
-    decided_at TEXT,
-    decided_by TEXT,
-    signature TEXT,
-    spent_at TEXT,
-    argv_json TEXT,
-    stdin_text TEXT,
-    context_text TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_approvals_hash ON dispatch_approvals(payload_hash);
 
 CREATE TABLE IF NOT EXISTS triage_items (
   event_id      INTEGER PRIMARY KEY REFERENCES events(id),
@@ -284,13 +264,7 @@ CREATE INDEX IF NOT EXISTS idx_item_transitions_event ON item_transitions(event_
 # Version 5 — `operations`, the crash-recovery unit DESIGN.md § Crash recovery
 # calls for: "an operation id recorded before dispatch... unknown is an
 # explicit outcome, reconciled before any retry — never silently read as
-# failure." docs/history/state-log.md §46 Correction 1 is why this hangs off its OWN table
-# rather than `dispatch_approvals`: the unattended door (--auto-from-item) can
-# never produce an approval row (`mint_approval` has one call site, behind
-# PLANNED=1, and `awaiting_confirm()` is false whenever AUTO_FROM_ITEM is set —
-# the two doors are mutually exclusive by construction), so attribution has to
-# live somewhere BOTH doors write, and this repo writes this table itself, on
-# both doors, rather than depending on the CLI to own a third table.
+# failure."
 #
 # `outcome IS NULL` means "in flight" — an operation this process recorded as
 # STARTED but has not yet recorded the result of, whether because it crashed
@@ -378,52 +352,16 @@ UPDATE dispatches
    AND delivery_status IS NULL;
 """
 
-# Version 7 — Wave 5.2 (the policy/dispatch/approval port). Four columns, two
-# tables, for two unrelated reasons that happen to land in the same migration:
-#
-#   dispatch_approvals.key_id        the signer.key_id() of the public key that
-#     was live at MINT time, so `execute_approved()` (scripts/lifecycle/
-#     approvals.py) can tell a genuinely forged/tampered row ("invalid") from
-#     one signed correctly under a gateway key that has since rotated
-#     ("superseded") — the two read identically from `verify()` alone (both are
-#     "does not verify against the CURRENT key"), and only one of them means
-#     the approval was ever real. NULL for every pre-Wave-5.2 row: the bash
-#     mint_approval() never recorded a key id, so those rows fall back to the
-#     "invalid" branch rather than "superseded" — a harmless conservatism,
-#     since nothing minted before this migration is still a live approval by
-#     the time it ships.
-#
-#   dispatch_approvals.params_json   the CLOSED parameter dict the spend
-#     replays: why, model, origin_channel, origin_thread_ts, origin_event_id.
-#     `argv_json` (version 1) stays exactly what it always was — the bash
-#     invocation's own argv, kept as an audit copy of the command line that
-#     was approved. It is not what execute_approved() reads to reopen the
-#     episode, because there is no argv to replay anymore: `params_json` is
-#     the structured, closed equivalent for the Python spend path.
-#
-#   dispatch_approvals.spent_job_id  the sideclaw job id the spend actually
-#     opened, once it opens one. Distinct from `spent_at` (version 1): a row
-#     can be spent (its single use consumed, `spent_at` set) without ever
-#     reaching a job id, if `open_episode()`'s submit itself failed after the
-#     spend committed — see approvals.py's `execute_approved()` for why the
-#     spend and the operations-row commit happen in one transaction BEFORE the
-#     submit is attempted, not after.
-#
-#   dispatch_approvals.spend_error   why the LAST spend attempt did not open a
-#     job, for an approval that is not yet (or never) spent. A budget refusal
-#     at spend time leaves the approval retryable until `expires_at` — see
-#     execute_approved()'s docstring — and this column is what a human or the
-#     next sweep pass reads to know why, instead of a silent "still pending".
+# Version 7 — Wave 5.2 (the policy/dispatch port).
 #
 #   triage_items.revert_pr           `warden revert <item>` (Wave 5.3, not yet
 #     built) records the revert PR's URL here. Added now, alongside the other
 #     lifecycle columns, so a single migration covers both of Wave 5's halves
 #     rather than forcing a Wave-5.3-only schema bump for one column.
+#
+# (This migration also used to add four columns to `dispatch_approvals`; that
+# table is gone — see version 12 — so they are not replayed here.)
 _MIGRATION_7 = """
-ALTER TABLE dispatch_approvals ADD COLUMN key_id TEXT;
-ALTER TABLE dispatch_approvals ADD COLUMN params_json TEXT;
-ALTER TABLE dispatch_approvals ADD COLUMN spent_job_id TEXT;
-ALTER TABLE dispatch_approvals ADD COLUMN spend_error TEXT;
 ALTER TABLE triage_items ADD COLUMN revert_pr INTEGER;
 """
 
@@ -546,6 +484,14 @@ ALTER TABLE triage_items ADD COLUMN parked_recurrences INTEGER NOT NULL DEFAULT 
 ALTER TABLE triage_items ADD COLUMN recurrence_reminded_at TEXT;
 """
 
+# Version 12 — the signed-approval stack is deleted (agent-platform.md §Warden:
+# review is the gate, not a Slack click). `dispatch_approvals` and its index held
+# nothing the loop reads any more; nothing replaces them.
+_MIGRATION_12 = """
+DROP INDEX IF EXISTS idx_approvals_hash;
+DROP TABLE IF EXISTS dispatch_approvals;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -558,13 +504,14 @@ MIGRATIONS: dict[int, str] = {
     9: _MIGRATION_9,
     10: _MIGRATION_10,
     11: _MIGRATION_11,
+    12: _MIGRATION_12,
 }
 
-# The five tables BASE_SCHEMA declares, i.e. what "this is the live
+# The four tables BASE_SCHEMA declares, i.e. what "this is the live
 # pre-versioned ledger" looks like from the outside. Used only by the
 # adoption check in migrate() — never by connect()/assert_schema_version(),
 # which only ever look at schema_version itself.
-_ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "dispatch_approvals", "triage_items")
+_ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "triage_items")
 
 # Every table this schema declares AT LEDGER_SCHEMA_VERSION, used only by
 # _expected_columns()/_verify_columns() — deliberately a DIFFERENT set from
@@ -609,9 +556,9 @@ def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-# Public alias — scripts/intents.py and scripts/lifecycle/operations.py used
-# to carry byte-identical zero-arg copies of this; both now call this one
-# instead of hand-mirroring it. (scripts/lifecycle/items.py's and
+# Public alias — scripts/lifecycle/operations.py used to carry a
+# byte-identical zero-arg copy of this; it now calls this one instead of
+# hand-mirroring it. (scripts/lifecycle/items.py's and
 # scripts/triage.py's own `_now_iso(now)` take an argument and are
 # deliberately NOT this function — see the one-line comment on each.)
 now_iso = _now_iso
@@ -660,7 +607,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     1. A genuinely fresh database — nothing exists yet. Run BASE_SCHEMA.
     2. THE LIVE LEDGER, adopted for the first time. `schema_version` has
        never existed because nothing before this module ever wrote one, but
-       `events`, `cursors`, `dispatches`, `dispatch_approvals` and
+       `events`, `cursors`, `dispatches` and
        `triage_items` are already there, already carrying the columns that
        used to arrive via a runtime ALTER TABLE, already holding real rows
        going back months. This is the NORMAL case this module was written
@@ -672,10 +619,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     `IF NOT EXISTS` and would therefore be a no-op against a table whose
     columns already match, "no-op today" is not the guarantee this function
     exists to make — the guarantee is that adopting a live database is a
-    pure read (three queries: does schema_version exist, do the five tables
+    pure read (three queries: does schema_version exist, do the four tables
     exist, what version do we stamp) plus one small, well-understood write
     (create schema_version, stamp it to 1). Nothing here drops, recreates or
-    rewrites a single one of the five business tables. Case 2 is detected
+    rewrites a single one of the four business tables. Case 2 is detected
     and handled BEFORE the migration loop below ever runs, and returns
     immediately.
 
@@ -754,10 +701,10 @@ def _verify_columns(conn: sqlite3.Connection) -> None:
     """Refuse a database that is stamped but structurally incomplete.
 
     Adoption (case 2 in `_run_migrations`) decides on TABLE PRESENCE alone —
-    all five tables exist, so this is the live ledger, stamp it and touch
+    all four tables exist, so this is the live ledger, stamp it and touch
     nothing. That is the right call for the ledger this module was written to
     adopt, whose columns were verified to match exactly. It is the wrong call
-    for a database where the five tables exist but one of them predates a
+    for a database where the four tables exist but one of them predates a
     column that arrived through a runtime ALTER TABLE on some other machine:
     adoption would stamp it version 1, every later query would be reading a
     schema that is not there, and the failure would surface as a bare
@@ -924,7 +871,7 @@ def snapshot(conn: sqlite3.Connection, dest: Path | str) -> Path:
 #
 # So a process that is NOT warden can prepare or check a ledger without carrying
 # its own copy of the schema. That is not a convenience: the CLI owns two
-# of the five tables and still writes them, and the only alternative to this door
+# of the four tables and still writes them, and the only alternative to this door
 # is the one that was there before — a second, unversioned migrator running
 # `executescript` on every connect, which is the exact defect this module exists
 # to remove. A shell script cannot import a Python module; it can run one.

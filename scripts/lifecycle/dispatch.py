@@ -4,10 +4,8 @@ record (the Python port of the retired bash CLI's `read_brief`/`read_context`
 1557-1585, and the submit half of `cmd_dispatch` 1395-1414).
 
 `open_episode()` is the one function in this module that did not exist in
-the bash script in this shape: the old `--confirm` re-invocation is gone
-(docs/history/state-log.md §46), so opening the sideclaw episode for a signed approval now
-happens in-process, in `lifecycle/approvals.py`'s `execute_approved()`,
-which calls this function rather than re-running a CLI.
+the bash script in this shape: it submits the sideclaw episode in-process,
+with no approval step in front of it.
 """
 
 from __future__ import annotations
@@ -107,22 +105,19 @@ def open_episode(
     model: str | None,
     origin: Origin,
     authorized_by: str | None,
-    op_id: str | None = None,
     now: dt.datetime | None = None,
 ) -> Opened:
     """Submit one sideclaw episode and record it.
 
     A gated tier (`implement`) is covered by an `operations` row committed
-    BEFORE the submit — DESIGN.md § Crash recovery. If the caller has not
-    already recorded one (the signed-approval spend records its own, in the
-    same transaction as `spent_at`, and passes `op_id` in), one is minted
-    here; `authorized_by` is required in that case."""
+    BEFORE the submit — DESIGN.md § Crash recovery. `authorized_by` is the
+    audit label that row records and is required for a gated tier."""
     policy.require_no_recursion()
     now = now or dt.datetime.now(dt.timezone.utc)
     gated = tier in policy.GATED_TIERS
 
-    opened_op_id = op_id
-    if gated and opened_op_id is None:
+    opened_op_id = None
+    if gated:
         if not authorized_by:
             raise ValueError("authorized_by is required to open a gated episode")
         # check_repo_not_in_flight() is a bare SELECT; the operations row

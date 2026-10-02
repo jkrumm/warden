@@ -9,8 +9,7 @@ thin argument-parsing and JSON-rendering layer over `scripts/clients/` and
 `python3 -c '...'` fragments.
 
 VERBS
-  dispatch <repo>    open a BARE episode, no item (brief on stdin, never argv);
-                     its own --tier implement path is the Slack-click approval door
+  dispatch <repo>    open a BARE episode, no item (brief on stdin, never argv)
   run <repo>         open an ITEM riding the alert lifecycle (investigate first,
                      implement only if the verdict says so and policy allows;
                      brief on stdin) — the intake for a human or for Hermes
@@ -57,7 +56,7 @@ import ledger  # noqa: E402
 import triage  # noqa: E402
 from clients import github, sideclaw  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError, WardenError  # noqa: E402
-from lifecycle import approvals, dispatch, items, merge, operations, policy  # noqa: E402
+from lifecycle import dispatch, items, merge, operations, policy  # noqa: E402
 
 WAIT_TIMEOUT = 170
 WAIT_INTERVAL = 5
@@ -307,42 +306,6 @@ def _parse_int(text: str | None, label: str) -> int:
     return int(text)
 
 
-def _sanitized_argv(original_argv: list[str]) -> list[str]:
-    """The argv a mint stores for audit purposes: the original invocation
-    minus the --brief-file/--context-file operands (their bytes are stored
-    separately, as stdin_text/context_text), plus --json."""
-    out: list[str] = []
-    skip_next = False
-    for a in original_argv:
-        if skip_next:
-            skip_next = False
-            continue
-        if a in ("--brief-file", "--context-file"):
-            skip_next = True
-            continue
-        if a.startswith("--brief-file=") or a.startswith("--context-file="):
-            continue
-        out.append(a)
-    if "--json" not in out:
-        out.append("--json")
-    return out
-
-
-def _approval_params(flags: Flags, origin_event: int | None) -> dict[str, Any]:
-    params: dict[str, Any] = {}
-    if flags.why:
-        params["why"] = flags.why
-    if flags.model:
-        params["model"] = flags.model
-    if flags.origin_channel:
-        params["origin_channel"] = flags.origin_channel
-    if flags.origin_thread:
-        params["origin_thread_ts"] = flags.origin_thread
-    if origin_event is not None:
-        params["origin_event_id"] = origin_event
-    return params
-
-
 def _read_brief(flags: Flags) -> str:
     if flags.brief_file:
         p = Path(flags.brief_file)
@@ -370,30 +333,20 @@ def _read_context(flags: Flags) -> str | None:
 
 
 def _plan_payload(
-    conn, *, name: str, tier: str, target: policy.RepoTarget, brief: str, why: str | None,
-    needs_confirm: bool, now: dt.datetime,
+    conn, *, name: str, tier: str, target: policy.RepoTarget, brief: str, now: dt.datetime,
 ) -> dict[str, Any]:
-    note = "nothing ran — no episode was opened"
-    if needs_confirm:
-        note += (
-            ". This tier is GATED: an approval request is posted to Slack (if --origin-channel was "
-            "given) and Johannes must approve it there before anything runs. Passing --confirm is not "
-            "possible on dispatch any more — approving happens in Slack."
-        )
     out: dict[str, Any] = {
         "verb": "dispatch",
         "ok": True,
         "dryRun": True,
-        "needsConfirm": needs_confirm,
         "repo": name,
         "tier": tier,
         "repoMaxTier": target.max_tier,
         "cwd": str(target.path),
         "briefChars": len(brief),
-        "why": why or None,
         "wouldDo": _EFFECTS[tier],
         "wouldNeverDo": _NEVER,
-        "note": note,
+        "note": "nothing ran — no episode was opened",
     }
     return out
 
@@ -423,7 +376,7 @@ def _result_payload(
     return out
 
 
-def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, original_argv: list[str]) -> dict[str, Any]:
+def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
     if not positional:
         raise UsageError("usage: warden dispatch <repo> [--tier investigate] [--wait] [--json] <<'BRIEF' ... BRIEF")
     name = positional[0]
@@ -432,7 +385,7 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, origi
     require_backend()
 
     if flags.confirm:
-        raise UsageError("the Approve button in Slack runs an approved implement; --confirm is a merge flag")
+        raise UsageError("--confirm is a merge flag; dispatch has no confirmation step")
 
     target = policy.resolve_repo(name)
     tier = flags.tier or "investigate"
@@ -443,12 +396,6 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, origi
     if flags.auto_from_item:
         linked_job = policy.require_auto_from_item(conn, event_id=flags.auto_from_item, repo=name, tier=tier)
 
-    if tier in policy.GATED_TIERS and not flags.why:
-        raise UsageError(
-            f"tier '{tier}' requires --why \"<reason>\". It lands in the audit log and is the record of "
-            "why an unattended episode was allowed to write. There is no default."
-        )
-
     policy.valid_origin(channel=flags.origin_channel, thread_ts=flags.origin_thread, event_id=flags.origin_event)
     origin_event_int = int(flags.origin_event) if flags.origin_event else None
 
@@ -458,28 +405,15 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State, origi
     state.target = f"{name}:{tier}"
     now = dt.datetime.now(dt.timezone.utc)
 
-    needs_confirm = tier == "implement" and not flags.auto_from_item
-
     if flags.dry_run:
-        return _plan_payload(conn, name=name, tier=tier, target=target, brief=brief, why=flags.why,
-                              needs_confirm=needs_confirm, now=now)
-
-    if needs_confirm:
-        state.planned = True
-        approvals.mint(
-            conn, verb="dispatch", repo=name, tier=tier, body=brief, why=flags.why, context=context,
-            channel=flags.origin_channel, params=_approval_params(flags, origin_event_int),
-            argv=_sanitized_argv(original_argv),
-        )
-        return _plan_payload(conn, name=name, tier=tier, target=target, brief=brief, why=flags.why,
-                              needs_confirm=needs_confirm, now=now)
+        return _plan_payload(conn, name=name, tier=tier, target=target, brief=brief, now=now)
 
     if flags.auto_from_item:
         policy.check_repo_not_in_flight(conn, repo=name)
         authorized_by = f"triage:item-{flags.auto_from_item}:job-{linked_job}"
-        state.approved_by = authorized_by
     else:
-        authorized_by = None
+        authorized_by = "cli:dispatch"
+    state.approved_by = authorized_by
 
     origin = dispatch.Origin(
         channel=flags.origin_channel or None, thread_ts=flags.origin_thread or None, event_id=origin_event_int,
@@ -533,8 +467,7 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
     (investigating -> verdict -> auto-implement -> validating -> merged ->
     ...), starting at `investigate` and reaching `implement` only if the
     verdict says so AND policy allows it. `dispatch` stays the bare-episode,
-    no-item door — its own `--tier implement` path is the Slack-click
-    approval flow, unaffected by this verb. `run` is the intake for a human
+    no-item door. `run` is the intake for a human
     typing at a terminal and for Hermes answering in a Slack thread."""
     if not positional:
         raise UsageError(
@@ -992,12 +925,7 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
             print(f"  repo:  {out['repo']} ({out.get('cwd', '')})")
             print(f"  tier:  {out['tier']} (repo ceiling: {out.get('repoMaxTier')})")
             print(f"  brief: {out.get('briefChars')} chars")
-            if out.get("why"):
-                print(f"  why:   {out['why']}")
-            if out.get("needsConfirm"):
-                print("GATED — an approval request has been posted; nothing runs until Johannes approves it in Slack.")
-            else:
-                print("Re-invoke without --dry-run to open the episode.")
+            print("Re-invoke without --dry-run to open the episode.")
         elif out.get("waited"):
             _print_result_text(out)
         else:
@@ -1041,8 +969,7 @@ _HELP_TEXT = """\
 warden — the CLI over warden's lifecycle modules.
 
 VERBS
-  dispatch <repo>    open a BARE episode, no item (brief on stdin, never argv);
-                     its own --tier implement path is the Slack-click approval door
+  dispatch <repo>    open a BARE episode, no item (brief on stdin, never argv)
   run <repo>         open an ITEM riding the alert lifecycle (investigate first,
                      implement only if the verdict says so and policy allows;
                      brief on stdin) — the intake for a human or for Hermes
@@ -1108,7 +1035,7 @@ def main(argv: list[str]) -> int:
             raise PreconditionError(str(exc)) from exc
         try:
             if verb == "dispatch":
-                out = cmd_dispatch(conn, flags, rest, state, argv)
+                out = cmd_dispatch(conn, flags, rest, state)
             elif verb == "run":
                 out = cmd_run(conn, flags, rest, state)
             elif verb == "status":

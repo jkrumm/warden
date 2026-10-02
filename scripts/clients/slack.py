@@ -11,11 +11,6 @@ lifts that token resolver and a minimal `chat.postMessage` call out of
 triage.py so `dispatch-sweep.py` (and anything else in this repo) can use
 the exact same HTTP path instead of a second, gateway-dependent one.
 
-`hermes-agent/plugins/dispatch-approval/__init__.py`'s `_send_to_origin()`
-mirrors this module by hand rather than importing it — that plugin runs
-inside a different process, in a different repo, and this repo's modules
-are reached by local path, not a package it can depend on.
-
 stdlib only. Every function here either returns a value or raises and never
 prints, with one deliberate exception: `resolve_slack_token()` prints once
 per process when it falls back off Warden's own identity onto Hermes's — see
@@ -37,10 +32,9 @@ SLACK_POST_URL = "https://slack.com/api/chat.postMessage"
 
 
 def slack_api_base() -> str:
-    """`WARDEN_SLACK_API`, defaulting to Slack's own base — the same
-    override the retired bash CLI's `post_approval_buttons` read as
-    `WARDEN_SLACK_API`, so a test can point every Slack-facing call in
-    this module at a stub server without touching a second constant."""
+    """`WARDEN_SLACK_API`, defaulting to Slack's own base, so a test can
+    point every Slack-facing call in this module at a stub server without
+    touching a second constant."""
     return os.environ.get("WARDEN_SLACK_API", "https://slack.com/api")
 
 
@@ -93,16 +87,6 @@ def resolve_slack_token() -> str:
     return token
 
 
-def resolve_interactive_token() -> str:
-    """The identity for a message whose BUTTONS must work: Hermes's bot. Only
-    the Hermes app has socket mode and interactivity, and its gateway plugin
-    (hermes-agent `plugins/dispatch-approval/`) is what turns a click into a
-    signature. Warden's own app is `chat:write` only — buttons it posts go
-    nowhere, which is exactly what happened to every approval request from
-    2026-09-11 (Warden app live) to §101: posted, unclickable, expired."""
-    return resolve_secret("SLACK_BOT_TOKEN", _SLACK_TOKEN_REF)
-
-
 def slack_raw_post(url: str, payload: dict[str, Any], token: str, *,
                     timeout: int = 15) -> dict[str, Any] | None:
     """The bare `chat.*` POST that `scripts/triage.py`'s and
@@ -136,30 +120,6 @@ def slack_post_message(token: str, channel: str, text: str,
     `response.get("ok")` and never has to catch an exception from this
     function. Never raises."""
     payload: dict[str, Any] = {"channel": channel, "text": text}
-    if thread_ts:
-        payload["thread_ts"] = thread_ts
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        f"{slack_api_base()}/chat.postMessage", data=body,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
-            TimeoutError, OSError) as e:
-        return {"ok": False, "error": str(e)}
-
-
-def slack_post_blocks(token: str, channel: str, text: str, blocks: list[dict[str, Any]],
-                       thread_ts: str | None = None, *, timeout: int = 15) -> dict[str, Any]:
-    """POST `chat.postMessage` with Block Kit `blocks` alongside the plain
-    `text` fallback — the transport `mint()` (lifecycle/approvals.py) uses to
-    post the Approve/Deny buttons, the Python port of the retired bash CLI's
-    `post_approval_buttons` (977-1038). Same never-raises contract as
-    `slack_post_message`."""
-    payload: dict[str, Any] = {"channel": channel, "text": text, "blocks": blocks}
     if thread_ts:
         payload["thread_ts"] = thread_ts
     body = json.dumps(payload).encode()

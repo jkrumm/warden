@@ -9,17 +9,12 @@ migrated ledger, a sandboxed dispatch policy, and a single in-process
 a real network call, never the developer's own `~/.warden` or `~/.hermes`.
 
 This is a deliberately reduced port of the retired tests/test_hermes_cc.py
-(165 cases) and tests/test_dispatch_approval.py's CLI-facing half. Dropped
-outright, because the CLI itself dropped them:
+(165 cases). Dropped outright, because the CLI itself dropped them:
   - the `cancel` verb (sideclaw grew a real cancel endpoint; `abort` replaced
     it) and its `lost`/`queued` dispatch statuses.
-  - `--confirm` as a dispatch flag and the old shell-out "the Approve button
-    replays this exact command line" replay path — the Approve click now
-    drains an intent in-process (see the click-path tests below) rather than
-    re-invoking a CLI.
-Replaced with: `abort`/`revert` verb coverage, and a click-path test that
-exercises `scripts/intents.py --record`/`--drain` end to end against a
-plan this suite mints.
+  - `--confirm` as a dispatch flag, and the signed-approval gate on
+    `dispatch --tier implement` (it now submits directly).
+Replaced with: `abort`/`revert` verb coverage.
 
 Run: .venv/bin/python3 tests/test_warden_cli.py  (or: make test, from warden/)
 """
@@ -43,14 +38,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 import stubs  # noqa: E402
-from clients import signer  # noqa: E402
-
-from cryptography.hazmat.primitives import serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 WARDEN_BIN = REPO / "scripts" / "warden"
 LEDGER_PY = REPO / "scripts" / "ledger.py"
-INTENTS_PY = REPO / "scripts" / "intents.py"
 
 VALID_BRIEF = "Investigate why the check job keeps failing."
 
@@ -70,7 +60,6 @@ class Harness:
         self.pr_required_json = self._write_json(
             "pr-required.json", {"repos": []}
         )
-        self.no_such_pubkey = self.tmp / "no-such.pub"
         self.repos_json = self._write_repos_json()
         self.triage_policy_json = self._write_triage_policy()
 
@@ -134,7 +123,7 @@ class Harness:
 
     def base_env(self, *, db: Path | None = None, sideclaw: str | None = None,
                  gh: str | None = None, slack: str | None = None,
-                 log: Path | None = None, pubkey: Path | None = None) -> dict[str, str]:
+                 log: Path | None = None) -> dict[str, str]:
         return {
             "HOME": str(self.home),
             "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
@@ -148,7 +137,6 @@ class Harness:
             "WARDEN_SIDECLAW_BASE": sideclaw or f"http://127.0.0.1:{stubs.closed_port()}",
             "WARDEN_GH_API": gh or f"http://127.0.0.1:{stubs.closed_port()}",
             "WARDEN_SLACK_API": slack or f"http://127.0.0.1:{stubs.closed_port()}",
-            "WARDEN_APPROVAL_PUBKEY": str(pubkey or self.no_such_pubkey),
         }
 
     def run(self, args: list[str], *, env: dict[str, str] | None = None,
@@ -369,7 +357,7 @@ def test_denied_and_sensitive_repo_permits_investigate_only():
 
 def test_tier_over_repo_ceiling_is_refused():
     h = Harness()
-    proc = h.run(["dispatch", "alpha", "--tier", "implement", "--why", "w", "--json"], stdin=VALID_BRIEF)
+    proc = h.run(["dispatch", "alpha", "--tier", "implement", "--json"], stdin=VALID_BRIEF)
     out = _json_or_fail(proc)
     assert proc.returncode == 4 and "capped at tier" in out["error"], out
 
@@ -412,7 +400,7 @@ def test_audit_log_records_refused_dispatch():
     h = Harness()
     log = h.new_log("audit-refused")
     env = h.base_env(log=log)
-    h.run(["dispatch", "alpha", "--tier", "implement", "--why", "w", "--json"], env=env, stdin=VALID_BRIEF)
+    h.run(["dispatch", "alpha", "--tier", "implement", "--json"], env=env, stdin=VALID_BRIEF)
     line = log.read_text(encoding="utf-8").strip()
     assert "verb=dispatch" in line and "mode=refused" in line and "rc=4" in line, line
 
@@ -649,51 +637,38 @@ def test_status_non_terminal_record_with_pruned_job_is_remote_error():
     assert proc.returncode == 3 and "verdict is lost" in out["error"], out
 
 
-# --- write-tier gate: mint + Slack buttons ----------------------------------------
+# --- write-tier dispatch: no approval gate -----------------------------------------
 
 
-def test_implement_dispatch_mints_an_approval_and_posts_slack_buttons():
+def test_implement_dispatch_submits_directly_with_no_approval_or_slack():
     h = Harness()
     db = h.new_db()
-    priv, pub_hex = _keypair()
-    pubkey_path = h.tmp / "gate-dispatch-approval.pub"
-    pubkey_path.write_text(pub_hex + "\n", encoding="utf-8")
-    slack_srv = stubs.StubServer({("POST", "/chat.postMessage"): (200, {"ok": True, "ts": "1.1"})})
+    sideclaw_srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-impl", "status": "running"}})})
+    slack_srv = stubs.StubServer({("POST", "/chat.postMessage"): (200, {"ok": True})})
     try:
-        env = h.base_env(db=db, slack=slack_srv.base, pubkey=pubkey_path)
-        proc = h.run(
-            ["dispatch", "gamma", "--tier", "implement", "--why", "fix it", "--origin-channel", "C1234ABCD",
-             "--json"],
-            env=env, stdin=VALID_BRIEF,
-        )
+        env = h.base_env(db=db, sideclaw=sideclaw_srv.base, slack=slack_srv.base)
+        proc = h.run(["dispatch", "gamma", "--tier", "implement", "--json"], env=env, stdin=VALID_BRIEF)
         out = _json_or_fail(proc)
-        assert proc.returncode == 0 and out["needsConfirm"] is True and out["dryRun"] is True, out
-        assert len(slack_srv.requests) == 1, slack_srv.requests
-        assert slack_srv.requests[0]["body"]["blocks"][1]["elements"][0]["action_id"] == "hermes_cc_approve"
+        assert proc.returncode == 0 and out["jobId"] == "job-impl" and "dryRun" not in out, out
+        assert sideclaw_srv.requests[0]["body"]["params"]["brief"] == VALID_BRIEF
+        assert slack_srv.requests == [], slack_srv.requests
     finally:
+        sideclaw_srv.stop()
         slack_srv.stop()
 
     conn, _ = _connect(db)
-    row = _row(conn, "SELECT * FROM dispatch_approvals")
-    assert row is not None and row["repo"] == "gamma" and row["key_id"] == signer.key_id(pub_hex), (
-        dict(row) if row else None
-    )
+    op = _row(conn, "SELECT * FROM operations WHERE repo='gamma'")
+    assert op["kind"] == "implement" and op["authorized_by"] == "cli:dispatch" and op["outcome"] == "done", dict(op)
+    row = _row(conn, "SELECT tier, status FROM dispatches WHERE job_id='job-impl'")
+    assert row["tier"] == "implement", dict(row)
     conn.close()
 
 
 def test_confirm_flag_on_dispatch_is_usage_error():
     h = Harness()
-    proc = h.run(["dispatch", "gamma", "--tier", "implement", "--confirm", "--why", "w", "--json"],
-                  stdin=VALID_BRIEF)
+    proc = h.run(["dispatch", "gamma", "--tier", "implement", "--confirm", "--json"], stdin=VALID_BRIEF)
     out = _json_or_fail(proc)
     assert proc.returncode == 64 and "--confirm is a merge flag" in out["error"], out
-
-
-def test_implement_without_why_is_usage_error():
-    h = Harness()
-    proc = h.run(["dispatch", "gamma", "--tier", "implement", "--json"], stdin=VALID_BRIEF)
-    out = _json_or_fail(proc)
-    assert proc.returncode == 64 and "requires --why" in out["error"], out
 
 
 # --- auto-from-item ----------------------------------------------------------------
@@ -1091,83 +1066,6 @@ def test_missing_schema_is_precondition_error():
     proc = h.run(["list", "--json"], env=h.base_env(db=empty_db))
     out = _json_or_fail(proc)
     assert proc.returncode == 2, out
-
-
-# --- click path: plan -> sign -> intents.py --record/--drain -----------------------
-
-
-def _keypair():
-    priv = Ed25519PrivateKey.generate()
-    pub_hex = priv.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
-    ).hex()
-    return priv, pub_hex
-
-
-def test_click_path_drains_a_signed_approval_into_an_opened_episode():
-    h = Harness()
-    db = h.new_db()
-    priv, pub_hex = _keypair()
-    pubkey_path = h.tmp / "dispatch-approval.pub"
-    pubkey_path.write_text(pub_hex + "\n", encoding="utf-8")
-
-    slack_srv = stubs.StubServer({("POST", "/chat.postMessage"): (200, {"ok": True})})
-    try:
-        env = h.base_env(db=db, slack=slack_srv.base, pubkey=pubkey_path)
-        planned = h.run(
-            ["dispatch", "gamma", "--tier", "implement", "--why", "fix it", "--json"], env=env, stdin=VALID_BRIEF,
-        )
-    finally:
-        slack_srv.stop()
-    assert planned.returncode == 0, planned.stderr
-
-    conn, _ = _connect(db)
-    row = _row(conn, "SELECT * FROM dispatch_approvals")
-    nonce, payload_hash, expires_at = row["nonce"], row["payload_hash"], row["expires_at"]
-    assert row["stdin_text"] == VALID_BRIEF
-    conn.close()
-
-    message = signer.canonical_message(nonce, payload_hash, "approve", "U999", expires_at)
-    intent = {
-        "v": 1, "kind": "approval_decision", "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source": "test-click", "nonce": nonce, "decision": "approve", "decided_by": "U999",
-        "signature": priv.sign(message).hex(),
-    }
-
-    intents_env = {**h.base_env(db=db, pubkey=pubkey_path), "WARDEN_INTENTS_DIR": str(h.tmp / "intents")}
-    rec = subprocess.run(
-        [sys.executable, str(INTENTS_PY), "--record"], input=json.dumps(intent),
-        capture_output=True, text=True, env=intents_env,
-    )
-    assert rec.returncode == 0, rec.stderr
-
-    sideclaw_srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-click", "status": "running"}})})
-    try:
-        intents_env["WARDEN_SIDECLAW_BASE"] = sideclaw_srv.base
-        drained = subprocess.run(
-            [sys.executable, str(INTENTS_PY), "--drain", str(db)],
-            capture_output=True, text=True, env=intents_env,
-        )
-        assert drained.returncode == 0, drained.stderr
-        assert sideclaw_srv.requests[0]["body"]["params"]["brief"] == VALID_BRIEF
-
-        # A replay of an already-drained (now-gone) intent file opens nothing
-        # a second time — there is nothing left to drain, and re-running is a no-op.
-        replay = subprocess.run(
-            [sys.executable, str(INTENTS_PY), "--drain", str(db)],
-            capture_output=True, text=True, env=intents_env,
-        )
-        assert replay.returncode == 0 and replay.stdout.strip() == "applied=0 rejected=0", replay.stdout
-        assert len(sideclaw_srv.requests) == 1, "a replayed drain must never submit a second episode"
-    finally:
-        sideclaw_srv.stop()
-
-    conn, _ = _connect(db)
-    row = _row(conn, "SELECT * FROM dispatch_approvals WHERE nonce=?", (nonce,))
-    assert row["spent_job_id"] == "job-click", dict(row)
-    op = _row(conn, "SELECT * FROM operations WHERE repo='gamma'")
-    assert op["authorized_by"] == "signed:U999", dict(op)
-    conn.close()
 
 
 # --- no free-form surface ------------------------------------------------------------

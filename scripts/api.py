@@ -1,13 +1,12 @@
 """warden HTTP API — GET /metrics, /health, /board, /items/<event_id>, read-only.
 
-WHAT THIS IS STILL NOT. `POST /items/:id/intent` and `POST /items/:id/note` are
-DESIGN.md's real contract (§ HTTP API) and are Wave 4, built alongside Argo — the
-only consumer of the write-adjacent endpoints. Building them now, unconsumed,
-would be dead surface with no caller to prove it correct. `/board` and
-`/items/<event_id>` (Wave 6.3) are the two read-only projections that ARE useful
-the moment they exist: a funnel-snapshot list of every non-terminal item, and the
-full detail behind any one item — dispatches, verdicts, operations, approvals,
-transition history.
+WHAT THIS IS STILL NOT. `POST /items/:id/note` is DESIGN.md's real contract
+(§ HTTP API) and is Wave 4, built alongside Argo — the only consumer of the
+write-adjacent endpoints. Building it now, unconsumed, would be dead surface with
+no caller to prove it correct. `/board` and `/items/<event_id>` (Wave 6.3) are the
+two read-only projections that ARE useful the moment they exist: a
+funnel-snapshot list of every non-terminal item, and the full detail behind any
+one item — dispatches, verdicts, operations, transition history.
 
 BIND AND AUTH. `127.0.0.1:7735` (reserved by comment in dotfiles' Caddyfile
 registry; it sat on 7734 until 2026-09-11, where sy-serendipity's `kill-port
@@ -392,39 +391,20 @@ def _metric_median_needs_human_to_decision(
 # DISPOSITION_STATES above: this module stays a read-only, dependency-free
 # reader of the ledger, and copying two string literals that change on the
 # same rare cadence as the schema itself is a smaller risk than importing the
-# whole 4000-line act-loop module just to read two constants. "fixed" is
-# triage.py's own STATE_FIXED; "signed:" is the authorized_by prefix
-# triage.py's record_operation() docstring documents for a spent SIGNED
-# approval (as opposed to the literal "auto-from-item", which is the only
-# value this chain has ever actually produced — see docs/history/state-log.md §46 Correction 1).
+# whole 4000-line act-loop module just to read a constant. "fixed" is
+# triage.py's own STATE_FIXED.
 _FIXED_STATE = "fixed"
-_SIGNED_AUTHORIZED_BY_PREFIX = "signed:"
 
 
 def _metric_verified_unattended_fixes_per_week(
     conn: sqlite3.Connection, now: dt.datetime, history_since: str | None,
 ) -> dict[str, Any]:
-    """# 4 — verified UNATTENDED fixes per week. The qualifier IS now
-    derivable (schema 5, `operations` — see docs/history/state-log.md §46 Correction 1 and
-    DESIGN.md § Crash recovery): an item is unattended if none of the
-    `operations` rows tied to its event_id carries a `signed:` authorization.
-    `operations` is written on BOTH the auto-from-item and the (not yet
-    reachable) signed-approval door — unlike `dispatch_approvals`, which the
-    unattended door structurally NEVER writes (`mint_approval` has one call
-    site, behind PLANNED=1, and `awaiting_confirm()` is false whenever
-    AUTO_FROM_ITEM is set — the two doors are mutually exclusive by
-    construction, verified against the CLI directly). This is the first
-    table in the ledger where "was a human's signed approval involved in
-    landing this fix" is a real question to ask.
+    """# 4 — verified UNATTENDED fixes per week. With the signed-approval gate
+    gone every fix is unattended, so this is the count of distinct items that
+    entered `fixed` in the window.
 
-    Still returns `null` today — but for a DIFFERENT and correct reason than
-    before: docs/history/state-log.md §46 Correction 3 measured zero `item_transitions` into
-    `fixed` in production (the chain has never run), so either the window
-    predates `history_since` entirely, or it does not and there are simply
-    zero `fixed` transitions to evaluate — both are "no basis", never a
-    fabricated 0. The derivation becoming POSSIBLE is this slice's
-    deliverable; the number moving needs the chain to actually run, which is
-    a later slice.
+    Returns `null` when the window predates `history_since` or holds no
+    `fixed` transition — "no basis", never a fabricated 0.
     """
     window_start = now - dt.timedelta(days=WINDOW_DAYS)
     window_start_iso = window_start.isoformat()
@@ -437,14 +417,9 @@ def _metric_verified_unattended_fixes_per_week(
             "unattended_in_window": 0,
             "windowed": True, "window_days": WINDOW_DAYS,
         }
-    # DISTINCT, and the unit is the ITEM, not the transition. An item can
+    # DISTINCT, and the unit is the ITEM, not the transition: an item can
     # enter `fixed` more than once in one window (fixed -> reopened by a
-    # failed liveness probe -> fixed again), and `operations` is keyed by
-    # event_id, so a per-transition numerator subtracted from a per-item
-    # signed set is a count of one thing minus a count of another. That is
-    # precisely the shape of the metric-1 defect the Wave 2 boundary review
-    # caught (docs/history/state-log.md §42 defect 1) — dispatch counts divided while broken
-    # down by item counts — and it is not being repeated here.
+    # failed liveness probe -> fixed again) and counts once.
     fixed_event_ids = [
         row["event_id"] for row in conn.execute(
             "SELECT DISTINCT event_id FROM item_transitions WHERE to_state=? AND at >= ?",
@@ -459,15 +434,7 @@ def _metric_verified_unattended_fixes_per_week(
             "unattended_in_window": 0,
             "windowed": True, "window_days": WINDOW_DAYS,
         }
-    placeholders = ",".join("?" for _ in fixed_event_ids)
-    signed_event_ids = {
-        row["event_id"] for row in conn.execute(
-            f"SELECT DISTINCT event_id FROM operations WHERE event_id IN ({placeholders}) "
-            f"AND authorized_by LIKE ?",
-            (*fixed_event_ids, f"{_SIGNED_AUTHORIZED_BY_PREFIX}%"),
-        )
-    }
-    unattended = len(fixed_event_ids) - len(signed_event_ids)
+    unattended = len(fixed_event_ids)
     return {
         "value": unattended,
         "unavailable": None,
@@ -805,7 +772,7 @@ def item_payload(
     conn: sqlite3.Connection, event_id: int, *, history_limit: int | None = None
 ) -> dict[str, Any]:
     """The whole `/items/<event_id>` body — the item itself, its parent
-    event, and every dispatch/operation/approval/transition that names it.
+    event, and every dispatch/operation/transition that names it.
     Raises `ItemNotFoundError` for the 404 case; `Handler._serve()` owns
     turning that into an HTTP response, same shell/deep-module split as
     `metrics_payload()`/`health_payload()`/`board_payload()`.
@@ -860,8 +827,6 @@ def item_payload(
     )
     operations = [dict(row) for row in operations]
 
-    approvals = _approvals_for_item(conn, event_id)
-
     transition_rows, transitions_total = _bounded_history(
         conn, "item_transitions", "id", event_id, history_limit
     )
@@ -876,7 +841,6 @@ def item_payload(
         "dispatches": dispatches,
         "operations": operations,
         "operations_total": operations_total,
-        "approvals": approvals,
         "transitions": transitions,
         "transitions_total": transitions_total,
     }
@@ -943,29 +907,6 @@ def _parse_verdict(verdict_json: str | None) -> dict[str, Any] | None:
         "outcome": verdict.get("outcome"),
         "schemaVersion": verdict.get("schemaVersion"),
     }
-
-
-def _approvals_for_item(conn: sqlite3.Connection, event_id: int) -> list[dict[str, Any]]:
-    """`dispatch_approvals` carries no `event_id` column at all — the only
-    link back to an item is `params_json.origin_event_id`, the closed
-    parameter dict the spend replays (ledger.py schema 7's own docstring).
-    `nonce` (the table's actual primary key) and `stdin_text`/`context_text`
-    are never selected, let alone returned — see this module's docstring on
-    secrets. `rowid` stands in for a stable `id` a consumer can key on
-    without exposing the nonce itself."""
-    result: list[dict[str, Any]] = []
-    for row in conn.execute(
-        "SELECT rowid AS id, verb, repo, tier, created_at, expires_at, decided_at, decision, decided_by, "
-        "spent_at, spent_job_id, spend_error, params_json FROM dispatch_approvals"
-    ):
-        params_json = row["params_json"]
-        params = json.loads(params_json) if params_json else {}
-        if params.get("origin_event_id") != event_id:
-            continue
-        d = dict(row)
-        d.pop("params_json")
-        result.append(d)
-    return result
 
 
 # --- HTTP handler ---------------------------------------------------------------

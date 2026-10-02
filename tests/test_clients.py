@@ -29,15 +29,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
-from clients import argo, github, rollout, signer, sideclaw  # noqa: E402
+from clients import argo, github, rollout, sideclaw  # noqa: E402
 from clients import slack as clients_slack  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError  # noqa: E402
-
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
-    Ed25519PrivateKey,
-)
-
-SPEC_PATH = REPO / "config" / "approval-spec.json"
 
 
 # --- stub HTTP server ----------------------------------------------------------
@@ -1159,88 +1153,6 @@ def test_rollout_run_failure_output_truncated_to_2000():
     assert result.ok is False and result.exit_code == 1 and len(result.output) == 2000
 
 
-# --- signer / approval spec ---------------------------------------------------
-
-def test_spec_payload_hash_vectors():
-    spec = json.loads(SPEC_PATH.read_text())
-    for v in spec["vectors"]["payloadHash"]:
-        got = signer.payload_hash(v["verb"], v["repo"], v["tier"], v["body"], v["why"], v["context"])
-        assert got == v["expected"], (v, got)
-
-
-def test_spec_signed_message_vectors():
-    spec = json.loads(SPEC_PATH.read_text())
-    for v in spec["vectors"]["signedMessage"]:
-        got = signer.canonical_message(v["nonce"], v["payload_hash"], v["decision"], v["decided_by"], v["expires_at"])
-        assert got.hex() == v["expectedHex"], (v, got.hex())
-
-
-def test_spec_key_id_vector():
-    spec = json.loads(SPEC_PATH.read_text())
-    for v in spec["vectors"]["keyId"]:
-        assert signer.key_id(v["publicKeyHex"]) == v["expected"], v
-
-
-def test_signer_round_trip():
-    priv = Ed25519PrivateKey.generate()
-    from cryptography.hazmat.primitives import serialization
-    pub_hex = priv.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
-    ).hex()
-    msg = signer.canonical_message("nonce123", "hash456", "approve", "U1", "2026-09-10T12:00:00+00:00")
-    sig_hex = priv.sign(msg).hex()
-    assert signer.verify(pub_hex, sig_hex, msg) is True
-
-
-def test_signer_wrong_key_fails():
-    from cryptography.hazmat.primitives import serialization
-    priv = Ed25519PrivateKey.generate()
-    other = Ed25519PrivateKey.generate()
-    wrong_pub_hex = other.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
-    ).hex()
-    msg = signer.canonical_message("nonce123", "hash456", "approve", "U1", "2026-09-10T12:00:00+00:00")
-    sig_hex = priv.sign(msg).hex()
-    assert signer.verify(wrong_pub_hex, sig_hex, msg) is False
-
-
-def test_signer_garbage_hex_fails():
-    assert signer.verify("not-hex", "also-not-hex", b"whatever") is False
-    assert signer.verify("aa" * 32, "not-hex", b"whatever") is False
-
-
-def test_load_pubkey_missing_raises_policy_error():
-    missing = Path(tempfile.mkdtemp(prefix="clients-pubkey-")) / "no-such-file.pub"
-    try:
-        signer.load_pubkey(missing)
-    except PolicyError as e:
-        assert str(missing) in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_load_pubkey_malformed_raises_precondition_error():
-    bad = Path(tempfile.mkdtemp(prefix="clients-pubkey-")) / "bad.pub"
-    bad.write_text("not-hex-at-all", encoding="utf-8")
-    try:
-        signer.load_pubkey(bad)
-    except PreconditionError:
-        pass
-    else:
-        raise AssertionError("expected PreconditionError")
-
-
-def test_load_pubkey_valid_round_trip():
-    from cryptography.hazmat.primitives import serialization
-    priv = Ed25519PrivateKey.generate()
-    pub_hex = priv.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
-    ).hex()
-    path = Path(tempfile.mkdtemp(prefix="clients-pubkey-")) / "good.pub"
-    path.write_text(pub_hex + "\n", encoding="utf-8")
-    assert signer.load_pubkey(path) == pub_hex
-
-
 # --- the slack move ------------------------------------------------------------
 
 def test_slack_module_importable_from_clients():
@@ -1678,19 +1590,6 @@ def main() -> int:
         return 1
     return 0
 
-
-
-def test_interactive_token_is_hermes_never_the_chat_write_only_warden_app():
-    """§101: buttons posted under the Warden app (chat:write only, no
-    interactivity) could never be clicked through to Hermes's plugin."""
-    calls: list[tuple[str, str]] = []
-    saved = clients_slack.resolve_secret
-    clients_slack.resolve_secret = lambda env_var, ref: calls.append((env_var, ref)) or "hermes-token"
-    try:
-        assert clients_slack.resolve_interactive_token() == "hermes-token"
-    finally:
-        clients_slack.resolve_secret = saved
-    assert calls == [("SLACK_BOT_TOKEN", "op://hermes/slack/bot-token")]
 
 
 if __name__ == "__main__":

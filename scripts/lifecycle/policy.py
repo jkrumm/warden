@@ -282,16 +282,12 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
     A note on `authorized_by` (the gate `dispatch.open_episode()`/
     `merge.plan_or_land()` actually enforce, `if not authorized_by: raise
     ValueError(...)`): it is a plain truthy-string check, not a validated
-    allowlist. `"signed:{who}"`, `"auto-remediate"`, `"auto-from-item"` and
-    `"cli:confirm"` are conventional string shapes a human reader relies on,
+    allowlist. `"auto-remediate"`, `"auto-from-item"`, `"cli:confirm"` and
+    `"cli:dispatch"` are conventional string shapes a human reader relies on,
     never values this module parses or checks. `"owner:argo"`
-    (`triage.apply_argo_actions()`) is a fifth such convention: an action the
-    owner pulled off Argo's own pending-actions queue and had the loop apply
-    is the owner himself, the same way a signed Slack approval is — per
-    `docs/waves/PLAN.md`'s 2026-09-15 owner-decisions section, tailnet access
-    to Argo IS him. This is documentation of an existing mechanical fact, not
-    new validation — nothing here checks the string any more than it checks
-    the other four."""
+    (`triage.apply_argo_actions()`) is another such convention: an action the
+    owner pulled off Argo's own pending-actions queue is the owner himself —
+    tailnet access to Argo IS him. Nothing here checks the string."""
     if tier != "implement":
         raise UsageError(f"--auto-from-item is only valid with --tier implement (got '{tier}')")
 
@@ -373,8 +369,8 @@ def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
                               exclude_event_id: int | None = None) -> None:
     """DESIGN.md § per-repo in-flight lock. One implement episode per repo at
     a time, checked two ways: the triage item driving it (if any) and the
-    operations ledger (which also covers an approval-spend-opened episode
-    that has no triage_items row at all).
+    operations ledger (which also covers an episode that has no
+    triage_items row at all).
 
     `exclude_event_id` is the caller's OWN item — e.g. maybe_auto_implement()
     claims its item to `implementing` (an in-flight state) BEFORE calling

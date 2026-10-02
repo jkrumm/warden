@@ -7,9 +7,7 @@ default branch, so it re-checks everything the episode was inspected under
 at dispatch time, against the CURRENT state of the pull request and the
 CURRENT policy — a stale record is a refusal, never a trust.
 
-`plan_or_land()` is confirm-gated, not signature-gated, deliberately (owner
-decision, the retired bash CLI 2044-2049): Johannes approved the change when he
-confirmed the `implement`; merging is finishing the thing he said yes to.
+`plan_or_land()` is confirm-gated: a plan (no `--confirm`) changes nothing.
 
 Deploy is a second write-point since Wave 5 (docs/history/state-log.md §48's "one operation,
 not two" limitation) — `rollout_after_merge()` records its own `operations`
@@ -561,8 +559,6 @@ def plan_or_land(
 
     slug = f"{owner}/{repo}"
 
-    # NOT gated on a signed approval, deliberately — see this module's own
-    # docstring. Johannes approved the change when he confirmed the implement.
     if not confirm or dry_run:
         return MergePlan(
             needs_confirm=not confirm,

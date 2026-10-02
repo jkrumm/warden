@@ -201,18 +201,11 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         ("_github", "merge_pr"): triage._github.merge_pr,
         ("_github", "delete_branch"): triage._github.delete_branch,
         ("_merge", "plan_or_land"): triage._merge.plan_or_land,
-        ("_approvals", "execute_approved"): triage._approvals.execute_approved,
         ("_argo", "push_snapshot"): triage._argo.push_snapshot,
         ("_argo", "fetch_actions"): triage._argo.fetch_actions,
         ("_argo", "ack_action"): triage._argo.ack_action,
     }
     prev_deny = _RESOLVE_REPO_DENY["deny"]
-    # NOT part of `saved` above: the spool lives on triage._intents, not on
-    # triage, so the setattr loop in the finally cannot restore it. Pointed at
-    # the throwaway dir unconditionally, for every test in this file, so no
-    # test can ever consume or delete an intent out of the live
-    # ~/.warden/intents.
-    saved_intents_dir = triage._intents.INTENTS_DIR
     # This suite runs INSIDE a Claude Code session (CLAUDECODE etc. are set
     # in the real environment), and lifecycle.policy.require_no_recursion()
     # (called from open_episode() and plan_or_land()'s LAND step) refuses
@@ -221,7 +214,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
     # real dispatch/merge path rather than the guard's own refusal.
     saved_recursion_markers = {m: os.environ.pop(m, None) for m in _RECURSION_MARKERS}
     try:
-        triage._intents.INTENTS_DIR = tmp_dir / "intents"
         triage.DB_PATH = tmp_dir / "watchdog.db"
         triage.POLICY_PATH = tmp_dir / "triage-policy.json"
         triage.DISPATCH_REPOS_JSON = tmp_dir / "dispatch-repos.json"
@@ -346,7 +338,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None, deny: list[str] | None 
         for (obj_name, attr), v in saved_client_attrs.items():
             setattr(getattr(triage, obj_name), attr, v)
         _RESOLVE_REPO_DENY["deny"] = prev_deny
-        triage._intents.INTENTS_DIR = saved_intents_dir
         for m, v in saved_recursion_markers.items():
             if v is None:
                 os.environ.pop(m, None)
@@ -3101,71 +3092,6 @@ def test_no_chain_state_is_silence_resolvable():
         )
 
 
-def _spool_approval(nonce: str, decision: str = "approve") -> None:
-    """Spool one approval_decision intent through the REAL intents module —
-    the same call the Slack plugin makes. Not a hand-written file: the point is
-    that whatever the plugin can spool, the loop can drain."""
-    triage._intents.record({
-        "v": 1, "kind": "approval_decision",
-        "created_at": NOW.isoformat(), "source": "test",
-        "nonce": nonce, "decision": decision, "decided_by": "U123",
-        "signature": "ab" * 64,
-    })
-
-
-def _pending_approval(conn, nonce: str) -> None:
-    conn.execute(
-        "INSERT INTO dispatch_approvals(nonce, verb, repo, tier, payload_hash, created_at, expires_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (nonce, "dispatch", "demo-repo", "1", "hash-" + nonce, OLD.isoformat(), NOW.isoformat()),
-    )
-    conn.commit()
-
-
-def test_the_loop_is_the_backstop_drainer():
-    """A surface can spool an intent it cannot itself drain — Argo has no
-    ledger access at all by design, and the Slack plugin, which does drain
-    synchronously, can fail at it. Without a drain in the loop that intent sits
-    in the spool forever, which is exactly the silent discard this control
-    plane exists to remove. DESIGN.md § The ledger says intents go through the
-    loop's queue."""
-    with _triage_env() as (conn, _ctx):
-        _pending_approval(conn, "n-backstop")
-        _spool_approval("n-backstop")
-        assert len(list(triage._intents.INTENTS_DIR.glob("*.json"))) == 1
-
-        triage.run(conn, dry_run=False)
-
-        row = conn.execute(
-            "SELECT decision, decided_by, signature FROM dispatch_approvals WHERE nonce=?",
-            ("n-backstop",),
-        ).fetchone()
-        assert row["decision"] == "approve", f"the loop did not drain the intent: {dict(row)}"
-        assert row["decided_by"] == "U123"
-        assert list(triage._intents.INTENTS_DIR.glob("*.json")) == [], "a drained intent must be gone"
-
-
-def test_dry_run_never_consumes_the_live_spool():
-    """The one place this file's "local bookkeeping runs for real under
-    --dry-run" rule does NOT apply, and deliberately. A dry-run is pointed at a
-    COPY of the ledger, but there is only ONE ~/.warden/intents — so draining
-    would permanently eat intents the live loop still needs and apply them to a
-    database nobody reads. Eating the live system's queue is worse than either
-    thing the dry-run contract forbids."""
-    with _triage_env() as (conn, ctx):
-        _pending_approval(conn, "n-dryrun")
-        _spool_approval("n-dryrun")
-
-        triage.run(conn, dry_run=True)
-
-        assert len(list(triage._intents.INTENTS_DIR.glob("*.json"))) == 1, (
-            "--dry-run consumed a spooled intent; the spool is shared with the live loop")
-        row = conn.execute(
-            "SELECT decision FROM dispatch_approvals WHERE nonce=?", ("n-dryrun",)).fetchone()
-        assert row["decision"] is None, "--dry-run applied an intent to the ledger"
-        assert ctx.total_calls() == 0
-
-
 def test_recovery_pairing_skipped_under_dry_run():
     """--dry-run must make zero outbound calls, Slack reads included — a
     preview against a throwaway DB copy must never depend on live
@@ -5470,7 +5396,7 @@ def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
 
 _ARGO_SNAPSHOT_REQUIRED_KEYS = {
     "machine", "generatedAt", "health", "metrics", "board",
-    "items", "itemsTruncated", "intents",
+    "items", "itemsTruncated",
 }
 
 
@@ -5537,56 +5463,6 @@ def test_build_argo_snapshot_bounds_embedded_history():
         detail = snapshot["items"][str(eid)]
         assert detail["transitions_total"] == real_total
         assert len(detail["transitions"]) == 3, detail["transitions"]
-
-
-def _write_intent_file(directory: Path, name: str) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / name
-    path.write_text(json.dumps({
-        "v": 1, "kind": "approval_decision", "created_at": NOW.isoformat(), "source": "test",
-        "nonce": "deadbeef", "decision": "approve", "decided_by": "test", "signature": "ab" * 32,
-    }))
-    return path
-
-
-def test_argo_intents_snapshot_caps_entries_but_keeps_full_counts():
-    """25 rejected files must never grow the pushed snapshot without bound —
-    `rejected/` is never cleaned, so without a cap it eventually crosses
-    clients.argo.MAX_BODY_BYTES and Argo stops receiving health/metrics/board
-    too, not just intents."""
-    with _triage_env() as (conn, _ctx):
-        rejected_dir = triage._intents.INTENTS_DIR / triage._intents.REJECTED_SUBDIR
-        for i in range(25):
-            _write_intent_file(rejected_dir, f"intent-{i:03d}.json")
-
-        snapshot = triage.build_argo_snapshot(conn, NOW)
-        intents = snapshot["intents"]
-        assert intents["rejected"] == 25, intents["rejected"]
-        assert intents["pending"] == 0, intents["pending"]
-        assert len(intents["entries"]) == 20, len(intents["entries"])
-        assert intents["entriesTruncated"] is True
-
-
-def test_argo_intents_snapshot_never_ships_err_content():
-    """`intents.py`'s own validators embed the raw offending value (a fake
-    signature, a nonce) directly in the exception text a rejected file's
-    `.err` sibling carries — this must never reach the pushed payload, not
-    even truncated to one line. Only `has_error` (a bool) may."""
-    with _triage_env() as (conn, _ctx):
-        rejected_dir = triage._intents.INTENTS_DIR / triage._intents.REJECTED_SUBDIR
-        path = _write_intent_file(rejected_dir, "intent-bad.json")
-        fake_signature = "deadfeed" * 8
-        (rejected_dir / f"{path.name}.err").write_text(
-            f"ValueError: intent field 'signature' must be hex, got {fake_signature!r} (bad)\n"
-        )
-
-        snapshot = triage.build_argo_snapshot(conn, NOW)
-        entries = snapshot["intents"]["entries"]
-        assert len(entries) == 1
-        assert entries[0]["status"] == "rejected"
-        assert entries[0]["has_error"] is True
-        assert "error" not in entries[0]
-        assert fake_signature not in json.dumps(snapshot), "a raw signature must never reach the pushed payload"
 
 
 def test_push_argo_snapshot_non_serializable_field_is_build_failed_not_a_crash():
@@ -6949,12 +6825,12 @@ def test_reconcile_operations_runs_before_anything_that_could_retry():
     back to `verdict` and out again in the same run."""
     import inspect
     # Comment lines are stripped first — the step's own explanatory comment
-    # mentions drain_intents() by name before the call it precedes, which
+    # mentions run_self_audit() by name before the call it precedes, which
     # would otherwise make a naive substring search find the wrong occurrence.
     code_lines = [ln for ln in inspect.getsource(triage.run).splitlines() if not ln.strip().startswith("#")]
     code = "\n".join(code_lines)
-    assert code.index("reconcile_operations(") < code.index("drain_intents("), (
-        "reconcile_operations() must be called before drain_intents() in run()")
+    assert code.index("reconcile_operations(") < code.index("run_self_audit("), (
+        "reconcile_operations() must be called before run_self_audit() in run()")
 
     with _triage_env() as (conn, _ctx):
         eid = _seed_verdict_item(conn, external_id="sig-reconcile-order", confidence="high",
@@ -6978,13 +6854,13 @@ def test_reconcile_operations_runs_before_anything_that_could_retry():
 
 
 def test_reconcile_operation_with_no_event_id_resolves_without_touching_any_item():
-    """A Slack-door implement (or a signed-approval spend) may have no
+    """A CLI-door implement may have no
     triage_items row at all — `event_id` is NULL on its operation.
     Reconciling it must still resolve the operation, and must never try to
     move an item that does not exist."""
     with _triage_env() as (conn, _ctx):
         op_id = triage.record_operation(conn, event_id=None, kind="implement", repo="demo-repo",
-                                         authorized_by="signed:someone")
+                                         authorized_by="cli:dispatch")
         conn.execute("UPDATE operations SET receipt_json=? WHERE op_id=?",
                      (json.dumps({"jobId": "implement-job-no-item"}), op_id))
         conn.commit()
@@ -7079,36 +6955,6 @@ def test_reconcile_deploy_operation_with_no_runs_and_recent_start_stays_open():
         op = conn.execute("SELECT outcome, reconciled_at FROM operations WHERE op_id=?", (deploy_op,)).fetchone()
         assert op["outcome"] is None, "too soon to tell must leave the row genuinely open"
         assert op["reconciled_at"] is None, "a row left open must not even be stamped reconciled_at"
-
-
-def test_drain_intents_retries_pending_approved_and_never_under_dry_run():
-    """The retry sweep drain_intents() runs after draining the spool: every
-    decided-approve, unspent, unexpired approval gets one execute_approved()
-    call — and, being a spend that can open a real sideclaw episode, NEVER
-    under --dry-run."""
-    with _triage_env() as (conn, _ctx):
-        nonce = "n-retry-test"
-        conn.execute(
-            "INSERT INTO dispatch_approvals(nonce,verb,repo,tier,payload_hash,created_at,expires_at,"
-            "decision,decided_at,decided_by,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (nonce, "dispatch", "demo-repo", "implement", "hash-x", NOW.isoformat(),
-             (NOW + dt.timedelta(minutes=30)).isoformat(), "approve", NOW.isoformat(), "johannes", "sig-x"),
-        )
-        conn.commit()
-
-        spend_calls: list[str] = []
-
-        def _fake_execute_approved(conn_arg, nonce_arg, *, now=None):
-            spend_calls.append(nonce_arg)
-            return triage._approvals.SpendResult(status="opened", nonce=nonce_arg, job_id="job-retry")
-
-        triage._approvals.execute_approved = _fake_execute_approved
-
-        triage.drain_intents(conn, NOW, dry_run=True)
-        assert spend_calls == [], "a dry run must never spend a live approval"
-
-        triage.drain_intents(conn, NOW, dry_run=False)
-        assert spend_calls == [nonce], f"expected the pending approval to be retried, got {spend_calls}"
 
 
 def test_action_required_block_keeps_countdown_under_a_long_note():

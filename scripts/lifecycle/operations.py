@@ -44,8 +44,7 @@ def record(conn: sqlite3.Connection, *, event_id: int | None, kind: str, repo: s
     """Mint and durably record an operation before the external call.
 
     `commit=False` lets a caller fold this INSERT into a transaction of its
-    own (the signed-approval spend writes `spent_at` and this row together);
-    that caller then owns the commit and must make it before the call.
+    own; that caller then owns the commit and must make it before the call.
     `kind` reaches SQL and is closed on purpose."""
     if kind not in KINDS:
         raise ValueError(f"{kind!r} not in KINDS={KINDS} — kind reaches SQL, closed on purpose")
