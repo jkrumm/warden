@@ -252,9 +252,8 @@ def assert_result_schema(job: dict[str, Any], expected: int, tool: str) -> None:
     consumer (this file's own callers in triage.py) silently parsing a verdict
     whose shape moved under it. Every loop poll that reads a `result` off an
     `investigate`/`implement`/`review` job calls this first; the caller is
-    expected to land the item `needs_human` with the exact message this
-    raises, per DESIGN.md's "deferral must be visible" — a silently-skipped
-    item would just hit its deadline instead.
+    expected to treat it as an infrastructure failure (a strike) carrying the exact
+    message this raises, per DESIGN.md's "deferral must be visible".
 
     Only checked on `status == "done"`: a failed/interrupted/cancelled job
     carries no `result` worth pinning a shape to."""

@@ -98,46 +98,29 @@ BIND_PORT = 7735
 
 WINDOW_DAYS = 7
 
-# The implement chain, plus needs_human and dismissed — every state DESIGN.md's
-# "What done means" table counts as a RECORDED disposition for a verdict.
-# `quiet` is deliberately absent: DESIGN.md's own principle 5, "silence is
-# never an outcome" — a signal going quiet cancels the need to START work, it
-# never discharges an obligation a verdict already created. `split` is
-# absent for the same reason it sits outside `quiet`'s company, not inside
-# it: a split item's verdict has NOT reached a disposition yet — it is
-# mid-funnel, carrying an unre-evaluated verdict while it waits to be
-# escalated again on its own (triage.py's STATE_SPLIT) — so it belongs with
-# `new`/`investigating`/`verdict`, outside this list, until IT reaches one of
-# the states actually named here. Mirrors
-# triage.py's STATE_* constants by literal value rather than by import: this
-# module stays a read-only, dependency-free reader of the ledger, and copying
-# ten string literals that change on the same rare cadence as the lifecycle
-# diagram itself (DESIGN.md § Lifecycle) is a smaller risk than pulling in the
-# whole 3400-line act-loop module just to read its constants.
+# Every state that counts as a RECORDED disposition for a verdict: the item left
+# the investigation and landed somewhere visible. `quiet` is deliberately absent:
+# a signal going quiet cancels the need to START work, it never discharges an
+# obligation a verdict already created. `new`, `triaged` and `working` are absent
+# because the verdict has not reached a disposition yet — they are mid-funnel.
+# Mirrors triage.py's STATE_* constants by literal value (and ledger.py's) rather
+# than by import: this module stays a read-only, dependency-free reader of the
+# ledger, and copying string literals that change on the same rare cadence as the
+# lifecycle diagram itself is a smaller risk than pulling in the whole act-loop
+# module just to read its constants.
 DISPOSITION_STATES = (
-    "implementing", "remediating", "validating", "merge_blocked", "merged", "liveness_pending",
-    "pr_open", "fixed", "closed", "needs_human", "dismissed",
+    "merging", "verifying", "fixed", "closed", "needs_decision", "failed",
 )
 
 # --- /board's state vocabulary -------------------------------------------------
 #
-# The ten non-terminal chain states DESIGN.md's own lifecycle diagram names,
-# in the order a card moves through them. Mirrored from triage.py's STATE_*
-# constants by literal value — same reasoning as DISPOSITION_STATES above:
-# this module stays a read-only, dependency-free reader of the ledger rather
-# than importing the 3400-line act-loop module for ten string literals that
-# change on the schema's own rare cadence. `needs_human` is the one state
-# ledger.py already exposes as a constant (STATE_NEEDS_HUMAN, shared with
-# watchdog-poll.py), so that one entry is the real import, not a copy.
-# `snoozed` and `pr_open` are deliberately absent — they are real non-terminal
-# states but not part of this list's guaranteed-zero shape; if either is
-# present in the ledger it still surfaces in `/board`'s counts, just without
-# a guaranteed zero when it is not.
+# The non-terminal states of the machine, in the order an item moves through
+# them, each guaranteed a (possibly zero) entry in `/board`'s counts. Mirrored by
+# literal value — same reasoning as DISPOSITION_STATES above.
 BOARD_ITEMS_CAP = 200
 
 CHAIN_STATES = (
-    "new", "investigating", "verdict", "implementing", "validating", "merged",
-    "liveness_pending", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", "split",
+    "new", "triaged", "working", "merging", "verifying", "needs_decision", "failed",
 )
 
 # --- /board's per-item `availableActions` ---------------------------------
@@ -145,13 +128,12 @@ CHAIN_STATES = (
 # Mirrors triage.py's apply_argo_actions() per-verb allowed-state sets
 # (ARGO_ACTION_VERBS = {"implement", "merge", "dismiss", "reinvestigate",
 # "note"}) by literal state string, same reasoning as CHAIN_STATES/
-# DISPOSITION_STATES above: importing triage.py just for these sets would
-# pull in the whole 3400-line act-loop module. Must stay in sync by hand with
-# apply_argo_actions()'s handlers if either changes.
-_IMPLEMENT_STATES = ("verdict", _ledger.STATE_NEEDS_HUMAN)
-_MERGE_STATES = ("merge_blocked",)
-_DISMISS_STATES = ("new", "verdict", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", _ledger.STATE_QUIET, _ledger.STATE_NOTE)
-_REINVESTIGATE_STATES = ("verdict", _ledger.STATE_NEEDS_HUMAN, "merge_blocked", _ledger.STATE_QUIET, _ledger.STATE_NOTE)
+# DISPOSITION_STATES above. Must stay in sync by hand with apply_argo_actions()'s
+# handlers if either changes.
+_IMPLEMENT_STATES = ("needs_decision", "failed")
+_MERGE_STATES = ("needs_decision", "failed")
+_DISMISS_STATES = ("new", "triaged", "needs_decision", "failed", _ledger.STATE_QUIET)
+_REINVESTIGATE_STATES = ("needs_decision", "failed", _ledger.STATE_QUIET)
 
 
 def _available_actions(state: str, mergeable: bool = False) -> list[str]:
@@ -163,9 +145,9 @@ def _available_actions(state: str, mergeable: bool = False) -> list[str]:
     actions: list[str] = []
     if state in _IMPLEMENT_STATES:
         actions.append("implement")
-    # `mergeable`: a PR whose step-7 review confirmed — the one needs_human
-    # shape an owner merge can land.
-    if state in _MERGE_STATES or (mergeable and state == _ledger.STATE_NEEDS_HUMAN):
+    # `mergeable`: a PR whose step-7 review confirmed — the one shape an owner
+    # merge can land.
+    if mergeable and state in _MERGE_STATES:
         actions.append("merge")
     if state in _DISMISS_STATES:
         actions.append("dismiss")
@@ -291,12 +273,11 @@ def _metric_verified_fixes_vs_silence(conn: sqlite3.Connection) -> dict[str, Any
     fixed = counts.get("fixed", 0)
     quiet = counts.get("quiet", 0)
     closed = counts.get("closed", 0)
-    dismissed = counts.get("dismissed", 0)
     denominator = fixed + quiet
     return {
         "value": (fixed / denominator) if denominator else None,
         "unavailable": None if denominator else "no fixed/quiet closes yet for a mapped signature",
-        "fixed": fixed, "quiet": quiet, "closed": closed, "dismissed": dismissed,
+        "fixed": fixed, "quiet": quiet, "closed": closed,
         "windowed": False,
     }
 
@@ -323,27 +304,24 @@ def _history_guard_reason(history_since: str | None, window_start: dt.datetime) 
     return None
 
 
-def _metric_median_needs_human_to_decision(
+def _metric_median_needs_decision_to_decision(
     conn: sqlite3.Connection, now: dt.datetime, history_since: str | None,
 ) -> dict[str, Any]:
-    """# 3 — median needs_human -> human decision, in hours. Windowed on entry.
+    """# 3 — median needs_decision -> owner's decision, in hours. Windowed on entry.
+    (The payload key is `median_needs_decision_to_decision_hours`.)
 
-    Pairs each transition INTO needs_human with the very next transition for
+    Pairs each transition INTO needs_decision with the very next transition for
     that same event_id (item_transitions is per-event chronological, and
     _set_state() only ever appends on a REAL state change — see triage.py's
-    own docstring — so "the next row" IS "the exit from needs_human"). A pair
-    whose exit is `dismissed` is excluded: that is the 7-day clock expiring
-    (STATE_DEADLINES' needs_human rule), not a human deciding anything, and
-    counting it would make the metric improve the longer a human ignores the
-    card — the Goodhart failure REVIEW.md's C3 already named.
-    """
+    own docstring — so "the next row" IS "the exit from needs_decision"). Nothing
+    expires a needs_decision item, so every exit is somebody deciding."""
     window_start = now - dt.timedelta(days=WINDOW_DAYS)
     guard_reason = _history_guard_reason(history_since, window_start)
     if guard_reason:
         return {
             "value": None,
             "unavailable": guard_reason,
-            "pairs": 0, "excluded_dismissed_pairs": 0,
+            "pairs": 0,
             "windowed": True, "window_days": WINDOW_DAYS,
         }
 
@@ -355,10 +333,9 @@ def _metric_median_needs_human_to_decision(
         by_event.setdefault(row["event_id"], []).append(row)
 
     deltas_hours: list[float] = []
-    excluded_dismissed = 0
     for transitions in by_event.values():
         for i, t in enumerate(transitions):
-            if t["to_state"] != "needs_human":
+            if t["to_state"] != "needs_decision":
                 continue
             if i + 1 >= len(transitions):
                 continue  # still open — no exit recorded yet
@@ -366,23 +343,20 @@ def _metric_median_needs_human_to_decision(
             entry_at = dt.datetime.fromisoformat(t["at"])
             if entry_at < window_start:
                 continue
-            if exit_t["to_state"] == "dismissed":
-                excluded_dismissed += 1
-                continue
             exit_at = dt.datetime.fromisoformat(exit_t["at"])
             deltas_hours.append((exit_at - entry_at).total_seconds() / 3600)
 
     if not deltas_hours:
         return {
             "value": None,
-            "unavailable": "no needs_human -> decision pairs in window (excluding expiry-to-dismissed)",
-            "pairs": 0, "excluded_dismissed_pairs": excluded_dismissed,
+            "unavailable": "no needs_decision -> decision pairs in window",
+            "pairs": 0,
             "windowed": True, "window_days": WINDOW_DAYS,
         }
     return {
         "value": statistics.median(deltas_hours),
         "unavailable": None,
-        "pairs": len(deltas_hours), "excluded_dismissed_pairs": excluded_dismissed,
+        "pairs": len(deltas_hours),
         "windowed": True, "window_days": WINDOW_DAYS,
     }
 
@@ -476,16 +450,11 @@ def _metric_reverts_and_reopens(
 ) -> dict[str, Any]:
     """# 6 — reverts and reopen-after-fixed.
 
-    `reverts` now has a real primitive (`warden revert`, Wave 5.3):
-    `triage_items.revert_pr` records the revert PR, and STATE_REVERTED
-    (`reverted`) is the state a merged/liveness_pending/fixed item lands in
-    once it's reverted (ledger.py schema 7 + `TERMINAL_STATES`). A row can
-    carry `revert_pr` without (yet) being in `reverted` and vice versa
-    depending on exactly when the sweep observes it, so the count is an OR
-    of both, windowed on `updated_at` like every other metric here. This is
-    the first honest, non-null value this leaf has ever produced — it reads
-    `0` freely now, because `0` is a real measurement, not a stand-in for
-    "not tracked". `reopen_after_fixed` is unchanged: `item_transitions`-
+    `reverts` is `warden revert` (Wave 5.3): `triage_items.revert_pr` records the
+    revert PR and the item lands `failed` with a "reverted: PR #n" note. The count
+    is windowed on `updated_at` like every other metric here, and reads `0`
+    freely, because `0` is a real measurement, not a stand-in for "not tracked".
+    `reopen_after_fixed` is unchanged: `item_transitions`-
     derived, behind the same leaf-level history guard as metrics 3 and 4
     (`_history_guard_reason`) for the same reason — an empty or young table
     must never present a fabricated `0`."""
@@ -501,8 +470,8 @@ def _metric_reverts_and_reopens(
         ).fetchone()["n"]
         reopen_reason = None
     reverts_value = conn.execute(
-        "SELECT COUNT(*) AS n FROM triage_items WHERE (revert_pr IS NOT NULL OR state = ?) AND updated_at >= ?",
-        (_ledger.STATE_REVERTED, window_start.isoformat()),
+        "SELECT COUNT(*) AS n FROM triage_items WHERE revert_pr IS NOT NULL AND updated_at >= ?",
+        (window_start.isoformat(),),
     ).fetchone()["n"]
     return {
         "reopen_after_fixed": {
@@ -543,7 +512,7 @@ def metrics_payload(conn: sqlite3.Connection) -> dict[str, Any]:
         "history_since": history_since,
         "verdicts_recorded_disposition": _metric_verdicts_recorded_disposition(conn),
         "verified_fixes_vs_silence": _metric_verified_fixes_vs_silence(conn),
-        "median_needs_human_to_decision_hours": _metric_median_needs_human_to_decision(conn, now, history_since),
+        "median_needs_decision_to_decision_hours": _metric_median_needs_decision_to_decision(conn, now, history_since),
         "verified_unattended_fixes_per_week": _metric_verified_unattended_fixes_per_week(conn, now, history_since),
         "poller_ages": _metric_poller_ages(conn, now),
         "reverts_and_reopens": _metric_reverts_and_reopens(conn, now, history_since),
@@ -647,7 +616,7 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     return payload
 
 
-AWAITING_OWNER_STATES = (_ledger.STATE_NEEDS_HUMAN, "merge_blocked")
+AWAITING_OWNER_STATES = (_ledger.STATE_NEEDS_DECISION, _ledger.STATE_FAILED)
 
 
 def _age_days(since: str | None, now: dt.datetime) -> float | None:
@@ -664,12 +633,12 @@ def _age_days(since: str | None, now: dt.datetime) -> float | None:
 
 def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str, Any]]:
     """Everything that is waiting on Johannes and nothing else, oldest first:
-    every parked item (`needs_human`/`merge_blocked`) with how long it has sat
-    there and why."""
+    every `needs_decision` item (and every `failed` one, which only an owner
+    action moves) with how long it has sat there and why."""
     placeholders = ",".join("?" for _ in AWAITING_OWNER_STATES)
     out: list[dict[str, Any]] = []
     for row in conn.execute(
-        f"SELECT ti.event_id, ti.repo, ti.state, ti.note, ti.pr_url, ti.parked_recurrences, ti.revision_count, "
+        f"SELECT ti.event_id, ti.repo, ti.state, ti.note, ti.pr_url, ti.revision_count, "
         f"e.title, (SELECT d.validation_status FROM dispatches d WHERE d.job_id = ti.implement_job) "
         f"AS validation_status, (SELECT MAX(at) FROM item_transitions t WHERE t.event_id = ti.event_id "
         f"AND t.to_state = ti.state) AS entered_at FROM triage_items ti JOIN events e ON e.id = ti.event_id "
@@ -679,9 +648,7 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
         out.append({
             "kind": "item", "event_id": row["event_id"], "repo": row["repo"], "title": row["title"],
             "state": row["state"], "pr_url": row["pr_url"], "age_days": _age_days(row["entered_at"], now),
-            # Argo's AwaitingOwnerEntrySchema requires it; drop with the Argo rewrite in Wave 2.
-            "reason": row["note"], "parked_recurrences": row["parked_recurrences"],
-            "revision_count": row["revision_count"],
+            "reason": row["note"], "revision_count": row["revision_count"],
             "availableActions": _available_actions(
                 row["state"], bool(row["pr_url"]) and row["validation_status"] == "confirmed"),
         })
@@ -724,7 +691,9 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "origin": row["origin"],
         "repo": row["repo"],
         "state": row["state"],
-        "state_deadline": row["state_deadline"],
+        "close_reason": row["close_reason"],
+        "strikes": row["strikes"],
+        "retry_at": row["retry_at"],
         "max_tier": row["max_tier"],
         "title": row["event_title"],
         "note": row["note"],

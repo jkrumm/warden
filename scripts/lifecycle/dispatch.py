@@ -133,8 +133,8 @@ def open_episode(
             )
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # The loop's own claimed item (already flipped to `implementing`
-            # by the caller, e.g. maybe_auto_implement()'s compare-and-set,
+            # The loop's own claimed item (already carrying its claim in `implement_job`
+            # from the caller, e.g. maybe_auto_implement()'s compare-and-set,
             # BEFORE it calls this function) must not refuse itself.
             policy.check_repo_not_in_flight(conn, repo=repo, exclude_event_id=origin.event_id)
             opened_op_id = operations.record(

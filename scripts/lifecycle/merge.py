@@ -33,6 +33,15 @@ from clients.errors import (
 )
 from lifecycle import operations, policy
 
+
+class ChecksPending(PolicyError):
+    """CI on the head commit is still running — nothing has failed, so the caller
+    waits and asks again rather than ending the item."""
+
+
+class MergeInFlight(PolicyError):
+    """Another caller is already landing this very pull request."""
+
 # `deployOnMerge` only fires once a real merge commit exists — a 40-hex sha,
 # never `None`/"" (both reject) nor a malformed one (present-but-wrong is a
 # defect, not a missing value — see docs/history/state-log.md §51's mutation note on the same
@@ -154,6 +163,13 @@ def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation:
         or r.get("conclusion") not in ("success", "neutral", "skipped")
     ]
     if bad_runs:
+        # Every non-green run still running (queued/in progress), none failed:
+        # that is waiting, not a refusal.
+        if all(r.get("status") != "completed" for r in check_runs
+               if str(r.get("name")) in bad_runs):
+            raise ChecksPending(
+                f"{repo}'s CI is still running on the head commit: {', '.join(bad_runs)}."
+            )
         raise PolicyError(
             f"{repo}'s CI has not passed cleanly on the head commit: {', '.join(bad_runs)}."
         )
@@ -447,7 +463,7 @@ def plan_or_land(
             (f"job:{job_id}",),
         ).fetchone()
         if in_flight is not None:
-            raise PolicyError(f"a merge for job {job_id} is already in flight")
+            raise MergeInFlight(f"a merge for job {job_id} is already in flight")
         merge_op = operations.record(
             conn, event_id=origin_event_id, kind="merge", repo=repo, authorized_by=authorized_by,
             note=f"job:{job_id}", commit=False,

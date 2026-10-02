@@ -128,7 +128,7 @@ def test_metric1_arithmetic_numerator_denominator():
     _dispatch(conn, "j3", verdict_json=None, now=now)   # NOT eligible — no verdict
     _dispatch(conn, "j4", tier="implement", verdict_json="{}", now=now)  # NOT eligible — wrong tier
     _item(conn, 1, state="fixed", dispatch_job="j1", now=now)     # disposition
-    _item(conn, 2, state="investigating", dispatch_job="j2", now=now)  # NOT a disposition
+    _item(conn, 2, state="working", dispatch_job="j2", now=now)  # NOT a disposition
     conn.commit()
 
     m = api._metric_verdicts_recorded_disposition(conn)
@@ -136,7 +136,7 @@ def test_metric1_arithmetic_numerator_denominator():
     assert m["numerator"] == 1, m
     assert m["value"] == 0.5, m
     assert m["unavailable"] is None
-    assert m["item_states"] == {"fixed": 1, "investigating": 1}, m
+    assert m["item_states"] == {"fixed": 1, "working": 1}, m
     assert m["excluded_interactive"] == 0, m
     conn.close()
 
@@ -157,7 +157,7 @@ def test_metric1_excludes_interactive_dispatches_and_item_states_can_exceed_deno
     _dispatch(conn, "j1", verdict_json="{}", origin_event_id=1, now=now)
     _item(conn, 1, state="fixed", dispatch_job="j1", now=now)
     _item(conn, 2, state="fixed", dispatch_job="j1", now=now)
-    _item(conn, 3, state="needs_human", dispatch_job="j1", now=now)
+    _item(conn, 3, state="needs_decision", dispatch_job="j1", now=now)
     # Loop-originated, single item, `quiet` — not a recorded disposition.
     _dispatch(conn, "j2", verdict_json="{}", origin_event_id=4, now=now)
     _item(conn, 4, state="quiet", dispatch_job="j2", now=now)
@@ -238,29 +238,30 @@ def test_metric2_zero_denominator_is_null():
     conn.close()
 
 
-# --- Metric 3: median needs_human -> decision -----------------------------------
+# --- Metric 3: median needs_decision -> decision --------------------------------
 
-def test_metric3_excludes_dismissed_exit_includes_other_exit():
+def test_metric3_pairs_every_exit_from_needs_decision():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)  # keep history_since well before the 7d window
     _event(conn, 1, now)
     _event(conn, 2, now)
 
-    # Event 1: needs_human -> dismissed (the 7d expiry clock) — must be excluded.
-    _transition(conn, 1, "investigating", "needs_human", now - dt.timedelta(hours=10))
-    _transition(conn, 1, "needs_human", "dismissed", now - dt.timedelta(hours=2))
+    # Nothing expires a needs_decision item, so every exit is somebody deciding.
+    # Event 1: needs_decision -> closed after 8h.
+    _transition(conn, 1, "working", "needs_decision", now - dt.timedelta(hours=10))
+    _transition(conn, 1, "needs_decision", "closed", now - dt.timedelta(hours=2))
 
-    # Event 2: needs_human -> investigating (a real human decision) — 4h, included.
-    _transition(conn, 2, "investigating", "needs_human", now - dt.timedelta(hours=8))
-    _transition(conn, 2, "needs_human", "investigating", now - dt.timedelta(hours=4))
+    # Event 2: needs_decision -> working (a decision to go ahead) after 4h.
+    _transition(conn, 2, "working", "needs_decision", now - dt.timedelta(hours=8))
+    _transition(conn, 2, "needs_decision", "working", now - dt.timedelta(hours=4))
     conn.commit()
 
     history_since = api._item_transitions_history_since(conn)
-    m = api._metric_median_needs_human_to_decision(conn, now, history_since)
-    assert m["pairs"] == 1, m
-    assert m["excluded_dismissed_pairs"] == 1, m
-    assert abs(m["value"] - 4.0) < 0.01, m
+    m = api._metric_median_needs_decision_to_decision(conn, now, history_since)
+    assert m["pairs"] == 2, m
+    assert abs(m["value"] - 6.0) < 0.01, m
+    assert "excluded_dismissed_pairs" not in m, "there is no expiry clock to exclude any more"
     conn.close()
 
 
@@ -268,7 +269,7 @@ def test_metric3_no_pairs_is_null_not_zero():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     history_since = api._item_transitions_history_since(conn)
-    m = api._metric_median_needs_human_to_decision(conn, now, history_since)
+    m = api._metric_median_needs_decision_to_decision(conn, now, history_since)
     assert m["value"] is None
     assert m["unavailable"]
     conn.close()
@@ -281,18 +282,18 @@ def test_metric3_windowed_on_entry():
     # Entry 10 days ago — outside the 7-day window — must not count. history_since
     # lands at -10d too, which is still before window_start(-7d), so the guard
     # does not swallow this: it's a real "no pairs in window", not a young table.
-    _transition(conn, 1, "investigating", "needs_human", now - dt.timedelta(days=10))
-    _transition(conn, 1, "needs_human", "investigating", now - dt.timedelta(days=9))
+    _transition(conn, 1, "working", "needs_decision", now - dt.timedelta(days=10))
+    _transition(conn, 1, "needs_decision", "working", now - dt.timedelta(days=9))
     conn.commit()
     history_since = api._item_transitions_history_since(conn)
-    m = api._metric_median_needs_human_to_decision(conn, now, history_since)
+    m = api._metric_median_needs_decision_to_decision(conn, now, history_since)
     assert m["pairs"] == 0, m
     assert m["value"] is None
     conn.close()
 
 
 def test_metric3_null_with_history_reason_when_table_is_young():
-    """A REAL needs_human -> decision pair exists here (would compute a 1h
+    """A REAL needs_decision -> decision pair exists here (would compute a 1h
     median under the old code), but item_transitions has no history before
     it — the leaf guard must still null the value, and the reason must name
     `history_since`, not the generic "no pairs" message, so a reader can tell
@@ -300,11 +301,11 @@ def test_metric3_null_with_history_reason_when_table_is_young():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
-    _transition(conn, 1, "investigating", "needs_human", now - dt.timedelta(hours=2))
-    _transition(conn, 1, "needs_human", "investigating", now - dt.timedelta(hours=1))
+    _transition(conn, 1, "working", "needs_decision", now - dt.timedelta(hours=2))
+    _transition(conn, 1, "needs_decision", "working", now - dt.timedelta(hours=1))
     conn.commit()
     history_since = api._item_transitions_history_since(conn)
-    m = api._metric_median_needs_human_to_decision(conn, now, history_since)
+    m = api._metric_median_needs_decision_to_decision(conn, now, history_since)
     assert m["value"] is None, m
     assert "history_since" in m["unavailable"], m
     conn.close()
@@ -322,7 +323,7 @@ def test_metric4_counts_a_fixed_item_as_unattended():
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)
     _event(conn, 1, now)
-    _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=1))
+    _transition(conn, 1, "working", "fixed", now - dt.timedelta(hours=1))
     _operation(conn, "op1", event_id=1, authorized_by="auto-from-item", now=now - dt.timedelta(hours=2))
     conn.commit()
 
@@ -344,7 +345,7 @@ def test_metric4_counts_an_item_once_even_if_it_reaches_fixed_twice():
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)
     _event(conn, 1, now)
-    _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=5))
+    _transition(conn, 1, "working", "fixed", now - dt.timedelta(hours=5))
     _transition(conn, 1, "new", "fixed", now - dt.timedelta(hours=1))
     conn.commit()
 
@@ -379,7 +380,7 @@ def test_metric4_null_not_zero_when_history_is_young():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
-    _transition(conn, 1, "implementing", "fixed", now - dt.timedelta(hours=1))
+    _transition(conn, 1, "working", "fixed", now - dt.timedelta(hours=1))
     _operation(conn, "op1", event_id=1, authorized_by="auto-from-item", now=now - dt.timedelta(hours=2))
     conn.commit()
 
@@ -414,7 +415,7 @@ def test_metric5_per_poller_ages_and_worst_case():
 # --- Metric 6: reverts and reopen-after-fixed -----------------------------------
 
 def test_metric6_reopen_after_fixed_counts_and_reverts_is_a_real_zero():
-    """`reverts` now has a real primitive (`revert_pr`/`reverted`) — a `0`
+    """`reverts` is `revert_pr` on the item — a `0`
     here is a genuine measurement, not the permanent `null` it used to be."""
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
@@ -431,21 +432,24 @@ def test_metric6_reopen_after_fixed_counts_and_reverts_is_a_real_zero():
     conn.close()
 
 
-def test_metric6_reverts_counts_revert_pr_and_reverted_state_within_window():
-    """The count is an OR of two signals (`revert_pr IS NOT NULL`, or
-    `state='reverted'`) — a row can carry either independently depending on
-    exactly when the sweep observed it — windowed on `updated_at` like every
-    other leaf here. An item updated outside the window must not count."""
+def test_metric6_reverts_counts_revert_pr_within_window():
+    """`warden revert` leaves the item `failed` with `revert_pr` set — windowed on
+    `updated_at` like every other leaf here. An item updated outside the window
+    must not count."""
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _seed_old_history_anchor(conn, now)
     _event(conn, 1, now)
-    _item(conn, 1, state="reverted", now=now, updated_at=now - dt.timedelta(hours=1))
+    _item(conn, 1, state="failed", now=now, updated_at=now - dt.timedelta(hours=1))
+    conn.execute("UPDATE triage_items SET revert_pr = 41 WHERE event_id = 1")
     _event(conn, 2, now)
-    _item(conn, 2, state="merged", now=now, updated_at=now - dt.timedelta(hours=1))
+    _item(conn, 2, state="verifying", now=now, updated_at=now - dt.timedelta(hours=1))
     conn.execute("UPDATE triage_items SET revert_pr = 42 WHERE event_id = 2")
     _event(conn, 3, now)
-    _item(conn, 3, state="reverted", now=now, updated_at=now - dt.timedelta(days=30))  # outside window
+    _item(conn, 3, state="failed", now=now, updated_at=now - dt.timedelta(days=30))  # outside window
+    conn.execute("UPDATE triage_items SET revert_pr = 43 WHERE event_id = 3")
+    _event(conn, 4, now)
+    _item(conn, 4, state="failed", now=now, updated_at=now - dt.timedelta(hours=1))  # failed, but not a revert
     conn.commit()
 
     history_since = api._item_transitions_history_since(conn)
@@ -488,8 +492,8 @@ def test_history_since_is_earliest_transition():
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
     earliest = now - dt.timedelta(days=3)
-    _transition(conn, 1, "new", "investigating", earliest)
-    _transition(conn, 1, "investigating", "needs_human", now - dt.timedelta(days=1))
+    _transition(conn, 1, "new", "working", earliest)
+    _transition(conn, 1, "working", "needs_decision", now - dt.timedelta(days=1))
     conn.commit()
     payload = api.metrics_payload(conn)
     assert payload["history_since"] == _iso(earliest)
@@ -506,7 +510,7 @@ def test_board_counts_items_shape_ordering_and_terminal_24h():
         _item(conn, i, state=state, dispatch_job=f"j{i}", now=now, updated_at=now - dt.timedelta(minutes=i))
     human_id = len(api.CHAIN_STATES) + 1
     _event(conn, human_id, now)
-    _item(conn, human_id, state="needs_human", origin="human", now=now, updated_at=now - dt.timedelta(seconds=5))
+    _item(conn, human_id, state="needs_decision", origin="human", now=now, updated_at=now - dt.timedelta(seconds=5))
     fixed_id = human_id + 1
     _event(conn, fixed_id, now)
     _item(conn, fixed_id, state="fixed", now=now, updated_at=now - dt.timedelta(hours=1))
@@ -517,7 +521,7 @@ def test_board_counts_items_shape_ordering_and_terminal_24h():
 
     payload = api.board_payload(conn)
     for state in api.CHAIN_STATES:
-        expected = 2 if state == "needs_human" else 1
+        expected = 2 if state == "needs_decision" else 1
         assert payload["counts"][state] == expected, payload["counts"]
     assert payload["terminal_24h"] == 1, "only the 1h-old `fixed` row, not the 3d-old `closed` row"
     assert len(payload["items"]) == len(api.CHAIN_STATES) + 1, "terminal items must be excluded"
@@ -528,7 +532,7 @@ def test_board_counts_items_shape_ordering_and_terminal_24h():
 
     one = next(item for item in payload["items"] if item["event_id"] == 1)
     assert set(one.keys()) == {
-        "event_id", "origin", "repo", "state", "state_deadline", "max_tier", "title", "note",
+        "event_id", "origin", "repo", "state", "close_reason", "strikes", "retry_at", "max_tier", "title", "note",
         "pr_url", "dispatch_job", "implement_job", "validation_job", "occurrences",
         "revision_count", "created_at", "updated_at", "origin_channel", "origin_thread_ts",
         "availableActions", "issue",
@@ -542,7 +546,7 @@ def test_board_item_available_actions_and_issue_shape():
     now = dt.datetime.now(dt.timezone.utc)
 
     _event(conn, 1, now)
-    _item(conn, 1, state="verdict", now=now)
+    _item(conn, 1, state="working", now=now)
 
     _event(conn, 2, now)
     _item(conn, 2, state="closed", now=now)
@@ -553,14 +557,14 @@ def test_board_item_available_actions_and_issue_shape():
         "VALUES (?,?,?,?,?,?,?)",
         (3, "s", "e3", "title3", "https://github.com/jkrumm/foo/issues/3", issue_payload, _iso(now)),
     )
-    _item(conn, 3, state="verdict", origin="github_issue", now=now)
+    _item(conn, 3, state="working", origin="github_issue", now=now)
 
     conn.execute(
         "INSERT INTO events (id, source, external_id, title, url, payload_json, first_seen) "
         "VALUES (?,?,?,?,?,?,?)",
         (4, "s", "e4", "title4", None, json.dumps([1, 2, 3]), _iso(now)),
     )
-    _item(conn, 4, state="verdict", origin="github_issue", now=now)
+    _item(conn, 4, state="working", origin="github_issue", now=now)
     conn.commit()
 
     rows = {
@@ -572,9 +576,9 @@ def test_board_item_available_actions_and_issue_shape():
         ).fetchall()
     }
 
-    verdict_item = api._board_item(rows[1])
-    assert set(verdict_item["availableActions"]) == {"implement", "dismiss", "reinvestigate", "note"}
-    assert verdict_item["issue"] is None
+    working_item = api._board_item(rows[1])
+    assert set(working_item["availableActions"]) == {"note"}, "a working item is in nobody's hands"
+    assert working_item["issue"] is None
 
     closed_item = api._board_item(rows[2])
     assert closed_item["availableActions"] == [], closed_item["availableActions"]
@@ -594,6 +598,37 @@ def test_board_item_available_actions_and_issue_shape():
     # object (e.g. a list) must yield `issue: None`, never raise.
     non_dict_payload_item = api._board_item(rows[4])
     assert non_dict_payload_item["issue"] is None
+    conn.close()
+
+
+def test_available_actions_follow_the_new_state_machine():
+    """The owner's verbs per state — needs_decision and failed are the two states an
+    owner acts on; merge is offered only for a PR whose review confirmed."""
+    a = api._available_actions
+    assert set(a("needs_decision")) == {"implement", "dismiss", "reinvestigate", "note"}
+    assert set(a("needs_decision", mergeable=True)) == {"implement", "merge", "dismiss", "reinvestigate", "note"}
+    assert set(a("failed", mergeable=True)) == {"implement", "merge", "dismiss", "reinvestigate", "note"}
+    assert set(a("new")) == {"dismiss", "note"} and set(a("triaged")) == {"dismiss", "note"}
+    assert set(a("quiet")) == {"dismiss", "reinvestigate"}
+    for in_flight in ("working", "merging", "verifying"):
+        assert a(in_flight, mergeable=True) == ["note"], in_flight
+    for terminal in ("fixed", "closed"):
+        assert a(terminal) == [], terminal
+
+
+def test_awaiting_owner_lists_needs_decision_and_failed_without_the_retired_fields():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    for i, state in enumerate(("needs_decision", "failed", "working"), start=1):
+        _event(conn, i, now)
+        _item(conn, i, state=state, now=now, note=f"note {i}")
+        _transition(conn, i, "new", state, now - dt.timedelta(days=i))
+    conn.commit()
+    rows = api.awaiting_owner(conn, now)
+    assert [r["event_id"] for r in rows] == [2, 1], rows   # oldest first
+    assert {r["state"] for r in rows} == {"needs_decision", "failed"}
+    for r in rows:
+        assert r["kind"] == "item" and "parked_recurrences" not in r, r
     conn.close()
 
 
@@ -617,19 +652,19 @@ def test_item_payload_full_shape():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
-    _item(conn, 1, state="verdict", dispatch_job="j1", now=now)
+    _item(conn, 1, state="working", dispatch_job="j1", now=now)
     verdict = {
         "summary": "s", "nextAction": "implement", "confidence": "high",
         "recommendation": "do it", "outcome": "pending", "schemaVersion": 1,
     }
     _dispatch(conn, "j1", tier="investigate", verdict_json=json.dumps(verdict), origin_event_id=1, now=now)
     _operation(conn, "op1", event_id=1, now=now)
-    _transition(conn, 1, "new", "verdict", now)
+    _transition(conn, 1, "new", "working", now)
     conn.commit()
 
     payload = api.item_payload(conn, 1)
     assert payload["item"]["event_id"] == 1
-    assert payload["item"]["state"] == "verdict"
+    assert payload["item"]["state"] == "working"
     assert payload["item"]["brief_truncated"] is False
     assert payload["event"]["title"] == "title1"
     assert payload["event"]["payload"] is None
@@ -650,7 +685,7 @@ def test_item_payload_full_shape():
     assert payload["transitions"][0]["to_state"] == "new"
     assert payload["transitions"][0]["synthetic"] is True
     assert payload["transitions"][1]["from_state"] == "new"
-    assert payload["transitions"][1]["to_state"] == "verdict"
+    assert payload["transitions"][1]["to_state"] == "working"
     assert payload["transitions_total"] == 1
     assert payload["operations_total"] == 1
 
@@ -661,7 +696,7 @@ def test_item_payload_brief_truncated_at_2000_chars():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
-    _item(conn, 1, state="verdict", origin="human", now=now)
+    _item(conn, 1, state="working", origin="human", now=now)
     conn.execute("UPDATE triage_items SET brief = ? WHERE event_id = 1", ("x" * 3000,))
     conn.commit()
 
@@ -691,9 +726,9 @@ def test_item_payload_synthetic_created_entry_for_legacy_item():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
-    _item(conn, 1, state="needs_human", now=now)
-    _transition(conn, 1, "new", "investigating", now)
-    _transition(conn, 1, "investigating", "needs_human", now)
+    _item(conn, 1, state="needs_decision", now=now)
+    _transition(conn, 1, "new", "working", now)
+    _transition(conn, 1, "working", "needs_decision", now)
     conn.commit()
 
     payload = api.item_payload(conn, 1)
@@ -751,12 +786,12 @@ def test_item_payload_history_limit_truncates_newest_first_oldest_returned():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)
     _event(conn, 1, now)
-    _item(conn, 1, state="needs_human", now=now)
+    _item(conn, 1, state="needs_decision", now=now)
     # A real `created` row up front (from_state NULL) so the unbounded read
     # below already has one and this test isn't also exercising the
     # synthetic-entry path covered elsewhere.
     _transition(conn, 1, None, "new", now)
-    states = ["new", "investigating", "verdict", "implementing", "needs_human"]
+    states = ["new", "investigating", "verdict", "implementing", "needs_decision"]
     for i in range(len(states) - 1):
         _transition(conn, 1, states[i], states[i + 1], now + dt.timedelta(minutes=i + 1))
     for i in range(3):
@@ -774,7 +809,7 @@ def test_item_payload_history_limit_truncates_newest_first_oldest_returned():
     assert limited["transitions"][0]["from_state"] == "verdict"
     assert limited["transitions"][0]["to_state"] == "implementing"
     assert limited["transitions"][1]["from_state"] == "implementing"
-    assert limited["transitions"][1]["to_state"] == "needs_human"
+    assert limited["transitions"][1]["to_state"] == "needs_decision"
     assert not any(t.get("synthetic") for t in limited["transitions"])
 
     assert limited["operations_total"] == 3
@@ -957,7 +992,7 @@ def test_metrics_and_health_are_200_with_expected_top_level_keys():
         status, body = handle.get("/metrics")
         assert status == 200, body
         for key in ("verdicts_recorded_disposition", "verified_fixes_vs_silence",
-                    "median_needs_human_to_decision_hours", "verified_unattended_fixes_per_week",
+                    "median_needs_decision_to_decision_hours", "verified_unattended_fixes_per_week",
                     "poller_ages", "reverts_and_reopens", "history_since", "window_days"):
             assert key in body, f"missing {key}"
         status, body = handle.get("/health")

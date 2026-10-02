@@ -8,7 +8,7 @@
      `finished_at_iso()` and its own dedicated tests in test_clients.py.
 
   2. `main()` calls `triage.advance_implement_chain()` — the same
-     verdict -> implementing -> validating -> merge/merge_blocked code
+     verdict -> implement -> review -> merge code
      triage.py's own 600s loop tick calls — once per pass, unconditionally,
      so an item does not wait for that tick to cross its next stage
      boundary. `advance_implement_chain()`'s own behaviour (does it
@@ -190,8 +190,10 @@ def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
     """The whole point: an investigate verdict folded by THIS pass's own
     row loop (fold_dispatch_verdict(), inside process_dispatch()) must be
     visible to advance_implement_chain() in the SAME call, not the next one
-    — that ordering is what lets an item cross verdict -> implementing
-    without waiting for anything else."""
+    — that ordering is what lets an item cross verdict -> implement
+    without waiting for anything else. A `human` verdict is used here because it
+    changes the state (working -> needs_decision), which is what the chain's own
+    first look has to observe."""
     db_path = _fresh_db()
     conn = _ledger.connect(db_path)
     try:
@@ -204,7 +206,7 @@ def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
         conn.execute(
             "INSERT INTO triage_items(event_id,signature,repo,state,dispatch_job,occurrences,"
             "created_at,updated_at,max_tier) VALUES(?,?,?,?,?,?,?,?,?)",
-            (1, "sig-fold-then-chain", "demo-repo", "escalated", "job-fold-then-chain", 1,
+            (1, "sig-fold-then-chain", "demo-repo", "working", "job-fold-then-chain", 1,
              now, now, "implement"),
         )
         conn.commit()
@@ -213,7 +215,7 @@ def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
         job = {
             "id": "job-fold-then-chain",
             "status": "done",
-            "result": {"nextAction": "implement", "confidence": "low", "summary": "not high enough"},
+            "result": {"nextAction": "human", "confidence": "low", "summary": "needs the owner"},
         }
         seen_states: list[str] = []
 
@@ -227,7 +229,7 @@ def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
              _patch(dispatch_sweep._triage, "advance_implement_chain", _fake_advance):
             dispatch_sweep.main(["--db", str(db_path)])
 
-        assert seen_states == ["verdict"], (
+        assert seen_states == ["needs_decision"], (
             f"advance_implement_chain must observe the fold this SAME pass already made, got {seen_states}")
     finally:
         conn.close()

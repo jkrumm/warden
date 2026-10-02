@@ -35,7 +35,7 @@ below.
 
 ADVANCE ON COMPLETION (docs/history/state-log.md §87). After that per-row
 pass, every pass also calls `triage.advance_implement_chain()` — the same
-verdict -> implementing -> validating -> merge/merge_blocked code
+verdict -> implement -> review -> merge code
 `triage.run()` calls on its own 600s tick. Before this, an item that just
 crossed a stage boundary (its verdict folded above, or the row loop
 noticing an implement/review job go terminal) waited for the loop's next
@@ -851,7 +851,7 @@ def main(argv: list[str] | None = None) -> int:
         # process_dispatch()) can make an item eligible for its next
         # deterministic transition RIGHT NOW rather than at the loop's next
         # 600s tick — triage.advance_implement_chain() is the exact same
-        # verdict -> implementing -> validating -> merge/merge_blocked code
+        # verdict -> implement -> review -> merge code
         # run() itself calls, see that function's own docstring for why
         # calling it from here, on this 300s cadence, needs no new lock and
         # is not a second loop. Runs unconditionally, once per pass, exactly

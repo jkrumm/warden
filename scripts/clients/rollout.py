@@ -36,7 +36,7 @@ ROLLOUTS: dict[str, tuple[str, ...]] = {
     # ran it. serve is the vendored open-meteo binary: nothing a merge can
     # change without a rebuild, so it is left alone. Any failing step fails
     # the deploy — a merged PR with a daemon still on the old code is
-    # `needs_human`, never `merged`.
+    # `failed`, never verified.
     "weatherorb-pull": ("/bin/sh", "-c",
                         'git -C "$HOME/SourceRoot/weatherorb" pull --ff-only'
                         ' && make -C "$HOME/SourceRoot/weatherorb" launchd-install'

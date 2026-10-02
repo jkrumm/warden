@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 12
+LEDGER_SCHEMA_VERSION = 13
 
 
 class LedgerBehind(RuntimeError):
@@ -404,14 +404,6 @@ ALTER TABLE triage_items ADD COLUMN origin_channel TEXT;
 ALTER TABLE triage_items ADD COLUMN origin_thread_ts TEXT;
 """
 
-# Versions 9 and 11 below added the needs_human/merge_blocked reminder and
-# parked-recurrence columns on `triage_items` (reminder_count, last_reminder_at,
-# parked_mark, parked_recurrences, recurrence_reminded_at). The reminder feature
-# is gone; the columns stay — dropping them would be a destructive migration
-# of the live ledger for no behavioural gain. Nothing writes them any more and
-# only api.py's `awaiting_owner()` still reads `parked_recurrences`, to satisfy
-# Argo's entry schema until Wave 2. Do not read them elsewhere.
-#
 # Version 9 — the `needs_human`/`merge_blocked` reminder (DESIGN.md:247's
 # "7d, reminder at 1d", the one row of its own deadline table triage.py's
 # STATE_DEADLINES comment and docs/api.md's carried-debt note both flagged
@@ -500,6 +492,81 @@ DROP INDEX IF EXISTS idx_approvals_hash;
 DROP TABLE IF EXISTS dispatch_approvals;
 """
 
+# Version 13 — the state machine collapses to the spec's states (agent-platform.md
+# §Warden) and every clock-driven expiry becomes one retry rule.
+#
+#   triage_items.close_reason   closed -> duplicate | fixed_by | ignored | resolved.
+#     NULL on every other state.
+#   triage_items.strikes        consecutive infrastructure failures of the current
+#     step; 3 -> `failed`. Reset when the item advances forward in the pipeline.
+#   triage_items.retry_at       a poller that submits skips the row until then.
+#
+# Dropped, dead since Wave 1 (nothing reads or writes them; the reminder and
+# parked-recurrence features are gone, `snoozed` is gone, and the generic
+# STATE_DEADLINES clock is gone with `state_deadline`): reminder_count,
+# last_reminder_at, parked_mark, parked_recurrences, recurrence_reminded_at,
+# propose_unsure_at, snoozed_until, state_deadline. `events.reminder_count` and
+# `events.last_reminder_at` are a different table and are NOT touched.
+#
+# State mapping (old -> new), applied to triage_items.state AND to both columns of
+# item_transitions. History rows are rewritten rather than left as history because
+# live code reads them back (funnel metrics 3/4/6 and the chronic-recurrence count
+# compare from_state/to_state against the new vocabulary):
+#
+#   | old                                          | new                  |
+#   | new                                          | new                  |
+#   | split                                        | triaged              |
+#   | investigating, verdict, implementing,        | working              |
+#   |   remediating                                |                      |
+#   | validating, pr_open                          | merging              |
+#   | merged, liveness_pending                     | verifying            |
+#   | needs_human, merge_blocked, reverted         | failed (note kept)   |
+#   | fixed                                        | fixed                |
+#   | quiet                                        | quiet                |
+#   | closed                                       | closed, resolved     |
+#   | ignored, dismissed, note                     | closed, ignored      |
+#   | snoozed                                      | new                  |
+#
+# `close_reason` is only written on triage_items (history has no reason column).
+_STATE_MAP_13 = {
+    "new": "new", "split": "triaged",
+    "investigating": "working", "verdict": "working", "implementing": "working", "remediating": "working",
+    "validating": "merging", "pr_open": "merging",
+    "merged": "verifying", "liveness_pending": "verifying",
+    "needs_human": "failed", "merge_blocked": "failed", "reverted": "failed",
+    "fixed": "fixed", "quiet": "quiet", "closed": "closed",
+    "ignored": "closed", "dismissed": "closed", "note": "closed",
+    "snoozed": "new",
+}
+
+
+def _case_13(column: str) -> str:
+    whens = " ".join(f"WHEN '{old}' THEN '{new}'" for old, new in _STATE_MAP_13.items())
+    return f"CASE {column} {whens} ELSE {column} END"
+
+
+_MIGRATION_13 = f"""
+DROP INDEX IF EXISTS idx_triage_state_deadline;
+ALTER TABLE triage_items DROP COLUMN reminder_count;
+ALTER TABLE triage_items DROP COLUMN last_reminder_at;
+ALTER TABLE triage_items DROP COLUMN parked_mark;
+ALTER TABLE triage_items DROP COLUMN parked_recurrences;
+ALTER TABLE triage_items DROP COLUMN recurrence_reminded_at;
+ALTER TABLE triage_items DROP COLUMN propose_unsure_at;
+ALTER TABLE triage_items DROP COLUMN snoozed_until;
+ALTER TABLE triage_items DROP COLUMN state_deadline;
+ALTER TABLE triage_items ADD COLUMN close_reason TEXT;
+ALTER TABLE triage_items ADD COLUMN strikes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE triage_items ADD COLUMN retry_at TEXT;
+UPDATE triage_items SET
+  close_reason = CASE state WHEN 'closed' THEN 'resolved' WHEN 'ignored' THEN 'ignored'
+                            WHEN 'dismissed' THEN 'ignored' WHEN 'note' THEN 'ignored' END,
+  state = {_case_13("state")};
+UPDATE item_transitions SET
+  from_state = {_case_13("from_state")},
+  to_state = {_case_13("to_state")};
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -513,6 +580,7 @@ MIGRATIONS: dict[int, str] = {
     10: _MIGRATION_10,
     11: _MIGRATION_11,
     12: _MIGRATION_12,
+    13: _MIGRATION_13,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live
@@ -536,26 +604,24 @@ _ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "triage_items")
 # _verify_columns(), because it only ever walked _ADOPTABLE_TABLES.
 _VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
 
-# triage_items.state vocabulary, mirrored from scripts/triage.py's own
-# STATE_* constants (triage.py:332-427) and its TERMINAL_STATES (triage.py:531).
-# ledger.py is the schema owner, so it is the home for the state names that
-# OTHER files need without pulling in triage.py itself — chiefly api.py, which
-# triage.py imports and so cannot import back. triage.py does not import these back yet
-# (STATE.md follow-up).
-STATE_NEEDS_HUMAN = "needs_human"
+# triage_items.state vocabulary, mirrored from scripts/triage.py's own STATE_*
+# constants. ledger.py is the schema owner, so it is the home for the state names
+# that OTHER files need without pulling in triage.py itself — chiefly api.py and
+# warden.py's item transitions, which triage.py imports and so cannot import back.
+STATE_NEW = "new"
+STATE_TRIAGED = "triaged"
+STATE_WORKING = "working"
+STATE_MERGING = "merging"
+STATE_VERIFYING = "verifying"
+STATE_NEEDS_DECISION = "needs_decision"
+STATE_FAILED = "failed"
 STATE_FIXED = "fixed"
 STATE_QUIET = "quiet"
 STATE_CLOSED = "closed"
-STATE_IGNORED = "ignored"
-STATE_NOTE = "note"
-STATE_DISMISSED = "dismissed"
-# `reverted` (Wave 5.3, `warden revert`) — a merged/liveness_pending/fixed item
-# whose PR was reverted by a later, named PR. Terminal like the six above: a
-# revert closes the item's story, it does not reopen it.
-STATE_REVERTED = "reverted"
-TERMINAL_STATES = (
-    STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_IGNORED, STATE_NOTE, STATE_DISMISSED, STATE_REVERTED,
-)
+TERMINAL_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED)
+
+# `closed` always carries one of these in triage_items.close_reason.
+CLOSE_REASONS = ("duplicate", "fixed_by", "ignored", "resolved")
 
 
 def _now_iso() -> str:

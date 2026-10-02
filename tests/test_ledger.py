@@ -164,7 +164,6 @@ def test_fresh_migrate_creates_all_tables_and_indexes():
         "idx_dispatches_open",
         "idx_dispatches_created",
         "idx_triage_state",
-        "idx_triage_state_deadline",   # version 2
         "idx_item_transitions_event",  # version 4
         "operations_open",             # version 5
         "operations_event",            # version 5
@@ -278,15 +277,16 @@ def test_migrate_adopts_pre_versioned_database():
 
     post_cols = {t: _table_columns(conn, t) for t in ledger._ADOPTABLE_TABLES}
     post_counts = _row_counts(conn, ledger._ADOPTABLE_TABLES)
-    # Every column the fixture had is still there, and the only additions are
-    # the ones the migrations past version 1 declare. Nothing is dropped or
-    # renamed: adopting a live database stays additive.
+    # Every column the fixture had is still there, except the two migration 13
+    # drops from triage_items (dead since Wave 1); the only additions are the ones
+    # the migrations past version 1 declare. Every other table stays additive.
+    dropped_by_13 = {"snoozed_until", "propose_unsure_at"}
     for table, cols in pre_cols.items():
-        assert cols <= post_cols[table], f"{table} lost columns: {cols - post_cols[table]}"
+        lost = cols - post_cols[table]
+        assert lost == (dropped_by_13 if table == "triage_items" else set()), f"{table} lost columns: {lost}"
     assert post_cols["triage_items"] - pre_cols["triage_items"] == {
-        "state_deadline", "occurrence_mark", "revert_pr", "origin", "max_tier", "brief",
-        "origin_channel", "origin_thread_ts", "reminder_count", "last_reminder_at",
-        "revision_count", "parked_mark", "parked_recurrences", "recurrence_reminded_at",
+        "occurrence_mark", "revert_pr", "origin", "max_tier", "brief",
+        "origin_channel", "origin_thread_ts", "revision_count", "close_reason", "strikes", "retry_at",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -328,7 +328,8 @@ def test_adopting_a_pre_versioned_ledger_runs_every_later_migration():
         f"{ledger.LEDGER_SCHEMA_VERSION} — every migration after the adopted one was skipped")
 
     cols = _table_columns(conn, "triage_items")
-    assert "state_deadline" in cols, "migration 2 did not run against the adopted ledger"
+    assert "occurrence_mark" in cols and "close_reason" in cols, "later migrations did not run against the adopted ledger"
+    assert "state_deadline" not in cols, "migration 13 drops the generic deadline column"
 
     fresh = ledger.connect(_tmp_path(), migrate=True)
     for table in ledger._ADOPTABLE_TABLES:
@@ -723,23 +724,29 @@ def test_v5_database_migrates_to_v6_matching_a_fresh_one():
     conn.close()
 
 
-def test_migration_9_adds_reminder_columns():
-    """See _MIGRATION_9 — the columns still exist (unused since the reminder
-    feature was removed). `reminder_count` defaults to 0 on every pre-existing
-    row."""
+def test_migration_13_drops_the_dead_triage_columns_and_leaves_events_alone():
+    """The reminder, parked-recurrence, snooze and deadline columns are gone from
+    triage_items; `events.reminder_count`/`last_reminder_at` belong to the pollers'
+    own table and stay."""
     conn = ledger.connect(_tmp_path(), migrate=True)
     cols = _table_columns(conn, "triage_items")
-    assert "reminder_count" in cols, cols
-    assert "last_reminder_at" in cols, cols
+    for gone in ("reminder_count", "last_reminder_at", "parked_mark", "parked_recurrences",
+                 "recurrence_reminded_at", "propose_unsure_at", "snoozed_until", "state_deadline"):
+        assert gone not in cols, gone
+    for added in ("close_reason", "strikes", "retry_at"):
+        assert added in cols, added
+    event_cols = _table_columns(conn, "events")
+    assert "reminder_count" in event_cols and "last_reminder_at" in event_cols
+    indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert "idx_triage_state_deadline" not in indexes
     conn.close()
 
 
-def test_v8_database_migrates_to_v9_matching_a_fresh_one():
+def test_v8_database_migrates_to_current_matching_a_fresh_one():
     """A real upgrade path, not adoption: a database already stamped at
-    schema_version 8 must reach LEDGER_SCHEMA_VERSION 9 with a schema
-    identical to a fresh database's, and an existing triage_items row must
-    default to reminder_count=0, never NULL (the column is NOT NULL
-    DEFAULT 0, same as occurrence_mark's own migration 3 shape)."""
+    schema_version 8 must reach LEDGER_SCHEMA_VERSION with a schema identical to a
+    fresh database's, an existing triage_items row surviving with its old
+    `needs_human` mapped to `failed`."""
     path = _tmp_path()
     conn = sqlite3.connect(path)
     conn.executescript(ledger.BASE_SCHEMA)
@@ -764,9 +771,8 @@ def test_v8_database_migrates_to_v9_matching_a_fresh_one():
 
     conn = ledger.connect(path, migrate=True)
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
-    row = conn.execute("SELECT reminder_count, last_reminder_at FROM triage_items WHERE event_id=1").fetchone()
-    assert row["reminder_count"] == 0, row["reminder_count"]
-    assert row["last_reminder_at"] is None, row["last_reminder_at"]
+    row = conn.execute("SELECT state, strikes, retry_at, close_reason FROM triage_items WHERE event_id=1").fetchone()
+    assert (row["state"], row["strikes"], row["retry_at"], row["close_reason"]) == ("failed", 0, None, None), dict(row)
 
     fresh = ledger.connect(_tmp_path(), migrate=True)
     for table in ledger._VERSIONED_TABLES:
@@ -851,7 +857,7 @@ def test_v11_database_migrates_to_v12_without_dispatch_approvals():
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 12 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
     assert "dispatch_approvals" not in names and "idx_approvals_hash" not in names, names
     assert conn.execute("SELECT COUNT(*) FROM dispatches WHERE job_id='pre-v12-job'").fetchone()[0] == 1
@@ -861,6 +867,93 @@ def test_v11_database_migrates_to_v12_without_dispatch_approvals():
         assert _table_columns(fresh, table) == _table_columns(conn, table), (
             f"{table}: a v11-upgraded schema diverges from a fresh one")
     fresh.close()
+    conn.close()
+
+
+_OLD_TO_NEW = {
+    "new": ("new", None), "split": ("triaged", None),
+    "investigating": ("working", None), "verdict": ("working", None),
+    "implementing": ("working", None), "remediating": ("working", None),
+    "validating": ("merging", None), "pr_open": ("merging", None),
+    "merged": ("verifying", None), "liveness_pending": ("verifying", None),
+    "needs_human": ("failed", None), "merge_blocked": ("failed", None), "reverted": ("failed", None),
+    "fixed": ("fixed", None), "quiet": ("quiet", None),
+    "closed": ("closed", "resolved"),
+    "ignored": ("closed", "ignored"), "dismissed": ("closed", "ignored"), "note": ("closed", "ignored"),
+    "snoozed": ("new", None),
+}
+
+
+def _v12_database(path, states):
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    for version in range(2, 13):
+        conn.executescript(ledger.MIGRATIONS[version])
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (12, 'test')")
+    for i, state in enumerate(states, start=1):
+        conn.execute("INSERT INTO events(source, external_id, title, first_seen) VALUES ('s', ?, 't', 'now')",
+                     (f"e{i}",))
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, state, note, state_deadline, snoozed_until, "
+            "reminder_count, parked_recurrences, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, '2030-01-01', '2030-01-01', 2, 5, 'now', 'now')",
+            (i, f"s:e{i}", state, f"note-{state}"))
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+                     (i, "new", state, "now", None))
+        conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+                     (i, state, "new", "later", None))
+    conn.commit()
+    conn.close()
+
+
+def test_migration_13_maps_every_old_state_and_close_reason_and_rewrites_history():
+    """The spec's mapping table, on a synthetic v12 database holding one row per old
+    state: state and close_reason land as documented, the note survives, the
+    dead columns are gone, the new ones default to 0/NULL, and item_transitions
+    (which live code reads back) speaks the new vocabulary in both columns."""
+    path = _tmp_path()
+    _v12_database(path, list(_OLD_TO_NEW))
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 13 == ledger.LEDGER_SCHEMA_VERSION
+
+    rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
+    assert len(rows) == len(_OLD_TO_NEW)
+    for old, (state, reason) in _OLD_TO_NEW.items():
+        row = rows[f"note-{old}"]
+        assert (row["state"], row["close_reason"]) == (state, reason), (old, dict(row))
+        assert row["strikes"] == 0 and row["retry_at"] is None, (old, dict(row))
+    assert {r["state"] for r in rows.values()} <= {
+        "new", "triaged", "working", "merging", "verifying", "needs_decision", "failed",
+        "fixed", "quiet", "closed"}
+    cols = _table_columns(conn, "triage_items")
+    assert not ({"state_deadline", "snoozed_until", "reminder_count", "parked_recurrences"} & cols)
+
+    history = conn.execute("SELECT from_state, to_state FROM item_transitions").fetchall()
+    seen = {s for r in history for s in (r["from_state"], r["to_state"])}
+    assert seen <= {"new", "triaged", "working", "merging", "verifying", "needs_decision", "failed",
+                    "fixed", "quiet", "closed"}, seen
+    to_state = {r["note"]: r["to_state"] for r in conn.execute(
+        "SELECT t.to_state, i.note FROM item_transitions t JOIN triage_items i ON i.event_id=t.event_id WHERE t.at='now'")}
+    assert to_state["note-needs_human"] == "failed" and to_state["note-ignored"] == "closed", to_state
+    assert conn.execute("SELECT COUNT(*) FROM item_transitions").fetchone()[0] == 2 * len(_OLD_TO_NEW), (
+        "history rows survive")
+
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    for table in ledger._VERSIONED_TABLES:
+        assert _table_columns(fresh, table) == _table_columns(conn, table), (
+            f"{table}: a v12-upgraded schema diverges from a fresh one")
+    fresh.close()
+    conn.close()
+
+
+def test_migration_13_is_one_transaction_and_a_second_connect_is_a_no_op():
+    path = _tmp_path()
+    _v12_database(path, ["needs_human", "ignored", "verdict"])
+    ledger.connect(path, migrate=True).close()
+    conn = ledger.connect(path, migrate=True)   # already at 13: nothing runs again
+    states = sorted(r["state"] for r in conn.execute("SELECT state FROM triage_items"))
+    assert states == ["closed", "failed", "working"], states
     conn.close()
 
 

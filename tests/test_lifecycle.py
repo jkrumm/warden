@@ -248,18 +248,18 @@ def test_require_auto_from_item_norow():
 
 def test_require_auto_from_item_wrong_state():
     conn, _ = _fresh_ledger()
-    _seed_triage_item(conn, 1, repo="warden", state="investigating")
+    _seed_triage_item(conn, 1, repo="warden", state="needs_decision")
     try:
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
-        assert "not 'verdict'" in str(e), e
+        assert "not 'working'" in str(e), e
     else:
         raise AssertionError("expected PolicyError")
 
 
 def test_require_auto_from_item_repo_mismatch():
     conn, _ = _fresh_ledger()
-    _seed_triage_item(conn, 1, repo="other", state="verdict")
+    _seed_triage_item(conn, 1, repo="other", state="working")
     try:
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
@@ -270,7 +270,7 @@ def test_require_auto_from_item_repo_mismatch():
 
 def test_require_auto_from_item_rejects_investigate_ceiling():
     conn, _ = _fresh_ledger()
-    _seed_triage_item(conn, 1, repo="warden", state="verdict", max_tier="investigate")
+    _seed_triage_item(conn, 1, repo="warden", state="working", max_tier="investigate")
     try:
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
@@ -281,7 +281,7 @@ def test_require_auto_from_item_rejects_investigate_ceiling():
 
 def test_require_auto_from_item_no_dispatch_job():
     conn, _ = _fresh_ledger()
-    _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job=None)
+    _seed_triage_item(conn, 1, repo="warden", state="working", dispatch_job=None)
     try:
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
@@ -292,7 +292,7 @@ def test_require_auto_from_item_no_dispatch_job():
 
 def test_require_auto_from_item_no_dispatch_record():
     conn, _ = _fresh_ledger()
-    _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job="job-ghost")
+    _seed_triage_item(conn, 1, repo="warden", state="working", dispatch_job="job-ghost")
     try:
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
@@ -304,7 +304,7 @@ def test_require_auto_from_item_no_dispatch_record():
 def test_require_auto_from_item_not_done():
     conn, _ = _fresh_ledger()
     _seed_dispatch_row(conn, "job-1", status="running")
-    _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job="job-1")
+    _seed_triage_item(conn, 1, repo="warden", state="working", dispatch_job="job-1")
     try:
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
@@ -316,7 +316,7 @@ def test_require_auto_from_item_not_done():
 def test_require_auto_from_item_no_verdict():
     conn, _ = _fresh_ledger()
     _seed_dispatch_row(conn, "job-1", status="done", verdict=None)
-    _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job="job-1")
+    _seed_triage_item(conn, 1, repo="warden", state="working", dispatch_job="job-1")
     try:
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
@@ -328,7 +328,7 @@ def test_require_auto_from_item_no_verdict():
 def test_require_auto_from_item_next_action_not_implement():
     conn, _ = _fresh_ledger()
     _seed_dispatch_row(conn, "job-1", status="done", verdict={"nextAction": "human", "confidence": "high"})
-    _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job="job-1")
+    _seed_triage_item(conn, 1, repo="warden", state="working", dispatch_job="job-1")
     try:
         policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement")
     except PolicyError as e:
@@ -337,18 +337,22 @@ def test_require_auto_from_item_next_action_not_implement():
         raise AssertionError("expected PolicyError")
 
 
-def test_require_auto_from_item_accepts_any_confidence():
+def test_require_auto_from_item_accepts_implement_and_issue_at_any_confidence():
     for confidence in ("low", "medium", "high"):
         conn, _ = _fresh_ledger()
         _seed_dispatch_row(conn, "job-1", status="done", verdict={"nextAction": "implement", "confidence": confidence})
-        _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job="job-1")
+        _seed_triage_item(conn, 1, repo="warden", state="working", dispatch_job="job-1")
         assert policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement") == "job-1"
+    conn, _ = _fresh_ledger()
+    _seed_dispatch_row(conn, "job-1", status="done", verdict={"nextAction": "issue", "confidence": "low"})
+    _seed_triage_item(conn, 1, repo="warden", state="working", dispatch_job="job-1")
+    assert policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement") == "job-1"
 
 
 def test_require_auto_from_item_positive():
     conn, _ = _fresh_ledger()
     _seed_dispatch_row(conn, "job-1", status="done", verdict={"nextAction": "implement", "confidence": "high"})
-    _seed_triage_item(conn, 1, repo="warden", state="verdict", dispatch_job="job-1")
+    _seed_triage_item(conn, 1, repo="warden", state="working", dispatch_job="job-1")
     assert policy.require_auto_from_item(conn, event_id=1, repo="warden", tier="implement") == "job-1"
 
 
@@ -359,9 +363,12 @@ def test_check_repo_not_in_flight_passes_when_clear():
     policy.check_repo_not_in_flight(conn, repo="warden")
 
 
-def test_check_repo_not_in_flight_via_implementing_state():
+def test_check_repo_not_in_flight_via_a_working_item_with_an_implement_job():
     conn, _ = _fresh_ledger()
-    _seed_triage_item(conn, 1, repo="warden", state="implementing")
+    _seed_triage_item(conn, 1, repo="warden", state="working")
+    policy.check_repo_not_in_flight(conn, repo="warden")   # an investigation is not an implement episode
+    conn.execute("UPDATE triage_items SET implement_job='job-impl' WHERE event_id=1")
+    conn.commit()
     try:
         policy.check_repo_not_in_flight(conn, repo="warden")
     except PolicyError as e:
@@ -370,10 +377,11 @@ def test_check_repo_not_in_flight_via_implementing_state():
         raise AssertionError("expected PolicyError")
 
 
-def test_check_repo_not_in_flight_via_validating_state():
+def test_check_repo_not_in_flight_via_merging_state():
     conn, _ = _fresh_ledger()
-    _seed_triage_item(conn, 1, repo="warden", state="validating")
+    _seed_triage_item(conn, 1, repo="warden", state="merging")
     _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden")
+    policy.check_repo_not_in_flight(conn, repo="warden", exclude_event_id=1)
 
 
 def test_check_repo_not_in_flight_via_open_operation():

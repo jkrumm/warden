@@ -483,7 +483,7 @@ def test_run_record_round_trip():
     assert proc.returncode == 0, out
     assert out["verb"] == "run" and out["origin"] == "human" and out["repo"] == "alpha"
     assert out["maxTier"] == "investigate" and out["queued"] is False
-    assert out["jobId"] == "job-run-rt" and out["state"] == "investigating"
+    assert out["jobId"] == "job-run-rt" and out["state"] == "working"
     assert out["eventId"] is not None
 
 
@@ -543,11 +543,20 @@ def test_run_dry_run_opens_nothing():
     assert count == 0, "a dry-run must never open an item"
 
 
-def test_run_tier_implement_without_why_is_usage_error():
+def test_run_tier_implement_needs_no_why_like_dispatch():
+    """`run --tier implement` used to demand `--why` (an approval-era audit
+    record); review is the gate now, and `dispatch` dropped the requirement in
+    Wave 1 — `run` matches it."""
     h = Harness()
-    proc = h.run(["run", "gamma", "--tier", "implement", "--json"], stdin=VALID_BRIEF)
+    db = h.new_db()
+    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-impl", "status": "running"}})})
+    try:
+        proc = h.run(["run", "gamma", "--tier", "implement", "--json"], env=h.base_env(db=db, sideclaw=srv.base),
+                     stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
     out = _json_or_fail(proc)
-    assert proc.returncode == 64 and "--why" in out["error"], out
+    assert proc.returncode == 0 and out["maxTier"] == "implement" and out["state"] == "working", out
 
 
 def test_run_wait_returns_result():
@@ -571,7 +580,7 @@ def test_run_wait_folds_the_verdict_before_returning():
     `dispatch.sync_record(conn, job, reported=True)` and stop there — that
     stamps `reported_at`, so dispatch-sweep.py's own sweep (which only ever
     folds a dispatch with `reported_at IS NULL`) would never fold this one,
-    leaving the item stuck in `investigating` with a DONE job underneath it
+    leaving the item stuck in `working` with a DONE job underneath it
     forever. `run --wait` must fold the verdict itself before it returns,
     the same call dispatch-sweep.py's process_dispatch() makes."""
     h = Harness()
@@ -589,13 +598,13 @@ def test_run_wait_folds_the_verdict_before_returning():
     out = _json_or_fail(proc)
     assert proc.returncode == 0 and out["waited"] is True, out
     assert out["state"] == "closed", out
-    assert out["note"] and out["note"].startswith("answered:"), out
+    assert out["note"] == "all good, no fix needed" and out["state"] == "closed", out
 
     conn, _ = _connect(db)
-    row = _row(conn, "SELECT state, note FROM triage_items WHERE event_id=?", (out["eventId"],))
+    row = _row(conn, "SELECT state, note, close_reason FROM triage_items WHERE event_id=?", (out["eventId"],))
     conn.close()
-    assert row["state"] == "closed", dict(row)
-    assert row["note"].startswith("answered:"), dict(row)
+    assert row["state"] == "closed" and row["close_reason"] == "resolved", dict(row)
+    assert row["note"] == "all good, no fix needed", dict(row)
 
 
 def test_status_unknown_job_is_usage_error():
@@ -677,7 +686,7 @@ def test_auto_from_item_happy_path_opens_directly_no_plan():
     db = h.new_db()
     _seed_dispatch(db, "job-verdict", tier="investigate", repo="gamma", status="done",
                     verdict_json=json.dumps({"nextAction": "implement", "confidence": "high"}))
-    _seed_item(db, 1, state="verdict", repo="gamma", dispatch_job="job-verdict")
+    _seed_item(db, 1, state="working", repo="gamma", dispatch_job="job-verdict")
     srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-auto", "status": "running"}})})
     try:
         proc = h.run(
@@ -701,11 +710,11 @@ def test_auto_from_item_unknown_event_is_policy_error():
 def test_auto_from_item_wrong_state_is_policy_error():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 2, state="needs_human", repo="gamma")
+    _seed_item(db, 2, state="needs_decision", repo="gamma")
     proc = h.run(["dispatch", "gamma", "--tier", "implement", "--auto-from-item", "2", "--why", "w", "--json"],
                   env=h.base_env(db=db), stdin=VALID_BRIEF)
     out = _json_or_fail(proc)
-    assert proc.returncode == 4 and "not 'verdict'" in out["error"], out
+    assert proc.returncode == 4 and "not 'working'" in out["error"], out
 
 
 # --- merge -------------------------------------------------------------------------
@@ -785,7 +794,7 @@ def test_abort_cancels_running_episode_and_closes_the_item():
     h = Harness()
     db = h.new_db()
     _seed_dispatch(db, "job-abort", tier="implement", repo="gamma", status="running")
-    _seed_item(db, 5, state="implementing", repo="gamma", implement_job="job-abort")
+    _seed_item(db, 5, state="working", repo="gamma", implement_job="job-abort")
     srv = stubs.StubServer({("POST", "/api/jobs/job-abort/cancel"): (200, {"job": {"id": "job-abort", "status": "cancelled"}})})
     try:
         proc = h.run(["abort", "5", "--why", "stuck", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
@@ -802,10 +811,10 @@ def test_abort_cancels_running_episode_and_closes_the_item():
 def test_abort_wrong_state_is_policy_error():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 6, state="verdict", repo="gamma")
+    _seed_item(db, 6, state="needs_decision", repo="gamma")
     proc = h.run(["abort", "6", "--why", "stuck", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
-    assert proc.returncode == 4 and "not investigating/implementing/validating" in out["error"], out
+    assert proc.returncode == 4 and "not working/merging" in out["error"], out
 
 
 def test_abort_unknown_item_is_usage_error():
@@ -820,12 +829,12 @@ def test_abort_discharges_every_member_of_the_cluster_sharing_the_job():
     investigation). Cancelling the job ends the episode for all of them, so the
     siblings must not be left behind in an in-flight state: `close` refuses
     them (in-flight states are abort's), and the sweep never folds a row it has
-    already reported — a stranded sibling can only expire to needs_human."""
+    already reported — a stranded sibling would sit in `working` with nothing polling it."""
     h = Harness()
     db = h.new_db()
     _seed_dispatch(db, "job-cluster", tier="investigate", repo="gamma", status="running")
-    _seed_item(db, 21, state="investigating", repo="gamma", dispatch_job="job-cluster")
-    _seed_item(db, 22, state="investigating", repo="gamma", dispatch_job="job-cluster")
+    _seed_item(db, 21, state="working", repo="gamma", dispatch_job="job-cluster")
+    _seed_item(db, 22, state="working", repo="gamma", dispatch_job="job-cluster")
     srv = stubs.StubServer({("POST", "/api/jobs/job-cluster/cancel"): (200, {"job": {"id": "job-cluster", "status": "cancelled"}})})
     try:
         proc = h.run(["abort", "21", "--why", "one batch, one cause", "--json"],
@@ -851,8 +860,8 @@ def test_abort_tolerates_an_already_terminal_job_and_still_discharges_the_cluste
     h = Harness()
     db = h.new_db()
     _seed_dispatch(db, "job-dead", tier="investigate", repo="gamma", status="cancelled")
-    _seed_item(db, 31, state="investigating", repo="gamma", dispatch_job="job-dead")
-    _seed_item(db, 32, state="investigating", repo="gamma", dispatch_job="job-dead")
+    _seed_item(db, 31, state="working", repo="gamma", dispatch_job="job-dead")
+    _seed_item(db, 32, state="working", repo="gamma", dispatch_job="job-dead")
     srv = stubs.StubServer({("POST", "/api/jobs/job-dead/cancel"): (409, {"error": "job already cancelled"})})
     try:
         proc = h.run(["abort", "31", "--why", "already cancelled by the sibling", "--json"],
@@ -869,13 +878,13 @@ def test_abort_tolerates_an_already_terminal_job_and_still_discharges_the_cluste
 
 def test_abort_leaves_a_cluster_sibling_that_already_opened_a_pr_alone():
     """Discharging the cluster must stop at the episode: a sibling that has
-    moved on to `pr_open` carries a draft PR a human still has to review, and
-    cancelling the investigation job is not a reason to close it."""
+    moved on to its own implement episode carries a draft PR a human still has to
+    review, and cancelling the investigation job is not a reason to close it."""
     h = Harness()
     db = h.new_db()
     _seed_dispatch(db, "job-pr", tier="investigate", repo="gamma", status="running")
-    _seed_item(db, 41, state="investigating", repo="gamma", dispatch_job="job-pr")
-    _seed_item(db, 42, state="pr_open", repo="gamma", dispatch_job="job-pr")
+    _seed_item(db, 41, state="working", repo="gamma", dispatch_job="job-pr")
+    _seed_item(db, 42, state="working", repo="gamma", dispatch_job="job-pr", implement_job="job-pr-impl")
     srv = stubs.StubServer({("POST", "/api/jobs/job-pr/cancel"): (200, {"job": {"id": "job-pr", "status": "cancelled"}})})
     try:
         proc = h.run(["abort", "41", "--why", "duplicate", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
@@ -885,7 +894,7 @@ def test_abort_leaves_a_cluster_sibling_that_already_opened_a_pr_alone():
     assert proc.returncode == 0 and out["discharged"] == [], out
     conn, _ = _connect(db)
     states = {r["event_id"]: r["state"] for r in conn.execute("SELECT event_id, state FROM triage_items").fetchall()}
-    assert states == {41: "closed", 42: "pr_open"}, states
+    assert states == {41: "closed", 42: "working"}, states
     conn.close()
 
 
@@ -897,15 +906,15 @@ def test_abort_dry_run_cancels_nothing_and_writes_nothing():
     h = Harness()
     db = h.new_db()
     _seed_dispatch(db, "job-dry", tier="investigate", repo="gamma", status="running")
-    _seed_item(db, 51, state="investigating", repo="gamma", dispatch_job="job-dry")
-    _seed_item(db, 52, state="investigating", repo="gamma", dispatch_job="job-dry")
+    _seed_item(db, 51, state="working", repo="gamma", dispatch_job="job-dry")
+    _seed_item(db, 52, state="working", repo="gamma", dispatch_job="job-dry")
     # No stub server at all: a closed port, so any cancel attempt fails loudly.
     proc = h.run(["abort", "51", "--why", "preview", "--dry-run", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
     assert proc.returncode == 0 and out.get("dryRun") is True and out["cancelled"] is False, out
     conn, _ = _connect(db)
     states = {r["event_id"]: r["state"] for r in conn.execute("SELECT event_id, state FROM triage_items").fetchall()}
-    assert states == {51: "investigating", 52: "investigating"}, states
+    assert states == {51: "working", 52: "working"}, states
     assert _row(conn, "SELECT status FROM dispatches WHERE job_id='job-dry'")["status"] == "running"
     assert _row(conn, "SELECT COUNT(*) AS n FROM item_transitions")["n"] == 0
     conn.close()
@@ -914,7 +923,7 @@ def test_abort_dry_run_cancels_nothing_and_writes_nothing():
 # --- revert --------------------------------------------------------------------------
 
 
-def test_revert_records_the_pr_and_closes_the_item():
+def test_revert_records_the_pr_and_leaves_the_item_failed():
     h = Harness()
     db = h.new_db()
     _seed_item(db, 7, state="fixed", repo="gamma")
@@ -926,17 +935,18 @@ def test_revert_records_the_pr_and_closes_the_item():
     finally:
         srv.stop()
     out = _json_or_fail(proc)
-    assert proc.returncode == 0 and out["state"] == "reverted" and out["pullRequest"] == 11, out
+    assert proc.returncode == 0 and out["state"] == "failed" and out["pullRequest"] == 11, out
     conn, _ = _connect(db)
-    row = _row(conn, "SELECT state, revert_pr FROM triage_items WHERE event_id=7")
-    assert row["state"] == "reverted" and row["revert_pr"] == 11, dict(row)
+    row = _row(conn, "SELECT state, revert_pr, note, close_reason FROM triage_items WHERE event_id=7")
+    assert row["state"] == "failed" and row["revert_pr"] == 11, dict(row)
+    assert row["note"] == "reverted: PR #11" and row["close_reason"] is None, dict(row)
     conn.close()
 
 
 def test_revert_fork_pr_is_policy_error():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 8, state="merged", repo="gamma")
+    _seed_item(db, 8, state="verifying", repo="gamma")
     srv = stubs.StubServer({
         ("GET", "/repos/jkrumm/gamma/pulls/12"): (200, {"state": "closed", "head": {"repo": {"full_name": "someone-else/gamma"}}}),
     })
@@ -951,7 +961,7 @@ def test_revert_fork_pr_is_policy_error():
 def test_revert_wrong_state_is_policy_error():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 9, state="verdict", repo="gamma")
+    _seed_item(db, 9, state="working", repo="gamma")
     proc = h.run(["revert", "9", "--pr", "1", "--why", "x", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
     assert proc.returncode == 4, out
@@ -960,21 +970,22 @@ def test_revert_wrong_state_is_policy_error():
 # --- close ---------------------------------------------------------------------
 
 
-def test_close_from_needs_human_writes_closed_and_a_transition_row():
+def test_close_from_needs_decision_writes_closed_resolved_and_a_transition_row():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 20, state="needs_human", repo="gamma")
+    _seed_item(db, 20, state="needs_decision", repo="gamma")
     proc = h.run(["close", "20", "--why", "answered in a session", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
     assert proc.returncode == 0 and out["toState"] == "closed", out
     assert out["note"].startswith("closed by hand: "), out
     conn, _ = _connect(db)
-    row = _row(conn, "SELECT state, note FROM triage_items WHERE event_id=20")
+    row = _row(conn, "SELECT state, note, close_reason FROM triage_items WHERE event_id=20")
     assert row["state"] == "closed" and row["note"].startswith("closed by hand: "), dict(row)
+    assert row["close_reason"] == "resolved", dict(row)
     trans = _row(
         conn, "SELECT from_state, to_state FROM item_transitions WHERE event_id=20 ORDER BY id DESC LIMIT 1"
     )
-    assert trans["from_state"] == "needs_human" and trans["to_state"] == "closed", dict(trans)
+    assert trans["from_state"] == "needs_decision" and trans["to_state"] == "closed", dict(trans)
     conn.close()
 
 
@@ -984,30 +995,30 @@ def test_close_text_output_prints_the_transition():
     (item 543, 2026-09-14)."""
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 25, state="needs_human", repo="gamma")
+    _seed_item(db, 25, state="needs_decision", repo="gamma")
     proc = h.run(["close", "25", "--why", "fixed elsewhere"], env=h.base_env(db=db))
     assert proc.returncode == 0, proc
-    assert "item 25: needs_human -> closed" in proc.stdout, proc.stdout
+    assert "item 25: needs_decision -> closed" in proc.stdout, proc.stdout
 
 
 def test_close_without_why_is_usage_error():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 21, state="needs_human", repo="gamma")
+    _seed_item(db, 21, state="needs_decision", repo="gamma")
     proc = h.run(["close", "21", "--json"], env=h.base_env(db=db))
     assert proc.returncode == 64, proc
 
 
-def test_close_from_implementing_is_refused_and_item_unchanged():
+def test_close_from_working_is_refused_and_item_unchanged():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 22, state="implementing", repo="gamma", implement_job="job-x")
+    _seed_item(db, 22, state="working", repo="gamma", implement_job="job-x")
     proc = h.run(["close", "22", "--why", "nope", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
     assert proc.returncode == 2, out
     conn, _ = _connect(db)
     row = _row(conn, "SELECT state FROM triage_items WHERE event_id=22")
-    assert row["state"] == "implementing", dict(row)
+    assert row["state"] == "working", dict(row)
     count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id=22")["n"]
     assert count == 0, count
     conn.close()
@@ -1016,7 +1027,7 @@ def test_close_from_implementing_is_refused_and_item_unchanged():
 def test_close_of_an_already_closed_item_is_a_no_op():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 23, state="closed", repo="gamma")
+    _seed_item(db, 23, state="closed", repo="gamma")   # (close_reason NULL: a hand-seeded legacy row)
     proc = h.run(["close", "23", "--why", "still done", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
     assert proc.returncode == 0 and out["toState"] == "closed", out
@@ -1029,13 +1040,13 @@ def test_close_of_an_already_closed_item_is_a_no_op():
 def test_close_dry_run_writes_nothing():
     h = Harness()
     db = h.new_db()
-    _seed_item(db, 24, state="needs_human", repo="gamma")
+    _seed_item(db, 24, state="needs_decision", repo="gamma")
     proc = h.run(["close", "24", "--why", "answered", "--dry-run", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
     assert proc.returncode == 0 and out.get("dryRun") is True, out
     conn, _ = _connect(db)
     row = _row(conn, "SELECT state FROM triage_items WHERE event_id=24")
-    assert row["state"] == "needs_human", dict(row)
+    assert row["state"] == "needs_decision", dict(row)
     count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id=24")["n"]
     assert count == 0, count
     conn.close()

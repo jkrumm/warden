@@ -106,9 +106,9 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
             f"no triage_items row for event_id {event_id_int} — --auto-from-item names a "
             "triage_items.event_id, not a dispatch job id or a bare events.id from another table"
         )
-    if row["state"] != "verdict":
+    if row["state"] != "working":
         raise PolicyError(
-            f"triage item {event_id_int} is in state '{row['state']}', not 'verdict' — --auto-from-item "
+            f"triage item {event_id_int} is in state '{row['state']}', not 'working' — --auto-from-item "
             "only fires off a completed investigation"
         )
     if row["max_tier"] != "implement":
@@ -144,20 +144,20 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
     if not isinstance(verdict_obj, dict):
         raise PolicyError(f"triage item {event_id_int}'s dispatch recorded no parseable verdict")
     next_action = str(verdict_obj.get("nextAction") or "")
-    if next_action != "implement":
+    if next_action not in ("implement", "issue"):
         raise PolicyError(
-            f"triage item {event_id_int}'s verdict says nextAction='{next_action}', not 'implement' — "
-            "--auto-from-item only fires on an investigation that concluded implement is warranted"
+            f"triage item {event_id_int}'s verdict says nextAction='{next_action}', not 'implement' or "
+            "'issue' — --auto-from-item only fires on an investigation that concluded implement is warranted"
         )
     return job_id
 
 
-# States that mean "an implement episode is already running against this
-# repo" — mirrored from triage.py's own state vocabulary rather than
-# imported from it (ledger.py is the schema owner and does not yet mirror
-# these two back; see ledger.py's own STATE_* comment for the pattern this
-# follows for the states it DOES mirror).
-_IN_FLIGHT_STATES = ("implementing", "validating")
+# "An implement episode is already running against this repo": an item in
+# `merging` (its PR is being reviewed and merged), or a `working` item with an
+# implement_job on record (a claim, an episode, or a revision waiting for its
+# next episode). Mirrored from triage.py's own state vocabulary rather than
+# imported from it.
+_IN_FLIGHT_SQL = "(state='merging' OR (state='working' AND implement_job IS NOT NULL))"
 
 
 def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
@@ -168,12 +168,11 @@ def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
     triage_items row at all).
 
     `exclude_event_id` is the caller's OWN item — e.g. maybe_auto_implement()
-    claims its item to `implementing` (an in-flight state) BEFORE calling
+    claims its item (an in-flight shape) BEFORE calling
     open_episode(), which runs this check; without the exclusion, that claim
     would make the item refuse itself the moment open_episode() re-checks."""
-    placeholders = ",".join("?" for _ in _IN_FLIGHT_STATES)
-    query = f"SELECT event_id FROM triage_items WHERE repo=? AND state IN ({placeholders})"
-    params: list[Any] = [repo, *_IN_FLIGHT_STATES]
+    query = f"SELECT event_id FROM triage_items WHERE repo=? AND {_IN_FLIGHT_SQL}"
+    params: list[Any] = [repo]
     if exclude_event_id is not None:
         query += " AND event_id != ?"
         params.append(exclude_event_id)

@@ -26,19 +26,18 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    including op_refs_homelab/op_refs_vps (a dead 1Password
                    ref blocks every future secrets-cache reseal — this must
                    reach at least the digest, never silently drop).
-  2. Reopen/unsnooze — undo a stale `quiet`/`fixed`/`closed`/`dismissed`/
-                   `snoozed` state the underlying event has since moved past
+  2. Reopen       — undo a stale `quiet`/`fixed`/`closed` state (but not
+                   `closed(ignored)`) the underlying event has since moved past
                    (grouped sources reuse the same events.id across a
                    close -> recur cycle, so this is a state fix-up, never a
                    new row).
   3. Classify     — fnmatch MULTIPLE targets per event (see MATCH TARGETS
                     below) against config/triage-policy.json, in order: the
                     explicit `ignore` list (genuine recoveries/known-benign —
-                    route to `ignored`, terminal, invisible), then `rules`
+                    route to `closed(ignored)`, invisible), then `rules`
                     (resolve `repo`, escalate to an episode), and ONLY for a row no rule matched the structural
                     `ignoreUnstructuredSlackProse` fallback (route to
-                    STATE_NOTE — terminal, but VISIBLE in the digest, see that
-                    state's own docstring for why). The prose filter runs LAST
+                    `closed(ignored)`). The prose filter runs LAST
                     deliberately — see classify()'s own docstring for the
                     family it froze when it ran first. Only ever touches a row
                     still in state `new`.
@@ -53,8 +52,8 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    maybe_auto_implement()/poll_validation_jobs()). Asks the
                    external system (sideclaw, GitHub) what actually
                    happened; an operation that still cannot be resolved
-                   moves its item to `needs_human` rather than being
-                   retried (see reconcile_operations()). DESIGN.md §
+                   is an infrastructure failure and strikes its item (see
+                   _strike() and reconcile_operations()). DESIGN.md §
                    Crash recovery: "unknown is an explicit outcome,
                    reconciled before any retry — never silently read as
                    failure." Must run before anything else in THE LOOP
@@ -77,28 +76,24 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    `new` rows too. Neither ever claims "fixed" — see
                    QUIET_RESOLVE_NOTE_PREFIX/RECOVERY_PAIRED_NOTE_PREFIX.
   5. Dissolve     — a cluster (see CLUSTERING below) whose folded verdict says
-                   its members do not share a root cause splits into `split`
+                   its members do not share a root cause splits into `triaged`
                    items — carrying that verdict in `note` — each waiting to
-                   be re-evaluated individually (see STATE_SPLIT).
+                   be re-evaluated individually.
   6. Escalate     — every `new`+`repo`-mapped+eligible item, GROUPED BY REPO,
                    becomes at most one sideclaw `investigate` dispatch per
-                   repo per run (a cluster), not one per item; a `split` item
+                   repo per run (a cluster), not one per item; a `triaged` item
                    escalates too, but always as a SINGLETON, ahead of that
                    repo's `new` clusters — see escalate()'s own comment.
-  6c. Deadlines   — every non-terminal state names its poller and how long a
-                   row may sit in it (STATE_DEADLINES); sweep_deadlines() is
-                   what happens when the poller did not deliver. Runs after
-                   every poller (so an item that can still advance does) and
-                   before the card (so the expiry is visible in the same pass).
-                   An expiry is never silent: it writes the reason into `note`
-                   and prints it.
+  6c. Retries     — there is no clock. An infrastructure failure strikes
+                   (_strike()): retried with backoff, `failed` on the third.
+                   `needs_decision` and `failed` never expire.
   7. Card         — one Slack card per cluster, posted
                    once state leaves `new` (an unescalated item, mapped or
                    not, is carried silently — see CARDED STATES below) and
                    updated in place after, no-op when the rendered content
                    hasn't changed.
-  9. Once a day, one digest message with up to two sections: signatures
-     that matched no policy rule and STATE_NOTE rows (see step 3).
+  9. Once a day, one digest message listing the signatures that matched no
+     policy rule.
   9.5. Argo actions — pulls the owner's queued Argo actions (implement/merge/
                    dismiss/reinvestigate/note) and applies each one before
                    this same pass's own Push step reflects the outcome — see
@@ -135,10 +130,10 @@ per brief; the rest wait for the next run), rather than one dispatch per item.
 Cluster membership is DERIVED, never stored as its own column: every CARDED
 triage_items row sharing a non-NULL `dispatch_job` value IS one cluster — a
 dedicated `cluster_id` column would just duplicate that fact under a different
-name. `_dissolve_cluster()` moves a split cluster's members to state `split`
+name. `_dissolve_cluster()` moves a split cluster's members to state `triaged`
 (which drops them out of every cluster grouping — see CARDED STATES below —
 while keeping the verdict that produced the split readable on each row, see
-STATE_SPLIT), but deliberately leaves `dispatch_job` itself set on those rows
+SPLIT_VERDICT_NOTE_PREFIX), but deliberately leaves `dispatch_job` itself set on those rows
 purely as a cooldown anchor, not a live cluster pointer — see that function's
 own docstring for why clearing it outright would let the escalate() call in the
 very same run instantly re-fuse the pair it just split. The clustering is a
@@ -156,12 +151,11 @@ it, no second writer races `dispatches` for that column — and then does the
 `UPDATE events SET dispatch_id=?` for EVERY member itself, which is the one
 edge nothing else can write.
 
-CARDED STATES. A card exists only once an item has left `new` — an item that
-is mapped but hasn't yet crossed minOccurrences/minOpenMinutes, or is simply
-unmapped, is carried silently (visible only in the once-a-day daily digest —
-see maybe_post_daily_digest()). This is what keeps an empty or partial policy
-from turning into dozens of cards of noise on day one. STATE_NOTE is
-deliberately excluded too — see that state's own docstring.
+CARDED STATES. A card exists only once an item has left `new`/`triaged` — an
+item that is mapped but hasn't yet crossed minOccurrences/minOpenMinutes, or is
+simply unmapped, is carried silently (visible only in the once-a-day daily
+digest — see maybe_post_daily_digest()). This is what keeps an empty or partial
+policy from turning into dozens of cards of noise on day one.
 
 DRY-RUN CONTRACT. `--dry-run` never touches Slack (no chat.postMessage/
 chat.update), never shells out to hermes-cc.sh, never shells out to `gh`,
@@ -175,18 +169,16 @@ six are the only externally-visible actions this script can take.
 uses `gh pr view` to ask GitHub whether a merge it lost the answer to
 actually landed. It is still a shell-out to a remote system, so it is named
 here rather than quietly exempted for being harmless.) Every other step
-(ingest, reopen/unsnooze, classify, resolve, dissolve bookkeeping) is local
+(ingest, reopen, classify, resolve, dissolve bookkeeping) is local
 bookkeeping against triage_items alone, idempotent and side-effect-free, so
 it runs for real even under --dry-run: that is what lets a dry run against a
 throwaway copy of watchdog.db print a meaningful "what would be carded and
 dispatched" preview instead of nothing at all.
 
-Two steps are carve-outs that do NOT run under --dry-run, each for its own
-stated reason: sweep_deadlines() (it can move an item TERMINALLY, and a preview
-must not be able to end an item), and reconcile_operations() (both of its branches
-shell out — see the paragraph above; a preview that cannot ask sideclaw or
-GitHub what happened has nothing to reconcile with, and guessing is the one
-thing that function exists not to do).
+One step is a carve-out that does NOT run under --dry-run:
+reconcile_operations() (both of its branches shell out — see the paragraph
+above; a preview that cannot ask sideclaw or GitHub what happened has nothing to
+reconcile with, and guessing is the one thing that function exists not to do).
 
 Source of truth: ~/SourceRoot/warden/scripts/triage.py
 ~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
@@ -293,168 +285,99 @@ INGEST_SOURCES = ("slack_alert", "uk", "docker_homelab", "docker_vps", "hermes_l
 # never ingests. See resolve_quiet_grouped()/resolve_recovery_paired().
 GROUPED_TRIAGE_SOURCES = ("slack_alert", "hermes_log")
 
+# --- the state machine (agent-platform.md §Warden) -----------------------------
+#
+#   new → triaged → working → merging → verifying → fixed
+#                      │          │          │
+#                      └──────────┴──────────┴──→ needs_decision | failed
+#   quiet · closed (terminal; `closed` always carries a close_reason)
+#
+# Mirrored by scripts/ledger.py (the schema owner) for the readers that cannot
+# import this module; tests/test_ledger.py pins the two together.
+#
+# `new`      event classified, waiting for debounce / capacity (overflow waits
+#            here; the one state silence may resolve).
+# `triaged`  decided worth working, waiting for its dispatch: a dissolved
+#            cluster member, or an item an infrastructure failure sent back for
+#            a retry. Escalates as a singleton.
+# `working`  an investigate, implement or host-verb episode is in flight, OR an
+#            implement verdict is waiting for its implement dispatch, OR a
+#            blocked review is waiting for its revision attempt. The phase is
+#            read off the row: implement_job NULL + an unfinished dispatch_job is
+#            the investigation; implement_job NULL + a finished verdict saying
+#            implement/issue is "waiting for its dispatch"; implement_job a
+#            claim sentinel is "being submitted"; a real implement_job is the
+#            episode; a real implement_job whose dispatch carries
+#            validation_status blocked/checks_failed is "waiting for revision".
+# `merging`  a pull request exists; its review and the merge gate are running.
+# `verifying` merged; the deploy/liveness window is open. A merge with nothing to
+#            verify goes straight on to `fixed` on the next pass.
+# `needs_decision` a verdict carried a question only the owner can answer.
+# `failed`   three infrastructure strikes, a sideclaw refusal, a merge refusal
+#            that will not clear, or revisions exhausted. Never expires, never
+#            silence-resolved, never retried automatically.
+# `fixed`    verified. `quiet`  the signal went quiet before work started.
+# `closed`   done without a verified fix; close_reason says why.
 STATE_NEW = "new"
-STATE_INVESTIGATING = "investigating"
-STATE_VERDICT = "verdict"
-# A cluster member whose SHARED investigation returned DISSOLVE_MARKER
-# ("UNRELATED SIGNATURES" — see _dissolve_cluster()): it HAS been evaluated,
-# it CARRIES that verdict, and it is waiting to be re-evaluated on its own.
-# Reached only from `verdict`, via maybe_dissolve_clusters(), which is why it
-# sits here rather than next to STATE_NEW.
-#
-# Deliberately NOT `new`. `new` is the one state a silence path may discharge
-# (_SILENCE_RESOLVE_ELIGIBLE_STATES is an inclusion list of exactly that one
-# state) precisely because a `new` row carries no obligation yet — and a
-# dissolved member does. Measured live, 2026-09-09 21:09-21:39Z (STATE.md
-# §43): two members carrying a real, correct verdict about an active
-# hermes-agent watchdog race were dissolved to `new`, missed re-escalation
-# inside cooldownHours (correctly — see _dissolve_cluster()'s docstring for
-# why `dispatch_job` stays the cooldown anchor), and were silently
-# quiet-resolved by apply_resolutions() before anyone ever saw the verdict.
-# The verdict survived only in dispatches.verdict_json, which nothing reads.
-# That is the defect this state exists to close, and it closes it by putting
-# the row somewhere silence structurally cannot reach.
-#
-# Deliberately NOT in CARDED_STATES — see that tuple's own comment for why: a
-# dissolved member still shares its (deliberately-retained) `dispatch_job`
-# with its former cluster-mates, and _cluster_groups() groups CARDED rows by
-# that column, so carding `split` would re-render, as one cluster card, the
-# very cluster this state exists to take apart.
-#
-# escalate() is what advances it — as a SINGLETON, never grouped, see that
-# function's own comment — and STATE_DEADLINES is what bounds it.
-STATE_SPLIT = "split"
-STATE_NEEDS_HUMAN = "needs_human"
-STATE_PR_OPEN = "pr_open"
-# Wave 2's `resolved` split — three honest terminal outcomes instead of one
-# number that improves the more questions go unanswered (DESIGN.md § the
-# state machine). Each is produced by exactly the paths its own comment names;
-# see the module docstring's producer table for the full mapping.
-#
-# A change landed AND a positive signal confirmed it. The only genuinely
-# verified-fix state in the file — produced solely by maybe_check_liveness()'s
-# positive branch (a live probe, never silence). See STATE_QUIET for why the
-# two silence-adjacent paths (quiet timer, recovery pairing) do NOT produce
-# this even when a recovery message looks like good news.
+STATE_TRIAGED = "triaged"
+STATE_WORKING = "working"
+STATE_MERGING = "merging"
+STATE_VERIFYING = "verifying"
+STATE_NEEDS_DECISION = "needs_decision"
+STATE_FAILED = "failed"
 STATE_FIXED = "fixed"
-# The signal stopped and NOTHING SHIPPED — never claims a fix. Produced by all
-# three silence/observation paths that predate the split: apply_resolutions()
-# (disappearance from observation), resolve_quiet_grouped() (a quiet timer),
-# and resolve_recovery_paired() (an explicit ✅ recovery message is still only
-# an OBSERVATION that the alert cleared — DESIGN.md § What must not be lost,
-# item 4: "neither [grouped resolve path] ever claims a fix"). A service that
-# is fully down also stops emitting, so silence alone — however it arrives —
-# can never be proof of a fix.
 STATE_QUIET = "quiet"
-# Done WITHOUT a verified positive signal: a human said so (cmd_close), or it
-# landed and there was nothing left to verify (a `merged` item whose repo has
-# no deploy target — sweep_deadlines() expires it here after 1h, per
-# DESIGN.md's own deadline table).
 STATE_CLOSED = "closed"
-STATE_SNOOZED = "snoozed"
-STATE_IGNORED = "ignored"
-# --- the auto-implement chain (verdict -> implement -> validate -> merge ->
-# deploy -> verify), all downstream of a STATE_VERDICT item whose folded
-# investigate verdict said nextAction=implement, at any confidence — review
-# is the gate, not the investigator's self-assessment.
-# See maybe_auto_implement()/poll_implement_jobs()/poll_validation_jobs()/
-# maybe_check_liveness() and their own docstrings for the state machine.
-STATE_IMPLEMENTING = "implementing"      # implement episode dispatched, awaiting a PR
-STATE_VALIDATING = "validating"          # sideclaw's own `review` job reviewing that PR's diff
-STATE_MERGE_BLOCKED = "merge_blocked"    # implement failed, validation blocked/errored, or merge itself refused
-STATE_MERGED = "merged"                  # landed; no deploy configured/enabled for this repo
-STATE_LIVENESS_PENDING = "liveness_pending"  # deployed; waiting on a positive liveness signal
-# The host-verb sibling of STATE_IMPLEMENTING, added 2026-09-11 for the host-verb
-# closed allowlist (HOST_VERB_ALLOWLIST — see that constant's own docstring
-# for the owner decision this exists to serve). maybe_auto_remediate() claims
-# an item into this state with the SAME compare-and-set shape
-# maybe_auto_implement() uses for STATE_IMPLEMENTING, immediately before
-# running the verb, so a crash mid-verb leaves a real, reconcilable
-# `operations` row (kind='host') rather than a silently-abandoned claim. Exits
-# to STATE_LIVENESS_PENDING on a successful (rc=0) run, or straight back to
-# STATE_NEEDS_HUMAN on a non-zero exit — never re-enters `verdict`, because a
-# failed restart is not "try the same episode again", it is a human's problem
-# now (see maybe_auto_remediate()'s own docstring).
-STATE_REMEDIATING = "remediating"
-# Terminal, like `ignored` — never escalates, never gets its own card — but
-# UNLIKE `ignored`, it is NOT a recovery/known-benign match: it's a
-# `slack_alert` row that doesn't look like a structured bot alert
-# (ignoreUnstructuredSlackProse — see classify()) and therefore MIGHT be a
-# human diagnosis that never got actioned (the shipped example: a Slack
-# message naming the exact 1Password rate-limit root cause and its two-line
-# fix, sitting unactioned). Silently dropping that into `ignored` would
-# recreate the exact failure this whole redesign exists to kill. A `note`
-# row surfaces once, under its own heading, in the daily digest — see
-# maybe_post_daily_digest() — then is never touched again.
-STATE_NOTE = "note"
-# Terminal, and the only state a DEADLINE is allowed to expire an item into
-# (see STATE_DEADLINES below). Always carries its reason in `note` —
-# _set_state() raises rather than let a reasonless dismissal exist, because
-# the reason is the whole content of the state: "nobody answered in 7 days"
-# and "the merge stayed blocked for 7 days" are different facts and the row
-# is the only place either survives.
-#
-# Deliberately neither of the two terminal states it superficially resembles.
-# NOT `resolved`: nothing was fixed, and `resolved` is the number DESIGN.md
-# optimizes for — a metric that improves the more questions go unanswered is
-# precisely the failure this loop exists to remove. NOT `ignored`: that is a
-# human calling a signature benign, and an expiry is the absence of a human
-# rather than a judgement by one. Conflating either would corrupt the only
-# two numbers this system reports.
-STATE_DISMISSED = "dismissed"
-# Terminal, like `fixed` — but the opposite verdict: a `warden revert <item>`
-# (Wave 5.3) records that a LATER, named pull request undid what this item's
-# own PR (or the merge it led to) landed. A merged/liveness_pending/fixed
-# item's story ends here; a revert closes it, it does not reopen it. Carries
-# the revert PR's number in `revert_pr` (see _SET_STATE_COLUMNS) — mirrored
-# from scripts/ledger.py's own STATE_REVERTED, which is the schema owner for
-# this vocabulary; see that file's own comment for the pin test that keeps
-# the two tuples from drifting apart.
-STATE_REVERTED = "reverted"
 
-# A card exists only for a row that has actually left `new` — see the module
-# docstring's CARDED STATES paragraph. `snoozed` and `note` are deliberately
-# excluded too: a human just silenced a snoozed row, and a `note` row is
-# visible via the digest, not a card (see STATE_NOTE above).
-#
-# THE INVARIANT (2026-09-08 correction — a 13-card burst reopened this exact
-# failure mode through the resolve path): a card is a conversation with the
-# human about an item they were told about; a state change on an item they
-# were never told about is not news. `STATE_QUIET`/`STATE_FIXED` sit in this
-# tuple because a CARDED item's close is real news (the human saw the problem,
-# now sees it close) — but both are also reachable straight from `new`
-# (apply_resolutions()/resolve_quiet_grouped()/resolve_recovery_paired() all
-# flip `new` straight to `quiet` on a silence/observation signal that was
-# never escalated, and `new` is the ONLY state they may flip — see
-# _SILENCE_RESOLVE_ELIGIBLE_STATES), and an item whose whole life was
-# `new -> quiet` was never told about in the first place. Being in
-# CARDED_STATES only makes a row ELIGIBLE for a card — sync_card() below is
-# where "already had one" is actually enforced (via `card_ts`), and that is the
-# one place this rule is checked, rather than every caller having to
-# re-derive it. `STATE_CLOSED` is here for the same reason: cmd_close()
-# addresses an item a human is looking at (already carded), and the `merged`
-# deadline's expiry to `closed` updates a card that already exists.
-# STATE_DISMISSED is in this tuple for the same reason: an item that HAD a
-# card and then ran out of time is real news to the human who was asked and
-# did not answer — silently dropping it is what a deadline must never look
-# like. Every state that can expire to `dismissed` (needs_human,
-# merge_blocked, pr_open) is itself carded, so in practice this only ever
-# updates a card that already exists.
-# STATE_SPLIT is deliberately ABSENT, and it looks like an omission rather
-# than a decision, so: `_cluster_groups()` groups CARDED rows BY
-# `dispatch_job`, and a dissolved member still shares its former cluster's
-# `dispatch_job` (kept on purpose, as the cooldown anchor — see
-# _dissolve_cluster()). Carding `split` would therefore re-render, as one
-# cluster card, the very cluster the dissolve just took apart — the row
-# would look carded-and-grouped exactly like the `investigating` cluster it
-# used to be. Its own dissolve-notice update (posted by _dissolve_cluster()
-# itself, directly) IS its card history; nothing further renders for it
-# until it reaches `needs_human` on expiry (see STATE_DEADLINES), which IS
-# carded.
-CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR_OPEN,
-                  STATE_FIXED, STATE_QUIET, STATE_CLOSED,
-                  STATE_IMPLEMENTING, STATE_REMEDIATING, STATE_VALIDATING, STATE_MERGE_BLOCKED, STATE_MERGED,
-                  STATE_LIVENESS_PENDING, STATE_DISMISSED, STATE_REVERTED)
+# Terminal means: no poller, no deadline, no exit but a genuine recurrence
+# (reopen_if_needed()) or an owner's `warden reopen`.
+TERMINAL_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED)
+
+# `closed` always carries one of these in triage_items.close_reason.
+CLOSE_DUPLICATE = "duplicate"
+CLOSE_FIXED_BY = "fixed_by"
+CLOSE_IGNORED = "ignored"
+CLOSE_RESOLVED = "resolved"
+CLOSE_REASONS = (CLOSE_DUPLICATE, CLOSE_FIXED_BY, CLOSE_IGNORED, CLOSE_RESOLVED)
+
+# Forward order of the pipeline. _set_state() resets the strike counter when an
+# item advances to merging or beyond (or leaves an end state), so "three strikes"
+# always means three consecutive failures of ONE step.
+_PIPELINE_RANK = {STATE_NEW: 0, STATE_TRIAGED: 1, STATE_WORKING: 2, STATE_MERGING: 3,
+                  STATE_VERIFYING: 4, STATE_FIXED: 5}
+_END_STATES = (STATE_NEEDS_DECISION, STATE_FAILED, *TERMINAL_STATES)
+
+# --- the one retry rule ------------------------------------------------------
+# An INFRASTRUCTURE failure (sideclaw 5xx or unreachable, a terminal episode
+# with no verdict, a review that produced no verdict, an implement episode that
+# ended without a pull request, a lost in-flight operation) is retried with
+# backoff; the third strike lands `failed` carrying the reason. Never a clock on
+# a RUNNING episode (rules/agent-limits.md) — a strike is only ever recorded
+# once the episode is over.
+STRIKE_LIMIT = 3
+STRIKE_BACKOFF_MINUTES = (10, 30)   # after strike 1, after strike 2
+
+# implement_job values that mean "claimed, not yet (or no longer) a sideclaw job".
+# The claim is a compare-and-set on `implement_job IS NULL`, written BEFORE the
+# external call, so two processes (the loop and the sweep) never submit twice.
+IMPLEMENT_CLAIM = "claiming"
+HOST_VERB_CLAIM_PREFIX = "host-verb:"
+
+
+def _is_claim(value: str | None) -> bool:
+    return bool(value) and (value == IMPLEMENT_CLAIM or value.startswith(HOST_VERB_CLAIM_PREFIX))
+
+
+# A card exists only for a row that has actually left `new`/`triaged` — see the
+# module docstring's CARDED STATES paragraph. Being in CARDED_STATES only makes a
+# row ELIGIBLE for a card; sync_card() is where "already had one" is enforced (via
+# `card_ts`) for the states reachable straight from `new` (_NEVER_CARDED_FIRST_STATES).
+# `triaged` is deliberately absent: _cluster_groups() groups CARDED rows by
+# `dispatch_job`, and a dissolved cluster member still shares its (deliberately
+# retained) `dispatch_job` with its former cluster-mates — carding it would
+# re-render, as one cluster card, the very cluster the dissolve took apart.
+CARDED_STATES = (STATE_WORKING, STATE_MERGING, STATE_VERIFYING, STATE_NEEDS_DECISION, STATE_FAILED,
+                 STATE_FIXED, STATE_QUIET, STATE_CLOSED)
 
 # `triage_items.note` prefixes for the grouped-source resolve paths (see
 # resolve_quiet_grouped()/resolve_recovery_paired()) plus the liveness path
@@ -464,7 +387,7 @@ CARDED_STATES = (STATE_INVESTIGATING, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR
 # now clears `note` outright) never accidentally inherits stale text from an
 # earlier phase. Deliberately NOT "fixed"/"resolved" wording for the first
 # two — a service that is fully down also stops emitting, so silence alone is
-# never proof of a fix; see both functions' own docstrings, and STATE_QUIET's.
+# never proof of a fix; see both functions' own docstrings.
 # LIVENESS_CONFIRMED_NOTE_PREFIX is the one genuine "this is actually fixed"
 # claim in the file, because it is backed by a POSITIVE probe
 # (maybe_check_liveness()'s own gatherer), not silence — it is the only prefix
@@ -474,162 +397,23 @@ RECOVERY_PAIRED_NOTE_PREFIX = "recovery message observed: "
 LIVENESS_CONFIRMED_NOTE_PREFIX = "liveness confirmed: "
 # _dissolve_cluster()'s own note prefix — the dissolve verdict's text
 # (summary + verdict + recommendation, the same text_blob DISSOLVE_MARKER is
-# matched against), so a `split` row's obligation is readable on its own row,
-# not only inside dispatches.verdict_json where docs/history/state-log.md §43 found nobody
-# ever reads it. Safe to write here where a note was not safe on `new`
-# (apply_resolutions() clears note=NULL, but a `split` row is never a
-# candidate for that function — see _SILENCE_RESOLVE_ELIGIBLE_STATES): this
-# is the ledger RECORDING the obligation (DESIGN.md principle 1), not
-# forgetting it. sweep_deadlines() preserves it, rather than overwriting it,
-# on the one expiry path that can reach a `split` row — see that function.
+# matched against), so a `triaged` row's obligation is readable on its own row,
+# not only inside dispatches.verdict_json where nobody reads it.
 SPLIT_VERDICT_NOTE_PREFIX = "cluster split — the investigation's verdict, pending individual re-evaluation: "
 
 STATE_EMOJI = {
     STATE_NEW: ":large_blue_circle:",
-    STATE_INVESTIGATING: ":mag:",
-    STATE_VERDICT: ":memo:",
-    STATE_NEEDS_HUMAN: ":raising_hand:",
-    STATE_PR_OPEN: ":twisted_rightwards_arrows:",
-    # `fixed` inherits the old `resolved` emoji — it is the only one of the
-    # three that earns it (a verified positive signal, not silence).
+    STATE_TRIAGED: ":scissors:",
+    STATE_WORKING: ":hammer_and_wrench:",
+    STATE_MERGING: ":test_tube:",
+    STATE_VERIFYING: ":hourglass_flowing_sand:",
+    STATE_NEEDS_DECISION: ":raising_hand:",
+    STATE_FAILED: ":no_entry:",
+    # `fixed` is the only closing state backed by a verified positive signal.
     STATE_FIXED: ":white_check_mark:",
     STATE_QUIET: ":mute:",
     STATE_CLOSED: ":ballot_box_with_check:",
-    STATE_SNOOZED: ":zzz:",
-    STATE_IMPLEMENTING: ":hammer_and_wrench:",
-    STATE_REMEDIATING: ":gear:",
-    STATE_VALIDATING: ":test_tube:",
-    STATE_MERGE_BLOCKED: ":no_entry:",
-    STATE_MERGED: ":rocket:",
-    STATE_LIVENESS_PENDING: ":hourglass_flowing_sand:",
-    STATE_DISMISSED: ":wastebasket:",
-    STATE_REVERTED: ":leftwards_arrow_with_hook:",
-    # Unreachable on a rendered card today — `split` is deliberately absent
-    # from CARDED_STATES (see that state's own comment) — but STATE_EMOJI is
-    # a total map over the vocabulary, and a gap here would silently render
-    # `:question:` the day this state is ever carded.
-    STATE_SPLIT: ":scissors:",
 }
-
-# Terminal means: no poller, no deadline, no exit. Named once, as a constant,
-# so STATE_DEADLINES below can be checked against it by a test rather than by
-# a reader — DESIGN.md principle 6 is "checked against the diagram, not
-# assumed", and a hand-maintained second list of terminal states is exactly
-# how the two drift apart.
-TERMINAL_STATES = (
-    STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_IGNORED, STATE_NOTE, STATE_DISMISSED, STATE_REVERTED,
-)
-
-
-class _DeadlineRule(NamedTuple):
-    """What advances a state, how long a row may sit in it, and where it goes
-    when nothing advanced it in time.
-
-    `poller` names the function or the human — principle 6 asks every
-    non-terminal state to name the thing that polls it, and a name in a table
-    the code reads is a claim a test can check, where a name in a comment is
-    not. `hours` is None for a state bounded by something other than a clock.
-    `deadline_column` names WHICH column carries the moment, because two
-    states own their own and sweep_deadlines() must not touch a window it
-    does not own."""
-
-    poller: str
-    hours: float | None
-    on_expiry: str | None
-    reason: str | None
-    deadline_column: str | None
-
-
-# The generic column, owned by _set_state() (writes it) and sweep_deadlines()
-# (acts on it). `liveness_pending` and `snoozed` name their own instead.
-# Underscore-private, and that is load-bearing: it is not a state, and
-# test_every_non_terminal_state_names_a_poller_and_a_deadline enumerates every
-# public STATE_* string in this module to find the states it must check.
-_STATE_DEADLINE_COLUMN = "state_deadline"
-
-# THE table. Every non-terminal state appears here exactly once; a state that
-# does not is a state an item can sit in forever, which is the failure
-# DESIGN.md § Deadlines was written about
-# (test_every_non_terminal_state_names_a_poller_and_a_deadline enforces it).
-# The numbers are DESIGN.md's own table, not re-derived here.
-#
-# Two entries deviate from that table, deliberately, because a reader will
-# check:
-#
-#   * `verdict` is not in DESIGN.md's table at all, and it is non-terminal.
-#     maybe_auto_implement() advances it on the next tick whenever the verdict
-#     reads nextAction=implement, whatever its confidence; every other verdict
-#     (and one deferred by the per-repo lock) sits in `verdict` with nothing
-#     else scheduled to touch it. 24h -> needs_human. An ADDITION to the
-#     design's table, not a contradiction of it.
-#   * `split` is the same third addition as `verdict` above, for the same
-#     reason: post-verdict, nothing scheduled to touch it unless a specific
-#     condition is met (here: escalate() finding it a free per-repo slot —
-#     see that function). Poller is named as "escalate" — the real function
-#     that advances it, per principle 6 — not a comment. 24h, matching
-#     `verdict`'s own rule: `split` is the same KIND of state, and the
-#     deadline has to clear DEFAULT_COOLDOWN_HOURS=6 by a wide margin so
-#     escalate() gets several real chances (several 10-minute passes across
-#     multiple cooldown windows) before the clock takes over — this is the
-#     backstop for "the repo is denied/unmapped, or budgets stayed
-#     saturated", not the normal path. Expires to `needs_human`, not
-#     `dismissed`: the row holds an unactioned verdict, so the honest expiry
-#     is to put it in front of a human — which also makes it visible again,
-#     since `needs_human` IS carded (see CARDED_STATES).
-STATE_DEADLINES: dict[str, _DeadlineRule] = {
-    # Bounded by silence, not by a clock: the three silence paths resolve a
-    # `new` row after `quietResolveHours` (see _SILENCE_RESOLVE_ELIGIBLE_STATES,
-    # which is an inclusion list of exactly this one state). A clock here would
-    # be a second, competing bound on the one state that already has one.
-    STATE_NEW: _DeadlineRule("resolve_quiet_grouped / apply_resolutions", None, None, None, None),
-    STATE_INVESTIGATING: _DeadlineRule("dispatch-sweep.py", 2, STATE_NEEDS_HUMAN, None,
-                                        _STATE_DEADLINE_COLUMN),
-    STATE_VERDICT: _DeadlineRule("maybe_auto_implement", 24, STATE_NEEDS_HUMAN, None,
-                                  _STATE_DEADLINE_COLUMN),
-    STATE_SPLIT: _DeadlineRule("escalate", 24, STATE_NEEDS_HUMAN, "unre-evaluated", _STATE_DEADLINE_COLUMN),
-    STATE_IMPLEMENTING: _DeadlineRule("poll_implement_jobs", 2, STATE_MERGE_BLOCKED, None,
-                                       _STATE_DEADLINE_COLUMN),
-    # A THIRD addition beyond DESIGN.md's own table, same shape as `verdict`/
-    # `split` above: maybe_auto_remediate() resolves this state SYNCHRONOUSLY,
-    # within the same pass that claims it (record the operation, run the
-    # verb, complete it, transition on) — so this deadline is a backstop for
-    # a crash between the claim and the completion, not the normal exit path.
-    # 1h clears HOST_VERB_TIMEOUT (90s) by a wide margin. A row that reaches
-    # this deadline live has an `operations` row with outcome IS NULL that
-    # reconcile_operations() (which runs FIRST, every pass) will have already
-    # resolved to `needs_human` — see that function's own `host` branch —
-    # long before this clock ever fires.
-    STATE_REMEDIATING: _DeadlineRule("maybe_auto_remediate", 1, STATE_NEEDS_HUMAN, None,
-                                      _STATE_DEADLINE_COLUMN),
-    STATE_VALIDATING: _DeadlineRule("poll_validation_jobs", 1, STATE_MERGE_BLOCKED, None,
-                                     _STATE_DEADLINE_COLUMN),
-    STATE_MERGE_BLOCKED: _DeadlineRule("operator", 168, STATE_DISMISSED, "unresolved",
-                                        _STATE_DEADLINE_COLUMN),
-    # Nothing polls a `merged` row — the deploy path already declined it (see
-    # poll_validation_jobs()), so the clock IS its only exit, and this sweeper
-    # is therefore honestly named as the poller rather than left blank. Expires
-    # to `closed`, per DESIGN.md's own deadline table and FLOWS.md flow 2:
-    # landed, no deploy target, closed after 1h with no deploy — done without a
-    # verified positive signal, which is exactly STATE_CLOSED's definition.
-    STATE_MERGED: _DeadlineRule("sweep_deadlines", 1, STATE_CLOSED, None, _STATE_DEADLINE_COLUMN),
-    STATE_NEEDS_HUMAN: _DeadlineRule("operator", 168, STATE_DISMISSED, "expired",
-                                      _STATE_DEADLINE_COLUMN),
-    STATE_PR_OPEN: _DeadlineRule("operator", 336, STATE_DISMISSED, "expired", _STATE_DEADLINE_COLUMN),
-    # Owns `liveness_deadline` (schema version 1, the deploy path's own probe
-    # window) — maybe_check_liveness() both sets and acts on it, including the
-    # reopen-to-`new` that a generic expiry could never express. The generic
-    # sweeper skips it on this column name alone.
-    STATE_LIVENESS_PENDING: _DeadlineRule("maybe_check_liveness", None, None, None, "liveness_deadline"),
-    # Owns `snoozed_until`: a human chose that moment, and unsnooze_if_expired()
-    # is the poller that honours it.
-    STATE_SNOOZED: _DeadlineRule("unsnooze_if_expired", None, None, None, "snoozed_until"),
-}
-
-# Written into `note` by sweep_deadlines() and by nothing else. A human
-# reading a card must be able to tell "the clock ran out" from "something
-# decided this" without knowing the state machine, so the note says so in
-# words, first.
-DEADLINE_EXPIRED_NOTE_PREFIX = "deadline expired: "
 
 DEFAULT_CARD_CHANNEL = "C0BVDE5R562"  # #agents — see config/triage-policy.json
 DEFAULT_MIN_OCCURRENCES = 3
@@ -679,7 +463,7 @@ DEFAULT_HOST_VERB_MAX_ATTEMPTS = 2
 # wrong bar for THIS mechanism specifically. A restart from
 # HOST_VERB_ALLOWLIST is idempotent, followed by a positive liveness probe
 # before the item is ever marked done, and capped at `hostVerbMaxAttempts` —
-# so a wrong guess costs one restart and a `needs_human` card with the
+# so a wrong guess costs one restart and a `failed` card with the
 # receipt attached, which is cheaper than a human running the exact same
 # restart by hand. auto-IMPLEMENT has no confidence bar at all any
 # more (review is its gate); a host verb keeps one because it has no review
@@ -691,7 +475,7 @@ _CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 DEFAULT_HOST_VERB_MIN_CONFIDENCE = "medium"
 
 # Concurrency ceiling: simultaneously-open CLUSTERS (distinct dispatch_job
-# values in state=investigating) this loop is allowed to have outstanding at
+# values of a `working` investigation) this loop is allowed to have outstanding at
 # once — this bounds how many run AT THE SAME TIME, which matters because
 # sideclaw itself has its own concurrency limits shared with every other
 # dispatch source.
@@ -744,8 +528,8 @@ _HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_H
 #
 # The owner's decision (2026-09-11, STATE.md, docs/history/state-log.md §59): "if warden is
 # confident in a fix it must do it, even a host-level action like restarting
-# a process. `needs_human` for a restart is friction." Every one of the
-# repeat needs_human cards this decision is about reads the SAME shape: a
+# a process. `needs_decision` for a restart is friction." Every one of the
+# repeat needs_decision cards this decision is about reads the SAME shape: a
 # read-only investigate episode correctly diagnoses a wedged process and
 # correctly names the restart that clears it, but cannot itself run a host
 # command (see DESIGN.md § Security model — the episode is not contained,
@@ -762,7 +546,7 @@ _HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_H
 # against hermes-ops.sh's own `cmd_restart <host> <container> --why --confirm`
 # (a `docker restart <container>` over ssh, container name validated live
 # against `containers_for()` — see that function's own comment) for the
-# uk:193 "Research Gateway - HTTP" needs_human item, but the ACTUAL container
+# uk:193 "Research Gateway - HTTP" needs_decision item, but the ACTUAL container
 # name on vps could not be pinned from the repo alone: apps/research-gateway/
 # compose.yml declares no `container_name:` and no top-level `name:`, and the
 # vps Makefile's `research-gateway-up` target runs `docker compose -f
@@ -773,7 +557,7 @@ _HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_H
 # convention this repo cannot observe without an ssh session. Guessing wrong
 # into a closed, security-relevant allowlist is exactly the kind of
 # expression this section exists to prevent, so the entry is dropped rather
-# than shipped unverified — uk:193 stays on `needs_human` untouched by this
+# than shipped unverified — uk:193 stays on `needs_decision` untouched by this
 # slice; add the entry once the container name is confirmed live (`hermes-ops.sh
 # containers vps --json`).
 HOST_VERB_ALLOWLIST: dict[str, list[str]] = {
@@ -800,7 +584,7 @@ HOST_VERB_LIVENESS_MONITOR: dict[str, str] = {
 # would still run — the verb executes fine — but its item would get
 # `deploy_expect_json="[]"` on success (see maybe_auto_remediate()'s own
 # `monitor_title` branch), and _gather_kuma_push_fresh() unconditionally
-# refuses an empty `expected`, so the item would cycle liveness_pending ->
+# refuses an empty `expected`, so the item would cycle verifying ->
 # new on every liveness_deadline, forever, never confirmed and never
 # reaching a human either — exactly the silently-stuck-item failure
 # DESIGN.md's own deadline table exists to close, just one level removed
@@ -1252,7 +1036,7 @@ def load_policy() -> dict[str, Any]:
         # See CLAUDE.md/docs/triage.md — filters Hermes's OWN pre-silencing
         # conversational replies that watchdog-poll.py ingested from #alerts
         # as if they were alerts (297 signatures, ~30 permanently open) —
-        # routed to STATE_NOTE, never STATE_IGNORED (see classify()).
+        # routed to `closed(ignored)` (see classify()).
         "ignoreUnstructuredSlackProse": bool(data.get("ignoreUnstructuredSlackProse")),
         # Per-repo deploy/liveness policy (deploy, autoDeploy, deployOnMerge,
         # deployByPoller, liveness) — this file reads `liveness`
@@ -1411,13 +1195,12 @@ def _occurrence_mark(event: sqlite3.Row | dict[str, Any] | None) -> str | None:
 # `state`. A closed allowlist, for the same reason the verb/evidence/liveness/
 # repo lists are closed: these names are interpolated into SQL, and the rule
 # that a policy file (or any caller) may name and parameterise but never
-# express holds here too. `state`, `state_deadline` and `updated_at` are not in
-# it — those three are the helper's own, written on every transition, never by
-# a caller.
+# express holds here too. `state` and `updated_at` are not in it — those are the
+# helper's own, written on every transition, never by a caller.
 _SET_STATE_COLUMNS = (
     "note", "dispatch_job", "card_channel", "card_ts", "card_hash", "artifact_url",
     "pr_url", "implement_job", "validation_job", "liveness_deadline", "deploy_expect_json",
-    "snoozed_until", "revert_pr",
+    "revert_pr", "close_reason", "strikes", "retry_at", "revision_count",
 )
 
 
@@ -1434,46 +1217,34 @@ class _Coalesce(NamedTuple):
 
 def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datetime, *,
                 expect_state: str | None = None, expect_null: tuple[str, ...] = (),
-                **columns: Any) -> int:
+                expect_eq: dict[str, Any] | None = None, **columns: Any) -> int:
     """The ONLY place this file writes triage_items.state. Returns rowcount.
 
-    It exists because `state` and `state_deadline` are one fact written in two
-    columns: the deadline is a property OF the state (scripts/ledger.py's
-    migration 2 says the same from the schema side), so a transition that
-    writes one without the other produces a row that either sits forever with
-    no clock or carries the previous state's clock. Twenty-six call sites each
-    remembering to compute a deadline is twenty-six chances to forget one;
-    computing it HERE, from STATE_DEADLINES, is the entire reason for the
-    helper. test_no_raw_state_transition_remains is what keeps it the only one.
+    `closed` must carry its reason: a `close_reason` in CLOSE_REASONS is
+    required, and every other state clears it, so a reopened item never keeps the
+    reason it was closed with.
 
-    The deadline is NULL — deliberately, not by omission — for a terminal
-    state, for `new` (bounded by silence, see _SILENCE_RESOLVE_ELIGIBLE_STATES)
-    and for the two states carrying their own column. Everything else gets
-    `now + hours`.
+    The strike counter is owned here too: an item that advances to `merging`,
+    `verifying` or `fixed` (a step SUCCEEDED — claiming `working` is not
+    progress, the episode may still fail), or that leaves an end state
+    (needs_decision, failed, terminal) by any route, gets `strikes=0,
+    retry_at=NULL` unless the caller passed `strikes` itself — _strike() does —
+    so "three strikes" always means three consecutive failures of one step. A
+    retry (which moves an item BACKWARD, or leaves it where it is) therefore
+    never resets its own counter; a caller whose success does not change state
+    (a verdict folded onto a `working` row) resets it explicitly.
 
-    Raises on a state STATE_DEADLINES has never heard of and that is not
-    terminal: a state added later must fail loudly at its first transition
-    rather than quietly acquire "no deadline, forever". Raises on a `dismissed`
-    with no reason, because a dismissal without one is indistinguishable from
-    a bug (see STATE_DISMISSED).
-
-    `expect_state`/`expect_null` turn the UPDATE into a compare-and-swap —
-    maybe_auto_implement() claims an item that way, and the returned rowcount
-    is how it learns whether it won.
+    `expect_state`/`expect_null`/`expect_eq` turn the UPDATE into a
+    compare-and-swap — maybe_auto_implement() claims an item that way, and the
+    returned rowcount is how it learns whether it won.
 
     Also writes `occurrence_mark` (see _occurrence_mark()), on EVERY
-    transition, not only into terminal states — same reasoning as
-    `state_deadline`: a closed list of "states that need a mark" is one more
-    list to forget to update, so stamping unconditionally means the column is
-    never stale. It is computed here, from the event row (_get_event()), and
-    is not caller-settable — like `state_deadline`, it is not in
-    _SET_STATE_COLUMNS. The mark exists because `updated_at` cannot serve the
-    same purpose: ingest() rewrites `updated_at` on every open row on every
-    pass regardless of state, so "when did this item last actually change
-    state" needs its own column. reopen_if_needed() is the only reader — it
-    compares the mark stored here against the event's CURRENT mark to tell a
-    resolved/dismissed row that is still quiet from one a fresh occurrence
-    reopened underneath.
+    transition: a closed list of "states that need a mark" is one more list to
+    forget to update, so stamping unconditionally means the column is never
+    stale. It is computed here, from the event row (_get_event()), and is not
+    caller-settable. reopen_if_needed() is the only reader — it compares the
+    mark stored here against the event's CURRENT mark to tell a closed row that
+    is still quiet from one a fresh occurrence reopened underneath.
 
     See `_record_created_transition()` for the one exception: the two
     `INSERT INTO triage_items` creation sites, which start a row at `new`
@@ -1489,27 +1260,23 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     (sync_card() and friends write card_ts/card_hash/etc. through here with
     `state` unchanged) — recording those as transitions would fill the table
     with noise and corrupt every duration /metrics computes from it. `note`
-    rides along verbatim when the caller passed one (a dismissal's reason, a
-    quiet-resolve's timestamp) so history stays readable after the item moves
-    on again; a caller that passed none leaves it NULL rather than guessing."""
-    rule = STATE_DEADLINES.get(state)
-    if rule is None and state not in TERMINAL_STATES:
-        raise ValueError(
-            f"{state!r} is in neither STATE_DEADLINES nor TERMINAL_STATES. A non-terminal state "
-            f"with no deadline rule is an item that sits in it forever with nothing polling it out "
-            f"— add it to STATE_DEADLINES (poller, hours, on_expiry) or to TERMINAL_STATES.")
-    if state == STATE_DISMISSED and not str(columns.get("note") or "").strip():
-        raise ValueError(
-            "a `dismissed` transition must carry its reason in note= — the reason IS the state's "
-            "content, and a reasonless dismissal cannot be told apart from a bug (see STATE_DISMISSED)")
-    unknown = tuple(c for c in (*columns, *expect_null) if c not in _SET_STATE_COLUMNS)
+    rides along verbatim when the caller passed one so history stays readable
+    after the item moves on again; a caller that passed none leaves it NULL
+    rather than guessing."""
+    known = (STATE_NEW, STATE_TRIAGED, STATE_WORKING, STATE_MERGING, STATE_VERIFYING,
+             STATE_NEEDS_DECISION, STATE_FAILED, *TERMINAL_STATES)
+    if state not in known:
+        raise ValueError(f"{state!r} is not a state of this machine: {known}")
+    if state == STATE_CLOSED:
+        if columns.get("close_reason") not in CLOSE_REASONS:
+            raise ValueError(f"a `closed` transition must carry close_reason= one of {CLOSE_REASONS}")
+    else:
+        columns["close_reason"] = None
+    expect_eq = expect_eq or {}
+    unknown = tuple(c for c in (*columns, *expect_null, *expect_eq) if c not in _SET_STATE_COLUMNS)
     if unknown:
         raise ValueError(f"{unknown} not in _SET_STATE_COLUMNS — column names reach SQL here, so the "
                          f"list is closed on purpose")
-
-    deadline = None
-    if rule is not None and rule.hours is not None and rule.deadline_column == _STATE_DEADLINE_COLUMN:
-        deadline = (now + dt.timedelta(hours=rule.hours)).isoformat()
 
     mark = _occurrence_mark(_get_event(conn, event_id))
 
@@ -1519,8 +1286,16 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     prev_row = conn.execute("SELECT state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
     prev_state = prev_row["state"] if prev_row is not None else None
 
-    sql = "UPDATE triage_items SET state=?, state_deadline=?, occurrence_mark=?, updated_at=?"
-    params: list[Any] = [state, deadline, mark, _now_iso(now)]
+    if "strikes" not in columns and prev_state is not None and prev_state != state:
+        advanced = (state in _PIPELINE_RANK and prev_state in _PIPELINE_RANK
+                    and _PIPELINE_RANK[state] >= _PIPELINE_RANK[STATE_MERGING]
+                    and _PIPELINE_RANK[state] > _PIPELINE_RANK[prev_state])
+        if advanced or prev_state in _END_STATES:
+            columns["strikes"] = 0
+            columns["retry_at"] = None
+
+    sql = "UPDATE triage_items SET state=?, occurrence_mark=?, updated_at=?"
+    params: list[Any] = [state, mark, _now_iso(now)]
     for col, value in columns.items():
         if isinstance(value, _Coalesce):
             sql += f", {col}=COALESCE(?, {col})"
@@ -1535,6 +1310,12 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
         params.append(expect_state)
     for col in expect_null:
         sql += f" AND {col} IS NULL"
+    for col, value in expect_eq.items():
+        if value is None:
+            sql += f" AND {col} IS NULL"
+        else:
+            sql += f" AND {col}=?"
+            params.append(value)
     rowcount = conn.execute(sql, params).rowcount
 
     if rowcount > 0 and prev_state != state:
@@ -1546,6 +1327,40 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
             (event_id, prev_state, state, _now_iso(now), note_value),
         )
     return rowcount
+
+
+def _retry_ready_sql(now: dt.datetime, alias: str = "") -> tuple[str, list[str]]:
+    """The predicate every poller that SUBMITS adds to its candidate query: a row
+    waiting out a strike's backoff is skipped until `retry_at` passes."""
+    col = f"{alias}retry_at"
+    return f"({col} IS NULL OR {col} <= ?)", [_now_iso(now)]
+
+
+def _strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,
+            retry_state: str, expect_state: str | None = None, **retry_columns: Any) -> str:
+    """The one retry rule. An infrastructure failure of the step the item is on
+    increments `strikes`; below STRIKE_LIMIT the item goes to `retry_state` (the
+    state whose poller re-submits the failed step — `triaged` for an investigation,
+    `working` for an implement/host-verb episode, `merging` for a review or merge)
+    with `retry_at` pushed out by the backoff, and `retry_columns` applied (the
+    handle of the failed attempt cleared, so the poller starts a fresh one). At
+    STRIKE_LIMIT the item is `failed`, `reason` is its note, and its columns are
+    left alone as evidence. Returns the state the item landed in.
+
+    A SUBMIT REFUSED by sideclaw (4xx) is not an infrastructure failure and never
+    comes through here — see _end_on_refusal()."""
+    row = _get_item(conn, event_id)
+    strikes = (row["strikes"] if row is not None else 0) + 1
+    if strikes >= STRIKE_LIMIT:
+        _set_state(conn, event_id, STATE_FAILED, now, expect_state=expect_state, note=reason,
+                   strikes=strikes, retry_at=None)
+        return STATE_FAILED
+    backoff = STRIKE_BACKOFF_MINUTES[min(strikes, len(STRIKE_BACKOFF_MINUTES)) - 1]
+    retry_at = _now_iso(now + dt.timedelta(minutes=backoff))
+    _set_state(conn, event_id, retry_state, now, expect_state=expect_state,
+               note=f"{reason} — retry {strikes}/{STRIKE_LIMIT - 1} after {backoff} min",
+               strikes=strikes, retry_at=retry_at, **retry_columns)
+    return retry_state
 
 
 def _record_created_transition(conn: sqlite3.Connection, event_id: int, state: str, at: str) -> None:
@@ -1645,8 +1460,8 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
     somewhere between `new` and its own resolution — this returns that row's
     `event_id` and inserts nothing (the loop or CLI that dedups against this
     return value never opens a second item for the same handover). If a
-    TERMINAL item already exists (fixed/quiet/closed/dismissed/ignored/note/
-    reverted), this does NOTHING and returns None: a repeat sighting of an
+    TERMINAL item already exists (fixed/quiet/closed), this does NOTHING and
+    returns None: a repeat sighting of an
     issue whose work has already finished — because it dropped out of the
     open-issue poll entirely (closed, or `warden:skip` applied), or a repeat
     `warden run` for something already `closed` — is not a new handover; see
@@ -1796,7 +1611,7 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime) -> None:
     new occurrence, whichever of the two clocks produced it (see
     _occurrence_mark()'s own docstring for why both are needed).
 
-    Three-way outcome per resolved/dismissed row, comparing the event's
+    Three-way outcome per closed row, comparing the event's
     CURRENT mark against the one `_set_state()` stamped at this row's last
     transition:
 
@@ -1814,26 +1629,17 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime) -> None:
       it is what removes the need for a data backfill in ledger.py's
       migration 3.
 
-    `dismissed` reopens too, and the distinction matters. `ignored` and `note`
-    do NOT, because a human looked at those and said benign — a recurrence
-    tells us nothing new. `dismissed` is the opposite: it means NOBODY
-    answered before the deadline (see STATE_DEADLINES / sweep_deadlines), so a
-    fresh occurrence is new information about a question that was never
-    actually decided. Without this, item 1's whole point would be handed back
-    by item 3's clock — a `needs_human` row protected from silence-resolve
-    would instead go terminal on a 7-day fuse and never be seen again however
-    often its monitor fired. Terminal means "this item is closed", not "this
-    signature may never open another".
-
-    `fixed`/`quiet`/`closed` (the Wave 2 `resolved` split) inherit exactly the
-    behaviour `resolved` had here — none of the three is a human judgement
-    that a signature is benign, so a genuine recurrence is new information for
-    all of them, same as it was for the one state they replaced."""
+    `closed(ignored)` does NOT reopen, because a human (or the policy's ignore
+    list) looked at it and said benign — a recurrence tells us nothing new.
+    `fixed`, `quiet` and every other `closed` reason are not a judgement that a
+    signature is benign, so a genuine recurrence is new information for all of
+    them. Terminal means "this item is closed", not "this signature may never
+    open another"."""
     rows = conn.execute(
         "SELECT ti.event_id AS event_id, ti.occurrence_mark AS stored_mark, e.* "
         "FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state IN (?, ?, ?, ?)",
-        (STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_DISMISSED),
+        "WHERE ti.state IN (?, ?) OR (ti.state = ? AND COALESCE(ti.close_reason, '') != ?)",
+        (STATE_FIXED, STATE_QUIET, STATE_CLOSED, CLOSE_IGNORED),
     ).fetchall()
     for row in rows:
         stored_mark = row["stored_mark"]
@@ -1848,32 +1654,14 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime) -> None:
     conn.commit()
 
 
-def unsnooze_if_expired(conn: sqlite3.Connection, now: dt.datetime) -> None:
-    # Row at a time rather than one set-based UPDATE, so this goes through
-    # _set_state() like every other transition in the file: `snoozed` carries
-    # its deadline in its own column (STATE_DEADLINES), and clearing that
-    # column in the same write that changes the state is exactly what the
-    # helper exists to keep together.
-    now_iso = _now_iso(now)
-    rows = conn.execute(
-        "SELECT event_id FROM triage_items "
-        "WHERE state=? AND snoozed_until IS NOT NULL AND snoozed_until<=?",
-        (STATE_SNOOZED, now_iso),
-    ).fetchall()
-    for row in rows:
-        _set_state(conn, row["event_id"], STATE_NEW, now, snoozed_until=None)
-    conn.commit()
-
-
 def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime,
                       policy: dict[str, Any] | None = None) -> None:
     # `events.resolved_at` is set only by disappearance-from-observation
     # (watchdog-poll.py's own ingest sweep) or its 7-idle-day housekeeping —
     # never by a human decision. So this is a SILENCE path, and only `new` is
-    # eligible: see _SILENCE_RESOLVE_ELIGIBLE_STATES. STATE_NOTE, IGNORED and
-    # SNOOZED are covered by the same allowlist rather than by being named
-    # here — a `note` row is terminal by design (see that state's docstring)
-    # and must never flip to QUIET, which IS a carded state.
+    # eligible: see _SILENCE_RESOLVE_ELIGIBLE_STATES. Every other state — including
+    # the terminal ones — is covered by that allowlist rather than by being named
+    # here, so a closed row never flips to QUIET.
     #
     # -> STATE_QUIET, never STATE_FIXED: disappearance from observation is
     # pure silence, and nothing here confirms a change actually shipped (see
@@ -1889,7 +1677,7 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime,
             continue
         # note=NULL is safe BECAUSE the row is `new`: a `new` row carries no
         # obligation and therefore no prior-phase text worth keeping (a
-        # needs_human blocker, a host-verb receipt, ...) — those states
+        # needs_decision blocker, a host-verb receipt, ...) — those states
         # are not reachable from here at all any more. What clearing it does
         # do is stop a stale QUIET_RESOLVE_NOTE_PREFIX/
         # RECOVERY_PAIRED_NOTE_PREFIX note from a much earlier quiet-resolve
@@ -1913,8 +1701,8 @@ def _recurrence_count(conn: sqlite3.Connection, event_id: int, now: dt.datetime,
     since = (now - dt.timedelta(days=window_days)).isoformat()
     return conn.execute(
         "SELECT COUNT(*) FROM item_transitions WHERE event_id=? AND to_state=? "
-        "AND from_state IN (?, ?, ?, ?) AND at >= ?",
-        (event_id, STATE_NEW, STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_DISMISSED, since),
+        "AND from_state IN (?, ?, ?) AND at >= ?",
+        (event_id, STATE_NEW, STATE_FIXED, STATE_QUIET, STATE_CLOSED, since),
     ).fetchone()[0]
 
 
@@ -1990,13 +1778,13 @@ def _quiet_anchor(row: sqlite3.Row) -> tuple[dt.datetime | None, str | None]:
 # cancel it.
 #
 # The concrete failure this closes, which was live: an intermittent fault alerts,
-# an investigation writes a correct fix, the item reaches `needs_human`, the
+# an investigation writes a correct fix, the item reaches `needs_decision`, the
 # fault clears on its own, the item goes terminal and the written fix is
-# abandoned. The old exclusion list let a grouped `needs_human` item quiet-resolve
+# abandoned. The old exclusion list let a grouped `needs_decision` item quiet-resolve
 # after 2h — 90 minutes before DESIGN.md's own 4h SLA for answering one.
 #
-# It is an INCLUSION list of one, and that is the load-bearing part: Wave 2 adds
-# `implementing`, `validating`, `deploying` and `verifying` to the chain. An
+# It is an INCLUSION list of one, and that is the load-bearing part: every state
+# past `new` carries an obligation. An
 # exclusion list silently ADMITS every state added after it was written; an
 # inclusion list silently EXCLUDES them. This must fail closed.
 _SILENCE_RESOLVE_ELIGIBLE_STATES = (STATE_NEW,)
@@ -2129,7 +1917,7 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     changing already IS the quiet duration.
 
     Only a row still in `new` is eligible (see
-    _SILENCE_RESOLVE_ELIGIBLE_STATES). `investigating` is excluded here not as
+    _SILENCE_RESOLVE_ELIGIBLE_STATES). `working` is excluded here not as
     a special case about racing dispatch-sweep.py's fold_dispatch_verdict(),
     but as one instance of the general rule: every state past `new` carries an
     obligation, and a quiet timer is an observation about the signal, never a
@@ -2174,10 +1962,8 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
     targets — a deliberate human call that THIS signature is a genuine
     recovery or known-benign pattern, checked first so it always wins), then
     rule matching, and only for a row no rule matched the structural
-    `ignoreUnstructuredSlackProse` fallback (routes to STATE_NOTE, never
-    STATE_IGNORED — see that state's own docstring for why silently dropping
-    unstructured #alerts prose would recreate the exact bug this file exists
-    to kill). Only ever touches a row still in state `new`. Returns every
+    `ignoreUnstructuredSlackProse` fallback (routes to `closed(ignored)` with a
+    note saying why). Only ever touches a row still in state `new`. Returns every
     signature that matched no rule this run, for the once-a-day digest.
 
     **The prose filter runs LAST, and that order is load-bearing.** It is a
@@ -2204,7 +1990,7 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
         targets = _match_targets(event_row)
 
         if _fnmatch_any(targets, policy["ignore"]):
-            _set_state(conn, row["event_id"], STATE_IGNORED, now)
+            _set_state(conn, row["event_id"], STATE_CLOSED, now, close_reason=CLOSE_IGNORED)
             continue
 
         # Rules FIRST — a signature the policy already maps is a mapped
@@ -2248,11 +2034,8 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
 
         if policy["ignoreUnstructuredSlackProse"] and event_row["source"] == "slack_alert" \
                 and not _looks_like_bot_alert(event_row["title"]):
-            _set_state(conn, row["event_id"], STATE_NOTE, now)
-            # Not reported as unmapped: this row has its own digest section
-            # (see maybe_post_daily_digest()'s STATE_NOTE half), and listing
-            # the same signature under both headings is the noise this
-            # ordering exists to remove.
+            _set_state(conn, row["event_id"], STATE_CLOSED, now, close_reason=CLOSE_IGNORED,
+                       note="unstructured #alerts prose, not a bot alert")
             unmapped.discard(row["signature"])
             continue
     conn.commit()
@@ -2278,25 +2061,31 @@ def _cluster_groups(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
     return groups
 
 
+# `working` rows whose investigation is still running: no implement episode yet,
+# a dispatch on record, and that dispatch not finished. The one definition of "an
+# open investigation" — the concurrency cap and the heartbeat both read it.
+_INVESTIGATING_SQL = (
+    "state=? AND implement_job IS NULL AND dispatch_job IS NOT NULL AND NOT EXISTS "
+    "(SELECT 1 FROM dispatches d WHERE d.job_id = triage_items.dispatch_job AND d.finished_at IS NOT NULL)"
+)
+
+
 def _count_open_investigation_clusters(conn: sqlite3.Connection) -> int:
     row = conn.execute(
-        "SELECT count(DISTINCT dispatch_job) c FROM triage_items WHERE state=? AND dispatch_job IS NOT NULL",
-        (STATE_INVESTIGATING,),
+        f"SELECT count(DISTINCT dispatch_job) c FROM triage_items WHERE {_INVESTIGATING_SQL}",
+        (STATE_WORKING,),
     ).fetchone()
     return int(row["c"]) if row else 0
 
 
 def _sibling_open_items(conn: sqlite3.Connection, repo: str, exclude_event_ids: list[int],
                          limit: int = 5) -> list[dict[str, str]]:
-    # STATE_RESOLVED's three successors plus STATE_IGNORED — same exclusion,
-    # same reasoning, unchanged behaviour: `note`/`dismissed` still count as
-    # "open" siblings worth mentioning in a brief, exactly as before the split.
     placeholders = ",".join("?" * len(exclude_event_ids)) if exclude_event_ids else "-1"
     rows = conn.execute(
         f"SELECT ti.signature, e.title FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        f"WHERE ti.repo=? AND ti.event_id NOT IN ({placeholders}) AND ti.state NOT IN (?, ?, ?, ?) "
+        f"WHERE ti.repo=? AND ti.event_id NOT IN ({placeholders}) AND ti.state NOT IN (?, ?, ?) "
         f"ORDER BY ti.updated_at DESC LIMIT ?",
-        (repo, *exclude_event_ids, STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_IGNORED, limit),
+        (repo, *exclude_event_ids, STATE_FIXED, STATE_QUIET, STATE_CLOSED, limit),
     ).fetchall()
     return [{"signature": r["signature"], "title": r["title"]} for r in rows]
 
@@ -2580,7 +2369,7 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     `expected` is the same list-of-dicts shape every other LIVENESS_ALLOWLIST
     gatherer reads off `deploy_expect_json` — here written by
     maybe_auto_remediate() as `[{"monitorTitle": <str>, "since": <iso>}]` at
-    the moment the item entered `liveness_pending`, never the alert/commit
+    the moment the item entered `verifying`, never the alert/commit
     shape the other two gatherers use. Deliberately keyed by VERB
     (HOST_VERB_LIVENESS_MONITOR), not by the triggering item's own
     signature — uk:175 (`Hermes Agent`), uk:185 (`Hermes Watchdog - Push`)
@@ -2594,7 +2383,7 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     title: this loop is checking whether the RESTARTED PROCESS is alive
     again, not re-confirming whichever signal happened to trigger it."""
     if not expected:
-        return False, "no expected monitor was captured when this item entered liveness_pending"
+        return False, "no expected monitor was captured when this item entered verifying"
     monitor_title = expected[0].get("monitorTitle")
     since = expected[0].get("since")
     if not monitor_title or not since:
@@ -3058,14 +2847,12 @@ def _end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: S
                     tier: str, now: dt.datetime, policy: dict[str, Any], **columns: Any) -> None:
     """sideclaw answered the submit with a 4xx — a refusal (repo outside its
     allowlist, tier above the repo's ceiling, bad params). The same submit is
-    refused again, so every item the dispatch was for ends here, carrying
-    sideclaw's own message, and is never retried: `needs_human` is the path a
-    dispatch that ended terminal with no verdict already takes (see
-    fold_dispatch_verdict()). A 5xx or a connection failure is not this — it
-    keeps its retry behaviour at each call site."""
+    refused again, so every item the dispatch was for ends `failed`, carrying
+    sideclaw's own message, and is never retried. A 5xx or a connection failure
+    is not this — it is an infrastructure failure and strikes (see _strike())."""
     note = _cap_brief(f"{tier} episode not started — {exc}")
     for m in members:
-        _set_state(conn, m["event_id"], STATE_NEEDS_HUMAN, now, note=note, **columns)
+        _set_state(conn, m["event_id"], STATE_FAILED, now, note=note, **columns)
     conn.commit()
     print(f"triage: {tier} dispatch refused by sideclaw, ending {[m['signature'] for m in members]}: {exc}",
           file=sys.stderr)
@@ -3079,11 +2866,12 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
     one hypothesis) and `escalate_origin_items()` (a `human`/`github_issue`
     item, always a cluster of exactly one): dispatch ONE investigate episode
     against `repo` with `brief`, flip every row in `members` to
-    `STATE_INVESTIGATING` sharing that `dispatch_job`, retro-fill
+    `STATE_WORKING` sharing that `dispatch_job`, retro-fill
     `events.dispatch_id`, post/update the shared Slack card, and retro-fill
     `origin_thread_ts` onto the `dispatches` row so dispatch-sweep.py's
     actionable-dispatch nudge lands on the card's own thread. Returns the
-    opened job id, or None on a WardenError (logged) or under `dry_run`."""
+    opened job id, or None on a failed submit (every member strikes, see
+    _strike()) or under `dry_run`."""
     sigs = [m["signature"] for m in members]
     if dry_run:
         print(f"[dry-run] would dispatch investigate for {repo}: {sigs}")
@@ -3115,10 +2903,14 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
         return None
     except WardenError as e:
         print(f"triage: dispatch failed for {repo}: {e}", file=sys.stderr)
+        for m in members:
+            _strike(conn, m["event_id"], now, f"investigate dispatch failed: {e}", retry_state=STATE_TRIAGED,
+                    dispatch_job=None)
+        conn.commit()
         return None
     job_id = opened.job_id
     for m in members:
-        _set_state(conn, m["event_id"], STATE_INVESTIGATING, now, dispatch_job=job_id)
+        _set_state(conn, m["event_id"], STATE_WORKING, now, dispatch_job=job_id)
     dispatch_row = conn.execute("SELECT id FROM dispatches WHERE job_id=?", (job_id,)).fetchone()
     if dispatch_row is not None:
         for m in members:
@@ -3128,7 +2920,7 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
               f"(events.dispatch_id left unset for {sigs})", file=sys.stderr)
     conn.commit()
 
-    # The card only starts existing now (state just became `investigating`,
+    # The card only starts existing now (state just became `working`,
     # the first CARDED_STATES member of this cluster) — post it immediately,
     # then retro-fill origin_thread_ts on the dispatches row so
     # dispatch-sweep.py's actionable-dispatch nudge lands on the card's own
@@ -3174,21 +2966,21 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
 def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
     """Groups every eligible `new`+mapped item BY REPO and opens at most one
     sideclaw dispatch per repo per run (a cluster — see module docstring),
-    capped at MAX_CLUSTER_SIGNATURES members per brief. A `split` item (see
-    STATE_SPLIT) is ALSO an escalation candidate, gated by the exact same
-    checks (snoozed_until, _is_escalation_eligible(),
-    _cooldown_ok()) — but it escalates as a SINGLETON, never grouped with
-    another `split` item or with `new` items: grouping it would re-fuse the
-    very cluster _dissolve_cluster() just took apart, which its own Slack
-    notice promises will not happen ("Each will be re-evaluated
-    individually").
+    capped at MAX_CLUSTER_SIGNATURES members per brief. A `triaged` item (a
+    dissolved cluster member, or one an infrastructure failure sent back) is
+    ALSO an escalation candidate, gated by the exact same checks
+    (retry_at, _is_escalation_eligible(), _cooldown_ok()) — but it escalates as a
+    SINGLETON, never grouped with another `triaged` item or with `new` items:
+    grouping it would re-fuse the very cluster _dissolve_cluster() just took
+    apart, which its own Slack notice promises will not happen ("Each will be
+    re-evaluated individually").
 
-    `split` candidates are considered BEFORE `new` clusters — an item
-    carrying an obligation and a deadline outranks work that has not
-    started — and the "at most one dispatch per repo per run" property holds
-    across both kinds: if a repo has an eligible `split` item, THAT repo's
-    slot for this run is spent on it, and every `new` item (and any
-    additional `split` item) in that same repo waits for a later run,
+    `triaged` candidates are considered BEFORE `new` clusters — an item
+    carrying an obligation outranks work that has not started — and the "at
+    most one dispatch per repo per run" property holds across both kinds: if a
+    repo has an eligible `triaged` item, THAT repo's slot for this run is spent
+    on it, and every `new` item (and any additional `triaged` item) in that
+    same repo waits for a later run,
     reported exactly like the existing cluster-cap overflow is — a
     deferral that only reaches a `.err` file is indistinguishable from a
     broken loop.
@@ -3198,15 +2990,15 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     see an exhausted cap."""
     open_investigations = _count_open_investigation_clusters(conn)
 
+    ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
-        "SELECT * FROM triage_items WHERE state IN (?, ?) AND repo IS NOT NULL ORDER BY event_id",
-        (STATE_NEW, STATE_SPLIT),
+        f"SELECT * FROM triage_items WHERE state IN (?, ?) AND repo IS NOT NULL AND {ready_sql} "
+        f"ORDER BY event_id",
+        (STATE_NEW, STATE_TRIAGED, *ready_params),
     ).fetchall()
     split_by_repo: dict[str, list[sqlite3.Row]] = {}
     new_by_repo: dict[str, list[sqlite3.Row]] = {}
     for item in candidates:
-        if item["snoozed_until"]:
-            continue
         repo = item["repo"]
         if not _is_escalation_eligible(item, policy, now):
             continue
@@ -3214,10 +3006,10 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
             print(f"triage: {item['signature']} recurred inside cooldownHours, not re-escalating yet",
                   file=sys.stderr)
             continue
-        bucket = split_by_repo if item["state"] == STATE_SPLIT else new_by_repo
+        bucket = split_by_repo if item["state"] == STATE_TRIAGED else new_by_repo
         bucket.setdefault(repo, []).append(item)
 
-    # One ordered list of (repo, members, deferrals) attempts — `split`
+    # One ordered list of (repo, members, deferrals) attempts — `triaged`
     # singletons first (see this function's own docstring), each repo
     # appearing at most once. `claimed_repos` is what makes "one dispatch per
     # repo per run" hold ACROSS the two kinds, not just within `new_by_repo`
@@ -3228,7 +3020,7 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     # that never gets past the cap below did not take anyone's slot, and
     # announcing "N more wait for next run" for a cluster that was itself
     # deferred describes a dispatch that did not happen. That is the shape the
-    # cluster-cap message had before `split` existed — the overflow print sat
+    # cluster-cap message had before `triaged` existed — the overflow print sat
     # after the `continue` — and it is preserved rather than reinvented.
     attempts: list[tuple[str, list[sqlite3.Row], list[str]]] = []
     claimed_repos: set[str] = set()
@@ -3237,13 +3029,13 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
         deferrals = []
         if overflow:
             deferrals.append(
-                f"triage: {len(overflow)} more split item(s) in {repo} wait for next run "
-                f"(a split item escalates as a singleton, never grouped): "
+                f"triage: {len(overflow)} more triaged item(s) in {repo} wait for next run "
+                f"(a triaged item escalates as a singleton, never grouped): "
                 f"{[m['signature'] for m in overflow]}")
         held_new = new_by_repo.get(repo) or []
         if held_new:
             deferrals.append(
-                f"triage: {repo}'s slot this run went to a split item — {len(held_new)} new item(s) "
+                f"triage: {repo}'s slot this run went to a triaged item — {len(held_new)} new item(s) "
                 f"wait for next run: {[m['signature'] for m in held_new]}")
         attempts.append((repo, [primary], deferrals))
         claimed_repos.add(repo)
@@ -3380,8 +3172,8 @@ def _origin_item_brief(item: sqlite3.Row, event_row: sqlite3.Row) -> str:
 
 
 def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool = False) -> None:
-    """The origin-aware counterpart to `escalate()`, for every `new` item
-    whose `origin != 'alert'` (a `human` `warden run`, or a `github_issue`
+    """The origin-aware counterpart to `escalate()`, for every `new` or `triaged`
+    item whose `origin != 'alert'` (a `human` `warden run`, or a `github_issue`
     from `ingest_github_issues()`). Each is its own cluster of ONE — a human
     (or, for an owner-authored issue, the issue itself) already decided this
     is ready, so none of `escalate()`'s
@@ -3389,46 +3181,42 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
     never grouped with an alert cluster or with another origin item.
 
     `MAX_OPEN_INVESTIGATIONS` still applies — overflow WAITS in `new`, never
-    drops (DESIGN.md § What must not be lost, item 7). A refusal leaves the
-    item `new` with a `note` explaining why (deadline must be visible),
-    never errors and never drops it — the next tick (loop or CLI)
-    reconsiders it fresh.
+    drops (DESIGN.md § What must not be lost, item 7). A row waiting out a
+    strike's backoff (`retry_at`) is skipped.
 
     Called by both the loop tick (`run()`) and `warden run` — a human
     running `warden run` against an item the very same loop tick is about to
     pick up races it for that item's own `new` row. The claim below (`new ->
-    investigating`, CAS'd through `_set_state()`'s `expect_state=`, exactly
-    the shape `maybe_auto_implement()` uses for its own `verdict ->
-    implementing` claim) is what makes only one caller ever dispatch: a
-    caller that loses the CAS (rowcount 0) skips the item outright rather
-    than racing the winner into a second episode for the same row. The
-    orphan-reclaim pass at the top of this function is that claim's own
-    crash-recovery counterpart — the sibling of `poll_implement_jobs()`'s
-    `implementing`-with-no-job reclaim, for the identical window here
-    (claimed `investigating`, but `dispatch_job` never got written because
-    the process died, or `_dispatch_investigate_and_advance()` failed,
-    before it could)."""
+    working`, CAS'd through `_set_state()`'s `expect_state=`, exactly the shape
+    `maybe_auto_implement()` uses for its own claim) is what makes only one
+    caller ever dispatch: a caller that loses the CAS (rowcount 0) skips the
+    item outright rather than racing the winner into a second episode for the
+    same row. The orphan-reclaim pass at the top of this function is that
+    claim's own crash-recovery counterpart (claimed `working`, but
+    `dispatch_job` never got written because the process died before it
+    could)."""
     policy = load_policy()
     open_investigations = _count_open_investigation_clusters(conn)
     if not dry_run:
         orphans = conn.execute(
-            "SELECT * FROM triage_items WHERE state=? AND origin != 'alert' AND dispatch_job IS NULL",
-            (STATE_INVESTIGATING,),
+            "SELECT * FROM triage_items WHERE state=? AND origin != 'alert' AND dispatch_job IS NULL "
+            "AND implement_job IS NULL",
+            (STATE_WORKING,),
         ).fetchall()
         for orphan in orphans:
-            _set_state(conn, orphan["event_id"], STATE_NEW, now, expect_state=STATE_INVESTIGATING,
+            _set_state(conn, orphan["event_id"], STATE_NEW, now, expect_state=STATE_WORKING,
                        note="reclaimed: the loop stopped between claiming this item and dispatching it")
             conn.commit()
-            print(f"triage: reclaimed {orphan['signature']} (event {orphan['event_id']}) — investigating "
+            print(f"triage: reclaimed {orphan['signature']} (event {orphan['event_id']}) — working "
                   f"with no dispatch job", file=sys.stderr)
 
+    ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
-        "SELECT * FROM triage_items WHERE state=? AND origin != 'alert' ORDER BY event_id",
-        (STATE_NEW,),
+        f"SELECT * FROM triage_items WHERE state IN (?, ?) AND origin != 'alert' AND {ready_sql} "
+        f"ORDER BY event_id",
+        (STATE_NEW, STATE_TRIAGED, *ready_params),
     ).fetchall()
     for item in candidates:
-        if item["snoozed_until"]:
-            continue
         if item["repo"] is None:
             continue
 
@@ -3455,8 +3243,8 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
         # Claim before dispatch, not after — see this function's own
         # docstring. A caller that loses this CAS (another connection
         # already claimed this exact row) skips it rather than racing.
-        claimed = _set_state(conn, item["event_id"], STATE_INVESTIGATING, now,
-                             expect_state=STATE_NEW, expect_null=("dispatch_job",))
+        claimed = _set_state(conn, item["event_id"], STATE_WORKING, now,
+                             expect_state=item["state"], expect_null=("dispatch_job",))
         conn.commit()
         if not claimed:
             continue
@@ -3481,15 +3269,10 @@ def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, ev
     Never raises: a GitHub failure here is a logged line, never a state
     change (same contract as every other GitHub call this file makes).
 
-    `payload_json.commented_at` is a durable, second-line-of-defence marker:
-    the CAS in `fold_dispatch_verdict()` already stops two overlapping
-    sweeps from BOTH thinking they made the transition, but this guards the
-    GitHub side effect itself directly — refuse outright once a comment has
-    been posted for this item, so no future code path (a bug, a retry, a
-    second caller this function does not control) can ever double-post.
-    Written only after `create_issue_comment()` actually succeeds, in its
-    own commit — a failed POST leaves no marker, so a genuine transient
-    GitHub failure is still retried on the next real transition.
+    `payload_json.commented_at` is the durable, atomic claim on the comment: it
+    is flipped by a single UPDATE before the POST, so two overlapping folds can
+    never both post, and it is removed again if the POST fails — a genuine
+    transient GitHub failure is still retried on the next fold.
 
     `dry_run` never touches GitHub — same contract as every other Slack/
     GitHub side effect in this file (`sync_card()`'s own posts, the Slack
@@ -3523,15 +3306,27 @@ def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, ev
         lines.append(f"Next action: {next_action}")
     body = "\n\n".join(lines)[:2000]
 
+    # CLAIM the comment atomically before posting: two folds of the same verdict can
+    # both reach here (a `working` -> `working` fold records no state change for the
+    # CAS to arbitrate), and only the one whose UPDATE flips the marker may post.
+    claimed = conn.execute(
+        "UPDATE events SET payload_json=json_set(COALESCE(payload_json, '{}'), '$.commented_at', ?) "
+        "WHERE id=? AND json_extract(COALESCE(payload_json, '{}'), '$.commented_at') IS NULL",
+        (_now_iso(now), event_row["id"]),
+    ).rowcount
+    conn.commit()
+    if not claimed:
+        return
+
     try:
         _github.create_issue_comment(f"{_github.GH_OWNER}/{repo}", number, body)
     except WardenError as e:
         print(f"triage: could not comment back on {_github.GH_OWNER}/{repo}#{number}: {e}", file=sys.stderr)
-        return
-
-    payload["commented_at"] = _now_iso(now)
-    conn.execute("UPDATE events SET payload_json=? WHERE id=?", (json.dumps(payload), event_row["id"]))
-    conn.commit()
+        # A failed POST leaves no marker, so a genuine transient GitHub failure is
+        # retried on the next fold.
+        conn.execute("UPDATE events SET payload_json=json_remove(payload_json, '$.commented_at') WHERE id=?",
+                     (event_row["id"],))
+        conn.commit()
 
 
 # --- verbs — deterministic local commands, never an episode ----------------------
@@ -3580,10 +3375,10 @@ def _run_host_verb(argv: list[str], *, timeout: int) -> dict[str, Any]:
 
 def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now: dt.datetime,
                        verdict_text: str, *, dry_run: bool) -> None:
-    """Move every member to `split` so each is re-evaluated individually.
+    """Move every member to `triaged` so each is re-evaluated individually.
     `dispatch_job` is deliberately LEFT SET (only card_channel/card_ts/
-    card_hash are cleared) — a `split` row is never grouped by
-    `_cluster_groups()` (which only looks at CARDED_STATES, and `split` is
+    card_hash are cleared) — a `triaged` row is never grouped by
+    `_cluster_groups()` (which only looks at CARDED_STATES, and `triaged` is
     deliberately not in it — see that tuple's own comment), so the cluster
     is functionally gone for card/escalation purposes, but keeping the
     pointer means `_cooldown_ok()` still finds the dissolved dispatch's
@@ -3603,15 +3398,14 @@ def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now:
     member's `note` under SPLIT_VERDICT_NOTE_PREFIX. This is the actual fix
     for docs/history/state-log.md §43: the split verdict used to survive only in
     `dispatches.verdict_json`, which nothing reads — now it survives on the
-    row itself, in the one state silence can never touch.
+    row itself, in a state silence can never touch.
 
     Runs its bookkeeping for real even under `dry_run` — only the Slack
     `update_blocks()` call is skipped, per the module's own DRY-RUN CONTRACT
     ("dissolve bookkeeping ... runs for real even under --dry-run"). A
-    dissolve moves a row between two WORKING states (verdict -> split), the
+    dissolve moves a row between two WORKING states (working -> triaged), the
     same class of move classify()/apply_resolutions()/resolve_quiet_grouped()
-    already perform for real under --dry-run; it is not the TERMINAL,
-    non-re-derivable move sweep_deadlines() carves an exception for."""
+    already perform for real under --dry-run."""
     sigs = [m["signature"] for m in members]
     job_id = members[0]["dispatch_job"]
     card_channel = members[0]["card_channel"]
@@ -3633,25 +3427,25 @@ def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now:
                 update_blocks(card_channel, card_ts, blocks, "Cluster split — re-evaluating individually", token)
     note = f"{SPLIT_VERDICT_NOTE_PREFIX}{_cap_brief(verdict_text)}" if verdict_text.strip() else None
     for m in members:
-        _set_state(conn, m["event_id"], STATE_SPLIT, now,
+        _set_state(conn, m["event_id"], STATE_TRIAGED, now,
                    card_channel=None, card_ts=None, card_hash=None, note=note)
     conn.commit()
 
 
 def maybe_dissolve_clusters(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
-    """A cluster (>1 member sharing one dispatch_job) that landed in plain
-    `verdict` (not needs_human/pr_open — those found something actionable,
-    splitting doesn't apply) whose folded verdict text contains
-    DISSOLVE_MARKER gets unwound: every member moves to `split`, its
-    dispatch_job/card pointers cleared (dispatch_job itself retained — see
-    _dissolve_cluster()), carrying the verdict that produced the split in its
-    own `note` so each is re-evaluated independently on a later run without
-    losing it. Runs once per pass, before escalate() — "the cluster is
-    dissolved on the next run" per the design this implements."""
+    """A cluster (>1 member sharing one dispatch_job) whose folded verdict
+    landed on `working` (fold_dispatch_verdict() parks a marker verdict there
+    rather than closing it) and whose verdict text contains DISSOLVE_MARKER gets
+    unwound: every member moves to `triaged`, its card pointers cleared
+    (dispatch_job itself retained — see _dissolve_cluster()), carrying the
+    verdict that produced the split in its own `note` so each is re-evaluated
+    independently on a later run without losing it. Runs once per pass, before
+    escalate() — "the cluster is dissolved on the next run" per the design this
+    implements."""
     rows = conn.execute(
         "SELECT dispatch_job, count(*) c FROM triage_items WHERE dispatch_job IS NOT NULL AND state=? "
-        "GROUP BY dispatch_job HAVING c > 1",
-        (STATE_VERDICT,),
+        "AND implement_job IS NULL GROUP BY dispatch_job HAVING c > 1",
+        (STATE_WORKING,),
     ).fetchall()
     for row in rows:
         job_id = row["dispatch_job"]
@@ -3663,7 +3457,8 @@ def maybe_dissolve_clusters(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
         if DISSOLVE_MARKER not in text_blob:
             continue
         members = conn.execute(
-            "SELECT * FROM triage_items WHERE dispatch_job=? ORDER BY event_id", (job_id,)
+            "SELECT * FROM triage_items WHERE dispatch_job=? AND state=? ORDER BY event_id",
+            (job_id, STATE_WORKING),
         ).fetchall()
         _dissolve_cluster(conn, list(members), now, text_blob, dry_run=dry_run)
 
@@ -3679,47 +3474,34 @@ class _ActionRequired(NamedTuple):
     default_do: str
 
 
-# Per-state card copy for the two states that need a human. `default_do` is
+# Per-state card copy for the two states that need a person. `default_do` is
 # the `Do this:` line when `note` is empty — `_set_state()` guarantees a note
 # in the common paths, but a row edited by hand outside this file still needs
-# an actionable card rather than a blank instruction. `warden abort` refuses
-# `merge_blocked` (it only cancels an in-flight episode — see cmd_abort's own
-# investigating/implementing/validating check), so that retry verb is
-# `warden merge`, which re-attempts landing a blocked PR.
+# an actionable card rather than a blank instruction.
 _ACTION_REQUIRED: dict[str, _ActionRequired] = {
-    STATE_NEEDS_HUMAN: _ActionRequired(
-        heading="*Action required — needs a human*",
+    STATE_NEEDS_DECISION: _ActionRequired(
+        heading="*Decision needed*",
         default_do="read the verdict above and decide",
     ),
-    STATE_MERGE_BLOCKED: _ActionRequired(
-        heading="*Action required — merge blocked*",
-        default_do='merge by hand via the PR, or retry with `warden merge <job-id> --why "<reason>" --confirm`',
+    STATE_FAILED: _ActionRequired(
+        heading="*Failed*",
+        default_do='retry from Argo, merge by hand via the PR, or `warden close <event-id> --why "<reason>"`',
     ),
 }
 
 
-def _action_required_block(state: str, note: str | None, state_deadline: str | None) -> dict[str, Any]:
-    """The `needs_human` / `merge_blocked` card body: a `section` block (not
-    `context`) so it reads as an instruction, not a footnote. The countdown is
-    deliberately day-granularity only (see sync_card()'s card_hash
-    short-circuit): an hour-granularity line would change on every 10-minute
-    tick and defeat that short-circuit, turning one Slack update per real
-    change into one every tick. The note is truncated on its own, after the
-    heading and the countdown have reserved their space, so a long note can
-    never push the countdown off the card."""
+def _action_required_block(state: str, note: str | None) -> dict[str, Any]:
+    """The `needs_decision` / `failed` card body: a `section` block (not
+    `context`) so it reads as an instruction, not a footnote. Neither state ever
+    expires, so there is no countdown. The note is truncated on its own, after
+    the heading has reserved its space."""
     copy = _ACTION_REQUIRED[state]
     lines = [copy.heading]
-    tail: list[str] = []
-    deadline = _parse_ts(state_deadline)
-    if deadline is not None:
-        now = dt.datetime.now(dt.timezone.utc)
-        days_left = max(int((deadline - now).total_seconds() // 86400), 0)
-        tail.append(f"Auto-dismissed in {days_left}d if untouched ({_fmt_ts(state_deadline)})")
     note_text = (note or "").strip()
     do_body = _escape(note_text) if note_text else copy.default_do
-    budget = SECTION_TEXT_MAX - sum(len(x) + 1 for x in lines + tail) - len("Do this: ")
+    budget = SECTION_TEXT_MAX - sum(len(x) + 1 for x in lines) - len("Do this: ")
     lines.append(f"Do this: {do_body[:max(budget, 0)]}")
-    return {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines + tail)}}
+    return {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}
 
 
 def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row], conn: sqlite3.Connection
@@ -3745,14 +3527,33 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
         ctx_text += f"\nrepo `{primary['repo']}`"
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ctx_text[:SECTION_TEXT_MAX]}})
 
-    if state == STATE_INVESTIGATING and primary["dispatch_job"]:
+    implement_job = primary["implement_job"]
+    verdict_dispatch = None
+    if state in (STATE_WORKING, STATE_NEEDS_DECISION, STATE_FAILED) and primary["dispatch_job"]:
+        verdict_dispatch = conn.execute(
+            "SELECT verdict_json FROM dispatches WHERE job_id=?", (primary["dispatch_job"],)).fetchone()
+
+    if state == STATE_WORKING and _is_claim(implement_job):
+        # maybe_auto_remediate() writes the claim's own note as
+        # "restarting via <verb>" — render it verbatim rather than
+        # re-deriving the verb from the claim.
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"{_escape(primary['note'] or 'starting')} …"}],
+        })
+    elif state == STATE_WORKING and implement_job:
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Implementation running — job `{implement_job[:8]}`"}],
+        })
+    elif state == STATE_WORKING and primary["dispatch_job"] and not (
+            verdict_dispatch and verdict_dispatch["verdict_json"]):
         blocks.append({
             "type": "context",
             "elements": [{"type": "mrkdwn", "text": f"Investigation running — job `{primary['dispatch_job'][:8]}`"}],
         })
-    elif state in (STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_PR_OPEN) and primary["dispatch_job"]:
-        d = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?", (primary["dispatch_job"],)).fetchone()
-        result = _safe_json(d["verdict_json"]) if d and d["verdict_json"] else {}
+    elif state in (STATE_WORKING, STATE_NEEDS_DECISION, STATE_FAILED) and verdict_dispatch is not None:
+        result = _safe_json(verdict_dispatch["verdict_json"]) if verdict_dispatch["verdict_json"] else {}
         summary = (result.get("summary") or "").strip()
         confidence = result.get("confidence") or "?"
         text_lines = []
@@ -3772,17 +3573,18 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
         artifact_url = primary["artifact_url"]
         if artifact_url:
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Artifact:* <{artifact_url}>"}})
-        if state == STATE_NEEDS_HUMAN:
-            blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
-    elif state == STATE_NEEDS_HUMAN:
+        if state in (STATE_NEEDS_DECISION, STATE_FAILED):
+            blocks.append(_action_required_block(state, primary["note"]))
+    elif state == STATE_TRIAGED:
+        # Reachable on a card only through a strike (the card posted while the
+        # failed episode ran): say what is happening instead of leaving the old
+        # "running" line up.
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+            f"{_escape(primary['note'] or 'waiting for its dispatch')}"[:SECTION_TEXT_MAX]}]})
+    elif state in (STATE_NEEDS_DECISION, STATE_FAILED):
         # No dispatch_job at all (a host-verb receipt, a reconcile failure):
         # the note IS the whole verdict.
-        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
-    elif state == STATE_SNOOZED:
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"Snoozed until {_fmt_ts(primary['snoozed_until'])}"}],
-        })
+        blocks.append(_action_required_block(state, primary["note"]))
     elif state in (STATE_QUIET, STATE_FIXED) and (primary["note"] or "").startswith(
             (QUIET_RESOLVE_NOTE_PREFIX, RECOVERY_PAIRED_NOTE_PREFIX, LIVENESS_CONFIRMED_NOTE_PREFIX)):
         # Only ever rendered for the grouped-source resolve paths (see
@@ -3793,64 +3595,30 @@ def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row]
         # state-source (uk/docker/op_refs) recovery, which needs no caveat.
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"↳ _{_escape(primary['note'])}_"}]})
     elif state == STATE_CLOSED:
-        # `closed`'s reason is the whole point of the state (a human said
-        # done, or a `merged` item ran out its 1h clock with nothing left to
-        # verify) — same principle as STATE_DISMISSED just below.
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
-            f"↳ _{_escape(primary['note'] or 'closed, no reason recorded')}_"[:SECTION_TEXT_MAX]}]})
-    elif state == STATE_DISMISSED:
-        # The reason is the whole point of the state (see STATE_DISMISSED), and
-        # the human reading this card is the one who was asked and did not
-        # answer — so the card must say what expired rather than just going
-        # quiet. _set_state() guarantees the note exists; the fallback is for a
-        # row edited by hand outside this file.
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
-            f"↳ _{_escape(primary['note'] or 'dismissed, no reason recorded')}_"[:SECTION_TEXT_MAX]}]})
-    elif state == STATE_IMPLEMENTING and primary["implement_job"]:
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"Auto-implement running — job `{primary['implement_job'][:8]}`"}],
-        })
-    elif state == STATE_REMEDIATING:
-        # maybe_auto_remediate() writes the claim's own note as
-        # "restarting via <verb>" — render it verbatim rather than
-        # re-deriving the verb from `dispatch_job`, which this state does
-        # not own.
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"{_escape(primary['note'] or 'restarting')} …"}],
-        })
-    elif state == STATE_VALIDATING:
+        # `closed`'s reason is the whole point of the state.
+        reason = primary["close_reason"] or "closed"
+        text = f"↳ _{reason}: {_escape(primary['note'])}_" if primary["note"] else f"↳ _{reason}_"
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}]})
+    elif state == STATE_MERGING:
         text = "Independent validation running"
         if primary["validation_job"]:
             text += f" — job `{primary['validation_job'][:8]}`"
         if primary["pr_url"]:
             text += f"\nPull request: <{primary['pr_url']}>"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}})
-    elif state == STATE_MERGE_BLOCKED:
-        blocks.append(_action_required_block(state, primary["note"], primary["state_deadline"]))
-    elif state == STATE_MERGED:
-        text = f"Merged: <{primary['pr_url']}>" if primary["pr_url"] else "Merged"
         if primary["note"]:
             text += f"\n_{_escape(primary['note'])}_"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}})
-    elif state == STATE_LIVENESS_PENDING:
-        text = f"Deployed — confirming liveness by {_fmt_ts(primary['liveness_deadline'])}"
+    elif state == STATE_VERIFYING:
+        if primary["liveness_deadline"]:
+            text = f"Deployed — confirming liveness by {_fmt_ts(primary['liveness_deadline'])}"
+        else:
+            text = "Merged"
         if primary["pr_url"]:
             text += f"\nPull request: <{primary['pr_url']}>"
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text}]})
-    elif state == STATE_REVERTED:
-        revert_pr = primary["revert_pr"] if "revert_pr" in primary.keys() else None
-        text = f"reverted by PR #{revert_pr}" if revert_pr else "reverted"
         if primary["note"]:
             text += f"\n_{_escape(primary['note'])}_"
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text}]})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}]})
 
-    footer_sig = primary["signature"] if len(members) == 1 else f"<signature> ({len(members)} in this cluster)"
-    blocks.append({
-        "type": "context",
-        "elements": [{"type": "mrkdwn", "text": f"Snooze one member: `triage.py --snooze {footer_sig} --hours 24`"}],
-    })
     return blocks
 
 
@@ -3858,14 +3626,11 @@ def _card_hash(blocks: list[dict[str, Any]]) -> str:
     return hashlib.sha256(json.dumps(blocks, sort_keys=True).encode()).hexdigest()
 
 
-# States a row can reach directly from `new` (or, for `dismissed`, from a
-# carded state whose deadline nobody answered) that must never receive a
-# FIRST card — see sync_card()'s own docstring for the incident this guards.
-# `dismissed` was already missing here before this slice (a known-open item);
-# it is in scope now purely because this line is being edited anyway for the
-# `resolved` split. Named once, as a tuple, rather than four inline literals
-# repeated at the one call site that checks them.
-_NEVER_CARDED_FIRST_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED, STATE_DISMISSED)
+# States a row can reach directly from `new` that must never receive a FIRST
+# card — see sync_card()'s own docstring for the incident this guards. Named
+# once, as a tuple, rather than inline literals repeated at the one call site
+# that checks them.
+_NEVER_CARDED_FIRST_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED)
 
 
 def sync_card(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: list[sqlite3.Row],
@@ -3941,6 +3706,17 @@ def sync_card(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: 
     return [r for r in (_get_item(conn, m["event_id"]) for m in members) if r is not None]
 
 
+def _decision_note(result: dict[str, Any]) -> str:
+    """What a `needs_decision` item shows the owner: the verdict's own
+    `decisionQuestion` when sideclaw carried one (an optional field — its absence
+    is normal), else the summary, else the recommendation."""
+    for key in ("decisionQuestion", "summary", "recommendation"):
+        text = str(result.get(key) or "").strip()
+        if text:
+            return text
+    return "the investigation asked for a human decision and recorded no question"
+
+
 def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job_id: str,
                            now: dt.datetime, dry_run: bool) -> None:
     """Called by dispatch-sweep.py once a dispatch tied to a triage cluster
@@ -3948,30 +3724,38 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     triage_items row sharing this `dispatch_job` (not just origin_event_id's
     own row — a cluster can have several), folds the verdict onto all of
     them, and syncs the shared card immediately rather than waiting for this
-    file's own next 10-minute pass. Idempotent and safe to call on every
-    sweep for a row already folded — the card_hash short-circuit makes a
-    repeat call a no-op. `origin_event_id` is used only as a sanity check
-    (the primary member should be among the rows found by job_id); job_id is
-    authoritative for cluster membership. "The verdict" here also covers the
-    terminal-with-no-verdict case (a timeout, a kill, a pruned job — see
-    ledger.py migration 10's `dispatches.error`): that folds to
-    STATE_NEEDS_HUMAN with a note naming the tier, the terminal status and
-    sideclaw's own reason, never silently into STATE_VERDICT.
+    file's own next 10-minute pass. `origin_event_id` is used only as a sanity
+    check (the primary member should be among the rows found by job_id); job_id
+    is authoritative for cluster membership.
+
+    Only a member still waiting for THIS verdict is folded — `working` with no
+    implement episode yet. A re-fold of a dispatch whose delivery failed (the
+    sweep retries those) must never drag an item that has since moved on back to
+    an earlier state; an already-folded member is a same-state no-op.
+
+    The verdict -> state table (sideclaw's `nextAction` enum none|issue|implement|
+    human):
+
+      implement | issue                       -> working (maybe_auto_implement() picks it up)
+      human                                   -> needs_decision, note = decisionQuestion,
+                                                 else summary, else recommendation
+      none                                    -> closed(resolved), note = summary
+      an artifact (an author-tier issue)      -> closed(resolved), note = "filed <url>"
+      origin human/github_issue capped at
+        max_tier=investigate (not `human`)    -> closed(resolved), note = the answer
+      terminal with NO verdict                -> infrastructure failure: strike, retry
+                                                 the investigation (see _strike())
+
+    A multi-member cluster whose verdict carries DISSOLVE_MARKER stays `working`
+    for maybe_dissolve_clusters() to split.
 
     Each member's state transition is its own compare-and-set (`_set_state`'s
     `expect_state=`, read fresh off THIS row right before the write) committed
     IMMEDIATELY, and the GitHub comment-back only ever runs AFTER that commit
-    lands and only when the CAS actually won (`rowcount and prior_state !=
-    member_state`) — never before it. The old shape read `prior_state` once,
-    called `_set_state()` with no `expect_state`, posted the comment, and
-    committed everything (every member's transition AND every comment) in one
-    `conn.commit()` at the very end of the loop: a crash after a POST but
-    before that single commit left the transition unpersisted, so a retry
-    (or a second sweep racing the same row before either had committed)
-    reread the same stale `prior_state` and reposted. The CAS plus the
-    per-member commit closes that window; `_maybe_comment_back_on_issue()`'s
-    own `payload_json.commented_at` marker is the second, independent line
-    of defence against a repeat post."""
+    lands and only when the CAS actually won — never before it.
+    `_maybe_comment_back_on_issue()`'s own `payload_json.commented_at` marker is
+    the independent line of defence against a repeat post (a `working` -> `working`
+    fold records no state change, so the marker is what makes the comment once)."""
     members = conn.execute(
         "SELECT * FROM triage_items WHERE dispatch_job=? ORDER BY event_id", (job_id,)
     ).fetchall()
@@ -3986,122 +3770,72 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     ).fetchone()
     if d is None:
         return
+    all_members = members
+    members = [m for m in all_members if m["state"] == STATE_WORKING and m["implement_job"] is None]
+    if not members:
+        return
     result = _safe_json(d["verdict_json"]) if d["verdict_json"] else {}
     next_action = (result.get("nextAction") or "").strip().lower()
-    if d["artifact_url"]:
-        # Ordering is load-bearing, checked FIRST: an `implement` episode can
-        # fail AFTER already opening its draft PR (e.g. it degraded partway
-        # through validation) — the artifact exists and still needs a human to
-        # review it, so `pr_open` (which carries its own downstream chain) must
-        # keep winning over the "terminal with no verdict" branch below, not
-        # get downgraded to a plain needs_human that drops the PR link.
-        new_state = STATE_PR_OPEN
-    elif d["status"] != "done" and not result:
-        # A dispatch that ended some way OTHER than "done" (failed, interrupted,
-        # cancelled, sideclaw's own pruned-as-failed — see dispatch-sweep.py's
-        # PRUNED_STATUS) AND produced no schema-valid verdict at all — see
-        # ledger.py migration 10 for why `error` exists to answer why. `not
-        # result` is required, not just the status check alone: an
-        # `interrupted` episode that nonetheless returned a real verdict HAS
-        # answered the question, and downgrading it to needs_human here would
-        # throw away a real answer sideclaw actually produced.
-        #
-        # No retry — a failed episode routes to a human. Automatically
-        # retrying a killed/timed-out episode is a separate decision this
-        # migration does not make.
-        new_state = STATE_NEEDS_HUMAN
-    elif next_action == "human":
-        new_state = STATE_NEEDS_HUMAN
-    else:
-        new_state = STATE_VERDICT
-    blocker = ""
-    if new_state == STATE_NEEDS_HUMAN:
-        blocker = (result.get("recommendation") or result.get("summary") or "").strip()
-        if not blocker and not result:
-            # The "terminal, no verdict" branch above: name the tier and the
-            # terminal status so the card reads as a diagnosis, not a blank
-            # needs_human, and cap it the same way SPLIT_VERDICT_NOTE_PREFIX
-            # caps its own verdict text — a long stack trace must not blow up
-            # the Slack card.
-            reason = (d["error"] or "").strip() or "sideclaw recorded no reason"
-            blocker = _cap_brief(f"{d['tier']} episode {d['status']} with no verdict: {reason}")
+    text_blob = " ".join(str(result.get(k) or "") for k in ("summary", "verdict", "recommendation"))
+    answer = (result.get("summary") or result.get("recommendation") or "").strip() or None
+    # An artifact is checked first (see _member_outcome()): an episode that failed
+    # AFTER producing it has still answered.
+    no_verdict = not result and not d["artifact_url"]
+    clustered_marker = len(all_members) > 1 and DISSOLVE_MARKER in text_blob
 
-    def _member_state_and_note(m: sqlite3.Row) -> tuple[str, str | None]:
-        member_state, member_note = new_state, (blocker or None)
-        # An origin item capped at `investigate` whose plain verdict just
-        # landed splits by WHO asked, not just that someone asked:
-        #
-        #   - `human` — a question was asked and the answer just arrived in
-        #     the same breath; closing it `STATE_CLOSED` as `answered: …` is
-        #     correct, and landing it in `verdict` instead would only start
-        #     a 24h `verdict -> needs_human` clock (STATE_DEADLINES) over a
-        #     question nobody is going to act on further — pure noise.
-        #   - `github_issue` — a THIRD-PARTY issue never had a human in the
-        #     loop at ask time (every repo here is public, so anyone can
-        #     open one), so silently closing the assessment as "answered"
-        #     would be exactly the invisibility this split exists to
-        #     prevent. It lands in `STATE_NEEDS_HUMAN` instead, carrying the
-        #     verdict summary as the note (same shape every other
-        #     needs_human blocker uses), so the owner sees the assessment on
-        #     the card/Argo and decides what happens next — no public
-        #     comment, no silent close for a stranger's issue. An
-        #     owner-authored issue never reaches this branch at all: it
-        #     opened at `max_tier="implement"`.
-        #   - `alert` items are untouched: this branch only ever fires for
-        #     `new_state == STATE_VERDICT`, and an alert's own verdict still
-        #     needs maybe_auto_implement() to look at it.
-        #
-        # Also, structurally, why a FAILED episode can never reach either
-        # shortcut: `new_state == STATE_VERDICT` requires a real, schema-valid
-        # `result` (see the "terminal, no verdict" branch above, which routes
-        # a failure straight to STATE_NEEDS_HUMAN before this function is ever
-        # called for that member). A human-origin question or a third-party
-        # issue whose episode FAILED must land in front of a human through
-        # that branch, never be closed here as "answered" — this gate already
-        # guarantees that by construction, but it is exactly the invariant a
-        # future edit to either branch must not break.
-        if new_state == STATE_VERDICT and m["max_tier"] == "investigate":
-            summary = (result.get("summary") or result.get("recommendation") or "").strip()
-            if m["origin"] == "human":
-                member_state = STATE_CLOSED
-                member_note = f"answered: {summary}" if summary else "answered"
-            elif m["origin"] == "github_issue":
-                member_state = STATE_NEEDS_HUMAN
-                member_note = summary or "investigated, no recommendation"
-        return member_state, member_note
+    def _member_outcome(m: sqlite3.Row) -> tuple[str, str | None, str | None]:
+        """(state, note, close_reason) for one member."""
+        if d["artifact_url"]:
+            return STATE_CLOSED, f"filed {d['artifact_url']}", CLOSE_RESOLVED
+        if next_action == "human":
+            return STATE_NEEDS_DECISION, _decision_note(result), None
+        if clustered_marker:
+            return STATE_WORKING, None, None
+        # An origin item capped at `investigate` (a `human` question, or a GitHub
+        # issue that is not the owner's own) asked for an ANSWER: it is delivered
+        # — the comment-back below for the owner's own issue — and the item closes.
+        if m["max_tier"] == "investigate" or next_action == "none":
+            return STATE_CLOSED, answer, CLOSE_RESOLVED
+        if next_action not in ("implement", "issue"):
+            return (STATE_FAILED,
+                    f"investigation verdict carried nextAction {next_action or '(missing)'!r}, "
+                    f"expected none|issue|implement|human", None)
+        return STATE_WORKING, None, None
 
     if dry_run:
-        print(f"[dry-run] would fold dispatch {job_id} onto {len(members)} triage item(s): state={new_state}")
+        label = "infrastructure failure (strike)" if no_verdict else ", ".join(
+            sorted({_member_outcome(m)[0] for m in members}))
+        print(f"[dry-run] would fold dispatch {job_id} onto {len(members)} triage item(s): state={label}")
+        if no_verdict:
+            return
         for m in members:
-            member_state, _ = _member_state_and_note(m)
-            if m["state"] == member_state:
-                continue
             event_row = _get_event(conn, m["event_id"])
             if event_row is not None:
                 _maybe_comment_back_on_issue(conn, m, event_row, result, now, dry_run=True)
         return
 
     for m in members:
-        member_state, member_note = _member_state_and_note(m)
-
+        prior_state = m["state"]
+        if no_verdict:
+            reason = (d["error"] or "").strip() or "sideclaw recorded no reason"
+            reason = _cap_brief(f"{d['tier']} episode {d['status']} with no verdict: {reason}")
+            _strike(conn, m["event_id"], now, reason, retry_state=STATE_TRIAGED, expect_state=prior_state,
+                    dispatch_job=None)
+            conn.commit()
+            continue
+        member_state, member_note, close_reason = _member_outcome(m)
+        columns: dict[str, Any] = {"note": member_note, "strikes": 0, "retry_at": None}
+        if close_reason:
+            columns["close_reason"] = close_reason
         # Atomic compare-and-set, committed IMMEDIATELY — see this
         # function's own docstring. `expect_state` is read fresh off `m`
-        # right here, not carried from an earlier query, so the UPDATE's own
-        # `WHERE state=?` is what actually decides whether this call wins a
-        # race against another connection folding the same row, not a stale
-        # Python variable.
-        prior_state = m["state"]
+        # right here, so the UPDATE's own `WHERE state=?` is what actually
+        # decides whether this call wins a race against another connection
+        # folding the same row, not a stale Python variable.
         rowcount = _set_state(conn, m["event_id"], member_state, now, expect_state=prior_state,
-                              artifact_url=_Coalesce(d["artifact_url"]), note=member_note)
+                              artifact_url=_Coalesce(d["artifact_url"]), **columns)
         conn.commit()
-        # Comment-back only on a REAL transition THIS CALL WON —
-        # fold_dispatch_verdict() is idempotent by design (the card_hash
-        # short-circuit is what makes a repeat call safe), and a GitHub
-        # comment has no such short-circuit of its own; `_set_state()`'s CAS
-        # above is what makes `rowcount` mean "this call actually made the
-        # transition", and the comment only ever fires AFTER that transition
-        # is durable (the `conn.commit()` immediately above), never before.
-        if rowcount and prior_state != member_state:
+        if rowcount:
             event_row = _get_event(conn, m["event_id"])
             if event_row is not None:
                 _maybe_comment_back_on_issue(conn, m, event_row, result, now, dry_run=False)
@@ -4116,7 +3850,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 # --- the auto-implement chain: verdict -> implement -> validate -> merge ----
 # --- -> deploy -> verify (steps 6-10) -----------------------------------------
 #
-# Everything below is downstream of a STATE_VERDICT item whose folded
+# Everything below is downstream of a `working` item whose folded
 # investigate verdict said nextAction=implement, at any confidence.
 # Every step calls straight into the `clients`/`lifecycle` packages now (no
 # subprocess, no hermes-cc.sh — that script is retired, see docs/history/state-log.md's Wave
@@ -4163,7 +3897,7 @@ def complete_operation(conn: sqlite3.Connection, op_id: str, *, outcome: str,
 # own `merge_sha` and `gh`'s `mergeCommit.oid` both produce (docs/history/state-log.md §47's
 # jkrumm/argo#16 verification). Used by the deployOnMerge branches below (item
 # 1b) to refuse a probe with nothing real to compare against, rather than
-# entering `liveness_pending` on a short/garbled/empty value that could never
+# entering `verifying` on a short/garbled/empty value that could never
 # match a live commit and would just sit until liveness_deadline and reopen.
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -4262,14 +3996,9 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     what might be stale.
 
     `outcome`, once resolved, is always one of `_OPERATION_OUTCOMES`. An
-    operation that resolves to `unknown` moves its item to STATE_NEEDS_HUMAN
-    rather than being left for something else to retry: "we do not know
-    whether the world changed" is precisely the case DESIGN.md § Crash
-    recovery routes to a human, and `needs_human` is carded, so the operator
-    sees it. It must never silently become `failed` — that would retry a
-    possibly-already-running implement episode or re-attempt a merge that
-    may already have landed, which is the whole defect this slice exists to
-    close."""
+    operation that resolves to `unknown` is an infrastructure failure of the
+    step it covered: its item strikes (see _strike()) and the step's own poller
+    re-submits it, the third strike landing `failed` with the reason."""
     if dry_run:
         # Every branch below reaches out (sideclaw, `gh pr view`, GitHub
         # Actions) — the dry-run contract is "never shells out"/"never
@@ -4425,7 +4154,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # BEFORE the verb ran at all. Always unknown, never guessed
             # either way — see HOST_VERB_ALLOWLIST's own docstring for why a
             # host verb must stay idempotent, which is what makes "run it
-            # again from `needs_human`" a safe human decision either way.
+            # again from `needs_decision`" a safe human decision either way.
             #
             # The crash explanation goes in the RECEIPT, never in `note` —
             # `_host_verb_cooldown_ok()`/`_host_verb_attempts()` filter
@@ -4465,35 +4194,43 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
 
         if outcome == "unknown":
-            _set_state(conn, row["event_id"], STATE_NEEDS_HUMAN, now,
-                       note=f"operation {row['op_id']} ({row['kind']}) could not be reconciled: {note}")
-            conn.commit()
+            # A lost in-flight operation is an infrastructure failure: strike it
+            # and let the step's own poller re-submit (see _strike()). A `deploy`
+            # has no poller to re-run it — the verifying item's own liveness probe
+            # is what tells whether it landed — so it only records the outcome.
+            retry = _RECONCILE_RETRY.get(row["kind"])
+            if retry is not None:
+                retry_state, retry_columns = retry
+                _strike(conn, row["event_id"], now,
+                        f"operation {row['op_id']} ({row['kind']}) could not be reconciled: {note}",
+                        retry_state=retry_state, expect_state=retry_state, **retry_columns)
+                conn.commit()
             continue
 
         # A RESOLVED operation still has to move the item, and forgetting that
-        # reproduces the very defect this slice closes. Concretely: a `merge`
+        # reproduces the defect this function closes. Concretely: a `merge`
         # operation left open by a timeout, then reconciled to `done` because
-        # GitHub says MERGED, leaves the item sitting in `validating` — whose
-        # STATE_DEADLINES rule expires it to `merge_blocked` after 1h. The
-        # operations table would correctly read "merged, here is the sha"
-        # while the item read "blocked", which is docs/history/state-log.md §46's
-        # merged-but-recorded-as-failure bug wearing a different hat.
+        # GitHub says MERGED, leaves the item sitting in `merging` — the
+        # operations table would correctly read "merged, here is the sha" while
+        # the item still waits to merge it (docs/history/state-log.md §46's
+        # merged-but-recorded-as-failure bug wearing a different hat).
         #
         # `deploy`, resolved `done`: only worth an item transition when the
-        # item is still sitting in `merged` waiting on exactly this — a
+        # item is still sitting in `verifying` with nothing to verify against — a
         # deployOnMerge repo whose Actions run just appeared. Nothing else
         # reads a resolved deploy operation directly (dispatch-sweep.py and
         # the merge path above already moved the item for every other
         # outcome), so this is the only advancement to make.
         if row["kind"] == "deploy":
             item_row = conn.execute(
-                "SELECT state FROM triage_items WHERE event_id=?", (row["event_id"],)
+                "SELECT state, liveness_deadline FROM triage_items WHERE event_id=?", (row["event_id"],)
             ).fetchone()
             repo_entry = (policy.get("repos") or {}).get(row["repo"] or "") or {}
-            if item_row is not None and item_row["state"] == STATE_MERGED and repo_entry.get("deployOnMerge"):
+            if (item_row is not None and item_row["state"] == STATE_VERIFYING
+                    and item_row["liveness_deadline"] is None and repo_entry.get("deployOnMerge")):
                 sha = (new_receipt or {}).get("mergeCommit")
                 deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-                _set_state(conn, row["event_id"], STATE_LIVENESS_PENDING, now,
+                _set_state(conn, row["event_id"], STATE_VERIFYING, now,
                            liveness_deadline=deadline,
                            deploy_expect_json=json.dumps([{"commit": sha}] if sha else []),
                            note=None)
@@ -4510,11 +4247,12 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
         if outcome == "failed":
             # GitHub is authoritative and says it did not merge (closed, or
-            # open and untouched by whatever the crash interrupted). Same
-            # destination the live path uses for a definite refusal.
+            # open and untouched by whatever the crash interrupted): the merge
+            # step failed, so it strikes and is re-attempted.
             detail = note or f"see operation {row['op_id']}"
-            _set_state(conn, row["event_id"], STATE_MERGE_BLOCKED, now,
-                       note=f"reconciled from GitHub: the pull request is not merged ({detail})")
+            _strike(conn, row["event_id"], now,
+                    f"reconciled from GitHub: the pull request is not merged ({detail})",
+                    retry_state=STATE_MERGING, expect_state=STATE_MERGING)
             conn.commit()
             continue
         sha = (new_receipt or {}).get("mergeCommit")
@@ -4524,20 +4262,14 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # point of this branch. A deployOnMerge repo's deploy is driven by
             # GitHub Actions off the push, NOT by the subprocess warden lost —
             # so a crash here says nothing about whether the deploy ran, and
-            # the probe can still answer. Sending this item to `merged` (as
-            # the `else` below would) or to `needs_human` (as `autoDeploy`
-            # does) would strand a deploy that very likely succeeded, with a
-            # note saying "no deploy configured for this repo" that is simply
-            # false for this repo class.
-            #
-            # So it lands exactly where poll_validation_jobs() would have put
-            # it: `liveness_pending` on the same `[{"commit": sha}]` shape,
-            # with a fresh window measured from NOW rather than from the lost
-            # merge — the probe is idempotent and the deadline is a bound on
-            # how long we wait for it, not a claim about when the deploy
-            # happened.
+            # the probe can still answer. It lands exactly where
+            # poll_validation_jobs() would have put it: `verifying` on the same
+            # `[{"commit": sha}]` shape, with a fresh window measured from NOW
+            # rather than from the lost merge — the probe is idempotent and the
+            # deadline is a bound on how long we wait for it, not a claim about
+            # when the deploy happened.
             deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-            _set_state(conn, row["event_id"], STATE_LIVENESS_PENDING, now,
+            _set_state(conn, row["event_id"], STATE_VERIFYING, now,
                        liveness_deadline=deadline,
                        deploy_expect_json=json.dumps([{"commit": sha}]),
                        note=None)
@@ -4545,20 +4277,29 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # Merged, and the deploy rode along inside the same lost
             # subprocess. `ssh <host> make <target>` leaves no remote handle
             # to ask (docs/history/state-log.md §46), so whether production changed is
-            # genuinely unknown — and `merged` would quietly expire to
-            # `closed`, claiming a clean landing nobody verified.
-            _set_state(conn, row["event_id"], STATE_NEEDS_HUMAN, now,
+            # genuinely unknown — and `verifying` with nothing to verify would
+            # go straight to `fixed`, claiming a clean landing nobody verified.
+            _set_state(conn, row["event_id"], STATE_FAILED, now,
                        note=(f"reconciled from GitHub: merged as {sha}, but this repo auto-deploys and the "
                              f"deploy ran inside the same lost call — whether it completed cannot be "
                              f"determined remotely. Verify the deployment before acting on this item."))
         else:
             # No deploy was configured, so nothing else was supposed to
             # happen — this is exactly where the live path puts a merge with
-            # no deploy target, and `merged`'s own 1h rule takes it to
-            # `closed` from here.
-            _set_state(conn, row["event_id"], STATE_MERGED, now,
+            # no deploy target: `verifying` with nothing to verify, which
+            # maybe_check_liveness() takes to `fixed` on its next pass.
+            _set_state(conn, row["event_id"], STATE_VERIFYING, now,
                        note=f"reconciled from GitHub: merged as {sha}; no deploy configured for this repo")
         conn.commit()
+
+
+# What a lost `unknown` operation of each kind strikes back to — the state whose
+# poller re-submits that step, and the handle to clear so it starts a fresh one.
+_RECONCILE_RETRY: dict[str, tuple[str, dict[str, Any]]] = {
+    "implement": (STATE_WORKING, {"implement_job": None}),
+    "host": (STATE_WORKING, {"implement_job": None}),
+    "merge": (STATE_MERGING, {}),
+}
 
 
 def _verdict_as_context(job_id: str, verdict: dict[str, Any]) -> str:
@@ -4583,17 +4324,18 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                           *, dry_run: bool) -> None:
     """The host-verb allowlist's own poller (STATE.md's 2026-09-11 owner
     decision, docs/history/state-log.md §59): "if warden is confident in a fix it must do
-    it, even a host-level action like restarting a process. `needs_human` for
+    it, even a host-level action like restarting a process. `needs_decision` for
     a restart is friction." Modelled line for line on maybe_auto_implement()
     below — same claim-before-execute shape, for the same reason: recording
     the claim only after the verb runs leaves a crash window where a second
     pass restarts the same process a second time.
 
-    Runs BEFORE maybe_auto_implement() in run() (see that function's own
-    ordering comment) so an item this function moves on cannot also be
-    picked up by the implement chain in the same pass — the two are mutually
-    exclusive by construction: this only ever claims a row still sitting in
-    `verdict` or `needs_human`, and both branches below leave it in neither.
+    Runs BEFORE maybe_auto_implement() in run() so an item this function claims
+    cannot also be picked up by the implement chain in the same pass: the claim
+    writes a HOST_VERB_CLAIM_PREFIX sentinel into `implement_job`, which the
+    implement chain treats as "taken". This only ever claims a row still sitting
+    in `working` (a verdict waiting for its dispatch) or `needs_decision` (a
+    `human` verdict), with no implement episode on it.
 
     TWO-PHASE, keyed by VERB, not by item — corrected 2026-09-11 11:36Z: three
     triage items (`uk:175`, `uk:185`, the hermes_log `session-is-closed`
@@ -4607,16 +4349,17 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
     Phase 1 — collect every candidate passing gates 1-4 below into
     `by_verb: dict[verb_key, list[item]]`, one entry per row, no writes yet:
-      1. `state IN ('verdict', 'needs_human') AND dispatch_job IS NOT NULL` —
-         a row with no folded investigate verdict to read confidence/
-         nextAction off has nothing this function can act on.
+      1. `state IN ('working', 'needs_decision') AND dispatch_job IS NOT NULL
+         AND implement_job IS NULL` and not waiting out a strike's backoff — a
+         row with no folded investigate verdict to read confidence/nextAction
+         off has nothing this function can act on.
       2. no `operations` row of `kind='host'` still open (`outcome IS NULL`)
          for this item's OWN event_id — reconcile_operations() runs FIRST in
          run(), before even this, so a row still open here is genuinely in
          flight this same pass, not a crash left behind. (A crash between
          this function's own claim and its own record_operation() call is a
-         narrower window this check cannot see into — STATE_REMEDIATING's
-         own STATE_DEADLINES entry is the backstop for exactly that gap.)
+         narrower window this check cannot see into — poll_implement_jobs()'s
+         orphan reclaim is the backstop for exactly that gap.)
       3. the item's own signature matches a `hostVerbs` policy rule (same
          two match targets, same first-match-wins shape as `rules` —
          see _match_targets()/_match_rule()).
@@ -4628,7 +4371,7 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
          from HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE
          liveness probe before the item is ever marked done, and capped at
          `hostVerbMaxAttempts`, so a wrong guess costs one restart and a
-         `needs_human` card carrying the receipt — cheaper than a human
+         `needs_decision` card carrying the receipt — cheaper than a human
          running that exact same restart by hand. (maybe_auto_implement()
          has no confidence bar at all: its gate is the step-7 review.)
 
@@ -4640,36 +4383,36 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
          to the last `hostVerbCooldownHours * hostVerbMaxAttempts` hours —
          see that function's own docstring for why the window exists) at
          `hostVerbMaxAttempts` -> every item in the group moves to
-         STATE_NEEDS_HUMAN ONCE, note lists every prior attempt's exit code.
+         STATE_FAILED ONCE, note lists every prior attempt's exit code.
          NOT a deferral: a verb that has already failed this many times is a
          deterministic failure, and leaving its items to be retried forever
-         is the exact silent-stuck-item failure DESIGN.md's own deadline
-         table exists to close.
+         is the silent-stuck-item failure.
 
     Every item in a verb's group is claimed with the SAME compare-and-set
-    maybe_auto_implement() uses (`_set_state(..., STATE_REMEDIATING,
-    expect_state=item["state"])`) — an item whose OWN claim loses (a
+    maybe_auto_implement() uses (`_set_state(..., STATE_WORKING,
+    expect_state=item["state"], expect_null=("implement_job",))`) — an item whose OWN claim loses (a
     concurrent run, or a state that moved between phase 1 and phase 2) is
     simply excluded from `claimed`, never restarted on its own. `_run_host_verb()`
     — NOT `_run_verb()`, see that function's own docstring for why — then
     runs synchronously ONCE (bounded by HOST_VERB_TIMEOUT), covering every
     claimed item: ONE `operations` row, `event_id` set to the FIRST claimed
     item, receipt carrying `"items": [<every claimed event_id>]` so the
-    group is reconstructable from the row alone. Every claimed item leaves
-    `remediating` before this function returns, together, with the SAME
-    note: STATE_LIVENESS_PENDING on `exitCode == 0`, STATE_NEEDS_HUMAN
-    otherwise. There is no async poll step here — unlike the implement
-    chain, a host verb's own subprocess IS the whole operation, so
-    `_run_host_verb()` returning is the terminal answer for this pass;
-    STATE_REMEDIATING's own STATE_DEADLINES entry is a crash backstop only
-    (see that entry's own comment)."""
-    candidates = conn.execute(
-        "SELECT * FROM triage_items WHERE state IN (?, ?) AND dispatch_job IS NOT NULL ORDER BY event_id",
-        (STATE_VERDICT, STATE_NEEDS_HUMAN),
-    ).fetchall()
+    group is reconstructable from the row alone. Every claimed item releases its
+    claim before this function returns, together, with the SAME note:
+    STATE_VERIFYING on `exitCode == 0`, an infrastructure strike (back to
+    `working`, see _strike()) otherwise. There is no async poll step here —
+    unlike the implement chain, a host verb's own subprocess IS the whole
+    operation, so `_run_host_verb()` returning is the terminal answer for this
+    pass."""
     host_verbs = policy.get("hostVerbs") or []
     if not host_verbs:
         return
+    ready_sql, ready_params = _retry_ready_sql(now)
+    candidates = conn.execute(
+        f"SELECT * FROM triage_items WHERE state IN (?, ?) AND dispatch_job IS NOT NULL "
+        f"AND implement_job IS NULL AND {ready_sql} ORDER BY event_id",
+        (STATE_WORKING, STATE_NEEDS_DECISION, *ready_params),
+    ).fetchall()
 
     # --- Phase 1 — gates 1-4, grouped by verb. No writes below this point. ---
     by_verb: dict[str, list[sqlite3.Row]] = {}
@@ -4723,9 +4466,9 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 for i, op in enumerate(prior_ops)
             )
             note = (f"host verb {verb_key!r} hit hostVerbMaxAttempts="
-                    f"{policy['hostVerbMaxAttempts']} ({attempts}) — needs a human")
+                    f"{policy['hostVerbMaxAttempts']} ({attempts})")
             for item in items:
-                _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
+                _set_state(conn, item["event_id"], STATE_FAILED, now, note=note)
             conn.commit()
             _sync_cards(conn, items, policy)
             continue
@@ -4736,10 +4479,12 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # crash window where a second pass restarts the same process again.
         # An item whose own CAS loses is excluded from `claimed`, never
         # restarted separately from the rest of the group.
+        claim = f"{HOST_VERB_CLAIM_PREFIX}{verb_key}"
         claimed = [
             item for item in items
-            if _set_state(conn, item["event_id"], STATE_REMEDIATING, now,
-                          expect_state=item["state"], note=f"restarting via {verb_key}")
+            if _set_state(conn, item["event_id"], STATE_WORKING, now,
+                          expect_state=item["state"], expect_null=("implement_job",),
+                          implement_job=claim, note=f"restarting via {verb_key}")
         ]
         conn.commit()
         if not claimed:
@@ -4763,49 +4508,52 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
             note = f"restarted via {verb_key}; awaiting liveness"
             for item in claimed:
-                _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+                _set_state(conn, item["event_id"], STATE_VERIFYING, now, implement_job=None,
                            liveness_deadline=deadline, deploy_expect_json=deploy_expect, note=note)
         else:
             complete_operation(conn, op_id, outcome="failed", receipt=receipt)
             note = (f"host verb {verb_key!r} failed (exit {result['exitCode']}): "
                     f"{result['output'][:500] or '(no output)'}")
             for item in claimed:
-                _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
+                _strike(conn, item["event_id"], now, note, retry_state=STATE_WORKING,
+                        expect_state=STATE_WORKING, implement_job=None)
         conn.commit()
         _sync_cards(conn, claimed, policy)
 
 
 def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
-    """Step 6. A STATE_VERDICT item is eligible once, the moment its folded
+    """Step 6. A `working` item is eligible once, the moment its folded
     investigate verdict (dispatches.verdict_json, keyed by its own
-    dispatch_job) reads nextAction=implement, at ANY confidence (review is
-    the gate, not the investigator's self-assessment) AND it has
-    not already been auto-implemented (implement_job IS NULL) AND its own
-    `max_tier` is `implement`. "Runs at most once" is guaranteed by exactly
-    that eligibility: only STATE_VERDICT items with `implement_job IS NULL`
-    are picked up, and the claim moves the item out of STATE_VERDICT, so a
-    re-triggered item is never picked up again. `max_tier != 'implement'`
-    (a human's `warden run --tier investigate`, or any GitHub issue not the owner's own) never
-    reaches this loop at all — fold_dispatch_verdict() already routed its
-    verdict straight to `closed` instead of `verdict`, so it structurally
-    cannot appear in the eligibility query below; the clause is defence in
-    depth, mirroring `lifecycle/policy.py`'s own `require_auto_from_item()`
-    refusal on the same column.
+    dispatch_job) reads nextAction=implement or issue, at ANY confidence (review
+    is the gate, not the investigator's self-assessment) AND it has not already
+    been auto-implemented (implement_job IS NULL) AND its own `max_tier` is
+    `implement` AND it is not waiting out a strike's backoff (`retry_at`).
+    "Runs at most once per attempt" is guaranteed by the claim: a compare-and-set
+    writing IMPLEMENT_CLAIM into `implement_job`, so a re-triggered item is never
+    picked up twice. `max_tier != 'implement'` (a human's `warden run --tier
+    investigate`, or any GitHub issue not the owner's own) never reaches this
+    loop at all — fold_dispatch_verdict() already closed it with its answer, so
+    it structurally cannot appear in the eligibility query below; the clause is
+    defence in depth, mirroring `lifecycle/policy.py`'s own
+    `require_auto_from_item()` refusal on the same column.
 
     `require_auto_from_item()`/`check_repo_not_in_flight()` are checked
     BEFORE the compare-and-set claim below, not after: both read the item's
-    OWN current state off the ledger (`require_auto_from_item` refuses
-    anything not sitting in `verdict`), so checking them against a row this
-    same call already flipped to `implementing` would refuse every single
-    time — a policy check must see the state it is actually gating, not the
-    state its own caller is about to write. A refusal here is visible: the
-    reason lands in the item's own `note`, prefixed `deferred: ` (DESIGN.md
-    § What must not be lost), and the card is synced immediately rather than
-    waiting for whatever poller might read `note` next."""
+    OWN current state off the ledger, so checking them against a row this same
+    call already claimed would refuse every single time — a policy check must
+    see the state it is actually gating, not the state its own caller is about
+    to write. A refusal here is visible: the reason lands in the item's own
+    `note`, prefixed `deferred: ` (DESIGN.md § What must not be lost), and the
+    card is synced immediately rather than waiting for whatever poller might
+    read `note` next. A deferral is not a strike — nothing failed.
+
+    A submit that fails for infrastructure reasons (5xx, unreachable) strikes
+    (see _strike()); a sideclaw 4xx ends the item `failed` and is never retried."""
+    ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
-        "SELECT * FROM triage_items WHERE state=? AND dispatch_job IS NOT NULL AND implement_job IS NULL "
-        "AND max_tier = 'implement' ORDER BY event_id", (STATE_VERDICT,)
+        f"SELECT * FROM triage_items WHERE state=? AND dispatch_job IS NOT NULL AND implement_job IS NULL "
+        f"AND max_tier = 'implement' AND {ready_sql} ORDER BY event_id", (STATE_WORKING, *ready_params)
     ).fetchall()
     for item in candidates:
         if item["repo"] is None:
@@ -4814,7 +4562,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if d is None:
             continue
         verdict = _safe_json(d["verdict_json"])
-        if (verdict.get("nextAction") or "").strip().lower() != "implement":
+        if (verdict.get("nextAction") or "").strip().lower() not in ("implement", "issue"):
             continue
         if dry_run:
             print(f"[dry-run] would auto-implement {item['signature']} in {item['repo']} "
@@ -4825,7 +4573,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _policy.require_auto_from_item(conn, event_id=item["event_id"], repo=item["repo"], tier="implement")
             _policy.check_repo_not_in_flight(conn, repo=item["repo"])
         except (PolicyError, PreconditionError, UsageError) as e:
-            _set_state(conn, item["event_id"], STATE_VERDICT, now, note=f"deferred: {e}")
+            _set_state(conn, item["event_id"], STATE_WORKING, now, note=f"deferred: {e}")
             conn.commit()
             fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
             if fresh_item is not None and fresh_event is not None:
@@ -4842,16 +4590,17 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         )
 
         # CLAIM BEFORE DISPATCH, not after. The eligibility query above is
-        # `state='verdict' AND implement_job IS NULL`, so recording the claim only
-        # after the episode opens leaves a window: if this process dies between
-        # the dispatch and the UPDATE, the item is still eligible on the next tick
-        # and a SECOND implement episode opens for the same verdict — duplicate
-        # branches and duplicate draft PRs, bounded only by the daily budget. The
-        # conditional UPDATE is the claim: `AND state=?` makes it a compare-and-set,
-        # so a concurrent run that already claimed this item changes 0 rows and this
+        # `implement_job IS NULL`, so recording the claim only after the episode
+        # opens leaves a window: if this process dies between the dispatch and
+        # the UPDATE, the item is still eligible on the next tick and a SECOND
+        # implement episode opens for the same verdict — duplicate branches and
+        # duplicate draft PRs. The conditional UPDATE is the claim:
+        # `expect_null=("implement_job",)` makes it a compare-and-set, so a
+        # concurrent run that already claimed this item changes 0 rows and this
         # one skips instead of racing it.
-        claimed = _set_state(conn, item["event_id"], STATE_IMPLEMENTING, now,
-                             expect_state=STATE_VERDICT, expect_null=("implement_job",))
+        claimed = _set_state(conn, item["event_id"], STATE_WORKING, now,
+                             expect_state=STATE_WORKING, expect_null=("implement_job",),
+                             implement_job=IMPLEMENT_CLAIM)
         conn.commit()
         if not claimed:
             continue
@@ -4866,37 +4615,26 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             )
         except SubmitRefused as exc:
             # open_episode() already completed the operation `failed`. A
-            # refusal is final: end the item, never hand the claim back to
-            # `verdict` for the next tick to submit the same thing again.
-            _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy)
+            # refusal is final: end the item, never hand the claim back for
+            # the next tick to submit the same thing again.
+            _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy,
+                            implement_job=None)
             continue
         except RemoteError as exc:
-            if exc.maybe_mutated:
-                # sideclaw MAY have accepted the job. Do NOT roll back: that
-                # would re-implement next tick against a job that could
-                # already be running (the exact duplication bug this slice
-                # exists to fix). Leave the item in `implementing` (no
-                # implement_job to poll yet) — open_episode() has already
-                # resolved the operation itself, to `unknown` (a terminal
-                # resolution: the ambiguity was caught in-process, not left
-                # for reconcile_operations(), which only ever revisits a row
-                # whose outcome is still NULL — a genuine crash that never
-                # ran any completion code at all). The item's own 2h
-                # `implementing` deadline (STATE_DEADLINES) is what moves it
-                # on if no implement_job ever shows up to poll.
-                print(f"triage: auto-implement for {item['signature']} may have reached sideclaw "
-                      f"({exc}) — left unresolved (operation recorded unknown)", file=sys.stderr)
-                continue
-            # A definite failure — sideclaw was never reached, or refused
-            # outright. open_episode() already completed the operation
-            # `failed`, so it is safe to hand the claim back.
-            _set_state(conn, item["event_id"], STATE_VERDICT, now, expect_state=STATE_IMPLEMENTING,
-                       note=f"deferred: {exc}")
+            # sideclaw 5xx or unreachable: an infrastructure failure, so the claim
+            # is handed back as a strike (open_episode() already completed the
+            # operation `failed`/`unknown`). If sideclaw DID accept the job before
+            # failing the response, the retry opens a second episode — the price
+            # of "retries are the default", bounded by the three strikes and by
+            # the per-repo in-flight lock.
+            maybe = " (the request may have reached sideclaw)" if exc.maybe_mutated else ""
+            _strike(conn, item["event_id"], now, f"implement dispatch failed{maybe}: {exc}",
+                    retry_state=STATE_WORKING, expect_state=STATE_WORKING, implement_job=None)
             conn.commit()
             continue
         except (PolicyError, PreconditionError, UsageError) as e:
-            _set_state(conn, item["event_id"], STATE_VERDICT, now,
-                       expect_state=STATE_IMPLEMENTING, note=f"deferred: {e}")
+            _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
+                       implement_job=None, note=f"deferred: {e}")
             conn.commit()
             continue
 
@@ -4982,66 +4720,94 @@ def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: 
     return opened.job_id, None
 
 
+def _sync_item_card(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int) -> None:
+    fresh_item, fresh_event = _get_item(conn, event_id), _get_event(conn, event_id)
+    if fresh_item is not None and fresh_event is not None:
+        sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+
+
+# What an implement attempt that did not produce a pull request clears, so the
+# next maybe_auto_implement() starts a fresh one.
+_IMPLEMENT_RETRY_COLUMNS: dict[str, Any] = {"implement_job": None, "validation_job": None, "pr_url": None}
+
+
+def _revisions_left(item: sqlite3.Row, policy: dict[str, Any]) -> bool:
+    max_attempts = int(policy.get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
+    return item["max_tier"] == "implement" and item["revision_count"] < max_attempts
+
+
 def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                          *, dry_run: bool) -> None:
-    """Step 6 -> 7. Polls every STATE_IMPLEMENTING item once, routing on the
-    DONE job's own typed `result.outcome` (clients.sideclaw.DISPATCH_OUTCOMES)
-    rather than "read artifactUrl, guess the rest":
+    """Step 6 -> 7. Polls every `working` item that has an implement episode on
+    record and has not been judged yet, routing on the DONE job's own typed
+    `result.outcome` (clients.sideclaw.DISPATCH_OUTCOMES) rather than "read
+    artifactUrl, guess the rest":
 
-      pr_opened                                -> opens the step-7 review (validating)
-      checks_failed                            -> needs_human (a red check is a human's, never a PR)
-      no_changes                               -> merge_blocked (the episode's own reason)
-      diff_refused/branch_no_pr/pr_failed/withheld -> merge_blocked, outcome named
-      salvaged                                 -> needs_human (sideclaw itself failed to get a verdict)
-      issue_declined/issue_failed/issue_filed/verdict_only -> needs_human (wrong tier's outcome)
-      anything else (missing/unrecognized)     -> needs_human, never guessed
-      result.nextAction == "human"             -> needs_human regardless of the above
+      pr_opened                                -> opens the step-7 review (merging)
+      checks_failed                            -> a revision attempt (stays working) while any
+                                                  are left, else failed
+      result.nextAction == "human"             -> needs_decision (decisionQuestion, else summary)
+      everything else — no_changes, diff_refused, branch_no_pr, pr_failed, withheld,
+        salvaged, a wrong tier's outcome, a missing/unrecognized outcome, a failed/
+        interrupted/cancelled job, a job sideclaw no longer knows, a schemaVersion
+        mismatch                               -> an episode that ended without a pull request:
+                                                  an infrastructure failure, so it strikes and
+                                                  maybe_auto_implement() starts a fresh attempt
+                                                  (the third strike lands failed)
 
-    A non-`done` terminal status (failed/interrupted/cancelled) blocks the
-    chain outright — STATE_MERGE_BLOCKED, never a silent drop, so the card
-    says why nothing landed. A `done` job whose `result.schemaVersion`
-    disagrees with `DISPATCH_SCHEMA_VERSION` is a loud needs_human, never a
-    best-effort parse — see `assert_result_schema()`."""
+    A claim (`implement_job` an IMPLEMENT_CLAIM/HOST_VERB_CLAIM_PREFIX sentinel)
+    with no open operation behind it is the loop having died between the
+    compare-and-set claim and open_episode()'s operation record: it is released
+    here. An open operation for the event means the crash was AFTER the record,
+    and that is reconcile_operations()'s case, not this one.
+
+    A judged item is marked on its implement dispatch (`validation_status`), so
+    it is polled once, and an item waiting for a revision is not re-polled."""
     if dry_run:
         return
     orphans = conn.execute(
-        "SELECT * FROM triage_items WHERE state=? AND implement_job IS NULL", (STATE_IMPLEMENTING,)
+        "SELECT * FROM triage_items WHERE state=? AND (implement_job=? OR implement_job LIKE ?)",
+        (STATE_WORKING, IMPLEMENT_CLAIM, f"{HOST_VERB_CLAIM_PREFIX}%"),
     ).fetchall()
     for item in orphans:
-        # Claimed, never dispatched, and no operation covering it: the loop died
-        # between the compare-and-set claim and open_episode()'s operation
-        # record. An open
-        # operation for the event means the crash was AFTER the record, and
-        # that is reconcile_operations()'s case, not this one.
         open_ops = conn.execute(
-            "SELECT 1 FROM operations WHERE event_id=? AND kind='implement' AND outcome IS NULL",
+            "SELECT 1 FROM operations WHERE event_id=? AND kind IN ('implement', 'host') AND outcome IS NULL",
             (item["event_id"],),
         ).fetchone()
         if open_ops is not None:
             continue
-        _set_state(conn, item["event_id"], STATE_VERDICT, now, expect_state=STATE_IMPLEMENTING,
-                   note="reclaimed: the loop stopped between claiming this item and dispatching it")
+        released = _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
+                              expect_eq={"implement_job": item["implement_job"]}, implement_job=None,
+                              note="reclaimed: the loop stopped between claiming this item and dispatching it")
         conn.commit()
-        print(f"triage: reclaimed {item['signature']} (event {item['event_id']}) — implementing with "
-              f"no episode and no operation", file=sys.stderr)
+        if released:
+            print(f"triage: reclaimed {item['signature']} (event {item['event_id']}) — claimed with no "
+                  f"episode and no operation", file=sys.stderr)
     items = conn.execute(
-        "SELECT * FROM triage_items WHERE state=? AND implement_job IS NOT NULL", (STATE_IMPLEMENTING,)
+        "SELECT ti.* FROM triage_items ti LEFT JOIN dispatches d ON d.job_id = ti.implement_job "
+        "WHERE ti.state=? AND ti.implement_job IS NOT NULL AND ti.implement_job != ? "
+        "AND ti.implement_job NOT LIKE ? AND d.validation_status IS NULL",
+        (STATE_WORKING, IMPLEMENT_CLAIM, f"{HOST_VERB_CLAIM_PREFIX}%"),
     ).fetchall()
     for item in items:
+        event_id, job_id = item["event_id"], item["implement_job"]
+
+        def _strike_attempt(reason: str) -> None:
+            _strike(conn, event_id, now, reason, retry_state=STATE_WORKING, expect_state=STATE_WORKING,
+                    **_IMPLEMENT_RETRY_COLUMNS)
+            conn.commit()
+            _sync_item_card(conn, policy, event_id)
+
         try:
-            resp = _sideclaw.get(item["implement_job"])
+            resp = _sideclaw.get(job_id)
         except RemoteError as e:
-            print(f"triage: could not poll sideclaw job {item['implement_job']} for "
-                  f"{item['signature']}: {e}", file=sys.stderr)
+            print(f"triage: could not poll sideclaw job {job_id} for {item['signature']}: {e}", file=sys.stderr)
             continue
         if resp is None:
-            # sideclaw no longer knows this job: it prunes terminal jobs at 24h
-            # OR at 200 terminal rows, a cap shared with every interactive
-            # /check, so 200 can arrive in an afternoon. Nothing here can move
-            # the item — which is why `implementing` has a 2h deadline in
-            # STATE_DEADLINES that fires long before either bound and takes it
-            # to `merge_blocked`. No miss counter, no extra column: the clock
-            # already covers the case (see sweep_deadlines()).
+            # sideclaw no longer knows this job (it prunes terminal jobs at 24h or
+            # at 200 terminal rows): the episode's result is lost, which is an
+            # infrastructure failure of the step, not something to poll forever.
+            _strike_attempt(f"sideclaw has no record of implement job {job_id} (pruned or lost)")
             continue
         status = resp.get("status")
         if status not in ("done", "failed", "interrupted", "cancelled"):
@@ -5050,7 +4816,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         # state transition — dispatch-sweep.py does the same sync, but on its
         # own 300s cadence, and this poll must not depend on that sibling
         # agent's timing for ledger consistency (the incident this closes:
-        # item 986 sat `validating` with its implement dispatch row still
+        # item 986 sat `merging` with its implement dispatch row still
         # `status='running'` because the sweep was unloaded, and the merge
         # precheck refused on a row this loop itself had the fresher read
         # for). `reported=False` leaves reported_at/delivery_status alone —
@@ -5060,23 +4826,14 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         conn.commit()
         if status != "done":
             reason = resp.get("error") or ("cancelled" if status == "cancelled" else "no further detail")
-            note = f"implement episode {item['implement_job']} finished '{status}' with no pull request: {reason}"
-            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=note)
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+            _strike_attempt(f"implement episode {job_id} finished '{status}' with no pull request: {reason}")
             continue
 
         try:
             _sideclaw.assert_result_schema(resp, _sideclaw.DISPATCH_SCHEMA_VERSION, "implement")
             _sideclaw.assert_outcome(resp, _sideclaw.DISPATCH_OUTCOMES, "implement")
         except RemoteError as e:
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=str(e))
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+            _strike_attempt(str(e))
             continue
 
         # sideclaw's job envelope nests the verdict inside `result` —
@@ -5088,52 +4845,49 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         outcome = result.get("outcome")
         artifact_url = result.get("artifactUrl")
         summary = result.get("summary") or "no further detail"
-        job_id = item["implement_job"]
 
         if result.get("nextAction") == "human":
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=f"implement {job_id}: {summary}")
+            _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=_decision_note(result))
         elif outcome == "pr_opened" and artifact_url:
             try:
                 val_job, val_err = _open_validation_dispatch(
-                    conn, repo=item["repo"], event_id=item["event_id"], implement_job=job_id,
+                    conn, repo=item["repo"], event_id=event_id, implement_job=job_id,
                     pr_url=artifact_url, context=_validation_context(conn, item))
             except SubmitRefused as e:
                 _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=artifact_url)
                 continue
             if val_job is None:
-                _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                           note=val_err or "could not open the step-7 validation episode", pr_url=artifact_url)
+                # The PR exists; only the review could not be submitted. The item
+                # moves on to `merging` and the review submission is what retries.
+                _set_state(conn, event_id, STATE_MERGING, now, pr_url=artifact_url, validation_job=None)
+                _strike(conn, event_id, now, val_err or "could not open the step-7 review",
+                        retry_state=STATE_MERGING, expect_state=STATE_MERGING)
             else:
-                _set_state(conn, item["event_id"], STATE_VALIDATING, now,
-                           validation_job=val_job, pr_url=artifact_url)
+                _set_state(conn, event_id, STATE_MERGING, now, validation_job=val_job, pr_url=artifact_url)
         elif outcome == "pr_opened":
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
-                       note=f"implement {job_id}: pr_opened outcome carried no artifactUrl")
+            conn.commit()
+            _strike_attempt(f"implement {job_id}: pr_opened outcome carried no artifactUrl")
+            continue
         elif outcome == "checks_failed":
             branch = result.get("branch") or "?"
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
-                       note=(f"implement {job_id}: the repo's checks failed before push "
-                             f"(branch {branch}): {summary[:300]}"))
-        elif outcome == "no_changes":
-            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                       note=f"implement {job_id}: the episode changed nothing — {summary}")
-        elif outcome in ("diff_refused", "branch_no_pr", "pr_failed", "withheld"):
-            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                       note=f"implement {job_id}: {outcome} — {summary}")
-        elif outcome == "salvaged":
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
-                       note=(f"implement {job_id}: sideclaw could not obtain a structured verdict "
-                             f"(salvaged) — {summary}"))
-        elif outcome in ("issue_declined", "issue_failed", "issue_filed", "verdict_only"):
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
-                       note=f"implement {job_id}: unexpected outcome for an implement job ('{outcome}')")
+            note = (f"implement {job_id}: the repo's checks failed before push "
+                    f"(branch {branch}): {summary[:300]}")
+            # Marked on the dispatch row so this job is judged once; the revision
+            # attempt (maybe_revise_blocked()) is what follows while any are left.
+            conn.execute("UPDATE dispatches SET validation_status='checks_failed' WHERE job_id=?", (job_id,))
+            if _revisions_left(item, policy):
+                _set_state(conn, event_id, STATE_WORKING, now, note=f"{note} — revision pending")
+            else:
+                _set_state(conn, event_id, STATE_FAILED, now, note=note)
         else:
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
-                       note=f"implement {job_id}: unknown implement outcome '{outcome or 'missing'}'")
+            # no_changes, diff_refused, branch_no_pr, pr_failed, withheld, salvaged,
+            # a wrong tier's outcome, or one this switch does not know: the episode
+            # ended without a pull request.
+            conn.commit()
+            _strike_attempt(f"implement {job_id}: {outcome or 'missing outcome'} — {summary}")
+            continue
         conn.commit()
-        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-        if fresh_item is not None and fresh_event is not None:
-            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+        _sync_item_card(conn, policy, event_id)
 
 
 def _already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
@@ -5143,10 +4897,10 @@ def _already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
 
 def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                               now: dt.datetime) -> None:
-    """A `validating` item whose implement dispatch already carries
+    """A `merging` item whose implement dispatch already carries
     `merged_at`: the loop died after `plan_or_land()` merged and stamped the
     row but before the item's own state write. Calling merge again would refuse with "already
-    merged" and land the item `merge_blocked` for a pull request that is
+    merged" and land the item `failed` for a pull request that is
     merged and deploying — the exact misreport docs/history/state-log.md §46 measured. So the
     post-merge state is derived from the merge operation's receipt instead,
     the same way the confirmed-merge branch derives it from a fresh result."""
@@ -5159,11 +4913,11 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
     repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
     if repo_entry.get("deployOnMerge") and isinstance(sha, str) and _FULL_SHA_RE.match(sha):
         deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-        _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now, liveness_deadline=deadline,
+        _set_state(conn, item["event_id"], STATE_VERIFYING, now, liveness_deadline=deadline,
                    deploy_expect_json=json.dumps([{"commit": sha}]),
                    note="merged before the loop stopped; state derived from the merge receipt")
     else:
-        _set_state(conn, item["event_id"], STATE_MERGED, now,
+        _set_state(conn, item["event_id"], STATE_VERIFYING, now,
                    note="merged before the loop stopped; state derived from the merge receipt")
     conn.commit()
     print(f"triage: {item['signature']} was already merged (event {item['event_id']}) — state derived "
@@ -5235,119 +4989,88 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
     )
 
 
-# Step 8 of the target spec: an infrastructure failure of the review job
-# (failed/interrupted, or a `done` job whose result is empty/unparseable) is
-# retried, never routed to a human on the first strike.
-REVIEW_INFRA_MAX_STRIKES = 3
-
-
-def _review_row_lacks_verdict(row: sqlite3.Row) -> bool:
-    """True for a `review` dispatches row that ended with no verdict — the
-    infra-failure shape poll_validation_jobs() retries. A real verdict (any
-    non-empty result), a cancel, or anything still running is not a strike."""
-    if row["status"] not in ("failed", "interrupted", "done"):
-        return False
-    return not _safe_json(row["verdict_json"])
-
-
-def _consecutive_review_failures(conn: sqlite3.Connection, *, event_id: int,
-                                  current_job: str) -> int:
-    """Strikes against this item's review, current job included. Counted from
-    the ledger — the item's `review` dispatches rows, newest first, excluding
-    the job being polled (its row may be absent) — and stopped by the first
-    row that is not a no-verdict failure, so a blocked/confirmed round resets
-    the count. No column of its own: the dispatches table already is the
-    attempt history."""
-    rows = conn.execute(
-        "SELECT status, verdict_json FROM dispatches WHERE tier='review' AND origin_event_id=? "
-        "AND job_id != ? ORDER BY id DESC", (event_id, current_job),
-    ).fetchall()
-    prior = 0
-    for row in rows:
-        if not _review_row_lacks_verdict(row):
-            break
-        prior += 1
-    return prior + 1
-
-
-def _retry_review_or_escalate(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
-                               now: dt.datetime, *, reason: str) -> None:
-    """A review job ended with no verdict. Below REVIEW_INFRA_MAX_STRIKES
-    consecutive failures, open a fresh review on the same PR and keep the item
-    in `validating` pointing at it. At the cap, land `needs_human` carrying the
-    last error. A sideclaw refusal on the re-submit is final (`_end_on_refusal`).
-    A re-submit that fails without a job (5xx, unreachable) leaves the item
-    untouched: the next poll sees the same failed job and tries again, bounded
-    by `validating`'s own 1h deadline."""
-    strikes = _consecutive_review_failures(conn, event_id=item["event_id"], current_job=item["validation_job"])
-    if strikes >= REVIEW_INFRA_MAX_STRIKES:
-        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
-                     ("error", item["implement_job"]))
-        _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now,
-                   note=f"step-7 validation (error): the review failed {strikes} times in a row "
-                        f"with no verdict — last error: {reason}")
+def _submit_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                   now: dt.datetime) -> None:
+    """Open the step-7 review for a `merging` item that has a pull request and no
+    review on it — the retry half of a review that failed, or one that could not
+    be submitted. A submit that fails for infrastructure reasons strikes (see
+    _strike()); a sideclaw refusal (4xx) is final."""
+    try:
+        val_job, val_err = _open_validation_dispatch(
+            conn, repo=item["repo"], event_id=item["event_id"], implement_job=item["implement_job"],
+            pr_url=item["pr_url"] or "", context=_validation_context(conn, item))
+    except SubmitRefused as e:
+        _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=item["pr_url"])
+        return
+    if val_job is None:
+        _strike(conn, item["event_id"], now, val_err or "could not open the step-7 review",
+                retry_state=STATE_MERGING, expect_state=STATE_MERGING)
     else:
-        try:
-            val_job, val_err = _open_validation_dispatch(
-                conn, repo=item["repo"], event_id=item["event_id"], implement_job=item["implement_job"],
-                pr_url=item["pr_url"] or "", context=_validation_context(conn, item))
-        except SubmitRefused as e:
-            _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=item["pr_url"])
-            return
-        if val_job is None:
-            print(f"triage: review retry for {item['signature']} could not be submitted: {val_err}",
-                  file=sys.stderr)
-            return
-        _set_state(conn, item["event_id"], STATE_VALIDATING, now, expect_state=STATE_VALIDATING,
-                   validation_job=val_job,
-                   note=f"step-7 review retry {strikes}/{REVIEW_INFRA_MAX_STRIKES - 1} after: {reason}")
+        _set_state(conn, item["event_id"], STATE_MERGING, now, expect_state=STATE_MERGING,
+                   validation_job=val_job, note=None)
     conn.commit()
-    fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-    if fresh_item is not None and fresh_event is not None:
-        sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+    _sync_item_card(conn, policy, item["event_id"])
 
 
 def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
-    """Step 7 -> 8. Polls every STATE_VALIDATING item once against sideclaw's
-    own `review` job (server/jobs/handlers/review.ts) run on the pull
-    request's OWN branch — a TYPED verdict (`outcome`/`blocking`/...), not a
-    marker phrase substring-matched out of prose. `outcome == "clean"`, or
-    `"actionable"` with an EMPTY `blocking` list, confirms and calls `merge`
-    (via lifecycle/merge.py's `plan_or_land()`, which owns its own
-    `merge`/`deploy` operations and receipts end to end); its own outcome
-    (landed, or refused by the merge gate or by GitHub) decides the next
-    state. A non-empty `blocking` list refuses the merge outright —
-    never read as a pass, the brief's own words — with ONE precedence above
-    it (§115): `"needs-human"` routes to a human even when it carries
-    findings, because that outcome says the REVIEW is incomplete and a
-    revision would be spent on findings its own reviewer would not stand
-    behind. A finding about the PR's own *wrapper* (§114) never
-    blocks-and-revises either — no episode can satisfy it — so it routes to
-    a human with the finding on the card. A review job that ends with NO
-    verdict (failed/interrupted, or `done` with an empty result) is an
-    infrastructure failure and is re-submitted
-    (`_retry_review_or_escalate()`); the third consecutive one lands
-    `needs_human` carrying the last error. A CANCELLED review, or a
-    non-`done` one that still carries a result, blocks the merge.
-    `dispatches.validation_status` lands one of
-    `confirmed | blocked | needs_human | error`.
+    """Step 7 -> 8. Polls every `merging` item once against sideclaw's own
+    `review` job (server/jobs/handlers/review.ts) run on the pull request's OWN
+    branch — a TYPED verdict (`outcome`/`blocking`/...), not a marker phrase
+    substring-matched out of prose. `outcome == "clean"`, or `"actionable"` with an
+    EMPTY `blocking` list, confirms and calls `merge` (via lifecycle/merge.py's
+    `plan_or_land()`, which owns its own `merge`/`deploy` operations and receipts
+    end to end); its own outcome decides the next state: landed -> `verifying`,
+    checks still pending -> stays `merging` and is polled again, transient GitHub
+    failure -> a strike, a refusal that will not clear (the merge gate, GitHub's
+    own rules, a conflict) -> `failed` with the reason.
 
-    Fail-closed, the same shape `poll_implement_jobs()` uses for its own
-    outcome switch: `"clean"` confirms; `"actionable"` with nothing in
-    `blocking` confirms; `"needs-human"` routes to a human whatever it
-    carries; any other non-empty `blocking` blocks, regardless of `outcome`;
-    anything else — missing, or an outcome value this switch does not
-    otherwise recognise — is ALSO a human, never a silent confirm.
-    `assert_outcome()` above is the first line of defence (a value outside
-    `REVIEW_OUTCOMES` entirely is a loud `RemoteError` before this switch
+    A non-empty `blocking` list refuses the merge outright — never read as a pass —
+    with ONE precedence above it (§115): `"needs-human"` goes to the owner
+    (`needs_decision`) even when it carries findings, because that outcome says the
+    REVIEW is incomplete and a revision would be spent on findings its own reviewer
+    would not stand behind. A finding about the PR's own *wrapper* (§114) never
+    blocks-and-revises either — no episode can satisfy it — so it also goes to the
+    owner with the finding on the card. A `blocked` review goes back to `working`
+    for a revision attempt (maybe_revise_blocked()) while any are left, else
+    `failed` carrying the blocking findings.
+
+    A review job that ends with NO verdict (failed/interrupted/cancelled, or `done`
+    with an empty result, a schemaVersion mismatch, a job sideclaw no longer knows)
+    is an infrastructure failure and strikes: the review is re-submitted after the
+    backoff (`_submit_review()`), the third strike lands `failed`.
+    `dispatches.validation_status` lands one of `confirmed | blocked | needs_decision |
+    error`.
+
+    Fail-closed, the same shape `poll_implement_jobs()` uses for its own outcome
+    switch: `"clean"` confirms; `"actionable"` with nothing in `blocking` confirms;
+    `"needs-human"` goes to the owner whatever it carries; any other non-empty
+    `blocking` blocks, regardless of `outcome`; anything else — missing, or an
+    outcome value this switch does not otherwise recognise — is `failed`, never a
+    silent confirm. `assert_outcome()` above is the first line of defence (a value
+    outside `REVIEW_OUTCOMES` entirely is a loud `RemoteError` before this switch
     ever runs); this switch's own `else` is the second."""
     if dry_run:
         return
+    ready_sql, ready_params = _retry_ready_sql(now)
     items = conn.execute(
-        "SELECT * FROM triage_items WHERE state=? AND validation_job IS NOT NULL", (STATE_VALIDATING,)
+        f"SELECT * FROM triage_items WHERE state=? AND pr_url IS NOT NULL AND implement_job IS NOT NULL "
+        f"AND {ready_sql}", (STATE_MERGING, *ready_params)
     ).fetchall()
     for item in items:
+        event_id = item["event_id"]
+        if not item["validation_job"]:
+            _submit_review(conn, policy, item, now)
+            continue
+
+        def _review_failed(reason: str) -> None:
+            conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
+                         ("error", item["implement_job"]))
+            _strike(conn, event_id, now, f"step-7 review ended with no verdict: {reason}",
+                    retry_state=STATE_MERGING, expect_state=STATE_MERGING, validation_job=None)
+            conn.commit()
+            _sync_item_card(conn, policy, event_id)
+
         try:
             resp = _sideclaw.get(item["validation_job"])
         except RemoteError as e:
@@ -5355,10 +5078,9 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                   f"{item['signature']}: {e}", file=sys.stderr)
             continue
         if resp is None:
-            # Same pruned-job case as poll_implement_jobs() above, same answer:
-            # `validating` carries a 1h deadline in STATE_DEADLINES, so an item
-            # whose validation job sideclaw has forgotten exits to
-            # `merge_blocked` on the clock instead of being polled forever.
+            # Same pruned-job case as poll_implement_jobs() above, same answer: the
+            # review's result is lost, so the review is run again.
+            _review_failed(f"sideclaw has no record of review job {item['validation_job']}")
             continue
         status = resp.get("status")
         if status not in ("done", "failed", "interrupted", "cancelled"):
@@ -5372,33 +5094,22 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         _dispatch.sync_record(conn, resp, reported=False, now=now)
         conn.commit()
 
-        if status != "cancelled" and not resp.get("result"):
-            reason = resp.get("error") or f"review job {status} with no verdict"
-            _retry_review_or_escalate(conn, policy, item, now, reason=reason)
-            continue
-
-        if status != "done":
-            reason = resp.get("error") or ("cancelled" if status == "cancelled" else "no further detail")
-            conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
-                         ("error", item["implement_job"]))
-            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                       note=f"step-7 validation (error): {reason}")
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+        if status != "done" or not resp.get("result"):
+            reason = resp.get("error") or (
+                "cancelled" if status == "cancelled" else f"review job {status} with no verdict")
+            _review_failed(reason)
             continue
 
         try:
             _sideclaw.assert_result_schema(resp, _sideclaw.REVIEW_SCHEMA_VERSION, "review")
             _sideclaw.assert_outcome(resp, _sideclaw.REVIEW_OUTCOMES, "review")
         except RemoteError as e:
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=str(e))
-            conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+            _review_failed(str(e))
             continue
+
+        # A real verdict ends the review's strike streak: whatever happens to the
+        # merge below is a different step.
+        _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_MERGING, strikes=0, retry_at=None)
 
         # Same nested envelope as poll_implement_jobs() above — the verdict
         # lives in `result`, never at the top level.
@@ -5407,8 +5118,8 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         blocking = verdict.get("blocking") or []
         # §114: the wrapper class is not the implementer's — see
         # _is_process_only_finding(). It must not read as `blocked` (that is what
-        # spends a revision) but it must not be dropped either, so it routes to a
-        # human with the finding on the card.
+        # spends a revision) but it must not be dropped either, so it goes to the
+        # owner with the finding on the card.
         code_blocking = [f for f in blocking if not _is_process_only_finding(f)]
         process_blocking = [f for f in blocking if _is_process_only_finding(f)]
         summary = verdict.get("summary") or "no further detail"
@@ -5428,46 +5139,54 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # implementer — 1289 spent both its attempts that way, on rounds
             # whose own reviews said a human had to look. The findings still
             # reach the card: a human is the reader now.
-            validation_status = "needs_human"
+            validation_status = "needs_decision"
             if code_blocking:
                 human_question_note = _format_blocking_findings(code_blocking)
         elif code_blocking:
             validation_status = "blocked"
         elif process_blocking:
-            validation_status = "needs_human"
+            validation_status = "needs_decision"
             process_only_note = ("process-only finding(s), no code defect — a revision cannot "
                                  "satisfy these: "
                                  + _format_blocking_findings(process_blocking))
         else:
             # Missing, or an outcome value REVIEW_OUTCOMES carries but this
             # switch does not otherwise handle (there is none today — this
-            # branch exists for the day there is). Fail closed: a human,
-            # never a silent confirm. See this function's own docstring.
-            validation_status = "needs_human"
+            # branch exists for the day there is). Fail closed.
+            validation_status = "unknown"
             unknown_outcome_note = f"unknown review outcome '{outcome or 'missing'}'"
         conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
                      (validation_status, item["implement_job"]))
         conn.commit()
 
-        if validation_status == "needs_human":
-            detail = unknown_outcome_note or process_only_note or summary
+        if validation_status == "unknown":
+            _set_state(conn, event_id, STATE_FAILED, now, note=f"step-7 validation: {unknown_outcome_note}")
+            conn.commit()
+        elif validation_status == "needs_decision":
+            detail = process_only_note or summary
             if human_question_note:
                 detail = (f"{detail} — findings the review leaves with you, reasons a human must "
                           f"look rather than a work order: {human_question_note}")
-            note = f"step-7 validation (needs-human): {detail}"
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
+            _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=f"step-7 validation (needs-human): {detail}")
             conn.commit()
         elif validation_status == "blocked":
-            _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now,
-                       note=f"step-7 validation (blocked): {_format_blocking_findings(blocking)}")
+            note = f"step-7 validation (blocked): {_format_blocking_findings(blocking)}"
+            if _revisions_left(item, policy):
+                # The findings go back to a fresh implement episode — see
+                # maybe_revise_blocked(), which picks this row up.
+                _set_state(conn, event_id, STATE_WORKING, now, note=note)
+            else:
+                _set_state(conn, event_id, STATE_FAILED, now, note=note)
             conn.commit()
         elif _already_merged(conn, item["implement_job"]):
             _land_already_merged_item(conn, policy, item, now)
         else:
             _merge_and_rollout(conn, policy, item, now)
-        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-        if fresh_item is not None and fresh_event is not None:
-            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+        _sync_item_card(conn, policy, event_id)
+
+
+MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
+MERGE_PENDING_NOTE_PREFIX = "waiting for checks: "
 
 
 def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
@@ -5476,11 +5195,16 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     """Land a validation-confirmed PR and route the item on the merge/deploy
     outcome — the tail of poll_validation_jobs(), and the owner's Argo merge.
 
-    Returns "merged", "refused" or "ambiguous" — callers starting from a
-    parked state cannot read the outcome off the item's state (§96).
-    Every refusal writes its note only if the item is still in the state the
-    caller found it in: a concurrent pass that already landed this PR must
-    never be clobbered back to `merge_blocked` by the loser's refusal."""
+    Returns "merged", "pending", "refused" or "ambiguous" — callers starting from
+    a parked state cannot read the outcome off the item's state (§96).
+
+    Outcomes: landed -> `verifying`; checks still running -> unchanged (a note says
+    so, the item is polled again); a refusal that will not clear by waiting (the
+    merge gate, GitHub's rules, a conflict, a closed PR) -> `failed` with the
+    reason; a transient GitHub failure -> a strike on `merging`. Every refusal
+    writes its note only if the item is still in the state the caller found it in:
+    a concurrent pass that already landed this PR must never be clobbered by the
+    loser's refusal."""
     # Belt-and-suspenders on top of the sync above (which folds only
     # THIS poll's own review job): `plan_or_land()` is about to read
     # the IMPLEMENT job's dispatches row and refuse if `status` isn't
@@ -5489,8 +5213,8 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     # the implement job itself finished 'done' (that is what opened
     # this validation in the first place), so re-reading it here is
     # cheap insurance against exactly the staleness this whole fix is
-    # about, for any row that reached `validating` before this file
-    # carried the fix above. Never blocks the merge attempt on a
+    # about, for any row that reached `merging` before this file carried
+    # the fix above. Never blocks the merge attempt on a
     # failed re-read — plan_or_land()'s own precheck still fails
     # closed against whatever the row already says.
     try:
@@ -5507,8 +5231,17 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
             conn, job_id=item["implement_job"], why=why,
             confirm=True, dry_run=False, authorized_by=authorized_by, now=now,
         )
+    except _merge.MergeInFlight:
+        # Another process is landing this very PR (the loop and the sweep both
+        # run this chain): its outcome is what moves the item, not this one's.
+        return "ambiguous"
+    except _merge.ChecksPending as e:
+        _set_state(conn, item["event_id"], item["state"], now, note=f"{MERGE_PENDING_NOTE_PREFIX}{e}",
+                   expect_state=item["state"])
+        conn.commit()
+        return "pending"
     except (PolicyError, PreconditionError) as e:
-        _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}",
+        _set_state(conn, item["event_id"], STATE_FAILED, now, note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}",
                    expect_state=item["state"])
         conn.commit()
         return "refused"
@@ -5518,14 +5251,13 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
             # happened. Leave the state as the caller found it:
             # reconcile_operations() asks GitHub directly on the very
             # next pass, BEFORE this function gets another chance to
-            # re-attempt the merge. Setting STATE_MERGE_BLOCKED here
-            # would be exactly DESIGN.md § Crash recovery's "silently
-            # read as failure".
+            # re-attempt the merge. Striking here would be exactly DESIGN.md
+            # § Crash recovery's "silently read as failure".
             print(f"triage: merge for {item['signature']} may have reached GitHub "
                   f"({e}) — left unresolved for reconcile_operations()", file=sys.stderr)
             return "ambiguous"
-        _set_state(conn, item["event_id"], STATE_MERGE_BLOCKED, now, note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}",
-                   expect_state=item["state"])
+        _strike(conn, item["event_id"], now, f"{MERGE_REFUSED_NOTE_PREFIX}{e}",
+                retry_state=STATE_MERGING, expect_state=item["state"])
         conn.commit()
         return "refused"
     else:
@@ -5537,18 +5269,20 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
         repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
         kuma_title = (_kuma_monitor_title(_get_event(conn, item["event_id"]))
                       if repo_entry.get("liveness") == "kuma-push-fresh" else None)
+        # `verifying` with no liveness window and no expectations is "nothing to
+        # verify": maybe_check_liveness() takes it to `fixed` on its next pass.
+        nothing = {"liveness_deadline": None, "deploy_expect_json": None}
         if deploy.get("attempted") and deploy.get("ok") and repo_entry.get("liveness") == "kuma-push-fresh" \
                 and kuma_title is None:
             # Deployed, but this item did not come from a Kuma monitor, so there
-            # is no monitor of its own to confirm against — `merged`, not a
-            # liveness window that can only time out and reopen.
-            _set_state(conn, item["event_id"], STATE_MERGED, now,
+            # is no monitor of its own to confirm against.
+            _set_state(conn, item["event_id"], STATE_VERIFYING, now, **nothing,
                        note=f"merged and deployed ({deploy.get('key')}); no Kuma monitor of its own to verify")
         elif deploy.get("attempted") and deploy.get("ok"):
             deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
             expected = (deploy.get("expectedAlerts") or []) if kuma_title is None else [
                 {"monitorTitle": kuma_title, "since": _now_iso(now), "trip": {"status": TRIP_PENDING}}]
-            _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+            _set_state(conn, item["event_id"], STATE_VERIFYING, now,
                        liveness_deadline=deadline,
                        deploy_expect_json=json.dumps(expected), note=None)
         elif (repo_entry.get("deployByPoller") and isinstance(result.merge_commit, str)
@@ -5556,7 +5290,7 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
             # Merge IS deploy through a mini-side poller (research-gateway):
             # nothing to run, the liveness probe reads the poller's checkout.
             deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-            _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+            _set_state(conn, item["event_id"], STATE_VERIFYING, now,
                        liveness_deadline=deadline,
                        deploy_expect_json=json.dumps([{"commit": result.merge_commit, "repo": item["repo"]}]),
                        note=None)
@@ -5566,24 +5300,21 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
             # operation lifecycle/merge.py just recorded — no second
             # `_run_gh_run_list()` read needed here.
             deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-            _set_state(conn, item["event_id"], STATE_LIVENESS_PENDING, now,
+            _set_state(conn, item["event_id"], STATE_VERIFYING, now,
                        liveness_deadline=deadline,
                        deploy_expect_json=json.dumps([{"commit": result.merge_commit}]), note=None)
         elif deploy.get("attempted") and not deploy.get("ok"):
             # autoDeploy ran and failed — this must never read as a
-            # clean merge. A merged PR with a failed rollout is a
-            # human-needed state, not `merged`.
+            # clean merge. A merged PR with a failed rollout is `failed`.
             output_tail = (deploy.get("output") or "")[-300:]
             note = (f"merged {result.repo_slug}#{result.pull_request} but the deploy failed "
                     f"(exit {deploy.get('exitCode')}): {output_tail}")
-            _set_state(conn, item["event_id"], STATE_NEEDS_HUMAN, now, note=note)
+            _set_state(conn, item["event_id"], STATE_FAILED, now, note=note)
         else:
             reason = deploy.get("reason") or "merged; no deploy configured for this repo"
-            _set_state(conn, item["event_id"], STATE_MERGED, now, note=reason)
+            _set_state(conn, item["event_id"], STATE_VERIFYING, now, **nothing, note=reason)
         conn.commit()
     return "merged"
-
-MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
 
 
 def _safe_json_list(raw: str | None) -> list[dict[str, Any]]:
@@ -5598,13 +5329,13 @@ REVISION_NOTE_PREFIX = "revision "
 
 
 def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | None:
-    """What the next implement episode must fix, or None when this parked
-    item is not a revisable one. Two shapes qualify, both a concrete defect in
+    """What the next implement episode must fix, or None when this item is not
+    a revisable one. Two shapes qualify, both a concrete defect in
     code the loop wrote itself: the independent review blocked the PR
     (`validation_status='blocked'`, findings from the review job's own
     verdict), or the repo's own checks failed before push (`checks_failed`).
-    Everything else parked — a needs-human review, a merge-gate refusal, a
-    failed deploy — is a question, not a finding, and stays with a human."""
+    Everything else — a needs-human review, a merge-gate refusal, a failed
+    deploy — is a question, not a finding, and is not revised."""
     impl = conn.execute("SELECT verdict_json, validation_status FROM dispatches WHERE job_id=?",
                         (item["implement_job"],)).fetchone()
     if impl is None:
@@ -5637,24 +5368,28 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
 def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                          *, dry_run: bool) -> None:
     """A blocked implementation goes back to a fresh implement episode with
-    the reviewer's findings, instead of parking in `merge_blocked` until a
-    human happens to look (2026-09-28, state-log §92 — dotfiles#7 sat five
+    the reviewer's findings (2026-09-28, state-log §92 — dotfiles#7 sat five
     days on one concrete, fixable finding while its alert paged 16 times).
 
-    Eligible: `merge_blocked`/`needs_human`, an implement job on record,
-    `max_tier='implement'`, a revisable reason (_revision_findings()), and
-    `revision_count < revisionMaxAttempts`. The claim is a compare-and-set
-    into `implementing` with `revision_count+1`, before the dispatch — the
-    same claim-before-dispatch shape maybe_auto_implement() uses. The new
-    episode is told to start from the previous branch and fix every finding;
-    its PR goes through the same step-7 review as the first one. The superseded
-    PR is closed with a pointer, so dead drafts do not accumulate. Past the cap
-    the item stays parked, visibly, with the attempt count on its note."""
+    Eligible: `working` with a real implement job on record, `max_tier='implement'`,
+    a revisable reason (_revision_findings() — only a review that BLOCKED, or an
+    implement whose own checks failed, ever leaves that mark on the dispatch row),
+    and `revision_count < revisionMaxAttempts`. poll_validation_jobs()/
+    poll_implement_jobs() leave such an item in `working` while attempts remain
+    and land it `failed` carrying the findings once they are spent. The claim is a
+    compare-and-set that swaps the old job for IMPLEMENT_CLAIM with
+    `revision_count+1`, before the dispatch — the same claim-before-dispatch shape
+    maybe_auto_implement() uses. The new episode is told to start from the
+    previous branch and fix every finding; its PR goes through the same step-7
+    review as the first one. The superseded PR is closed with a pointer, so dead
+    drafts do not accumulate."""
     max_attempts = int(policy.get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
+    ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
-        "SELECT * FROM triage_items WHERE state IN (?, ?) AND implement_job IS NOT NULL "
-        "AND max_tier='implement' AND revision_count < ? ORDER BY event_id",
-        (STATE_MERGE_BLOCKED, STATE_NEEDS_HUMAN, max_attempts),
+        f"SELECT * FROM triage_items WHERE state=? AND implement_job IS NOT NULL AND implement_job != ? "
+        f"AND implement_job NOT LIKE ? AND max_tier='implement' AND revision_count < ? AND {ready_sql} "
+        f"ORDER BY event_id",
+        (STATE_WORKING, IMPLEMENT_CLAIM, f"{HOST_VERB_CLAIM_PREFIX}%", max_attempts, *ready_params),
     ).fetchall()
     for item in candidates:
         if item["repo"] is None:
@@ -5697,14 +5432,15 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         context = (_verdict_as_context(item["dispatch_job"], _safe_json(inv["verdict_json"]))
                    if inv is not None else None)
 
-        claimed = _set_state(conn, item["event_id"], STATE_IMPLEMENTING, now, expect_state=item["state"],
+        claimed = _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
+                             expect_eq={"implement_job": item["implement_job"],
+                                        "revision_count": item["revision_count"]},
                              note=f"{REVISION_NOTE_PREFIX}{attempt}/{max_attempts}: {findings[:300]}",
-                             implement_job=None, validation_job=None, pr_url=None)
-        if not claimed:
-            conn.commit()
-            continue
-        conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?", (attempt, item["event_id"]))
+                             implement_job=IMPLEMENT_CLAIM, validation_job=None, pr_url=None,
+                             revision_count=attempt)
         conn.commit()
+        if not claimed:
+            continue
 
         try:
             opened = _dispatch.open_episode(
@@ -5714,36 +5450,26 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 authorized_by="auto-from-item",
             )
         except SubmitRefused as exc:
-            # Refused for good: end the item, and spend the remaining revision
-            # budget so the next tick cannot pick it up and submit it again.
-            conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?",
-                         (max_attempts, item["event_id"]))
+            # Refused for good: end the item.
             _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy,
                             implement_job=item["implement_job"], validation_job=item["validation_job"],
                             pr_url=item["pr_url"])
             continue
         except RemoteError as exc:
-            if exc.maybe_mutated:
-                # Same as maybe_auto_implement(): the job may exist; the
-                # `implementing` deadline moves the item on if none appears.
-                print(f"triage: revision for {item['signature']} may have reached sideclaw ({exc})",
-                      file=sys.stderr)
-                continue
-            _set_state(conn, item["event_id"], item["state"], now, expect_state=STATE_IMPLEMENTING,
-                       note=f"revision {attempt} could not start: {exc}",
+            # An infrastructure failure: hand the attempt back (the prior job is
+            # restored, so the findings are still on the row) and strike.
+            _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
                        implement_job=item["implement_job"], validation_job=item["validation_job"],
-                       pr_url=item["pr_url"])
-            conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?",
-                         (item["revision_count"], item["event_id"]))
+                       pr_url=item["pr_url"], revision_count=item["revision_count"])
+            _strike(conn, item["event_id"], now, f"revision {attempt} could not start: {exc}",
+                    retry_state=STATE_WORKING, expect_state=STATE_WORKING)
             conn.commit()
             continue
         except (PolicyError, PreconditionError, UsageError) as e:
-            _set_state(conn, item["event_id"], item["state"], now, expect_state=STATE_IMPLEMENTING,
+            _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
                        note=f"revision {attempt} could not start: {e}",
                        implement_job=item["implement_job"], validation_job=item["validation_job"],
-                       pr_url=item["pr_url"])
-            conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?",
-                         (item["revision_count"], item["event_id"]))
+                       pr_url=item["pr_url"], revision_count=item["revision_count"])
             conn.commit()
             continue
 
@@ -5761,14 +5487,12 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             except RemoteError as e:
                 print(f"triage: could not close superseded {prior_pr}: {e}", file=sys.stderr)
 
-        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-        if fresh_item is not None and fresh_event is not None:
-            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+        _sync_item_card(conn, policy, item["event_id"])
 
 
 def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                              *, dry_run: bool) -> None:
-    """Steps 6-8 — verdict -> implementing -> validating -> merge/merge_blocked
+    """Steps 6-8 — verdict -> implement -> review -> merge
     — as one callable unit, so `run()`'s own 600s tick and
     dispatch-sweep.py's 300s pass advance an item through EXACTLY the same
     code, not two copies that can drift.
@@ -5777,7 +5501,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     same ledger, with no new lock: every step here already re-derives its
     own eligibility from the DB on each call and is CAS-guarded end to end —
     `maybe_auto_implement()`'s claim-before-dispatch UPDATE only ever wins
-    once (`AND state='verdict' AND implement_job IS NULL`), and
+    once (`AND state='working' AND implement_job IS NULL`), and
     `poll_implement_jobs()`/`poll_validation_jobs()` each do their own fresh
     sideclaw poll per row before touching a state. A second call landing on
     a row the other process already advanced changes zero rows and moves on
@@ -5938,7 +5662,7 @@ def sweep_trip_residue(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: b
     if dry_run or (last is not None and (now - last).total_seconds() < TRIP_SWEEP_INTERVAL_S):
         return
     keep = []
-    for r in conn.execute("SELECT deploy_expect_json FROM triage_items WHERE state=?", (STATE_LIVENESS_PENDING,)):
+    for r in conn.execute("SELECT deploy_expect_json FROM triage_items WHERE state=?", (STATE_VERIFYING,)):
         for rec in _safe_json_list(r["deploy_expect_json"]):
             trip = rec.get("trip") or {}
             if trip.get("status") == TRIP_ARMED and isinstance(trip.get("shadowId"), int):
@@ -5959,8 +5683,11 @@ def sweep_trip_residue(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: b
 
 def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
-    """Step 10. The item must not close because the alert went quiet — a
-    fully-down service is also quiet, same principle as
+    """Step 10. Walks every `verifying` item. One with nothing to verify (a merge
+    with no deploy configured: no liveness window, no expectations) goes to
+    `fixed` on this pass — W4 adds real signal-only verification; there is no
+    timer here. Otherwise the item must not close because the alert went quiet —
+    a fully-down service is also quiet, same principle as
     resolve_quiet_grouped()/resolve_recovery_paired() above. Runs the
     repo's declared `liveness` probe (config/triage-policy.json's
     `repos.<repo>.liveness`, same closed-allowlist shape as `verb`/
@@ -5970,8 +5697,16 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     carrying the full history (the pull request, the last liveness check) —
     the exact context that was missing when the same alert was
     re-diagnosed 61 times before this file existed."""
-    items = conn.execute("SELECT * FROM triage_items WHERE state=?", (STATE_LIVENESS_PENDING,)).fetchall()
+    items = conn.execute("SELECT * FROM triage_items WHERE state=?", (STATE_VERIFYING,)).fetchall()
     for item in items:
+        if item["liveness_deadline"] is None and not item["deploy_expect_json"]:
+            if dry_run:
+                print(f"[dry-run] would mark {item['signature']} fixed: merged, nothing to verify")
+                continue
+            _set_state(conn, item["event_id"], STATE_FIXED, now)
+            conn.commit()
+            _sync_item_card(conn, policy, item["event_id"])
+            continue
         repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
         key = repo_entry.get("liveness")
         gatherer = LIVENESS_ALLOWLIST.get(key) if key else None
@@ -6044,179 +5779,14 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         conn.commit()
 
 
-# --- the clock ----------------------------------------------------------------
-
-def sweep_deadlines(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
-    """The only thing that acts on `state_deadline`. Every non-terminal state
-    names a poller and a deadline (STATE_DEADLINES); this is what happens when
-    the poller did not deliver in time.
-
-    Runs LAST of the pollers and BEFORE the card sync, and both halves of that
-    matter. A poller that can still advance an item this pass must get its
-    chance before the clock takes it away — an item that reached its 2h mark
-    thirty seconds before its episode finished should finish, not expire. And
-    an expiry the human never sees is the same as no expiry at all, so the
-    state change has to land before sync_card() renders this pass's cards.
-
-    UNDER --dry-run THIS REPORTS AND DOES NOT WRITE, which is a departure from
-    apply_resolutions()/classify()/resolve_quiet_grouped() and is deliberate.
-    Those three move an item between working states; this one can move it
-    TERMINALLY, to `dismissed`, and `--dry-run` defaults to the live ledger.
-    "Never touches Slack, never shells out, everything else real" was written
-    around writes that the next real pass would re-derive anyway. A terminal
-    dismissal is not re-derivable — `reopen_if_needed()` is the only way back
-    and it needs a fresh occurrence. A preview must not be able to end an item.
-    It prints every expiry it WOULD apply, because a deadline that fires
-    silently is indistinguishable from a loop that is not firing them at all.
-
-    A NON-TERMINAL row with a NULL `state_deadline` is stamped `now + hours`
-    and reported. Two anchors were possible and only one is safe: `updated_at`
-    is rewritten by ingest() on every recurrence, so a deadline derived from it
-    would move further away every pass and never fire while looking
-    authoritative. `now` cannot drift that way, and it is deliberately
-    conservative — a row already six days into `needs_human` gets a fresh 168h
-    rather than expiring at once.
-
-    Reporting WITHOUT stamping was the first version and it was wrong in the
-    only case that occurs: every NULL-deadline row on the live ledger is
-    `needs_human`, and only a human transitions one, so "it gets a deadline
-    when it next transitions" meant never. It stays a FINDING because a NULL
-    deadline is either a pre-column legacy row or a bug in a transition site,
-    and silently fixing the second is how it stays a bug.
-
-    NARROW exception to "write a fresh generic note": a `split` row's `note`
-    carries the dissolve verdict under SPLIT_VERDICT_NOTE_PREFIX (see
-    _dissolve_cluster()) — the one unactioned obligation this sweeper can
-    expire. Overwriting it at the exact moment the row finally becomes
-    visible again (split -> needs_human, which IS carded) would lose the
-    verdict a second time, on top of the loss docs/history/state-log.md §43 already recorded
-    once. So THIS ONE CASE appends the expiry note to the existing one
-    instead of replacing it. Deliberately NOT generalised to every state's
-    prior note — the other five expiry paths' prior notes are HISTORICAL
-    (an old written fix, a stale receipt), not a pending
-    obligation being handed to the deadline for the first time, and
-    preserving them too is a different, unasked-for change."""
-    now_iso = _now_iso(now)
-    # The string comparison is a prefilter over the state_deadline index (the
-    # same shape unsnooze_if_expired() uses on snoozed_until); _parse_ts()
-    # below makes the actual decision, so a differently-formatted timestamp
-    # can never expire an item on a lexical accident.
-    rows = conn.execute(
-        "SELECT event_id, signature, state, state_deadline, note FROM triage_items "
-        "WHERE state_deadline IS NOT NULL AND state_deadline<=? ORDER BY event_id",
-        (now_iso,),
-    ).fetchall()
-    for row in rows:
-        rule = STATE_DEADLINES.get(row["state"])
-        if rule is None or rule.on_expiry is None:
-            continue
-        if rule.deadline_column != _STATE_DEADLINE_COLUMN:
-            # `liveness_pending` and `snoozed` own their own window and their
-            # own poller. A stale value in this column on one of them is not
-            # this sweeper's to act on.
-            continue
-        deadline = _parse_ts(row["state_deadline"])
-        if deadline is None or now < deadline:
-            continue
-        note = (f"{DEADLINE_EXPIRED_NOTE_PREFIX}sat in `{row['state']}` for its full "
-                f"{rule.hours:g}h without {rule.poller} advancing it (deadline "
-                f"{_fmt_ts(row['state_deadline'])}). Moved to `{rule.on_expiry}` by the clock, "
-                f"not by a decision")
-        if rule.reason:
-            note += f" — reason `{rule.reason}`"
-        note += "."
-        prior_note = row["note"] or ""
-        if row["state"] == STATE_SPLIT and prior_note.startswith(SPLIT_VERDICT_NOTE_PREFIX):
-            # See this function's own docstring, "NARROW exception" paragraph
-            # — this is the one prior note that is itself an unactioned
-            # obligation, not history, so it is appended rather than lost.
-            note = f"{note}\n\n{prior_note}"
-        if dry_run:
-            print(f"[dry-run] would expire {row['signature']} (event {row['event_id']}): "
-                  f"{row['state']} -> {rule.on_expiry} after {rule.hours:g}h with no advance "
-                  f"from {rule.poller}")
-            continue
-        _set_state(conn, row["event_id"], rule.on_expiry, now, note=note)
-        print(f"triage: deadline expired for {row['signature']} (event {row['event_id']}): "
-              f"{row['state']} -> {rule.on_expiry} after {rule.hours:g}h with no advance "
-              f"from {rule.poller}")
-    conn.commit()
-
-    expected = [s for s, r in STATE_DEADLINES.items() if r.deadline_column == _STATE_DEADLINE_COLUMN]
-    placeholders = ",".join("?" * len(expected))
-    for row in conn.execute(
-        f"SELECT event_id, signature, state FROM triage_items "
-        f"WHERE state_deadline IS NULL AND state IN ({placeholders}) ORDER BY event_id",
-        expected,
-    ).fetchall():
-        # Stamp it from NOW, and say so. Two anchors were possible and only one
-        # is safe: `updated_at` is rewritten by ingest() on every recurrence, so
-        # a deadline derived from it would move further away every pass and
-        # never fire — which is the bug this whole slice closes, rebuilt. `now`
-        # cannot do that. It is deliberately CONSERVATIVE: a row that has
-        # already sat in `needs_human` for six days gets a fresh 168h rather
-        # than expiring immediately, and erring toward not-discarding is the
-        # same call item 1 made.
-        #
-        # Leaving these as a report only was the first version of this, and it
-        # was wrong in the one case that matters: the rows carrying a NULL
-        # deadline on the live ledger are all `needs_human`, and the only thing
-        # that transitions a `needs_human` row is a human — so "it gets a real
-        # one when it next transitions" means "never", for exactly the
-        # population that must not sit forever. It would have printed the same
-        # four lines every 600s and bounded nothing.
-        #
-        # Still printed as a FINDING, once, at stamp time: a NULL deadline on a
-        # non-terminal row can only be a pre-column legacy row or a bug in a
-        # transition site, and silently fixing the second is how it stays a bug.
-        rule = STATE_DEADLINES[row["state"]]
-        stamped = now + dt.timedelta(hours=rule.hours)
-        if dry_run:
-            print(f"[dry-run] would stamp {row['signature']} (event {row['event_id']}) in "
-                  f"{row['state']!r} with a {rule.hours:g}h deadline", file=sys.stderr)
-            continue
-        conn.execute(
-            "UPDATE triage_items SET state_deadline=? WHERE event_id=? AND state_deadline IS NULL",
-            (_now_iso(stamped), row["event_id"]),
-        )
-        print(f"triage: FINDING — {row['signature']} (event {row['event_id']}) was in non-terminal "
-              f"state {row['state']!r} with a NULL state_deadline, so nothing would ever have timed "
-              f"it out. Stamped {rule.hours:g}h from now ({_fmt_ts(_now_iso(stamped))}), not from "
-              f"updated_at, which ingest() rewrites every pass. If this row is not a pre-column "
-              f"legacy row, a transition site is failing to write a deadline.", file=sys.stderr)
-    conn.commit()
-
-
 # --- unmapped-signature digest -------------------------------------------------
-
-def _fetch_note_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """The digest's `note` rows: unstructured #alerts prose that might be an
-    unactioned root cause — so only rows whose event is still OPEN.
-
-    A `note` row whose event has since resolved is excluded. The heading it
-    prints under claims an unactioned root cause, and a resolution-closed
-    event is the producer saying the condition is over; the row stays in
-    `note` (terminal, as designed) but has nothing left to report. Four such
-    rows — events 105, 542, 918, 999, left behind by §76's one-time revive
-    precisely because their events had resolved — printed here every day
-    against resolutions that had landed days earlier (§77 left this as a
-    digest-content decision; it is made here)."""
-    return conn.execute(
-        "SELECT ti.signature, e.title FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state=? AND e.resolved_at IS NULL ORDER BY ti.updated_at DESC",
-        (STATE_NOTE,),
-    ).fetchall()
-
 
 def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], unmapped: set[str],
                              now: dt.datetime, *, dry_run: bool) -> None:
-    """One Slack message, at most once per UTC day, with up to two
-    sections: unmapped signatures (no policy rule matched — see classify())
-    and STATE_NOTE rows (unstructured #alerts prose that might be an
-    unactioned root cause — see that state's own docstring). Both are silent
-    by default; this is the only place either becomes visible."""
-    notes = _fetch_note_rows(conn)
-    if not unmapped and not notes:
+    """One Slack message, at most once per UTC day, listing the unmapped
+    signatures (no policy rule matched — see classify()). Silent by default;
+    this is the only place they become visible."""
+    if not unmapped:
         return
     today = now.date().isoformat()
     row = conn.execute("SELECT value FROM cursors WHERE key=?", (DAILY_DIGEST_CURSOR_KEY,)).fetchone()
@@ -6230,21 +5800,11 @@ def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], un
         lines.extend(f"- `{s}`" for s in sigs[:20])
         if len(sigs) > 20:
             lines.append(f"… and {len(sigs) - 20} more")
-    if notes:
-        if lines:
-            lines.append("")
-        lines.append("*Unstructured notes in #alerts* — possible root causes nobody actioned:")
-        for r in notes[:20]:
-            title = (r["title"] or "").strip()
-            truncated = title[:140] + ("…" if len(title) > 140 else "")
-            lines.append(f"- `{r['signature']}` — {truncated}")
-        if len(notes) > 20:
-            lines.append(f"… and {len(notes) - 20} more")
 
     text = "\n".join(lines)
     channel = _card_channel(policy)
     if dry_run:
-        print(f"[dry-run] would post daily digest ({len(unmapped)} unmapped, {len(notes)} notes) to {channel}")
+        print(f"[dry-run] would post daily digest ({len(unmapped)} unmapped) to {channel}")
         return
     token = resolve_slack_token()
     if not token:
@@ -6285,39 +5845,35 @@ ARGO_SNAPSHOT_HISTORY_LIMIT = 50
 # value must be a loud, acked rejection, never a silent drop or a guess.
 ARGO_ACTION_VERBS = frozenset({"implement", "merge", "dismiss", "reinvestigate", "note"})
 
-# The same closed set warden.py's own _CLOSE_ALLOWED_STATES uses for the CLI
-# `close` verb — an owner dismissal pulled off Argo is the same kind of
-# terminal call a human `warden close` makes, so it is gated on identical
-# states. Duplicated here (never imported) so this file's own closed-state
-# lists (TERMINAL_STATES, STATE_DEADLINES) stay self-contained; keep the two
-# in sync by hand if either ever changes.
+# Argo's owner actions are gated on the same closed state sets api.py's
+# `availableActions` offers (mirrored there by literal value, kept in sync by
+# hand). An owner dismissal is the same kind of terminal call a human
+# `warden close` makes, so it may end anything that has not started work
+# (`new`, `triaged`), anything waiting on the owner (`needs_decision`, `failed`)
+# and a `quiet` item.
 _ARGO_DISMISS_ALLOWED_STATES = (
-    STATE_NEW, STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_MERGE_BLOCKED, STATE_QUIET, STATE_NOTE,
+    STATE_NEW, STATE_TRIAGED, STATE_NEEDS_DECISION, STATE_FAILED, STATE_QUIET,
 )
-# The same six minus STATE_NEW: an item still `new` has not been
-# investigated at all yet, so "re"-investigating it is a no-op state-wise —
-# escalate()/escalate_origin_items() already pick it up on their own.
-_ARGO_REINVESTIGATE_ALLOWED_STATES = (
-    STATE_VERDICT, STATE_NEEDS_HUMAN, STATE_MERGE_BLOCKED, STATE_QUIET, STATE_NOTE,
-)
+# The same without `new`/`triaged`: an item that has not been investigated yet has
+# nothing to "re"-investigate — escalate()/escalate_origin_items() pick it up on
+# their own.
+_ARGO_REINVESTIGATE_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED, STATE_QUIET)
+_ARGO_IMPLEMENT_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED)
+_ARGO_MERGE_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED)
 
 
 def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                            now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
-    if item["state"] not in (STATE_VERDICT, STATE_NEEDS_HUMAN):
-        return "rejected", None, f"item is in state {item['state']!r}, not verdict/needs_human"
+    if item["state"] not in _ARGO_IMPLEMENT_ALLOWED_STATES:
+        return "rejected", None, f"item is in state {item['state']!r}, not needs_decision/failed"
 
     # No `expect_null=("implement_job",)` here (unlike maybe_auto_implement()'s
-    # own claim): that function's own SELECT already filters to
-    # `implement_job IS NULL`, so the invariant holds by construction. This
-    # handler instead accepts `needs_human` items that carry a STALE
-    # implement_job from a prior attempt that landed there without ever
-    # clearing it (poll_implement_jobs()'s `nextAction == "human"` and
-    # schema/outcome-assertion-failure branches both do this) — refusing a
-    # re-implement on that column alone would make retrying from Argo
-    # permanently impossible for exactly the item this action exists to
-    # unstick. Overwritten below on success.
-    claimed = _set_state(conn, event_id, STATE_IMPLEMENTING, now, expect_state=item["state"])
+    # own claim): this handler accepts `needs_decision`/`failed` items that carry
+    # a STALE implement_job from a prior attempt — refusing a re-implement on that
+    # column alone would make retrying from Argo permanently impossible for exactly
+    # the item this action exists to unstick. Overwritten below on success.
+    claimed = _set_state(conn, event_id, STATE_WORKING, now, expect_state=item["state"],
+                         implement_job=IMPLEMENT_CLAIM, validation_job=None, pr_url=None)
     conn.commit()
     if not claimed:
         return "rejected", None, "item state changed before this action could be applied — retry from Argo"
@@ -6339,6 +5895,12 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
         context = None
         brief = "The owner asked, via Argo, for this to be implemented directly. " + (item["brief"] or "")
 
+    def _hand_back(note: str) -> None:
+        _set_state(conn, event_id, item["state"], now, expect_state=STATE_WORKING, note=note,
+                   implement_job=item["implement_job"], validation_job=item["validation_job"],
+                   pr_url=item["pr_url"])
+        conn.commit()
+
     try:
         opened = _dispatch.open_episode(
             conn, repo=item["repo"], tier="implement", brief=brief, context=context,
@@ -6346,45 +5908,30 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
             origin=_dispatch.Origin(event_id=event_id), authorized_by="owner:argo",
         )
     except SubmitRefused as exc:
-        _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=load_policy())
+        _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=load_policy(),
+                        implement_job=None)
         return "failed", None, str(exc)
-    except RemoteError as exc:
-        if exc.maybe_mutated:
-            print(f"triage: argo implement for event {event_id} may have reached sideclaw "
-                  f"({exc}) — left unresolved (operation recorded unknown)", file=sys.stderr)
-            return "applied", {
-                "note": "submitted to sideclaw, outcome ambiguous — left in-flight for reconcile_operations()"
-            }, None
-        _set_state(conn, event_id, STATE_VERDICT if item["state"] == STATE_VERDICT else STATE_NEEDS_HUMAN,
-                   now, expect_state=STATE_IMPLEMENTING, note=f"deferred: {exc}")
-        conn.commit()
+    except (RemoteError, PolicyError, PreconditionError, UsageError) as exc:
+        _hand_back(f"deferred: {exc}")
         return "failed", None, str(exc)
-    except (PolicyError, PreconditionError, UsageError) as e:
-        _set_state(conn, event_id, STATE_VERDICT if item["state"] == STATE_VERDICT else STATE_NEEDS_HUMAN,
-                   now, expect_state=STATE_IMPLEMENTING, note=f"deferred: {e}")
-        conn.commit()
-        return "failed", None, str(e)
 
     conn.execute(
         "UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
         (opened.job_id, _now_iso(now), event_id),
     )
     conn.commit()
-    fresh_item, fresh_event = _get_item(conn, event_id), _get_event(conn, event_id)
-    if fresh_item is not None and fresh_event is not None:
-        sync_card(conn, [fresh_item], [fresh_event], load_policy(), dry_run=False)
+    _sync_item_card(conn, load_policy(), event_id)
     return "applied", {"jobId": opened.job_id}, None
 
 
 def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                        now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
-    """The owner's one-click merge. Accepted from `merge_blocked` and from
-    `needs_human` carrying a PR. Goes through _merge_and_rollout() with
+    """The owner's one-click merge. Accepted from `failed` and from `needs_decision`
+    carrying a PR. Goes through _merge_and_rollout() with
     `authorized_by="owner:argo"`, so an owner merge deploys and verifies
-    exactly like an automatic one (before §94 a successful Argo merge left the
-    item sitting in `merge_blocked`)."""
-    if item["state"] not in (STATE_MERGE_BLOCKED, STATE_NEEDS_HUMAN):
-        return "rejected", None, f"item is in state {item['state']!r}, not merge_blocked/needs_human"
+    exactly like an automatic one."""
+    if item["state"] not in _ARGO_MERGE_ALLOWED_STATES:
+        return "rejected", None, f"item is in state {item['state']!r}, not needs_decision/failed"
     if not item["implement_job"] or not item["pr_url"]:
         return "rejected", None, "no pull request on this item to merge"
 
@@ -6406,7 +5953,8 @@ def _apply_argo_dismiss(conn: sqlite3.Connection, item: sqlite3.Row, event_id: i
     reason = str(payload.get("reason") or "").strip()
     if not reason:
         return "rejected", None, "dismiss requires a reason"
-    rowcount = _set_state(conn, event_id, STATE_DISMISSED, now, expect_state=item["state"], note=reason)
+    rowcount = _set_state(conn, event_id, STATE_CLOSED, now, expect_state=item["state"], note=reason,
+                          close_reason=CLOSE_IGNORED)
     conn.commit()
     if rowcount == 0:
         return "rejected", None, "item state changed before this action could be applied — retry from Argo"
@@ -6415,48 +5963,19 @@ def _apply_argo_dismiss(conn: sqlite3.Connection, item: sqlite3.Row, event_id: i
 
 def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                                now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
+    """Back to `triaged`, whose pollers (escalate()/escalate_origin_items()) open the
+    fresh investigation. The old investigation, review and PR handles are cleared so
+    the new `working` phase starts clean — and `dispatch_job` with them, which
+    would otherwise hold the cooldown anchor against the very re-run asked for."""
     if item["state"] not in _ARGO_REINVESTIGATE_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, reinvestigate not allowed"
-    claimed = _set_state(conn, event_id, STATE_INVESTIGATING, now, expect_state=item["state"])
+    rowcount = _set_state(conn, event_id, STATE_TRIAGED, now, expect_state=item["state"],
+                          note="re-investigation requested by the owner via Argo",
+                          dispatch_job=None, implement_job=None, validation_job=None)
     conn.commit()
-    if not claimed:
+    if rowcount == 0:
         return "rejected", None, "item state changed before this action could be applied — retry from Argo"
-
-    if item["origin"] in ("github_issue", "human"):
-        event_row = _get_event(conn, event_id)
-        brief = _origin_item_brief(item, event_row) if event_row is not None else (item["brief"] or "")
-    else:
-        brief = item["brief"] or ""
-
-    try:
-        opened = _dispatch.open_episode(
-            conn, repo=item["repo"], tier="investigate", brief=brief, context=None,
-            why="owner requested re-investigation via Argo",
-            origin=_dispatch.Origin(event_id=event_id), authorized_by="owner:argo",
-        )
-    except SubmitRefused as exc:
-        _end_on_refusal(conn, [item], exc, tier="investigate", now=now, policy=load_policy())
-        return "failed", None, str(exc)
-    except RemoteError as exc:
-        if exc.maybe_mutated:
-            return "applied", {"note": "submitted, outcome ambiguous"}, None
-        _set_state(conn, event_id, item["state"], now, expect_state=STATE_INVESTIGATING, note=f"deferred: {exc}")
-        conn.commit()
-        return "failed", None, str(exc)
-    except (PolicyError, PreconditionError, UsageError) as e:
-        _set_state(conn, event_id, item["state"], now, expect_state=STATE_INVESTIGATING, note=f"deferred: {e}")
-        conn.commit()
-        return "failed", None, str(e)
-
-    conn.execute(
-        "UPDATE triage_items SET dispatch_job=?, updated_at=? WHERE event_id=?",
-        (opened.job_id, _now_iso(now), event_id),
-    )
-    conn.commit()
-    fresh_item, fresh_event = _get_item(conn, event_id), _get_event(conn, event_id)
-    if fresh_item is not None and fresh_event is not None:
-        sync_card(conn, [fresh_item], [fresh_event], load_policy(), dry_run=False)
-    return "applied", {"jobId": opened.job_id}, None
+    return "applied", None, None
 
 
 def _apply_argo_note(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int, now: dt.datetime,
@@ -6638,7 +6157,6 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     ingest(conn, now)
     ingest_github_issues(conn, now)
     reopen_if_needed(conn, now)
-    unsnooze_if_expired(conn, now)
     unmapped = classify(conn, policy, now)
     apply_resolutions(conn, now, policy)
     resolve_recovery_paired(conn, policy, now, dry_run=dry_run)
@@ -6649,10 +6167,9 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     escalate(conn, policy, now, dry_run=dry_run)
 
     # The host-verb allowlist's own poller (STATE.md's 2026-09-11 owner
-    # decision) — BEFORE the implement chain, on purpose: a verdict/
-    # needs_human row this claims moves straight to `remediating`, which is
-    # neither `verdict` nor `needs_human` any more, so maybe_auto_implement()
-    # below can never also pick it up in the same pass.
+    # decision) — BEFORE the implement chain, on purpose: a row this claims
+    # carries a host-verb claim in `implement_job`, which maybe_auto_implement()
+    # below treats as taken, so it can never also pick it up in the same pass.
     maybe_auto_remediate(conn, policy, now, dry_run=dry_run)
 
     # Steps 6-10 — verdict -> implement -> validate -> merge -> deploy ->
@@ -6667,12 +6184,6 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     advance_implement_chain(conn, policy, now, dry_run=dry_run)
     maybe_check_liveness(conn, policy, now, dry_run=dry_run)
     sweep_trip_residue(conn, now, dry_run=dry_run)
-
-    # After every poller above, before the cards below — see sweep_deadlines()'s
-    # own docstring: a poller that can still advance an item this pass gets its
-    # chance before the clock takes it away, and an expiry has to be on the card
-    # in the same pass it happens.
-    sweep_deadlines(conn, now, dry_run=dry_run)
 
     for _key, members in _cluster_groups(conn).items():
         members = sorted(members, key=lambda r: r["event_id"])
@@ -6728,11 +6239,7 @@ def record_heartbeat(conn: sqlite3.Connection, *, dry_run: bool) -> None:
             "SELECT state, COUNT(*) AS n FROM triage_items GROUP BY state"
         )
     }
-    open_clusters = conn.execute(
-        "SELECT COUNT(DISTINCT dispatch_job) AS n FROM triage_items "
-        "WHERE state=? AND dispatch_job IS NOT NULL",
-        (STATE_INVESTIGATING,),
-    ).fetchone()["n"]
+    open_clusters = _count_open_investigation_clusters(conn)
     value = json.dumps({"states": census, "open_clusters": open_clusters}, sort_keys=True)
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
@@ -6752,13 +6259,11 @@ def record_heartbeat(conn: sqlite3.Connection, *, dry_run: bool) -> None:
     conn.commit()
 
 
-# --- CLI verbs: --snooze / --ignore / --reopen / --close / --list --------------
+# --- CLI verbs: --ignore / --reopen / --close / --list --------------------------
 
 def _items_for_signature(conn: sqlite3.Connection, signature: str) -> list[sqlite3.Row]:
-    """The four CLI verbs address a SIGNATURE, not an event, so they resolve
-    it to rows first and transition each through _set_state() — same reason
-    unsnooze_if_expired() stopped being one set-based UPDATE: the deadline is
-    written with the state, by one function, or it drifts."""
+    """The CLI verbs address a SIGNATURE, not an event, so they resolve it to rows
+    first and transition each through _set_state() — the one writer of `state`."""
     return conn.execute("SELECT event_id FROM triage_items WHERE signature=?", (signature,)).fetchall()
 
 
@@ -6769,29 +6274,6 @@ def _arg_value(argv: list[str], flag: str) -> str | None:
     return argv[idx + 1] if idx + 1 < len(argv) else None
 
 
-def cmd_snooze(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> int:
-    signature = _arg_value(argv, "--snooze")
-    hours_s = _arg_value(argv, "--hours")
-    if not signature:
-        print("triage: --snooze needs a signature", file=sys.stderr)
-        return 2
-    try:
-        hours = float(hours_s) if hours_s else 24.0
-    except ValueError:
-        print(f"triage: --hours must be a number, got {hours_s!r}", file=sys.stderr)
-        return 2
-    until = (now + dt.timedelta(hours=hours)).isoformat()
-    rows = _items_for_signature(conn, signature)
-    for row in rows:
-        _set_state(conn, row["event_id"], STATE_SNOOZED, now, snoozed_until=until)
-    conn.commit()
-    if not rows:
-        print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
-        return 1
-    print(f"snoozed {signature} until {until}")
-    return 0
-
-
 def cmd_ignore(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> int:
     signature = _arg_value(argv, "--ignore")
     if not signature:
@@ -6799,7 +6281,7 @@ def cmd_ignore(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
         return 2
     rows = _items_for_signature(conn, signature)
     for row in rows:
-        _set_state(conn, row["event_id"], STATE_IGNORED, now, snoozed_until=None)
+        _set_state(conn, row["event_id"], STATE_CLOSED, now, close_reason=CLOSE_IGNORED)
     conn.commit()
     if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
@@ -6815,7 +6297,7 @@ def cmd_reopen(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
         return 2
     rows = _items_for_signature(conn, signature)
     for row in rows:
-        _set_state(conn, row["event_id"], STATE_NEW, now, snoozed_until=None)
+        _set_state(conn, row["event_id"], STATE_NEW, now)
     conn.commit()
     if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
@@ -6825,13 +6307,9 @@ def cmd_reopen(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
 
 
 def cmd_close(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> int:
-    """`closed`'s only HUMAN producer (its other producer, the `merged`
-    deadline's expiry, is a clock — see STATE_CLOSED and STATE_DEADLINES).
-    Addressed by signature like every other CLI verb (see
-    _items_for_signature()). A reason is required for the same reason
-    _set_state() already requires one for `dismissed`: a close with no reason
-    is indistinguishable from a bug, and the reason is the whole content of
-    the state."""
+    """`closed(resolved)` by hand. Addressed by signature like every other CLI verb
+    (see _items_for_signature()). A reason is required: a close with no reason is
+    indistinguishable from a bug, and the reason is the whole content of the state."""
     signature = _arg_value(argv, "--close")
     reason = _arg_value(argv, "--reason")
     if not signature:
@@ -6842,7 +6320,7 @@ def cmd_close(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> in
         return 2
     rows = _items_for_signature(conn, signature)
     for row in rows:
-        _set_state(conn, row["event_id"], STATE_CLOSED, now, note=reason.strip())
+        _set_state(conn, row["event_id"], STATE_CLOSED, now, note=reason.strip(), close_reason=CLOSE_RESOLVED)
     conn.commit()
     if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
@@ -6852,18 +6330,16 @@ def cmd_close(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> in
 
 
 def cmd_list(conn: sqlite3.Connection) -> int:
-    # STATE_RESOLVED's three successors, and nothing else — `note`/`dismissed`/
-    # `ignored` stay listed, exactly as before the split.
     rows = conn.execute(
         "SELECT signature, state, repo, verb, occurrences, first_seen FROM triage_items "
         "WHERE state NOT IN (?, ?, ?) ORDER BY updated_at DESC",
-        (STATE_FIXED, STATE_QUIET, STATE_CLOSED),
+        TERMINAL_STATES,
     ).fetchall()
     if not rows:
         print("no open triage items")
         return 0
     for r in rows:
-        print(f"{r['state']:<13} {r['signature']:<70} repo={r['repo'] or '-'} "
+        print(f"{r['state']:<15} {r['signature']:<70} repo={r['repo'] or '-'} "
               f"occurrences={r['occurrences']} since={r['first_seen']}")
     return 0
 
@@ -6874,8 +6350,6 @@ def main(argv: list[str] | None = None) -> int:
     now = dt.datetime.now(dt.timezone.utc)
     conn = db_connect()
     try:
-        if "--snooze" in argv:
-            return cmd_snooze(conn, argv, now)
         if "--ignore" in argv:
             return cmd_ignore(conn, argv, now)
         if "--reopen" in argv:

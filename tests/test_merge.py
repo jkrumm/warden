@@ -624,12 +624,28 @@ def test_gate_refuses_failing_check_run():
         raise AssertionError("expected PolicyError")
 
 
-def test_gate_refuses_pending_check_run():
+def test_gate_waits_on_a_pending_check_run_as_checks_pending():
+    """CI still running is not a refusal: ChecksPending (a PolicyError subclass, so
+    every old caller still refuses) lets the loop keep the item and ask again."""
     try:
         merge.merge_gate_check(repo="gamma", validation="confirmed",
                                check_runs=[{"name": "build", "status": "in_progress", "conclusion": None}])
+    except merge.ChecksPending as e:
+        assert isinstance(e, PolicyError)
+        assert "still running" in str(e) and "build" in str(e)
+    else:
+        raise AssertionError("expected ChecksPending")
+
+
+def test_gate_refuses_a_failed_check_even_when_another_is_still_pending():
+    try:
+        merge.merge_gate_check(repo="gamma", validation="confirmed", check_runs=[
+            {"name": "build", "status": "in_progress", "conclusion": None},
+            {"name": "lint", "status": "completed", "conclusion": "failure"}])
+    except merge.ChecksPending:
+        raise AssertionError("a failed check is a refusal, not a wait")
     except PolicyError as e:
-        assert "has not passed cleanly" in str(e) and "build" in str(e)
+        assert "has not passed cleanly" in str(e) and "lint" in str(e) and "build" in str(e)
     else:
         raise AssertionError("expected PolicyError")
 
