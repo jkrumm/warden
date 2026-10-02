@@ -1440,7 +1440,9 @@ def test_escalate_origin_items_reclaims_investigating_orphan_with_no_dispatch_jo
             conn, origin="human", repo="demo-repo", brief="do the thing", max_tier="implement",
             external_id="human:orphan-inv-1", title="ask", now=NOW,
         )
-        triage._set_state(conn, eid, triage.STATE_WORKING, NOW, expect_state=triage.STATE_NEW)
+        # claimed long enough ago that no live caller can still be mid-dispatch
+        triage._set_state(conn, eid, triage.STATE_WORKING, NOW - dt.timedelta(minutes=10),
+                          expect_state=triage.STATE_NEW)
         conn.commit()
 
         calls: list[dict[str, Any]] = []
@@ -1452,6 +1454,47 @@ def test_escalate_origin_items_reclaims_investigating_orphan_with_no_dispatch_jo
         assert item["state"] == triage.STATE_WORKING, item["state"]
         assert item["dispatch_job"] is not None
         assert len(calls) == 1, calls
+
+
+def test_escalate_origin_items_leaves_a_live_claim_alone_and_a_lost_cas_skips():
+    """The loop and `warden run` both call escalate_origin_items(). A claim younger than
+    ORIGIN_CLAIM_STALE_MINUTES belongs to a caller still opening its episode: the other caller
+    must neither reclaim it nor dispatch it a second time."""
+    with _triage_env() as (conn, ctx):
+        eid = triage.open_origin_item(
+            conn, origin="human", repo="demo-repo", brief="do the thing", max_tier="implement",
+            external_id="human:live-claim", title="ask", now=NOW,
+        )
+        triage._set_state(conn, eid, triage.STATE_WORKING, NOW - dt.timedelta(minutes=1),
+                          expect_state=triage.STATE_NEW)   # the other caller's claim, mid-dispatch
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.escalate_origin_items(conn, NOW)
+        item = triage._get_item(conn, eid)
+        assert calls == [] and item["state"] == triage.STATE_WORKING and item["dispatch_job"] is None, dict(item)
+        assert "reclaimed" not in (item["note"] or ""), item["note"]
+
+        # the other caller claims between this pass's read and its CAS: the CAS is lost, so it skips.
+        conn.execute("UPDATE triage_items SET state=?, updated_at=? WHERE event_id=?",
+                     (triage.STATE_NEW, NOW.isoformat(), eid))
+        conn.commit()
+        raced = {"done": False}
+
+        def _racing_get_event(conn_, event_id):
+            if not raced["done"]:
+                raced["done"] = True    # the other caller claims between this pass's read and its CAS
+                conn_.execute("UPDATE triage_items SET state=? WHERE event_id=?", (triage.STATE_WORKING, event_id))
+                conn_.commit()
+            return real_get_event(conn_, event_id)
+
+        real_get_event = triage._get_event
+        triage._get_event = _racing_get_event
+        try:
+            triage.escalate_origin_items(conn, NOW)
+        finally:
+            triage._get_event = real_get_event
+        assert calls == [], "a lost claim must not dispatch"
 
 
 def test_maybe_auto_implement_blocked_by_investigate_ceiling():
@@ -2165,23 +2208,6 @@ def test_op_refs_raw_fallback_dedups_across_timestamps():
     key3 = watchdog_poll.normalize_title(watchdog_poll._strip_op_refs_timestamps(s3))[:80]
     key4 = watchdog_poll.normalize_title(watchdog_poll._strip_op_refs_timestamps(s4))[:80]
     assert key3 == key4
-
-
-def test_watchdog_poll_alerts_read_token_pinned_to_hermes():
-    """resolve_alerts_read_token() (the digest post that follows reading
-    #alerts/#updates via the homelab API's own Hermes-authenticated proxy)
-    must stay pinned to the Hermes identity — unlike
-    scripts/clients/slack.py's resolve_slack_token(), a Warden env var must
-    have zero effect on it. A Warden app with chat:write/chat:write.public
-    only cannot read history at all, so mixing identities on this one path
-    would silently break it rather than just relabel it."""
-    os.environ["WARDEN_SLACK_BOT_TOKEN"] = "should-never-be-read-here"
-    os.environ["SLACK_BOT_TOKEN"] = "hermes-alerts-token"
-    try:
-        assert watchdog_poll.resolve_alerts_read_token() == "hermes-alerts-token"
-    finally:
-        os.environ.pop("WARDEN_SLACK_BOT_TOKEN", None)
-        os.environ.pop("SLACK_BOT_TOKEN", None)
 
 
 # --- evidence commands (declared runtime-state probes) -----------------------
@@ -5558,9 +5584,10 @@ def test_auto_implement_maps_each_failure_mode():
     for the claim-ordering property itself):
 
     - RemoteError(maybe_mutated=True): sideclaw MAY have accepted the job —
-      the item stays claimed (`implementing`) and the operation stays OPEN
-      (outcome NULL) for reconcile_operations() to resolve, never rolled
-      back (that would duplicate the episode next tick).
+      the item stays claimed and the operation stays OPEN (outcome NULL), never
+      rolled back (that would duplicate the episode next tick). Sideclaw hands
+      back no job id and cannot list jobs, so reconcile_operations() holds it for
+      a 30 min grace window, then resolves it `unknown` and strikes the item.
     - RemoteError(maybe_mutated=False): a definite failure — sideclaw was
       never reached — so the claim is safely handed back to `verdict` and
       the operation resolves `failed`.
@@ -5577,21 +5604,45 @@ def test_auto_implement_maps_each_failure_mode():
     with _triage_env() as (conn, ctx):
         eid1 = _seed_verdict_item(conn, external_id="sig-map-mutated", confidence="high",
                                    investigate_job="investigate-map-mutated", repo="demo-repo")
-        triage._sideclaw.submit = lambda **kw: (_ for _ in ()).throw(
-            triage.RemoteError("timed out mid-submit", maybe_mutated=True))
+        submits: list[dict[str, Any]] = []
+
+        def _timing_out_submit(**kw):
+            submits.append(kw)
+            raise triage.RemoteError("timed out mid-submit", maybe_mutated=True)
+
+        triage._sideclaw.submit = _timing_out_submit
         triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item1 = triage._get_item(conn, eid1)
-        assert item1["state"] == triage.STATE_WORKING, (
-            f"a maybe-mutated failure must NOT roll back (the duplication bug) — got {item1['state']}")
-        assert item1["implement_job"] is None
+        assert item1["state"] == triage.STATE_WORKING and item1["strikes"] == 0, (
+            f"a maybe-mutated failure must NOT strike or roll back — got {dict(item1)}")
+        assert item1["implement_job"] == triage.IMPLEMENT_CLAIM, "the claim stays"
+        op1 = conn.execute("SELECT outcome, receipt_json FROM operations WHERE event_id=? AND kind='implement'",
+                            (eid1,)).fetchone()
+        assert op1 is not None and op1["outcome"] is None, "the operation stays open for reconcile_operations()"
+        # Later ticks never re-submit while the claim and the operation are open.
+        later = NOW + dt.timedelta(hours=1)
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, later, dry_run=False)
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, later, dry_run=False)
+        assert len(submits) == 1 and triage._get_item(conn, eid1)["implement_job"] == triage.IMPLEMENT_CLAIM
+        # reconcile_operations() has no job id to poll: inside the 30 min grace it leaves the
+        # operation and the claim alone; after it, the operation resolves `unknown` and the item
+        # strikes back to `working` for a fresh attempt.
+        inside = NOW + dt.timedelta(minutes=29)
+        conn.execute("UPDATE operations SET started_at=? WHERE event_id=?", (NOW.isoformat(), eid1))
+        conn.commit()
+        triage.reconcile_operations(conn, DEFAULT_POLICY, inside, dry_run=False)
+        item1 = triage._get_item(conn, eid1)
+        assert item1["implement_job"] == triage.IMPLEMENT_CLAIM and item1["strikes"] == 0, dict(item1)
+        assert conn.execute("SELECT outcome FROM operations WHERE event_id=?", (eid1,)).fetchone()["outcome"] is None
+        triage.reconcile_operations(conn, DEFAULT_POLICY, later, dry_run=False)
+        item1 = triage._get_item(conn, eid1)
+        assert item1["state"] == triage.STATE_WORKING and item1["implement_job"] is None, dict(item1)
+        assert item1["strikes"] == 1 and item1["note"].startswith(
+            "ambiguous implement submit — retried after 30 min grace"), dict(item1)
         op1 = conn.execute("SELECT outcome FROM operations WHERE event_id=? AND kind='implement'",
                             (eid1,)).fetchone()
-        # open_episode() itself resolves this — not left NULL for
-        # reconcile_operations(): it already knows the submit's OWN outcome
-        # was ambiguous, which is exactly what `unknown` means (distinct
-        # from a genuine process crash mid-flight, where the row would stay
-        # NULL because nothing ever ran the completion code at all).
-        assert op1 is not None and op1["outcome"] == "unknown", op1["outcome"]
+        assert op1["outcome"] == "unknown", op1["outcome"]
+        assert len(submits) == 1, "nothing submitted until the strike's backoff passes"
 
         eid2 = _seed_verdict_item(conn, external_id="sig-map-failed", confidence="high",
                                    investigate_job="investigate-map-failed", repo="other-repo")
@@ -5947,16 +5998,28 @@ def test_reconcile_operations_runs_before_anything_that_could_retry():
 
         implement_calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(implement_calls)
-        triage._sideclaw.get = lambda job_id: None  # 404 — resolves to `unknown`
+        triage._sideclaw.get = lambda job_id: None
 
         triage.run(conn, dry_run=False)
 
         assert implement_calls == [], (
             "maybe_auto_implement() must never fire while this item's operation is unreconciled")
         item = triage._get_item(conn, eid)
+        assert item["strikes"] == 0 and item["state"] == triage.STATE_WORKING, (
+            f"an operation with no job id stays open through its grace window: {dict(item)}")
+
+        # Past the grace window it resolves `unknown` and the item strikes in that same pass,
+        # before any poller can resubmit it.
+        conn.execute("UPDATE operations SET started_at=?",
+                     ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=31)).isoformat(),))
+        conn.commit()
+        triage.run(conn, dry_run=False)
+        assert implement_calls == [], "the strike's backoff keeps the resubmission waiting"
+        item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_WORKING and item["strikes"] == 1 and item["retry_at"], (
             "reconcile_operations() must have already struck the item this same pass: "
             f"{dict(item)}")
+        assert item["note"].startswith("ambiguous implement submit — retried after 30 min grace"), item["note"]
 
 
 def test_reconcile_operation_with_no_event_id_resolves_without_touching_any_item():
@@ -7962,6 +8025,360 @@ def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline(
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEW and "unproven, not fixed" in item["note"]
         assert ("stop", ("906",)) in TRIP_CALLS
+
+
+# --- review fixes: claims, ambiguous submits, strike CAS, notify claim, origin answers ----
+
+def _spy_calls(fn):
+    calls: list[tuple[tuple, dict]] = []
+
+    def wrapper(*a, **kw):
+        calls.append((a, kw))
+        return fn(*a, **kw)
+
+    return wrapper, calls
+
+
+def test_implement_handoff_that_lost_the_race_opens_no_second_review():
+    """Two crons reach the pr_opened handoff for one item. The loser's compare-and-set (item
+    still `working`, same implement job, no review yet) matches nothing, so it opens no review."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-handoff-race", job_id="impl-handoff-race")
+        url = "https://github.com/jkrumm/demo-repo/pull/10"
+        review_calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_review = _fake_submit_review(review_calls)
+        done = {"status": "done", "result": _dispatch_result("pr_opened", artifact_url=url)}
+
+        def _get(job_id):
+            # The other cron claims, and finishes, the handoff after this pass's snapshot.
+            conn.execute("UPDATE triage_items SET state=?, validation_job=?, pr_url=? WHERE event_id=?",
+                         (triage.STATE_MERGING, "review-from-the-other-cron", url, eid))
+            conn.commit()
+            return done
+
+        triage._sideclaw.get = _get
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert review_calls == [], "the loser must not submit a review"
+        item = triage._get_item(conn, eid)
+        assert item["validation_job"] == "review-from-the-other-cron" and item["state"] == triage.STATE_MERGING
+
+
+def test_implement_handoff_claim_is_visible_and_released():
+    """While the winner is inside the review submit, the item is already `merging` with a claim
+    expiry in `retry_at`, so the other cron's poll_validation_jobs() cannot submit a second review;
+    once the review is open the claim is gone."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-handoff-claim", job_id="impl-handoff-claim")
+        url = "https://github.com/jkrumm/demo-repo/pull/10"
+        review_calls: list[dict[str, Any]] = []
+        inner = _fake_submit_review(review_calls)
+        seen: dict[str, Any] = {}
+
+        def _submit_review(**kw):
+            mid = triage._get_item(conn, eid)
+            seen["mid"] = (mid["state"], mid["validation_job"], mid["retry_at"])
+            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
+            return inner(**kw)
+
+        triage._sideclaw.submit_review = _submit_review
+        triage._sideclaw.get = lambda job_id: {"status": "done",
+                                               "result": _dispatch_result("pr_opened", artifact_url=url)}
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert seen["mid"] == (triage.STATE_MERGING, None, (NOW + dt.timedelta(minutes=5)).isoformat()), seen
+        assert len(review_calls) == 1, "the other cron's pass inside the claim window submitted a second review"
+        item = triage._get_item(conn, eid)
+        assert item["validation_job"] == "review-job-000001" and item["retry_at"] is None and item["strikes"] == 0
+
+
+def test_a_crashed_handoff_claim_is_retaken_once_it_expires():
+    """The process died after claiming: `merging`, a PR, no review. Once the claim's `retry_at`
+    passes, poll_validation_jobs() submits the review itself."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-handoff-crash", implement_job="impl-handoff-crash",
+                                    review_job="unused")
+        conn.execute("UPDATE triage_items SET validation_job=NULL, retry_at=? WHERE event_id=?",
+                     ((NOW + dt.timedelta(minutes=5)).isoformat(), eid))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_review = _fake_submit_review(calls)
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=1), dry_run=False)
+        assert calls == [], "a live claim holds"
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=6), dry_run=False)
+        assert len(calls) == 1 and triage._get_item(conn, eid)["validation_job"] == "review-job-000001"
+
+
+def test_a_review_result_is_acted_on_once_when_two_passes_race():
+    """Both crons read the same `done` review. The one that loses the claim must not merge,
+    revise or park; the winner holds a claim (retry_at) while it acts and drops it after."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-race", implement_job="impl-rv-race",
+                                    review_job="review-job-race")
+        landed: list[int] = []
+        inside: dict[str, Any] = {}
+
+        def _land(conn_, **kw):
+            landed.append(1)
+            inside["retry_at"] = triage._get_item(conn, eid)["retry_at"]
+            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
+            raise triage._merge.ChecksPending("CI still running")
+
+        triage._merge.plan_or_land = _land
+        triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _review_result("clean")}
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert landed == [1], "the other cron's pass inside the claim window must not act on the result"
+        assert inside["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat(), inside
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["retry_at"] is None, dict(item)
+        assert (item["note"] or "").startswith(triage.MERGE_PENDING_NOTE_PREFIX), item["note"]
+
+
+def test_a_review_result_claim_lost_to_another_pass_does_nothing():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-lost", implement_job="impl-rv-lost",
+                                    review_job="review-job-lost")
+        landed: list[int] = []
+
+        def _get(job_id):
+            # The other cron claims after this pass's snapshot was taken.
+            conn.execute("UPDATE triage_items SET retry_at=? WHERE event_id=?",
+                         ((NOW + dt.timedelta(minutes=5)).isoformat(), eid))
+            conn.commit()
+            return {"id": job_id, "status": "done", "result": _review_result("clean")}
+
+        triage._sideclaw.get = _get
+        triage._merge.plan_or_land = lambda *a, **kw: landed.append(1)
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert landed == [], "a lost claim must not merge"
+        assert triage._get_item(conn, eid)["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat()
+
+
+def test_reconcile_leaves_an_implement_operation_open_while_sideclaw_still_runs_it():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-recon-running", state=triage.STATE_WORKING,
+                         implement_job="impl-still-running", max_tier="implement")
+        op = triage.record_operation(conn, event_id=eid, kind="implement", repo="demo-repo",
+                                     authorized_by="auto-from-item")
+        conn.execute("UPDATE operations SET receipt_json=? WHERE op_id=?", (json.dumps({"jobId": "impl-still-running"}), op))
+        conn.commit()
+        for status in ("running", "pending"):
+            triage._sideclaw.get = lambda job_id, status=status: {"id": job_id, "status": status}
+            triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            row = conn.execute("SELECT outcome, reconciled_at FROM operations WHERE op_id=?", (op,)).fetchone()
+            assert row["outcome"] is None and row["reconciled_at"] is None, (status, dict(row))
+            item = triage._get_item(conn, eid)
+            assert item["strikes"] == 0 and item["implement_job"] == "impl-still-running", dict(item)
+
+
+def test_strike_reports_the_state_the_item_is_really_in_when_its_write_lost():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-strike-cas", state=triage.STATE_VERIFYING, note="moved on")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            landed = triage._strike(conn, eid, NOW, "boom", retry_state=triage.STATE_WORKING,
+                                    expect_state=triage.STATE_MERGING)
+        item = triage._get_item(conn, eid)
+        assert landed == triage.STATE_VERIFYING, "must report where the item is, not where the strike meant to put it"
+        assert item["state"] == triage.STATE_VERIFYING and item["strikes"] == 0 and item["note"] == "moved on"
+        assert "lost its compare-and-set" in err.getvalue(), err.getvalue()
+
+        eid2 = _seed_item(conn, external_id="sig-strike-ok", state=triage.STATE_MERGING)
+        assert triage._strike(conn, eid2, NOW, "boom", retry_state=triage.STATE_MERGING,
+                              expect_state=triage.STATE_MERGING) == triage.STATE_MERGING
+        eid3 = _seed_item(conn, external_id="sig-strike-failed", state=triage.STATE_MERGING, strikes=2)
+        assert triage._strike(conn, eid3, NOW, "boom", retry_state=triage.STATE_MERGING,
+                              expect_state=triage.STATE_MERGING) == triage.STATE_FAILED
+        eid4 = _seed_item(conn, external_id="sig-strike-failed-lost", state=triage.STATE_FIXED, strikes=2)
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert triage._strike(conn, eid4, NOW, "boom", retry_state=triage.STATE_MERGING,
+                                  expect_state=triage.STATE_MERGING) == triage.STATE_FIXED
+
+
+def test_cli_close_stamps_the_occurrence_mark_so_a_recurrence_before_it_does_not_reopen_it():
+    """A human `warden close` goes through items.transition(): it must record the occurrence it
+    closed against, as _set_state() does, or reopen_if_needed() reads the stale mark as new."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-close-mark", title="x", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage._set_state(conn, eid, triage.STATE_NEEDS_DECISION, NOW, note="which?")
+        conn.execute("UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
+                     (NOW.isoformat(), eid))
+        conn.commit()
+        triage._items.transition(conn, eid, to_state=triage.STATE_CLOSED, now=NOW, note="closed by hand",
+                                 extra={"close_reason": triage.CLOSE_RESOLVED})
+        conn.commit()
+        assert triage._get_item(conn, eid)["occurrence_mark"] == triage._occurrence_mark(triage._get_event(conn, eid))
+        triage.reopen_if_needed(conn, NOW)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_CLOSED, "the hand-close was undone"
+
+
+def test_cli_transition_refuses_a_close_reason_outside_the_ledger_vocabulary():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-close-reason", state=triage.STATE_NEEDS_DECISION)
+        for extra in ({"close_reason": "whatever"}, {}):
+            try:
+                triage._items.transition(conn, eid, to_state=triage.STATE_CLOSED, now=NOW, extra=extra)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"expected ValueError for {extra}")
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_NEEDS_DECISION
+
+
+def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_poller():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_pr_item(conn, external_id="sig-argo-pending", state=triage.STATE_NEEDS_DECISION, pr=12)
+
+        def _pending(conn_, **kw):
+            raise triage._merge.ChecksPending("CI is still running on the head commit: build.")
+
+        triage._merge.plan_or_land = _pending
+        triage._argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("m-pending", eid, "merge")])
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING, "parked in needs_decision nothing would ever ask again"
+        assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
+        # ...and the poller re-drives it: once the checks settle the merge lands.
+        conn.execute("UPDATE triage_items SET validation_job='review-argo-pending' WHERE event_id=?", (eid,))
+        conn.commit()
+        landed: list[int] = []
+
+        def _land(conn_, **kw):
+            landed.append(1)
+            conn_.execute("UPDATE dispatches SET merged_at=? WHERE job_id=?", (NOW.isoformat(), kw["job_id"]))
+            conn_.commit()
+            return types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo", pull_request=12)
+
+        triage._merge.plan_or_land = _land
+        triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _review_result("clean")}
+        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+        assert landed == [1] and triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
+
+
+def test_argo_implement_and_merge_are_rejected_for_a_reverted_item():
+    """Server-side twin of api.py's offer gate: an item with revert_pr set is neither
+    re-implemented nor re-merged, whatever Argo sends."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_pr_item(conn, external_id="sig-argo-reverted", state=triage.STATE_FAILED, pr=13)
+        conn.execute("UPDATE triage_items SET revert_pr=14 WHERE event_id=?", (eid,))
+        conn.commit()
+        submits: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(submits)
+        landed: list[int] = []
+        triage._merge.plan_or_land = lambda *a, **kw: landed.append(1)
+        triage._argo.fetch_actions = lambda machine, **kw: ("ok", [
+            _argo_action("rv-impl", eid, "implement"), _argo_action("rv-merge", eid, "merge")])
+        triage.apply_argo_actions(conn, NOW, dry_run=False)
+        assert [a["status"] for a in ctx.argo_acks] == ["rejected", "rejected"], ctx.argo_acks
+        assert all("revert" in a["error"] for a in ctx.argo_acks), ctx.argo_acks
+        assert submits == [] and landed == [], "nothing may be dispatched or merged"
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED and item["implement_job"] == "impl-sig-argo-reverted", dict(item)
+
+
+def test_strike_on_a_missing_item_raises_instead_of_reporting_a_state():
+    with _triage_env() as (conn, ctx):
+        try:
+            triage._strike(conn, 424242, NOW, "boom", retry_state=triage.STATE_WORKING)
+        except LookupError:
+            pass
+        else:
+            raise AssertionError("expected LookupError")
+
+
+def test_notify_claim_keeps_a_second_process_from_posting_the_same_line():
+    """The loop and the sweep both notify. While one holds the claim, the other posts nothing;
+    exactly one line is posted, and the claim ends as the state itself."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-notify-race", state=triage.STATE_NEEDS_DECISION, note="which?")
+        real = triage.post_line
+        inside: dict[str, Any] = {}
+
+        def _racing_post(channel, text, token, *, thread_ts=None):
+            inside["card_hash"] = triage._get_item(conn, eid)["card_hash"]
+            _notify(conn, eid)              # the other cron, mid-post
+            return real(channel, text, token, thread_ts=thread_ts)
+
+        triage.post_line = _racing_post
+        _notify(conn, eid)
+        assert len(ctx.posted) == 1, ctx.posted
+        assert inside["card_hash"].startswith(f"{triage.NOTIFY_CLAIM_PREFIX}{triage.STATE_NEEDS_DECISION}:"), inside
+        assert triage._get_item(conn, eid)["card_hash"] == triage.STATE_NEEDS_DECISION
+
+
+def test_notify_claim_is_handed_back_on_a_slack_failure_and_retaken_when_stale():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-notify-claim", state=triage.STATE_FIXED, note="done")
+        real = triage.post_line
+        triage.post_line = lambda channel, text, token, *, thread_ts=None: (False, None)
+        _notify(conn, eid)
+        assert triage._get_item(conn, eid)["card_hash"] is None, "a failed post hands the claim back"
+        triage.post_line = real
+
+        fresh = f"{triage.NOTIFY_CLAIM_PREFIX}{triage.STATE_FIXED}:{dt.datetime.now(dt.timezone.utc).isoformat()}"
+        conn.execute("UPDATE triage_items SET card_hash=? WHERE event_id=?", (fresh, eid))
+        conn.commit()
+        _notify(conn, eid)
+        assert ctx.posted == [], "a live claim belongs to the other poster"
+
+        stale = f"{triage.NOTIFY_CLAIM_PREFIX}{triage.STATE_FIXED}:" + (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=triage.NOTIFY_CLAIM_STALE_S + 60)).isoformat()
+        conn.execute("UPDATE triage_items SET card_hash=? WHERE event_id=?", (stale, eid))
+        conn.commit()
+        _notify(conn, eid)
+        assert len(ctx.posted) == 1, "a crashed poster's stale claim is retaken"
+        assert triage._get_item(conn, eid)["card_hash"] == triage.STATE_FIXED
+
+
+def test_a_resolved_answer_is_posted_once_into_its_own_origin_thread():
+    with _triage_env() as (conn, ctx), _argo_url():
+        eid = _seed_item(conn, external_id="sig-answered", state=triage.STATE_CLOSED, note="It is the cron.",
+                         max_tier="investigate", origin="human", origin_channel="C0ORIGIN0001",
+                         origin_thread_ts="1111.000001")
+        _notify(conn, eid)
+        _notify(conn, eid)
+        triage.run(conn, dry_run=False)
+        assert len(ctx.posted) == 1, ctx.posted
+        post = ctx.posted[0]
+        assert post["channel"] == "C0ORIGIN0001" and post["thread_ts"] == "1111.000001", post
+        assert post["text"] == ":speech_balloon: demo-repo: It is the cron. — answered <https://argo.example.test/warden|Argo>", post
+        assert triage._get_item(conn, eid)["card_hash"] == triage.NOTIFY_ANSWERED
+
+
+def test_an_answer_with_no_origin_thread_or_no_answer_tier_stays_out_of_slack():
+    with _triage_env() as (conn, ctx):
+        no_thread = _seed_item(conn, external_id="sig-ans-nothread", state=triage.STATE_CLOSED, note="a",
+                               max_tier="investigate", origin="github_issue")
+        implement_tier = _seed_item(conn, external_id="sig-ans-impl", state=triage.STATE_CLOSED, note="b",
+                                    max_tier="implement", origin_channel="C0ORIGIN0001", origin_thread_ts="1.1")
+        ignored = _seed_item(conn, external_id="sig-ans-ignored", state=triage.STATE_CLOSED, note="c",
+                             max_tier="investigate", origin_channel="C0ORIGIN0001", origin_thread_ts="1.2",
+                             close_reason=triage.CLOSE_IGNORED)
+        for eid in (no_thread, implement_tier, ignored):
+            _notify(conn, eid)
+        triage.run(conn, dry_run=False)
+        assert ctx.posted == [], ctx.posted
+
+
+def test_an_answer_folded_from_an_investigation_reaches_its_origin_thread_and_a_failed_post_is_retried():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-ans-fold", state=triage.STATE_WORKING, dispatch_job="job-ans-fold",
+                         max_tier="investigate", origin="human", origin_channel="C0ORIGIN0001",
+                         origin_thread_ts="2222.000002")
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) "
+                     "VALUES(?,?,?,?,?,?,?)",
+                     ("job-ans-fold", "investigate", "demo-repo", "b", "done",
+                      json.dumps({"summary": "Nothing is wrong.", "nextAction": "none"}), NOW.isoformat()))
+        conn.commit()
+        real = triage.post_line
+        triage.post_line = lambda channel, text, token, *, thread_ts=None: (False, None)
+        triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id="job-ans-fold", now=NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_CLOSED and item["close_reason"] == triage.CLOSE_RESOLVED, dict(item)
+        assert item["card_hash"] is None
+        triage.post_line = real
+        triage.run(conn, dry_run=False)     # the main pass retries the unposted answer
+        assert len(ctx.posted) == 1 and ctx.posted[0]["thread_ts"] == "2222.000002", ctx.posted
+        assert "Nothing is wrong." in ctx.posted[0]["text"] and "— answered" in ctx.posted[0]["text"]
 
 
 if __name__ == "__main__":

@@ -523,9 +523,12 @@ DROP TABLE IF EXISTS dispatch_approvals;
 #   | needs_human, merge_blocked, reverted         | failed (note kept)   |
 #   | fixed                                        | fixed                |
 #   | quiet                                        | quiet                |
-#   | closed                                       | closed, resolved     |
-#   | ignored, dismissed, note                     | closed, ignored      |
+#   | closed, dismissed                            | closed, resolved     |
+#   | ignored, note                                | closed, ignored      |
 #   | snoozed                                      | new                  |
+#
+# `dismissed` was a deadline expiry, never a human judgement, so it maps to `resolved`
+# (a recurrence reopens it) and not to `ignored` (a human's "this is noise", which stays).
 #
 # `close_reason` is only written on triage_items (history has no reason column).
 #
@@ -534,7 +537,8 @@ DROP TABLE IF EXISTS dispatch_approvals;
 # `notify_cluster()` posts when an item is in `fixed`/`needs_decision` and
 # `card_hash` differs from that state). Every item already `fixed` has been dealt
 # with, so it is stamped `fixed` here — otherwise the first pass on this schema would
-# announce the whole backlog.
+# announce the whole backlog. The same goes for a `closed` item with its own origin thread:
+# it is answered there once (state `answered`), and every one already closed has been.
 _STATE_MAP_13 = {
     "new": "new", "split": "triaged",
     "investigating": "working", "verdict": "working", "implementing": "working", "remediating": "working",
@@ -566,10 +570,11 @@ ALTER TABLE triage_items ADD COLUMN close_reason TEXT;
 ALTER TABLE triage_items ADD COLUMN strikes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE triage_items ADD COLUMN retry_at TEXT;
 UPDATE triage_items SET
-  close_reason = CASE state WHEN 'closed' THEN 'resolved' WHEN 'ignored' THEN 'ignored'
-                            WHEN 'dismissed' THEN 'ignored' WHEN 'note' THEN 'ignored' END,
+  close_reason = CASE state WHEN 'closed' THEN 'resolved' WHEN 'dismissed' THEN 'resolved'
+                            WHEN 'ignored' THEN 'ignored' WHEN 'note' THEN 'ignored' END,
   state = {_case_13("state")};
 UPDATE triage_items SET card_hash = 'fixed' WHERE state = 'fixed';
+UPDATE triage_items SET card_hash = 'answered' WHERE state = 'closed' AND origin_channel IS NOT NULL;
 UPDATE item_transitions SET
   from_state = {_case_13("from_state")},
   to_state = {_case_13("to_state")};

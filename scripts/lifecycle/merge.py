@@ -157,22 +157,21 @@ class MergeResult:
 def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation: str | None) -> None:
     """Checks green — or none exist, which passes — and the step-7 review
     `confirmed`. "PR open" is read off the pull request by `plan_or_land()`."""
-    bad_runs = [
-        str(r.get("name")) for r in check_runs
+    bad = [
+        r for r in check_runs
         if r.get("status") != "completed"
         or r.get("conclusion") not in ("success", "neutral", "skipped")
     ]
-    if bad_runs:
-        # Every non-green run still running (queued/in progress), none failed:
-        # that is waiting, not a refusal.
-        if all(r.get("status") != "completed" for r in check_runs
-               if str(r.get("name")) in bad_runs):
-            raise ChecksPending(
-                f"{repo}'s CI is still running on the head commit: {', '.join(bad_runs)}."
-            )
-        raise PolicyError(
-            f"{repo}'s CI has not passed cleanly on the head commit: {', '.join(bad_runs)}."
-        )
+    if bad:
+        names = ", ".join(str(r.get("name")) for r in bad)
+        # Decided on the very runs that are bad, never by re-filtering on name: two
+        # runs can share a name (a re-run), and a completed-green one must not
+        # make a still-running one read as failed.
+        if all(r.get("status") != "completed" for r in bad):
+            # Every non-green run still running (queued/in progress), none failed:
+            # that is waiting, not a refusal.
+            raise ChecksPending(f"{repo}'s CI is still running on the head commit: {names}.")
+        raise PolicyError(f"{repo}'s CI has not passed cleanly on the head commit: {names}.")
 
     if validation != "confirmed":
         raise PolicyError(

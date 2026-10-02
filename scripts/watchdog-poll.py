@@ -7,7 +7,11 @@ the failure class behind the 2026-08-01 outage, instead of inferring it hours
 later from silent heartbeats), and stray agent-created skills under
 ~/.hermes/skills/ (untracked, unreviewed — the failure class behind the
 2026-08-02 skill-sprawl cleanup). Reconciles against ~/.hermes/watchdog.db
-(SQLite). Emits NEW=, RESOLVED= blocks for the LLM cron prompt.
+(SQLite). Posts nothing to Slack: the New/Resolved raw-event digest is gone (a
+warden item reaches Slack only as `fixed`/`needs_decision`, triage.py's
+notify_cluster(); everything else lives in Argo). What stays is the poller's own
+health: the blind-Slack-poll alarm on stderr and the exit code, and the UptimeKuma
+heartbeat on a clean run.
 
 Source of truth: ~/SourceRoot/warden/scripts/watchdog-poll.py
 ~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
@@ -54,27 +58,15 @@ assert _ledger_spec and _ledger_spec.loader, "Failed to load scripts/ledger.py"
 _ledger = importlib.util.module_from_spec(_ledger_spec)
 _ledger_spec.loader.exec_module(_ledger)
 
-# scripts/slack_client.py — same by-path loading mechanism, the same shim
-# triage.py and dispatch-sweep.py already load: the plain Slack Web API HTTP
-# client (scripts/clients/slack.py) this file's own _slack_call() shares its
-# request construction with below.
-_SLACK_CLIENT_PATH = Path(__file__).resolve().parent / "slack_client.py"
-_slack_client_spec = importlib.util.spec_from_file_location("slack_client", _SLACK_CLIENT_PATH)
-assert _slack_client_spec and _slack_client_spec.loader, "Failed to load scripts/slack_client.py"
-_slack_client = importlib.util.module_from_spec(_slack_client_spec)
-_slack_client_spec.loader.exec_module(_slack_client)
-
 # scripts/ (this file's own directory) onto sys.path so `clients` is
 # importable as a real package — the same reason triage.py and
-# dispatch-sweep.py do this (slack_client.py's own load above already does
-# it too, but this makes the precondition explicit for the import below).
+# dispatch-sweep.py do this.
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from clients import secrets as _secrets  # noqa: E402
 
-STATE_PATH = HERMES_HOME / "scripts" / "briefing-state.json"
 JOBS_PATH = HERMES_HOME / "cron" / "jobs.json"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 SKILLS_DIR = HERMES_HOME / "skills"
@@ -83,22 +75,8 @@ SKILL_USAGE_PATH = SKILLS_DIR / ".usage.json"
 
 API_BASE = "https://argo.jkrumm.com/api"
 GH_OWNER = "jkrumm"
-# `gh search --owner` filters by repo OWNER, never by item AUTHOR — every repo
-# here is public, so anyone can open an issue/PR and have its title enter the
-# agent loop. Only this login is self-authored/trusted; anything else (or an
-# unparseable/missing author) is fail-closed third-party. See _github_author.
-TRUSTED_GH_LOGIN = GH_OWNER
-
 CH_ALERTS = "C0AS1LAUQ3C"
 CH_UPDATES = "C0ARZJD824W"
-
-# Where the composed NEW/RESOLVED digest itself is delivered — not one
-# of the two channels polled above. Matches the retiring gateway cron job's
-# `"deliver": "slack:C0ASRULFTSS"` (hermes-agent cron/jobs.json, job
-# 4b1faabda97d, "Watchdog"); this constant is what replaces that gateway-side
-# delivery target now that the poller posts for itself instead of relying on
-# the gateway to deliver its stdout.
-WATCHDOG_CHANNEL = os.environ.get("WATCHDOG_SLACK_CHANNEL", "C0ASRULFTSS")
 
 # Same env-first, absolute-default shape as triage.py's GH_BIN: launchd hands
 # this job PATH=/usr/bin:/bin, where a bare `gh` does not exist.
@@ -139,10 +117,6 @@ LOG_RECENT_HOURS = 6  # log lines older than this are ignored even on first run
 # the model to `…-does-not-exist` so the endpoint is guaranteed to 404, proving
 # the fallback chain engages. Matched on the raw log line — see poll_hermes_logs().
 PROBE_SENTINEL_RE = re.compile(r"model\s+'[^']*-does-not-exist'")
-
-QUIET_START_H = 0
-QUIET_END_H = 7
-
 
 # Probes whether the shared .env.tpl on each host still fully resolves — the
 # root cause of the 2026-08-01 outage: `op run --env-file=... -- <script>` (every
@@ -215,28 +189,7 @@ _CACHE_REFS: dict[str, str] = {
     "GITHUB_TOKEN": "op://hermes/github/token",
     "HOMELAB_API_KEY": "op://common/api/SECRET",
     "UPTIME_PUSH_WATCHDOG": "op://hermes/uptime-kuma/watchdog-push-url",
-    # The Hermes fallback ref triage.py's resolve_slack_token() also carries
-    # (its _SLACK_TOKEN_REF) — kept in sync by hand, the same way that file's
-    # own Slack helpers are hand-mirrored rather than imported (see its
-    # "Reused, not reimplemented" note). Used here ONLY through
-    # resolve_alerts_read_token() below, never through resolve_slack_token()'s
-    # own Warden-first resolution — see that function's docstring for why.
-    "SLACK_BOT_TOKEN": "op://hermes/slack/bot-token",
 }
-
-
-def resolve_alerts_read_token() -> str:
-    """Pinned to the Hermes identity — env `SLACK_BOT_TOKEN`, else
-    `secrets-run read op://hermes/slack/bot-token` — deliberately never
-    Warden's own app (`scripts/clients/slack.py`'s `resolve_slack_token()`,
-    which now tries Warden's `WARDEN_BOT_TOKEN` first). The digest this
-    poller composes summarizes Slack history read via the homelab API
-    (`poll_slack_messages()`, `HOMELAB_API_KEY`, itself proxying to Slack's
-    own `conversations.history` with read scopes Warden's `chat:write`-only
-    app does not have and is not meant to), so posting that digest under a
-    second identity would fragment one feed across two apps for zero
-    benefit — this whole read-then-digest path stays Hermes end to end."""
-    return resolve_secret("SLACK_BOT_TOKEN")
 
 
 def resolve_secret(key: str) -> str:
@@ -269,32 +222,6 @@ def load_env() -> dict[str, str]:
     return env
 
 
-def load_state() -> dict[str, Any]:
-    try:
-        return json.loads(STATE_PATH.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def in_quiet_hours(state: dict[str, Any]) -> bool:
-    tz_name = state.get("timezone") or "Europe/Berlin"
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("Europe/Berlin")
-    return QUIET_START_H <= dt.datetime.now(tz).hour < QUIET_END_H
-
-
-def vacation_active(state: dict[str, Any]) -> bool:
-    vu = state.get("vacation_until")
-    if not vu:
-        return False
-    try:
-        return dt.date.today() <= dt.date.fromisoformat(vu)
-    except ValueError:
-        return False
-
-
 def http_get(url: str, headers: dict[str, str] | None = None, timeout: int = 15) -> Any:
     req = urllib.request.Request(url, headers=headers or {})
     try:
@@ -302,37 +229,6 @@ def http_get(url: str, headers: dict[str, str] | None = None, timeout: int = 15)
             return json.loads(resp.read().decode())
     except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError) as e:
         return {"_error": str(e)}
-
-
-# --- Slack delivery --------------------------------------------------------
-#
-# A plain HTTP client, mirroring triage.py's _slack_call()/post_blocks() shape
-# exactly — never the gateway's live slack_bolt connection. That is the
-# property that lets this poller deliver its own digest once it runs as its
-# own LaunchAgent instead of as a gateway cron job whose stdout the gateway
-# posts on its behalf.
-SLACK_POST_URL = "https://slack.com/api/chat.postMessage"
-
-
-def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, str | None]:
-    """Transport is clients/slack.py's shared slack_raw_post() (loaded above
-    as _slack_client); this wrapper owns only the return-shape and the
-    "watchdog:"-prefixed stderr line."""
-    data = _slack_client.slack_raw_post(url, payload, token)
-    if data is None:
-        return False, None
-    ok = bool(data.get("ok"))
-    if not ok:
-        print(f"watchdog: slack call failed: {data.get('error', 'unknown')}", file=sys.stderr)
-    return ok, data.get("ts")
-
-
-def post_text(channel: str, text: str, token: str) -> tuple[bool, str | None]:
-    return _slack_call(
-        SLACK_POST_URL,
-        {"channel": channel, "text": text, "unfurl_links": False},
-        token,
-    )
 
 
 def db_connect() -> sqlite3.Connection:
@@ -1116,137 +1012,6 @@ def resolve_stale_github_issue_events(conn: sqlite3.Connection, now: dt.datetime
     return cur.rowcount
 
 
-SOURCE_EMOJI = {
-    "uk": ":satellite_antenna:",
-    "docker_homelab": ":whale:",
-    "docker_vps": ":whale:",
-    "github_pr": ":cat:",
-    "slack_alert": ":mega:",
-    "slack_update": ":package:",
-    "hermes_cron": ":robot_face:",
-    "hermes_log": ":bug:",
-    "op_refs_homelab": ":key:",
-    "op_refs_vps": ":key:",
-    "stray_skill": ":ghost:",
-}
-
-SECTION_CAP = 8
-
-
-def _github_author(item: dict[str, Any]) -> str | None:
-    """Read the author login stashed in payload_json by poll_github. Rows
-    written before this key existed (or a corrupt/unparseable payload) return
-    None — same fail-closed treatment as a missing author, i.e. third-party."""
-    try:
-        payload = json.loads(item.get("payload_json") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload.get("author")
-
-
-def _render_bullet(item: dict[str, Any], now: dt.datetime) -> str:
-    """Returns a single Slack-mrkdwn line, no leading dash."""
-    src = item.get("source", "?")
-    emoji = SOURCE_EMOJI.get(src, ":grey_question:")
-    title = (item.get("title") or "?").strip()
-    url = (item.get("url") or "").strip()
-
-    # source-specific body
-    if src == "github_pr":
-        ext = (item.get("external_id") or "").strip()
-        # Strip owner from "owner/repo#N" — display as "repo#N".
-        if "/" in ext:
-            ext = ext.split("/", 1)[1]
-        body = f"{emoji} {title}"
-        suffix_bits = []
-        if ext:
-            suffix_bits.append(f"`{ext}`")
-        if url:
-            suffix_bits.append(f"<{url}>")
-        if suffix_bits:
-            body += f" ({', '.join(suffix_bits)})"
-        # gh search --owner filters by repo OWNER, never item AUTHOR, and every
-        # repo is public — anyone can open a PR here. Mark non-self items
-        # unmistakably so neither Hermes nor Johannes mistakes
-        # attacker-controlled text for his own note (claude-dispatch can pick
-        # a stale PR as a dispatch trigger, which would hand the attacker's
-        # own body to a live Claude Code episode — prompt injection).
-        author = _github_author(item)
-        if author != TRUSTED_GH_LOGIN:
-            who = author or "unknown"
-            body = f":warning: THIRD-PARTY (@{who}) — untrusted, do not dispatch on this without Johannes\n{body}"
-    elif src.startswith("docker_"):
-        host = "homelab" if src == "docker_homelab" else "vps"
-        # Docker titles end with " (homelab)" or " (vps)" — strip to avoid duplication
-        # since we already render "on <host>".
-        cleaned = re.sub(r"\s*\((?:homelab|vps)\)\s*$", "", title)
-        body = f"{emoji} {cleaned} on {host}"
-    else:
-        body = f"{emoji} {title}"
-        if url:
-            body += f" (<{url}>)"
-
-    return body
-
-
-def _render_section(label: str, header_emoji: str, items: list[dict[str, Any]],
-                    now: dt.datetime) -> list[str]:
-    if not items:
-        return []
-    lines = [f"{header_emoji} **{label}**"]
-    capped = items[:SECTION_CAP]
-    overflow = len(items) - len(capped)
-    for it in capped:
-        lines.append(f"- {_render_bullet(it, now)}")
-    if overflow > 0:
-        lines.append(f"- … and {overflow} more")
-    return lines
-
-
-def compose_slack_body(
-    new: list[dict[str, Any]],
-    resolved: list[dict[str, Any]],
-    *,
-    quiet: bool,
-    vacation: bool,
-    now: dt.datetime,
-) -> str:
-    """Returns the Slack mrkdwn message body, or empty string for suppression.
-
-    Under `--post` (the `com.jkrumm.warden-poll` LaunchAgent's production
-    path), an empty return means no Slack call is made at all — silent by
-    design, not an error.
-    """
-    if quiet or vacation:
-        return ""
-    if not new and not resolved:
-        return ""
-
-    sections: list[list[str]] = []
-    if new:
-        sections.append(_render_section("New", ":rotating_light:", new, now))
-    if resolved:
-        sections.append(_render_section("Resolved", ":white_check_mark:", resolved, now))
-
-    return "\n\n".join("\n".join(sec) for sec in sections)
-
-
-def fmt_block(label: str, items: list[dict[str, Any]]) -> str:
-    if not items:
-        return f"{label}=[]"
-    lines = [f"{label}=["]
-    for it in items:
-        src = it.get("source", "?")
-        title = it.get("title", "?")
-        url = it.get("url") or ""
-        suffix = f" ({url})" if url else ""
-        lines.append(f"  - [{src}] {title}{suffix}")
-    lines.append("]")
-    return "\n".join(lines)
-
-
 def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
               deliver: bool = True) -> tuple[list[dict], list[dict]]:
     """Run the full polling pipeline against `conn`. Returns (new, resolved).
@@ -1438,24 +1203,19 @@ def record_heartbeat(conn: sqlite3.Connection, *,
 
 
 def main(argv: list[str] | None = None) -> int:
+    """One poll pass. `--post` is what the LaunchAgent passes: on a clean run (rc == 0) it
+    pings the UptimeKuma push monitor, which is the only thing that notices this poller
+    itself has died. `--dry-run` polls a temp copy of the ledger and writes, pings and posts
+    nothing. Nothing is ever posted to Slack from here.
+
+    rc is 1 while a Slack source is blind (SLACK_FAIL_STREAK_ALERT consecutive failed
+    polls), reported on stderr, so the heartbeat is withheld and Kuma raises it."""
     args = set(argv if argv is not None else sys.argv[1:])
     post = "--post" in args
-    # --post implies --slack-body: it composes the same digest, it just
-    # delivers it itself instead of printing it for a caller to deliver.
-    emit_slack_body = "--slack-body" in args or post
     dry_run = "--dry-run" in args
 
     env = load_env()
-    state = load_state()
-    quiet = in_quiet_hours(state)
-    vacation = vacation_active(state)
-    # compose_slack_body() suppresses on either, so tell the poll up front rather
-    # than letting it stamp notifications for a message that will never be sent.
-    # --slack-body is the production path; the block-printing path below always
-    # delivers to its caller, so it stays deliver=True.
-    deliver = not (quiet or vacation) if emit_slack_body else True
     now = dt.datetime.now(dt.timezone.utc)
-    now_iso = now.isoformat()
 
     if dry_run:
         # Run poll against a temp copy of the DB so we don't advance notified_at
@@ -1471,7 +1231,7 @@ def main(argv: list[str] | None = None) -> int:
         DB_PATH = tmp_db
         try:
             conn = db_connect()
-            all_new, all_res = _run_poll(conn, now, env, deliver=deliver)
+            all_new, all_res = _run_poll(conn, now, env)
             conn.commit()
             slack_blind = slack_poll_failure(conn)
             conn.close()
@@ -1487,65 +1247,28 @@ def main(argv: list[str] | None = None) -> int:
                 "the loop migrates at its next tick",
                 file=sys.stderr,
             )
-            if post and not dry_run:
+            # The Kuma monitor measures "is the poller alive", not "did the ledger
+            # open": a pass deliberately skipped during a migration window is a
+            # live poller.
+            if post:
                 _push_uptime_heartbeat()
             return 0
-        all_new, all_res = _run_poll(conn, now, env, deliver=deliver)
+        all_new, all_res = _run_poll(conn, now, env)
         conn.commit()
         slack_blind = slack_poll_failure(conn)
         record_heartbeat(conn, new_count=len(all_new),
                          resolved_count=len(all_res), slack_blind=bool(slack_blind))
         conn.close()
 
-    # stderr, never stdout: --post delivers the digest itself via chat.postMessage,
-    # so stdout carries no message for anything to consume.
     if slack_blind:
         print(slack_blind, file=sys.stderr)
-
-    if emit_slack_body:
-        body = compose_slack_body(all_new, all_res,
-                                  quiet=quiet, vacation=vacation, now=now)
-        rc = 1 if slack_blind else 0
-
-        if post:
-            # --dry-run beats --post, always: compose as usual, make zero
-            # Slack calls (and no heartbeat — that is a network call too),
-            # print what would have been sent, and stop.
-            if dry_run:
-                print(f"[dry-run] would post {len(body)} chars to {WATCHDOG_CHANNEL}", file=sys.stderr)
-                return rc
-            # An empty body is the NORMAL case — quiet hours, vacation, or simply
-            # nothing new — and compose_slack_body() already made that call, so
-            # posting nothing is not an error. Note what this branch must NOT do:
-            # skip the heartbeat. The monitor this feeds answers "is the poller
-            # still running", not "did the poller have news"; treating a quiet poll
-            # as a missed heartbeat would page on every silent half hour and train
-            # the alert to be ignored — which is how an eleven-day blindness goes
-            # unnoticed in the first place. The retiring wrapper pinged on rc == 0
-            # regardless of whether a body was printed, and that is the behaviour.
-            if body:
-                token = resolve_alerts_read_token()
-                if not token:
-                    print("watchdog: no Slack token, cannot post digest", file=sys.stderr)
-                    return 1
-                ok, _ = post_text(WATCHDOG_CHANNEL, body, token)
-                if not ok:
-                    print("watchdog: slack post failed, digest not delivered", file=sys.stderr)
-                    return 1
-            if rc == 0:
-                _push_uptime_heartbeat()
-            return rc
-
-        if body:
-            print(body)
-        return rc
-
-    print(f"QUIET_HOURS={'true' if quiet else 'false'}")
-    print(f"VACATION={'true' if vacation else 'false'}")
-    print(f"NOW={now_iso}")
-    print(fmt_block("NEW", all_new))
-    print(fmt_block("RESOLVED", all_res))
-    return 1 if slack_blind else 0
+    rc = 1 if slack_blind else 0
+    # The ping answers "is the poller still running", not "did it have news": a quiet
+    # poll is the normal case and must still ping, or the alert pages on every silent
+    # half hour and gets ignored — which is how an eleven-day blindness goes unnoticed.
+    if post and not dry_run and rc == 0:
+        _push_uptime_heartbeat()
+    return rc
 
 
 if __name__ == "__main__":

@@ -178,9 +178,38 @@ def test_submit_connection_refused_raises_remote_error():
     try:
         sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
     except RemoteError as e:
-        assert e.maybe_mutated is True, "a submit failure is ambiguous, must be flagged"
+        assert e.maybe_mutated is False, "connection refused is definitive: nothing was sent, a retry is safe"
     else:
         raise AssertionError("expected RemoteError")
+
+
+def test_submit_timeout_is_ambiguous_and_flagged_maybe_mutated():
+    real = sideclaw._request
+    def _timeout(*a, **kw):
+        raise TimeoutError("timed out")
+    sideclaw._request = _timeout
+    try:
+        sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
+    except RemoteError as e:
+        assert e.maybe_mutated is True, "a timeout may have landed — must be flagged"
+    else:
+        raise AssertionError("expected RemoteError")
+    finally:
+        sideclaw._request = real
+
+
+def test_submit_5xx_is_definitive_and_not_maybe_mutated():
+    srv = _StubServer({("POST", "/api/jobs"): (503, {"error": "busy"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
+        except RemoteError as e:
+            assert e.maybe_mutated is False, e.maybe_mutated
+        else:
+            raise AssertionError("expected RemoteError")
+    finally:
+        srv.stop()
 
 
 def test_submit_no_id_raises_remote_error():
@@ -191,6 +220,7 @@ def test_submit_no_id_raises_remote_error():
             sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
         except RemoteError as e:
             assert "no id" in str(e), e
+            assert e.maybe_mutated is True, "a 200 means the job exists — a retry would duplicate it"
         else:
             raise AssertionError("expected RemoteError")
     finally:

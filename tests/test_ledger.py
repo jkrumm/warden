@@ -879,7 +879,7 @@ _OLD_TO_NEW = {
     "needs_human": ("failed", None), "merge_blocked": ("failed", None), "reverted": ("failed", None),
     "fixed": ("fixed", None), "quiet": ("quiet", None),
     "closed": ("closed", "resolved"),
-    "ignored": ("closed", "ignored"), "dismissed": ("closed", "ignored"), "note": ("closed", "ignored"),
+    "ignored": ("closed", "ignored"), "dismissed": ("closed", "resolved"), "note": ("closed", "ignored"),
     "snoozed": ("new", None),
 }
 
@@ -947,6 +947,33 @@ def test_migration_13_maps_every_old_state_and_close_reason_and_rewrites_history
         assert _table_columns(fresh, table) == _table_columns(conn, table), (
             f"{table}: a v12-upgraded schema diverges from a fresh one")
     fresh.close()
+    conn.close()
+
+
+def test_migration_13_maps_dismissed_to_resolved_so_a_recurrence_resurfaces_it():
+    """`dismissed` was a deadline expiry, not a human judgement: it must land `resolved` (which
+    reopen_if_needed() reopens on a recurrence), while a human's `ignored`/`note` stay `ignored`."""
+    path = _tmp_path()
+    _v12_database(path, ["dismissed", "ignored", "note"])
+    conn = ledger.connect(path, migrate=True)
+    reasons = {r["note"]: (r["state"], r["close_reason"]) for r in conn.execute("SELECT note, state, close_reason FROM triage_items")}
+    assert reasons == {"note-dismissed": ("closed", "resolved"), "note-ignored": ("closed", "ignored"),
+                       "note-note": ("closed", "ignored")}, reasons
+    conn.close()
+
+
+def test_migration_13_stamps_answered_on_closed_items_with_an_origin_thread():
+    """A closed item with its own origin thread has been answered there already; stamping
+    `answered` keeps the first pass on the new schema from re-announcing the backlog."""
+    path = _tmp_path()
+    _v12_database(path, ["closed", "closed", "fixed"])
+    raw = sqlite3.connect(path)
+    raw.execute("UPDATE triage_items SET origin_channel='C0ORIGIN0001' WHERE event_id=1")
+    raw.commit()
+    raw.close()
+    conn = ledger.connect(path, migrate=True)
+    hashes = {r["event_id"]: r["card_hash"] for r in conn.execute("SELECT event_id, card_hash FROM triage_items")}
+    assert hashes == {1: "answered", 2: "sha-of-an-old-card", 3: "fixed"}, hashes
     conn.close()
 
 

@@ -16,8 +16,11 @@ reason, as `_set_state()`'s own docstring.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sqlite3
 from typing import Any
+
+import ledger
 
 # Closed allowlist of extra columns a caller may set alongside `state` and
 # `note` — column names reach SQL here, so the list stays closed on purpose,
@@ -41,6 +44,60 @@ def cap_note(note: str | None) -> str | None:
     if len(text) <= NOTE_MAX:
         return text
     return text[: NOTE_MAX - 1] + "…"
+
+
+def _payload(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def occurrence_mark(event: sqlite3.Row | dict[str, Any] | None) -> str | None:
+    """An opaque fingerprint of which occurrences `event` has produced so far,
+    for triage.py's reopen_if_needed() to compare with `!=` — never with `>` or `MAX()`.
+
+    Five `|`-separated slots, each the raw string value (empty for None/missing),
+    in fixed position:
+
+        payload_json->$.ts_last | last_reminder_at | notified_at | first_seen | reminder_count
+
+    Slot 1 (grouped sources only, via a guarded json.loads() — never SQL json_extract, so
+    a malformed payload degrades to "absent" instead of raising) is a Slack
+    `ts` float-string ("1788850795.862159"). Slots 2-4 are ISO-8601
+    ("2026-09-08T07:00:20..."). These are TWO DIFFERENT CLOCKS IN TWO DIFFERENT
+    FORMATS — a `MAX()` or `>` across them is a lexical compare of "1788…"
+    against "2026…" that reads as correct and is not. Fixed slots plus whole-
+    string equality never compares one clock against the other.
+
+    All five slots are required, not redundant with each other:
+    watchdog-poll.py's upsert_grouped() re-stamps last_reminder_at/notified_at
+    ONLY when it emits (cooldown-gated) — a suppressed occurrence moves only
+    payload_json.ts_last. A state source has no ts_last at all; its reopen
+    signal is watchdog-poll.py:878 resetting resolved_at=NULL, first_seen=<now>,
+    notified_at=NULL, last_reminder_at=NULL, reminder_count=0 on that same
+    UPDATE — which moves the ISO slots. Every slot moves only on a genuine
+    occurrence, or on that reopen reset (itself a genuine occurrence). Title
+    and URL churn is deliberately NOT in the mark.
+
+    Returns None if `event` is None — reopen_if_needed() reads this as "no
+    event row", which cannot happen for a joined query but keeps the function
+    total rather than partial."""
+    if event is None:
+        return None
+    payload = _payload(event["payload_json"])
+    ts_last = payload.get("ts_last")
+    slots = (
+        ts_last if isinstance(ts_last, str) else "",
+        event["last_reminder_at"] or "",
+        event["notified_at"] or "",
+        event["first_seen"] or "",
+        str(event["reminder_count"] if event["reminder_count"] is not None else ""),
+    )
+    return "|".join(slots)
 
 
 def _now_iso(now: dt.datetime) -> str:
@@ -69,8 +126,8 @@ def transition(
     # `closed` always carries its reason; every other state clears it — the same
     # invariant triage.py's `_set_state()` enforces.
     if to_state == "closed":
-        if not extra.get("close_reason"):
-            raise ValueError("a `closed` transition must carry extra={'close_reason': ...}")
+        if extra.get("close_reason") not in ledger.CLOSE_REASONS:
+            raise ValueError(f"a `closed` transition must carry extra={{'close_reason': one of {ledger.CLOSE_REASONS}}}")
     else:
         extra = {**extra, "close_reason": None}
 
@@ -79,8 +136,13 @@ def transition(
 
     # card_hash records the state a Slack line was posted for; entering a different state
     # clears it so a later re-entry posts again (triage.py `notify_cluster()`).
-    sql = "UPDATE triage_items SET state=?, note=?, updated_at=?, card_hash=CASE WHEN state=? THEN card_hash END"
-    params: list[Any] = [to_state, note, _now_iso(now), to_state]
+    # Stamped on EVERY transition, exactly as triage.py's `_set_state()` does: a human
+    # `warden close` must record the occurrence it closed against, or reopen_if_needed()
+    # reads the stale mark as a fresh occurrence and undoes it.
+    event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+    sql = ("UPDATE triage_items SET state=?, note=?, updated_at=?, occurrence_mark=?, "
+           "card_hash=CASE WHEN state=? THEN card_hash END")
+    params: list[Any] = [to_state, note, _now_iso(now), occurrence_mark(event), to_state]
     for col, value in extra.items():
         sql += f", {col}=?"
         params.append(value)

@@ -212,6 +212,9 @@ def test_bare_invocation_prints_help_and_exits_zero():
     proc = h.run([])
     assert proc.returncode == 0, proc
     assert "dispatch <repo>" in proc.stdout
+    assert "--reason resolved|ignored" in proc.stdout.split("Global flags")[1], "the flags line names --reason"
+    assert "close <event-id>" in proc.stdout and "--reason" in [
+        ln for ln in proc.stdout.splitlines() if "close <event-id>" in ln][0], "the close verb line names --reason"
 
 
 # --- argument bounding ---------------------------------------------------------
@@ -485,6 +488,17 @@ def test_run_record_round_trip():
     assert out["maxTier"] == "investigate" and out["queued"] is False
     assert out["jobId"] == "job-run-rt" and out["state"] == "working"
     assert out["eventId"] is not None
+
+
+def test_run_text_output_prints_the_real_state_not_a_stale_literal():
+    h = Harness()
+    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-txt", "status": "running"}})})
+    try:
+        proc = h.run(["run", "alpha"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    assert proc.returncode == 0, proc
+    assert "working — job job-run-txt" in proc.stdout and "investigating" not in proc.stdout, proc.stdout
 
 
 def test_run_with_origin_channel_and_thread_carries_onto_the_dispatch_row():
@@ -939,7 +953,7 @@ def test_revert_records_the_pr_and_leaves_the_item_failed():
     conn, _ = _connect(db)
     row = _row(conn, "SELECT state, revert_pr, note, close_reason FROM triage_items WHERE event_id=7")
     assert row["state"] == "failed" and row["revert_pr"] == 11, dict(row)
-    assert row["note"] == "reverted: PR #11" and row["close_reason"] is None, dict(row)
+    assert row["note"] == "reverted by PR #11: regressed" and row["close_reason"] is None, dict(row)
     conn.close()
 
 
@@ -986,6 +1000,33 @@ def test_close_from_needs_decision_writes_closed_resolved_and_a_transition_row()
         conn, "SELECT from_state, to_state FROM item_transitions WHERE event_id=20 ORDER BY id DESC LIMIT 1"
     )
     assert trans["from_state"] == "needs_decision" and trans["to_state"] == "closed", dict(trans)
+    conn.close()
+
+
+def test_close_reason_ignored_is_recorded_and_default_stays_resolved():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 30, state="needs_decision", repo="gamma")
+    _seed_item(db, 31, state="needs_decision", repo="gamma")
+    proc = h.run(["close", "30", "--why", "noise", "--reason", "ignored", "--json"], env=h.base_env(db=db))
+    assert proc.returncode == 0, _json_or_fail(proc)
+    proc = h.run(["close", "31", "--why", "dealt with", "--json"], env=h.base_env(db=db))
+    assert proc.returncode == 0, _json_or_fail(proc)
+    conn, _ = _connect(db)
+    reasons = {r["event_id"]: r["close_reason"] for r in conn.execute("SELECT event_id, close_reason FROM triage_items")}
+    assert reasons[30] == "ignored" and reasons[31] == "resolved", reasons
+    conn.close()
+
+
+def test_close_with_an_unknown_reason_is_usage_error_and_writes_nothing():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 32, state="needs_decision", repo="gamma")
+    for bad in ("duplicate", "bogus"):
+        proc = h.run(["close", "32", "--why", "x", "--reason", bad, "--json"], env=h.base_env(db=db))
+        assert proc.returncode == 64, _json_or_fail(proc)
+    conn, _ = _connect(db)
+    assert _row(conn, "SELECT state FROM triage_items WHERE event_id=32")["state"] == "needs_decision"
     conn.close()
 
 

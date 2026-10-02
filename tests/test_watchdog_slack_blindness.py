@@ -136,13 +136,12 @@ conn.commit()
 # UptimeKuma heartbeat. Stub the poll itself — the wiring is what is under test.
 wp._run_poll = lambda *a, **k: ([], [])
 wp.load_env = lambda: ENV
-wp.load_state = lambda: {}
-check("main() exits 1 while blind", wp.main(["--slack-body"]), 1)
+check("main() exits 1 while blind", wp.main([]), 1)
 
 for src in ("slack_alert", "slack_update"):
     wp.cursor_set(conn, f"{src}_fail_streak", "0", NOW_ISO)
 conn.commit()
-check("main() exits 0 once reads recover", wp.main(["--slack-body"]), 0)
+check("main() exits 0 once reads recover", wp.main([]), 0)
 
 conn.close()
 wp.http_get = original

@@ -5,8 +5,9 @@
   <key>Label</key><string>com.jkrumm.warden-poll</string>
   <!-- The ingest poller. Polls UptimeKuma, Docker (homelab + vps), GitHub,
        Slack #alerts/#updates, Hermes self-state, 1Password ref health, and
-       stray agent-created skills; reconciles into the ledger and composes the
-       NEW/RESOLVED digest.
+       stray agent-created skills and reconciles them into the ledger. It posts
+       nothing to Slack: items reach Slack only as fixed/needs_decision
+       (triage.py's notify_cluster()), everything else lives in Argo.
 
        Was gateway cron job 4b1faabda97d ("Watchdog", */30, no_agent: true):
        the gateway invoked watchdog-slack.py, which loaded this module, called
@@ -17,14 +18,9 @@
        2026-09-07 while the loop kept ticking against a ledger that had stopped
        receiving signals.
 
-       A LaunchAgent has no stdout consumer, so the move required more than a
-       plist: this poller now delivers its own digest via a plain HTTP
-       chat.postMessage (--post, see scripts/watchdog-poll.py's post_text()),
-       never the gateway's live connection — the same property that makes the
-       act-loop (com.jkrumm.warden-loop) safe to run independently. Its cron
-       wrapper (watchdog-slack.py) is not a pure orphan: the UptimeKuma
-       self-health heartbeat it carried on a clean run is ported into main()
-       itself, fired only outside --dry-run. -->
+       --post makes a clean run ping the UptimeKuma self-health heartbeat (the
+       one thing that notices this poller died); it is withheld while Slack
+       polling is blind and under --dry-run. -->
   <key>ProgramArguments</key>
   <array>
     <string>__HOME__/SourceRoot/warden/.venv/bin/python3</string>

@@ -122,8 +122,14 @@ def submit(
 
     try:
         status, text = _request("POST", "/api/jobs", body)
-    except (urllib.error.URLError, TimeoutError, OSError):
-        # A timeout on submit is ambiguous — the POST may have landed.
+    except urllib.error.URLError as e:
+        # Connection refused is definitive: nothing was sent, so a retry cannot duplicate.
+        # Anything else (a timeout, a reset) is ambiguous — the POST may have landed.
+        raise RemoteError(
+            f"sideclaw job submit failed (is the LaunchAgent up? curl {_base()}/health)",
+            maybe_mutated=not isinstance(e.reason, ConnectionRefusedError),
+        )
+    except (TimeoutError, OSError):
         raise RemoteError(
             f"sideclaw job submit failed (is the LaunchAgent up? curl {_base()}/health)",
             maybe_mutated=True,
@@ -131,14 +137,16 @@ def submit(
 
     _raise_for_submit_status(status, text)
 
+    # From here sideclaw answered 200: the job EXISTS, whatever the body says.
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
+        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}",
+                          maybe_mutated=True)
 
     job = parsed.get("job") if isinstance(parsed, dict) else None
     if not isinstance(job, dict) or "id" not in job:
-        raise RemoteError("sideclaw accepted the job but returned no id")
+        raise RemoteError("sideclaw accepted the job but returned no id", maybe_mutated=True)
     return job
 
 

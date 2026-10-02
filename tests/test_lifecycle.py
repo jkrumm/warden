@@ -583,7 +583,7 @@ def test_open_episode_remote_error_marks_operation_failed():
     assert op["outcome"] == "failed", dict(op)
 
 
-def test_open_episode_remote_error_maybe_mutated_marks_operation_unknown():
+def test_open_episode_remote_error_maybe_mutated_leaves_the_operation_open():
     conn, _ = _fresh_ledger()
     with _patch(sideclaw, "submit", _raiser(RemoteError("boom", maybe_mutated=True))):
         try:
@@ -596,7 +596,8 @@ def test_open_episode_remote_error_maybe_mutated_marks_operation_unknown():
         else:
             raise AssertionError("expected RemoteError")
     op = conn.execute("SELECT * FROM operations WHERE repo='warden'").fetchone()
-    assert op["outcome"] == "unknown", dict(op)
+    assert op["outcome"] is None, ("an ambiguous submit must stay open for reconcile_operations()", dict(op))
+    assert json.loads(op["receipt_json"])["maybeMutated"] is True, dict(op)
 
 
 def test_open_episode_submits_the_composed_cwd_and_no_sensitive_or_model_key():

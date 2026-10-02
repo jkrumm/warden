@@ -110,7 +110,9 @@ def open_episode(
     """Submit one sideclaw episode and record it.
 
     A gated tier (`implement`) is covered by an `operations` row committed
-    BEFORE the submit — DESIGN.md § Crash recovery. `authorized_by` is the
+    BEFORE the submit — DESIGN.md § Crash recovery. A submit that fails definitively
+    resolves it `failed`; one that MAY have reached sideclaw (`maybe_mutated`) leaves it
+    open, annotated, for reconcile_operations(). `authorized_by` is the
     audit label that row records and is required for a gated tier."""
     now = now or dt.datetime.now(dt.timezone.utc)
     gated = tier in policy.GATED_TIERS
@@ -160,12 +162,16 @@ def open_episode(
         )
     except RemoteError as exc:
         if gated and opened_op_id is not None:
-            operations.complete(
-                conn,
-                opened_op_id,
-                outcome="unknown" if exc.maybe_mutated else "failed",
-                receipt=json.dumps({"error": str(exc)}),
-            )
+            if exc.maybe_mutated:
+                # sideclaw MAY have accepted the job, and no job id came back to ask
+                # about: the operation stays OPEN (it is also what holds the per-repo
+                # in-flight lock) and reconcile_operations() decides — never a blind
+                # re-submit, which would open a second episode for the same work.
+                operations.annotate(conn, opened_op_id,
+                                    receipt=json.dumps({"error": str(exc), "maybeMutated": True}))
+            else:
+                operations.complete(conn, opened_op_id, outcome="failed",
+                                    receipt=json.dumps({"error": str(exc)}))
         raise
 
     job_id = job["id"]

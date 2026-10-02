@@ -18,13 +18,14 @@ VERBS
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
   revert <event-id>   record a revert PR against a merged item (--pr --why)
-  close <event-id>    resolve an open item by hand (--why required)
+  close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
   help
 
 Global flags, anywhere on the line, `--flag value` or `--flag=value`:
   --json --confirm --dry-run --wait
   --why --tier --brief-file --context-file
   --origin-channel --origin-thread --origin-event --auto-from-item --model --pr
+  --reason resolved|ignored    (close only; default resolved — `ignored` is a human's "this is noise")
 
 There is deliberately no `--brief`: the brief is data, never an argv string.
 
@@ -230,6 +231,7 @@ class Flags:
     auto_from_item: str | None = None
     model: str | None = None
     pr: str | None = None
+    reason: str | None = None
 
 
 _VALUE_FLAGS = {
@@ -243,6 +245,7 @@ _VALUE_FLAGS = {
     "--auto-from-item": "auto_from_item",
     "--model": "model",
     "--pr": "pr",
+    "--reason": "reason",
 }
 _BOOL_FLAGS = {"--json": "json", "--confirm": "confirm", "--dry-run": "dry_run", "--wait": "wait"}
 
@@ -781,7 +784,7 @@ def cmd_revert(conn, flags: Flags, positional: list[str], state: _State) -> dict
     now = dt.datetime.now(dt.timezone.utc)
     items.transition(
         conn, event_id, to_state=ledger.STATE_FAILED, now=now,
-        note=f"reverted: PR #{pr_number}", extra={"revert_pr": pr_number},
+        note=f"reverted by PR #{pr_number}: {flags.why}", extra={"revert_pr": pr_number},
     )
     conn.commit()
     state.did_mutate = True
@@ -809,6 +812,9 @@ _CLOSE_INFLIGHT_STATES = (triage.STATE_WORKING, triage.STATE_MERGING, triage.STA
 # moved past the episode carries work of its own — a PR a human must review — and
 # is never closed behind their back by cancelling the job.
 _CLUSTER_ABORT_STATES = (triage.STATE_WORKING,)
+# What a human may say a hand-close means: dealt with, or noise. `duplicate`/`fixed_by`
+# belong to the loop's own bookkeeping.
+_CLOSE_REASONS_BY_HAND = (triage.CLOSE_RESOLVED, triage.CLOSE_IGNORED)
 # Already terminal — closing again is a no-op, not a refusal.
 _CLOSE_TERMINAL_STATES = (ledger.STATE_CLOSED, triage.STATE_FIXED)
 
@@ -824,7 +830,7 @@ def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     # No require_backend(): close only ever writes triage_items/item_transitions
     # in the local ledger — no GitHub or sideclaw call to authenticate for.
     if not positional:
-        raise UsageError('usage: warden close <event-id> --why "<reason>" [--json]')
+        raise UsageError('usage: warden close <event-id> --why "<reason>" [--reason resolved|ignored] [--json]')
     event_id = _parse_int(positional[0], "event-id")
     if not flags.why:
         raise UsageError(
@@ -858,6 +864,9 @@ def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 
     to_state = ledger.STATE_CLOSED
     note = f"closed by hand: {flags.why}"
+    reason = flags.reason or triage.CLOSE_RESOLVED
+    if reason not in _CLOSE_REASONS_BY_HAND:
+        raise UsageError(f"--reason must be one of {'/'.join(_CLOSE_REASONS_BY_HAND)} (got: {reason})")
 
     if flags.dry_run:
         state.dry_run = True
@@ -868,7 +877,7 @@ def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 
     now = dt.datetime.now(dt.timezone.utc)
     items.transition(conn, event_id, to_state=to_state, now=now, note=note,
-                     extra={"close_reason": triage.CLOSE_RESOLVED})
+                     extra={"close_reason": reason})
     conn.commit()
     state.did_mutate = True
 
@@ -922,7 +931,7 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
             if out.get("queued"):
                 print(f"queued — {out.get('note') or 'waiting for a free slot'}")
             elif out.get("jobId"):
-                print(f"investigating — job {out['jobId']}, not finished — poll: warden status {out['jobId']}")
+                print(f"{out['state']} — job {out['jobId']}, not finished — poll: warden status {out['jobId']}")
             if out.get("result"):
                 v = out["result"].get("verdict") or {}
                 if v:
@@ -955,13 +964,14 @@ VERBS
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
   revert <event-id>   record a revert PR against a merged item (--pr --why)
-  close <event-id>    resolve an open item by hand (--why required)
+  close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
   help
 
 Global flags, anywhere on the line, --flag value or --flag=value:
   --json --confirm --dry-run --wait
   --why --tier --brief-file --context-file
   --origin-channel --origin-thread --origin-event --auto-from-item --model --pr
+  --reason resolved|ignored    (close only; default resolved)
 
 There is deliberately no --brief: the brief is data, never an argv string.
 Pass it on stdin with a QUOTED heredoc (<<'BRIEF' ... BRIEF) or --brief-file.
@@ -1038,7 +1048,7 @@ def main(argv: list[str]) -> int:
                     "  merge <job-id>    land the draft PR that dispatch opened (--why --confirm)\n"
                     "  abort <event-id>  cancel an in-flight implement/validate episode (--why)\n"
                     "  revert <event-id> record a revert PR against a merged item (--pr --why)\n"
-                    "  close <event-id>  resolve an open item by hand (--why required)\n"
+                    "  close <event-id>  resolve an open item by hand (--why required; --reason resolved|ignored)\n"
                     "  help"
                 )
         finally:

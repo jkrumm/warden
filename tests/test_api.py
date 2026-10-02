@@ -616,6 +616,31 @@ def test_available_actions_follow_the_new_state_machine():
         assert a(terminal) == [], terminal
 
 
+def test_reverted_items_are_not_offered_implement_or_merge():
+    """An item with revert_pr set already merged and was rolled back by hand: re-implementing or
+    re-merging it would redo the reverted change. Dismiss/reinvestigate/note stay."""
+    a = api._available_actions
+    assert set(a("failed", mergeable=True, reverted=True)) == {"dismiss", "reinvestigate", "note"}
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="failed", now=now, pr_url="https://github.com/jkrumm/x/pull/1")
+    conn.execute("UPDATE triage_items SET revert_pr=7 WHERE event_id=1")
+    conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at, validation_status) "
+                 "VALUES ('j1','implement','x','b','done',?, 'confirmed')", (_iso(now),))
+    conn.execute("UPDATE triage_items SET implement_job='j1' WHERE event_id=1")
+    conn.commit()
+    _transition(conn, 1, "new", "failed", now)
+    conn.commit()
+    row = api.awaiting_owner(conn, now)[0]
+    assert "implement" not in row["availableActions"] and "merge" not in row["availableActions"], row
+    board_row = conn.execute(
+        "SELECT ti.*, e.title AS event_title, e.url AS event_url, 'confirmed' AS validation_status, "
+        "e.payload_json AS event_payload_json FROM triage_items ti JOIN events e ON e.id = ti.event_id").fetchone()
+    assert "merge" not in api._board_item(board_row)["availableActions"]
+    conn.close()
+
+
 def test_awaiting_owner_lists_needs_decision_and_failed_without_the_retired_fields():
     conn, _ = _fresh_conn()
     now = dt.datetime.now(dt.timezone.utc)

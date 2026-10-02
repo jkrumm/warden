@@ -235,6 +235,41 @@ def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
         conn.close()
 
 
+def test_a_pruned_item_backed_dispatch_is_folded_so_its_item_strikes_instead_of_staying_working():
+    """sideclaw pruned an investigation that a triage item was waiting on: the dispatch closes
+    ITEM_TRACKED, and the item takes the no-verdict path (a strike back to `triaged` with its
+    dispatch handle cleared) rather than sitting `working` forever."""
+    db_path = _fresh_db()
+    conn = _ledger.connect(db_path)
+    try:
+        now = _now()
+        conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (1,'s','e1','t',?)",
+                     (now.isoformat(),))
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, dispatch_job, occurrences, first_seen, "
+            "last_seen, created_at, updated_at) VALUES (1,'s:e1','demo-repo','working','job-pruned',1,?,?,?,?)",
+            (now.isoformat(),) * 4)
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_event_id,poll_misses) "
+            "VALUES('job-pruned','investigate','demo-repo','b','running',?,1,?)",
+            (now.isoformat(), dispatch_sweep.LOST_AFTER_MISSES - 1))
+        conn.commit()
+        row = conn.execute("SELECT * FROM dispatches WHERE job_id='job-pruned'").fetchone()
+
+        with _patch(dispatch_sweep, "poll_job", lambda job_id: dispatch_sweep.NOT_FOUND):
+            dispatch_sweep.process_dispatch(conn, row, dry_run=False)
+
+        d = conn.execute("SELECT status, delivery_status, reported_at FROM dispatches "
+                         "WHERE job_id='job-pruned'").fetchone()
+        assert d["delivery_status"] == dispatch_sweep.ITEM_TRACKED and d["reported_at"], dict(d)
+        item = conn.execute("SELECT state, strikes, dispatch_job, retry_at FROM triage_items "
+                            "WHERE event_id=1").fetchone()
+        assert item["state"] == "triaged" and item["strikes"] == 1, dict(item)
+        assert item["dispatch_job"] is None and item["retry_at"], dict(item)
+    finally:
+        conn.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

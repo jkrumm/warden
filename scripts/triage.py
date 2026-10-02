@@ -151,9 +151,13 @@ NOTIFICATIONS. Slack hears about an item exactly twice in its life at most: when
 it enters `fixed` and when it enters `needs_decision`, one plain
 `chat.postMessage` line each (notify_cluster()). Everything else — including
 `failed`, which gets a once-a-day count line (maybe_post_daily_digest()) — lives
-in Argo. `card_hash` records the state a line was posted for; leaving that state
-clears it (_set_state()), so a re-entry posts again and a re-run of one pass never
-posts twice.
+in Argo. The one other line is an ANSWER: an item that asked a question (max_tier
+investigate) and has its own origin thread gets its `closed(resolved)` note posted in
+that thread, once (state `answered`) — never in the shared channel. `card_hash` records
+the state a line was posted for; leaving that state clears it (_set_state()), so a
+re-entry posts again and a re-run of one pass never posts twice. While a line is being
+posted it holds a `posting:<state>:<time>` claim, so the loop and the sweep cannot both
+post it.
 
 DRY-RUN CONTRACT. `--dry-run` never touches Slack (no chat.postMessage), never shells out to hermes-cc.sh, never shells out to `gh`,
 never runs a HOST_VERB_ALLOWLIST verb (maybe_auto_remediate() prints
@@ -365,8 +369,17 @@ def _is_claim(value: str | None) -> bool:
     return bool(value) and (value == IMPLEMENT_CLAIM or value.startswith(HOST_VERB_CLAIM_PREFIX))
 
 
-# The only states Slack is told about, one line each (notify_cluster()).
+# The only states the shared channel is told about, one line each (notify_cluster()).
 NOTIFY_STATES = (STATE_NEEDS_DECISION, STATE_FIXED)
+# A pseudo-state, not a ledger state: a `closed(resolved)` item that ASKED for an answer
+# (max_tier=investigate) and has its own origin thread is answered THERE, once. It is
+# what `card_hash` holds after that line was posted, and the shared channel never hears it.
+NOTIFY_ANSWERED = "answered"
+# `card_hash` while one process is posting a line: `posting:<state>:<iso claimed-at>`. The
+# loop and the sweep both notify, so the claim is what keeps one line from posting twice;
+# a claim older than one loop interval is a crashed poster's and may be retaken.
+NOTIFY_CLAIM_PREFIX = "posting:"
+NOTIFY_CLAIM_STALE_S = 600
 
 # `triage_items.note` prefixes for the grouped-source resolve paths (see
 # resolve_quiet_grouped()/resolve_recovery_paired()) plus the liveness path
@@ -389,6 +402,7 @@ SPLIT_VERDICT_NOTE_PREFIX = "cluster split — the investigation's verdict, pend
 NOTIFY_ICON = {
     STATE_NEEDS_DECISION: ":raising_hand:",
     STATE_FIXED: ":white_check_mark:",
+    NOTIFY_ANSWERED: ":speech_balloon:",
 }
 
 DEFAULT_CARD_CHANNEL = "C0BVDE5R562"  # #agents — see config/triage-policy.json
@@ -1078,48 +1092,8 @@ def _get_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
 
 
-def _occurrence_mark(event: sqlite3.Row | dict[str, Any] | None) -> str | None:
-    """An opaque fingerprint of which occurrences `event` has produced so far,
-    for reopen_if_needed() to compare with `!=` — never with `>` or `MAX()`.
-
-    Five `|`-separated slots, each the raw string value (empty for None/missing),
-    in fixed position:
-
-        payload_json->$.ts_last | last_reminder_at | notified_at | first_seen | reminder_count
-
-    Slot 1 (grouped sources only, via _safe_json() — never SQL json_extract, so
-    a malformed payload degrades to "absent" instead of raising) is a Slack
-    `ts` float-string ("1788850795.862159"). Slots 2-4 are ISO-8601
-    ("2026-09-08T07:00:20..."). These are TWO DIFFERENT CLOCKS IN TWO DIFFERENT
-    FORMATS — a `MAX()` or `>` across them is a lexical compare of "1788…"
-    against "2026…" that reads as correct and is not. Fixed slots plus whole-
-    string equality never compares one clock against the other.
-
-    All five slots are required, not redundant with each other:
-    watchdog-poll.py's upsert_grouped() re-stamps last_reminder_at/notified_at
-    ONLY when it emits (cooldown-gated) — a suppressed occurrence moves only
-    payload_json.ts_last. A state source has no ts_last at all; its reopen
-    signal is watchdog-poll.py:878 resetting resolved_at=NULL, first_seen=<now>,
-    notified_at=NULL, last_reminder_at=NULL, reminder_count=0 on that same
-    UPDATE — which moves the ISO slots. Every slot moves only on a genuine
-    occurrence, or on that reopen reset (itself a genuine occurrence). Title
-    and URL churn is deliberately NOT in the mark.
-
-    Returns None if `event` is None — reopen_if_needed() reads this as "no
-    event row", which cannot happen for a joined query but keeps the function
-    total rather than partial."""
-    if event is None:
-        return None
-    payload = _safe_json(event["payload_json"])
-    ts_last = payload.get("ts_last")
-    slots = (
-        ts_last if isinstance(ts_last, str) else "",
-        event["last_reminder_at"] or "",
-        event["notified_at"] or "",
-        event["first_seen"] or "",
-        str(event["reminder_count"] if event["reminder_count"] is not None else ""),
-    )
-    return "|".join(slots)
+# Lives in lifecycle/items.py so the CLI's own transitions stamp it the same way.
+_occurrence_mark = _items.occurrence_mark
 
 
 # --- the one state transition ------------------------------------------------
@@ -1291,22 +1265,38 @@ def _strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: s
     with `retry_at` pushed out by the backoff, and `retry_columns` applied (the
     handle of the failed attempt cleared, so the poller starts a fresh one). At
     STRIKE_LIMIT the item is `failed`, `reason` is its note, and its columns are
-    left alone as evidence. Returns the state the item landed in.
+    left alone as evidence. Returns the state the item landed in — or, when
+    `expect_state` no longer matched (another pass moved it first) and so nothing was
+    written, the state it is actually in, logged to stderr.
 
     A SUBMIT REFUSED by sideclaw (4xx) is not an infrastructure failure and never
     comes through here — see _end_on_refusal()."""
     row = _get_item(conn, event_id)
-    strikes = (row["strikes"] if row is not None else 0) + 1
+    if row is None:
+        raise LookupError(f"strike on event {event_id}: no such triage item")
+    strikes = row["strikes"] + 1
     if strikes >= STRIKE_LIMIT:
-        _set_state(conn, event_id, STATE_FAILED, now, expect_state=expect_state, note=reason,
-                   strikes=strikes, retry_at=None)
-        return STATE_FAILED
-    backoff = STRIKE_BACKOFF_MINUTES[min(strikes, len(STRIKE_BACKOFF_MINUTES)) - 1]
-    retry_at = _now_iso(now + dt.timedelta(minutes=backoff))
-    _set_state(conn, event_id, retry_state, now, expect_state=expect_state,
-               note=f"{reason} — retry {strikes}/{STRIKE_LIMIT - 1} after {backoff} min",
-               strikes=strikes, retry_at=retry_at, **retry_columns)
-    return retry_state
+        landed = STATE_FAILED
+        written = _set_state(conn, event_id, STATE_FAILED, now, expect_state=expect_state, note=reason,
+                             strikes=strikes, retry_at=None)
+    else:
+        landed = retry_state
+        backoff = STRIKE_BACKOFF_MINUTES[min(strikes, len(STRIKE_BACKOFF_MINUTES)) - 1]
+        retry_at = _now_iso(now + dt.timedelta(minutes=backoff))
+        written = _set_state(conn, event_id, retry_state, now, expect_state=expect_state,
+                             note=f"{reason} — retry {strikes}/{STRIKE_LIMIT - 1} after {backoff} min",
+                             strikes=strikes, retry_at=retry_at, **retry_columns)
+    if written:
+        return landed
+    # The compare-and-set lost: another pass moved the item first, so nothing here landed
+    # and what is reported must be where the item really is.
+    current = _get_item(conn, event_id)
+    if current is None:
+        raise LookupError(f"strike on event {event_id}: no such triage item")
+    actual = current["state"]
+    print(f"triage: strike on event {event_id} lost its compare-and-set (expected {expect_state!r}, "
+          f"item is {actual!r}) — nothing written: {reason}", file=sys.stderr)
+    return actual
 
 
 def _record_created_transition(conn: sqlite3.Connection, event_id: int, state: str, at: str) -> None:
@@ -1989,8 +1979,10 @@ def _cluster_groups(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
     singleton group keyed by its own event_id."""
     placeholders = ",".join("?" * len(NOTIFY_STATES))
     rows = conn.execute(
-        f"SELECT * FROM triage_items WHERE state IN ({placeholders}) ORDER BY event_id",
-        NOTIFY_STATES,
+        f"SELECT * FROM triage_items WHERE state IN ({placeholders}) "
+        f"OR (state=? AND close_reason=? AND max_tier='investigate' AND origin_channel IS NOT NULL "
+        f"AND card_hash IS NOT ?) ORDER BY event_id",
+        (*NOTIFY_STATES, STATE_CLOSED, CLOSE_RESOLVED, NOTIFY_ANSWERED),
     ).fetchall()
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
@@ -3066,6 +3058,10 @@ def _origin_item_brief(item: sqlite3.Row, event_row: sqlite3.Row) -> str:
     return brief
 
 
+# A `working` origin item with no dispatch job is a live claim for this long, then an orphan.
+ORIGIN_CLAIM_STALE_MINUTES = 5
+
+
 def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool = False) -> None:
     """The origin-aware counterpart to `escalate()`, for every `new` or `triaged`
     item whose `origin != 'alert'` (a `human` `warden run`, or a `github_issue`
@@ -3089,14 +3085,21 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
     same row. The orphan-reclaim pass at the top of this function is that
     claim's own crash-recovery counterpart (claimed `working`, but
     `dispatch_job` never got written because the process died before it
-    could)."""
+    could). It only takes a claim older than ORIGIN_CLAIM_STALE_MINUTES: a younger
+    one is another caller still mid-dispatch, and reclaiming it would open the
+    investigation twice."""
     policy = load_policy()
     open_investigations = _count_open_investigation_clusters(conn)
     if not dry_run:
+        # Only a STALE claim is an orphan: `updated_at` is when the claim was written, and a
+        # claim younger than ORIGIN_CLAIM_STALE_MINUTES belongs to a caller (the loop or
+        # `warden run`) that is still opening its episode — reclaiming that one would
+        # dispatch the same item twice.
+        stale_before = _now_iso(now - dt.timedelta(minutes=ORIGIN_CLAIM_STALE_MINUTES))
         orphans = conn.execute(
             "SELECT * FROM triage_items WHERE state=? AND origin != 'alert' AND dispatch_job IS NULL "
-            "AND implement_job IS NULL",
-            (STATE_WORKING,),
+            "AND implement_job IS NULL AND updated_at < ?",
+            (STATE_WORKING, stale_before),
         ).fetchall()
         for orphan in orphans:
             _set_state(conn, orphan["event_id"], STATE_NEW, now, expect_state=STATE_WORKING,
@@ -3273,8 +3276,9 @@ def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now:
                        verdict_text: str, *, dry_run: bool) -> None:
     """Move every member to `triaged` so each is re-evaluated individually.
     `dispatch_job` is deliberately LEFT SET — a `triaged` row is never grouped by
-    `_cluster_groups()` (which only looks at NOTIFY_STATES, and `triaged` is
-    deliberately not in it), so the cluster is functionally gone for
+    `_cluster_groups()` (which only looks at NOTIFY_STATES plus its NOTIFY_ANSWERED
+    clause — a `closed(resolved)` origin-thread answer — and `triaged` is
+    deliberately in neither), so the cluster is functionally gone for
     notification/escalation purposes, but keeping the
     pointer means `_cooldown_ok()` still finds the dissolved dispatch's
     created_at and enforces a real cooldownHours wait. Without this, the very
@@ -3365,39 +3369,81 @@ def format_notification(state: str, primary: sqlite3.Row, event_row: sqlite3.Row
     return f"{NOTIFY_ICON[state]} {primary['repo'] or 'warden'}: {_escape(summary)} — {state} {argo_link()}"
 
 
+def _announce_state(item: sqlite3.Row) -> str | None:
+    """The state a Slack line is owed for, or None. Besides NOTIFY_STATES, an item that
+    asked for an answer (`closed(resolved)`, max_tier=investigate) and has its own origin
+    channel is owed NOTIFY_ANSWERED — in that thread, never in the shared channel."""
+    if item["state"] in NOTIFY_STATES:
+        return item["state"]
+    if (item["state"] == STATE_CLOSED and item["close_reason"] == CLOSE_RESOLVED
+            and item["max_tier"] == "investigate" and item["origin_channel"]):
+        return NOTIFY_ANSWERED
+    return None
+
+
+def _notify_claim_live(card_hash: str | None, state: str, now: dt.datetime) -> bool:
+    """True while another process holds the posting claim for `state` — a stale claim
+    (older than NOTIFY_CLAIM_STALE_S, or unreadable) is a dead poster's and is retaken."""
+    prefix = f"{NOTIFY_CLAIM_PREFIX}{state}:"
+    if not card_hash or not card_hash.startswith(prefix):
+        return False
+    claimed_at = _parse_ts(card_hash[len(prefix):])
+    return claimed_at is not None and (now - claimed_at).total_seconds() < NOTIFY_CLAIM_STALE_S
+
+
 def notify_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: list[sqlite3.Row],
                    policy: dict[str, Any], *, dry_run: bool) -> None:
-    """Post ONE plain line to Slack for each NOTIFY_STATES state `members` has entered and
-    not yet announced; everything else is silent (it lives in Argo). A cluster (several
-    members, one state) posts once, for its first member. Dedupe is `card_hash` = the
+    """Post ONE plain line to Slack for each NOTIFY_STATES state (and NOTIFY_ANSWERED) `members`
+    has entered and not yet announced; everything else is silent (it lives in Argo). A cluster
+    (several members, one state) posts once, for its first member. Dedupe is `card_hash` = the
     state posted for, copied onto every member of that state: _set_state() clears it when
     an item leaves the state, so a re-entry posts again and a re-run of the same pass
     never posts twice. Only Slack's own `ok: true` stamps it — a failed post is retried
     on the next pass.
 
+    The loop and the sweep both call this, so the post is CLAIMED before it is made: a
+    compare-and-set swaps `card_hash` for `posting:<state>:<now>`, only the winner posts, and
+    on a Slack failure the claim is handed back (so the next pass retries). A claim older than
+    NOTIFY_CLAIM_STALE_S belongs to a poster that died and is retaken.
+
     An item with its own origin thread (`warden run`, Hermes) is answered there instead
     of in the shared channel. `dry_run` never touches Slack."""
-    for state in NOTIFY_STATES:
-        pairs = [(m, e) for m, e in zip(members, event_rows) if m["state"] == state and m["card_hash"] != state]
+    now = dt.datetime.now(dt.timezone.utc)
+    for state in (*NOTIFY_STATES, NOTIFY_ANSWERED):
+        pairs = [(m, e) for m, e in zip(members, event_rows)
+                 if _announce_state(m) == state and m["card_hash"] != state
+                 and not _notify_claim_live(m["card_hash"], state, now)]
         if not pairs:
             continue
         primary, event_row = pairs[0]
-        text = format_notification(state, primary, event_row, len(pairs))
         channel = primary["origin_channel"] or _card_channel(policy)
         thread_ts = primary["origin_thread_ts"] if primary["origin_channel"] else None
         if dry_run:
-            print(f"[dry-run] would post to {channel}: {text}")
+            print(f"[dry-run] would post to {channel}: {format_notification(state, primary, event_row, len(pairs))}")
             continue
         token = resolve_slack_token()
         if not token:
             print(f"triage: no Slack token, cannot post for {[m['signature'] for m, _ in pairs]}", file=sys.stderr)
             continue
-        ok, ts = post_line(channel, text, token, thread_ts=thread_ts)
-        if not ok:
+        claim = f"{NOTIFY_CLAIM_PREFIX}{state}:{_now_iso(now)}"
+        won = [(m, e) for m, e in pairs
+               if conn.execute("UPDATE triage_items SET card_hash=? WHERE event_id=? AND state=? AND card_hash IS ?",
+                               (claim, m["event_id"], m["state"], m["card_hash"])).rowcount]
+        conn.commit()
+        if not won:
             continue
-        for m, _e in pairs:
+        primary, event_row = won[0]
+        ok, ts = post_line(channel, format_notification(state, primary, event_row, len(won)), token,
+                           thread_ts=thread_ts)
+        if not ok:
+            for m, _e in won:
+                conn.execute("UPDATE triage_items SET card_hash=? WHERE event_id=? AND card_hash=?",
+                             (m["card_hash"], m["event_id"], claim))
+            conn.commit()
+            continue
+        for m, _e in won:
             conn.execute("UPDATE triage_items SET card_channel=?, card_ts=?, card_hash=? "
-                         "WHERE event_id=? AND state=?", (channel, ts, state, m["event_id"], state))
+                         "WHERE event_id=? AND card_hash=?", (channel, ts, state, m["event_id"], claim))
         conn.commit()
 
 
@@ -3678,6 +3724,12 @@ def _run_gh_run_list(owner: str, repo: str, sha: str) -> list[dict[str, Any]] | 
     return data if isinstance(data, list) else None
 
 
+# An implement operation with no sideclaw job id (a timed-out submit, or a crash between the
+# operation record and the submit's answer) stays open this long before it resolves `unknown`.
+AMBIGUOUS_SUBMIT_GRACE = dt.timedelta(minutes=30)
+AMBIGUOUS_SUBMIT_NOTE = "ambiguous implement submit — retried after 30 min grace"
+
+
 def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step -1 (see the module docstring) — runs FIRST in run(), before
@@ -3707,16 +3759,26 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         receipt = _safe_json(row["receipt_json"])
         new_receipt: dict[str, Any] | None = None
         note: str | None = None
+        strike_reason: str | None = None
 
         if row["kind"] == "implement":
             job_id = receipt.get("jobId")
             if not job_id:
-                # No job id was ever recorded — this process crashed (or the
-                # call site left the row open on a timeout/non-JSON stdout)
-                # before it even learned whether sideclaw accepted the
-                # submission. There is nothing left here to ask.
+                # No job id was ever recorded: either the submit timed out
+                # (open_episode() annotated the row) or this process crashed between
+                # recording the operation and learning sideclaw's answer. sideclaw may
+                # be running the episode, and it cannot list jobs by what they were
+                # for, so there is no id to ask about. Give a started episode time to
+                # open its PR (the row stays open, no write, no strike — and it keeps
+                # the repo's in-flight lock), then resolve it `unknown` and strike: the
+                # duplicate risk is accepted, bounded by the strike limit and sideclaw's
+                # per-repo lease.
+                started = _parse_ts(row["started_at"])
+                if started is not None and (now - started) < AMBIGUOUS_SUBMIT_GRACE:
+                    continue
                 outcome = "unknown"
                 note = "no sideclaw job id was ever recorded for this implement dispatch"
+                strike_reason = AMBIGUOUS_SUBMIT_NOTE
             else:
                 try:
                     resp = _sideclaw.get(job_id)
@@ -3739,9 +3801,10 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                             outcome, new_receipt = "failed", {**receipt, "status": status}
                         else:
                             # queued/running — genuinely still in flight, not
-                            # yet resolvable either way; try again next pass.
-                            outcome = "unknown"
-                            note = f"sideclaw reports job {job_id} still {status!r}"
+                            # yet resolvable either way: leave the row open, no
+                            # write and no strike (the `deploy` branch's own
+                            # "too soon" shape), and ask again next pass.
+                            continue
         elif row["kind"] == "deploy":
             sha = receipt.get("mergeCommit")
             if sha is None:
@@ -3899,7 +3962,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             if retry is not None:
                 retry_state, retry_columns = retry
                 _strike(conn, row["event_id"], now,
-                        f"operation {row['op_id']} ({row['kind']}) could not be reconciled: {note}",
+                        strike_reason or f"operation {row['op_id']} ({row['kind']}) could not be reconciled: {note}",
                         retry_state=retry_state, expect_state=retry_state, **retry_columns)
                 conn.commit()
             continue
@@ -4216,6 +4279,17 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         conn.commit()
 
 
+def _hold_ambiguous_submit(item: sqlite3.Row, exc: RemoteError) -> None:
+    """An implement submit that MAY have reached sideclaw (a timeout): the item keeps its
+    claim and its implement operation stays open. Clearing either would let the next tick
+    submit the same work again while the first episode runs. reconcile_operations() resolves
+    it — sideclaw handed back no job id, so there is nothing to poll: after a grace window
+    the operation resolves `unknown` and the item strikes back to `working` (see its
+    `implement` branch)."""
+    print(f"triage: implement submit for {item['signature']} (event {item['event_id']}) may have reached "
+          f"sideclaw ({exc}) — claim and operation left open for reconcile_operations()", file=sys.stderr)
+
+
 def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step 6. A `working` item is eligible once, the moment its folded
@@ -4243,8 +4317,11 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     card is synced immediately rather than waiting for whatever poller might
     read `note` next. A deferral is not a strike — nothing failed.
 
-    A submit that fails for infrastructure reasons (5xx, unreachable) strikes
-    (see _strike()); a sideclaw 4xx ends the item `failed` and is never retried."""
+    A submit that fails definitively (5xx, connection refused) strikes (see _strike()); a
+    sideclaw 4xx ends the item `failed` and is never retried. A submit that MAY have
+    reached sideclaw (a timeout) is never retried blind: the claim and the open operation
+    stay put for reconcile_operations() (_hold_ambiguous_submit()), which strikes the item
+    back to `working` once the grace window has passed."""
     ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND dispatch_job IS NOT NULL AND implement_job IS NULL "
@@ -4313,14 +4390,13 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                             implement_job=None)
             continue
         except RemoteError as exc:
-            # sideclaw 5xx or unreachable: an infrastructure failure, so the claim
-            # is handed back as a strike (open_episode() already completed the
-            # operation `failed`/`unknown`). If sideclaw DID accept the job before
-            # failing the response, the retry opens a second episode — the price
-            # of "retries are the default", bounded by the three strikes and by
-            # the per-repo in-flight lock.
-            maybe = " (the request may have reached sideclaw)" if exc.maybe_mutated else ""
-            _strike(conn, item["event_id"], now, f"implement dispatch failed{maybe}: {exc}",
+            if exc.maybe_mutated:
+                _hold_ambiguous_submit(item, exc)
+                continue
+            # sideclaw 5xx or unreachable-before-send: definitively not sent, an
+            # infrastructure failure, so the claim is handed back as a strike
+            # (open_episode() already completed the operation `failed`).
+            _strike(conn, item["event_id"], now, f"implement dispatch failed: {exc}",
                     retry_state=STATE_WORKING, expect_state=STATE_WORKING, implement_job=None)
             conn.commit()
             continue
@@ -4418,6 +4494,15 @@ def _notify_item(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int
 # What an implement attempt that did not produce a pull request clears, so the
 # next maybe_auto_implement() starts a fresh one.
 _IMPLEMENT_RETRY_COLUMNS: dict[str, Any] = {"implement_job": None, "validation_job": None, "pr_url": None}
+
+
+# How long a claim on the review handoff / on acting on a review result holds before another
+# pass may take the work again: one sweep interval, far longer than the call it covers.
+REVIEW_CLAIM_MINUTES = 5
+
+
+def _review_claim_until(now: dt.datetime) -> str:
+    return _now_iso(now + dt.timedelta(minutes=REVIEW_CLAIM_MINUTES))
 
 
 def _revisions_left(item: sqlite3.Row, policy: dict[str, Any]) -> bool:
@@ -4537,21 +4622,39 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         if result.get("nextAction") == "human":
             _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=_decision_note(result))
         elif outcome == "pr_opened" and artifact_url:
+            # CLAIM BEFORE DISPATCH, the same shape as maybe_auto_implement(): the loop and
+            # the sweep both reach this handoff, and an unclaimed one opens two reviews. The
+            # compare-and-set moves the item to `merging` only while it is still the
+            # `working` item this pass read (same implement job, no review yet); the loser
+            # skips. Its `retry_at` is the claim's expiry — poll_validation_jobs() skips a
+            # row waiting out a retry_at, so the other process cannot submit the review
+            # too, and a process that dies right here leaves a row that is picked up again
+            # once it passes.
+            claimed = _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_WORKING,
+                                 expect_eq={"implement_job": job_id, "validation_job": None},
+                                 pr_url=artifact_url, strikes=0, retry_at=_review_claim_until(now))
+            conn.commit()
+            if not claimed:
+                print(f"triage: {item['signature']} (event {event_id}) was already handed to review by "
+                      f"another pass — skipped", file=sys.stderr)
+                continue
             try:
                 val_job, val_err = _open_validation_dispatch(
                     conn, repo=item["repo"], event_id=event_id, implement_job=job_id,
                     pr_url=artifact_url, context=_validation_context(conn, item))
             except SubmitRefused as e:
-                _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=artifact_url)
+                _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=artifact_url,
+                                retry_at=None)
                 continue
             if val_job is None:
-                # The PR exists; only the review could not be submitted. The item
-                # moves on to `merging` and the review submission is what retries.
-                _set_state(conn, event_id, STATE_MERGING, now, pr_url=artifact_url, validation_job=None)
+                # The PR exists; only the review could not be submitted. The item is
+                # already `merging` and the review submission is what retries.
                 _strike(conn, event_id, now, val_err or "could not open the step-7 review",
                         retry_state=STATE_MERGING, expect_state=STATE_MERGING)
             else:
-                _set_state(conn, event_id, STATE_MERGING, now, validation_job=val_job, pr_url=artifact_url)
+                _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_MERGING,
+                           expect_eq={"validation_job": None}, validation_job=val_job,
+                           strikes=0, retry_at=None)
         elif outcome == "pr_opened":
             conn.commit()
             _strike_attempt(f"implement {job_id}: pr_opened outcome carried no artifactUrl")
@@ -4682,20 +4785,34 @@ def _submit_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlit
     """Open the step-7 review for a `merging` item that has a pull request and no
     review on it — the retry half of a review that failed, or one that could not
     be submitted. A submit that fails for infrastructure reasons strikes (see
-    _strike()); a sideclaw refusal (4xx) is final."""
+    _strike()); a sideclaw refusal (4xx) is final.
+
+    Claimed before the submit, like the handoff in poll_implement_jobs(): the loop and the
+    sweep both land here, and an unclaimed submit opens two reviews. The claim is a
+    compare-and-set on the row as this pass read it, and its `retry_at` is the claim's expiry."""
+    claim_until = _review_claim_until(now)
+    claimed = _set_state(conn, item["event_id"], STATE_MERGING, now, expect_state=STATE_MERGING,
+                         expect_eq={"validation_job": None, "retry_at": item["retry_at"]},
+                         retry_at=claim_until)
+    conn.commit()
+    if not claimed:
+        print(f"triage: the review of {item['signature']} (event {item['event_id']}) is already being "
+              f"submitted by another pass — skipped", file=sys.stderr)
+        return
     try:
         val_job, val_err = _open_validation_dispatch(
             conn, repo=item["repo"], event_id=item["event_id"], implement_job=item["implement_job"],
             pr_url=item["pr_url"] or "", context=_validation_context(conn, item))
     except SubmitRefused as e:
-        _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=item["pr_url"])
+        _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=item["pr_url"],
+                        retry_at=None)
         return
     if val_job is None:
         _strike(conn, item["event_id"], now, val_err or "could not open the step-7 review",
                 retry_state=STATE_MERGING, expect_state=STATE_MERGING)
     else:
         _set_state(conn, item["event_id"], STATE_MERGING, now, expect_state=STATE_MERGING,
-                   validation_job=val_job, note=None)
+                   validation_job=val_job, note=None, retry_at=None)
     conn.commit()
 
 
@@ -4794,8 +4911,21 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
 
         # A real verdict ends the review's strike streak: whatever happens to the
-        # merge below is a different step.
-        _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_MERGING, strikes=0, retry_at=None)
+        # merge below is a different step. The write is also the CLAIM on acting on this
+        # result — the loop and the sweep both reach this point, and two passes must not
+        # both merge, revise or park the same item. It is a compare-and-set on the row as
+        # this pass read it (same review job, same retry_at); the loser skips, and the
+        # winner's `retry_at` (the claim's expiry) keeps a third pass off until
+        # _release_review_claim() below.
+        claim_until = _review_claim_until(now)
+        claimed = _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_MERGING,
+                             expect_eq={"validation_job": item["validation_job"], "retry_at": item["retry_at"]},
+                             strikes=0, retry_at=claim_until)
+        conn.commit()
+        if not claimed:
+            print(f"triage: the review result for {item['signature']} (event {event_id}) is already "
+                  f"being acted on by another pass — skipped", file=sys.stderr)
+            continue
 
         # Same nested envelope as poll_implement_jobs() above — the verdict
         # lives in `result`, never at the top level.
@@ -4868,7 +4998,15 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _land_already_merged_item(conn, policy, item, now)
         else:
             _merge_and_rollout(conn, policy, item, now)
+        _release_review_claim(conn, event_id, claim_until)
         _notify_item(conn, policy, event_id)
+
+
+def _release_review_claim(conn: sqlite3.Connection, event_id: int, claim_until: str) -> None:
+    """Drop the claim poll_validation_jobs() took, and only that one: a `retry_at` the acted-on
+    step wrote itself (a strike's backoff) is a different value and stays."""
+    conn.execute("UPDATE triage_items SET retry_at=NULL WHERE event_id=? AND retry_at=?", (event_id, claim_until))
+    conn.commit()
 
 
 MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
@@ -5142,7 +5280,10 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                             pr_url=item["pr_url"])
             continue
         except RemoteError as exc:
-            # An infrastructure failure: hand the attempt back (the prior job is
+            if exc.maybe_mutated:
+                _hold_ambiguous_submit(item, exc)
+                continue
+            # A definite infrastructure failure: hand the attempt back (the prior job is
             # restored, so the findings are still on the row) and strike.
             _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
                        implement_job=item["implement_job"], validation_job=item["validation_job"],
@@ -5520,12 +5661,17 @@ _ARGO_DISMISS_ALLOWED_STATES = (
 _ARGO_REINVESTIGATE_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED, STATE_QUIET)
 _ARGO_IMPLEMENT_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED)
 _ARGO_MERGE_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED)
+# An item with `revert_pr` set was merged and rolled back by hand: implementing or merging it
+# again would redo the reverted change. api.py's `availableActions` does not offer either.
+_ARGO_REVERTED_REFUSAL = "this item was reverted (revert_pr is set) — implement/merge would redo the reverted change"
 
 
 def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                            now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
     if item["state"] not in _ARGO_IMPLEMENT_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, not needs_decision/failed"
+    if item["revert_pr"] is not None:
+        return "rejected", None, _ARGO_REVERTED_REFUSAL
 
     # No `expect_null=("implement_job",)` here (unlike maybe_auto_implement()'s
     # own claim): this handler accepts `needs_decision`/`failed` items that carry
@@ -5571,7 +5717,14 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
         _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=load_policy(),
                         implement_job=None)
         return "failed", None, str(exc)
-    except (RemoteError, PolicyError, PreconditionError, UsageError) as exc:
+    except RemoteError as exc:
+        if exc.maybe_mutated:
+            _hold_ambiguous_submit(item, exc)
+            return "applied", {"note": "implement submit may have reached sideclaw, outcome ambiguous — "
+                                       "left for reconcile_operations()"}, None
+        _hand_back(f"deferred: {exc}")
+        return "failed", None, str(exc)
+    except (PolicyError, PreconditionError, UsageError) as exc:
         _hand_back(f"deferred: {exc}")
         return "failed", None, str(exc)
 
@@ -5591,6 +5744,8 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
     exactly like an automatic one."""
     if item["state"] not in _ARGO_MERGE_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, not needs_decision/failed"
+    if item["revert_pr"] is not None:
+        return "rejected", None, _ARGO_REVERTED_REFUSAL
     if not item["implement_job"] or not item["pr_url"]:
         return "rejected", None, "no pull request on this item to merge"
 
@@ -5599,6 +5754,16 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
     fresh = _get_item(conn, event_id)
     if outcome == "merged":
         return "applied", {"merged": True, "state": fresh["state"] if fresh else None}, None
+    if outcome == "pending":
+        # The owner said merge and the checks are still running: that is a merge in
+        # progress, not a refusal. `merging` is the state poll_validation_jobs() re-drives
+        # until the checks settle — parked here it would never be asked again.
+        moved = _set_state(conn, event_id, STATE_MERGING, now, expect_state=item["state"])
+        conn.commit()
+        if not moved:
+            return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+        return "applied", {"merging": True, "note": (fresh["note"] if fresh is not None else None)
+                           or "waiting for checks"}, None
     if outcome == "ambiguous":
         return "applied", {"note": "merge may have reached GitHub, outcome ambiguous — left for "
                                    "reconcile_operations()"}, None

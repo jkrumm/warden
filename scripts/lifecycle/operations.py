@@ -75,6 +75,14 @@ def complete(conn: sqlite3.Connection, op_id: str, *, outcome: str,
     conn.commit()
 
 
+def annotate(conn: sqlite3.Connection, op_id: str, *, receipt: str) -> None:
+    """Record what is known about an operation that is STILL OPEN — an ambiguous return the
+    caller deliberately does not resolve (see `complete()`). Never sets an outcome and never
+    touches a resolved row."""
+    conn.execute("UPDATE operations SET receipt_json=? WHERE op_id=? AND outcome IS NULL", (receipt, op_id))
+    conn.commit()
+
+
 def open_for_repo(conn: sqlite3.Connection, *, repo: str, kind: str) -> list[sqlite3.Row]:
     """Operations of `kind` on `repo` whose outcome is still NULL — the
     per-repo in-flight lock reads this."""

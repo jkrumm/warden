@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Regression guard for the two ways the watchdog silently lost an alert.
+"""Regression guard for the two ways the watchdog silently lost an alert, and for what its
+`main()` still does now that it posts nothing to Slack (the New/Resolved digest is gone: only
+the blindness alarm and the heartbeat remain).
 
 Run: ~/.hermes/hermes-agent/venv/bin/python3 tests/test_watchdog_delivery.py
 
@@ -71,16 +73,14 @@ def notified_at(conn, external_id: str = "sig-a"):
 # --- --post fixture --------------------------------------------------------
 #
 # `main(["--post"])` runs the full poll pipeline (UptimeKuma, Docker, GitHub,
-# Slack, op-refs ssh probes, …) before it ever reaches delivery — none of
-# that belongs in a delivery-path test and none of it may touch the network
-# here. `_run_poll` is stubbed wholesale so main() never gets that far;
-# in_quiet_hours/vacation_active are stubbed too so the suppression decision
-# is deterministic regardless of wall-clock time; post_text, resolve_secret,
-# and the UptimeKuma heartbeat are stubbed so nothing reaches Slack, 1Password,
-# or uptime.jkrumm.com.
+# Slack, op-refs ssh probes, …) before it ever reaches the heartbeat — none of
+# that belongs in this test and none of it may touch the network here.
+# `_run_poll` is stubbed wholesale so main() never gets that far; resolve_secret
+# and the UptimeKuma heartbeat are stubbed so nothing reaches 1Password or
+# uptime.jkrumm.com. This poller posts nothing to Slack at all (the New/Resolved
+# digest is gone), so there is no Slack stub: the module no longer has a way to post.
 @contextlib.contextmanager
-def post_env(*, run_poll_result=None, quiet: bool = False, vacation: bool = False,
-             token: str | None = "test-slack-token", post_ok: bool = True):
+def post_env(*, run_poll_result=None):
     tmp_dir = Path(tempfile.mkdtemp(prefix="wd-post-test-"))
     tmp_db = tmp_dir / "watchdog.db"
     wp._ledger.connect(tmp_db, migrate=True).close()
@@ -88,24 +88,16 @@ def post_env(*, run_poll_result=None, quiet: bool = False, vacation: bool = Fals
     saved = {
         "DB_PATH": wp.DB_PATH,
         "_run_poll": wp._run_poll,
-        "in_quiet_hours": wp.in_quiet_hours,
-        "vacation_active": wp.vacation_active,
-        "post_text": wp.post_text,
         "resolve_secret": wp.resolve_secret,
         "_push_uptime_heartbeat": wp._push_uptime_heartbeat,
     }
 
-    posts: list[dict] = []
     heartbeats = {"n": 0}
-    secrets = {"SLACK_BOT_TOKEN": token, "UPTIME_PUSH_WATCHDOG": "https://push.example/x"}
+    secrets = {"UPTIME_PUSH_WATCHDOG": "https://push.example/x"}
     result = run_poll_result if run_poll_result is not None else ([], [])
 
     def _fake_run_poll(conn, now, env, deliver=True):
         return result
-
-    def _fake_post_text(channel, text, tok):
-        posts.append({"channel": channel, "text": text, "token": tok})
-        return post_ok, ("1000.000001" if post_ok else None)
 
     def _fake_resolve_secret(key):
         return secrets.get(key) or ""
@@ -116,15 +108,11 @@ def post_env(*, run_poll_result=None, quiet: bool = False, vacation: bool = Fals
     try:
         wp.DB_PATH = tmp_db
         wp._run_poll = _fake_run_poll
-        wp.in_quiet_hours = lambda state: quiet
-        wp.vacation_active = lambda state: vacation
-        wp.post_text = _fake_post_text
         wp.resolve_secret = _fake_resolve_secret
         wp._push_uptime_heartbeat = _fake_heartbeat
 
         class Ctx:
             def __init__(self):
-                self.posts = posts
                 self.heartbeats = heartbeats
                 self.db_path = tmp_db
 
@@ -137,13 +125,15 @@ def post_env(*, run_poll_result=None, quiet: bool = False, vacation: bool = Fals
 
 def _seed_slack_blind(db_path: Path) -> None:
     """Mark Slack polling as blind (three consecutive failures) so main()
-    returns rc=1 without any post_text failure — used to prove the heartbeat
-    fires only on a clean run. db_path must already be wp.DB_PATH."""
+    returns rc=1 — used to prove the heartbeat fires only on a clean run.
+    db_path must already be wp.DB_PATH."""
     conn = wp.db_connect()
     wp.cursor_set(conn, "slack_alert_fail_streak", "3", dt.datetime.now(dt.timezone.utc).isoformat())
     conn.commit()
     conn.close()
 
+
+NEWS = ([{"source": "uk", "title": "monitor down", "url": ""}], [])
 
 print("\n1. reconcile — quiet hours defer rather than burn")
 conn = fresh_db()
@@ -213,74 +203,43 @@ row = conn.execute("SELECT resolved_at FROM events WHERE external_id='sig-a'").f
 check("disappearance still resolves under suppression", row["resolved_at"] is not None, True)
 conn.close()
 
-print("\n6. --post with a non-empty body posts once, right channel and body")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
+print("\n6. a poll with news posts nothing to Slack and still heartbeats")
+check("no digest composer left", hasattr(wp, "compose_slack_body"), False)
+check("no Slack post path left", hasattr(wp, "post_text"), False)
+with post_env(run_poll_result=NEWS) as ctx:
     rc = wp.main(["--post"])
     check("rc == 0", rc, 0)
-    check("post_text called exactly once", len(ctx.posts), 1)
-    check("posted to WATCHDOG_CHANNEL", ctx.posts[0]["channel"], wp.WATCHDOG_CHANNEL)
-    check("posted body is non-empty", bool(ctx.posts[0]["text"]), True)
-    check("no heartbeat call skipped on clean run", ctx.heartbeats["n"], 1)
+    # The monitor this feeds answers "is the poller still running", not "did it have
+    # news": a quiet half hour is the normal case and must still ping.
+    check("heartbeat fires on a clean run", ctx.heartbeats["n"], 1)
 
-print("\n7. --post with an empty body (quiet hours) posts nothing")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], []),
-              quiet=True) as ctx:
-    rc = wp.main(["--post"])
+print("\n7. no --post, no heartbeat")
+with post_env(run_poll_result=NEWS) as ctx:
+    rc = wp.main([])
     check("rc == 0", rc, 0)
-    check("zero Slack calls", len(ctx.posts), 0)
-    # NOT zero. The monitor this feeds answers "is the poller still running", not
-    # "did it have news", and a quiet half hour is the normal case. Skipping the
-    # ping here pages on every silent poll and trains the alert to be ignored —
-    # which is how eleven days of blindness go unnoticed. The retiring wrapper
-    # pinged on rc == 0 regardless of whether a body was printed.
-    check("heartbeat STILL fires on a quiet poll", ctx.heartbeats["n"], 1)
+    check("zero heartbeat calls", ctx.heartbeats["n"], 0)
 
-print("\n8. --post --dry-run makes zero Slack calls and zero heartbeat calls")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
+print("\n8. --post --dry-run makes zero heartbeat calls")
+with post_env(run_poll_result=NEWS) as ctx:
     # main()'s --dry-run branch still runs the full temp-copy-then-poll path
-    # (see main(): "Run poll against a temp copy of the DB…") before it ever
-    # reaches delivery — a clean rc here is evidence that path completed.
+    # (see main(): "Run poll against a temp copy of the DB…") — a clean rc here is
+    # evidence that path completed.
     rc = wp.main(["--post", "--dry-run"])
     check("rc == 0", rc, 0)
-    check("zero Slack calls under dry-run", len(ctx.posts), 0)
     check("zero heartbeat calls under dry-run", ctx.heartbeats["n"], 0)
 
-print("\n9. an unresolvable token returns non-zero and posts nothing")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], []),
-              token=None) as ctx:
-    rc = wp.main(["--post"])
-    check("rc != 0", rc == 0, False)
-    check("zero Slack calls", len(ctx.posts), 0)
-    check("zero heartbeat calls", ctx.heartbeats["n"], 0)
-
-print("\n10. a failing post_text returns non-zero")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], []),
-              post_ok=False) as ctx:
-    rc = wp.main(["--post"])
-    check("rc != 0", rc == 0, False)
-    check("post_text was still called once", len(ctx.posts), 1)
-    check("no heartbeat on a failed post", ctx.heartbeats["n"], 0)
-
-print("\n11. the heartbeat fires on rc == 0 and not on a non-zero rc")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
+print("\n9. the heartbeat fires on rc == 0 and not while Slack polling is blind")
+with post_env(run_poll_result=NEWS) as ctx:
     _seed_slack_blind(ctx.db_path)
-    rc = wp.main(["--post"])
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        rc = wp.main(["--post"])
     check("rc != 0 (slack polling blind)", rc == 0, False)
-    check("post still delivered (digest itself unaffected)", len(ctx.posts), 1)
+    check("the blindness alarm is still reported", "Slack polling is blind" in stderr.getvalue(), True)
     check("no heartbeat on a non-zero rc", ctx.heartbeats["n"], 0)
 
-print("\n12. --slack-body alone still prints to stdout and posts nothing")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = wp.main(["--slack-body"])
-    check("rc == 0", rc, 0)
-    check("body printed to stdout", bool(buf.getvalue().strip()), True)
-    check("zero Slack calls", len(ctx.posts), 0)
-    check("zero heartbeat calls", ctx.heartbeats["n"], 0)
-
-print("\n13. ledger behind this process's schema, --post — pass skipped, heartbeat still fires")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
+print("\n10. ledger behind this process's schema, --post — pass skipped, heartbeat still fires")
+with post_env(run_poll_result=NEWS) as ctx:
     behind_conn = sqlite3.connect(ctx.db_path)
     behind_conn.execute("UPDATE schema_version SET version = ?", (wp._ledger.LEDGER_SCHEMA_VERSION - 1,))
     behind_conn.commit()
@@ -290,14 +249,13 @@ with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url":
     with contextlib.redirect_stderr(stderr):
         rc = wp.main(["--post"])
     check("rc == 0", rc, 0)
-    check("zero Slack calls (pass skipped before delivery)", len(ctx.posts), 0)
     # The Kuma monitor measures "is the poller alive", not "did the ledger open" —
     # a pass deliberately skipped during a migration window is a live poller.
     check("heartbeat still fires", ctx.heartbeats["n"], 1)
     check("stderr names the skip", "ledger behind this process's schema" in stderr.getvalue(), True)
 
-print("\n14. ledger behind this process's schema, no --post — heartbeat NOT pushed")
-with post_env(run_poll_result=([{"source": "uk", "title": "monitor down", "url": ""}], [])) as ctx:
+print("\n11. ledger behind this process's schema, no --post — heartbeat NOT pushed")
+with post_env(run_poll_result=NEWS) as ctx:
     behind_conn = sqlite3.connect(ctx.db_path)
     behind_conn.execute("UPDATE schema_version SET version = ?", (wp._ledger.LEDGER_SCHEMA_VERSION - 1,))
     behind_conn.commit()

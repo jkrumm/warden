@@ -650,6 +650,20 @@ def test_gate_refuses_a_failed_check_even_when_another_is_still_pending():
         raise AssertionError("expected PolicyError")
 
 
+def test_gate_pending_is_decided_on_the_bad_runs_not_on_their_names():
+    """Two runs sharing a name (a re-run): one completed-green, one still running.
+    Only the running one is bad, and it is waiting — ChecksPending, not a refusal.
+    Re-filtering all runs by name pulled the green one back in and read it as failed."""
+    try:
+        merge.merge_gate_check(repo="gamma", validation="confirmed", check_runs=[
+            {"name": "build", "status": "completed", "conclusion": "success"},
+            {"name": "build", "status": "in_progress", "conclusion": None}])
+    except merge.ChecksPending as e:
+        assert "still running" in str(e) and "build" in str(e)
+    else:
+        raise AssertionError("expected ChecksPending")
+
+
 def test_gate_refuses_validation_disagreed():
     try:
         merge.merge_gate_check(repo="gamma", check_runs=[], validation="disagreed")

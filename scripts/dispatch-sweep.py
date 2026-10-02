@@ -35,7 +35,9 @@ below.
 
 ITEM-BACKED DISPATCHES post nothing. A dispatch opened for a triage item
 (`origin_event_id` set) is folded onto the item and closed with
-`delivery_status = ITEM_TRACKED`; Slack hears about the item itself, once, when it
+`delivery_status = ITEM_TRACKED` — a dispatch sideclaw PRUNED is folded too, as a
+terminal dispatch with no verdict, so its item strikes and retries rather than
+staying `working` forever; Slack hears about the item itself, once, when it
 enters `fixed` or `needs_decision` (triage.py `notify_cluster()`, a one-line post
 into the item's own origin thread when it has one). Only a dispatch with no item —
 a `warden dispatch` somebody asked for — is delivered as described above.
@@ -602,6 +604,21 @@ def _mark_pruned(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry
          f"sideclaw pruned this job before it reported ({misses} consecutive 404s)", job_id),
     )
     conn.commit()
+    if item_tracked:
+        # A pruned item-backed investigation is a terminal dispatch with no verdict: fold it
+        # exactly like the terminal path in process_dispatch(), so the item strikes and retries
+        # (fold_dispatch_verdict()'s no-verdict path) instead of sitting `working` forever.
+        try:
+            _triage.fold_dispatch_verdict(
+                conn, origin_event_id=row["origin_event_id"], job_id=job_id,
+                now=dt.datetime.now(dt.timezone.utc), dry_run=False,
+            )
+        except Exception as e:  # a triage-item failure must never look like a sweep failure
+            print(
+                f"dispatch-sweep: folding triage item failed for pruned job {job_id} "
+                f"(origin_event_id {row['origin_event_id']}): {e}",
+                file=sys.stderr,
+            )
     stamp: str | None = None
     if target is None:
         stamp, delivery_status = now_iso, ITEM_TRACKED if item_tracked else UNDELIVERABLE_SENTINEL
