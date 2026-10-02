@@ -9372,3 +9372,36 @@ for 24h. The control plane's own repo is merge-approval-gated and this is the ha
 lane — a saved edit to `scripts/triage.py` *is* the next tick's behaviour — so the
 change lands here, direct to `master`, and #1 is closed as superseded. Item 1294
 closes with it.
+
+## 116. Agent-platform Wave 1 — the gates are cut (2026-10-02)
+
+Spec: `~/SourceRoot/dotfiles/docs/agent-platform.md`; plan: `docs/waves/PLAN.md`.
+Measured reason: ~10 of 414 dispatches merged by warden's own path, behind 23
+trust/approval/policy gates. Commits 405aee5..64b4f7a:
+
+- **Signed approvals deleted** — `approvals.py`, `signer.py`, `intents.py`,
+  `approval-spec.json`; `warden dispatch --tier implement` submits directly;
+  ledger migration 12 drops `dispatch_approvals` (tested on a copy: 1406 events,
+  414 dispatches, 288 items unchanged, integrity ok). `requirements.txt` is empty.
+- **sideclaw is the only boundary** — `dispatch-repos.json`, `resolve_repo/tier`,
+  `check-dispatch-policy.py`, `check-routing.py`, the `TRIAGE_*_MODEL` knobs gone.
+  `policy.repo_cwd()` keeps the one `cwd` sideclaw's wire still needs. A submit
+  4xx raises `SubmitRefused`; `_end_on_refusal()` ends the item `needs_human`
+  with sideclaw's message, never retried.
+- **Merge gate = four facts** (`merge.merge_gate_check()` / `plan_or_land()`):
+  PR open, checks green or none, review `confirmed`, GitHub's merge call allows.
+  Unreadable check runs refuse (unknown ≠ none). Executor repos are no longer
+  special — warden may now auto-merge on sideclaw/warden/dotfiles.
+- **Meta-machinery deleted** — reminders, self-audit, stranded-PR sweep, chaos,
+  restore drill (backup kept), `check-schema-versions.py`, `propose_mappings`,
+  env-check, `warden_self`, `require_no_recursion` (agents may `warden run`).
+  Reminder columns on `triage_items` stay unwritten rather than a table rebuild;
+  `awaiting_owner` still emits `parked_recurrences` for Argo's schema until Wave 2.
+- **Auto-implement on any `nextAction=implement`** — confidence gate gone (also in
+  `require_auto_from_item`). A step-7 review ending with no verdict is
+  re-submitted; the third consecutive failure (`_consecutive_review_failures()`,
+  counted from `dispatches`) lands `needs_human`.
+
+test_triage 352 → 302 (deleted with the code they tested). Not done here: the
+loop/poll/sweep stay paused; the installed `com.jkrumm.warden-restore-drill`
+plist (if bootstrapped) needs a `bootout` + `rm` at redeploy.

@@ -6,16 +6,24 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-09-30 (§115 — a step-7 review that says `needs-human` is a question about the review, not a finding, so it never spends a revision even when it carries findings; those findings now ride the card, because a human is the reader. §114's wrapper class and §92's revisable set are unchanged; the disjoint-set guard stays rejected, on §114's evidence) |
-| Current wave | GitHub-issues-in-warden chain is DONE — all five waves complete (§70 Wave 1, §71 Wave 2, Wave 3 in argo's own history, §72 Wave 4, §73 Wave 5). `docs/waves/PLAN.md` deleted in the same commit as §73; no chain currently active. Separately: estate chain Wave 8 done (§57); field look §58; autonomy §59; Wave 9, the field review, still the owner's to start — authority `~/SourceRoot/dotfiles/docs/waves/PLAN.md` |
+| Last updated | 2026-10-02 (§116 — agent-platform Wave 1: the trust/approval/policy gates are deleted; see the banner under *What is live*) |
+| Current wave | agent-platform rewrite — `docs/waves/PLAN.md`, Wave 1 done (§116), Wave 2 next. Spec: `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
-| Ledger | `~/.warden/warden.db`, schema 11 |
-| Tests | `tests/test_triage.py` 352/352 is the gate; `make test` runs all suites (19 files, incl. `tests/test_dispatch_sweep_pipeline.py` and `tests/test_watchdog_hermes_log_probe.py`) |
+| Ledger | `~/.warden/warden.db`, schema 12 in code (migration 12 drops `dispatch_approvals`); the live file stays at 11 until the loop boots on the new code |
+| Tests | `tests/test_triage.py` 302/302 is the gate; `make test` runs all 15 suites |
 | Next action | see § Next action (bottom) |
 
 ---
 
 ## What is live
+
+> **Superseded in part by agent-platform Wave 1 (§116).** Gone: signed approvals
+> and intents, warden's repo/tier policy and model knobs, the executor-repo /
+> `merge_approval` / `autoMergePaths` / `noCiRequired` / size merge carve-outs,
+> reminders, self-audit, the stranded-PR sweep, chaos, the restore drill,
+> `propose_mappings`, the env-check verb, `warden_self`, `require_no_recursion`,
+> and the high-confidence auto-implement gate. Text below that describes them is
+> history until Wave 5 rewrites this file.
 
 Six LaunchAgents run the whole control plane; no `hermes cron` job is in the
 loop.
