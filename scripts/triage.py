@@ -1,7 +1,7 @@
 """Alert triage — the act-loop that turns deduplicated watchdog.db events into
-one durable, updated-in-place Slack card per problem, with a real sideclaw
-investigation attached once a signature repeats or stays open. THE ACT PATH
-(ingest -> classify -> cluster -> escalate -> card -> resolve) MAKES NO LLM
+Argo items and, at the two moments that matter, one Slack line; a real sideclaw
+investigation is attached once a signature repeats or stays open. THE ACT PATH
+(ingest -> classify -> cluster -> escalate -> notify -> resolve) MAKES NO LLM
 CALL AT ALL (the dispatched sideclaw `investigate` episode itself runs Claude
 Code, which is inherent to what "investigate" means — that is a property of
 sideclaw's dispatch tier, reached here via scripts/clients/sideclaw.py, not of
@@ -87,13 +87,9 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
   6c. Retries     — there is no clock. An infrastructure failure strikes
                    (_strike()): retried with backoff, `failed` on the third.
                    `needs_decision` and `failed` never expire.
-  7. Card         — one Slack card per cluster, posted
-                   once state leaves `new` (an unescalated item, mapped or
-                   not, is carried silently — see CARDED STATES below) and
-                   updated in place after, no-op when the rendered content
-                   hasn't changed.
-  9. Once a day, one digest message listing the signatures that matched no
-     policy rule.
+  7. Notify       — one plain Slack line when a cluster enters `fixed` or
+                   `needs_decision`, nothing else — see NOTIFICATIONS below.
+  9. Once a day, one line counting `failed` items (silent at zero).
   9.5. Argo actions — pulls the owner's queued Argo actions (implement/merge/
                    dismiss/reinvestigate/note) and applies each one before
                    this same pass's own Push step reflects the outcome — see
@@ -107,7 +103,7 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
 `scripts/dispatch-sweep.py` closes the other half: when a dispatch tied to a
 triage cluster (dispatches.origin_event_id) reaches a terminal status, it
 calls `fold_dispatch_verdict()` below to fold the verdict onto every member's
-row and the shared card — without waiting for this script's own next
+row and notifies — without waiting for this script's own next
 10-minute pass.
 
 MATCH TARGETS. `_match_targets()` builds TWO strings per event:
@@ -127,12 +123,12 @@ both `threshold: 0` in the same commit, fixed by the same two-line diff in the
 same repo. `escalate()` groups every eligible `new` item BY RESOLVED REPO and
 opens at most ONE sideclaw dispatch per repo per run (capped at 5 signatures
 per brief; the rest wait for the next run), rather than one dispatch per item.
-Cluster membership is DERIVED, never stored as its own column: every CARDED
+Cluster membership is DERIVED, never stored as its own column: every
 triage_items row sharing a non-NULL `dispatch_job` value IS one cluster — a
 dedicated `cluster_id` column would just duplicate that fact under a different
 name. `_dissolve_cluster()` moves a split cluster's members to state `triaged`
-(which drops them out of every cluster grouping — see CARDED STATES below —
-while keeping the verdict that produced the split readable on each row, see
+(which drops them out of every cluster grouping — only `fixed` and
+`needs_decision` rows are ever grouped — while keeping the verdict that produced the split readable on each row, see
 SPLIT_VERDICT_NOTE_PREFIX), but deliberately leaves `dispatch_job` itself set on those rows
 purely as a cooldown anchor, not a live cluster pointer — see that function's
 own docstring for why clearing it outright would let the escalate() call in the
@@ -151,14 +147,15 @@ it, no second writer races `dispatches` for that column — and then does the
 `UPDATE events SET dispatch_id=?` for EVERY member itself, which is the one
 edge nothing else can write.
 
-CARDED STATES. A card exists only once an item has left `new`/`triaged` — an
-item that is mapped but hasn't yet crossed minOccurrences/minOpenMinutes, or is
-simply unmapped, is carried silently (visible only in the once-a-day daily
-digest — see maybe_post_daily_digest()). This is what keeps an empty or partial
-policy from turning into dozens of cards of noise on day one.
+NOTIFICATIONS. Slack hears about an item exactly twice in its life at most: when
+it enters `fixed` and when it enters `needs_decision`, one plain
+`chat.postMessage` line each (notify_cluster()). Everything else — including
+`failed`, which gets a once-a-day count line (maybe_post_daily_digest()) — lives
+in Argo. `card_hash` records the state a line was posted for; leaving that state
+clears it (_set_state()), so a re-entry posts again and a re-run of one pass never
+posts twice.
 
-DRY-RUN CONTRACT. `--dry-run` never touches Slack (no chat.postMessage/
-chat.update), never shells out to hermes-cc.sh, never shells out to `gh`,
+DRY-RUN CONTRACT. `--dry-run` never touches Slack (no chat.postMessage), never shells out to hermes-cc.sh, never shells out to `gh`,
 never runs a HOST_VERB_ALLOWLIST verb (maybe_auto_remediate() prints
 `[dry-run] would run host verb <key> for <signature>` and does nothing
 else), never polls Argo for pending owner
@@ -191,7 +188,6 @@ from __future__ import annotations
 import concurrent.futures
 import datetime as dt
 import fnmatch
-import hashlib
 import importlib.util
 import json
 import os
@@ -225,6 +221,7 @@ from clients.errors import (  # noqa: E402
 )
 from lifecycle import (  # noqa: E402
     dispatch as _dispatch,
+    items as _items,
     merge as _merge,
     operations as _operations,
     policy as _policy,
@@ -266,7 +263,7 @@ POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
 # governance-cadence, not the reactive-alert-channel firehose this exists to
 # stop. op_refs_homelab/op_refs_vps ARE included: a dead 1Password ref blocks
 # every future reseal of the mini's offline secrets cache (dotfiles' own
-# AGENTS.md §Secrets) — it must reach at least the unmapped digest. See
+# AGENTS.md §Secrets) — it must reach at least Argo. See
 # docs/triage.md.
 #
 # Wave 6.1 adds two MORE origins that also open a `triage_items` row and
@@ -368,24 +365,12 @@ def _is_claim(value: str | None) -> bool:
     return bool(value) and (value == IMPLEMENT_CLAIM or value.startswith(HOST_VERB_CLAIM_PREFIX))
 
 
-# A card exists only for a row that has actually left `new`/`triaged` — see the
-# module docstring's CARDED STATES paragraph. Being in CARDED_STATES only makes a
-# row ELIGIBLE for a card; sync_card() is where "already had one" is enforced (via
-# `card_ts`) for the states reachable straight from `new` (_NEVER_CARDED_FIRST_STATES).
-# `triaged` is deliberately absent: _cluster_groups() groups CARDED rows by
-# `dispatch_job`, and a dissolved cluster member still shares its (deliberately
-# retained) `dispatch_job` with its former cluster-mates — carding it would
-# re-render, as one cluster card, the very cluster the dissolve took apart.
-CARDED_STATES = (STATE_WORKING, STATE_MERGING, STATE_VERIFYING, STATE_NEEDS_DECISION, STATE_FAILED,
-                 STATE_FIXED, STATE_QUIET, STATE_CLOSED)
+# The only states Slack is told about, one line each (notify_cluster()).
+NOTIFY_STATES = (STATE_NEEDS_DECISION, STATE_FIXED)
 
 # `triage_items.note` prefixes for the grouped-source resolve paths (see
 # resolve_quiet_grouped()/resolve_recovery_paired()) plus the liveness path
-# (see maybe_check_liveness()) — render_card_blocks() only surfaces `note` on
-# a STATE_QUIET/STATE_FIXED card when it starts with one of these,
-# specifically so an ordinary event-driven resolve (apply_resolutions, which
-# now clears `note` outright) never accidentally inherits stale text from an
-# earlier phase. Deliberately NOT "fixed"/"resolved" wording for the first
+# (see maybe_check_liveness()). Deliberately NOT "fixed"/"resolved" wording for the first
 # two — a service that is fully down also stops emitting, so silence alone is
 # never proof of a fix; see both functions' own docstrings.
 # LIVENESS_CONFIRMED_NOTE_PREFIX is the one genuine "this is actually fixed"
@@ -401,18 +386,9 @@ LIVENESS_CONFIRMED_NOTE_PREFIX = "liveness confirmed: "
 # not only inside dispatches.verdict_json where nobody reads it.
 SPLIT_VERDICT_NOTE_PREFIX = "cluster split — the investigation's verdict, pending individual re-evaluation: "
 
-STATE_EMOJI = {
-    STATE_NEW: ":large_blue_circle:",
-    STATE_TRIAGED: ":scissors:",
-    STATE_WORKING: ":hammer_and_wrench:",
-    STATE_MERGING: ":test_tube:",
-    STATE_VERIFYING: ":hourglass_flowing_sand:",
+NOTIFY_ICON = {
     STATE_NEEDS_DECISION: ":raising_hand:",
-    STATE_FAILED: ":no_entry:",
-    # `fixed` is the only closing state backed by a verified positive signal.
     STATE_FIXED: ":white_check_mark:",
-    STATE_QUIET: ":mute:",
-    STATE_CLOSED: ":ballot_box_with_check:",
 }
 
 DEFAULT_CARD_CHANNEL = "C0BVDE5R562"  # #agents — see config/triage-policy.json
@@ -501,21 +477,7 @@ MAX_BRIEF_CHARS = 8000
 # substring check on the folded verdict's own text, never an LLM call here.
 DISSOLVE_MARKER = "UNRELATED SIGNATURES"
 
-# `WARDEN_SLACK_API`-overridable — the same env var `warden.py`'s test
-# harness already points at a stub server, read at CALL time inside
-# post_blocks()/update_blocks() via clients/slack.py's own slack_api_base()
-# (not baked into a module-level constant here), so a test that sets the env
-# var after this module is imported (every subprocess test in
-# tests/test_warden_cli.py) still gets intercepted. Wave 6.1's `warden run`
-# is the first caller that can reach this code SYNCHRONOUSLY from the CLI
-# (escalate_origin_items() -> sync_card()) — before it, only the loop
-# (under its own LaunchAgent) ever posted a card, and test_triage.py already
-# replaces post_blocks()/update_blocks() wholesale rather than relying on
-# this override. Defaults to real Slack, unchanged.
-
-SECTION_TEXT_MAX = 3000  # Block Kit section text hard limit
-
-DAILY_DIGEST_CURSOR_KEY = "triage_unmapped_digest_date"
+DAILY_DIGEST_CURSOR_KEY = "triage_failed_digest_date"
 
 # hermes-ops.sh (62 KB) deliberately stayed behind in hermes-agent — the
 # evidence/liveness gatherers shell out to it as a live cross-repo argv, not an
@@ -871,45 +833,16 @@ except Exception:  # pragma: no cover - defensive: keep triage.py independently 
         return _DEDUP_NORMALIZE.sub("-", text.lower()).strip("-")[:120]
 
 
-def _slack_call(url: str, payload: dict[str, Any], token: str) -> tuple[bool, str | None]:
-    """Second element is Slack's own `ts` on success, or Slack's own `error`
-    string (e.g. `cant_update_message`) on a Slack-side rejection — `None`
-    only for a transport/parse failure that never got a Slack response to
-    read an error out of. `sync_card()` reads this to decide whether a
-    failed `chat.update` is the specific, recoverable "wrong app identity"
-    case worth reposting over, rather than parsing stderr. Transport is
-    clients/slack.py's shared slack_raw_post() (loaded above as
-    _slack_client); this wrapper owns only the return-shape and the
-    "triage:"-prefixed stderr line."""
-    data = _slack_client.slack_raw_post(url, payload, token)
-    if data is None:
+def post_line(channel: str, text: str, token: str, *,
+              thread_ts: str | None = None) -> tuple[bool, str | None]:
+    """One plain `chat.postMessage` — text only, no blocks, never an edit. Returns
+    (ok, Slack's own `ts`). `WARDEN_SLACK_API` (clients/slack.py's
+    `slack_api_base()`, read at call time) retargets it at a stub server."""
+    result = _slack_client.slack_post_message(token, channel, text, thread_ts)
+    if not result.get("ok"):
+        print(f"triage: slack post failed: {result.get('error', 'unknown')}", file=sys.stderr)
         return False, None
-    ok = bool(data.get("ok"))
-    if not ok:
-        error = data.get("error", "unknown")
-        print(f"triage: slack call failed: {error}", file=sys.stderr)
-        return False, error
-    return True, data.get("ts")
-
-
-def post_blocks(channel: str, blocks: list[dict[str, Any]], text_fallback: str, token: str, *,
-                 thread_ts: str | None = None) -> tuple[bool, str | None]:
-    """`thread_ts`, when given, posts as a reply under an existing message
-    (a reply threaded under the item's card) rather than a new top-level message — every other caller leaves it
-    unset and gets today's behaviour unchanged."""
-    payload: dict[str, Any] = {"channel": channel, "blocks": blocks, "text": text_fallback, "unfurl_links": False}
-    if thread_ts:
-        payload["thread_ts"] = thread_ts
-    return _slack_call(f"{_slack_client.slack_api_base()}/chat.postMessage", payload, token)
-
-
-def update_blocks(channel: str, ts: str, blocks: list[dict[str, Any]], text_fallback: str,
-                   token: str) -> tuple[bool, str | None]:
-    return _slack_call(
-        f"{_slack_client.slack_api_base()}/chat.update",
-        {"channel": channel, "ts": ts, "blocks": blocks, "text": text_fallback},
-        token,
-    )
+    return True, result.get("ts")
 
 
 # --- policy loading -----------------------------------------------
@@ -1238,6 +1171,9 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     compare-and-swap — maybe_auto_implement() claims an item that way, and the
     returned rowcount is how it learns whether it won.
 
+    `note` is capped to one short line (lifecycle/items.py `cap_note()`): whitespace
+    collapsed, at most 200 characters, the last of them an ellipsis when cut.
+
     Also writes `occurrence_mark` (see _occurrence_mark()), on EVERY
     transition: a closed list of "states that need a mark" is one more list to
     forget to update, so stamping unconditionally means the column is never
@@ -1257,8 +1193,7 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     same reason this is the only writer of `triage_items.state`: a second
     writer of history is a second source of truth about it. The guard matters
     because this same UPDATE also serves CALLERS THAT DO NOT CHANGE STATE
-    (sync_card() and friends write card_ts/card_hash/etc. through here with
-    `state` unchanged) — recording those as transitions would fill the table
+    (callers that change only columns pass `state` unchanged) — recording those as transitions would fill the table
     with noise and corrupt every duration /metrics computes from it. `note`
     rides along verbatim when the caller passed one so history stays readable
     after the item moves on again; a caller that passed none leaves it NULL
@@ -1278,6 +1213,11 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
         raise ValueError(f"{unknown} not in _SET_STATE_COLUMNS — column names reach SQL here, so the "
                          f"list is closed on purpose")
 
+    if "note" in columns:
+        note_column = columns["note"]
+        columns["note"] = (_Coalesce(_items.cap_note(note_column.value)) if isinstance(note_column, _Coalesce)
+                           else _items.cap_note(note_column))
+
     mark = _occurrence_mark(_get_event(conn, event_id))
 
     # The row's state BEFORE this write — the only way to tell a real
@@ -1296,6 +1236,12 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
 
     sql = "UPDATE triage_items SET state=?, occurrence_mark=?, updated_at=?"
     params: list[Any] = [state, mark, _now_iso(now)]
+    if "card_hash" not in columns:
+        # card_hash is the state a Slack line was posted for (notify_cluster()): leaving
+        # that state clears it, so re-entering it later posts again. The CASE reads the
+        # row's state from BEFORE this UPDATE.
+        sql += ", card_hash=CASE WHEN state=? THEN card_hash END"
+        params.append(state)
     for col, value in columns.items():
         if isinstance(value, _Coalesce):
             sql += f", {col}=COALESCE(?, {col})"
@@ -1681,8 +1627,7 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime,
         # are not reachable from here at all any more. What clearing it does
         # do is stop a stale QUIET_RESOLVE_NOTE_PREFIX/
         # RECOVERY_PAIRED_NOTE_PREFIX note from a much earlier quiet-resolve
-        # surviving a reopen -> genuine fix -> resolve cycle and rendering
-        # under render_card_blocks()'s STATE_QUIET branch as if it were
+        # surviving a reopen -> genuine fix -> resolve cycle as if it were
         # still current.
         _set_state(conn, row["event_id"], STATE_QUIET, now, note=None)
     conn.commit()
@@ -1924,13 +1869,13 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     discharge of that obligation. It exits through its own transition or its
     deadline, not through silence.
 
-    Deliberately never claims a fix: render_card_blocks() only ever shows
-    this as "signal quiet since <time>" (QUIET_RESOLVE_NOTE_PREFIX) — a
+    Deliberately never claims a fix: the note only ever says "signal quiet
+    since <time>" (QUIET_RESOLVE_NOTE_PREFIX) — a
     service that is fully down also stops emitting, so silence alone is
     never proof of anything beyond silence. Pure local bookkeeping (no
     Slack, no dispatch), so — like apply_resolutions()/classify() — this
-    runs for real even under --dry-run; only the eventual card sync
-    respects `dry_run` (see run()'s own sync_card() call)."""
+    runs for real even under --dry-run; only the eventual notification
+    respects `dry_run` (see run()'s own notify_cluster() call)."""
     quiet_hours = _quiet_resolve_hours(policy)
     placeholders_sources = ",".join("?" * len(GROUPED_TRIAGE_SOURCES))
     placeholders_states = ",".join("?" * len(_SILENCE_RESOLVE_ELIGIBLE_STATES))
@@ -1956,15 +1901,14 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     conn.commit()
 
 
-def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> set[str]:
+def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> None:
     """Resolve `repo` (fnmatch against BOTH match targets — see
     _match_targets()) and apply, in order: the explicit `ignore` list (same
     targets — a deliberate human call that THIS signature is a genuine
     recovery or known-benign pattern, checked first so it always wins), then
     rule matching, and only for a row no rule matched the structural
     `ignoreUnstructuredSlackProse` fallback (routes to `closed(ignored)` with a
-    note saying why). Only ever touches a row still in state `new`. Returns every
-    signature that matched no rule this run, for the once-a-day digest.
+    note saying why). Only ever touches a row still in state `new`.
 
     **The prose filter runs LAST, and that order is load-bearing.** It is a
     prefix test on the title (`_looks_like_bot_alert`), and a producer that
@@ -1981,7 +1925,6 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
         "SELECT event_id, signature, repo, origin FROM triage_items WHERE state=?",
         (STATE_NEW,),
     ).fetchall()
-    unmapped: set[str] = set()
     now_iso = _now_iso(now)
     for row in rows:
         event_row = _get_event(conn, row["event_id"])
@@ -2030,29 +1973,24 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
             continue
 
         # No rule matched this row.
-        unmapped.add(row["signature"])
-
         if policy["ignoreUnstructuredSlackProse"] and event_row["source"] == "slack_alert" \
                 and not _looks_like_bot_alert(event_row["title"]):
             _set_state(conn, row["event_id"], STATE_CLOSED, now, close_reason=CLOSE_IGNORED,
                        note="unstructured #alerts prose, not a bot alert")
-            unmapped.discard(row["signature"])
             continue
     conn.commit()
-    return unmapped
 
 
 # --- clustering ----------------------------------------------------------------
 
 def _cluster_groups(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
-    """Every carded (state in CARDED_STATES) triage_items row, grouped by
-    `dispatch_job` — the derived cluster key (see module docstring). A row
-    with no dispatch_job (e.g. `quiet` without ever having escalated) is
-    its own singleton group keyed by its own event_id."""
-    placeholders = ",".join("?" * len(CARDED_STATES))
+    """Every triage_items row in a NOTIFY_STATES state, grouped by `dispatch_job` — the
+    derived cluster key (see module docstring). A row with no dispatch_job is its own
+    singleton group keyed by its own event_id."""
+    placeholders = ",".join("?" * len(NOTIFY_STATES))
     rows = conn.execute(
         f"SELECT * FROM triage_items WHERE state IN ({placeholders}) ORDER BY event_id",
-        CARDED_STATES,
+        NOTIFY_STATES,
     ).fetchall()
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
@@ -2831,18 +2769,6 @@ def _host_verb_attempts(conn: sqlite3.Connection, verb_key: str, policy: dict[st
     ).fetchall()
 
 
-def _sync_cards(conn: sqlite3.Connection, items: list[sqlite3.Row], policy: dict[str, Any]) -> None:
-    """Re-render each of `items`' own (single-row) card after a state write.
-    maybe_auto_remediate()'s group operations touch several UNRELATED
-    triage_items rows — not a cluster sharing one `dispatch_job`, which is
-    what sync_card()'s usual multi-member callers group by — so each item
-    gets its own one-row sync_card() call rather than one shared render."""
-    for item in items:
-        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-        if fresh_item is not None and fresh_event is not None:
-            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
-
-
 def _end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: SubmitRefused, *,
                     tier: str, now: dt.datetime, policy: dict[str, Any], **columns: Any) -> None:
     """sideclaw answered the submit with a 4xx — a refusal (repo outside its
@@ -2856,7 +2782,6 @@ def _end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: S
     conn.commit()
     print(f"triage: {tier} dispatch refused by sideclaw, ending {[m['signature'] for m in members]}: {exc}",
           file=sys.stderr)
-    _sync_cards(conn, members, policy)
 
 
 def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, brief: str,
@@ -2866,29 +2791,19 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
     one hypothesis) and `escalate_origin_items()` (a `human`/`github_issue`
     item, always a cluster of exactly one): dispatch ONE investigate episode
     against `repo` with `brief`, flip every row in `members` to
-    `STATE_WORKING` sharing that `dispatch_job`, retro-fill
-    `events.dispatch_id`, post/update the shared Slack card, and retro-fill
-    `origin_thread_ts` onto the `dispatches` row so dispatch-sweep.py's
-    actionable-dispatch nudge lands on the card's own thread. Returns the
-    opened job id, or None on a failed submit (every member strikes, see
+    `STATE_WORKING` sharing that `dispatch_job`, and retro-fill
+    `events.dispatch_id`. Returns the opened job id, or None on a failed submit (every member strikes, see
     _strike()) or under `dry_run`."""
     sigs = [m["signature"] for m in members]
     if dry_run:
         print(f"[dry-run] would dispatch investigate for {repo}: {sigs}")
-        card_channel = _card_channel(policy)
-        print(f"[dry-run] would post card for {repo} ({len(members)} signature"
-              f"{'s' if len(members) != 1 else ''}: {sigs}) in {card_channel}")
         return None
 
-    event_rows_by_id = {m["event_id"]: _get_event(conn, m["event_id"]) for m in members}
     primary = members[0]
     channel = _card_channel(policy)
     # A human (or Hermes, on a human's behalf) that opened this item with its
-    # own thread wants the verdict answered THERE, not on the shared triage
-    # card — the card is a projection, the asker's thread is the origin. Only
-    # `human`-origin items carry these; every alert-cluster `primary` has both
-    # NULL and falls back to the card channel exactly as before this column
-    # existed.
+    # own thread is answered THERE (notify_cluster()). Only `human`-origin items
+    # carry these; every alert-cluster `primary` has both NULL.
     own_channel = primary["origin_channel"]
     own_thread = primary["origin_thread_ts"]
     try:
@@ -2919,26 +2834,6 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
         print(f"triage: dispatch reported job {job_id} but no matching dispatches row was found "
               f"(events.dispatch_id left unset for {sigs})", file=sys.stderr)
     conn.commit()
-
-    # The card only starts existing now (state just became `working`,
-    # the first CARDED_STATES member of this cluster) — post it immediately,
-    # then retro-fill origin_thread_ts on the dispatches row so
-    # dispatch-sweep.py's actionable-dispatch nudge lands on the card's own
-    # thread. Same "small follow-up write to a column dispatch-sweep.py
-    # doesn't own" pattern that file already uses for status/verdict_json/
-    # artifact_url/merged_at/poll_misses/reported_at on this same table.
-    fresh_members = [_get_item(conn, m["event_id"]) for m in members]
-    fresh_members = [m for m in fresh_members if m is not None]
-    fresh_events = [event_rows_by_id[m["event_id"]] for m in fresh_members]
-    fresh_members = sync_card(conn, fresh_members, fresh_events, policy, dry_run=False)
-    card_ts = fresh_members[0]["card_ts"] if fresh_members else None
-    # Skip the retro-fill when the item already named its own thread above —
-    # open_episode()'s own INSERT already wrote the correct origin_thread_ts
-    # at creation, and overwriting it with the card's ts would misroute the
-    # verdict onto the card thread instead of back to the asker.
-    if card_ts and not own_thread:
-        conn.execute("UPDATE dispatches SET origin_thread_ts=? WHERE job_id=?", (card_ts, job_id))
-        conn.commit()
     return job_id
 
 
@@ -3259,8 +3154,21 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
         open_investigations += 1
 
 
+def _comment_back_body(state: str, note: str | None, result: dict[str, Any]) -> str:
+    """At most three lines: `<state>: <summary>`, the pull request if there is one, the Argo link."""
+    summary = (_items.cap_note(note or result.get("summary") or result.get("recommendation") or "")
+               or "no summary recorded")
+    lines = [f"{state}: {summary}"]
+    pr_url = str(result.get("artifactUrl") or "").strip()
+    if pr_url:
+        lines.append(f"PR: {pr_url}")
+    lines.append(f"Argo: {argo_warden_url()}")
+    return "\n".join(lines)
+
+
 def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, event_row: sqlite3.Row,
-                                   result: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
+                                   result: dict[str, Any], now: dt.datetime, *, state: str, note: str | None,
+                                   dry_run: bool) -> None:
     """Comment-back for a `github_issue` item whose verdict just landed
     (called from `fold_dispatch_verdict()`, only on a REAL state transition —
     never on an idempotent re-fold). Only ever posts for the owner's own
@@ -3275,9 +3183,7 @@ def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, ev
     transient GitHub failure is still retried on the next fold.
 
     `dry_run` never touches GitHub — same contract as every other Slack/
-    GitHub side effect in this file (`sync_card()`'s own posts, the Slack
-    card sync `fold_dispatch_verdict()` gates the identical way) — a preview
-    line instead of a POST."""
+    GitHub side effect in this file — a preview line instead of a POST."""
     if item["origin"] != "github_issue":
         return
     payload = _safe_json(event_row["payload_json"])
@@ -3294,17 +3200,7 @@ def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, ev
         print(f"[dry-run] would comment on {_github.GH_OWNER}/{repo}#{number}")
         return
 
-    summary = (result.get("summary") or "").strip()
-    recommendation = (result.get("recommendation") or "").strip()
-    next_action = (result.get("nextAction") or "").strip()
-    lines = ["warden investigated this issue."]
-    if summary:
-        lines.append(f"Summary: {summary}")
-    if recommendation:
-        lines.append(f"Recommendation: {recommendation}")
-    if next_action:
-        lines.append(f"Next action: {next_action}")
-    body = "\n\n".join(lines)[:2000]
+    body = _comment_back_body(state, note, result)
 
     # CLAIM the comment atomically before posting: two folds of the same verdict can
     # both reach here (a `working` -> `working` fold records no state change for the
@@ -3376,11 +3272,10 @@ def _run_host_verb(argv: list[str], *, timeout: int) -> dict[str, Any]:
 def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now: dt.datetime,
                        verdict_text: str, *, dry_run: bool) -> None:
     """Move every member to `triaged` so each is re-evaluated individually.
-    `dispatch_job` is deliberately LEFT SET (only card_channel/card_ts/
-    card_hash are cleared) — a `triaged` row is never grouped by
-    `_cluster_groups()` (which only looks at CARDED_STATES, and `triaged` is
-    deliberately not in it — see that tuple's own comment), so the cluster
-    is functionally gone for card/escalation purposes, but keeping the
+    `dispatch_job` is deliberately LEFT SET — a `triaged` row is never grouped by
+    `_cluster_groups()` (which only looks at NOTIFY_STATES, and `triaged` is
+    deliberately not in it), so the cluster is functionally gone for
+    notification/escalation purposes, but keeping the
     pointer means `_cooldown_ok()` still finds the dissolved dispatch's
     created_at and enforces a real cooldownHours wait. Without this, the very
     same `run()` that dissolves a cluster would see both members freshly
@@ -3400,35 +3295,17 @@ def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now:
     `dispatches.verdict_json`, which nothing reads — now it survives on the
     row itself, in a state silence can never touch.
 
-    Runs its bookkeeping for real even under `dry_run` — only the Slack
-    `update_blocks()` call is skipped, per the module's own DRY-RUN CONTRACT
-    ("dissolve bookkeeping ... runs for real even under --dry-run"). A
-    dissolve moves a row between two WORKING states (working -> triaged), the
+    Runs its bookkeeping for real even under `dry_run`, per the module's own
+    DRY-RUN CONTRACT ("dissolve bookkeeping ... runs for real even under
+    --dry-run"). A dissolve moves a row between two WORKING states (working -> triaged), the
     same class of move classify()/apply_resolutions()/resolve_quiet_grouped()
     already perform for real under --dry-run."""
     sigs = [m["signature"] for m in members]
     job_id = members[0]["dispatch_job"]
-    card_channel = members[0]["card_channel"]
-    card_ts = members[0]["card_ts"]
     print(f"{'[dry-run] would dissolve' if dry_run else 'triage: dissolving'} cluster {job_id}: {sigs}")
-    if card_channel and card_ts:
-        if dry_run:
-            print(f"[dry-run] would post cluster-split update to {card_channel}/{card_ts}")
-        else:
-            token = resolve_slack_token()
-            if token:
-                sig_list = ", ".join(f"`{s}`" for s in sigs)
-                blocks = [
-                    {"type": "header", "text": {"type": "plain_text", "text": ":arrows_counterclockwise: Cluster split"}},
-                    {"type": "section", "text": {"type": "mrkdwn", "text":
-                        f"The investigation found these did not share a root cause: {sig_list}. "
-                        f"Each will be re-evaluated individually."}},
-                ]
-                update_blocks(card_channel, card_ts, blocks, "Cluster split — re-evaluating individually", token)
     note = f"{SPLIT_VERDICT_NOTE_PREFIX}{_cap_brief(verdict_text)}" if verdict_text.strip() else None
     for m in members:
-        _set_state(conn, m["event_id"], STATE_TRIAGED, now,
-                   card_channel=None, card_ts=None, card_hash=None, note=note)
+        _set_state(conn, m["event_id"], STATE_TRIAGED, now, note=note)
     conn.commit()
 
 
@@ -3436,7 +3313,7 @@ def maybe_dissolve_clusters(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
     """A cluster (>1 member sharing one dispatch_job) whose folded verdict
     landed on `working` (fold_dispatch_verdict() parks a marker verdict there
     rather than closing it) and whose verdict text contains DISSOLVE_MARKER gets
-    unwound: every member moves to `triaged`, its card pointers cleared
+    unwound: every member moves to `triaged`
     (dispatch_job itself retained — see _dissolve_cluster()), carrying the
     verdict that produced the split in its own `note` so each is re-evaluated
     independently on a later run without losing it. Runs once per pass, before
@@ -3463,247 +3340,65 @@ def maybe_dissolve_clusters(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
         _dissolve_cluster(conn, list(members), now, text_blob, dry_run=dry_run)
 
 
-# --- card rendering ------------------------------------------------------------
+# --- notifications ------------------------------------------------------------
 
 def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-class _ActionRequired(NamedTuple):
-    heading: str
-    default_do: str
+def argo_warden_url() -> str:
+    """Argo's /warden page (no per-item deep link exists): the configured Argo base
+    (clients/argo.py `argo_api_base()`, `ARGO_URL`) without its trailing `/api`."""
+    return f"{_argo.argo_api_base().removesuffix('/api')}/warden"
 
 
-# Per-state card copy for the two states that need a person. `default_do` is
-# the `Do this:` line when `note` is empty — `_set_state()` guarantees a note
-# in the common paths, but a row edited by hand outside this file still needs
-# an actionable card rather than a blank instruction.
-_ACTION_REQUIRED: dict[str, _ActionRequired] = {
-    STATE_NEEDS_DECISION: _ActionRequired(
-        heading="*Decision needed*",
-        default_do="read the verdict above and decide",
-    ),
-    STATE_FAILED: _ActionRequired(
-        heading="*Failed*",
-        default_do='retry from Argo, merge by hand via the PR, or `warden close <event-id> --why "<reason>"`',
-    ),
-}
+def argo_link() -> str:
+    return f"<{argo_warden_url()}|Argo>"
 
 
-def _action_required_block(state: str, note: str | None) -> dict[str, Any]:
-    """The `needs_decision` / `failed` card body: a `section` block (not
-    `context`) so it reads as an instruction, not a footnote. Neither state ever
-    expires, so there is no countdown. The note is truncated on its own, after
-    the heading has reserved its space."""
-    copy = _ACTION_REQUIRED[state]
-    lines = [copy.heading]
-    note_text = (note or "").strip()
-    do_body = _escape(note_text) if note_text else copy.default_do
-    budget = SECTION_TEXT_MAX - sum(len(x) + 1 for x in lines) - len("Do this: ")
-    lines.append(f"Do this: {do_body[:max(budget, 0)]}")
-    return {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}
+def format_notification(state: str, primary: sqlite3.Row, event_row: sqlite3.Row, member_count: int) -> str:
+    """The one Slack line: `<icon> <repo>: <summary> — <state> <Argo link>`. The summary
+    is the item's note (for `needs_decision` the decision question), else the event's
+    title, as one line of at most 200 characters."""
+    fallback = f"{member_count} related alerts" if member_count > 1 else (event_row["title"] or primary["signature"])
+    summary = _items.cap_note(primary["note"]) or _items.cap_note(fallback) or primary["signature"]
+    return f"{NOTIFY_ICON[state]} {primary['repo'] or 'warden'}: {_escape(summary)} — {state} {argo_link()}"
 
 
-def render_card_blocks(members: list[sqlite3.Row], event_rows: list[sqlite3.Row], conn: sqlite3.Connection
-                        ) -> list[dict[str, Any]]:
-    primary = members[0]
-    state = primary["state"]
-    emoji = STATE_EMOJI.get(state, ":question:")
-    if len(members) > 1:
-        title = f"{len(members)} related alerts in `{primary['repo']}`"
-    else:
-        title = _escape(event_rows[0]["title"] or primary["signature"])[:140]
-    blocks: list[dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": f"{emoji} {title}"[:150]}},
-    ]
+def notify_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: list[sqlite3.Row],
+                   policy: dict[str, Any], *, dry_run: bool) -> None:
+    """Post ONE plain line to Slack for each NOTIFY_STATES state `members` has entered and
+    not yet announced; everything else is silent (it lives in Argo). A cluster (several
+    members, one state) posts once, for its first member. Dedupe is `card_hash` = the
+    state posted for, copied onto every member of that state: _set_state() clears it when
+    an item leaves the state, so a re-entry posts again and a re-run of the same pass
+    never posts twice. Only Slack's own `ok: true` stamps it — a failed post is retried
+    on the next pass.
 
-    member_lines = [
-        f"• `{m['signature']}` — {m['occurrences']}× since {_fmt_ts(m['first_seen'])} · "
-        f"last {_fmt_ts(m['last_seen'])}"
-        for m in members
-    ]
-    ctx_text = "\n".join(member_lines)
-    if primary["repo"]:
-        ctx_text += f"\nrepo `{primary['repo']}`"
-    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ctx_text[:SECTION_TEXT_MAX]}})
-
-    implement_job = primary["implement_job"]
-    verdict_dispatch = None
-    if state in (STATE_WORKING, STATE_NEEDS_DECISION, STATE_FAILED) and primary["dispatch_job"]:
-        verdict_dispatch = conn.execute(
-            "SELECT verdict_json FROM dispatches WHERE job_id=?", (primary["dispatch_job"],)).fetchone()
-
-    if state == STATE_WORKING and _is_claim(implement_job):
-        # maybe_auto_remediate() writes the claim's own note as
-        # "restarting via <verb>" — render it verbatim rather than
-        # re-deriving the verb from the claim.
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"{_escape(primary['note'] or 'starting')} …"}],
-        })
-    elif state == STATE_WORKING and implement_job:
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"Implementation running — job `{implement_job[:8]}`"}],
-        })
-    elif state == STATE_WORKING and primary["dispatch_job"] and not (
-            verdict_dispatch and verdict_dispatch["verdict_json"]):
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"Investigation running — job `{primary['dispatch_job'][:8]}`"}],
-        })
-    elif state in (STATE_WORKING, STATE_NEEDS_DECISION, STATE_FAILED) and verdict_dispatch is not None:
-        result = _safe_json(verdict_dispatch["verdict_json"]) if verdict_dispatch["verdict_json"] else {}
-        summary = (result.get("summary") or "").strip()
-        confidence = result.get("confidence") or "?"
-        text_lines = []
-        if summary:
-            text_lines.append(_escape(summary))
-        text_lines.append(f"_confidence {confidence}_")
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(text_lines)[:SECTION_TEXT_MAX]}})
-        evidence = result.get("evidence")
-        if isinstance(evidence, list) and evidence:
-            ev_lines = []
-            for e in evidence[:3]:
-                if isinstance(e, dict):
-                    ev_lines.append(f"- `{_escape(str(e.get('file') or '?'))}` — {_escape(str(e.get('detail') or ''))}")
-                else:
-                    ev_lines.append(f"- {_escape(str(e))}")
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(ev_lines)}})
-        artifact_url = primary["artifact_url"]
-        if artifact_url:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Artifact:* <{artifact_url}>"}})
-        if state in (STATE_NEEDS_DECISION, STATE_FAILED):
-            blocks.append(_action_required_block(state, primary["note"]))
-    elif state == STATE_TRIAGED:
-        # Reachable on a card only through a strike (the card posted while the
-        # failed episode ran): say what is happening instead of leaving the old
-        # "running" line up.
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
-            f"{_escape(primary['note'] or 'waiting for its dispatch')}"[:SECTION_TEXT_MAX]}]})
-    elif state in (STATE_NEEDS_DECISION, STATE_FAILED):
-        # No dispatch_job at all (a host-verb receipt, a reconcile failure):
-        # the note IS the whole verdict.
-        blocks.append(_action_required_block(state, primary["note"]))
-    elif state in (STATE_QUIET, STATE_FIXED) and (primary["note"] or "").startswith(
-            (QUIET_RESOLVE_NOTE_PREFIX, RECOVERY_PAIRED_NOTE_PREFIX, LIVENESS_CONFIRMED_NOTE_PREFIX)):
-        # Only ever rendered for the grouped-source resolve paths (see
-        # resolve_quiet_grouped()/resolve_recovery_paired(), both STATE_QUIET)
-        # and the liveness confirm path (maybe_check_liveness(), STATE_FIXED)
-        # — an ordinary event-driven resolve clears `note` outright
-        # (apply_resolutions()), so this never fires for a genuine
-        # state-source (uk/docker/op_refs) recovery, which needs no caveat.
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"↳ _{_escape(primary['note'])}_"}]})
-    elif state == STATE_CLOSED:
-        # `closed`'s reason is the whole point of the state.
-        reason = primary["close_reason"] or "closed"
-        text = f"↳ _{reason}: {_escape(primary['note'])}_" if primary["note"] else f"↳ _{reason}_"
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}]})
-    elif state == STATE_MERGING:
-        text = "Independent validation running"
-        if primary["validation_job"]:
-            text += f" — job `{primary['validation_job'][:8]}`"
-        if primary["pr_url"]:
-            text += f"\nPull request: <{primary['pr_url']}>"
-        if primary["note"]:
-            text += f"\n_{_escape(primary['note'])}_"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}})
-    elif state == STATE_VERIFYING:
-        if primary["liveness_deadline"]:
-            text = f"Deployed — confirming liveness by {_fmt_ts(primary['liveness_deadline'])}"
-        else:
-            text = "Merged"
-        if primary["pr_url"]:
-            text += f"\nPull request: <{primary['pr_url']}>"
-        if primary["note"]:
-            text += f"\n_{_escape(primary['note'])}_"
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}]})
-
-    return blocks
-
-
-def _card_hash(blocks: list[dict[str, Any]]) -> str:
-    return hashlib.sha256(json.dumps(blocks, sort_keys=True).encode()).hexdigest()
-
-
-# States a row can reach directly from `new` that must never receive a FIRST
-# card — see sync_card()'s own docstring for the incident this guards. Named
-# once, as a tuple, rather than inline literals repeated at the one call site
-# that checks them.
-_NEVER_CARDED_FIRST_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED)
-
-
-def sync_card(conn: sqlite3.Connection, members: list[sqlite3.Row], event_rows: list[sqlite3.Row],
-              policy: dict[str, Any], *, dry_run: bool) -> list[sqlite3.Row]:
-    """Render this cluster's card and post/update Slack ONLY if the rendered
-    content changed since the last sync (the card_hash short-circuit — the
-    property that keeps the channel from becoming a firehose again). Every
-    member row carries an identical copy of card_channel/card_ts/card_hash
-    (rather than one "owning" row) so cluster membership stays self-
-    describing even after a process restart. Returns the (possibly reloaded)
-    member rows.
-
-    A cluster in one of _NEVER_CARDED_FIRST_STATES with no `card_ts` was
-    never carded in the first place — every one of the resolve paths
-    (apply_resolutions(), resolve_quiet_grouped(), resolve_recovery_paired())
-    can flip an unescalated `new` row straight to `quiet` on a
-    quiet/disappeared signal, and a card announcing the resolution of a
-    problem nobody was told about is exactly the noise this loop replaced
-    (see CARDED_STATES's own comment for the incident). The fix is a
-    `chat.postMessage` this branch must never make — an already-carded item
-    still gets its final `chat.update` below, unchanged."""
-    if not members:
-        return members
-    primary = members[0]
-    if primary["state"] in _NEVER_CARDED_FIRST_STATES and not primary["card_ts"]:
-        return members
-    blocks = render_card_blocks(members, event_rows, conn)
-    new_hash = _card_hash(blocks)
-    if new_hash == primary["card_hash"]:
-        return members
-    channel = primary["card_channel"] or _card_channel(policy)
-    if len(members) > 1:
-        fallback = f"{len(members)} related alerts in {primary['repo']}"
-    else:
-        fallback = (event_rows[0]["title"] or primary["signature"])[:150]
-    if dry_run:
-        action = "update" if primary["card_ts"] else "post"
-        sigs = [m["signature"] for m in members]
-        print(f"[dry-run] would {action} card for {sigs} (state={primary['state']}) in {channel}")
-        return members
-    token = resolve_slack_token()
-    if not token:
-        print(f"triage: no Slack token, cannot sync card for cluster "
-              f"{[m['signature'] for m in members]}", file=sys.stderr)
-        return members
-    if primary["card_ts"]:
-        ok, result = update_blocks(channel, primary["card_ts"], blocks, fallback, token)
-        if not ok and result == "cant_update_message":
-            # Slack refuses chat.update across app identities — the old
-            # card was posted by a different app than the one holding
-            # `token` now (e.g. a pre-cutover Hermes-posted card, Warden's
-            # token now seeded). Post a fresh card instead of leaving this
-            # cluster stuck re-failing the same update every pass. Anything
-            # threaded under the old card is orphaned — Slack has no "move a
-            # thread" call — so those replies are simply lost.
-            print(f"triage: cant_update_message for cluster {[m['signature'] for m in members]} "
-                  f"(old card_ts {primary['card_ts']}) — reposting as a new card", file=sys.stderr)
-            ok, result = post_blocks(channel, blocks, fallback, token)
-        ts = result
-    else:
-        ok, ts = post_blocks(channel, blocks, fallback, token)
-    if not ok:
-        print(f"triage: slack card sync failed for cluster {[m['signature'] for m in members]}", file=sys.stderr)
-        return members
-    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-    ts_value = ts or primary["card_ts"]
-    for m in members:
-        conn.execute(
-            "UPDATE triage_items SET card_channel=?, card_ts=?, card_hash=?, updated_at=? WHERE event_id=?",
-            (channel, ts_value, new_hash, now_iso, m["event_id"]),
-        )
-    conn.commit()
-    return [r for r in (_get_item(conn, m["event_id"]) for m in members) if r is not None]
+    An item with its own origin thread (`warden run`, Hermes) is answered there instead
+    of in the shared channel. `dry_run` never touches Slack."""
+    for state in NOTIFY_STATES:
+        pairs = [(m, e) for m, e in zip(members, event_rows) if m["state"] == state and m["card_hash"] != state]
+        if not pairs:
+            continue
+        primary, event_row = pairs[0]
+        text = format_notification(state, primary, event_row, len(pairs))
+        channel = primary["origin_channel"] or _card_channel(policy)
+        thread_ts = primary["origin_thread_ts"] if primary["origin_channel"] else None
+        if dry_run:
+            print(f"[dry-run] would post to {channel}: {text}")
+            continue
+        token = resolve_slack_token()
+        if not token:
+            print(f"triage: no Slack token, cannot post for {[m['signature'] for m, _ in pairs]}", file=sys.stderr)
+            continue
+        ok, ts = post_line(channel, text, token, thread_ts=thread_ts)
+        if not ok:
+            continue
+        for m, _e in pairs:
+            conn.execute("UPDATE triage_items SET card_channel=?, card_ts=?, card_hash=? "
+                         "WHERE event_id=? AND state=?", (channel, ts, state, m["event_id"], state))
+        conn.commit()
 
 
 def _decision_note(result: dict[str, Any]) -> str:
@@ -3723,7 +3418,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     (dispatches.origin_event_id) reaches a terminal status. Looks up EVERY
     triage_items row sharing this `dispatch_job` (not just origin_event_id's
     own row — a cluster can have several), folds the verdict onto all of
-    them, and syncs the shared card immediately rather than waiting for this
+    them, and notifies immediately rather than waiting for this
     file's own next 10-minute pass. `origin_event_id` is used only as a sanity
     check (the primary member should be among the rows found by job_id); job_id
     is authoritative for cluster membership.
@@ -3811,7 +3506,9 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         for m in members:
             event_row = _get_event(conn, m["event_id"])
             if event_row is not None:
-                _maybe_comment_back_on_issue(conn, m, event_row, result, now, dry_run=True)
+                outcome_state, outcome_note, _reason = _member_outcome(m)
+                _maybe_comment_back_on_issue(conn, m, event_row, result, now, state=outcome_state,
+                                             note=outcome_note, dry_run=True)
         return
 
     for m in members:
@@ -3838,13 +3535,13 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         if rowcount:
             event_row = _get_event(conn, m["event_id"])
             if event_row is not None:
-                _maybe_comment_back_on_issue(conn, m, event_row, result, now, dry_run=False)
+                _maybe_comment_back_on_issue(conn, m, event_row, result, now, state=member_state,
+                                             note=member_note, dry_run=False)
 
     fresh_members = [r for r in (_get_item(conn, m["event_id"]) for m in members) if r is not None]
     fresh_events = [e for e in (_get_event(conn, m["event_id"]) for m in fresh_members) if e is not None]
     if fresh_members and len(fresh_members) == len(fresh_events):
-        policy = load_policy()
-        sync_card(conn, fresh_members, fresh_events, policy, dry_run=False)
+        notify_cluster(conn, fresh_members, fresh_events, load_policy(), dry_run=False)
 
 
 # --- the auto-implement chain: verdict -> implement -> validate -> merge ----
@@ -4470,7 +4167,6 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             for item in items:
                 _set_state(conn, item["event_id"], STATE_FAILED, now, note=note)
             conn.commit()
-            _sync_cards(conn, items, policy)
             continue
 
         # CLAIM EVERY ITEM IN THE GROUP before executing — same
@@ -4518,7 +4214,6 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 _strike(conn, item["event_id"], now, note, retry_state=STATE_WORKING,
                         expect_state=STATE_WORKING, implement_job=None)
         conn.commit()
-        _sync_cards(conn, claimed, policy)
 
 
 def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -4575,9 +4270,6 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         except (PolicyError, PreconditionError, UsageError) as e:
             _set_state(conn, item["event_id"], STATE_WORKING, now, note=f"deferred: {e}")
             conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
             continue
 
         brief = (
@@ -4643,9 +4335,6 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             (opened.job_id, _now_iso(now), item["event_id"]),
         )
         conn.commit()
-        fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-        if fresh_item is not None and fresh_event is not None:
-            sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 
 VALIDATION_GATE_QUESTIONS = (
@@ -4720,10 +4409,10 @@ def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: 
     return opened.job_id, None
 
 
-def _sync_item_card(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int) -> None:
+def _notify_item(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int) -> None:
     fresh_item, fresh_event = _get_item(conn, event_id), _get_event(conn, event_id)
     if fresh_item is not None and fresh_event is not None:
-        sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+        notify_cluster(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
 
 # What an implement attempt that did not produce a pull request clears, so the
@@ -4796,7 +4485,6 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             _strike(conn, event_id, now, reason, retry_state=STATE_WORKING, expect_state=STATE_WORKING,
                     **_IMPLEMENT_RETRY_COLUMNS)
             conn.commit()
-            _sync_item_card(conn, policy, event_id)
 
         try:
             resp = _sideclaw.get(job_id)
@@ -4887,7 +4575,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             _strike_attempt(f"implement {job_id}: {outcome or 'missing outcome'} — {summary}")
             continue
         conn.commit()
-        _sync_item_card(conn, policy, event_id)
+        _notify_item(conn, policy, event_id)
 
 
 def _already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
@@ -5009,7 +4697,6 @@ def _submit_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlit
         _set_state(conn, item["event_id"], STATE_MERGING, now, expect_state=STATE_MERGING,
                    validation_job=val_job, note=None)
     conn.commit()
-    _sync_item_card(conn, policy, item["event_id"])
 
 
 def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -5069,7 +4756,6 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _strike(conn, event_id, now, f"step-7 review ended with no verdict: {reason}",
                     retry_state=STATE_MERGING, expect_state=STATE_MERGING, validation_job=None)
             conn.commit()
-            _sync_item_card(conn, policy, event_id)
 
         try:
             resp = _sideclaw.get(item["validation_job"])
@@ -5182,7 +4868,7 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _land_already_merged_item(conn, policy, item, now)
         else:
             _merge_and_rollout(conn, policy, item, now)
-        _sync_item_card(conn, policy, event_id)
+        _notify_item(conn, policy, event_id)
 
 
 MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
@@ -5487,8 +5173,6 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             except RemoteError as e:
                 print(f"triage: could not close superseded {prior_pr}: {e}", file=sys.stderr)
 
-        _sync_item_card(conn, policy, item["event_id"])
-
 
 def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                              *, dry_run: bool) -> None:
@@ -5705,7 +5389,7 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 continue
             _set_state(conn, item["event_id"], STATE_FIXED, now)
             conn.commit()
-            _sync_item_card(conn, policy, item["event_id"])
+            _notify_item(conn, policy, item["event_id"])
             continue
         repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
         key = repo_entry.get("liveness")
@@ -5746,9 +5430,7 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # message — backs the claim.
             _set_state(conn, item["event_id"], STATE_FIXED, now, note=note)
             conn.commit()
-            fresh_item, fresh_event = _get_item(conn, item["event_id"]), _get_event(conn, item["event_id"])
-            if fresh_item is not None and fresh_event is not None:
-                sync_card(conn, [fresh_item], [fresh_event], policy, dry_run=False)
+            _notify_item(conn, policy, item["event_id"])
             continue
 
         deadline = _parse_ts(item["liveness_deadline"])
@@ -5758,62 +5440,40 @@ def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             print(f"[dry-run] would REOPEN {item['signature']} — liveness never confirmed: {detail}")
             continue
 
-        # Reopen carries history on the card itself (mirrors _dissolve_cluster()'s
-        # own final-update-then-reset shape) — never through sync_card()/
-        # render_card_blocks(), because the row is about to land back in
-        # `new`, which must never be carded (see CARDED_STATES's own comment).
+        # The row lands back in `new`, which Slack never hears about — the reason rides on
+        # its note.
         history = (f"PR: {item['pr_url'] or '(none)'} — reopened, liveness never confirmed "
                    f"within the window. Last check: {detail}. Still failing as of "
                    f"{_fmt_ts(now_iso)}.")
-        if item["card_channel"] and item["card_ts"]:
-            token = resolve_slack_token()
-            if token:
-                blocks = [
-                    {"type": "header", "text": {"type": "plain_text",
-                     "text": ":recycle: Reopened — liveness never confirmed"}},
-                    {"type": "section", "text": {"type": "mrkdwn", "text": _escape(history)[:SECTION_TEXT_MAX]}},
-                ]
-                update_blocks(item["card_channel"], item["card_ts"], blocks,
-                              "Reopened — liveness never confirmed", token)
         _set_state(conn, item["event_id"], STATE_NEW, now, note=history)
         conn.commit()
 
 
-# --- unmapped-signature digest -------------------------------------------------
+# --- failed digest -------------------------------------------------------------
 
-def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], unmapped: set[str],
-                             now: dt.datetime, *, dry_run: bool) -> None:
-    """One Slack message, at most once per UTC day, listing the unmapped
-    signatures (no policy rule matched — see classify()). Silent by default;
-    this is the only place they become visible."""
-    if not unmapped:
+def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                             *, dry_run: bool) -> None:
+    """`failed` never posts when an item enters it; instead one line, at most once per UTC
+    day, says how many are failed: `:x: <n> failed — <Argo link>`. Silent at zero."""
+    failed = conn.execute("SELECT count(*) c FROM triage_items WHERE state=?", (STATE_FAILED,)).fetchone()["c"]
+    if not failed:
         return
     today = now.date().isoformat()
     row = conn.execute("SELECT value FROM cursors WHERE key=?", (DAILY_DIGEST_CURSOR_KEY,)).fetchone()
     if row and row["value"] == today:
         return
 
-    lines: list[str] = []
-    if unmapped:
-        sigs = sorted(unmapped)
-        lines.append("*Unmapped triage signatures* — no rule in `triage-policy.json`, so these never escalate:")
-        lines.extend(f"- `{s}`" for s in sigs[:20])
-        if len(sigs) > 20:
-            lines.append(f"… and {len(sigs) - 20} more")
-
-    text = "\n".join(lines)
+    text = f":x: {failed} failed — {argo_link()}"
     channel = _card_channel(policy)
     if dry_run:
-        print(f"[dry-run] would post daily digest ({len(unmapped)} unmapped) to {channel}")
+        print(f"[dry-run] would post to {channel}: {text}")
         return
     token = resolve_slack_token()
     if not token:
         print("triage: no Slack token, cannot post daily digest", file=sys.stderr)
         return
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:SECTION_TEXT_MAX]}}]
-    ok, _ts = post_blocks(channel, blocks, text, token)
+    ok, _ts = post_line(channel, text, token)
     if not ok:
-        print("triage: daily digest post failed", file=sys.stderr)
         return
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
@@ -5920,7 +5580,6 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
         (opened.job_id, _now_iso(now), event_id),
     )
     conn.commit()
-    _sync_item_card(conn, load_policy(), event_id)
     return "applied", {"jobId": opened.job_id}, None
 
 
@@ -6157,7 +5816,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     ingest(conn, now)
     ingest_github_issues(conn, now)
     reopen_if_needed(conn, now)
-    unmapped = classify(conn, policy, now)
+    classify(conn, policy, now)
     apply_resolutions(conn, now, policy)
     resolve_recovery_paired(conn, policy, now, dry_run=dry_run)
     resolve_quiet_grouped(conn, policy, now)
@@ -6190,9 +5849,9 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
         event_rows = [_get_event(conn, m["event_id"]) for m in members]
         if any(er is None for er in event_rows):
             continue
-        sync_card(conn, members, event_rows, policy, dry_run=dry_run)
+        notify_cluster(conn, members, event_rows, policy, dry_run=dry_run)
 
-    maybe_post_daily_digest(conn, policy, unmapped, now, dry_run=dry_run)
+    maybe_post_daily_digest(conn, policy, now, dry_run=dry_run)
 
     # No timestamp argument, deliberately — see record_heartbeat().
     record_heartbeat(conn, dry_run=dry_run)

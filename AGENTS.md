@@ -41,8 +41,8 @@ a `ThrottleInterval`. It binds `127.0.0.1:7735` only, loopback and no auth — s
 honesty rules (`null` + reason, never a fabricated `0`), and what is deliberately
 not built yet.
 
-Slack delivery from the loop is a **plain HTTP client** (`chat.postMessage` /
-`chat.update` with a token from `resolve_slack_token()`), never the gateway's live
+Slack delivery from the loop is a **plain HTTP client** (one text-only
+`chat.postMessage` per notification, with a token from `resolve_slack_token()`), never the gateway's live
 `slack_bolt` connection. That is what makes a gateway-independent agent safe, and
 it is not an implementation detail — it is the property. It posts under warden's
 own Slack app identity, falling back to Hermes's token until that app is seeded —
@@ -84,7 +84,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **292/292**. Any other number is a
+`tests/test_triage.py` is the regression gate at **301/301**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -98,7 +98,8 @@ the failure mode this whole project exists to remove.
 ## The ledger
 
 `~/.warden/warden.db` — SQLite, WAL, **not in git**, live. It is the source of
-truth; Slack cards and Argo pages are projections.
+truth; Argo pages are projections, and Slack hears one line when an item is `fixed` or
+`needs_decision` (plus a daily `failed` count).
 
 - **One migrator.** `scripts/ledger.py` owns the schema and `schema_version`;
   only the loop migrates, at boot. Everything else asserts the version and

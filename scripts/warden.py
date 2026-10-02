@@ -794,7 +794,7 @@ def cmd_revert(conn, flags: Flags, positional: list[str], state: _State) -> dict
 # States a human can resolve by hand: no episode or operation is in flight,
 # and the item is not already terminal. Mirrors the closed-allowlist shape
 # used elsewhere in this repo (items._EXTRA_COLUMNS, triage.py's own
-# _NEVER_CARDED_FIRST_STATES) — a state not named here is refused, never
+# NOTIFY_STATES) — a state not named here is refused, never
 # silently allowed.
 _CLOSE_ALLOWED_STATES = (
     triage.STATE_NEW, triage.STATE_TRIAGED, triage.STATE_NEEDS_DECISION,

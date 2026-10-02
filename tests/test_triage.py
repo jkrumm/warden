@@ -116,8 +116,8 @@ CLOSED_PRS: list[tuple[str, str, int, str | None]] = []
 @contextlib.contextmanager
 def _triage_env(*, policy: dict[str, Any] | None = None):
     """Stand up a throwaway watchdog.db + policy fixture,
-    point scripts/triage.py's module globals at them, stub Slack (post_blocks/
-    update_blocks/resolve_slack_token) to record calls with no network, fake
+    point scripts/triage.py's module globals at them, stub Slack (post_line/
+    resolve_slack_token) to record calls with no network, fake
     the client boundary (`triage._sideclaw`, `triage._github`) so no test ever reaches a real HTTP call, and restore
     every patched attribute on exit. Yields (conn, ctx) where ctx exposes the
     recorded Slack calls; a test overrides `triage._sideclaw.submit`/`.get`
@@ -128,8 +128,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         "DB_PATH": triage.DB_PATH,
         "POLICY_PATH": triage.POLICY_PATH,
         "resolve_slack_token": triage.resolve_slack_token,
-        "post_blocks": triage.post_blocks,
-        "update_blocks": triage.update_blocks,
+        "post_line": triage.post_line,
         "LIVENESS_ALLOWLIST": dict(triage.LIVENESS_ALLOWLIST),
         "MAX_OPEN_INVESTIGATIONS": triage.MAX_OPEN_INVESTIGATIONS,
         "_HERMES_OPS_BIN": triage._HERMES_OPS_BIN,
@@ -210,23 +209,16 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
             (owner, repo, number, comment))
 
         posted: list[dict[str, Any]] = []
-        updated: list[dict[str, Any]] = []
         _ts_counter = {"n": 0}
 
-        def _fake_post(channel, blocks, text_fallback, token, *, thread_ts=None):
+        def _fake_post(channel, text, token, *, thread_ts=None):
             _ts_counter["n"] += 1
             ts = f"1000.{_ts_counter['n']:06d}"
-            posted.append({"channel": channel, "blocks": blocks, "text": text_fallback, "ts": ts,
-                           "thread_ts": thread_ts})
-            return True, ts
-
-        def _fake_update(channel, ts, blocks, text_fallback, token):
-            updated.append({"channel": channel, "ts": ts, "blocks": blocks, "text": text_fallback})
+            posted.append({"channel": channel, "text": text, "ts": ts, "thread_ts": thread_ts})
             return True, ts
 
         triage.resolve_slack_token = lambda: "test-token"
-        triage.post_blocks = _fake_post
-        triage.update_blocks = _fake_update
+        triage.post_line = _fake_post
 
         # Never a real network call for the Argo push either — every test in
         # this file that runs a full pass would otherwise reach out to
@@ -263,13 +255,12 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         class Ctx:
             def __init__(self):
                 self.posted = posted
-                self.updated = updated
                 self.tmp_dir = tmp_dir
                 self.argo_pushes = argo_pushes
                 self.argo_acks = argo_acks
 
             def total_calls(self) -> int:
-                return len(self.posted) + len(self.updated)
+                return len(self.posted)
 
         yield conn, Ctx()
         conn.close()
@@ -439,7 +430,7 @@ def _seed_split_item(conn: sqlite3.Connection, *, external_id: str, repo: str = 
 
 # --- tests -----------------------------------------------------------------
 
-def test_repeated_signature_one_card_one_investigation():
+def test_repeated_signature_one_investigation_and_no_slack_post():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-a", title="Alert A", first_seen=OLD)
         calls: list[dict[str, Any]] = []
@@ -449,18 +440,15 @@ def test_repeated_signature_one_card_one_investigation():
         assert triage.run(conn, dry_run=False) == 0  # a second cron cycle, nothing changed
 
         assert len(calls) == 1, f"expected exactly one dispatch, got {len(calls)}"
-        assert len(ctx.posted) == 1, f"expected exactly one initial card post, got {len(ctx.posted)}"
-        assert len(ctx.updated) == 0, f"expected zero card updates (posted directly in investigating state)"
+        assert ctx.posted == [], f"`working` is not a notify state, got {ctx.posted}"
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_WORKING
         assert item["dispatch_job"] == "job-000001"
 
 
-def test_new_state_item_gets_no_card():
-    """The core fix for correction #2: an item still in `new` — mapped or
-    not — must never be carded, only the once-a-day unmapped digest speaks
-    for it."""
+def test_new_state_item_gets_no_post():
+    """An item still in `new` — mapped or not — never posts anything."""
     policy = dict(DEFAULT_POLICY, minOccurrences=5, minOpenMinutes=999999)
     with _triage_env(policy=policy) as (conn, ctx):
         _insert_event(conn, source="slack_alert", external_id="sig-fresh", title="Not yet eligible", first_seen=NOW)
@@ -468,29 +456,19 @@ def test_new_state_item_gets_no_card():
         triage._sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == []
-        assert ctx.total_calls() == 0, "an item still in `new` must never get a card"
+        assert ctx.total_calls() == 0, "an item still in `new` must never post"
         item = conn.execute("SELECT state FROM triage_items").fetchone()
         assert item["state"] == triage.STATE_NEW
 
 
 def test_all_unmapped_backlog_posts_zero_slack_calls():
-    """An empty/non-matching policy must not turn into a wall of cards —
-    the exact failure mode (37 cards) this correction exists to remove. The
-    digest is pre-seeded as already-posted-today so this asserts truly zero
-    Slack calls of any kind, not just zero cards."""
+    """An empty/non-matching policy must not turn into a wall of posts — the
+    unmapped signatures stay `new`, silent."""
     policy = dict(DEFAULT_POLICY, rules=[])
     with _triage_env(policy=policy) as (conn, ctx):
         for i in range(5):
             _insert_event(conn, source="slack_alert", external_id=f"sig-nowhere-{i}",
                            title=f"Nowhere {i}", first_seen=OLD)
-        # Pre-seed today's unmapped-digest cursor so that separate, deliberate
-        # mechanism doesn't count against "zero Slack calls" here.
-        today = NOW.date().isoformat()
-        now_iso = NOW.isoformat()
-        conn.execute("INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?)",
-                     (triage.DAILY_DIGEST_CURSOR_KEY, today, now_iso))
-        conn.commit()
-
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
@@ -546,7 +524,7 @@ def test_min_open_minutes_withholds_then_allows():
         assert len(calls) == 1, "should escalate once minOpenMinutes has elapsed"
 
 
-def test_ignore_policy_never_cards_or_escalates():
+def test_ignore_policy_never_posts_or_escalates():
     with _triage_env() as (conn, ctx):
         _insert_event(conn, source="slack_alert", external_id="ignoreme-recovery", title="All good now",
                        first_seen=OLD)
@@ -554,16 +532,16 @@ def test_ignore_policy_never_cards_or_escalates():
         triage._sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == []
-        assert ctx.total_calls() == 0, "an ignored signature must never get a card"
+        assert ctx.total_calls() == 0, "an ignored signature must never post"
         row = conn.execute("SELECT state, close_reason FROM triage_items").fetchone()
         assert row["state"] == triage.STATE_CLOSED and row["close_reason"] == triage.CLOSE_IGNORED
 
 
-def test_unstructured_prose_is_closed_ignored_and_never_escalates_or_cards():
+def test_unstructured_prose_is_closed_ignored_and_never_escalates_or_posts():
     """Unstructured #alerts prose (not a bot alert) that no rule maps is closed as
     `ignored` — there is no `note` state any more — carrying why in its note. It
-    never escalates and never gets a card; a bracketed bot alert with no rule
-    stays `new` (and shows in the digest as unmapped)."""
+    never escalates and never posts; a bracketed bot alert with no rule
+    stays `new`."""
     policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
     with _triage_env(policy=policy) as (conn, ctx):
         prose_title = ("1Password rate-limiting. Der Cronjob ruft `op run` jede Minute auf, "
@@ -587,15 +565,7 @@ def test_unstructured_prose_is_closed_ignored_and_never_escalates_or_cards():
         assert rows["slack_alert:api-real-alert-down"]["state"] == triage.STATE_NEW
 
         assert calls == [], "a closed row must never escalate"
-        card_posts = [
-            p for p in ctx.posted
-            if any(b.get("type") == "header" and "1Password" in b.get("text", {}).get("text", "")
-                   for b in p["blocks"])
-        ]
-        assert card_posts == [], "a closed(ignored) row must produce zero Slack cards"
-        digests = [p for p in ctx.posted if "Unmapped triage signatures" in p["text"]]
-        assert len(digests) == 1 and "api-real-alert-down" in digests[0]["text"]
-        assert "op-rate-limit-note" not in digests[0]["text"]
+        assert ctx.posted == [], "a closed(ignored) row must produce zero Slack posts"
 
 
 def test_rule_matching_runs_before_the_prose_filter():
@@ -604,8 +574,7 @@ def test_rule_matching_runs_before_the_prose_filter():
     other way round, the structural filter froze a whole producer family —
     Beszel's bare-sentence `HomeLab CPU above threshold`, no prefix at all —
     in a terminal state before any rule was consulted, which is what
-    made the homelab rules already in the shipped policy file unreachable and
-    the daily digest print the same ten signatures for a week. The filter's
+    made the homelab rules already in the shipped policy file unreachable. The filter's
     own documented contract is the other half of this test: an un-prefixed,
     rule-LESS message is still closed by it."""
     policy = dict(
@@ -621,7 +590,7 @@ def test_rule_matching_runs_before_the_prose_filter():
             conn, source="slack_alert", external_id="unprefixed-no-rule",
             title="HomeLab NVMe is running hot and no rule covers this yet", first_seen=OLD)
         triage.ingest(conn, NOW)
-        unmapped = triage.classify(conn, policy, NOW)
+        triage.classify(conn, policy, NOW)
 
         mapped = triage._get_item(conn, mapped_id)
         assert mapped["repo"] == "homelab", (
@@ -632,9 +601,6 @@ def test_rule_matching_runs_before_the_prose_filter():
         prose = triage._get_item(conn, prose_id)
         assert prose["state"] == triage.STATE_CLOSED and prose["close_reason"] == triage.CLOSE_IGNORED, (
             "an un-prefixed message with NO rule is still closed by the prose filter")
-        assert "slack_alert:unprefixed-no-rule" not in unmapped, (
-            "a closed row is not an unmapped signature — listing it there is the "
-            "double-report this ordering removes")
 
 
 def test_mapped_row_survives_a_second_classify_pass():
@@ -656,14 +622,13 @@ def test_mapped_row_survives_a_second_classify_pass():
             title="HomeLab CPU above threshold", first_seen=OLD)
         triage.ingest(conn, NOW)
         triage.classify(conn, policy, NOW)
-        unmapped = triage.classify(conn, policy, NOW)
+        triage.classify(conn, policy, NOW)
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEW, (
             "a row mapped on an earlier pass must stay `new` for the escalation pass, "
             f"not be routed by the prose filter — got state={item['state']!r}")
         assert item["repo"] == "homelab"
-        assert "slack_alert:homelab-cpu-above-threshold" not in unmapped
 
 
 def test_corrected_rule_re_maps_a_reopened_alert_row_only():
@@ -882,7 +847,7 @@ def test_unmapped_repo_never_dispatches():
         assert ctx.total_calls() == 0, "an unescalated (state=new) item must never get a card"
 
 
-def test_cluster_same_repo_one_dispatch_one_card_both_edges():
+def test_cluster_same_repo_one_dispatch_both_edges():
     with _triage_env() as (conn, ctx):
         e1 = _insert_event(conn, source="slack_alert", external_id="sig-cluster-a", title="A", first_seen=OLD)
         e2 = _insert_event(conn, source="slack_alert", external_id="sig-cluster-b", title="B", first_seen=OLD)
@@ -891,7 +856,6 @@ def test_cluster_same_repo_one_dispatch_one_card_both_edges():
         triage.run(conn, dry_run=False)
 
         assert len(calls) == 1, f"two eligible items in the same repo must open exactly one dispatch, got {len(calls)}"
-        assert len(ctx.posted) == 1, f"two eligible items in the same repo must produce exactly one card, got {len(ctx.posted)}"
 
         brief = calls[0]["brief"]
         assert "sig-cluster-a" in brief and "sig-cluster-b" in brief, "both signatures must be in the brief"
@@ -916,7 +880,6 @@ def test_cluster_different_repos_two_dispatches():
         triage._sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert len(calls) == 2, f"two eligible items in different repos must open two dispatches, got {len(calls)}"
-        assert len(ctx.posted) == 2
 
 
 def test_cluster_dissolves_on_unrelated_verdict():
@@ -973,7 +936,6 @@ def test_dissolve_cluster_dry_run_performs_state_change_without_slack_call():
         triage.run(conn, dry_run=False)
         job_id = triage._get_item(conn, e1)["dispatch_job"]
         assert job_id is not None
-        assert triage._get_item(conn, e1)["card_ts"] is not None, "the cluster must have a real card first"
 
         conn.execute(
             "UPDATE dispatches SET status=?, verdict_json=? WHERE job_id=?",
@@ -992,7 +954,6 @@ def test_dissolve_cluster_dry_run_performs_state_change_without_slack_call():
             assert item["state"] == triage.STATE_TRIAGED, (
                 f"dissolve bookkeeping must run for real under --dry-run, got {item['state']}"
             )
-            assert item["card_ts"] is None
             assert item["note"].startswith(triage.SPLIT_VERDICT_NOTE_PREFIX), item["note"]
 
 
@@ -1216,37 +1177,22 @@ def test_dispatch_brief_on_stdin_and_capped():
         assert item["dispatch_job"] is not None
 
 
-def test_resolution_updates_card_once_then_stops():
-    """A CARDED item's resolve is exactly one chat.update, and the resolved
-    card is then never touched again.
-
-    The item is escalated first (that is what puts a real card on it), then
-    returned to `new` before the resolve — the shape production reaches via
-    a liveness-window reopen, which keeps the card (a cluster dissolve no longer
-    produces this shape: _dissolve_cluster() moves a member to `triaged`, not
-    `new`). It has to be `new` because a silence resolve may touch
-    nothing else (_SILENCE_RESOLVE_ELIGIBLE_STATES); apply_resolutions() runs
-    before escalate() in run(), so the row resolves on that pass rather than
-    being re-dispatched."""
+def test_quiet_resolution_never_posts():
+    """An escalated item returned to `new` and then silence-resolved lands `quiet`,
+    which Slack never hears about — on that pass or any later one."""
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-resolve", title="Resolve me", first_seen=OLD)
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
-        calls_before = ctx.total_calls()
-        assert calls_before >= 1
 
         conn.execute("UPDATE triage_items SET state=? WHERE event_id=?", (triage.STATE_NEW, eid))
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
         conn.commit()
         triage.run(conn, dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_QUIET
-        calls_after_resolve = ctx.total_calls()
-        assert calls_after_resolve == calls_before + 1, "resolution must update the card exactly once"
-
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_QUIET
         triage.run(conn, dry_run=False)
-        assert ctx.total_calls() == calls_after_resolve, "a resolved card must stop being touched"
+        assert ctx.posted == [], ctx.posted
 
 
 def test_dry_run_never_calls_slack_or_dispatch():
@@ -1411,11 +1357,10 @@ def test_human_item_with_its_own_origin_thread_routes_the_dispatch_there():
         assert d["origin_thread_ts"] == "1111.000001", dict(d)
 
 
-def test_human_item_without_its_own_origin_thread_falls_back_to_the_card():
+def test_human_item_without_its_own_origin_thread_falls_back_to_the_card_channel():
     """No `--origin-channel`/`--origin-thread` (a plain `warden run`, or any
-    alert cluster, which never carries these columns): behaves exactly as
-    before this column existed — the card's own channel, and its ts
-    retro-filled once the card posts."""
+    alert cluster, which never carries these columns): the dispatch records the
+    shared channel and no thread."""
     with _triage_env() as (conn, ctx):
         eid = triage.open_origin_item(
             conn, origin="human", repo="demo-repo", brief="fix it", max_tier="implement",
@@ -1430,7 +1375,7 @@ def test_human_item_without_its_own_origin_thread_falls_back_to_the_card():
             "SELECT origin_channel, origin_thread_ts FROM dispatches ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert d["origin_channel"] == DEFAULT_POLICY["cardChannel"], dict(d)
-        assert d["origin_thread_ts"] is not None, "the card's own ts must retro-fill this row"
+        assert d["origin_thread_ts"] is None, dict(d)
 
 
 def test_escalate_origin_items_overflow_waits_in_new_with_note():
@@ -2135,7 +2080,7 @@ def test_reopen_after_resolve_preserves_artifact_url():
         assert item["artifact_url"] == "https://github.com/jkrumm/demo-repo/pull/1"
 
 
-def test_fold_dispatch_verdict_artifact_closes_resolved_and_syncs_the_card():
+def test_fold_dispatch_verdict_artifact_closes_resolved_without_a_post():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-verdict", title="Verdict test",
                              first_seen=OLD)
@@ -2161,7 +2106,7 @@ def test_fold_dispatch_verdict_artifact_closes_resolved_and_syncs_the_card():
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_CLOSED and item["close_reason"] == triage.CLOSE_RESOLVED
         assert item["artifact_url"] == "https://github.com/jkrumm/demo-repo/issues/2"
-        assert len(ctx.updated) == 1, "fold_dispatch_verdict must sync the card immediately"
+        assert ctx.posted == [], "closed(resolved) is not a notify state"
 
 
 def test_fold_dispatch_verdict_updates_every_cluster_member():
@@ -2190,7 +2135,7 @@ def test_fold_dispatch_verdict_updates_every_cluster_member():
 def test_op_refs_sources_are_ingested():
     """Correction #2: op_refs_homelab/op_refs_vps must not be structurally
     excluded from ingest — a dead 1Password ref must at minimum reach the
-    daily digest even with no matching policy rule."""
+    Argo even with no matching policy rule."""
     assert "op_refs_homelab" in triage.INGEST_SOURCES
     assert "op_refs_vps" in triage.INGEST_SOURCES
     with _triage_env(policy=dict(DEFAULT_POLICY, rules=[])) as (conn, ctx):
@@ -2455,7 +2400,7 @@ def test_evidence_total_stays_under_brief_cap():
 
 # --- grouped-source resolution (quiet timer + recovery pairing) --------------
 
-def test_quiet_grouped_resolves_after_window_and_updates_card_once():
+def test_quiet_grouped_resolves_after_window_without_a_post():
     """A CARDED item still gets its final chat.update on a quiet-timer
     resolve — the positive half of the 2026-09-08 correction, see
     test_new_to_resolved_with_no_card_is_silent for the negative half.
@@ -2492,10 +2437,7 @@ def test_quiet_grouped_resolves_after_window_and_updates_card_once():
         assert item["state"] == triage.STATE_QUIET
         assert item["note"].startswith(triage.QUIET_RESOLVE_NOTE_PREFIX)
         assert "fixed" not in item["note"].lower()
-        assert len(ctx.updated) == 1 and len(ctx.posted) == 0, (
-            f"an already-carded item's resolve must be exactly one chat.update, never a "
-            f"chat.postMessage — got {len(ctx.updated)} update(s), {len(ctx.posted)} post(s)")
-        calls_after_first = ctx.total_calls()
+        assert ctx.posted == [], f"`quiet` is not a notify state, got {ctx.posted}"
         first_mark = item["occurrence_mark"]
         first_note = item["note"]
 
@@ -2517,9 +2459,7 @@ def test_quiet_grouped_resolves_after_window_and_updates_card_once():
         assert item_after["state"] == triage.STATE_QUIET
         assert item_after["occurrence_mark"] == first_mark, "quiet-resolved grouped item churned"
         assert item_after["note"] == first_note, "quiet-resolved grouped item churned"
-        assert ctx.total_calls() == calls_after_first, (
-            f"a resolved card must update exactly once — got "
-            f"{ctx.total_calls() - calls_after_first} extra call(s) on the second run")
+        assert ctx.posted == [], ctx.posted
 
 
 def test_new_to_resolved_with_no_card_is_silent():
@@ -3353,7 +3293,6 @@ def test_implement_outcome_missing_is_a_strike_never_guessed():
         # assert_outcome() (clients/sideclaw.py) catches a missing outcome
         # before poll_implement_jobs()'s own switch ever runs.
         assert 'result outcome None' in item["note"], item["note"]
-        assert 'refusing to parse' in item["note"], item["note"]
 
 
 def test_implement_outcome_unrecognized_is_a_strike_never_guessed():
@@ -3369,8 +3308,6 @@ def test_implement_outcome_unrecognized_is_a_strike_never_guessed():
         # assert_outcome() (clients/sideclaw.py) catches a value outside
         # DISPATCH_OUTCOMES before poll_implement_jobs()'s own switch ever runs.
         assert 'a_future_outcome_this_warden_does_not_know' in item["note"], item["note"]
-        assert 'refusing to parse' in item["note"], item["note"]
-        assert "refusing to parse" in item["note"], item["note"]
 
 
 def test_implement_next_action_human_overrides_pr_opened():
@@ -4458,14 +4395,14 @@ def test_liveness_confirmed_resolves_the_item():
         assert item["state"] == triage.STATE_FIXED, (
             "a positive liveness probe is the only producer of STATE_FIXED in the file")
         assert item["note"].startswith(triage.LIVENESS_CONFIRMED_NOTE_PREFIX)
-        assert len(ctx.updated) == 1 and len(ctx.posted) == 0
+        assert len(ctx.posted) == 1 and ctx.posted[0]["text"].startswith(":white_check_mark: "), ctx.posted
 
 
 def test_liveness_failure_reopens_the_item_with_history():
     """The direct fix for the 61-re-triage scenario one level up the chain:
     an item that deployed but never verified live must not silently vanish
     OR silently sit "deployed" forever — past the window it REOPENS to
-    `new`, carrying the PR link and the last liveness check on the card, so
+    `new`, carrying the PR link and the last liveness check on its note, so
     the next escalation does not start from zero."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-live-fail")
@@ -4487,8 +4424,7 @@ def test_liveness_failure_reopens_the_item_with_history():
         assert item["state"] == triage.STATE_NEW, "must reopen to `new`, not sit deployed forever"
         assert "pull/14" in item["note"], "the reopened item must carry the PR in its history"
         assert "Y: live threshold=9" in item["note"], "the reopened item must carry the last liveness check"
-        assert len(ctx.updated) == 1 and len(ctx.posted) == 0, (
-            "the reopen must post its final update on the EXISTING card thread, never a new post")
+        assert ctx.posted == [], "a reopen to `new` is silent"
 
 
 def test_liveness_still_inside_window_neither_resolves_nor_reopens():
@@ -4646,7 +4582,7 @@ def test_deploy_on_merge_liveness_confirmed_produces_a_fixed_row():
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_FIXED
         assert item["note"].startswith(triage.LIVENESS_CONFIRMED_NOTE_PREFIX)
-        assert len(ctx.updated) == 1 and len(ctx.posted) == 0
+        assert len(ctx.posted) == 1 and ctx.posted[0]["text"].startswith(":white_check_mark: "), ctx.posted
 
 
 # --- Argo actions — owner-pulled implement/merge/dismiss/reinvestigate/note ---
@@ -4801,7 +4737,7 @@ def test_apply_argo_note_appends_rather_than_overwrites():
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEEDS_DECISION, item["state"]
-        assert item["note"].startswith("original note\n\n"), item["note"]
+        assert item["note"].startswith("original note "), item["note"]
         assert "owner adds context" in item["note"], item["note"]
         assert len(ctx.argo_acks) == 1, ctx.argo_acks
         assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks[0]
@@ -5489,63 +5425,10 @@ def test_recovery_paired_never_produces_fixed():
         assert item["state"] == triage.STATE_QUIET, item["state"]
 
 
-def test_quiet_fixed_closed_cards_render_with_caveat_and_reason():
-    """render_card_blocks()'s caveat branch must reach BOTH `quiet` and
-    `fixed` rows (see QUIET_RESOLVE_NOTE_PREFIX/RECOVERY_PAIRED_NOTE_PREFIX/
-    LIVENESS_CONFIRMED_NOTE_PREFIX's own comment) — and a `closed` row must
-    render its human reason, the same way `dismissed` already does."""
-    with _triage_env() as (conn, _ctx):
-        eid_quiet = _insert_event(conn, source="slack_alert", external_id="sig-render-quiet",
-                                   title="🚨 quiet", first_seen=OLD)
-        conn.execute(
-            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
-            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (eid_quiet, "slack_alert:sig-render-quiet", "demo-repo", triage.STATE_QUIET,
-             f"{triage.QUIET_RESOLVE_NOTE_PREFIX}2026-09-01", 5, OLD.isoformat(), OLD.isoformat(),
-             NOW.isoformat(), NOW.isoformat()),
-        )
-        conn.commit()
-        item = triage._get_item(conn, eid_quiet)
-        event = triage._get_event(conn, eid_quiet)
-        blocks = triage.render_card_blocks([item], [event], conn)
-        assert triage.QUIET_RESOLVE_NOTE_PREFIX in json.dumps(blocks)
-
-        eid_fixed = _insert_event(conn, source="slack_alert", external_id="sig-render-fixed",
-                                   title="🚨 fixed", first_seen=OLD)
-        conn.execute(
-            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
-            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (eid_fixed, "slack_alert:sig-render-fixed", "demo-repo", triage.STATE_FIXED,
-             f"{triage.LIVENESS_CONFIRMED_NOTE_PREFIX}2 alert(s) verified live", 5, OLD.isoformat(),
-             OLD.isoformat(), NOW.isoformat(), NOW.isoformat()),
-        )
-        conn.commit()
-        item = triage._get_item(conn, eid_fixed)
-        event = triage._get_event(conn, eid_fixed)
-        blocks = triage.render_card_blocks([item], [event], conn)
-        assert triage.LIVENESS_CONFIRMED_NOTE_PREFIX in json.dumps(blocks)
-
-        eid_closed = _insert_event(conn, source="slack_alert", external_id="sig-render-closed",
-                                    title="🚨 closed", first_seen=OLD)
-        conn.execute(
-            "INSERT INTO triage_items(event_id, signature, repo, state, note, occurrences, "
-            "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (eid_closed, "slack_alert:sig-render-closed", "demo-repo", triage.STATE_CLOSED,
-             "closed by hand: false alarm, no code change needed", 5, OLD.isoformat(), OLD.isoformat(),
-             NOW.isoformat(), NOW.isoformat()),
-        )
-        conn.commit()
-        item = triage._get_item(conn, eid_closed)
-        event = triage._get_event(conn, eid_closed)
-        blocks = triage.render_card_blocks([item], [event], conn)
-        assert "closed by hand: false alarm" in json.dumps(blocks)
-
-
 def test_set_state_records_transitions_only_on_real_change():
     """_set_state() is the only writer of item_transitions, appending exactly
     one row per REAL state change and nothing for a column-only write with the
-    state unchanged (sync_card() and friends write dispatch_job/card_ts/etc.
-    through here this way) — recording those would fill the table with noise
+    state unchanged (column-only writers such as dispatch_job) — recording those would fill the table with noise
     and corrupt every duration /metrics computes from it."""
     with _triage_env() as (conn, _ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-transitions", title="x",
@@ -5612,66 +5495,6 @@ def test_cmd_ignore_closes_ignored_and_cmd_reopen_returns_the_item_to_new():
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEW and item["close_reason"] is None
         assert triage.cmd_ignore(conn, ["--ignore", "slack_alert:nope"], NOW) != 0
-
-
-def test_sync_card_never_posts_a_first_card_for_any_never_carded_terminal_state():
-    """A row that reaches a terminal state directly from `new` (no card_ts)
-    must never get its first Slack post — extends the 2026-09-08 guard (see
-    CARDED_STATES) to every terminal state."""
-    with _triage_env() as (conn, ctx):
-        for state in (triage.STATE_QUIET, triage.STATE_FIXED, triage.STATE_CLOSED):
-            eid = _insert_event(conn, source="slack_alert", external_id=f"sig-never-card-{state}",
-                                 title="x", first_seen=OLD)
-            conn.execute(
-                "INSERT INTO triage_items(event_id, signature, repo, state, note, close_reason, occurrences, "
-                "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (eid, f"slack_alert:sig-never-card-{state}", "demo-repo", state, "reason",
-                 "resolved" if state == triage.STATE_CLOSED else None, 1,
-                 OLD.isoformat(), OLD.isoformat(), NOW.isoformat(), NOW.isoformat()),
-            )
-            conn.commit()
-            item = triage._get_item(conn, eid)
-            event = triage._get_event(conn, eid)
-            triage.sync_card(conn, [item], [event], DEFAULT_POLICY, dry_run=False)
-        assert ctx.total_calls() == 0, "a never-carded state must never post a first card"
-
-
-def test_sync_card_reposts_as_new_card_on_cant_update_message():
-    """Slack refuses `chat.update` on a message a DIFFERENT app posted
-    (`cant_update_message`) — e.g. an old card carded under Hermes's
-    identity, this pass holding Warden's token. sync_card() must not get
-    stuck re-failing the same update every pass: it posts a fresh card
-    instead, stores the NEW ts (never the stale one), and names the
-    cluster and the old ts on stderr rather than failing silently. Anything
-    threaded under the old card is lost — see the docstring, not re-tested
-    here since Slack has no API to prove a thread was orphaned."""
-    with _triage_env() as (conn, ctx):
-        eid = _insert_event(conn, source="slack_alert", external_id="sig-cant-update", title="x", first_seen=OLD)
-        triage.ingest(conn, NOW)
-        conn.execute(
-            "UPDATE triage_items SET card_channel=?, card_ts=?, card_hash=? WHERE event_id=?",
-            ("C0TESTCHAN01", "999.999999", "stale-hash-forces-a-sync", eid),
-        )
-        conn.commit()
-        item = triage._get_item(conn, eid)
-        event = triage._get_event(conn, eid)
-
-        def _fake_update_cant_update_message(channel, ts, blocks, text_fallback, token):
-            return False, "cant_update_message"
-
-        triage.update_blocks = _fake_update_cant_update_message
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            triage.sync_card(conn, [item], [event], DEFAULT_POLICY, dry_run=False)
-
-        assert len(ctx.posted) == 1, "must repost as a new card rather than give up"
-        assert len(ctx.updated) == 0, "the failed update must not itself count as a call"
-        new_item = triage._get_item(conn, eid)
-        assert new_item["card_ts"] == ctx.posted[0]["ts"]
-        assert new_item["card_ts"] != "999.999999", "must store the NEW ts, never the stale one"
-        stderr_text = buf.getvalue()
-        assert "cant_update_message" in stderr_text
-        assert "999.999999" in stderr_text, "must name the old ts on stderr"
 
 
 # =============================================================================
@@ -6240,44 +6063,239 @@ def test_reconcile_deploy_operation_with_no_runs_and_recent_start_stays_open():
         assert op["reconciled_at"] is None, "a row left open must not even be stamped reconciled_at"
 
 
-def test_action_required_block_truncates_a_long_note_to_the_section_limit():
-    """A note long enough to exhaust SECTION_TEXT_MAX loses its own tail, never the
-    heading. Neither state expires, so there is no countdown line any more."""
-    block = triage._action_required_block(triage.STATE_NEEDS_DECISION, "x" * 5000)
-    text = block["text"]["text"]
-    assert len(text) <= triage.SECTION_TEXT_MAX
-    assert text.startswith("*Decision needed*")
-    assert text.splitlines()[1].startswith("Do this: xxx")
-    assert "Auto-dismissed" not in text
+# --- terse output: one Slack line on fixed / needs_decision, nothing else -----
+
+_ALL_STATES = (triage.STATE_NEW, triage.STATE_TRIAGED, triage.STATE_WORKING, triage.STATE_MERGING,
+               triage.STATE_VERIFYING, triage.STATE_NEEDS_DECISION, triage.STATE_FAILED,
+               triage.STATE_FIXED, triage.STATE_QUIET, triage.STATE_CLOSED)
 
 
-def test_needs_decision_and_failed_cards_say_what_to_do():
-    """render_card_blocks() must render needs_decision/failed as an explicit
-    instruction, not a footnote the owner can miss — see _action_required_block()'s
-    own docstring for why. Covers a note present and a note absent (the default
-    `Do this:` line). Neither state expires, so no card carries a countdown."""
+@contextlib.contextmanager
+def _argo_url(url: str = "https://argo.example.test/api"):
+    saved = os.environ.get("ARGO_URL")
+    os.environ["ARGO_URL"] = url
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("ARGO_URL", None)
+        else:
+            os.environ["ARGO_URL"] = saved
+
+
+def _notify(conn, eid, *, dry_run=False):
+    triage.notify_cluster(conn, [triage._get_item(conn, eid)], [triage._get_event(conn, eid)],
+                          DEFAULT_POLICY, dry_run=dry_run)
+
+
+def test_notify_posts_only_for_fixed_and_needs_decision():
+    with _triage_env() as (conn, ctx):
+        for state in _ALL_STATES:
+            eid = _seed_item(conn, external_id=f"sig-notify-{state}", state=state, note="something happened")
+            _notify(conn, eid)
+        posted_states = sorted(p["text"].split(" — ")[1].split(" ")[0] for p in ctx.posted)
+        assert posted_states == sorted([triage.STATE_FIXED, triage.STATE_NEEDS_DECISION]), ctx.posted
+
+
+def test_notify_line_has_the_exact_one_line_format():
+    with _triage_env() as (conn, ctx), _argo_url():
+        decision = _seed_item(conn, external_id="sig-fmt-decision", state=triage.STATE_NEEDS_DECISION,
+                              note="Drop the legacy table\nor keep it?  (a) drop (b) keep")
+        _notify(conn, decision)
+        fixed = _seed_item(conn, external_id="sig-fmt-fixed", state=triage.STATE_FIXED)
+        _notify(conn, fixed)
+
+        argo = "<https://argo.example.test/warden|Argo>"
+        assert [p["text"] for p in ctx.posted] == [
+            f":raising_hand: demo-repo: Drop the legacy table or keep it? (a) drop (b) keep — needs_decision {argo}",
+            f":white_check_mark: demo-repo: Seeded sig-fmt-fixed — fixed {argo}",
+        ], ctx.posted
+        assert all("\n" not in p["text"] and p["channel"] == DEFAULT_POLICY["cardChannel"] for p in ctx.posted)
+        assert all(set(p) == {"channel", "text", "ts", "thread_ts"} for p in ctx.posted), "no blocks"
+
+
+def test_notify_argo_link_strips_the_api_suffix_of_the_configured_base():
+    with _argo_url("https://argo.jkrumm.com/api/"):
+        assert triage.argo_warden_url() == "https://argo.jkrumm.com/warden"
+    with _argo_url("https://argo.example.test"):
+        assert triage.argo_warden_url() == "https://argo.example.test/warden"
+
+
+def test_notify_summary_is_capped_at_200_characters():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-fmt-long", state=triage.STATE_FIXED,
+                         note="word " * 200)
+        _notify(conn, eid)
+        summary = ctx.posted[0]["text"].split("demo-repo: ", 1)[1].rsplit(" — ", 1)[0]
+        assert len(summary) == 200 and summary.endswith("…"), (len(summary), summary)
+
+
+def test_notify_posts_once_per_entry_and_again_on_reentry():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-once", state=triage.STATE_NEEDS_DECISION, note="which one?")
+        _notify(conn, eid)
+        _notify(conn, eid)
+        triage.run(conn, dry_run=False)
+        triage.run(conn, dry_run=False)
+        assert len(ctx.posted) == 1, ctx.posted
+        item = triage._get_item(conn, eid)
+        assert item["card_hash"] == triage.STATE_NEEDS_DECISION and item["card_ts"] == ctx.posted[0]["ts"]
+
+        # Leaving the state clears the dedupe marker; entering it again is a new entry.
+        triage._set_state(conn, eid, triage.STATE_WORKING, NOW)
+        assert triage._get_item(conn, eid)["card_hash"] is None
+        triage._set_state(conn, eid, triage.STATE_NEEDS_DECISION, NOW, note="which one now?")
+        conn.commit()
+        triage.run(conn, dry_run=False)
+        triage.run(conn, dry_run=False)
+        assert len(ctx.posted) == 2 and "which one now?" in ctx.posted[1]["text"], ctx.posted
+
+
+def test_notify_a_failed_post_is_retried_on_the_next_pass():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-retry-post", state=triage.STATE_FIXED, note="done")
+        real = triage.post_line
+        triage.post_line = lambda channel, text, token, *, thread_ts=None: (False, None)
+        _notify(conn, eid)
+        assert triage._get_item(conn, eid)["card_hash"] is None
+        triage.post_line = real
+        _notify(conn, eid)
+        assert len(ctx.posted) == 1
+
+
+def test_notify_cluster_posts_one_line_for_the_primary_member():
+    with _triage_env() as (conn, ctx):
+        e1 = _seed_item(conn, external_id="sig-clu-a", state=triage.STATE_NEEDS_DECISION, note="q?",
+                        dispatch_job="job-clu")
+        e2 = _seed_item(conn, external_id="sig-clu-b", state=triage.STATE_NEEDS_DECISION, note="q?",
+                        dispatch_job="job-clu")
+        triage.run(conn, dry_run=False)
+        triage.run(conn, dry_run=False)
+        assert len(ctx.posted) == 1, ctx.posted
+        assert ctx.posted[0]["text"].startswith(":raising_hand: demo-repo: q? — needs_decision"), ctx.posted
+        assert {triage._get_item(conn, e)["card_hash"] for e in (e1, e2)} == {triage.STATE_NEEDS_DECISION}
+
+
+def test_notify_answers_in_the_origin_thread_when_the_item_has_one():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-origin", state=triage.STATE_NEEDS_DECISION, note="which?",
+                         origin_channel="C0ORIGIN0001", origin_thread_ts="1111.000001")
+        _notify(conn, eid)
+        assert len(ctx.posted) == 1
+        assert ctx.posted[0]["channel"] == "C0ORIGIN0001" and ctx.posted[0]["thread_ts"] == "1111.000001"
+
+
+def test_notify_dry_run_never_posts():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-notify-dry", state=triage.STATE_FIXED, note="done")
+        _notify(conn, eid, dry_run=True)
+        triage.run(conn, dry_run=True)
+        assert ctx.posted == []
+        assert triage._get_item(conn, eid)["card_hash"] is None
+
+
+def test_failed_entry_never_posts_but_the_daily_digest_counts_failed_items():
+    with _triage_env() as (conn, ctx), _argo_url():
+        # silent at zero
+        triage.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert ctx.posted == []
+
+        e1 = _seed_item(conn, external_id="sig-failed-a", state=triage.STATE_FAILED, note="merge refused")
+        _seed_item(conn, external_id="sig-failed-b", state=triage.STATE_FAILED, note="no verdict")
+        _notify(conn, e1)
+        assert ctx.posted == [], "entering `failed` must not post"
+
+        triage.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW, dry_run=True)
+        assert ctx.posted == [], "dry-run never posts the digest"
+
+        triage.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW + dt.timedelta(hours=3), dry_run=False)
+        assert [p["text"] for p in ctx.posted] == [":x: 2 failed — <https://argo.example.test/warden|Argo>"], ctx.posted
+
+        # the next UTC day posts again
+        triage.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
+        assert len(ctx.posted) == 2
+
+        # nothing failed any more: silent again
+        conn.execute("UPDATE triage_items SET state=?", (triage.STATE_QUIET,))
+        conn.commit()
+        triage.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=2), dry_run=False)
+        assert len(ctx.posted) == 2
+
+
+def test_full_pass_with_nothing_notifiable_posts_nothing():
+    """A full pass over a ledger with nothing in a notify state and nothing failed posts nothing."""
+    with _triage_env() as (conn, ctx):
+        _insert_event(conn, source="slack_alert", external_id="sig-pass-silent", title="x", first_seen=OLD)
+        triage._sideclaw.submit = _fake_submit([])
+        triage.run(conn, dry_run=False)
+        assert ctx.posted == []
+
+
+def test_set_state_caps_the_note_to_one_short_line():
     with _triage_env() as (conn, _ctx):
-        eid = _seed_item(conn, external_id="sig-render-needs-decision", state=triage.STATE_NEEDS_DECISION,
-                         note="Drop the legacy table or keep it? (a) drop (b) keep")
-        blocks = triage.render_card_blocks([triage._get_item(conn, eid)], [triage._get_event(conn, eid)], conn)
-        text_blob = json.dumps(blocks)
-        assert "Decision needed" in text_blob and "Do this:" in text_blob, text_blob
-        assert "Drop the legacy table or keep it?" in text_blob, text_blob
-        assert "Auto-dismissed" not in text_blob
+        eid = _seed_item(conn, external_id="sig-note-cap", state=triage.STATE_WORKING)
+        long_note = "first line\n\n  second   line\t" + "x" * 500
+        triage._set_state(conn, eid, triage.STATE_NEEDS_DECISION, NOW, note=long_note)
+        note = triage._get_item(conn, eid)["note"]
+        assert len(note) == 200 and note.endswith("…") and "\n" not in note, note
+        assert note.startswith("first line second line xxx"), note
+        transition = conn.execute("SELECT note FROM item_transitions WHERE event_id=? ORDER BY id DESC",
+                                  (eid,)).fetchone()
+        assert transition["note"] == note, "history carries the capped note too"
 
-        eid2 = _seed_item(conn, external_id="sig-render-needs-decision-empty",
-                          state=triage.STATE_NEEDS_DECISION, note=None)
-        blocks = triage.render_card_blocks([triage._get_item(conn, eid2)], [triage._get_event(conn, eid2)], conn)
-        assert "Do this: read the verdict above and decide" in json.dumps(blocks)
+        triage._set_state(conn, eid, triage.STATE_FAILED, NOW, note=triage._Coalesce("y" * 300))
+        assert len(triage._get_item(conn, eid)["note"]) == 200
 
-        eid3 = _seed_item(conn, external_id="sig-render-failed", state=triage.STATE_FAILED,
-                          note="merge refused: required check failed")
-        blocks = triage.render_card_blocks([triage._get_item(conn, eid3)], [triage._get_event(conn, eid3)], conn)
-        text_blob = json.dumps(blocks)
-        assert "*Failed*" in text_blob and "Do this: merge refused: required check failed" in text_blob, text_blob
-        for block in blocks:
-            if block["type"] == "section":
-                assert len(block["text"]["text"]) <= triage.SECTION_TEXT_MAX
+        triage._set_state(conn, eid, triage.STATE_FAILED, NOW, note="short\nnote")
+        assert triage._get_item(conn, eid)["note"] == "short note"
+        triage._set_state(conn, eid, triage.STATE_FAILED, NOW, note=None)
+        assert triage._get_item(conn, eid)["note"] is None
+
+
+def test_cli_transition_caps_the_note_too():
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_item(conn, external_id="sig-note-cap-cli", state=triage.STATE_WORKING)
+        triage._items.transition(conn, eid, to_state=triage.STATE_CLOSED, now=NOW, note="aborted: " + "z\n" * 300,
+                                 extra={"close_reason": triage.CLOSE_IGNORED})
+        note = triage._get_item(conn, eid)["note"]
+        assert len(note) == 200 and "\n" not in note, note
+
+
+def test_comment_back_is_at_most_three_lines():
+    with _triage_env() as (conn, ctx), _argo_url():
+        eid = triage.open_origin_item(
+            conn, origin="github_issue", repo="argo", brief="fix it", max_tier="implement",
+            external_id="jkrumm/argo#30", title="fix it", url="https://github.com/jkrumm/argo/issues/30",
+            payload={"repo": "argo", "number": 30, "author": triage._github.GH_OWNER}, now=NOW,
+        )
+        job_id = "job-comment-short"
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (job_id, "investigate", "argo", "b", eid, "done",
+             json.dumps({"summary": "root cause found\n\n## Evidence\n- a\n- b\n" + "detail " * 300,
+                         "recommendation": "merge it", "nextAction": "implement",
+                         "evidence": [{"file": "x.py", "detail": "y"}] * 5,
+                         "artifactUrl": "https://github.com/jkrumm/argo/pull/31"}), NOW.isoformat()),
+        )
+        triage._set_state(conn, eid, triage.STATE_WORKING, NOW, dispatch_job=job_id)
+        conn.commit()
+        comments: list[str] = []
+        triage._github.create_issue_comment = lambda repo_full, number, body: comments.append(body) or {"id": 1}
+
+        triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+        assert len(comments) == 1
+        lines = comments[0].split("\n")
+        assert len(lines) == 3, lines
+        assert lines[0].startswith("working: root cause found") and len(lines[0]) <= len("working: ") + 200, lines[0]
+        assert lines[1] == "PR: https://github.com/jkrumm/argo/pull/31", lines[1]
+        assert lines[2] == "Argo: https://argo.example.test/warden", lines[2]
+        assert not any(line.startswith(("#", "-", "*")) for line in lines), "no headings or bullet dumps"
+
+        # Without a pull request the comment is two lines.
+        assert triage._comment_back_body("closed", "no change needed", {}).split("\n")[0] == "closed: no change needed"
+        assert len(triage._comment_back_body("closed", None, {"summary": "s"}).split("\n")) == 2
 
 
 # --- runner ------------------------------------------------------------------

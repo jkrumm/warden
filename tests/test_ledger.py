@@ -896,8 +896,8 @@ def _v12_database(path, states):
                      (f"e{i}",))
         conn.execute(
             "INSERT INTO triage_items(event_id, signature, state, note, state_deadline, snoozed_until, "
-            "reminder_count, parked_recurrences, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, '2030-01-01', '2030-01-01', 2, 5, 'now', 'now')",
+            "reminder_count, parked_recurrences, created_at, updated_at, card_hash) "
+            "VALUES (?, ?, ?, ?, '2030-01-01', '2030-01-01', 2, 5, 'now', 'now', 'sha-of-an-old-card')",
             (i, f"s:e{i}", state, f"note-{state}"))
         conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
                      (i, "new", state, "now", None))
@@ -923,6 +923,9 @@ def test_migration_13_maps_every_old_state_and_close_reason_and_rewrites_history
         row = rows[f"note-{old}"]
         assert (row["state"], row["close_reason"]) == (state, reason), (old, dict(row))
         assert row["strikes"] == 0 and row["retry_at"] is None, (old, dict(row))
+        # card_hash is now "the state a Slack line was posted for": an already-`fixed` item
+        # is stamped so the first pass on the new schema does not announce the backlog.
+        assert row["card_hash"] == ("fixed" if state == "fixed" else "sha-of-an-old-card"), (old, dict(row))
     assert {r["state"] for r in rows.values()} <= {
         "new", "triaged", "working", "merging", "verifying", "needs_decision", "failed",
         "fixed", "quiet", "closed"}

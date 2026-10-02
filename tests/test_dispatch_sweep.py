@@ -714,6 +714,47 @@ def main() -> int:
         check(f"pruned dispatches.error: {label}", cond)
     pruned_error_ok = sum(1 for _, cond in pruned_error_checks if cond)
 
+    # --- item-backed dispatches: reported by their item, never posted by the sweep --
+    item_checks: list[tuple[str, bool]] = []
+    tmpdb7 = Path(_tempfile.mkdtemp(prefix="dispatch-sweep-item-")) / "watchdog.db"
+    orig_db7, orig_poll7, orig_send7 = dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message
+    item_sent: list[tuple[str, str]] = []
+    try:
+        dispatch_sweep.DB_PATH = tmpdb7
+        conn = dispatch_sweep._ledger.connect(tmpdb7, migrate=True)
+        for job in ("item-done", "item-pruned"):
+            conn.execute(
+                "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_channel,origin_thread_ts,"
+                "origin_event_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (job, "investigate", "example", "b", "queued", "2026-10-02T00:00:00+00:00", "C0ITEM", "1.2", 4242))
+        conn.commit(); conn.close()
+        dispatch_sweep.send_message = lambda target, body: item_sent.append((target, body)) or (0, "delivered")
+
+        def row7(job_id):
+            c = _sqlite3.connect(tmpdb7); c.row_factory = _sqlite3.Row
+            r = c.execute("SELECT * FROM dispatches WHERE job_id=?", (job_id,)).fetchone(); c.close()
+            return r
+
+        dispatch_sweep.poll_job = lambda job_id: (
+            {"status": "done", "result": {"summary": "found it", "confidence": "high", "nextAction": "none"}}
+            if job_id == "item-done" else dispatch_sweep.NOT_FOUND)
+        for _ in range(dispatch_sweep.LOST_AFTER_MISSES):
+            dispatch_sweep.main([])
+        done_row, pruned_row = row7("item-done"), row7("item-pruned")
+        item_checks.append(("nothing is posted for an item-backed dispatch, finished or pruned", item_sent == []))
+        item_checks.append(("a finished item-backed dispatch is closed as item-tracked",
+                            done_row["reported_at"] is not None and done_row["status"] == "done"
+                            and done_row["delivery_status"] == dispatch_sweep.ITEM_TRACKED))
+        item_checks.append(("a pruned item-backed dispatch is closed as item-tracked",
+                            pruned_row["status"] == "failed" and pruned_row["reported_at"] is not None
+                            and pruned_row["delivery_status"] == dispatch_sweep.ITEM_TRACKED))
+    finally:
+        dispatch_sweep.DB_PATH, dispatch_sweep.poll_job, dispatch_sweep.send_message = (
+            orig_db7, orig_poll7, orig_send7)
+    for label, cond in item_checks:
+        check(f"item-backed: {label}", cond)
+    item_ok = sum(1 for _, cond in item_checks if cond)
+
     # --- ledger behind this process's schema: skip the pass, exit 0 --------
     #
     # A ledger stamped one version behind (the window between a
@@ -769,6 +810,7 @@ def main() -> int:
     print(f"review-tier rows              {review_ok}/{len(review_checks)}")
     print(f"dispatches.error              {error_ok}/{len(error_checks)}")
     print(f"pruned dispatches.error       {pruned_error_ok}/{len(pruned_error_checks)}")
+    print(f"item-backed dispatches        {item_ok}/{len(item_checks)}")
     print(f"ledger behind                 {ledger_behind_ok}/{len(ledger_behind_checks)}")
 
     if failures:

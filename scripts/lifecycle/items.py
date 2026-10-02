@@ -27,6 +27,21 @@ from typing import Any
 # escape hatch.
 _EXTRA_COLUMNS = ("revert_pr", "close_reason")
 
+# An item `note` is one short line: it is what Slack and Argo show. Both writers of
+# the column (this module and triage.py's `_set_state()`) cap it here.
+NOTE_MAX = 200
+
+
+def cap_note(note: str | None) -> str | None:
+    """Collapse all whitespace (newlines included) to single spaces and truncate to
+    NOTE_MAX characters, ending in an ellipsis when anything was cut."""
+    if note is None:
+        return None
+    text = " ".join(note.split())
+    if len(text) <= NOTE_MAX:
+        return text
+    return text[: NOTE_MAX - 1] + "…"
+
 
 def _now_iso(now: dt.datetime) -> str:
     return now.astimezone(dt.timezone.utc).isoformat() if now.tzinfo else now.isoformat()
@@ -45,6 +60,7 @@ def transition(
     column), and append one
     `item_transitions` row when, and only when, the state actually changed.
     Returns the UPDATE's rowcount (0 means no such event_id)."""
+    note = cap_note(note)
     extra = extra or {}
     unknown = tuple(c for c in extra if c not in _EXTRA_COLUMNS)
     if unknown:
@@ -61,8 +77,10 @@ def transition(
     prev_row = conn.execute("SELECT state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
     prev_state = prev_row["state"] if prev_row is not None else None
 
-    sql = "UPDATE triage_items SET state=?, note=?, updated_at=?"
-    params: list[Any] = [to_state, note, _now_iso(now)]
+    # card_hash records the state a Slack line was posted for; entering a different state
+    # clears it so a later re-entry posts again (triage.py `notify_cluster()`).
+    sql = "UPDATE triage_items SET state=?, note=?, updated_at=?, card_hash=CASE WHEN state=? THEN card_hash END"
+    params: list[Any] = [to_state, note, _now_iso(now), to_state]
     for col, value in extra.items():
         sql += f", {col}=?"
         params.append(value)

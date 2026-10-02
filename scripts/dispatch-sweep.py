@@ -33,6 +33,13 @@ into) can never be delivered anywhere, so it is closed with a sentinel
 instead of accumulating as a permanent debt — see UNDELIVERABLE_SENTINEL
 below.
 
+ITEM-BACKED DISPATCHES post nothing. A dispatch opened for a triage item
+(`origin_event_id` set) is folded onto the item and closed with
+`delivery_status = ITEM_TRACKED`; Slack hears about the item itself, once, when it
+enters `fixed` or `needs_decision` (triage.py `notify_cluster()`, a one-line post
+into the item's own origin thread when it has one). Only a dispatch with no item —
+a `warden dispatch` somebody asked for — is delivered as described above.
+
 ADVANCE ON COMPLETION (docs/history/state-log.md §87). After that per-row
 pass, every pass also calls `triage.advance_implement_chain()` — the same
 verdict -> implement -> review -> merge code
@@ -196,6 +203,11 @@ ARGO_HTTP_TIMEOUT = 10  # seconds; a bare POST against a remote HTTP API
 # historical occurrence of this string out of `reported_at` and into its own
 # column.
 UNDELIVERABLE_SENTINEL = "undeliverable:no-origin-channel"
+
+# A dispatch opened for a triage item (`origin_event_id` set) is never reported on its
+# own: Slack hears about the ITEM, once, when it enters `fixed` or `needs_decision`
+# (triage.py `notify_cluster()`), and the sweep only closes the row with this status.
+ITEM_TRACKED = "item-tracked"
 
 # Slack mrkdwn block limit is 4000 chars; this leaves headroom for the
 # "(message truncated)" suffix itself and any mrkdwn formatting overhead.
@@ -570,8 +582,9 @@ def _mark_pruned(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry
     body = pruned_notice(repo=repo, tier=tier, job_id=job_id, misses=misses)
     origin_channel = row["origin_channel"]
     origin_thread_ts = row["origin_thread_ts"]
+    item_tracked = bool(row["origin_event_id"])
     target = (f"slack:{origin_channel}:{origin_thread_ts}" if origin_thread_ts
-              else f"slack:{origin_channel}") if origin_channel else None
+              else f"slack:{origin_channel}") if origin_channel and not item_tracked else None
     if dry_run:
         print(f"[dry-run] would mark job {job_id} (repo {repo}) pruned and send to {target or 'nowhere'}:\n{body}\n")
         return
@@ -591,7 +604,7 @@ def _mark_pruned(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry
     conn.commit()
     stamp: str | None = None
     if target is None:
-        stamp, delivery_status = now_iso, UNDELIVERABLE_SENTINEL
+        stamp, delivery_status = now_iso, ITEM_TRACKED if item_tracked else UNDELIVERABLE_SENTINEL
     else:
         rc, delivery_status = send_message(target, body)
         if rc == 0:
@@ -701,14 +714,11 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
         )
         conn.commit()
 
-    # Fold the terminal verdict onto the triage card, if this dispatch was
-    # opened BY triage.py (origin_event_id set — see scripts/triage.py's
-    # escalate_one()). This is a different concern from the #watchdog/thread
-    # delivery below: the card lives in its own Slack message, independent of
-    # whether send_message() below succeeds, so it runs unconditionally here
-    # rather than being duplicated into every branch of the delivery logic
-    # that follows. A dispatch with no origin_event_id (the pre-existing
-    # #watchdog path, and every non-triage dispatch) is untouched.
+    # Fold the terminal verdict onto the triage item, if this dispatch was
+    # opened BY triage.py (origin_event_id set). An item-backed dispatch is
+    # reported by its item alone (ITEM_TRACKED, below); a dispatch with no
+    # origin_event_id (the pre-existing thread-delivery path, and every
+    # non-triage dispatch) is delivered to its origin thread as before.
     origin_event_id = row["origin_event_id"] if "origin_event_id" in row.keys() else None
     if origin_event_id:
         try:
@@ -716,12 +726,24 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
                 conn, origin_event_id=origin_event_id, job_id=job_id,
                 now=dt.datetime.now(dt.timezone.utc), dry_run=dry_run,
             )
-        except Exception as e:  # a triage-card failure must never look like a sweep failure
+        except Exception as e:  # a triage-item failure must never look like a sweep failure
             print(
-                f"dispatch-sweep: folding triage card failed for job {job_id} "
+                f"dispatch-sweep: folding triage item failed for job {job_id} "
                 f"(origin_event_id {origin_event_id}): {e}",
                 file=sys.stderr,
             )
+
+    if origin_event_id:
+        if dry_run:
+            print(f"[dry-run] would stamp reported_at=<now>, delivery_status={ITEM_TRACKED!r} "
+                  f"for job {job_id} (item-backed, nothing sent)")
+            return
+        conn.execute(
+            "UPDATE dispatches SET reported_at=?, delivery_status=? WHERE job_id=? AND reported_at IS NULL",
+            (dt.datetime.now(dt.timezone.utc).isoformat(), ITEM_TRACKED, job_id),
+        )
+        conn.commit()
+        return
 
     origin_channel = row["origin_channel"]
     origin_thread_ts = row["origin_thread_ts"]
