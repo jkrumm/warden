@@ -9555,3 +9555,38 @@ checks→review hop clears `validation_job` and merge needs `reviewed_sha == tra
 Not done: reconcile's merge→`verifying` write is not CAS; a PR merged on GitHub
 mid-train (checks/review stage) lands `failed`; the revert does not jump an implement
 episode already running in its repo; auto-reverts are not in the metrics' revert count.
+
+## 120. Agent-platform Wave 5 — docs and shape (2026-10-04)
+
+Commits 7f5ea2a, d5fb7c3, 074f48d + close-out on branch `wave-5`, fast-forwarded to master.
+
+- **Docs.** DESIGN.md rewritten to what exists (891 → ~190 lines), linking the spec;
+  AGENTS.md's intake/deploy/verify/sweep paragraphs folded into it. AGENTS.md now
+  carries the repo contract's `## Validate`, `## Deploy`, `## Verify & Monitor`,
+  `## Gotchas`. STATE.md rewritten as a current-state page. Archived to
+  `docs/history/`: `triage.md`, `never-auto-merge-widening.md`,
+  `handover-field-review.md`, `FLOWS.md` → `flows.md`, `REVIEW.md` → `review.md`.
+  `docs/api.md` re-verified against `api.py` (319 → 185 lines). README rewritten.
+- **Repo contract.** `make check` (compileall + every suite), `make deploy`
+  (`scripts/deploy.sh`: compile + import smoke, kickstart `warden-api`, wait for
+  `/health` 200 — or 503 only for a schema mismatch the next loop boot migrates; on
+  failure `git reset --keep HEAD@{1}`), `make verify` (`/health` 200, schema as expected,
+  loop heartbeat fresh — not the other pollers or the backup, which would revert a good
+  merge for an unrelated cause), `make logs`. The logic lives in a script because the
+  loop probes with `make -n deploy` and make runs `$(MAKE)` lines even under `-n` (a
+  review caught the first draft recording a deploy on every probe). Deploy never boots out a periodic agent:
+  the loop runs `make deploy` from inside `warden-loop`, and the periodic agents read
+  the new checkout on their next tick. A changed plist is reported for `make agents`.
+  `make setup` writes `~/.local/bin/warden` (same wrapper dotfiles writes).
+- **Shape.** `scripts/triage.py` split into `scripts/loop/` by stage; history comments
+  dropped. No behaviour change; tests retargeted to the defining modules.
+- **Dead code.** The `warden-trip:` shadow filter in `watchdog-poll.py` and its test.
+- **Cross-repo.** dotfiles `docs/agent-platform.md` status table: warden W3–W5
+  landed. hermes-agent: `scripts/warden-live-sync.sh` and cron `e9e72d028dc5` removed
+  now that warden deploys itself.
+
+`make check` green, test_triage 461 → 460 (the trip test). sideclaw `/review` synthesis
+failed again (Max OAuth expired); an independent reviewer's two blocking findings on the
+deploy/verify draft are fixed (above); the split and the docs came back clean. The split
+worker once ran `triage.py --help`, which `main()` treats as a live pass: verified on a
+ledger copy that it wrote no transition and no dispatch — an extra tick.

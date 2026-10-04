@@ -2,8 +2,8 @@
 
 App ID: `A0C13NMFLD9` — use it for every later `apps.manifest.update`.
 
-`app-manifest.json` declares warden's own Slack bot, so triage cards,
-remediation receipts and reminders are attributable at a glance instead of
+`app-manifest.json` declares warden's own Slack bot, so its one-line
+`fixed` / `needs_decision` posts are attributable at a glance instead of
 riding under the Hermes bot's username (HomeLab, Hermes, VPS and Argo already
 each have their own app — this is warden's).
 
