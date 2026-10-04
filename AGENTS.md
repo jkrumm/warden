@@ -1,253 +1,107 @@
 # warden — Developer Notes
 
-**Read `STATE.md` before touching anything.** It is where the implementation
-actually is: what is done, what is in flight, what failed and why, and the exact
-next action. `DESIGN.md` is authoritative for *what warden is*; `FLOWS.md` for how
-six real scenarios run end to end; `REVIEW.md` records what four reviews rejected,
-so settled arguments stay settled. Do not re-litigate `REVIEW.md` without new
-evidence, and say so explicitly if you have some. `docs/history/state-log.md` is
-the verbatim build log (§§1–56 and onward, append-only); `STATE.md` itself is a
-two-page current-state summary that gets rewritten each wave, while the log is
-only ever appended to.
+warden is the autonomous loop of the agent platform: it owns one SQLite ledger and
+drives every unattended item from a signal to `fixed`, through sideclaw jobs.
+**Read `STATE.md` first** (where the implementation is, what is next), then
+`DESIGN.md` (what exists, and § *What must not be lost* — check it before every
+merge). The spec is `~/SourceRoot/dotfiles/docs/agent-platform.md`; it wins over
+anything here. `docs/history/` is the archive: the append-only build log
+(`state-log.md`, §1 onward), old flows, design reviews.
 
-`DESIGN.md` § *What must not be lost* is nine details that read like accidents and
-are not. Check against it before every merge.
+**Code owns every state transition.** The only LLM inputs are sideclaw's episode
+verdicts and triage answers, and each is validated against the ledger before an
+item moves.
 
-## Architecture
+## Layout
 
-warden is a deterministic control plane over one SQLite ledger. **Code owns every
-state transition.** Its only LLM inputs are sideclaw's episode verdicts and the
-single-shot intake triage answer (sideclaw `triage`), and each is validated against
-the ledger (an open target, a candidate repo, the origin guards in
-`_fold_triage_job()`) before any item moves; an answer that fails validation is
-treated as `new` or strikes. Pollers feed it, sideclaw executes for
-it, Slack and Argo render it.
+| Path | Is |
+|-|-|
+| `scripts/triage.py` | the loop's entry point: `run()` (one pass), CLI flags, heartbeat |
+| `scripts/loop/` | the loop by stage: `core` (paths, states, `_set_state`, strikes, policy), `intake`, `triaging`, `work`, `train`, `verify`, `notify` |
+| `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate, rollout (`make deploy`/`verify`), dispatch, operations |
+| `scripts/clients/` | the only HTTP/CLI boundaries: sideclaw, GitHub, Argo, Slack, secrets |
+| `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`) |
+| `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents |
+| `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
+| `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns |
 
-**Intake is one pool.** Alerts, GitHub issues and `warden run` are `new` items;
-each gets one triage job (alerts once debounce-eligible, the rest at once), and
-`triaged` is that step's output — `escalate()`/`escalate_origin_items()` pick up
-nothing else. Before triage, `classify()` closes `ignore`-list and chat-prose alerts
-`closed(ignored)` with no model call. The signal's own label then picks the candidate
-repos (`_label_route()`): a native label first (`lifecycle/intake.py`: a Kuma tag, a
-container name, an OTel `service.name`, the issue's repo), then a policy `rules`
-match — **a rule is a label, not a route**; triage still runs for a labelled item
-(dedup: attach / fixed_by / ignore) with the label's repo as the only candidate. With no
-label every checkout under the repos root with an `AGENTS.md` is a candidate and the job
-reads their `## Verify & Monitor` sections. `rules` is the tier a later wave deletes once
-those sections cover the fleet (replay: 86/86 rule-routed alerts keep their repo as a
-label; triage alone matched 88 of 108 and misrouted a few for lack of repo knowledge).
-A model's `closed(ignored)` is not forever: on recurrence after `cooldownHours` it
-reopens to `new` (the ignore list and prose filter re-close it without a model call); a
-human `--ignore` stays closed.
-
-Six LaunchAgents, never `hermes cron` jobs, and that is the whole reason this
-repo is separate from `hermes-agent`: a gateway cron job runs *inside* the
-`ai.hermes.gateway` process, so the loop whose job is noticing Hermes is broken
-cannot run when Hermes is down. That was measured, not theorized — the gateway
-crash-looped seven times in 3m34s on 2026-09-07 while the act-loop kept ticking
-against a ledger that had stopped receiving signals.
-
-| Agent | Runs | Interval |
-|-|-|-|
-| `com.jkrumm.warden-loop` | `scripts/triage.py --run` | 600s |
-| `com.jkrumm.warden-poll` | ingest | 1800s |
-| `com.jkrumm.warden-sweep` | `scripts/dispatch-sweep.py` | 300s |
-| `com.jkrumm.warden-backup` | `scripts/warden-backup.sh` | daily 03:10 |
-| `com.jkrumm.warden-api` | `scripts/api.py --serve` (GET /metrics, /health) | long-running, `KeepAlive` |
-
-`warden-api` is the odd shape: a long-running server, not a periodic job — see
-its own plist template for why that changes `KeepAlive`/`StartInterval` and adds
-a `ThrottleInterval`. It binds `127.0.0.1:7735` only, loopback and no auth — see
-`docs/api.md` for the endpoints, the six funnel numbers' exact definitions, the
-honesty rules (`null` + reason, never a fabricated `0`), and what is deliberately
-not built yet.
-
-Slack delivery from the loop is a **plain HTTP client** (one text-only
-`chat.postMessage` per notification, with a token from `resolve_slack_token()`), never the gateway's live
-`slack_bolt` connection. That is what makes a gateway-independent agent safe, and
-it is not an implementation detail — it is the property. It posts under warden's
-own Slack app identity, falling back to Hermes's token until that app is seeded —
-see `slack/README.md` for creating and seeding it.
-
-## Running it
+## Validate
 
 ```bash
-make setup     # venv + plists + load the agents
-make test      # every tests/*.py
-make status    # what is loaded, what ran last, is the ledger reachable
-make unload    # stop the agents
-```
-
-**Never start a second loop.** Two loops against one ledger double every post and
-every dispatch. Before loading an agent, check nothing else is already running the
-same script — during the extraction that means `com.jkrumm.warden-loop` in
-particular.
-
-## Python
-
-Pinned to **3.11.15** via `python3.11` (uv-managed). The box's default `python3` is
-3.14 — do not use it. `make venv` fails loudly rather than falling back, because
-the extracted loop was written and proven against 3.11 and an interpreter change
-is its own verifiable step.
-
-**The loop is pure stdlib.** `requirements.txt` has no entries. Keep it that way: a dependency here is a dependency in the
-thing that decides whether to touch production.
-
-## Tests
-
-Hand-rolled runners, **not pytest** — this venv has none. Each file collects its
-own module-level `test_*` functions reflectively, calls them with no arguments,
-and exits non-zero on failure. Every test function is argument-free and
-fixture-free, so the files stay valid pytest input if that ever changes.
-
-```bash
-make test                                  # all suites
+make check     # compileall + every tests/*.py
+make test      # the suites only
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **461/461**. Any other number is a
-finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
-temp dir and monkeypatches the module globals and every client boundary
-(`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
-sideclaw, GitHub or Argo. **Do not delete, skip or weaken a test
-to make it pass** — if it cannot pass without changing production behaviour, that
-is the finding.
+Python is pinned to **3.11.15** via `python3.11` (uv-managed); the box's default
+`python3` is 3.14 — do not use it. **The loop is pure stdlib**: `requirements.txt`
+stays empty, because a dependency here is a dependency in the thing that decides
+whether to touch production.
 
-`make test` fails when it finds zero tests. A suite that silently runs nothing is
-the failure mode this whole project exists to remove.
+Tests are hand-rolled runners, **not pytest**: each file collects its own
+argument-free `test_*` functions and exits non-zero on failure. `make test` fails
+when it finds zero tests. `tests/test_triage.py` is the regression gate at
+**460/460** — any other number is a finding to report, not a count to edit.
+`_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
+and every client boundary, so nothing reaches Slack, sideclaw, GitHub or Argo.
+Patch a name on the module that defines it (`loop.core.DB_PATH`, `loop.core.post_line`) —
+cross-module references are attribute lookups, so that is the one place it takes
+effect. **Never delete, skip or weaken a test to make it pass**; if it cannot pass
+without changing production behaviour, that is the finding.
 
-## The ledger
+## Deploy
 
-`~/.warden/warden.db` — SQLite, WAL, **not in git**, live. It is the source of
-truth; Argo pages are projections, and Slack hears one line when an item is `fixed` or
-`needs_decision` (plus a daily `failed` count).
+warden deploys itself from this checkout, which the LaunchAgents run directly.
 
-- **One migrator.** `scripts/ledger.py` owns the schema and `schema_version`;
-  only the loop migrates, at boot. Everything else asserts the version and
-  refuses on mismatch. Four processes racing unversioned `CREATE TABLE` /
-  `ALTER TABLE` is what this replaced.
-- **Read-only means read-only**: `sqlite3.connect(f"file:{p}?mode=ro", uri=True)`.
-- Backup is `VACUUM INTO` (never a bare `cp` or `rsync` of an open database —
-  that captures the main file and its `-wal` at different instants and restores
-  as either stale or corrupt with nothing saying which), shipped to
-  `homelab:/mnt/hdd/backups/warden/`, which the existing restic container already
-  walks on its way to B2.
+```bash
+make setup     # venv + plists + load the agents + ~/.local/bin/warden
+make deploy    # compile + import smoke, kickstart warden-api, wait for /health;
+               # on failure roll back to HEAD@{1} (git reset --keep) — scripts/deploy.sh
+make agents    # (re)load the LaunchAgents — needed when a plist template changed
+make unload    # stop the agents
+```
 
-## Talking to sideclaw
+The loop calls `make deploy` itself after merging a warden PR (from inside
+`warden-loop`), so deploy never boots out a periodic agent — they read the new code
+on their next tick; only the long-running `warden-api` is restarted. A changed plist
+is reported, not reloaded. Schema migrations run on the loop's next boot.
 
-Warden depends on exactly two things: `submit(tier, repo, brief, model) -> jobId`
-and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
+## Verify & Monitor
 
-- **The verdict schema is published by sideclaw**, not copied here. Copying it
-  guarantees drift, and drift presents as "verdict silently ignored" — the exact
-  failure warden exists to fix. A version mismatch is a loud refusal, never a
-  best-effort parse.
-- **sideclaw is the only boundary.** Warden carries no repo allowlist, tier
-  ceiling or model choice: a dispatch names a repo (`lifecycle.policy.repo_cwd()`
-  composes the one `cwd` the wire protocol still needs) and sends no `model` key —
-  sideclaw enforces its own allowlist (`GET /api/dispatch-policy`) and routes each
-  tier (`GET /api/routing`). A sideclaw **4xx on submit is a refusal**
-  (`clients.errors.SubmitRefused`): the item ends `failed` carrying sideclaw's
-  message (`triage._end_on_refusal()`) and is never retried — except a refused
-  escalation `model` (attempt 3+), resubmitted once without it, and a refused
-  **triage** submit, which strikes like any other failure (a triage refusal is never
-  the item's fault); 5xx and connection
-  errors strike (`triage._strike()`: 10/30 min backoff, third strike → `failed`). `warden dispatch --model` stays — it is the
-  owner's explicit choice, not policy.
-- **The merge gate is four facts**: PR open, checks green (or none exist), step-7
-  review `confirmed`, and GitHub's own rules allowing the merge call
-  (`lifecycle.merge.merge_gate_check()` / `plan_or_land()`). No path scope, size
-  ceiling, per-repo carve-out or executor-repo exception; `warden merge <job>
-  --confirm` goes through the same gate. The facts hold on one SHA: a `merging` item
-  rides its repo's merge train (`triage.advance_merge_trains()`, oldest item per repo)
-  — sideclaw `update_pr` rebases it, checks are read on the resulting head, the review
-  confirms that head, and the merge is pinned to it; a head that moves goes back to
-  `update`.
-- **Deploy and verify are the repo's own Makefile.** A merged item waits in `verifying`
-  and `triage.maybe_verify()` walks it: `make deploy` if the repo defines the target
-  (after fast-forwarding the checkout to `origin/<default>`, only when it is on the default
-  branch and clean — else a strike; a failing deploy strikes, third → `failed` with the
-  output tail, and never reverts), then `make verify` if defined, and for an alert item its
-  own signal quiet for `VERIFY_WINDOW_HOURS` (the event's occurrence mark unchanged since the
-  window opened, a state-source event closed, its own Kuma monitor UP). No signal (issue,
-  `warden run`) → `fixed` once `make verify` passes. Signal recurrence or three consecutive
-  failing passes → `_on_verify_failure()`: the merged commit (`merged_sha`) is reverted by an
-  implement episode (`git revert --no-edit <sha>`, nothing else; `reverting_sha` marks the
-  item, `revert_pr` stays the owner's `warden revert` record) whose PR rides the same train
-  with no revisions (blocked/checks/conflict → `failed`, PR left open), deploys, and verifies
-  on `make verify` alone — three failing passes → `failed`; a pass → a fresh attempt with the
-  evidence and the reverted diff (the failed fix counts as an attempt, the revert does not),
-  or `failed` when attempts are spent. Host-verb
-  restarts enter `verifying` with their window open and verify on `HOST_VERB_LIVENESS_MONITOR`
-  (no merge to revert: a failure goes back to `triaged`).
-- **A fix's merge is followed by a fixed-by sweep** (never a revert's: `_is_revert()`).
-  `_merged_entry()` queues it on the merged item (`sweep_pr`); `advance_fixed_by_sweeps()`
-  (in the implement chain, so both crons) submits one sideclaw `triage` job per merge — the PR
-  title, body and diff (≤12k chars) against the repo's `triaged` and idle `working` items —
-  and folds `{matches: [{item, reason}]}` under a compare-and-set, accepting only an id the
-  prompt showed that is still in that state with no episode in flight. A match enters
-  `verifying` with `fixed_by_pr` set and verifies by signal alone (`_verify_swept()`): quiet
-  for the window → `closed(fixed_by)` with no Slack line, recurrence → back to `triaged`
-  (never a revert: it was not its merge). A `-private` repo is never swept, and a failing sweep
-  never touches the merged item: stderr, three attempts, then dropped.
-- **An episode is not contained.** `readOnly` is three tool names on a CLI flag
-  under `--dangerously-skip-permissions`; `Bash` is unrestricted and the brief is
-  attacker-influenceable (public issues, alert text, log lines all reach it). A
-  bearer token on this host is not an authorization boundary against an episode.
+- Health: `http://127.0.0.1:7735/health` (loopback only, no auth) — schema version
+  and each poller's heartbeat age vs. 3× its interval. `make verify` = `/health`
+  answering 200 with the expected schema and a fresh loop heartbeat; the other pollers
+  and agents are `make status`'s business.
+- `make status` — agents, last exits, API, ledger file. `make logs` — tail of
+  `~/Library/Logs/warden-{loop,poll,sweep,backup,api}.{log,err}`.
+- Kuma monitor: `warden-backup` push (the daily backup pings it on success); the
+  loop itself has no Kuma monitor — its staleness shows on `/health`.
+- OTel `service.name`: none — warden does not export telemetry.
+- The queue: Argo `/warden`. Slack #agents: one line per `fixed` / `needs_decision`.
 
-## Things that are load-bearing and look like they are not
+## Gotchas
 
-- **A signal going quiet may cancel the need to *start* work. It may never
-  discharge a verdict or an in-flight operation.**
-  Silence-resolve applies to `new` and to nothing else.
-- **Overflow waits, never drops.** Triage submissions past the per-run cap stay `new`;
-  cluster members past the cap stay `triaged`.
-- **The triage submit and fold are compare-and-set** on `triage_job` (a
-  `claiming:<time>` sentinel before the call, the job id after, a stale claim
-  released after 5 minutes). Two passes finding the same finished job fold it once.
-  Entering `new` clears `triage_job`, so a recurrence is triaged afresh; the fold clears it
-  on every outcome except `ignore`, so a row that still carries one is a *model's* ignore
-  (revisited after `cooldownHours`) and an owner's dismiss never reopens. Every triage
-  submit failure, a sideclaw 4xx included, strikes under a CAS on the claim (`failed` on
-  the third); a job still not terminal 30 minutes after submit (`triage_job_at`) is
-  cancelled best-effort and struck.
-- **Triage never leaks a private repo.** A `-private` candidate is a name only (no item
-  lines), and an item in one sends the model `(private repo — content withheld)` instead
-  of its title/payload; everything else the event says is fenced as untrusted data.
-  Grouped-source policy patterns (`slack_alert`, `slack_update`, `hermes_log`) match
-  `fingerprint(title)`, which has no digits — a pattern with one is dead.
-- **The dry-run contract**: never touches Slack, never shells out, never submits a
-  triage job (it prints what it would), everything else real. With no staging environment it is the only pre-production surface there is.
-- **A policy file may name and parameterise, never express.** Config carries
-  validated values; code owns the argv array: `make -C <repo> deploy|verify` (two
-  fixed targets, `lifecycle/rollout.py`) and `HOST_VERB_ALLOWLIST` (added
-  2026-09-11 for the owner's host-restart decision — DESIGN.md § The host-verb
-  carve-out) are the two instances left.
-- **Deferral must be visible.** A budget hit that only reaches a `.err` file is
-  indistinguishable from a broken loop.
-- **A dispatch that ends terminal with no verdict is not a verdict.** It is an
-  infrastructure failure: it strikes and retries, and the third strike is
-  `failed` carrying `dispatches.error` — never a verdict-less `working` row (§64).
-- **`needs_decision` is the only human exit**, and only a verdict with
-  `nextAction=human` reaches it. `needs_decision` and `failed` never expire.
-- **Two crons drive one ledger** (loop and sweep). Every act on a row they can
-  both reach — a submit, a handoff, a Slack post — is a compare-and-set claim
-  first (§117).
-- **An action pulled from Argo's queue is the owner, full stop.**
-  `apply_argo_actions()` records `authorized_by="owner:argo"` and acts — Argo
-  is reachable only over his own tailnet, which is the trust boundary.
-
-## Cross-repo facts
-
-`hermes-ops.sh`, `agents-overview.py` and a
-six-line dispatch-shim script (which `exec`s into this repo's `scripts/warden`)
-live in `hermes-agent` and are reached, not vendored.
-`~/.hermes/{scripts,config}` are **whole-directory symlinks** into that repo, which
-is why the extraction was never a `git mv`.
+- **The working tree is live.** The LaunchAgents import this checkout every tick; a
+  saved half-edit (even a migration) acts on the real ledger. Do non-trivial work
+  in a git worktree and fast-forward master when green.
+- **Never start a second loop.** Two loops against one ledger double every post and
+  every dispatch. Check `make status` before loading anything.
+- **The ledger** `~/.warden/warden.db` is live and not in git. Never migrate it from
+  a session — copy it (`cp ~/.warden/warden.db /tmp/`) and test there. Read-only
+  means `sqlite3.connect(f"file:{p}?mode=ro", uri=True)`. Backup is `VACUUM INTO`,
+  never `cp`/`rsync` of the open file.
+- **A dirty or diverged checkout of any repo blocks its deploys**: the loop
+  fast-forwards only a clean default-branch checkout that ends at origin, else it
+  strikes (third → `failed`). That includes this one.
+- **`scripts/triage.py` has no `--help`**: any flag it does not know runs a full live
+  pass against the real ledger. Run the loop by hand only with `--dry-run` and `env -u CLAUDECODE …` (sideclaw's
+  recursion guard refuses dispatches from inside a Claude session).
+- **Cross-repo:** `hermes-ops.sh`, `agents-overview.py` and the dispatch shim (which
+  `exec`s `scripts/warden`) live in `hermes-agent`; `~/.hermes/{scripts,config}` are
+  whole-directory symlinks into that repo.
 
 ## Git
 
-Direct-to-master. `/commit` per logical concern, no attribution footers.
-Append a § to `docs/history/state-log.md` and rewrite `STATE.md` in the same
-commit as the work it describes — it is the memory, and the next session is a
-stranger.
+Direct-to-master. `/commit` per logical concern, no attribution footers. Append a §
+to `docs/history/state-log.md` and rewrite `STATE.md` in the same commit as the work
+it describes — the next session is a stranger.

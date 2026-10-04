@@ -28,9 +28,13 @@ WARDEN_PLISTS := com.jkrumm.warden-loop com.jkrumm.warden-poll \
 .PHONY: help
 help:
 	@echo "warden"
-	@echo "  make setup     venv + plists + load the agents"
+	@echo "  make setup     venv + plists + load the agents + warden on PATH"
 	@echo "  make venv      create .venv from $(BASE_PY) and install requirements"
+	@echo "  make check     compile every script + run every test suite"
 	@echo "  make test      run every tests/*.py (hand-rolled runners, not pytest)"
+	@echo "  make deploy    kickstart warden-api on this checkout, health-check, roll back on failure"
+	@echo "  make verify    production health: /health ok and every agent's last exit 0"
+	@echo "  make logs      bounded tail of every agent's logs"
 	@echo "  make status    what is loaded, what ran last, is the ledger reachable"
 	@echo "  make agents    (re)load the LaunchAgents from launchd/"
 	@echo "  make unload    unload the LaunchAgents"
@@ -38,8 +42,18 @@ help:
 	@echo "  make slack-app-update SLACK_CONFIG_TOKEN=xoxe-... APP_ID=... update it — see slack/README.md"
 
 .PHONY: setup
-setup: venv render-plists agents
+setup: venv render-plists agents link
 	@echo "warden: setup complete — run 'make status'"
+
+# A wrapper, not a symlink: scripts/warden resolves the venv relative to its own path.
+BIN_LINK := $(HOME)/.local/bin/warden
+
+.PHONY: link
+link:
+	@mkdir -p "$(dir $(BIN_LINK))"
+	@printf '#!/bin/sh\nexec "%s/scripts/warden" "$$@"\n' "$(WARDEN_REPO)" > "$(BIN_LINK)"
+	@chmod +x "$(BIN_LINK)"
+	@echo "  ✓ $(BIN_LINK) -> $(WARDEN_REPO)/scripts/warden"
 
 # ---------------------------------------------------------------------------
 # venv
@@ -84,6 +98,31 @@ test:
 	done; \
 	[ $$ran -gt 0 ] || { echo "  no tests found"; exit 1; }; \
 	exit $$fail
+
+.PHONY: check
+check:
+	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
+	@"$(PY)" -m compileall -q "$(WARDEN_REPO)/scripts" "$(WARDEN_REPO)/tests" >/dev/null
+	@echo "  ✓ compileall"
+	@$(MAKE) --no-print-directory test
+
+# ---------------------------------------------------------------------------
+# Deploy / verify / logs — the repo contract
+# ---------------------------------------------------------------------------
+
+.PHONY: deploy
+deploy:
+	@"$(WARDEN_REPO)/scripts/deploy.sh" deploy
+
+.PHONY: verify
+verify:
+	@"$(WARDEN_REPO)/scripts/deploy.sh" verify
+
+.PHONY: logs
+logs:
+	@for f in $(HOME)/Library/Logs/warden-*.log $(HOME)/Library/Logs/warden-*.err; do \
+		[ -s "$$f" ] || continue; echo "== $$f"; tail -n 30 "$$f"; \
+	done
 
 # ---------------------------------------------------------------------------
 # LaunchAgents
