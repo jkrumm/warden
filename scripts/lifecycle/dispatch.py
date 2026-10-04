@@ -105,9 +105,11 @@ def open_episode(
     origin: Origin,
     authorized_by: str | None,
     model: str | None = None,
+    revision_of: str | None = None,
     now: dt.datetime | None = None,
 ) -> Opened:
-    """Submit one sideclaw episode and record it.
+    """Submit one sideclaw episode and record it. `revision_of` (a prior episode's
+    `dispatch/*` branch) makes it a revision sideclaw applies to that branch's open PR.
 
     A gated tier (`implement`) is covered by an `operations` row committed
     BEFORE the submit — DESIGN.md § Crash recovery. A submit that fails definitively
@@ -159,6 +161,7 @@ def open_episode(
             brief=brief,
             context=context,
             model=model,
+            revision_of=revision_of,
         )
     except RemoteError as exc:
         if gated and opened_op_id is not None:

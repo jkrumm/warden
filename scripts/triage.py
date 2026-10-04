@@ -434,12 +434,19 @@ DEFAULT_QUIET_RESOLVE_HOURS = 2.0
 DEFAULT_CHRONIC_RECURRENCES = 3
 DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 
-# maybe_revise_blocked()'s attempt cap — how many times a blocked
-# implementation goes back to a fresh implement episode carrying the
-# reviewer's findings before it parks for a human. An attempt count per item,
-# the same shape as hostVerbMaxAttempts, never a turn or time limit on the
-# episode itself (rules/agent-limits.md).
-DEFAULT_REVISION_MAX_ATTEMPTS = 2
+# Implement attempts per item: the first, plus up to three revisions or re-dispatches
+# (a blocked review, failed checks, a base that moved — see maybe_revise_blocked()).
+# `triage_items.revision_count` counts the attempts after the first. An attempt count
+# per item, never a turn or time limit on the episode itself (rules/agent-limits.md).
+MAX_IMPLEMENT_ATTEMPTS = 4
+
+# Attempt N >= this one runs on sideclaw's escalation implement model (GET /api/routing),
+# when it has one — see _implement_model().
+ESCALATION_ATTEMPT = 3
+
+# How long an item waits after sideclaw's per-repo implement lease refused its episode
+# (another implement episode holds the repo) before the attempt is submitted again. Not a strike.
+LEASE_RETRY_MINUTES = 10
 
 # maybe_auto_remediate()'s own cooldown/attempt-cap defaults — same shape as
 # DEFAULT_COOLDOWN_HOURS above but against `operations`, not `dispatches`
@@ -955,9 +962,6 @@ def load_policy() -> dict[str, Any]:
         "quietResolveHours": float(data.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS),
         "chronicRecurrences": int(data.get("chronicRecurrences") or DEFAULT_CHRONIC_RECURRENCES),
         "chronicWindowDays": float(data.get("chronicWindowDays") or DEFAULT_CHRONIC_WINDOW_DAYS),
-        "revisionMaxAttempts": _valid_host_verb_positive_number(
-            data.get("revisionMaxAttempts"), key="revisionMaxAttempts",
-            default=DEFAULT_REVISION_MAX_ATTEMPTS, cast=int),
         "rules": [r for r in (data.get("rules") or []) if _valid_rule(r)],
         # The host-verb allowlist's own rule set (HOST_VERB_ALLOWLIST) —
         # same match-target/first-match-wins shape as `rules` above (see
@@ -1108,6 +1112,7 @@ _SET_STATE_COLUMNS = (
     "note", "dispatch_job", "card_channel", "card_ts", "card_hash", "artifact_url",
     "pr_url", "implement_job", "validation_job", "liveness_deadline", "deploy_expect_json",
     "revert_pr", "close_reason", "strikes", "retry_at", "revision_count",
+    "root_cause", "duplicate_of", "triage_job",
 )
 
 
@@ -1128,8 +1133,9 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     """The ONLY place this file writes triage_items.state. Returns rowcount.
 
     `closed` must carry its reason: a `close_reason` in CLOSE_REASONS is
-    required, and every other state clears it, so a reopened item never keeps the
-    reason it was closed with.
+    required, and every other state clears it (as it does `duplicate_of`, which
+    only a `closed(duplicate)` item carries), so a reopened item never keeps the reason it
+    was closed with.
 
     The strike counter is owned here too: an item that advances to `merging`,
     `verifying` or `fixed` (a step SUCCEEDED — claiming `working` is not
@@ -1181,6 +1187,8 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
             raise ValueError(f"a `closed` transition must carry close_reason= one of {CLOSE_REASONS}")
     else:
         columns["close_reason"] = None
+    if columns.get("close_reason") != CLOSE_DUPLICATE:
+        columns.setdefault("duplicate_of", None)
     expect_eq = expect_eq or {}
     unknown = tuple(c for c in (*columns, *expect_null, *expect_eq) if c not in _SET_STATE_COLUMNS)
     if unknown:
@@ -3458,6 +3466,65 @@ def _decision_note(result: dict[str, Any]) -> str:
     return "the investigation asked for a human decision and recorded no question"
 
 
+# What "open" means for the root-cause merge: not terminal and not `failed`.
+_ROOT_CAUSE_CLOSED_STATES = (*TERMINAL_STATES, STATE_FAILED)
+
+
+def _has_operation_in_flight(item: sqlite3.Row) -> bool:
+    """A merge, a verify window, or an implement/review episode (or its claim) on the row:
+    closing it would orphan whatever that operation is about to write."""
+    return (item["state"] in (STATE_MERGING, STATE_VERIFYING)
+            or item["implement_job"] is not None or item["validation_job"] is not None)
+
+
+def apply_root_cause(conn: sqlite3.Connection, members: list[sqlite3.Row], result: dict[str, Any],
+                     now: dt.datetime) -> None:
+    """A verdict's `rootCause` key goes on every member of the folded cluster, and an open
+    item in the same repo (another dispatch) carrying the same key is the same defect: the
+    two merge. The older item (earlier `created_at`, then lower `event_id`) is kept; the
+    other closes `closed(duplicate)` with `duplicate_of` set and a note naming the kept one.
+
+    Never merged away: an item with an operation in flight (`merging`/`verifying`, or an
+    implement/review job or claim on it) — skipped and logged, the next verdict may merge it.
+    The close is a compare-and-set on the state this pass read and on both job columns still
+    being empty, so a pass that moved the item first wins and this one writes nothing."""
+    root_cause = result.get("rootCause")
+    if not isinstance(root_cause, str) or not root_cause.strip():
+        return
+    root_cause = root_cause.strip()
+    for m in members:
+        conn.execute("UPDATE triage_items SET root_cause=? WHERE event_id=?", (root_cause, m["event_id"]))
+    conn.commit()
+    placeholders = ",".join("?" * len(_ROOT_CAUSE_CLOSED_STATES))
+    for member in members:
+        m = _get_item(conn, member["event_id"])
+        if m is None or m["state"] in _ROOT_CAUSE_CLOSED_STATES or m["repo"] is None:
+            continue
+        others = conn.execute(
+            f"SELECT event_id FROM triage_items WHERE repo=? AND root_cause=? AND event_id != ? "
+            f"AND dispatch_job IS NOT ? AND state NOT IN ({placeholders}) ORDER BY created_at, event_id",
+            (m["repo"], root_cause, m["event_id"], m["dispatch_job"], *_ROOT_CAUSE_CLOSED_STATES),
+        ).fetchall()
+        for row in others:
+            m, other = _get_item(conn, member["event_id"]), _get_item(conn, row["event_id"])
+            if (m is None or other is None or m["state"] in _ROOT_CAUSE_CLOSED_STATES
+                    or other["state"] in _ROOT_CAUSE_CLOSED_STATES):
+                continue
+            keep, drop = sorted((m, other), key=lambda r: (r["created_at"], r["event_id"]))
+            if _has_operation_in_flight(drop):
+                print(f"triage: root cause {root_cause!r}: not merging #{drop['event_id']} into "
+                      f"#{keep['event_id']} — #{drop['event_id']} has an operation in flight "
+                      f"({drop['state']})", file=sys.stderr)
+                continue
+            won = _set_state(
+                conn, drop["event_id"], STATE_CLOSED, now, expect_state=drop["state"],
+                expect_null=("implement_job", "validation_job"), close_reason=CLOSE_DUPLICATE,
+                duplicate_of=keep["event_id"], note=f"duplicate of #{keep['event_id']} ({root_cause})")
+            conn.commit()
+            if won and drop["event_id"] == m["event_id"]:
+                break
+
+
 def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job_id: str,
                            now: dt.datetime, dry_run: bool) -> None:
     """Called by dispatch-sweep.py once a dispatch tied to a triage cluster
@@ -3583,6 +3650,9 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
             if event_row is not None:
                 _maybe_comment_back_on_issue(conn, m, event_row, result, now, state=member_state,
                                              note=member_note, dry_run=False)
+
+    if not no_verdict:
+        apply_root_cause(conn, members, result, now)
 
     fresh_members = [r for r in (_get_item(conn, m["event_id"]) for m in members) if r is not None]
     fresh_events = [e for e in (_get_event(conn, m["event_id"]) for m in fresh_members) if e is not None]
@@ -4381,6 +4451,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 why="triage auto-implement: investigation concluded nextAction=implement",
                 origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
+                model=_implement_model(item["revision_count"] + 1),
             )
         except SubmitRefused as exc:
             # open_episode() already completed the operation `failed`. A
@@ -4505,9 +4576,67 @@ def _review_claim_until(now: dt.datetime) -> str:
     return _now_iso(now + dt.timedelta(minutes=REVIEW_CLAIM_MINUTES))
 
 
-def _revisions_left(item: sqlite3.Row, policy: dict[str, Any]) -> bool:
-    max_attempts = int(policy.get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
-    return item["max_tier"] == "implement" and item["revision_count"] < max_attempts
+def _revisions_left(item: sqlite3.Row) -> bool:
+    """Another implement attempt may follow the one on record: `revision_count` counts the
+    attempts after the first, so MAX_IMPLEMENT_ATTEMPTS - 1 of them are allowed."""
+    return item["max_tier"] == "implement" and item["revision_count"] + 1 < MAX_IMPLEMENT_ATTEMPTS
+
+
+def _implement_model(attempt: int) -> str | None:
+    """The `model` an implement attempt is submitted with. Attempts 1 and 2 send none
+    (sideclaw's own default); attempt ESCALATION_ATTEMPT and later send the escalation
+    model sideclaw's registry names, or none when it names no such route. Warden never
+    carries a model id of its own."""
+    return _sideclaw.escalation_model() if attempt >= ESCALATION_ATTEMPT else None
+
+
+def _close_superseded_pr(old_pr: str, new_pr: str) -> None:
+    """A newer attempt opened its own pull request (a conflicting revision re-derived from
+    the new base): the older one is stale. Closed with a pointer; a failed close is logged
+    only — the item's own path does not depend on it."""
+    parsed = _github.parse_pr_url(old_pr)
+    if parsed is None:
+        return
+    owner, repo_name, number = parsed
+    try:
+        _github.close_pr(owner, repo_name, number, comment=f"Superseded by {new_pr}: the base moved under this "
+                         f"branch, so warden re-derived the fix from the latest base.")
+    except RemoteError as e:
+        print(f"triage: could not close superseded {old_pr}: {e}", file=sys.stderr)
+
+
+def _retry_after_lease_refusal(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> None:
+    """sideclaw's per-repo implement lease refused this item's episode (another implement
+    episode holds the repo): the work is fine, the slot was taken. The item stays `working`
+    with `retry_at` pushed LEASE_RETRY_MINUTES out — no strike, no attempt spent — and the
+    attempt is submitted again from where it was:
+
+      a first attempt   -> implement_job cleared, maybe_auto_implement() submits it again
+      a revision        -> the previous attempt's job (and its review job) put back and
+                           `revision_count` handed back, so maybe_revise_blocked() re-derives the
+                           same findings and the same revisionOf
+
+    The write is a compare-and-set on the refused job, so two passes cannot both rewind."""
+    event_id, job_id = item["event_id"], item["implement_job"]
+    columns: dict[str, Any] = dict(_IMPLEMENT_RETRY_COLUMNS)
+    refused = conn.execute("SELECT id, why FROM dispatches WHERE job_id=?", (job_id,)).fetchone()
+    if refused is not None and (refused["why"] or "").startswith(REVISION_WHY_PREFIX):
+        prior = conn.execute(
+            "SELECT job_id, validation_job_id FROM dispatches WHERE origin_event_id=? AND tier='implement' "
+            "AND id < ? AND validation_status IN ('blocked', 'checks_failed', 'conflict') "
+            "ORDER BY id DESC LIMIT 1", (event_id, refused["id"])).fetchone()
+        if prior is not None:
+            columns = {"implement_job": prior["job_id"], "validation_job": prior["validation_job_id"],
+                       "revision_count": max(item["revision_count"] - 1, 0)}
+    won = _set_state(
+        conn, event_id, STATE_WORKING, now, expect_state=STATE_WORKING, expect_eq={"implement_job": job_id},
+        note=f"sideclaw's implement lease for {item['repo']} is held by another episode — "
+             f"retry after {LEASE_RETRY_MINUTES} min",
+        retry_at=_now_iso(now + dt.timedelta(minutes=LEASE_RETRY_MINUTES)), **columns)
+    conn.commit()
+    if won:
+        print(f"triage: {item['signature']} (event {event_id}): implement lease held in {item['repo']} — "
+              f"retrying in {LEASE_RETRY_MINUTES} min", file=sys.stderr)
 
 
 def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -4517,9 +4646,12 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
     `result.outcome` (clients.sideclaw.DISPATCH_OUTCOMES) rather than "read
     artifactUrl, guess the rest":
 
-      pr_opened                                -> opens the step-7 review (merging)
-      checks_failed                            -> a revision attempt (stays working) while any
+      pr_opened | pr_updated                   -> opens the step-7 review (merging); a newer PR
+                                                  than the one on record closes the older
+      checks_failed | conflict                 -> a revision attempt (stays working) while any
                                                   are left, else failed
+      a failed job refused by sideclaw's
+        per-repo implement lease               -> retry later (retry_at), no strike, no attempt
       result.nextAction == "human"             -> needs_decision (decisionQuestion, else summary)
       everything else — no_changes, diff_refused, branch_no_pr, pr_failed, withheld,
         salvaged, a wrong tier's outcome, a missing/unrecognized outcome, a failed/
@@ -4597,6 +4729,9 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         # the sweep already synced is a no-op (COALESCE on both columns).
         _dispatch.sync_record(conn, resp, reported=False, now=now)
         conn.commit()
+        if _sideclaw.is_lease_refusal(resp):
+            _retry_after_lease_refusal(conn, item, now)
+            continue
         if status != "done":
             reason = resp.get("error") or ("cancelled" if status == "cancelled" else "no further detail")
             _strike_attempt(f"implement episode {job_id} finished '{status}' with no pull request: {reason}")
@@ -4618,10 +4753,11 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         outcome = result.get("outcome")
         artifact_url = result.get("artifactUrl")
         summary = result.get("summary") or "no further detail"
+        apply_root_cause(conn, [item], result, now)
 
         if result.get("nextAction") == "human":
             _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=_decision_note(result))
-        elif outcome == "pr_opened" and artifact_url:
+        elif outcome in ("pr_opened", "pr_updated") and artifact_url:
             # CLAIM BEFORE DISPATCH, the same shape as maybe_auto_implement(): the loop and
             # the sweep both reach this handoff, and an unclaimed one opens two reviews. The
             # compare-and-set moves the item to `merging` only while it is still the
@@ -4638,6 +4774,8 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                 print(f"triage: {item['signature']} (event {event_id}) was already handed to review by "
                       f"another pass — skipped", file=sys.stderr)
                 continue
+            if item["pr_url"] and item["pr_url"] != artifact_url:
+                _close_superseded_pr(item["pr_url"], artifact_url)
             try:
                 val_job, val_err = _open_validation_dispatch(
                     conn, repo=item["repo"], event_id=event_id, implement_job=job_id,
@@ -4655,18 +4793,20 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                 _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_MERGING,
                            expect_eq={"validation_job": None}, validation_job=val_job,
                            strikes=0, retry_at=None)
-        elif outcome == "pr_opened":
+        elif outcome in ("pr_opened", "pr_updated"):
             conn.commit()
-            _strike_attempt(f"implement {job_id}: pr_opened outcome carried no artifactUrl")
+            _strike_attempt(f"implement {job_id}: {outcome} outcome carried no artifactUrl")
             continue
-        elif outcome == "checks_failed":
+        elif outcome in ("checks_failed", "conflict"):
             branch = result.get("branch") or "?"
             note = (f"implement {job_id}: the repo's checks failed before push "
-                    f"(branch {branch}): {summary[:300]}")
+                    f"(branch {branch}): {summary[:300]}" if outcome == "checks_failed" else
+                    f"implement {job_id}: the base moved and the rebase conflicted, nothing was "
+                    f"pushed: {summary[:300]}")
             # Marked on the dispatch row so this job is judged once; the revision
             # attempt (maybe_revise_blocked()) is what follows while any are left.
-            conn.execute("UPDATE dispatches SET validation_status='checks_failed' WHERE job_id=?", (job_id,))
-            if _revisions_left(item, policy):
+            conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?", (outcome, job_id))
+            if _revisions_left(item):
                 _set_state(conn, event_id, STATE_WORKING, now, note=f"{note} — revision pending")
             else:
                 _set_state(conn, event_id, STATE_FAILED, now, note=note)
@@ -4987,7 +5127,7 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             conn.commit()
         elif validation_status == "blocked":
             note = f"step-7 validation (blocked): {_format_blocking_findings(blocking)}"
-            if _revisions_left(item, policy):
+            if _revisions_left(item):
                 # The findings go back to a fresh implement episode — see
                 # maybe_revise_blocked(), which picks this row up.
                 _set_state(conn, event_id, STATE_WORKING, now, note=note)
@@ -5150,6 +5290,7 @@ def _safe_json_list(raw: str | None) -> list[dict[str, Any]]:
 
 
 REVISION_NOTE_PREFIX = "revision "
+REVISION_WHY_PREFIX = "triage revision "
 
 
 def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | None:
@@ -5186,34 +5327,53 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
     if result.get("outcome") == "checks_failed":
         return ("The repo's own checks FAILED on the previous attempt before it could be pushed:\n"
                 f"{result.get('summary') or 'no further detail'}")
+    if result.get("outcome") == "conflict":
+        return ("The default branch moved and the previous attempt could not be rebased onto it, "
+                f"so nothing was pushed:\n{result.get('summary') or 'no further detail'}")
     return None
+
+
+def _conflict_context(job_id: str, result: dict[str, Any]) -> str:
+    """What a re-dispatch after a `conflict` needs beyond the investigation: the conflicting
+    episode's own verdict, and where its commits are (a git bundle, when sideclaw made one)."""
+    parts = [f"Previous implement attempt: {job_id} (outcome: conflict)"]
+    verdict = result.get("verdict") or result.get("summary")
+    if verdict:
+        parts.append(f"verdict: {verdict}")
+    bundle = _sideclaw.conflict_bundle_path(result)
+    if bundle:
+        parts.append(f"The previous attempt's commits are in git bundle {bundle}; "
+                     f"`git fetch {bundle}` to read them.")
+    return "\n\n".join(parts)
 
 
 def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                          *, dry_run: bool) -> None:
-    """A blocked implementation goes back to a fresh implement episode with
-    the reviewer's findings (2026-09-28, state-log §92 — dotfiles#7 sat five
-    days on one concrete, fixable finding while its alert paged 16 times).
+    """A blocked or unlanded implementation goes back to another implement episode on the SAME
+    item — a revision is an attempt, never a new item (agent-platform.md §Warden step 4).
 
     Eligible: `working` with a real implement job on record, `max_tier='implement'`,
-    a revisable reason (_revision_findings() — only a review that BLOCKED, or an
-    implement whose own checks failed, ever leaves that mark on the dispatch row),
-    and `revision_count < revisionMaxAttempts`. poll_validation_jobs()/
-    poll_implement_jobs() leave such an item in `working` while attempts remain
-    and land it `failed` carrying the findings once they are spent. The claim is a
-    compare-and-set that swaps the old job for IMPLEMENT_CLAIM with
-    `revision_count+1`, before the dispatch — the same claim-before-dispatch shape
-    maybe_auto_implement() uses. The new episode is told to start from the
-    previous branch and fix every finding; its PR goes through the same step-7
-    review as the first one. The superseded PR is closed with a pointer, so dead
-    drafts do not accumulate."""
-    max_attempts = int(policy.get("revisionMaxAttempts") or DEFAULT_REVISION_MAX_ATTEMPTS)
+    a revisable reason (_revision_findings() — a review that BLOCKED, an implement whose
+    own checks failed, or one whose rebase conflicted ever leaves that mark on the dispatch
+    row), and an attempt left (MAX_IMPLEMENT_ATTEMPTS, the first included). poll_validation_jobs()/
+    poll_implement_jobs() leave such an item in `working` while attempts remain and land it
+    `failed` carrying the findings once they are spent. The claim is a compare-and-set that
+    swaps the old job for IMPLEMENT_CLAIM with `revision_count+1`, before the dispatch — the
+    same claim-before-dispatch shape maybe_auto_implement() uses.
+
+    A review block or failed checks on a pushed branch: the episode is sent `revisionOf` the
+    previous `dispatch/*` branch, so sideclaw cuts its worktree from that tip and updates the
+    SAME pull request (`pr_updated`); `pr_url` stays and the step-7 review runs again on it.
+    A `conflict` (the base moved; nothing was pushed): a fresh episode from the new base
+    carrying the conflicting attempt's verdict and its git bundle — without `revisionOf`; the
+    PR on record is closed when its replacement opens (poll_implement_jobs()). Attempt
+    ESCALATION_ATTEMPT and later run on the escalation model (_implement_model())."""
     ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND implement_job IS NOT NULL AND implement_job != ? "
-        f"AND implement_job NOT LIKE ? AND max_tier='implement' AND revision_count < ? AND {ready_sql} "
+        f"AND implement_job NOT LIKE ? AND max_tier='implement' AND revision_count + 1 < ? AND {ready_sql} "
         f"ORDER BY event_id",
-        (STATE_WORKING, IMPLEMENT_CLAIM, f"{HOST_VERB_CLAIM_PREFIX}%", max_attempts, *ready_params),
+        (STATE_WORKING, IMPLEMENT_CLAIM, f"{HOST_VERB_CLAIM_PREFIX}%", MAX_IMPLEMENT_ATTEMPTS, *ready_params),
     ).fetchall()
     for item in candidates:
         if item["repo"] is None:
@@ -5221,10 +5381,10 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         findings = _revision_findings(conn, item)
         if findings is None:
             continue
-        attempt = item["revision_count"] + 1
+        attempt = item["revision_count"] + 2   # the ordinal of the implement attempt about to start
         if dry_run:
             print(f"[dry-run] would revise {item['signature']} in {item['repo']} "
-                  f"(attempt {attempt}/{max_attempts})")
+                  f"(attempt {attempt}/{MAX_IMPLEMENT_ATTEMPTS})")
             continue
         try:
             _policy.check_repo_not_in_flight(conn, repo=item["repo"], exclude_event_id=item["event_id"])
@@ -5237,13 +5397,24 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         prior_result = _safe_json(prior["verdict_json"] if prior else None)
         prior_pr = item["pr_url"] or prior_result.get("artifactUrl")
         prior_branch = prior_result.get("branch")
-        start = (f"Start from the previous attempt, do not rewrite it: `git fetch origin {prior_branch}` "
-                 f"and bring its change into your worktree (`git diff HEAD...FETCH_HEAD | git apply "
-                 f"--index`), then fix what is listed below."
-                 if prior_branch else "The previous attempt's branch is not on record; re-derive the "
-                 "fix from the investigation below and avoid what is listed.")
+        conflicted = prior_result.get("outcome") == "conflict"
+        revision_of = (prior_branch if prior_pr and not conflicted and isinstance(prior_branch, str)
+                       and prior_branch.startswith("dispatch/") else None)
+        if revision_of:
+            start = (f"Your worktree starts at the tip of the previous attempt's branch ({revision_of}) and "
+                     f"your push updates that same pull request. Do not rewrite it; fix what is listed below.")
+        elif conflicted:
+            start = ("Your worktree starts from the latest default branch. The previous attempt's change "
+                     "is in the context below: re-apply its intent on the current base, do not copy it blindly.")
+        elif prior_branch:
+            start = (f"Start from the previous attempt, do not rewrite it: `git fetch origin {prior_branch}` "
+                     f"and bring its change into your worktree (`git diff HEAD...FETCH_HEAD | git apply "
+                     f"--index`), then fix what is listed below.")
+        else:
+            start = ("The previous attempt's branch is not on record; re-derive the "
+                     "fix from the investigation below and avoid what is listed.")
         brief = (
-            f"Revision {attempt} of {max_attempts} of a fix the alert triage loop already implemented"
+            f"Attempt {attempt} of {MAX_IMPLEMENT_ATTEMPTS} of a fix the alert triage loop already implemented"
             f"{f' as {prior_pr}' if prior_pr else ''}. {start}\n\n{findings}\n\n"
             f"{_issue_closing_instruction(conn, item)}"
             "Address every finding. Keep what the previous attempt got right and do not widen scope. "
@@ -5255,13 +5426,16 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                            (item["dispatch_job"],)).fetchone() if item["dispatch_job"] else None
         context = (_verdict_as_context(item["dispatch_job"], _safe_json(inv["verdict_json"]))
                    if inv is not None else None)
+        if conflicted:
+            context = "\n\n".join(filter(None, (_conflict_context(item["implement_job"], prior_result),
+                                               context)))[: _dispatch.MAX_CONTEXT_CHARS]
 
         claimed = _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
                              expect_eq={"implement_job": item["implement_job"],
                                         "revision_count": item["revision_count"]},
-                             note=f"{REVISION_NOTE_PREFIX}{attempt}/{max_attempts}: {findings[:300]}",
-                             implement_job=IMPLEMENT_CLAIM, validation_job=None, pr_url=None,
-                             revision_count=attempt)
+                             note=f"{REVISION_NOTE_PREFIX}{attempt}/{MAX_IMPLEMENT_ATTEMPTS}: {findings[:300]}",
+                             implement_job=IMPLEMENT_CLAIM, validation_job=None,
+                             revision_count=item["revision_count"] + 1)
         conn.commit()
         if not claimed:
             continue
@@ -5269,9 +5443,10 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         try:
             opened = _dispatch.open_episode(
                 conn, repo=item["repo"], tier="implement", brief=brief, context=context,
-                why=f"triage revision {attempt}: the step-7 review blocked the previous attempt",
+                why=f"{REVISION_WHY_PREFIX}{attempt}: the previous attempt could not land",
                 origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
+                model=_implement_model(attempt), revision_of=revision_of,
             )
         except SubmitRefused as exc:
             # Refused for good: end the item.
@@ -5287,7 +5462,7 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # restored, so the findings are still on the row) and strike.
             _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
                        implement_job=item["implement_job"], validation_job=item["validation_job"],
-                       pr_url=item["pr_url"], revision_count=item["revision_count"])
+                       revision_count=item["revision_count"])
             _strike(conn, item["event_id"], now, f"revision {attempt} could not start: {exc}",
                     retry_state=STATE_WORKING, expect_state=STATE_WORKING)
             conn.commit()
@@ -5296,23 +5471,13 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
                        note=f"revision {attempt} could not start: {e}",
                        implement_job=item["implement_job"], validation_job=item["validation_job"],
-                       pr_url=item["pr_url"], revision_count=item["revision_count"])
+                       revision_count=item["revision_count"])
             conn.commit()
             continue
 
         conn.execute("UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
                      (opened.job_id, _now_iso(now), item["event_id"]))
         conn.commit()
-
-        parsed = _github.parse_pr_url(prior_pr) if prior_pr else None
-        if parsed is not None:
-            owner, repo_name, number = parsed
-            try:
-                _github.close_pr(owner, repo_name, number, comment=(
-                    f"Superseded: the step-7 review blocked this; warden opened revision {attempt} "
-                    f"(job {opened.job_id}) from this branch with the findings."))
-            except RemoteError as e:
-                print(f"triage: could not close superseded {prior_pr}: {e}", file=sys.stderr)
 
 
 def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,

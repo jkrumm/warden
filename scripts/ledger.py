@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 13
+LEDGER_SCHEMA_VERSION = 14
 
 
 class LedgerBehind(RuntimeError):
@@ -580,6 +580,25 @@ UPDATE item_transitions SET
   to_state = {_case_13("to_state")};
 """
 
+# Version 14 — intake and dedup (agent-platform.md §Warden steps 2-3). Three nullable
+# columns on triage_items, all correct as NULL on every existing row:
+#
+#   root_cause    the verdict's own `rootCause` key (kebab, <=80) — what a later
+#     verdict is compared against to merge two items that are one defect.
+#   duplicate_of  event_id of the item this one was merged into; set together with
+#     state closed / close_reason duplicate. NULL on every other row.
+#   triage_job    the sideclaw `triage` job that is deciding this item's intake
+#     (the single-shot triage step); NULL until one is opened.
+#
+# The last implement episode's `dispatch/*` branch gets NO column: it already lives
+# in dispatches.verdict_json (`result.branch`) of the item's `implement_job`, which
+# is where a revision reads it.
+_MIGRATION_14 = """
+ALTER TABLE triage_items ADD COLUMN root_cause TEXT;
+ALTER TABLE triage_items ADD COLUMN duplicate_of INTEGER;
+ALTER TABLE triage_items ADD COLUMN triage_job TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -594,6 +613,7 @@ MIGRATIONS: dict[int, str] = {
     11: _MIGRATION_11,
     12: _MIGRATION_12,
     13: _MIGRATION_13,
+    14: _MIGRATION_14,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live

@@ -1577,6 +1577,87 @@ def test_resolve_slack_token_falls_back_to_hermes_and_warns_once():
     assert len(lines) == 1, buf.getvalue()
 
 
+def test_submit_revision_of_goes_out_as_params_revisionOf_only_when_set():
+    srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "j-rev"}})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        sideclaw.submit(cwd="/repo", tier="implement", brief="b", revision_of="dispatch/fix-1")
+        sideclaw.submit(cwd="/repo", tier="implement", brief="b")
+        assert srv.requests[0]["body"]["params"]["revisionOf"] == "dispatch/fix-1", srv.requests[0]["body"]
+        assert "revisionOf" not in srv.requests[1]["body"]["params"], srv.requests[1]["body"]
+    finally:
+        srv.stop()
+
+
+def test_dispatch_outcomes_include_pr_updated_and_conflict():
+    for outcome in ("pr_updated", "conflict"):
+        sideclaw.assert_outcome({"status": "done", "result": {"outcome": outcome}}, sideclaw.DISPATCH_OUTCOMES,
+                                "implement")
+
+
+def test_is_lease_refusal_matches_only_a_failed_job_with_the_lease_text():
+    lease = "dispatch refused: an implement episode is already running in this repo (job abc)"
+    assert sideclaw.is_lease_refusal({"status": "failed", "error": lease})
+    assert sideclaw.is_lease_refusal({"status": "failed", "error": f"update_pr refused: {lease}"})
+    assert not sideclaw.is_lease_refusal({"status": "failed", "error": "worker crashed"})
+    assert not sideclaw.is_lease_refusal({"status": "failed", "error": None})
+    assert not sideclaw.is_lease_refusal({"status": "done", "error": lease})
+    assert not sideclaw.is_lease_refusal({"status": "failed"})
+
+
+def test_conflict_bundle_path_is_read_from_the_verdict_prose():
+    path = "/tmp/dispatch-bundles/fix-1.bundle"
+    assert sideclaw.conflict_bundle_path(
+        {"verdict": f"Rebase conflicted. The episode's commits were bundled at {path}."}) == path
+    assert sideclaw.conflict_bundle_path({"verdict": f"bundled at {path}"}) == path
+    assert sideclaw.conflict_bundle_path({"verdict": f"bundled at {path}. More text follows."}) == path
+    assert sideclaw.conflict_bundle_path({"verdict": "Rebase conflicted, nothing bundled."}) is None
+    assert sideclaw.conflict_bundle_path({"summary": "no verdict key"}) is None
+
+
+def _routing(routes: dict) -> dict:
+    return {("GET", "/api/routing"): (200, {"routes": routes, "models": []})}
+
+
+def test_escalation_model_reads_the_route_and_caches_it():
+    sideclaw._escalation_cache.clear()
+    srv = _StubServer(_routing({"dispatch_implement": {"model": "default-m", "backend": "x"},
+                                "dispatch_implement_escalation": {"model": "strong-m", "backend": "x"}}))
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        assert sideclaw.escalation_model() == "strong-m"
+        assert sideclaw.escalation_model() == "strong-m"
+        assert len(srv.requests) == 1, "cached for the life of the process"
+    finally:
+        srv.stop()
+        sideclaw._escalation_cache.clear()
+
+
+def test_escalation_model_is_none_when_the_route_is_absent_or_the_call_fails():
+    sideclaw._escalation_cache.clear()
+    srv = _StubServer(_routing({"dispatch_implement": {"model": "default-m"}}))
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            assert sideclaw.escalation_model() is None
+        assert "dispatch_implement_escalation" in err.getvalue(), err.getvalue()
+    finally:
+        srv.stop()
+
+    srv = _StubServer({("GET", "/api/routing"): (500, {"error": "boom"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert sideclaw.escalation_model() is None
+    finally:
+        srv.stop()
+
+    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert sideclaw.escalation_model() is None, "an unreachable sideclaw means no model key, not an error"
+    assert sideclaw._escalation_cache == {}, "a failure is never cached"
+
+
 # --- runner --------------------------------------------------------------------
 
 def main() -> int:

@@ -616,7 +616,24 @@ def test_open_episode_submits_the_composed_cwd_and_no_sensitive_or_model_key():
             origin=dispatch.Origin(), authorized_by=None,
         )
     assert sent == [{"cwd": "/tmp/repos-root/warden", "tier": "investigate", "brief": "do it",
-                     "context": None, "model": None}], sent
+                     "context": None, "model": None, "revision_of": None}], sent
+
+
+def test_open_episode_threads_revision_of_and_model_to_the_submit():
+    conn, _ = _fresh_ledger()
+    sent: list[dict] = []
+
+    def _submit(**kw):
+        sent.append(kw)
+        return {"id": "j-rev", "status": "running"}
+
+    with _env(WARDEN_REPOS_ROOT="/tmp/repos-root"), _patch(sideclaw, "submit", _submit):
+        dispatch.open_episode(
+            conn, repo="warden", tier="implement", brief="fix it", context=None, why=None,
+            origin=dispatch.Origin(event_id=None), authorized_by="auto-from-item",
+            model="m-strong", revision_of="dispatch/fix-1",
+        )
+    assert sent[0]["revision_of"] == "dispatch/fix-1" and sent[0]["model"] == "m-strong", sent
 
 
 def test_open_episode_submit_refused_marks_operation_failed_not_unknown():

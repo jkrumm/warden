@@ -82,7 +82,7 @@ def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data))
 
 
-def _default_fake_submit(*, cwd, tier, brief, context=None, model=None):
+def _default_fake_submit(*, cwd, tier, brief, context=None, model=None, revision_of=None):
     """The module-level default for `triage._sideclaw.submit` inside
     `_triage_env()` — used by every test that never touches dispatch at all
     (classify-only, resolve-only tests) so an accidental real HTTP call is
@@ -149,6 +149,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_sideclaw", "submit_review"): triage._sideclaw.submit_review,
         ("_sideclaw", "get"): triage._sideclaw.get,
         ("_sideclaw", "cancel"): triage._sideclaw.cancel,
+        ("_sideclaw", "escalation_model"): triage._sideclaw.escalation_model,
         ("_github", "actions_runs"): triage._github.actions_runs,
         ("_github", "search_issues"): triage._github.search_issues,
         ("_github", "create_issue_comment"): triage._github.create_issue_comment,
@@ -173,6 +174,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         triage._sideclaw.submit = _default_fake_submit
         triage._sideclaw.submit_review = _default_fake_submit_review
         triage._sideclaw.get = _default_fake_get
+        triage._sideclaw.escalation_model = lambda: None
         triage._sideclaw.cancel = lambda job_id: (_ for _ in ()).throw(
             triage.RemoteError(f"test: no fake cancel registered for {job_id}"))
         triage._github.actions_runs = lambda owner, repo, *, head_sha: (_ for _ in ()).throw(
@@ -303,9 +305,10 @@ def _fake_submit(calls: list[dict[str, Any]], *, ok: bool = True):
     `open_episode()` wrote instead."""
     counter = {"n": 0}
 
-    def _submit(*, cwd, tier, brief, context=None, model=None):
+    def _submit(*, cwd, tier, brief, context=None, model=None, revision_of=None):
         counter["n"] += 1
-        calls.append({"cwd": cwd, "tier": tier, "brief": brief, "context": context, "model": model})
+        calls.append({"cwd": cwd, "tier": tier, "brief": brief, "context": context, "model": model,
+                      "revision_of": revision_of})
         if not ok:
             raise triage.RemoteError("test: dispatch refused")
         job_id = f"job-{counter['n']:06d}"
@@ -751,7 +754,7 @@ def _refusing_submit(calls: list[dict[str, Any]], *, status: int = 400,
                      message: str = "dispatch refused: tier 'implement' exceeds the ceiling for repo 'demo-repo'"):
     """A `submit` that answers like sideclaw refusing the job: a 4xx, which the
     client raises as `SubmitRefused` — a refusal the same submit will hit again."""
-    def _submit(*, cwd, tier, brief, context=None, model=None):
+    def _submit(*, cwd, tier, brief, context=None, model=None, revision_of=None):
         calls.append({"cwd": cwd, "tier": tier, "model": model})
         raise triage.SubmitRefused(f"sideclaw refused the job (HTTP {status}): {message}", status=status)
     return _submit
@@ -2907,7 +2910,7 @@ def test_auto_implement_claims_the_item_before_dispatching():
                                  investigate_job="investigate-claim")
         observed: list[list[str | None]] = []
 
-        def _observing_submit(*, cwd, tier, brief, context=None, model=None):
+        def _observing_submit(*, cwd, tier, brief, context=None, model=None, revision_of=None):
             rows = conn.execute("SELECT implement_job FROM triage_items WHERE event_id=?", (eid,)).fetchall()
             observed.append([r["implement_job"] for r in rows])
             return {"id": "implement-job-claim", "status": "queued"}
@@ -3201,7 +3204,8 @@ def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_no
 
         # Revisions exhausted -> failed, carrying the finding.
         eid2 = _seed_implementing_item(conn, external_id="sig-outcome-checks-failed-2", job_id="impl-checks-failed-2")
-        conn.execute("UPDATE triage_items SET revision_count=2 WHERE event_id=?", (eid2,))
+        conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?",
+                     (triage.MAX_IMPLEMENT_ATTEMPTS - 1, eid2))
         conn.commit()
         triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item2 = triage._get_item(conn, eid2)
@@ -3396,7 +3400,7 @@ def test_blocking_validation_blocks_the_merge_and_sends_the_findings_back_for_a_
     """A validation verdict carrying `blocking` findings blocks the merge — `merge`
     must never even be called — and sends the item back to `working` (a revision
     attempt) while attempts remain, else `failed` carrying the findings."""
-    for revision_count, want in ((0, triage.STATE_WORKING), (2, triage.STATE_FAILED)):
+    for revision_count, want in ((0, triage.STATE_WORKING), (triage.MAX_IMPLEMENT_ATTEMPTS - 1, triage.STATE_FAILED)):
         with _triage_env() as (conn, ctx):
             eid = _seed_verdict_item(conn, external_id="sig-val-disagree")
             conn.execute(
@@ -7313,18 +7317,21 @@ def test_blocked_implementation_goes_back_to_the_implementer_with_findings():
         assert item["state"] == triage.STATE_WORKING
         assert item["revision_count"] == 1
         assert item["implement_job"] and item["implement_job"] != "impl-sig-revise"
-        assert item["validation_job"] is None and item["pr_url"] is None
+        assert item["validation_job"] is None
+        assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/7", "the PR stays: sideclaw updates it"
         assert len(calls) == 1 and calls[0]["tier"] == "implement"
         brief = calls[0]["brief"]
         assert "scripts/check.sh:808" in brief and "fails open on crash loops" in brief
-        assert "git fetch origin dispatch/prior-branch" in brief
-        assert CLOSED_PRS and CLOSED_PRS[0][:3] == ("jkrumm", "demo-repo", 7)
+        assert calls[0]["revision_of"] == "dispatch/prior-branch", calls[0]
+        assert "Attempt 2 of 4" in brief, brief
+        assert calls[0]["model"] is None, "attempt 2 runs on sideclaw's default model"
+        assert CLOSED_PRS == [], "a revision updates the same PR; the superseded-PR close is gone"
 
 
 def test_revision_stops_at_the_attempt_cap():
     with _triage_env() as (conn, ctx):
         eid = _seed_blocked_item(conn, external_id="sig-capped",
-                                 revision_count=triage.DEFAULT_REVISION_MAX_ATTEMPTS)
+                                 revision_count=triage.MAX_IMPLEMENT_ATTEMPTS - 1)
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
         triage.maybe_revise_blocked(conn, triage.load_policy(), NOW, dry_run=False)
@@ -7435,6 +7442,391 @@ def test_argo_implement_refused_by_sideclaw_ends_the_item_and_reports_failed():
         assert item["state"] == triage.STATE_FAILED and "dispatch refused: ceiling" in item["note"], dict(item)
         assert ctx.argo_acks[0]["status"] == "failed", ctx.argo_acks
         assert "dispatch refused: ceiling" in (ctx.argo_acks[0]["error"] or ""), ctx.argo_acks
+
+
+def _outcome_item_with_pr(conn, *, external_id: str, job_id: str, pr: str | None, revision_count: int = 0) -> int:
+    eid = _seed_implementing_item(conn, external_id=external_id, job_id=job_id)
+    conn.execute("UPDATE triage_items SET pr_url=?, revision_count=? WHERE event_id=?", (pr, revision_count, eid))
+    conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id=?", (eid, job_id))
+    conn.commit()
+    return eid
+
+
+def test_pr_updated_hands_the_updated_pr_to_review_without_closing_it():
+    pr = "https://github.com/jkrumm/demo-repo/pull/7"
+    with _triage_env() as (conn, ctx):
+        eid = _outcome_item_with_pr(conn, external_id="sig-pr-updated", job_id="impl-pr-updated", pr=pr,
+                                    revision_count=1)
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done", "result": _dispatch_result("pr_updated", artifact_url=pr, branch="dispatch/prior-branch"),
+        }
+        review_calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_review = _fake_submit_review(review_calls)
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["pr_url"] == pr, dict(item)
+        assert item["validation_job"] and len(review_calls) == 1 and review_calls[0]["pr"] == 7, review_calls
+        assert CLOSED_PRS == [], "the same PR was updated, not superseded"
+
+
+def test_a_newer_pr_closes_the_one_it_supersedes():
+    with _triage_env() as (conn, ctx):
+        eid = _outcome_item_with_pr(conn, external_id="sig-superseded", job_id="impl-superseded",
+                                    pr="https://github.com/jkrumm/demo-repo/pull/7", revision_count=1)
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/9"),
+        }
+        triage._sideclaw.submit_review = _fake_submit_review([])
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["pr_url"].endswith("/pull/9"), dict(item)
+        assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
+
+
+def test_pr_updated_without_an_artifact_url_is_a_strike():
+    with _triage_env() as (conn, ctx):
+        eid = _outcome_item_with_pr(conn, external_id="sig-pr-updated-bare", job_id="impl-pr-updated-bare", pr=None)
+        triage._sideclaw.get = lambda job_id: {"status": "done", "result": _dispatch_result("pr_updated")}
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and item["strikes"] == 1, dict(item)
+        assert "pr_updated outcome carried no artifactUrl" in item["note"], item["note"]
+
+
+_CONFLICT_VERDICT = ("Rebase onto main conflicted in scripts/a.py. "
+                     "The episode's commits were bundled at /tmp/bundles/dispatch-x.bundle.")
+
+
+def _conflict_result(**kw: Any) -> dict[str, Any]:
+    result = _dispatch_result("conflict", summary="rebase conflict", **kw)
+    result["verdict"] = _CONFLICT_VERDICT
+    return result
+
+
+def test_conflict_is_an_attempt_that_redispatches_from_the_new_base_with_the_bundle_as_context():
+    pr = "https://github.com/jkrumm/demo-repo/pull/7"
+    with _triage_env() as (conn, ctx):
+        eid = _outcome_item_with_pr(conn, external_id="sig-conflict", job_id="impl-conflict", pr=pr,
+                                    revision_count=1)
+        triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and item["strikes"] == 0, dict(item)
+        assert item["implement_job"] == "impl-conflict" and "conflicted" in item["note"], dict(item)
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-conflict'").fetchone()
+        assert d["validation_status"] == "conflict"
+
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["revision_count"] == 2 and item["implement_job"] not in (None, "impl-conflict"), dict(item)
+        assert len(calls) == 1 and calls[0]["revision_of"] is None, calls
+        assert "Attempt 3 of 4" in calls[0]["brief"], calls[0]["brief"]
+        assert "/tmp/bundles/dispatch-x.bundle" in calls[0]["context"], calls[0]["context"]
+        assert "git fetch /tmp/bundles/dispatch-x.bundle" in calls[0]["context"], calls[0]["context"]
+        assert "Rebase onto main conflicted" in calls[0]["context"], calls[0]["context"]
+        assert item["pr_url"] == pr and CLOSED_PRS == [], "the stale PR closes when its replacement opens"
+
+        # The replacement PR opens: the stale one is closed with it.
+        triage._sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/9"),
+        }
+        triage._sideclaw.submit_review = _fake_submit_review([])
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_MERGING
+        assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
+
+
+def test_conflict_without_a_bundle_still_redispatches():
+    with _triage_env() as (conn, ctx):
+        eid = _outcome_item_with_pr(conn, external_id="sig-conflict-nobundle", job_id="impl-conflict-nb", pr=None)
+        result = _conflict_result()
+        result["verdict"] = "Rebase onto main conflicted."
+        triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": result}
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and "git bundle" not in calls[0]["context"], calls
+        assert triage._get_item(conn, eid)["revision_count"] == 1
+
+
+def test_conflict_with_no_attempts_left_fails_the_item_with_the_note():
+    with _triage_env() as (conn, ctx):
+        eid = _outcome_item_with_pr(conn, external_id="sig-conflict-last", job_id="impl-conflict-last", pr=None,
+                                    revision_count=triage.MAX_IMPLEMENT_ATTEMPTS - 1)
+        triage._sideclaw.get = lambda job_id: {"status": "done", "result": _conflict_result()}
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED and "conflicted" in item["note"], dict(item)
+
+
+def test_lease_refusal_of_a_first_attempt_retries_later_without_a_strike_or_an_attempt():
+    with _triage_env() as (conn, ctx):
+        eid = _outcome_item_with_pr(conn, external_id="sig-lease", job_id="impl-lease", pr=None)
+        triage._sideclaw.get = lambda job_id: {
+            "status": "failed",
+            "error": "dispatch refused: an implement episode is already running in this repo (job x)",
+        }
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and item["strikes"] == 0, dict(item)
+        assert item["implement_job"] is None and item["revision_count"] == 0, dict(item)
+        retry_at = dt.datetime.fromisoformat(item["retry_at"])
+        assert retry_at == NOW + dt.timedelta(minutes=triage.LEASE_RETRY_MINUTES), item["retry_at"]
+        assert "lease" in item["note"], item["note"]
+
+        # Not before retry_at ...
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert calls == []
+        # ... and then the same attempt is submitted again.
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=11), dry_run=False)
+        assert len(calls) == 1 and calls[0]["tier"] == "implement", calls
+
+
+def test_lease_refusal_of_a_revision_puts_the_previous_attempt_back_and_keeps_the_attempt_count():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-lease-rev")
+        conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id=?", (eid, "impl-sig-lease-rev"))
+        conn.execute("UPDATE dispatches SET validation_job_id=? WHERE job_id=?",
+                     ("val-sig-lease-rev", "impl-sig-lease-rev"))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        revision_job = item["implement_job"]
+        assert item["revision_count"] == 1 and revision_job != "impl-sig-lease-rev", dict(item)
+
+        triage._sideclaw.get = lambda job_id: {
+            "status": "failed",
+            "error": "update_pr refused: an implement episode is already running in this repo",
+        }
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and item["strikes"] == 0, dict(item)
+        assert item["implement_job"] == "impl-sig-lease-rev" and item["validation_job"] == "val-sig-lease-rev", dict(item)
+        assert item["revision_count"] == 0 and item["retry_at"], dict(item)
+
+        later = NOW + dt.timedelta(minutes=11)
+        triage.maybe_revise_blocked(conn, DEFAULT_POLICY, later, dry_run=False)
+        assert len(calls) == 2 and calls[1]["revision_of"] == "dispatch/prior-branch", calls
+        assert "scripts/check.sh:808" in calls[1]["brief"]
+        assert triage._get_item(conn, eid)["revision_count"] == 1
+
+
+def test_a_failed_job_that_is_not_the_lease_still_strikes():
+    with _triage_env() as (conn, ctx):
+        eid = _outcome_item_with_pr(conn, external_id="sig-notlease", job_id="impl-notlease", pr=None)
+        triage._sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["strikes"] == 1
+
+
+def test_attempt_three_escalates_the_model_when_sideclaw_routes_one_and_sends_none_when_it_does_not():
+    for escalation, want in (("escalation-model-x", "escalation-model-x"), (None, None)):
+        with _triage_env() as (conn, ctx):
+            triage._sideclaw.escalation_model = lambda esc=escalation: esc
+            eid = _seed_blocked_item(conn, external_id="sig-escalate", revision_count=1)
+            calls: list[dict[str, Any]] = []
+            triage._sideclaw.submit = _fake_submit(calls)
+            triage.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            assert len(calls) == 1 and calls[0]["model"] == want, calls
+            assert "Attempt 3 of 4" in calls[0]["brief"], calls[0]["brief"]
+
+
+def test_attempt_two_sends_no_model_even_when_sideclaw_routes_an_escalation_model():
+    with _triage_env() as (conn, ctx):
+        asked: list[int] = []
+        triage._sideclaw.escalation_model = lambda: asked.append(1) or "escalation-model-x"
+        _seed_blocked_item(conn, external_id="sig-attempt-two", revision_count=0)
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and calls[0]["model"] is None and asked == [], (calls, asked)
+
+
+def test_a_third_attempt_after_a_strike_retry_also_escalates():
+    """maybe_auto_implement() re-submits a strike-cleared item: the attempt number comes
+    from revision_count, so a late attempt does not slip back onto the default model."""
+    with _triage_env() as (conn, ctx):
+        triage._sideclaw.escalation_model = lambda: "escalation-model-x"
+        eid = _seed_verdict_item(conn, external_id="sig-late-first")
+        conn.execute("UPDATE triage_items SET revision_count=2 WHERE event_id=?", (eid,))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and calls[0]["model"] == "escalation-model-x", calls
+
+
+def test_four_attempts_in_total_then_the_pollers_fail_the_item():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-four", revision_count=triage.MAX_IMPLEMENT_ATTEMPTS - 2)
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and "Attempt 4 of 4" in calls[0]["brief"], calls
+        assert triage._get_item(conn, eid)["revision_count"] == triage.MAX_IMPLEMENT_ATTEMPTS - 1
+        assert not hasattr(triage, "DEFAULT_REVISION_MAX_ATTEMPTS")
+        assert "revisionMaxAttempts" not in triage.load_policy()
+
+
+# --- root-cause merge ------------------------------------------------------------
+
+def _folded_with_root_cause(conn, ext: str, root_cause: str | None, *, created: str | None = None,
+                            repo: str = "demo-repo", fold: bool = True) -> sqlite3.Row:
+    """An alert item whose investigation verdict (nextAction=implement, optional rootCause) is
+    folded onto it. `created` backdates `created_at` BEFORE the fold, which is what the merge orders by."""
+    verdict: dict[str, Any] = {"summary": "found it", "nextAction": "implement"}
+    if root_cause is not None:
+        verdict["rootCause"] = root_cause
+    eid = _insert_event(conn, source="slack_alert", external_id=ext, title=f"alert {ext}", first_seen=OLD)
+    triage.ingest(conn, NOW)
+    job_id = f"job-{ext}"
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (job_id, "investigate", repo, "b", eid, "done", json.dumps(verdict), NOW.isoformat()),
+    )
+    triage._set_state(conn, eid, triage.STATE_WORKING, NOW, dispatch_job=job_id)
+    conn.execute("UPDATE triage_items SET repo=? WHERE event_id=?", (repo, eid))
+    if created is not None:
+        conn.execute("UPDATE triage_items SET created_at=? WHERE event_id=?", (created, eid))
+    conn.commit()
+    if fold:
+        triage.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+    return triage._get_item(conn, eid)
+
+
+def test_root_cause_is_stored_on_the_folded_item():
+    with _triage_env() as (conn, ctx):
+        item = _folded_with_root_cause(conn, "sig-rc-store", "missing-retry-on-503")
+        assert item["root_cause"] == "missing-retry-on-503" and item["state"] == triage.STATE_WORKING, dict(item)
+        assert item["duplicate_of"] is None
+
+
+def test_a_matching_root_cause_closes_the_newer_item_as_a_duplicate_of_the_older():
+    with _triage_env() as (conn, ctx):
+        older = _folded_with_root_cause(conn, "sig-rc-old", "shared-cause", created="2026-10-01T00:00:00+00:00")
+        newer = _folded_with_root_cause(conn, "sig-rc-new", "shared-cause")
+        old_now, new_now = triage._get_item(conn, older["event_id"]), triage._get_item(conn, newer["event_id"])
+        assert old_now["state"] == triage.STATE_WORKING and old_now["duplicate_of"] is None, dict(old_now)
+        assert new_now["state"] == triage.STATE_CLOSED and new_now["close_reason"] == triage.CLOSE_DUPLICATE, dict(new_now)
+        assert new_now["duplicate_of"] == older["event_id"], dict(new_now)
+        assert new_now["note"] == f"duplicate of #{older['event_id']} (shared-cause)", new_now["note"]
+
+
+def test_the_older_item_is_kept_even_when_the_newer_verdict_folds_first():
+    """The item that folds LAST here is the older one: the newer, already-folded item is the
+    one that closes."""
+    with _triage_env() as (conn, ctx):
+        newer = _folded_with_root_cause(conn, "sig-rc-first", "shared-cause-2")
+        older = _folded_with_root_cause(conn, "sig-rc-second", "shared-cause-2", created="2026-10-01T00:00:00+00:00")
+        assert triage._get_item(conn, older["event_id"])["state"] == triage.STATE_WORKING
+        closed = triage._get_item(conn, newer["event_id"])
+        assert closed["state"] == triage.STATE_CLOSED and closed["duplicate_of"] == older["event_id"], dict(closed)
+
+
+def test_a_different_repo_or_root_cause_or_state_is_never_merged():
+    with _triage_env() as (conn, ctx):
+        a = _folded_with_root_cause(conn, "sig-rc-a", "cause-a")
+        b = _folded_with_root_cause(conn, "sig-rc-b", "cause-b")
+        c = _folded_with_root_cause(conn, "sig-rc-c", None)
+        assert [triage._get_item(conn, r["event_id"])["state"] for r in (a, b, c)] == [triage.STATE_WORKING] * 3
+
+        # same key, but the older item already ended (failed): not open, so no merge
+        d = _folded_with_root_cause(conn, "sig-rc-d", "cause-d", created="2026-10-01T00:00:00+00:00")
+        triage._set_state(conn, d["event_id"], triage.STATE_FAILED, NOW, note="x")
+        conn.commit()
+        e = _folded_with_root_cause(conn, "sig-rc-e", "cause-d")
+        assert triage._get_item(conn, e["event_id"])["state"] == triage.STATE_WORKING
+
+        # same key in another repo
+        f = _folded_with_root_cause(conn, "sig-rc-f", "cause-f", created="2026-10-01T00:00:00+00:00")
+        conn.execute("UPDATE triage_items SET repo='other-repo' WHERE event_id=?", (f["event_id"],))
+        conn.commit()
+        g = _folded_with_root_cause(conn, "sig-rc-g", "cause-f")
+        assert triage._get_item(conn, g["event_id"])["state"] == triage.STATE_WORKING
+
+
+def test_an_item_with_an_operation_in_flight_is_never_merged_away():
+    with _triage_env() as (conn, ctx):
+        for label, columns in (("merging", {"state": triage.STATE_MERGING}),
+                               ("verifying", {"state": triage.STATE_VERIFYING}),
+                               ("implementing", {"implement_job": "impl-busy"}),
+                               ("reviewing", {"validation_job": "val-busy"})):
+            newer_ext = f"sig-rc-busy-{label}"
+            # the NEWER item is the busy one and the one that would be closed
+            older = _folded_with_root_cause(conn, f"sig-rc-keep-{label}", f"busy-{label}",
+                                            created="2026-10-01T00:00:00+00:00")
+            newer = _fold_alert_verdict(conn, newer_ext, verdict={"summary": "x", "nextAction": "implement"})
+            sets = ", ".join(f"{k}=?" for k in columns)
+            conn.execute(f"UPDATE triage_items SET {sets}, root_cause=? WHERE event_id=?",
+                         (*columns.values(), f"busy-{label}", newer["event_id"]))
+            conn.commit()
+            triage.apply_root_cause(conn, [triage._get_item(conn, older["event_id"])],
+                                    {"rootCause": f"busy-{label}"}, NOW)
+            busy = triage._get_item(conn, newer["event_id"])
+            assert busy["state"] == columns.get("state", triage.STATE_WORKING), (label, dict(busy))
+            assert busy["close_reason"] is None and busy["duplicate_of"] is None, (label, dict(busy))
+            assert triage._get_item(conn, older["event_id"])["state"] == triage.STATE_WORKING
+
+
+def test_items_of_the_same_cluster_are_not_merged_with_each_other():
+    with _triage_env() as (conn, ctx):
+        job_id = "job-rc-cluster"
+        eids = []
+        for ext in ("sig-rc-cl-1", "sig-rc-cl-2"):
+            eid = _insert_event(conn, source="slack_alert", external_id=ext, title=ext, first_seen=OLD)
+            eids.append(eid)
+        triage.ingest(conn, NOW)
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (job_id, "investigate", "demo-repo", "b", eids[0], "done",
+             json.dumps({"summary": "one cause", "nextAction": "implement", "rootCause": "cluster-cause"}),
+             NOW.isoformat()))
+        for eid in eids:
+            triage._set_state(conn, eid, triage.STATE_WORKING, NOW, dispatch_job=job_id)
+        conn.commit()
+        triage.fold_dispatch_verdict(conn, origin_event_id=eids[0], job_id=job_id, now=NOW, dry_run=False)
+        items = [triage._get_item(conn, eid) for eid in eids]
+        assert [i["state"] for i in items] == [triage.STATE_WORKING] * 2, [dict(i) for i in items]
+        assert [i["root_cause"] for i in items] == ["cluster-cause"] * 2
+
+
+def test_the_implement_result_root_cause_merges_other_open_items():
+    with _triage_env() as (conn, ctx):
+        other = _folded_with_root_cause(conn, "sig-rc-impl-other", "impl-cause")
+        eid = _outcome_item_with_pr(conn, external_id="sig-rc-impl", job_id="impl-rc", pr=None)
+        conn.execute("UPDATE triage_items SET created_at='2026-10-01T00:00:00+00:00' WHERE event_id=?", (eid,))
+        conn.commit()
+        result = _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/12")
+        result["rootCause"] = "impl-cause"
+        triage._sideclaw.get = lambda job_id: {"status": "done", "result": result}
+        triage._sideclaw.submit_review = _fake_submit_review([])
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["root_cause"] == "impl-cause"
+        merged = triage._get_item(conn, other["event_id"])
+        assert merged["state"] == triage.STATE_CLOSED and merged["duplicate_of"] == eid, dict(merged)
+
+
+def test_a_reopened_duplicate_forgets_what_it_was_a_duplicate_of():
+    with _triage_env() as (conn, ctx):
+        _folded_with_root_cause(conn, "sig-rc-r-old", "reopen-cause", created="2026-10-01T00:00:00+00:00")
+        newer = _folded_with_root_cause(conn, "sig-rc-r-new", "reopen-cause")
+        assert triage._get_item(conn, newer["event_id"])["duplicate_of"] is not None
+        triage._set_state(conn, newer["event_id"], triage.STATE_NEW, NOW)
+        conn.commit()
+        item = triage._get_item(conn, newer["event_id"])
+        assert item["duplicate_of"] is None and item["close_reason"] is None, dict(item)
 
 
 # --- process-only blocking findings and the closing instruction (§113) --------

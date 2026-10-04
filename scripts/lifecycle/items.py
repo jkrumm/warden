@@ -130,6 +130,8 @@ def transition(
             raise ValueError(f"a `closed` transition must carry extra={{'close_reason': one of {ledger.CLOSE_REASONS}}}")
     else:
         extra = {**extra, "close_reason": None}
+    # `duplicate_of` belongs to `closed(duplicate)` alone (only the loop writes that).
+    extra = {**extra, "duplicate_of": None}
 
     prev_row = conn.execute("SELECT state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
     prev_state = prev_row["state"] if prev_row is not None else None

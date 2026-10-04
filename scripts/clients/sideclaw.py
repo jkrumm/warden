@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -41,7 +42,10 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 DISPATCH_SCHEMA_VERSION = 3
 REVIEW_SCHEMA_VERSION = 1
 
-# server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES at schema version 3.
+# server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES. `pr_updated` (a `revisionOf`
+# episode pushed to the same branch and updated the existing PR) and `conflict`
+# (the rebase onto the latest default branch failed; nothing pushed) arrive with
+# schema version 4 — DISPATCH_SCHEMA_VERSION moves together with sideclaw.
 DISPATCH_OUTCOMES: tuple[str, ...] = (
     "verdict_only",
     "issue_declined",
@@ -53,6 +57,8 @@ DISPATCH_OUTCOMES: tuple[str, ...] = (
     "branch_no_pr",
     "pr_failed",
     "pr_opened",
+    "pr_updated",
+    "conflict",
     "applied_in_place",
     "salvaged",
     "withheld",
@@ -112,12 +118,15 @@ def submit(
     brief: str,
     context: str | None = None,
     model: str | None = None,
+    revision_of: str | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"cwd": cwd, "tier": tier, "brief": brief}
     if context:
         params["context"] = context
     if model:
         params["model"] = model
+    if revision_of:
+        params["revisionOf"] = revision_of
     body = {"tool": "dispatch", "params": params}
 
     try:
@@ -180,6 +189,62 @@ def submit_review(*, cwd: Path, pr: int, context: str | None = None, model: str 
     if not isinstance(job, dict) or "id" not in job:
         raise RemoteError("sideclaw accepted the review job but returned no id")
     return job
+
+
+# The stable substring of sideclaw's per-repo implement lease refusal. The POST is
+# accepted (HTTP 200); the job then FAILS carrying this text (an `update_pr` refusal
+# prefixes it with `update_pr refused:`). It means "another implement episode holds
+# this repo right now" — retry later, not an infrastructure failure.
+_LEASE_REFUSAL = "an implement episode is already running in this repo"
+
+_BUNDLE_PATH_RE = re.compile(r"bundled at (\S+?)\.?(\s|$)")
+
+# GET /api/routing's route for the stronger implement model (attempt 3+). Warden never
+# names a model id itself: when sideclaw has no such route, the dispatch carries no
+# `model` key and sideclaw's own default applies.
+_ESCALATION_ROUTE = "dispatch_implement_escalation"
+_escalation_cache: dict[str, str] = {}
+
+
+def is_lease_refusal(job: dict[str, Any]) -> bool:
+    """True for a FAILED job whose error is sideclaw's per-repo implement lease refusal."""
+    if job.get("status") != "failed":
+        return False
+    error = job.get("error")
+    return isinstance(error, str) and _LEASE_REFUSAL in error
+
+
+def conflict_bundle_path(result: dict[str, Any]) -> str | None:
+    """The path of the git bundle holding a `conflict` episode's commits. sideclaw puts it
+    only in the verdict's prose ("... The episode's commits were bundled at <path>."), and
+    only when bundling worked — None when absent."""
+    verdict = result.get("verdict")
+    match = _BUNDLE_PATH_RE.search(verdict) if isinstance(verdict, str) else None
+    return match.group(1) if match else None
+
+
+def escalation_model() -> str | None:
+    """The stronger implement model from `GET /api/routing` (`routes.dispatch_implement_escalation
+    .model`), or None when the route is absent or the call fails — the caller then sends no
+    `model` key. Cached for the life of the process (one loop tick); a failure is not cached."""
+    cached = _escalation_cache.get("model")
+    if cached:
+        return cached
+    try:
+        status, text = _request("GET", "/api/routing", None)
+        parsed = json.loads(text) if status == 200 else None
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+        print(f"sideclaw: could not read /api/routing for the escalation model: {e}", file=sys.stderr)
+        return None
+    routes = parsed.get("routes") if isinstance(parsed, dict) else None
+    route = routes.get(_ESCALATION_ROUTE) if isinstance(routes, dict) else None
+    model = route.get("model") if isinstance(route, dict) else None
+    if not isinstance(model, str) or not model:
+        print(f"sideclaw: no {_ESCALATION_ROUTE} route (HTTP {status}) — escalating on the default model",
+              file=sys.stderr)
+        return None
+    _escalation_cache["model"] = model
+    return model
 
 
 def get(job_id: str) -> dict[str, Any] | None:

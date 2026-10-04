@@ -287,6 +287,7 @@ def test_migrate_adopts_pre_versioned_database():
     assert post_cols["triage_items"] - pre_cols["triage_items"] == {
         "occurrence_mark", "revert_pr", "origin", "max_tier", "brief",
         "origin_channel", "origin_thread_ts", "revision_count", "close_reason", "strikes", "retry_at",
+        "root_cause", "duplicate_of", "triage_job",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -915,7 +916,7 @@ def test_migration_13_maps_every_old_state_and_close_reason_and_rewrites_history
     path = _tmp_path()
     _v12_database(path, list(_OLD_TO_NEW))
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 13 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
 
     rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
     assert len(rows) == len(_OLD_TO_NEW)
@@ -981,9 +982,45 @@ def test_migration_13_is_one_transaction_and_a_second_connect_is_a_no_op():
     path = _tmp_path()
     _v12_database(path, ["needs_human", "ignored", "verdict"])
     ledger.connect(path, migrate=True).close()
-    conn = ledger.connect(path, migrate=True)   # already at 13: nothing runs again
+    conn = ledger.connect(path, migrate=True)   # already current: nothing runs again
     states = sorted(r["state"] for r in conn.execute("SELECT state FROM triage_items"))
     assert states == ["closed", "failed", "working"], states
+    conn.close()
+
+
+def _v13_database(path):
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    for version in range(2, 14):
+        conn.executescript(ledger.MIGRATIONS[version])
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (13, 'test')")
+    for i, state in enumerate(("working", "closed", "failed"), start=1):
+        conn.execute("INSERT INTO events(source, external_id, title, first_seen) VALUES ('s', ?, 't', 'now')",
+                     (f"e{i}",))
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, state, note, close_reason, revision_count, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 2, 'now', 'now')",
+            (i, f"s:e{i}", state, f"note-{state}", "resolved" if state == "closed" else None))
+    conn.commit()
+    conn.close()
+
+
+def test_migration_14_adds_the_three_intake_columns_and_keeps_every_row():
+    path = _tmp_path()
+    _v13_database(path)
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 14 == ledger.LEDGER_SCHEMA_VERSION
+    cols = _table_columns(conn, "triage_items")
+    assert {"root_cause", "duplicate_of", "triage_job"} <= cols, cols
+    assert "implement_branch" not in cols, "the branch lives in dispatches.verdict_json, not a second source of truth"
+    rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
+    assert set(rows) == {"note-working", "note-closed", "note-failed"}, rows.keys()
+    for row in rows.values():
+        assert row["root_cause"] is None and row["duplicate_of"] is None and row["triage_job"] is None, dict(row)
+        assert row["revision_count"] == 2
+    assert rows["note-closed"]["close_reason"] == "resolved"
+    assert "duplicate" in ledger.CLOSE_REASONS
     conn.close()
 
 
