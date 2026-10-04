@@ -1,158 +1,57 @@
 {
   "_readme": [
-    "This file is the signature -> repo map for scripts/triage.py, the act-loop that",
-    "replaced per-message LLM triage in #alerts. A 'signature' is `source:external_id`",
-    "from ~/.hermes/watchdog.db's `events` table (source = one of slack_alert, uk,",
-    "docker_homelab, docker_vps, hermes_log, op_refs_homelab, op_refs_vps).",
+    "Tunables and the deterministic first routing tier for scripts/triage.py, the act-loop. Where an alert,",
+    "an issue or a `warden run` goes is decided in this order: (1) `ignore` and the prose pre-filter close it",
+    "`ignored` with no model call; (2) the signal's LABEL picks the candidate repos: a native label (a Kuma tag,",
+    "a container name equal to a repo, an OTel `service.name`, the GitHub repo) first, then a `rules` match, which",
+    "is exactly a label route; (3) one sideclaw `triage` job runs for every item that gets that far and answers",
+    "attach | new(repo, title) | fixed_by | ignore, choosing among the label's repo or, with no label, among every",
+    "checkout with an AGENTS.md (it reads their `## Verify & Monitor` sections). `rules` is the tier a later wave",
+    "deletes once those sections cover the fleet; nothing else depends on it.",
     "",
-    "MATCH TARGETS (this is the part that was missing in the first draft of this file):",
-    "`rules`/`ignore` are matched against TWO candidate strings per event, in order, first",
-    "match wins across BOTH: `source:external_id` (the raw form) and",
-    "`source:normalize_title(title)` (the human-readable form, same normalize_title() as",
-    "scripts/watchdog-poll.py). For a grouped source (slack_alert, hermes_log) these are",
-    "usually the SAME string, since that source's external_id already IS",
-    "normalize_title(title) \u2014 see aggregate_slack_batch()/poll_hermes_logs(). For a state",
-    "source (uk, docker_homelab, docker_vps, op_refs_*) they differ: uk's external_id is an",
-    "opaque, unglobbable UptimeKuma monitor id ('204'), so `uk:macmini-dev-host-push` (the",
-    "title-derived target) is what makes that source mappable at all \u2014 a rule written",
-    "against the numeric id would break the moment the monitor is recreated.",
+    "MATCH TARGETS. `rules`, `ignore` and `hostVerbs` are matched against TWO candidate strings per event, in",
+    "order, first match wins across BOTH: `source:external_id` (the raw form) and",
+    "`source:normalize_title(title)` (the human-readable form, normalize_title() from scripts/watchdog-poll.py).",
+    "For a grouped source (slack_alert, hermes_log) they are usually the same string. For a state source (uk,",
+    "docker_homelab, docker_vps, op_refs_*) they differ: uk's external_id is an opaque UptimeKuma monitor id",
+    "('204'), so `uk:macmini-dev-host-push` (the title-derived target) is what makes that source matchable at all.",
+    "Matching is glob-style (Python fnmatch: `*`, `?`, `[seq]`), `rules` top to bottom.",
     "",
-    "Matching is glob-style (Python fnmatch: `*`, `?`, `[seq]`). `rules` matched",
-    "top-to-bottom, first match wins. `ignore` is checked FIRST, before everything else \u2014 a",
-    "match sends the item straight to state `ignored`: never carded, never escalated, never",
-    "even in the digest. Use `ignore` ONLY for a genuine recovery or a known-benign pattern",
-    "you have looked at and decided is truly nothing \u2014 see `ignoreUnstructuredSlackProse`",
-    "below for the very different case of 'this looks like it might matter but isn't",
-    "structured enough to auto-route'. No rule match at all -> the item stays unmapped",
-    "(state `new`, never escalates, carried silently) and its signature shows up in the",
-    "once-a-day digest so this file can grow deliberately instead of silently missing real",
-    "problems.",
+    "`rules` is a list of `{\"match\": \"<glob>\", \"repo\": \"<checkout under the repos root>\"}`; the optional",
+    "`proposedAt`/`proposedBy`/`reason` keys are provenance only. The `evidence` key rules used to carry is gone:",
+    "the runtime-state probes it selected were deleted with the rest of that machinery (Wave 4 would have). THE",
+    "CONVENTION FOR WHICH REPO OWNS AN INFRA-SIGNAL ALERT: a RollHook-managed app's infra alert maps to the repo",
+    "that owns its COMPOSE FILE AND DEPLOY TARGET, not its source (`argo` is compose-managed inside `vps`, so a",
+    "downed argo container maps to `vps`); apps that deploy on every push to their own repo map to that repo; the",
+    "HyperDX-origin alerts map to `vps`, where their definitions live (vps/observability/alerts/*.json).",
     "",
-    "`ignoreUnstructuredSlackProse` (bool) is a STRUCTURAL filter, not a glob list, checked",
-    "AFTER `ignore`: any `slack_alert` item whose title does not start with a recognized",
-    "bot-alert shape (`[`, the siren emoji, checkmark, warning, or a bold-mrkdwn warning) is",
-    "routed to STATE_NOTE \u2014 NOT `ignored`. This distinction is load-bearing: `ignored` is",
-    "terminal AND invisible, and this DB genuinely contains rows like a human-written 'the",
-    "1Password rate-limit root cause is X, the two-line fix is Y' diagnosis that was never",
-    "shipped \u2014 dropping that into `ignored` would recreate the exact failure this whole",
-    "redesign exists to kill. STATE_NOTE is ALSO terminal (never escalates, never gets its",
-    "own card) but IS surfaced, once a day, under its own heading in the digest, so a real",
-    "diagnosis stays visible instead of vanishing. WHY THE FILTER EXISTS AT ALL: before",
-    "#alerts was silenced (see config.yaml), Hermes replied in that channel to every",
-    "message, and watchdog-poll.py's slack_alert poller ingested those replies right",
-    "alongside real bot alerts \u2014 hundreds of German/English sentences ('Alles gr\u00fcn.",
-    "\u201e:ok_hand:\u201c') sitting in `events` as if they were alert signatures. Silencing the",
-    "channel stops NEW ones; this flag is what keeps the existing backlog visible-but-quiet",
-    "instead of either flooding the channel with cards or disappearing into `ignored`.",
+    "`ignore` (list of globs, or `{\"match\": ...}` objects) closes a matching item `closed(ignored)` before any",
+    "triage call. Use it only for a genuine recovery or a known-benign pattern you have looked at.",
     "",
-    "Every `repo` value MUST be a checkout directly under the repos root (~/SourceRoot by",
-    "default). Whether sideclaw lets an episode run in that repo is sideclaw's call: it",
-    "enforces its own allowlist and answers a refusal with a 4xx, which ends the item",
-    "`needs_human` with sideclaw's message and is never retried. 'shelfmark' below is in",
-    "`ignore` rather than mapped to `homelab-private`: shelfmark is a third-party image",
-    "(ghcr.io/calibrain/shelfmark) running in the private compose file \u2014 nothing to",
-    "dispatch an investigation against even if the repo were reachable.",
+    "`minOccurrences` / `minOpenMinutes` are the one debounce: an alert is triaged once it has fired this many",
+    "times or stayed open this long. Issues and `warden run` are immediate. `cooldownHours` is how long a",
+    "signature that already had an investigation waits before it is triaged or investigated again, and how long a",
+    "`closed(ignored)` item that the triage model ignored stays closed after a recurrence before it gets a fresh look.",
     "",
-    "THE CONVENTION FOR WHICH REPO OWNS AN INFRA-SIGNAL ALERT (this is the part a real VPS",
-    "outage trace caught wrong once already \u2014 the argo rules below used to point at `argo`):",
-    "an infra-signal alert about a RollHook-managed app maps to the repo that owns its",
-    "COMPOSE FILE AND DEPLOY TARGET, not the repo that owns its source. `argo` is",
-    "compose-managed manually inside `vps` (`apps/argo/compose.yml`, `make argo-up` \u2014",
-    "nothing in argo's own repo redeploys it), so a downed argo container maps to `vps`.",
-    "Most OTHER vps-hosted apps in this policy (audio-gateway, weatherorb,",
-    "image-gen, image-share) are the opposite: they deploy to the VPS on every push to THEIR OWN repo's master (GitHub Actions ->",
-    "RollHook), so a code fix in their own repo auto-redeploys \u2014 mapping those to their own",
-    "repo is correct and deliberate, not an oversight to 'fix' the same way. Before adding a",
-    "new vps-app rule, check `vps/apps/<name>/compose.yml` AND whether that app's own repo",
-    "has its own deploy workflow before deciding which direction the rule should point. The",
-    "HyperDX-origin alerts (job.reaped, podcast.failed, vps-edge-*, ...) map to `vps` for a",
-    "related but distinct reason: their threshold/definition lives in",
-    "vps/observability/alerts/*.json, which is where THAT fix lands regardless of which",
-    "service the alert is about.",
+    "`quietResolveHours` closes a GROUPED item (slack_alert, hermes_log) that is still `new` and has produced no",
+    "occurrence for that long, to `quiet`. A `\u2705` recovery message in #alerts resolves a slack_alert item to",
+    "`quiet` at once. Neither ever claims a fix.",
     "",
-    "To extend: run",
-    "  sqlite3 ~/.hermes/watchdog.db \"SELECT source, external_id, title FROM events",
-    "    WHERE resolved_at IS NULL ORDER BY first_seen DESC LIMIT 40;\"",
-    "and add a rule (or an ignore pattern) for anything real that shows up unmapped \u2014",
-    "remembering a `uk` rule almost always wants the title-derived target, e.g.",
-    "`uk:some-monitor-name-push`, never the bare numeric id.",
+    "`ignoreUnstructuredSlackProse` (bool) is a structural pre-filter: a `slack_alert` item that no rule matched",
+    "and whose title does not start with a bot-alert shape (`[`, the siren emoji, a check mark, a warning sign) is",
+    "chat prose ingested from #alerts, and is closed `ignored` without a model call. It runs after `rules` on",
+    "purpose: a producer of bare sentences (Beszel) fails the prefix test on every real alert.",
     "",
-    "`evidence` (list, optional on any `repo` rule) fences DECLARED runtime-state probes into",
-    "the escalation brief \u2014 the fix for every real episode so far (weatherorb, vps, hermes-agent)",
-    "coming back `nextAction: human` citing the SAME reason: the dispatched episode runs in a",
-    "read-only repo WORKTREE, which has the repo but never the live machine. Same closed-set",
-    "principle as `verb`: this file names KEYS from EVIDENCE_ALLOWLIST in scripts/triage.py,",
-    "never a command. Seeded: `weatherorb-health` (weatherorb's own var/health.json, summarized),",
-    "`gateway-starts`/`hermes-log-tail` (Hermes's own gateway restart ledger + its error log",
-    "sliced at the current process start, per skills/hermes-gateway/SKILL.md Rule 0),",
-    "`kuma-push-last` (the live UptimeKuma push-heartbeat text for a `uk`-sourced cluster",
-    "member \u2014 this is NOT in `events.payload_json`, which is only `{type, status}`; it exists",
-    "only in the raw #alerts Slack text, which watchdog-poll.py's `skip_uk_push` deliberately",
-    "drops before it ever reaches `events`). An unknown evidence key drops the WHOLE rule at",
-    "load, loudly, same as an unknown verb.",
+    "`hostVerbs` (list) lets warden run an idempotent host-level restart itself instead of asking the owner",
+    "(STATE.md, docs/history/state-log.md \u00a759). Each entry is `{\"match\": \"<glob>\", \"verb\": \"<key>\"}`;",
+    "`verb` names a KEY of HOST_VERB_ALLOWLIST in scripts/triage.py, never an argv, and an unknown key drops the",
+    "rule at load. maybe_auto_remediate() also needs the item's own investigation verdict to rank at or above",
+    "`hostVerbMinConfidence` (high/medium/low, default medium). `hostVerbCooldownHours` (default 6) and",
+    "`hostVerbMaxAttempts` (default 2) bound repeats of one verb.",
     "",
-    "`quietResolveHours` (default 2, see DEFAULT_QUIET_RESOLVE_HOURS's own comment) closes a",
-    "GROUPED item (slack_alert, hermes_log) whose signal has produced no new occurrence in",
-    "that many hours \u2014 those two sources otherwise never disappearance-resolve at all",
-    "(watchdog-poll.py's sweep_stale_grouped only clears them after 7 idle DAYS, deliberate",
-    "housekeeping, not signal). A `\u2705 <same alert text>` HyperDX recovery message resolves a",
-    "slack_alert item immediately instead, on the next run, whenever one is found \u2014 strictly",
-    "better than waiting out the timer. NEITHER path ever means \"fixed\": the resolved card",
-    "always says \"signal quiet since <time>\" or \"recovery message observed: \u2026\", never that.",
-    "",
-    "`repos` (object, keyed by repo name) is the DIFFERENT half of this file: it does not",
-    "route a signature, it governs what scripts/lifecycle/merge.py's `deploy`/`liveness`",
-    "machinery does after a triage-opened `implement` episode's pull request merged. The",
-    "merge gate itself (PR open, checks green or none, review confirmed, GitHub's own rules)",
-    "carries no per-repo keys. Per-repo entry:",
-    "  deploy          a KEY from scripts/clients/rollout.py's own closed DEPLOY allowlist (ROLLOUTS),",
-    "                  never a command \u2014 same closed-set principle as `verb`/`evidence` above.",
-    "  autoDeploy      bool, default false. Ships OFF everywhere: the mechanism lands reviewed",
-    "                  but inert. Flip it per-repo only after watching a run of merges land",
-    "                  cleanly with autoDeploy still off. See docs/triage.md for how.",
-    "  liveness        a KEY from triage.py's own LIVENESS_ALLOWLIST (same closed-set shape),",
-    "                  run after a deploy to positively confirm the intended state before the",
-    "                  item resolves \u2014 an alert going quiet is also what a fully-down service",
-    "                  looks like, so silence alone is never proof of a fix here either.",
-    "  deployOnMerge   bool, default false. Declares this repo's CI/CD as merge-IS-deploy",
-    "                  (GitHub Actions -> RollHook, DESIGN.md \u00a7 Deploy, STATE.md \u00a747/\u00a748",
-    "                  item 1b) \u2014 a successful merge itself IS the deploy, with the Actions",
-    "                  run id as its receipt (there is no ssh path here to ask, unlike",
-    "                  `deploy`/`autoDeploy` above). poll_validation_jobs() checks",
-    "                  `deploy.attempted`/`.ok` FIRST, so this key only takes effect once that",
-    "                  ssh-deploy branch has already said no \u2014 the two are naturally mutually",
-    "                  exclusive without an explicit guard, since a deployOnMerge repo",
-    "                  deliberately never declares `autoDeploy` too. A merge in a",
-    "                  deployOnMerge repo goes straight to `liveness_pending` on the merge",
-    "                  commit sha, never to `merged`, UNLESS the merge result carried no",
-    "                  usable 40-char-hex mergeCommit \u2014 that falls through to `merged` with a",
-    "                  reason, on purpose (a probe with nothing to compare against would just",
-    "                  sit until liveness_deadline and reopen, worse than an honest `merged`).",
-    "`argo` is seeded with `deployOnMerge` + `liveness: argo-commit-live`.",
-    "",
-    "`hostVerbs` (list) is the host-verb allowlist's own rule set \u2014 the owner's 2026-09-11",
-    "decision that warden may run an idempotent host-level restart itself, rather than card",
-    "`needs_human` for a fix it is already confident in (STATE.md, docs/history/state-log.md \u00a759). Same",
-    "match-target/first-match-wins shape as `rules` above: each entry is",
-    "`{\"match\": \"<glob>\", \"verb\": \"<key>\"}`, and `verb` names a KEY from",
-    "HOST_VERB_ALLOWLIST in scripts/triage.py, never an argv \u2014 an unknown key drops the whole",
-    "rule at load, loudly, same as `rules`'/`evidence`'s own unknown-key handling.",
-    "maybe_auto_remediate() ALSO requires the item's own folded investigate verdict to RANK AT",
-    "OR ABOVE `hostVerbMinConfidence` (default \"medium\" \u2014 validated at load to one of",
-    "high/medium/low, anything else falls back to \"medium\" with a stderr line) before it will",
-    "ever run one of these \u2014 a `hostVerbs` match alone is not enough. `high` is deliberately NOT",
-    "the floor here: a restart from",
-    "HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE liveness probe before the item is",
-    "ever marked done, and capped at `hostVerbMaxAttempts` \u2014 so a wrong guess costs one restart",
-    "and a `needs_human` card carrying the receipt, which is cheaper than a human running that",
-    "exact same restart by hand. `hostVerbCooldownHours` (default 6) and `hostVerbMaxAttempts`",
-    "(default 2) bound repeats against the SAME item, mirroring `cooldownHours` above but against",
-    "the `operations` ledger instead of `dispatches`. Seeded with the three signatures behind the",
-    "recurring hermes-agent gateway restart (uk:175 `Hermes Agent`, uk:185 `Hermes Watchdog -",
-    "Push`, and the hermes_log `session-is-closed` reconnect signal) mapped to",
-    "`restart-hermes-gateway`. uk:193 (`Research Gateway - HTTP`) was never seeded and is now",
-    "moot: the VPS research-gateway instance is retired (2026-09-26), the mini instance is the",
-    "only one, and its Kuma monitors are being removed."
+    "`repos` (object, keyed by repo name) is per-repo deploy/liveness policy for what happens after a PR merged:",
+    "`deploy` and `liveness` name KEYS from scripts/clients/rollout.py and LIVENESS_ALLOWLIST, `autoDeploy`,",
+    "`deployOnMerge` and `deployByPoller` are flags. Wave 4 replaces it with `make deploy` and `make verify`."
   ],
   "cardChannel": "C0BVDE5R562",
   "minOccurrences": 3,
@@ -196,104 +95,531 @@
     }
   },
   "hostVerbs": [
-    {"match": "uk:hermes-agent", "verb": "restart-hermes-gateway"},
-    {"match": "uk:hermes-watchdog-push", "verb": "restart-hermes-gateway"},
-    {"match": "hermes_log:*session-is-closed*", "verb": "restart-hermes-gateway"}
+    {
+      "match": "uk:hermes-agent",
+      "verb": "restart-hermes-gateway"
+    },
+    {
+      "match": "uk:hermes-watchdog-push",
+      "verb": "restart-hermes-gateway"
+    },
+    {
+      "match": "hermes_log:*session-is-closed*",
+      "verb": "restart-hermes-gateway"
+    }
   ],
   "rules": [
-    {"match": "docker_*:unhealthy:garmin-*", "repo": "homelab"},
-    {"match": "docker_*:restart:garmin-*", "repo": "homelab"},
-    {"match": "docker_*:unhealthy:audio-gateway*", "repo": "audio-gateway"},
-    {"match": "docker_*:restart:audio-gateway*", "repo": "audio-gateway"},
-    {"match": "docker_*:unhealthy:image-gen*", "repo": "image-gen"},
-    {"match": "docker_*:restart:image-gen*", "repo": "image-gen"},
-    {"match": "docker_*:unhealthy:image-share*", "repo": "image-share"},
-    {"match": "docker_*:restart:image-share*", "repo": "image-share"},
-    {"match": "docker_*:unhealthy:rollhook*", "repo": "rollhook"},
-    {"match": "docker_*:restart:rollhook*", "repo": "rollhook"},
-    {"match": "docker_*:unhealthy:weatherorb*", "repo": "weatherorb", "evidence": ["weatherorb-health"]},
-    {"match": "docker_*:restart:weatherorb*", "repo": "weatherorb", "evidence": ["weatherorb-health"]},
-    {"match": "docker_*:unhealthy:argo*", "repo": "vps"},
-    {"match": "docker_*:restart:argo*", "repo": "vps"},
-    {"match": "uk:macmini-dev-host-push", "repo": "dotfiles", "evidence": ["kuma-push-last", "launchd-restarts", "kuma-monitor-config"]},
-    {"match": "uk:macmini-*", "repo": "dotfiles", "evidence": ["kuma-push-last", "kuma-monitor-config"]},
-    {"match": "uk:brain-sync-push", "repo": "dotfiles", "evidence": ["kuma-push-last", "kuma-monitor-config"]},
-    {"match": "uk:brain-backup-push", "repo": "dotfiles", "evidence": ["kuma-push-last"]},
-    {"match": "uk:*collie*", "repo": "dotfiles", "evidence": ["kuma-push-last"]},
-    {"match": "uk:hermes-agent-push", "repo": "hermes-agent", "evidence": ["kuma-push-last", "gateway-starts", "hermes-log-tail"]},
-    {"match": "uk:hermes-backup-push", "repo": "hermes-agent", "evidence": ["kuma-push-last"]},
-    {"match": "uk:hermes-watchdog-push", "repo": "hermes-agent", "evidence": ["kuma-push-last"]},
-    {"match": "uk:hermes-*", "repo": "hermes-agent", "evidence": ["kuma-push-last", "gateway-starts", "hermes-log-tail"]},
-    {"match": "uk:weatherorb-*", "repo": "weatherorb", "evidence": ["kuma-push-last", "weatherorb-health"]},
-    {"match": "uk:rollhook-*", "repo": "rollhook", "evidence": ["kuma-push-last"]},
-    {"match": "slack_alert:*job-reaped*", "repo": "vps"},
-    {"match": "slack_alert:*podcast-failed*", "repo": "vps"},
-    {"match": "slack_alert:*vps-edge-*", "repo": "vps"},
-    {"match": "slack_alert:*vps-error-logs-*", "repo": "vps"},
-    {"match": "slack_alert:*otel-ingest-stalled-*", "repo": "vps"},
-    {"match": "slack_alert:api-*-red-circle-down-*", "repo": "vps"},
-    {"match": "slack_alert:dashboard-*-red-circle-down-*", "repo": "vps"},
-    {"match": "hermes_log:*", "repo": "hermes-agent", "evidence": ["hermes-log-tail", "gateway-starts"]},
-    {"match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-1-persisting-past-the-2h-grace-window-locally-atrisk-1-we-are-actually-not-", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The alert indicates the homelab torrent stack is failing to seed required content."},
-    {"match": "slack_alert:local-red-circle-down-child-monitors-down-weatherorb-watchdog-push-channel", "repo": "weatherorb", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The down child monitor is specifically the WeatherOrb Watchdog."},
-    {"match": "slack_alert:homelab-temperature-above-threshold", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The alert directly reports an above-threshold temperature in the homelab.", "evidence": ["beszel-alerts"]},
-    {"match": "slack_alert:flaresolverr-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The exited FlareSolverr container is part of the homelab service stack."},
-    {"match": "slack_alert:gluetun-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The exited Gluetun container is part of the homelab service stack."},
-    {"match": "slack_alert:prowlarr-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The exited Prowlarr container is part of the homelab service stack."},
-    {"match": "slack_alert:qbittorrent-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The exited qBittorrent container is part of the homelab service stack."},
-    {"match": "slack_alert:torrent-app-docker-red-circle-down-container-state-is-exited-channel", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The exited Torrent App container is part of the homelab service stack."},
-    {"match": "slack_alert:torrent-red-circle-down-child-monitors-down-gluetun-docker-qbittorrent-docker-prowlarr-docker-flaresolverr-docker-torren", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The aggregate torrent outage covers multiple homelab containers and the VPN watchdog."},
-    {"match": "slack_alert:local-red-circle-down-child-monitors-down-macmini-dev-host-push-channel", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The MacMini Dev Host is a local homelab infrastructure dependency."},
-    {"match": "slack_alert:new-incident-for-http-photos-jkrumm-com-photos-jkrumm-com", "repo": "image-share", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The incident targets the photos.jkrumm.com image-sharing service."},
-    {"match": "uk:95", "repo": "vps", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The alert is explicitly associated with VPS infrastructure."},
-    {"match": "slack_alert:homelab-5m-load-above-threshold", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The alert directly reports elevated five-minute load on the homelab.", "evidence": ["beszel-alerts"]},
-    {"match": "slack_alert:homelab-cpu-above-threshold", "repo": "homelab", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "The alert directly reports elevated CPU usage on the homelab.", "evidence": ["beszel-alerts"]},
-    {"match": "slack_alert:homelab-disk-usage-above-threshold", "repo": "homelab", "proposedAt": "2026-09-12T23:20:21.573431+00:00", "proposedBy": "triage-auto", "reason": "The alert directly identifies excessive disk usage on HomeLab.", "evidence": ["beszel-alerts"]},
-    {"match": "slack_alert:local-red-circle-down-child-monitors-down-brain-sync-push-channel", "repo": "brain", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Brain Sync child monitor down; brain owns sync service."},
-    {"match": "slack_alert:hermes-http-red-circle-down-request-failed-with-status-code-404", "repo": "hermes-agent", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Hermes HTTP endpoint down with 404; hermes-agent owns Hermes."},
-    {"match": "uk:234", "repo": "warden", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Warden Backup monitor firing repeatedly; warden owns backups."},
-    {"match": "slack_alert:research-gateway-http-red-circle-down-200-ok-but-keyword-is-not-in-status-ok-lastrestartat-2026-09-08t06-5", "repo": "research-gateway", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "Research Gateway HTTP health check failing."},
-    {"match": "uk:150", "repo": "homelab", "proposedAt": "2026-09-15T23:32:21.345170+00:00", "proposedBy": "triage-auto", "reason": "VPN Watchdog for homelab torrent VPN."},
-    {"match": "uk:144", "repo": "vps", "proposedAt": "2026-09-17T23:41:45.950846+00:00", "proposedBy": "triage-auto", "reason": "Torrent monitor down; part of VPS torrent stack."},
-    {"match": "slack_alert:homelab-temperature-below-threshold", "repo": "homelab", "proposedAt": "2026-09-18T23:46:49.411032+00:00", "proposedBy": "triage-auto", "reason": "HomeLab temperature below threshold alert"},
-    {"match": "slack_alert:homelab-5m-load-below-threshold", "repo": "homelab", "proposedAt": "2026-09-18T23:46:49.411032+00:00", "proposedBy": "triage-auto", "reason": "HomeLab 5m load below threshold"},
-    {"match": "uk:4", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "HomeLab monitor belongs to homelab infrastructure."},
-    {"match": "slack_alert:flaresolverr-docker-red-circle-down-container-state-is-exited", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "FlareSolverr container is part of homelab Docker stack."},
-    {"match": "slack_alert:gluetun-docker-red-circle-down-container-state-is-exited", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Gluetun VPN container is part of homelab Docker stack."},
-    {"match": "slack_alert:prowlarr-docker-red-circle-down-container-state-is-exited", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Prowlarr container is part of homelab Docker stack."},
-    {"match": "slack_alert:qbittorrent-docker-red-circle-down-container-state-is-exited", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "qBittorrent container is part of homelab Docker stack."},
-    {"match": "slack_alert:torrent-app-docker-red-circle-down-container-state-is-exited", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Torrent app container is part of homelab Docker stack."},
-    {"match": "slack_alert:photos-http-red-circle-down-read-econnreset", "repo": "image-share", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Photos HTTP service corresponds to image-share."},
-    {"match": "slack_alert:weatherorb-http-red-circle-down-read-econnreset", "repo": "weatherorb", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "WeatherOrb HTTP service belongs to weatherorb."},
-    {"match": "slack_alert:mam-account-monitoring-is-blind-mam-account-json-is-stale-seed-obligation-risk-can-no-longer-be-assessed-this-is-a-monit", "repo": "homelab", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "MAM seed-obligation monitoring is part of homelab torrent stack."},
-    {"match": "slack_alert:research-gateway-job-error-1-15m", "repo": "research-gateway", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "Job error alert for research-gateway service."},
-    {"match": "uk:226", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): the MAM session is homelab-side \u2014 mam-account-sync.sh / mam-seedbox-sync.sh live in homelab-private and push the monitor, and nothing in warden touches it. Routing it to warden sent item 843 into an implement episode that died pre-flight (warden's checkout has no origin remote), so the alert never reached the repo that owns the fix."},
-    {"match": "uk:211", "repo": "homelab", "proposedAt": "2026-09-23T00:05:38.312526+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-23 (was \"warden\"): Garmin auto-relogin is homelab's (garmin-collector + scripts/garmin-auto-relogin.sh); warden implements none of it."},
-    {"match": "uk:212", "repo": "kobo-mods", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "KoInsight is a KOReader/Kobo statistics service; repo kobo-mods owns it."},
-    {"match": "uk:213", "repo": "rollhook", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "Auto-Update push monitor belongs to the rollhook auto-update service."},
-    {"match": "slack_alert:public-files-http-red-circle-down-read-econnreset", "repo": "homelab", "proposedAt": "2026-09-28T00:29:42.370225+00:00", "proposedBy": "triage-auto", "reason": "CORRECTED 2026-09-28 (was \"image-share\"): \"Public Files - HTTP\" is UptimeKuma monitor 64 on https://public.jkrumm.com/ \u2014 the Dufs container defined in homelab/docker-compose.yml, so homelab owns the compose file and the deploy target (this file's infra-signal convention). image-share serves share.jkrumm.com and owns nothing in the Dufs path."},
-    {"match": "uk:207", "repo": "linewatch", "proposedAt": "2026-09-28T00:29:42.370225+00:00", "proposedBy": "triage-auto", "reason": "Home Line monitor matches linewatch repo", "evidence": ["kuma-monitor-config"]},
-    {"match": "slack_alert:research-gateway-http-red-circle-down-request-failed-with-status-code-404", "repo": "research-gateway", "proposedAt": "2026-09-28T00:29:42.370225+00:00", "proposedBy": "triage-auto", "reason": "Service name matches research-gateway repo"},
-    {"match": "slack_alert:research-gateway-renderer-http-red-circle-down-request-failed-with-status-code-404", "repo": "research-gateway", "proposedAt": "2026-09-28T00:29:42.370225+00:00", "proposedBy": "triage-auto", "reason": "Renderer is part of research-gateway service"},
-    {"match": "slack_alert:fpp-db-mysql-red-circle-down-database-connection-query-failed-can-t-add-new-command-when-connection-is-in-closed-state", "repo": "free-planning-poker", "proposedAt": "2026-10-01T00:45:48.476425+00:00", "proposedBy": "triage-auto", "reason": "FPP MySQL connection failure points to the free-planning-poker database."},
-    {"match": "slack_alert:hermes-http-red-circle-down-timeout-of-90000ms-exceeded", "repo": "hermes-agent", "proposedAt": "2026-10-01T00:45:48.476425+00:00", "proposedBy": "triage-auto", "reason": "Hermes HTTP timeout indicates a hermes-agent service issue."},
-    {"match": "uk:218", "repo": "homelab", "proposedAt": "2026-10-01T00:45:48.476425+00:00", "proposedBy": "triage-auto", "reason": "Prometheus state backup is homelab infrastructure monitoring."}
+    {
+      "match": "docker_*:unhealthy:garmin-*",
+      "repo": "homelab"
+    },
+    {
+      "match": "docker_*:restart:garmin-*",
+      "repo": "homelab"
+    },
+    {
+      "match": "docker_*:unhealthy:audio-gateway*",
+      "repo": "audio-gateway"
+    },
+    {
+      "match": "docker_*:restart:audio-gateway*",
+      "repo": "audio-gateway"
+    },
+    {
+      "match": "docker_*:unhealthy:image-gen*",
+      "repo": "image-gen"
+    },
+    {
+      "match": "docker_*:restart:image-gen*",
+      "repo": "image-gen"
+    },
+    {
+      "match": "docker_*:unhealthy:image-share*",
+      "repo": "image-share"
+    },
+    {
+      "match": "docker_*:restart:image-share*",
+      "repo": "image-share"
+    },
+    {
+      "match": "docker_*:unhealthy:rollhook*",
+      "repo": "rollhook"
+    },
+    {
+      "match": "docker_*:restart:rollhook*",
+      "repo": "rollhook"
+    },
+    {
+      "match": "docker_*:unhealthy:weatherorb*",
+      "repo": "weatherorb"
+    },
+    {
+      "match": "docker_*:restart:weatherorb*",
+      "repo": "weatherorb"
+    },
+    {
+      "match": "docker_*:unhealthy:argo*",
+      "repo": "vps"
+    },
+    {
+      "match": "docker_*:restart:argo*",
+      "repo": "vps"
+    },
+    {
+      "match": "uk:macmini-dev-host-push",
+      "repo": "dotfiles"
+    },
+    {
+      "match": "uk:macmini-*",
+      "repo": "dotfiles"
+    },
+    {
+      "match": "uk:brain-sync-push",
+      "repo": "dotfiles"
+    },
+    {
+      "match": "uk:brain-backup-push",
+      "repo": "dotfiles"
+    },
+    {
+      "match": "uk:*collie*",
+      "repo": "dotfiles"
+    },
+    {
+      "match": "uk:hermes-agent-push",
+      "repo": "hermes-agent"
+    },
+    {
+      "match": "uk:hermes-backup-push",
+      "repo": "hermes-agent"
+    },
+    {
+      "match": "uk:hermes-watchdog-push",
+      "repo": "hermes-agent"
+    },
+    {
+      "match": "uk:hermes-*",
+      "repo": "hermes-agent"
+    },
+    {
+      "match": "uk:weatherorb-*",
+      "repo": "weatherorb"
+    },
+    {
+      "match": "uk:rollhook-*",
+      "repo": "rollhook"
+    },
+    {
+      "match": "slack_alert:*job-reaped*",
+      "repo": "vps"
+    },
+    {
+      "match": "slack_alert:*podcast-failed*",
+      "repo": "vps"
+    },
+    {
+      "match": "slack_alert:*vps-edge-*",
+      "repo": "vps"
+    },
+    {
+      "match": "slack_alert:*vps-error-logs-*",
+      "repo": "vps"
+    },
+    {
+      "match": "slack_alert:*otel-ingest-stalled-*",
+      "repo": "vps"
+    },
+    {
+      "match": "slack_alert:api-*-red-circle-down-*",
+      "repo": "vps"
+    },
+    {
+      "match": "slack_alert:dashboard-*-red-circle-down-*",
+      "repo": "vps"
+    },
+    {
+      "match": "hermes_log:*",
+      "repo": "hermes-agent"
+    },
+    {
+      "match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-1-persisting-past-the-2h-grace-window-locally-atrisk-1-we-are-actually-not-",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The alert indicates the homelab torrent stack is failing to seed required content."
+    },
+    {
+      "match": "slack_alert:local-red-circle-down-child-monitors-down-weatherorb-watchdog-push-channel",
+      "repo": "weatherorb",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The down child monitor is specifically the WeatherOrb Watchdog."
+    },
+    {
+      "match": "slack_alert:homelab-temperature-above-threshold",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The alert directly reports an above-threshold temperature in the homelab."
+    },
+    {
+      "match": "slack_alert:flaresolverr-docker-red-circle-down-container-state-is-exited-channel",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The exited FlareSolverr container is part of the homelab service stack."
+    },
+    {
+      "match": "slack_alert:gluetun-docker-red-circle-down-container-state-is-exited-channel",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The exited Gluetun container is part of the homelab service stack."
+    },
+    {
+      "match": "slack_alert:prowlarr-docker-red-circle-down-container-state-is-exited-channel",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The exited Prowlarr container is part of the homelab service stack."
+    },
+    {
+      "match": "slack_alert:qbittorrent-docker-red-circle-down-container-state-is-exited-channel",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The exited qBittorrent container is part of the homelab service stack."
+    },
+    {
+      "match": "slack_alert:torrent-app-docker-red-circle-down-container-state-is-exited-channel",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The exited Torrent App container is part of the homelab service stack."
+    },
+    {
+      "match": "slack_alert:torrent-red-circle-down-child-monitors-down-gluetun-docker-qbittorrent-docker-prowlarr-docker-flaresolverr-docker-torren",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The aggregate torrent outage covers multiple homelab containers and the VPN watchdog."
+    },
+    {
+      "match": "slack_alert:local-red-circle-down-child-monitors-down-macmini-dev-host-push-channel",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The MacMini Dev Host is a local homelab infrastructure dependency."
+    },
+    {
+      "match": "slack_alert:new-incident-for-http-photos-jkrumm-com-photos-jkrumm-com",
+      "repo": "image-share",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The incident targets the photos.jkrumm.com image-sharing service."
+    },
+    {
+      "match": "uk:95",
+      "repo": "vps",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The alert is explicitly associated with VPS infrastructure."
+    },
+    {
+      "match": "slack_alert:homelab-5m-load-above-threshold",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The alert directly reports elevated five-minute load on the homelab."
+    },
+    {
+      "match": "slack_alert:homelab-cpu-above-threshold",
+      "repo": "homelab",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The alert directly reports elevated CPU usage on the homelab."
+    },
+    {
+      "match": "slack_alert:homelab-disk-usage-above-threshold",
+      "repo": "homelab",
+      "proposedAt": "2026-09-12T23:20:21.573431+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "The alert directly identifies excessive disk usage on HomeLab."
+    },
+    {
+      "match": "slack_alert:local-red-circle-down-child-monitors-down-brain-sync-push-channel",
+      "repo": "brain",
+      "proposedAt": "2026-09-14T23:27:43.175251+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Brain Sync child monitor down; brain owns sync service."
+    },
+    {
+      "match": "slack_alert:hermes-http-red-circle-down-request-failed-with-status-code-404",
+      "repo": "hermes-agent",
+      "proposedAt": "2026-09-14T23:27:43.175251+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Hermes HTTP endpoint down with 404; hermes-agent owns Hermes."
+    },
+    {
+      "match": "uk:234",
+      "repo": "warden",
+      "proposedAt": "2026-09-14T23:27:43.175251+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Warden Backup monitor firing repeatedly; warden owns backups."
+    },
+    {
+      "match": "slack_alert:research-gateway-http-red-circle-down-200-ok-but-keyword-is-not-in-status-ok-lastrestartat-2026-09-08t06-5",
+      "repo": "research-gateway",
+      "proposedAt": "2026-09-15T23:32:21.345170+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Research Gateway HTTP health check failing."
+    },
+    {
+      "match": "uk:150",
+      "repo": "homelab",
+      "proposedAt": "2026-09-15T23:32:21.345170+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "VPN Watchdog for homelab torrent VPN."
+    },
+    {
+      "match": "uk:144",
+      "repo": "vps",
+      "proposedAt": "2026-09-17T23:41:45.950846+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Torrent monitor down; part of VPS torrent stack."
+    },
+    {
+      "match": "slack_alert:homelab-temperature-below-threshold",
+      "repo": "homelab",
+      "proposedAt": "2026-09-18T23:46:49.411032+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "HomeLab temperature below threshold alert"
+    },
+    {
+      "match": "slack_alert:homelab-5m-load-below-threshold",
+      "repo": "homelab",
+      "proposedAt": "2026-09-18T23:46:49.411032+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "HomeLab 5m load below threshold"
+    },
+    {
+      "match": "uk:4",
+      "repo": "homelab",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "HomeLab monitor belongs to homelab infrastructure."
+    },
+    {
+      "match": "slack_alert:flaresolverr-docker-red-circle-down-container-state-is-exited",
+      "repo": "homelab",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "FlareSolverr container is part of homelab Docker stack."
+    },
+    {
+      "match": "slack_alert:gluetun-docker-red-circle-down-container-state-is-exited",
+      "repo": "homelab",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Gluetun VPN container is part of homelab Docker stack."
+    },
+    {
+      "match": "slack_alert:prowlarr-docker-red-circle-down-container-state-is-exited",
+      "repo": "homelab",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Prowlarr container is part of homelab Docker stack."
+    },
+    {
+      "match": "slack_alert:qbittorrent-docker-red-circle-down-container-state-is-exited",
+      "repo": "homelab",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "qBittorrent container is part of homelab Docker stack."
+    },
+    {
+      "match": "slack_alert:torrent-app-docker-red-circle-down-container-state-is-exited",
+      "repo": "homelab",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Torrent app container is part of homelab Docker stack."
+    },
+    {
+      "match": "slack_alert:photos-http-red-circle-down-read-econnreset",
+      "repo": "image-share",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Photos HTTP service corresponds to image-share."
+    },
+    {
+      "match": "slack_alert:weatherorb-http-red-circle-down-read-econnreset",
+      "repo": "weatherorb",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "WeatherOrb HTTP service belongs to weatherorb."
+    },
+    {
+      "match": "slack_alert:mam-account-monitoring-is-blind-mam-account-json-is-stale-seed-obligation-risk-can-no-longer-be-assessed-this-is-a-monit",
+      "repo": "homelab",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "MAM seed-obligation monitoring is part of homelab torrent stack."
+    },
+    {
+      "match": "slack_alert:research-gateway-job-error-1-15m",
+      "repo": "research-gateway",
+      "proposedAt": "2026-09-23T00:05:38.312526+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Job error alert for research-gateway service."
+    },
+    {
+      "match": "uk:226",
+      "repo": "homelab",
+      "proposedAt": "2026-09-23T00:05:38.312526+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "CORRECTED 2026-09-23 (was \"warden\"): the MAM session is homelab-side \u2014 mam-account-sync.sh / mam-seedbox-sync.sh live in homelab-private and push the monitor, and nothing in warden touches it. Routing it to warden sent item 843 into an implement episode that died pre-flight (warden's checkout has no origin remote), so the alert never reached the repo that owns the fix."
+    },
+    {
+      "match": "uk:211",
+      "repo": "homelab",
+      "proposedAt": "2026-09-23T00:05:38.312526+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "CORRECTED 2026-09-23 (was \"warden\"): Garmin auto-relogin is homelab's (garmin-collector + scripts/garmin-auto-relogin.sh); warden implements none of it."
+    },
+    {
+      "match": "uk:212",
+      "repo": "kobo-mods",
+      "proposedAt": "2026-09-24T00:12:42.369981+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "KoInsight is a KOReader/Kobo statistics service; repo kobo-mods owns it."
+    },
+    {
+      "match": "uk:213",
+      "repo": "rollhook",
+      "proposedAt": "2026-09-24T00:12:42.369981+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Auto-Update push monitor belongs to the rollhook auto-update service."
+    },
+    {
+      "match": "slack_alert:public-files-http-red-circle-down-read-econnreset",
+      "repo": "homelab",
+      "proposedAt": "2026-09-28T00:29:42.370225+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "CORRECTED 2026-09-28 (was \"image-share\"): \"Public Files - HTTP\" is UptimeKuma monitor 64 on https://public.jkrumm.com/ \u2014 the Dufs container defined in homelab/docker-compose.yml, so homelab owns the compose file and the deploy target (this file's infra-signal convention). image-share serves share.jkrumm.com and owns nothing in the Dufs path."
+    },
+    {
+      "match": "uk:207",
+      "repo": "linewatch",
+      "proposedAt": "2026-09-28T00:29:42.370225+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Home Line monitor matches linewatch repo"
+    },
+    {
+      "match": "slack_alert:research-gateway-http-red-circle-down-request-failed-with-status-code-404",
+      "repo": "research-gateway",
+      "proposedAt": "2026-09-28T00:29:42.370225+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Service name matches research-gateway repo"
+    },
+    {
+      "match": "slack_alert:research-gateway-renderer-http-red-circle-down-request-failed-with-status-code-404",
+      "repo": "research-gateway",
+      "proposedAt": "2026-09-28T00:29:42.370225+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Renderer is part of research-gateway service"
+    },
+    {
+      "match": "slack_alert:fpp-db-mysql-red-circle-down-database-connection-query-failed-can-t-add-new-command-when-connection-is-in-closed-state",
+      "repo": "free-planning-poker",
+      "proposedAt": "2026-10-01T00:45:48.476425+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "FPP MySQL connection failure points to the free-planning-poker database."
+    },
+    {
+      "match": "slack_alert:hermes-http-red-circle-down-timeout-of-90000ms-exceeded",
+      "repo": "hermes-agent",
+      "proposedAt": "2026-10-01T00:45:48.476425+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Hermes HTTP timeout indicates a hermes-agent service issue."
+    },
+    {
+      "match": "uk:218",
+      "repo": "homelab",
+      "proposedAt": "2026-10-01T00:45:48.476425+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Prometheus state backup is homelab infrastructure monitoring."
+    }
   ],
   "ignore": [
     "docker_*:unhealthy:shelfmark",
     "docker_*:restart:shelfmark",
     "slack_alert:*-white-check-mark-up-*",
     "slack_alert:automatically-resolved-*",
-    {"match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-1-persisting-past-the-2h-grace-window-locally-atrisk-0-mam-hasn-t-caught-up", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "MAM has not caught up, while local atRisk=0 confirms this is not an issue on our side."},
-    {"match": "slack_alert:homelab-temperature-below-threshold", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "A below-threshold temperature is a recovery or safe-state notification."},
-    {"match": "slack_alert:homelab-5m-load-below-threshold", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "A below-threshold load is a recovery or safe-state notification."},
-    {"match": "slack_alert:homelab-cpu-below-threshold", "proposedAt": "2026-09-11T23:19:27.263532+00:00", "proposedBy": "triage-auto", "reason": "A below-threshold CPU level is a recovery or safe-state notification."},
-    {"match": "slack_alert:argo-identity-test-this-app-now-posts-under-its-own-name-safe-to-delete", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Explicit identity test marked safe to delete."},
-    {"match": "slack_alert:recycle-recovered-reply-the-gateway-restarted-during-delivery-so-this-may-be-a-duplicate-verstanden-die-vps-integration-", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Recovered duplicate reply from gateway restart."},
-    {"match": "slack_alert:vps-identity-test-this-app-now-posts-under-its-own-name-safe-to-delete", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Explicit vps identity test marked safe to delete."},
-    {"match": "slack_alert:vps-webhook-test-hyperdx-alerts-will-arrive-under-this-name-safe-to-delete", "proposedAt": "2026-09-14T23:27:43.175251+00:00", "proposedBy": "triage-auto", "reason": "Explicit vps webhook test marked safe to delete."},
-    {"match": "slack_alert:canary-research-gateway-alert-pipeline-test-delete-me", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Canary test alert marked delete me; benign."},
-    {"match": "slack_alert:self-healing-success-vpn-stack-restored-after-gluetun-was-offline", "proposedAt": "2026-09-20T23:56:20.115447+00:00", "proposedBy": "triage-auto", "reason": "Genuine recovery notice; VPN stack already restored."},
-    {"match": "slack_alert:homelab-disk-usage-below-threshold", "proposedAt": "2026-09-24T00:12:42.369981+00:00", "proposedBy": "triage-auto", "reason": "Disk usage below threshold is a recovery/benign state."}
+    {
+      "match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-1-persisting-past-the-2h-grace-window-locally-atrisk-0-mam-hasn-t-caught-up",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "MAM has not caught up, while local atRisk=0 confirms this is not an issue on our side."
+    },
+    {
+      "match": "slack_alert:homelab-temperature-below-threshold",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "A below-threshold temperature is a recovery or safe-state notification."
+    },
+    {
+      "match": "slack_alert:homelab-5m-load-below-threshold",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "A below-threshold load is a recovery or safe-state notification."
+    },
+    {
+      "match": "slack_alert:homelab-cpu-below-threshold",
+      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "A below-threshold CPU level is a recovery or safe-state notification."
+    },
+    {
+      "match": "slack_alert:argo-identity-test-this-app-now-posts-under-its-own-name-safe-to-delete",
+      "proposedAt": "2026-09-14T23:27:43.175251+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Explicit identity test marked safe to delete."
+    },
+    {
+      "match": "slack_alert:recycle-recovered-reply-the-gateway-restarted-during-delivery-so-this-may-be-a-duplicate-verstanden-die-vps-integration-",
+      "proposedAt": "2026-09-14T23:27:43.175251+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Recovered duplicate reply from gateway restart."
+    },
+    {
+      "match": "slack_alert:vps-identity-test-this-app-now-posts-under-its-own-name-safe-to-delete",
+      "proposedAt": "2026-09-14T23:27:43.175251+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Explicit vps identity test marked safe to delete."
+    },
+    {
+      "match": "slack_alert:vps-webhook-test-hyperdx-alerts-will-arrive-under-this-name-safe-to-delete",
+      "proposedAt": "2026-09-14T23:27:43.175251+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Explicit vps webhook test marked safe to delete."
+    },
+    {
+      "match": "slack_alert:canary-research-gateway-alert-pipeline-test-delete-me",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Canary test alert marked delete me; benign."
+    },
+    {
+      "match": "slack_alert:self-healing-success-vpn-stack-restored-after-gluetun-was-offline",
+      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Genuine recovery notice; VPN stack already restored."
+    },
+    {
+      "match": "slack_alert:homelab-disk-usage-below-threshold",
+      "proposedAt": "2026-09-24T00:12:42.369981+00:00",
+      "proposedBy": "triage-auto",
+      "reason": "Disk usage below threshold is a recovery/benign state."
+    }
   ]
 }

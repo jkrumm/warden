@@ -33,6 +33,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -63,18 +64,12 @@ _wp_spec.loader.exec_module(watchdog_poll)
 
 # --- fixtures ------------------------------------------------------------------
 
-# Match targets are `source:external_id` — these fixture events use external_ids
-# that already read as the intended signature, so the rules below match the
-# first target directly without needing the title-normalized fallback (that
-# path gets its own dedicated test, test_uk_maps_via_title_not_external_id).
 DEFAULT_POLICY = {
     "cardChannel": "C0TESTCHAN01",
     "minOccurrences": 1,
     "minOpenMinutes": 30,
     "cooldownHours": 6,
     "ignoreUnstructuredSlackProse": False,
-    "rules": [{"match": "slack_alert:sig-*", "repo": "demo-repo"}],
-    "ignore": ["slack_alert:ignoreme-*"],
 }
 
 
@@ -92,6 +87,55 @@ def _default_fake_submit(*, cwd, tier, brief, context=None, model=None, revision
 
 def _default_fake_get(job_id):
     return None
+
+
+def _triage_job(answer: dict[str, Any], *, job_id: str = "triage-job-000001",
+                status: str = "done", error: str | None = None) -> dict[str, Any]:
+    """A sideclaw `triage` job as `get()` returns it: the schema-validated answer sits at
+    `result.result`."""
+    job: dict[str, Any] = {"id": job_id, "status": status}
+    if status == "done":
+        job["result"] = {"result": answer, "model": "test-model", "attempts": 1}
+    if error:
+        job["error"] = error
+    return job
+
+
+def _add_repo(ctx, name: str) -> None:
+    """A known repo for the triage step: a checkout under the fixture's repos root with an AGENTS.md."""
+    repo_dir = ctx.tmp_dir / "repos-root" / name
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "AGENTS.md").write_text(f"# {name}\n\nThe {name} service.\n")
+
+
+def _fake_triage(answers: dict[str, Any], *, calls: list[dict[str, Any]] | None = None):
+    """`submit_triage` fake answering per event title (the prompt's `title:` line). A value is an
+    answer dict, or a repo name meaning new(repo). Every submit is recorded on `calls`."""
+    seen: list[dict[str, Any]] = calls if calls is not None else []
+
+    def _submit(*, prompt, schema):
+        title = re.search(r"^title: (.*)$", prompt, re.M).group(1)
+        seen.append({"prompt": prompt, "schema": schema, "title": title})
+        answer = answers[title]
+        if isinstance(answer, str):
+            answer = {"action": "new", "repo": answer, "title": title, "reason": "test routing"}
+        return _triage_job(answer, job_id=f"triage-job-{len(seen):06d}")
+
+    return _submit
+
+
+def _triage_pass(conn, now=None) -> None:
+    """One submit pass of the triage step — what run() does before escalating."""
+    triage.submit_triage_jobs(conn, DEFAULT_POLICY, now or NOW, dry_run=False)
+
+
+def _default_fake_submit_triage(*, prompt, schema):
+    """The module-level default for `triage._sideclaw.submit_triage` inside `_triage_env()`:
+    every item is routed `new` to demo-repo, in a job that is already finished when the submit
+    returns (so a pass needs no `get()` fake) — the role the retired `slack_alert:sig-*` rule
+    played for every test that is not about intake."""
+    return _triage_job({"action": "new", "repo": "demo-repo", "title": "test routing",
+                        "reason": "default test triage"})
 
 
 def _default_fake_submit_review(*, cwd, pr, context=None, model=None):
@@ -134,9 +178,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         "_HERMES_OPS_BIN": triage._HERMES_OPS_BIN,
         "HOST_VERB_ALLOWLIST": dict(triage.HOST_VERB_ALLOWLIST),
         "_watchdog_poll": triage._watchdog_poll,
-        "WEATHERORB_HEALTH_PATH": triage.WEATHERORB_HEALTH_PATH,
-        "GATEWAY_STARTS_LOG": triage.GATEWAY_STARTS_LOG,
-        "HERMES_ERROR_LOG": triage.HERMES_ERROR_LOG,
         "TRIAGE_REPO_DIR": triage.TRIAGE_REPO_DIR,
         "_kuma_trip": triage._kuma_trip,
     }
@@ -147,7 +188,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
     saved_client_attrs = {
         ("_sideclaw", "submit"): triage._sideclaw.submit,
         ("_sideclaw", "submit_review"): triage._sideclaw.submit_review,
+        ("_sideclaw", "submit_triage"): triage._sideclaw.submit_triage,
         ("_sideclaw", "get"): triage._sideclaw.get,
+        ("_sideclaw", "wait"): triage._sideclaw.wait,
         ("_sideclaw", "cancel"): triage._sideclaw.cancel,
         ("_sideclaw", "escalation_model"): triage._sideclaw.escalation_model,
         ("_github", "actions_runs"): triage._github.actions_runs,
@@ -170,8 +213,11 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         triage.POLICY_PATH = tmp_dir / "triage-policy.json"
         _write_json(triage.POLICY_PATH, policy if policy is not None else DEFAULT_POLICY)
         os.environ["WARDEN_REPOS_ROOT"] = str(tmp_dir / "repos-root")
+        (tmp_dir / "repos-root" / "demo-repo").mkdir(parents=True)
+        (tmp_dir / "repos-root" / "demo-repo" / "AGENTS.md").write_text("# demo-repo\n\nA demo service.\n")
 
         triage._sideclaw.submit = _default_fake_submit
+        triage._sideclaw.submit_triage = _default_fake_submit_triage
         triage._sideclaw.submit_review = _default_fake_submit_review
         triage._sideclaw.get = _default_fake_get
         triage._sideclaw.escalation_model = lambda: None
@@ -464,11 +510,12 @@ def test_new_state_item_gets_no_post():
         assert item["state"] == triage.STATE_NEW
 
 
-def test_all_unmapped_backlog_posts_zero_slack_calls():
-    """An empty/non-matching policy must not turn into a wall of posts — the
-    unmapped signatures stay `new`, silent."""
-    policy = dict(DEFAULT_POLICY, rules=[])
-    with _triage_env(policy=policy) as (conn, ctx):
+def test_ignored_backlog_posts_zero_slack_calls():
+    """A backlog the triage step ignores must not turn into a wall of posts: five
+    noise signatures close `ignored`, silent, and nothing dispatches."""
+    with _triage_env() as (conn, ctx):
+        ignore = {"action": "ignore", "reason": "noise"}
+        triage._sideclaw.submit_triage = _fake_triage({f"Nowhere {i}": ignore for i in range(5)})
         for i in range(5):
             _insert_event(conn, source="slack_alert", external_id=f"sig-nowhere-{i}",
                            title=f"Nowhere {i}", first_seen=OLD)
@@ -477,6 +524,9 @@ def test_all_unmapped_backlog_posts_zero_slack_calls():
         triage.run(conn, dry_run=False)
         assert calls == []
         assert ctx.total_calls() == 0, f"expected zero Slack calls, got {ctx.total_calls()}"
+        closed = conn.execute("SELECT COUNT(*) FROM triage_items WHERE state=? AND close_reason=?",
+                              (triage.STATE_CLOSED, triage.CLOSE_IGNORED)).fetchone()[0]
+        assert closed == 5, closed
 
 
 def test_both_missing_edges_are_written():
@@ -527,8 +577,10 @@ def test_min_open_minutes_withholds_then_allows():
         assert len(calls) == 1, "should escalate once minOpenMinutes has elapsed"
 
 
-def test_ignore_policy_never_posts_or_escalates():
+def test_triage_ignore_never_posts_or_escalates():
     with _triage_env() as (conn, ctx):
+        triage._sideclaw.submit_triage = _fake_triage(
+            {"All good now": {"action": "ignore", "reason": "a recovery notice"}})
         _insert_event(conn, source="slack_alert", external_id="ignoreme-recovery", title="All good now",
                        first_seen=OLD)
         calls: list[dict[str, Any]] = []
@@ -541,23 +593,24 @@ def test_ignore_policy_never_posts_or_escalates():
 
 
 def test_unstructured_prose_is_closed_ignored_and_never_escalates_or_posts():
-    """Unstructured #alerts prose (not a bot alert) that no rule maps is closed as
-    `ignored` — there is no `note` state any more — carrying why in its note. It
-    never escalates and never posts; a bracketed bot alert with no rule
-    stays `new`."""
+    """Unstructured #alerts prose (not a bot alert) is closed as `ignored` — there is no
+    `note` state any more — carrying why in its note, before any triage job exists for it. It
+    never escalates and never posts; a bracketed bot alert goes on to the triage step."""
     policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
     with _triage_env(policy=policy) as (conn, ctx):
         prose_title = ("1Password rate-limiting. Der Cronjob ruft `op run` jede Minute auf, "
                         "1.440 Authentifizierungen/Tag.")
         _insert_event(conn, source="slack_alert", external_id="op-rate-limit-note",
                        title=prose_title, first_seen=OLD)
-        # Deliberately NOT starting with "sig-" — DEFAULT_POLICY's one rule
-        # matches that prefix, and this row's job here is only to prove the
-        # bracketed bot-alert shape survives the structural filter unmapped.
+        # This row's job is only to prove the bracketed bot-alert shape survives the
+        # structural filter.
         _insert_event(conn, source="slack_alert", external_id="api-real-alert-down",
                        title="[API - HTTP] [:red_circle: Down] timeout <!channel>", first_seen=OLD)
         calls: list[dict[str, Any]] = []
+        triage_calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
+        triage._sideclaw.submit_triage = _fake_triage(
+            {"[API - HTTP] [:red_circle: Down] timeout <!channel>": "demo-repo"}, calls=triage_calls)
         triage.run(conn, dry_run=False)
 
         rows = {r["signature"]: r for r in conn.execute(
@@ -565,65 +618,27 @@ def test_unstructured_prose_is_closed_ignored_and_never_escalates_or_posts():
         prose = rows["slack_alert:op-rate-limit-note"]
         assert prose["state"] == triage.STATE_CLOSED and prose["close_reason"] == triage.CLOSE_IGNORED
         assert prose["note"], "the reason it was closed is recorded"
-        assert rows["slack_alert:api-real-alert-down"]["state"] == triage.STATE_NEW
+        assert rows["slack_alert:api-real-alert-down"]["state"] == triage.STATE_WORKING
+        assert len(triage_calls) == 1, "only the bot alert reaches the triage step"
 
-        assert calls == [], "a closed row must never escalate"
+        assert len(calls) == 1 and "api-real-alert-down" in calls[0]["brief"], "a closed row must never escalate"
         assert ctx.posted == [], "a closed(ignored) row must produce zero Slack posts"
 
 
-def test_rule_matching_runs_before_the_prose_filter():
-    """The ordering fix (items 1117/1118): a `slack_alert` that does not look
-    like a bot alert must still be matched against `rules` FIRST. Run the
-    other way round, the structural filter froze a whole producer family —
-    Beszel's bare-sentence `HomeLab CPU above threshold`, no prefix at all —
-    in a terminal state before any rule was consulted, which is what
-    made the homelab rules already in the shipped policy file unreachable. The filter's
-    own documented contract is the other half of this test: an un-prefixed,
-    rule-LESS message is still closed by it."""
-    policy = dict(
-        DEFAULT_POLICY,
-        ignoreUnstructuredSlackProse=True,
-        rules=[{"match": "slack_alert:homelab-cpu-above-threshold", "repo": "homelab"}],
-    )
-    with _triage_env(policy=policy) as (conn, ctx):
-        mapped_id = _insert_event(
-            conn, source="slack_alert", external_id="homelab-cpu-above-threshold",
-            title="HomeLab CPU above threshold", first_seen=OLD)
-        prose_id = _insert_event(
-            conn, source="slack_alert", external_id="unprefixed-no-rule",
-            title="HomeLab NVMe is running hot and no rule covers this yet", first_seen=OLD)
-        triage.ingest(conn, NOW)
-        triage.classify(conn, policy, NOW)
-
-        mapped = triage._get_item(conn, mapped_id)
-        assert mapped["repo"] == "homelab", (
-            "a rule-mapped signature must be resolved before the prose filter can "
-            f"route it to note — got repo={mapped['repo']!r} state={mapped['state']!r}")
-        assert mapped["state"] == triage.STATE_NEW, (
-            "classify() only resolves repo/verb — escalation is a later pass")
-        prose = triage._get_item(conn, prose_id)
-        assert prose["state"] == triage.STATE_CLOSED and prose["close_reason"] == triage.CLOSE_IGNORED, (
-            "an un-prefixed message with NO rule is still closed by the prose filter")
-
-
 def test_mapped_row_survives_a_second_classify_pass():
-    """The half §76 left open (item 121, 2026-09-20 07:53Z: quiet -> new ->
-    note with repo=homelab intact). classify() only consults `rules` for a row
-    with no repo/verb yet, so a row mapped on an EARLIER pass — still `new`
-    because it waits on the threshold or the cluster cap, or back in `new`
-    because its signature recurred — matched no rule of its own and fell
-    through to the prose filter, which froze it in a terminal state.
-    A mapped signal is never the filter's to route, on any pass."""
-    policy = dict(
-        DEFAULT_POLICY,
-        ignoreUnstructuredSlackProse=True,
-        rules=[{"match": "slack_alert:homelab-cpu-above-threshold", "repo": "homelab"}],
-    )
+    """A row routed on an EARLIER pass (item 121, 2026-09-20: quiet -> new -> note with
+    repo=homelab intact) — back in `new` because its signature recurred — must not fall
+    through to the prose filter, which froze it in a terminal state. classify()'s prose
+    filter only touches a row with no repo yet: a routed signal is never the filter's to
+    close, on any pass."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
     with _triage_env(policy=policy) as (conn, ctx):
         eid = _insert_event(
             conn, source="slack_alert", external_id="homelab-cpu-above-threshold",
             title="HomeLab CPU above threshold", first_seen=OLD)
         triage.ingest(conn, NOW)
+        conn.execute("UPDATE triage_items SET repo='homelab' WHERE event_id=?", (eid,))
+        conn.commit()
         triage.classify(conn, policy, NOW)
         triage.classify(conn, policy, NOW)
 
@@ -634,112 +649,14 @@ def test_mapped_row_survives_a_second_classify_pass():
         assert item["repo"] == "homelab"
 
 
-def test_corrected_rule_re_maps_a_reopened_alert_row_only():
-    """A rule corrected AFTER its signature was first mapped must be able to
-    heal that row. `uk:226` (MyAnonamouse Session - Push) was auto-proposed to
-    `warden` — nothing in warden implements it, the MAM scripts are
-    homelab-side — and the rule was corrected to `homelab`. The recurrence
-    reopened the SAME row, whose repo is pinned at first mapping, and
-    classify() skipped rule matching for any row that already carried one:
-    the correction was inert and the alert escalated to `warden` again.
-    Alert rows are the policy's to re-resolve. A `human` row keeps the repo
-    its caller chose and a `github_issue` row the issue's own — neither is a
-    rule outcome — and a rule that still says what the row already carries is
-    not a rewrite."""
-    stale_rule = [{"match": "uk:226", "repo": "warden"}]
-    corrected_rule = [{"match": "uk:226", "repo": "homelab"},
-                      {"match": "human:*", "repo": "homelab"}]
-    with _triage_env(policy=dict(DEFAULT_POLICY, rules=stale_rule)) as (conn, ctx):
-        alert_id = _insert_event(conn, source="uk", external_id="226",
-                                  title="MyAnonamouse Session - Push", first_seen=OLD)
-        triage.ingest(conn, NOW)
-        triage.classify(conn, dict(DEFAULT_POLICY, rules=stale_rule), NOW)
-        assert triage._get_item(conn, alert_id)["repo"] == "warden"
-
-        hand_id = triage.open_origin_item(
-            conn, origin="human", repo="warden", brief="hand-filed", max_tier="investigate",
-            external_id="hand-1", title="hand-filed item", now=OLD)
-
-        corrected = dict(DEFAULT_POLICY, rules=corrected_rule)
-        triage.classify(conn, corrected, NOW)
-
-        healed = triage._get_item(conn, alert_id)
-        assert healed["repo"] == "homelab", (
-            "a corrected rule must heal the row it already mapped, or the correction can "
-            f"never take effect for a recurring signature — got {healed['repo']!r}")
-        assert healed["state"] == triage.STATE_NEW, (
-            f"re-mapping is not escalation — got state={healed['state']!r}")
-        assert triage._get_item(conn, hand_id)["repo"] == "warden", (
-            "a hand-opened item keeps the repo its caller chose; the policy is not its to "
-            "overwrite")
-
-        stamped = healed["updated_at"]
-        triage.classify(conn, corrected, NOW + dt.timedelta(minutes=1))
-        assert triage._get_item(conn, alert_id)["updated_at"] == stamped, (
-            "a rule that still says what the row already carries must not rewrite the row")
-
-
-def test_uk_maps_via_title_not_external_id():
-    """The core fix for correction #1: uk's external_id is an opaque monitor
-    id, unglobbable and unstable — only the title-derived match target makes
-    it mappable."""
-    policy = dict(DEFAULT_POLICY, rules=[{"match": "uk:macmini-dev-host-push", "repo": "dotfiles"}])
-    with _triage_env(policy=policy) as (conn, ctx):
-        eid = _insert_event(conn, source="uk", external_id="204", title="MacMini Dev Host - Push",
-                             first_seen=OLD)
-        triage.ingest(conn, NOW)
-        triage.classify(conn, policy, NOW)
-        item = triage._get_item(conn, eid)
-        assert item["repo"] == "dotfiles", f"expected dotfiles via title match, got {item['repo']!r}"
-
-
-def test_shipped_policy_routes_argo_infra_signals_to_vps():
-    """Correction #4: an infra-signal alert about a RollHook-managed app
-    maps to the repo owning its compose file/deploy target, not its source.
-    argo is compose-managed inside `vps` (apps/argo/compose.yml, make
-    argo-up) — a downed argo container, or its api-*/dashboard-* Kuma child
-    monitors, must route to `vps`, never `argo`. Loads the REAL shipped
-    config/triage-policy.json, not a test fixture, so a future accidental
-    revert of this fix fails this test directly."""
-    real_policy_path = triage.POLICY_PATH
-    real_policy = json.loads(real_policy_path.read_text())
-    rules = real_policy["rules"]
-
-    cases = [
-        ("docker_vps:unhealthy:argo-web", "vps"),
-        ("docker_vps:restart:argo-worker", "vps"),
-        ("slack_alert:api-docker-red-circle-down-request-failed-with-status-code-404-channel", "vps"),
-        ("slack_alert:api-http-red-circle-down-connect-ehostunreach-172-22-0-12-4000-channel", "vps"),
-        ("slack_alert:dashboard-docker-red-circle-down-request-failed-with-status-code-404-channel", "vps"),
-        ("slack_alert:dashboard-http-red-circle-down-connect-econnrefused-100-97-220-54-443-channel", "vps"),
-    ]
-    for target, expected_repo in cases:
-        matched = None
-        for rule in rules:
-            import fnmatch as _fnmatch
-            if _fnmatch.fnmatch(target, rule["match"]):
-                matched = rule
-                break
-        assert matched is not None, f"{target!r} matched no rule in the shipped policy"
-        assert matched.get("repo") == expected_repo, (
-            f"{target!r} matched {matched!r}, expected repo={expected_repo!r}"
-        )
-    assert not any(r.get("repo") == "argo" for r in rules), (
-        "no rule in the shipped policy may point at `argo` — the deploy target is `vps`"
-    )
-
-
 def test_max_open_investigations_cap():
     triage.MAX_OPEN_INVESTIGATIONS = 1
     with _triage_env() as (conn, ctx):
         _insert_event(conn, source="slack_alert", external_id="sig-cap-a", title="A", first_seen=OLD)
         # A different repo so it does NOT cluster with sig-cap-a — this test
         # is about the concurrency cap across independent clusters.
-        policy = dict(DEFAULT_POLICY, rules=[
-            {"match": "slack_alert:sig-cap-a", "repo": "demo-repo"},
-            {"match": "slack_alert:sig-cap-b", "repo": "other-repo"},
-        ])
-        _write_json(triage.POLICY_PATH, policy)
+        _add_repo(ctx, "other-repo")
+        triage._sideclaw.submit_triage = _fake_triage({"A": "demo-repo", "B": "other-repo"})
         _insert_event(conn, source="slack_alert", external_id="sig-cap-b", title="B", first_seen=OLD)
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
@@ -747,7 +664,7 @@ def test_max_open_investigations_cap():
         assert len(calls) == 1, f"MAX_OPEN_INVESTIGATIONS=1 must cap concurrent clusters, got {len(calls)}"
         states = [r["state"] for r in conn.execute("SELECT state FROM triage_items ORDER BY event_id").fetchall()]
         assert states.count(triage.STATE_WORKING) == 1
-        assert states.count(triage.STATE_NEW) == 1
+        assert states.count(triage.STATE_TRIAGED) == 1
 
 
 def _refusing_submit(calls: list[dict[str, Any]], *, status: int = 400,
@@ -765,8 +682,9 @@ def test_sideclaw_refusal_of_an_investigate_dispatch_ends_the_item_and_is_never_
     item `failed` carrying sideclaw's own message, immediately — a 4xx is not an
     infrastructure failure, so no strike and no retry. The next tick must not submit
     the same refused dispatch again."""
-    policy = dict(DEFAULT_POLICY, rules=[{"match": "slack_alert:sig-*", "repo": "refused-repo"}])
-    with _triage_env(policy=policy) as (conn, ctx):
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "refused-repo")
+        triage._sideclaw.submit_triage = _fake_triage({"Refused": "refused-repo"})
         _insert_event(conn, source="slack_alert", external_id="sig-refused", title="Refused", first_seen=OLD)
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _refusing_submit(calls, message="dispatch refused: repo is not allowed")
@@ -830,9 +748,9 @@ def test_auto_dispatches_send_no_model_key():
         assert not hasattr(triage, "AUTO_DISPATCH_MODEL") and not hasattr(triage, "AUTO_IMPLEMENT_MODEL")
 
 
-def test_unmapped_repo_never_dispatches():
-    policy = dict(DEFAULT_POLICY, rules=[])
-    with _triage_env(policy=policy) as (conn, ctx):
+def test_triage_naming_an_unknown_repo_never_dispatches():
+    with _triage_env() as (conn, ctx):
+        triage._sideclaw.submit_triage = _fake_triage({"Nowhere": "no-such-repo"})
         _insert_event(conn, source="slack_alert", external_id="sig-nowhere", title="Nowhere", first_seen=OLD)
         # Pre-seed today's unmapped-digest cursor so the separate, deliberate
         # digest mechanism doesn't count against "an unescalated item gets no card".
@@ -843,10 +761,10 @@ def test_unmapped_repo_never_dispatches():
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
-        assert calls == [], "an unmapped repo must never produce a dispatch"
-        item = conn.execute("SELECT state, repo FROM triage_items").fetchone()
+        assert calls == [], "a repo no checkout backs must never produce a dispatch"
+        item = conn.execute("SELECT state, repo, strikes, triage_job FROM triage_items").fetchone()
         assert item["repo"] is None
-        assert item["state"] == triage.STATE_NEW
+        assert item["state"] == triage.STATE_NEW and item["strikes"] == 1 and item["triage_job"] is None
         assert ctx.total_calls() == 0, "an unescalated (state=new) item must never get a card"
 
 
@@ -872,11 +790,9 @@ def test_cluster_same_repo_one_dispatch_both_edges():
 
 
 def test_cluster_different_repos_two_dispatches():
-    policy = dict(DEFAULT_POLICY, rules=[
-        {"match": "slack_alert:sig-diff-a", "repo": "demo-repo"},
-        {"match": "slack_alert:sig-diff-b", "repo": "other-repo"},
-    ])
-    with _triage_env(policy=policy) as (conn, ctx):
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "other-repo")
+        triage._sideclaw.submit_triage = _fake_triage({"A": "demo-repo", "B": "other-repo"})
         _insert_event(conn, source="slack_alert", external_id="sig-diff-a", title="A", first_seen=OLD)
         _insert_event(conn, source="slack_alert", external_id="sig-diff-b", title="B", first_seen=OLD)
         calls: list[dict[str, Any]] = []
@@ -1039,11 +955,11 @@ def test_escalate_singleton_splits_never_group():
         )
 
 
-def test_escalate_prefers_split_over_new_in_same_repo_and_defers_new():
-    """"split candidates are considered before new clusters" — and the
-    existing "one dispatch per repo per run" property holds across both
-    kinds: a repo with an eligible split item spends this run's slot on it,
-    and its new items wait for the next run, reported rather than dropped
+def test_escalate_prefers_singleton_over_cluster_in_same_repo_and_defers_cluster():
+    """"singletons (dissolved cluster members) are considered before fresh
+    clusters" — and the "one dispatch per repo per run" property holds across
+    both kinds: a repo with an eligible singleton spends this run's slot on it,
+    and its other triaged items wait for the next run, reported rather than dropped
     (DESIGN.md § What must not be lost item 7, "overflow waits, never
     drops")."""
     with _triage_env() as (conn, ctx):
@@ -1054,7 +970,7 @@ def test_escalate_prefers_split_over_new_in_same_repo_and_defers_new():
         conn.execute(
             "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
             "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (new_eid, "slack_alert:sig-priority-new", "demo-repo", triage.STATE_NEW, 5,
+            (new_eid, "slack_alert:sig-priority-new", "demo-repo", triage.STATE_TRIAGED, 5,
              OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
         )
         conn.commit()
@@ -1075,8 +991,8 @@ def test_escalate_prefers_split_over_new_in_same_repo_and_defers_new():
             f"expected the split item to win this run's slot, got origin_event_id={origin_event_id!r}"
         )
         assert triage._get_item(conn, split_eid)["state"] == triage.STATE_WORKING
-        assert triage._get_item(conn, new_eid)["state"] == triage.STATE_NEW, (
-            "the new item must wait for the next run, not be dropped"
+        assert triage._get_item(conn, new_eid)["state"] == triage.STATE_TRIAGED, (
+            "the clustered item must wait for the next run, not be dropped"
         )
         assert "wait for next run" in err.getvalue(), (
             f"a deferral that only reaches nothing is indistinguishable from a broken loop: "
@@ -1202,12 +1118,18 @@ def test_dry_run_never_calls_slack_or_dispatch():
     with _triage_env() as (conn, ctx):
         _insert_event(conn, source="slack_alert", external_id="sig-dry", title="Dry run", first_seen=OLD)
         calls: list[dict[str, Any]] = []
+        triage_calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
-        triage.run(conn, dry_run=True)
+        triage._sideclaw.submit_triage = _fake_triage({"Dry run": "demo-repo"}, calls=triage_calls)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            triage.run(conn, dry_run=True)
         assert calls == [], "--dry-run must never shell out to hermes-cc.sh"
+        assert triage_calls == [], "--dry-run must never submit a triage job"
+        assert "would submit 1 triage job" in out.getvalue(), out.getvalue()
         assert ctx.total_calls() == 0, "--dry-run must never touch Slack"
-        item = conn.execute("SELECT state, repo FROM triage_items").fetchone()
-        assert item["repo"] == "demo-repo"
+        item = conn.execute("SELECT state, repo, triage_job FROM triage_items").fetchone()
+        assert item["repo"] is None and item["triage_job"] is None
         assert item["state"] == triage.STATE_NEW
 
 
@@ -1218,13 +1140,15 @@ def test_dry_run_simulates_caps_across_repos():
     repos in one pass correctly shows a later repo deferred, matching what a
     real run would actually do."""
     triage.MAX_OPEN_INVESTIGATIONS = 1
-    policy = dict(DEFAULT_POLICY, rules=[
-        {"match": "slack_alert:sig-simA", "repo": "repo-a"},
-        {"match": "slack_alert:sig-simB", "repo": "repo-b"},
-    ])
-    with _triage_env(policy=policy) as (conn, ctx):
-        _insert_event(conn, source="slack_alert", external_id="sig-simA", title="A", first_seen=OLD)
-        _insert_event(conn, source="slack_alert", external_id="sig-simB", title="B", first_seen=OLD)
+    with _triage_env() as (conn, ctx):
+        for ext, repo in (("sig-simA", "repo-a"), ("sig-simB", "repo-b")):
+            eid = _insert_event(conn, source="slack_alert", external_id=ext, title=ext[-1], first_seen=OLD)
+            conn.execute(
+                "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+                "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (eid, f"slack_alert:{ext}", repo, triage.STATE_TRIAGED, 5,
+                 OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()))
+        conn.commit()
         import contextlib as _cl
         import io as _io
         out, err = _io.StringIO(), _io.StringIO()
@@ -1238,7 +1162,7 @@ def test_dry_run_simulates_caps_across_repos():
         )
         # Nothing actually mutated.
         states = [r["state"] for r in conn.execute("SELECT state FROM triage_items").fetchall()]
-        assert states == [triage.STATE_NEW, triage.STATE_NEW]
+        assert states == [triage.STATE_TRIAGED, triage.STATE_TRIAGED]
 
 
 # --- Wave 6.1: every origin opens an item -----------------------------------
@@ -1327,6 +1251,7 @@ def test_human_item_escalates_as_a_cluster_of_one_with_its_own_brief():
         )
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
+        _triage_pass(conn)
         triage.escalate_origin_items(conn, NOW)
 
         assert len(calls) == 1, f"expected exactly one dispatch, got {len(calls)}"
@@ -1351,6 +1276,8 @@ def test_human_item_with_its_own_origin_thread_routes_the_dispatch_there():
         item = triage._get_item(conn, eid)
         assert item["origin_channel"] == "C0ORIGIN0001" and item["origin_thread_ts"] == "1111.000001"
 
+        triage._sideclaw.submit = _fake_submit([])
+        _triage_pass(conn)
         triage.escalate_origin_items(conn, NOW)
 
         d = conn.execute(
@@ -1372,6 +1299,8 @@ def test_human_item_without_its_own_origin_thread_falls_back_to_the_card_channel
         item = triage._get_item(conn, eid)
         assert item["origin_channel"] is None and item["origin_thread_ts"] is None
 
+        triage._sideclaw.submit = _fake_submit([])
+        _triage_pass(conn)
         triage.escalate_origin_items(conn, NOW)
 
         d = conn.execute(
@@ -1381,7 +1310,7 @@ def test_human_item_without_its_own_origin_thread_falls_back_to_the_card_channel
         assert d["origin_thread_ts"] is None, dict(d)
 
 
-def test_escalate_origin_items_overflow_waits_in_new_with_note():
+def test_escalate_origin_items_overflow_waits_in_triaged_with_note():
     saved_cap = triage.MAX_OPEN_INVESTIGATIONS
     try:
         triage.MAX_OPEN_INVESTIGATIONS = 0
@@ -1392,11 +1321,12 @@ def test_escalate_origin_items_overflow_waits_in_new_with_note():
             )
             calls: list[dict[str, Any]] = []
             triage._sideclaw.submit = _fake_submit(calls)
+            _triage_pass(conn)
             triage.escalate_origin_items(conn, NOW)
 
             assert calls == [], "at the cap, nothing may dispatch"
             item = triage._get_item(conn, eid)
-            assert item["state"] == triage.STATE_NEW, "overflow waits in `new`, never drops"
+            assert item["state"] == triage.STATE_TRIAGED, "overflow waits in `triaged`, never drops"
             assert item["note"] and "MAX_OPEN_INVESTIGATIONS" in item["note"]
     finally:
         triage.MAX_OPEN_INVESTIGATIONS = saved_cap
@@ -2048,6 +1978,7 @@ def test_escalate_origin_items_wraps_third_party_github_issue_body_as_untrusted(
         )
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
+        _triage_pass(conn)
         triage.escalate_origin_items(conn, NOW)
 
         assert len(calls) == 1, calls
@@ -2094,6 +2025,7 @@ def test_escalate_origin_items_own_github_issue_brief_carries_closes_guidance():
         )
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit = _fake_submit(calls)
+        _triage_pass(conn)
         triage.escalate_origin_items(conn, NOW)
 
         assert len(calls) == 1, calls
@@ -2213,11 +2145,11 @@ def test_op_refs_raw_fallback_dedups_across_timestamps():
     assert key3 == key4
 
 
-# --- evidence commands (declared runtime-state probes) -----------------------
+# --- watchdog-poll stand-in, bounded helper -------------------------------------
 
 def _fake_wp_module(messages=None, *, homelab_key: str = "test-homelab-key", fetch_ok: bool = True):
     """A stand-in for the watchdog-poll.py sibling module used by
-    _gather_kuma_push_last()/resolve_recovery_paired() — no real network call,
+    resolve_recovery_paired() — no real network call,
     no dependency on a real HOMELAB_API_KEY being resolvable in this venv."""
     return types.SimpleNamespace(
         resolve_secret=lambda key: homelab_key if key == "HOMELAB_API_KEY" else "",
@@ -2231,97 +2163,7 @@ def _slack_msg(ts: str, text: str) -> dict[str, Any]:
     return {"external_id": ts, "title": text[:240], "url": "", "payload": {"text": text}}
 
 
-def test_evidence_weatherorb_health_bounded_output():
-    """weatherorb-health must summarize (not dump) var/health.json, and the
-    rendered evidence block must stay bounded even when the source file is
-    large — ~40 real checks, several failing, well over EVIDENCE_CAP_CHARS
-    once rendered raw."""
-    with _triage_env() as (conn, ctx):
-        health_path = ctx.tmp_dir / "weatherorb-health.json"
-        checks = [{"name": f"check-{i}", "ok": False, "detail": "x" * 200} for i in range(40)]
-        _write_json(health_path, {"ok": False, "heartbeat": "skipped(failure)",
-                                   "timestamp": "2026-09-08T18:47:52+00:00", "checks": checks})
-        triage.WEATHERORB_HEALTH_PATH = health_path
-
-        raw = triage._gather_evidence("weatherorb-health", [])
-        assert "ok=False" in raw and "40/40 checks failing" in raw
-
-        block = triage._build_evidence_block(["weatherorb-health"], {1: None}, triage.EVIDENCE_TOTAL_CAP_CHARS)
-        assert "weatherorb-health" in block
-        assert len(block) <= triage.EVIDENCE_TOTAL_CAP_CHARS
-        assert "…" in block, "a 40-check dump must have been truncated by the per-key cap"
-
-
-def test_evidence_gateway_starts_bounded_output():
-    with _triage_env() as (conn, ctx):
-        starts_path = ctx.tmp_dir / "gateway-starts.log"
-        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc).timestamp()
-        starts_path.write_text("\n".join(str(base + i * 3600) for i in range(20)) + "\n")
-        triage.GATEWAY_STARTS_LOG = starts_path
-
-        result = triage._gather_evidence("gateway-starts", [])
-        assert "last 5 gateway start(s)" in result
-        assert result.count(" UTC") == 5, "must show the 5 most recent starts, not every one on file"
-        assert "2026-01-01 00:00" not in result, "must show the 5 MOST RECENT starts, not the earliest ones"
-        assert len(result) <= triage.EVIDENCE_CAP_CHARS
-
-
-def test_evidence_hermes_log_tail_slices_at_gateway_start():
-    """The fix skills/hermes-gateway/SKILL.md's Rule 0 documents: a raw tail
-    mixes a dead incarnation's errors with the live one. gateway-starts.log's
-    last entry is the boundary; nothing before it may appear in the result."""
-    with _triage_env() as (conn, ctx):
-        boundary_dt = dt.datetime(2026, 1, 1, 12, 0, 0)
-        starts_path = ctx.tmp_dir / "gateway-starts.log"
-        starts_path.write_text(f"{boundary_dt.timestamp()}\n")
-        triage.GATEWAY_STARTS_LOG = starts_path
-
-        error_log = ctx.tmp_dir / "errors.log"
-        error_log.write_text(
-            "2026-01-01 11:59:00,000 WARNING old.module: BEFORE_BOUNDARY_MUST_BE_EXCLUDED\n"
-            "2026-01-01 12:00:00,000 WARNING new.module: AT_BOUNDARY_MUST_BE_INCLUDED\n"
-            "2026-01-01 12:00:05,000 WARNING new.module: AFTER_BOUNDARY_MUST_BE_INCLUDED\n"
-        )
-        triage.HERMES_ERROR_LOG = error_log
-
-        result = triage._gather_evidence("hermes-log-tail", [])
-        assert "BEFORE_BOUNDARY_MUST_BE_EXCLUDED" not in result
-        assert "AT_BOUNDARY_MUST_BE_INCLUDED" in result
-        assert "AFTER_BOUNDARY_MUST_BE_INCLUDED" in result
-        assert "sliced at current gateway start" in result
-
-
-def test_evidence_kuma_push_last_matches_bracket_and_normalizes():
-    with _triage_env() as (conn, ctx):
-        eid = _insert_event(conn, source="uk", external_id="204", title="MacMini Dev Host - Push",
-                             first_seen=OLD)
-        uk_event = triage._get_event(conn, eid)
-
-        older = "[MacMini Dev Host - Push] all green"
-        newest = "[MacMini Dev Host - Push] FAIL: disk 90% used (max 90%)"
-        unrelated = "[Some Other Monitor - Push] unrelated"
-        triage._watchdog_poll = _fake_wp_module([
-            _slack_msg("100.000001", older),
-            _slack_msg("300.000001", newest),
-            _slack_msg("200.000001", unrelated),
-        ])
-
-        result = triage._gather_evidence("kuma-push-last", [uk_event])
-        assert result == newest, "must pick the CHRONOLOGICALLY LATEST match, not list order"
-        assert "Some Other Monitor" not in result
-
-
-def test_evidence_kuma_push_last_no_uk_member_is_non_fatal():
-    with _triage_env() as (conn, ctx):
-        eid = _insert_event(conn, source="slack_alert", external_id="sig-a", title="not a uk event",
-                             first_seen=OLD)
-        event_row = triage._get_event(conn, eid)
-        triage._watchdog_poll = _fake_wp_module([])
-        result = triage._gather_evidence("kuma-push-last", [event_row])
-        assert "no uk" in result.lower()
-
-
-def test_evidence_hang_does_not_block_past_its_timeout():
+def test_run_bounded_hang_does_not_block_past_its_timeout():
     """_run_bounded() must RETURN at its timeout, not merely report one.
 
     Regression test for a real bug: the executor was used as a context manager,
@@ -2329,7 +2171,7 @@ def test_evidence_hang_does_not_block_past_its_timeout():
     finishes. A hung gatherer (a stuck network read, an unresponsive mount) would
     therefore sail past `timeout` and stall the whole 10-minute loop, while the
     caller still saw a tidy "timed out" string. The bug was invisible to every
-    other evidence test, because a gatherer that raises or returns quickly exits
+    other test, because a gatherer that raises or returns quickly exits
     the `with` block immediately either way — only an actual hang exposes it.
     Asserts wall-clock, which is the only thing that would have caught it."""
     started = time.monotonic()
@@ -2338,93 +2180,6 @@ def test_evidence_hang_does_not_block_past_its_timeout():
     assert ok is False, ok
     assert "timed out" in result, result
     assert elapsed < 5, f"_run_bounded blocked {elapsed:.1f}s past a 1s timeout"
-
-
-def test_evidence_command_failure_is_non_fatal():
-    """A raising gatherer must never abort the run — _run_bounded() folds it
-    into an error string, and _build_evidence_block() still renders every
-    OTHER requested key normally alongside it."""
-    with _triage_env() as (conn, ctx):
-        starts_path = ctx.tmp_dir / "gateway-starts.log"
-        starts_path.write_text(f"{dt.datetime.now(dt.timezone.utc).timestamp()}\n")
-        triage.GATEWAY_STARTS_LOG = starts_path
-
-        saved_gatherers = dict(triage._EVIDENCE_GATHERERS)
-        try:
-            def _boom(_event_rows):
-                raise RuntimeError("simulated evidence failure")
-
-            triage._EVIDENCE_GATHERERS = {**saved_gatherers, "weatherorb-health": _boom}
-
-            single = triage._gather_evidence("weatherorb-health", [])
-            assert "evidence command 'weatherorb-health' failed" in single
-            assert "simulated evidence failure" in single
-
-            block = triage._build_evidence_block(["weatherorb-health", "gateway-starts"], {1: None},
-                                                   triage.EVIDENCE_TOTAL_CAP_CHARS)
-            assert "weatherorb-health" in block and "gateway-starts" in block
-            assert "simulated evidence failure" in block
-            assert "gateway start" in block, "a failing key must not take down a sibling key's output"
-        finally:
-            triage._EVIDENCE_GATHERERS = saved_gatherers
-
-
-def test_unknown_evidence_key_rejected_at_policy_load():
-    """Same closed-set contract as verbs — a policy file must never be able
-    to name anything outside EVIDENCE_ALLOWLIST."""
-    policy = dict(DEFAULT_POLICY, rules=[{"match": "slack_alert:sig-*", "repo": "demo-repo",
-                                           "evidence": ["not-a-real-key"]}])
-    with _triage_env(policy=policy) as (conn, ctx):
-        loaded = triage.load_policy()
-        assert loaded["rules"] == [], "an unknown evidence key must drop the whole rule, not pass it through"
-
-
-def test_evidence_total_stays_under_brief_cap():
-    """A cluster whose title is already huge leaves little budget for
-    evidence — the whole brief (structure + evidence) must still respect
-    MAX_BRIEF_CHARS, the evidence block must be what gets cut, never the
-    closing instructions, and a truncation note must say so."""
-    policy = dict(DEFAULT_POLICY, rules=[
-        {"match": "slack_alert:sig-*", "repo": "demo-repo",
-         "evidence": ["weatherorb-health", "gateway-starts", "hermes-log-tail", "kuma-push-last"]},
-    ])
-    with _triage_env(policy=policy) as (conn, ctx):
-        health_path = ctx.tmp_dir / "weatherorb-health.json"
-        checks = [{"name": f"check-{i}", "ok": False, "detail": "y" * 200} for i in range(40)]
-        _write_json(health_path, {"ok": False, "heartbeat": "skipped(failure)",
-                                   "timestamp": "2026-09-08T00:00:00+00:00", "checks": checks})
-        triage.WEATHERORB_HEALTH_PATH = health_path
-        triage.GATEWAY_STARTS_LOG = ctx.tmp_dir / "does-not-exist.log"
-        triage.HERMES_ERROR_LOG = ctx.tmp_dir / "does-not-exist-errors.log"
-        triage._watchdog_poll = _fake_wp_module([])
-
-        # Large enough to leave a tight-but-positive evidence budget once the
-        # brief's own structure (the title appears twice: once in the alert
-        # line, once as its own "raw:" echo) is accounted for — see
-        # _build_cluster_brief()'s own evidence-budget comment. A title big
-        # enough to ALSO blow the structure itself is a different, pre-
-        # existing case (see test_dispatch_brief_on_stdin_and_capped) and
-        # would not isolate what this test is checking.
-        huge_title = "A" * 3000
-        _insert_event(conn, source="slack_alert", external_id="sig-huge-evidence", title=huge_title,
-                       first_seen=OLD)
-
-        calls: list[dict[str, Any]] = []
-        triage._sideclaw.submit = _fake_submit(calls)
-
-        triage.run(conn, dry_run=False)
-
-        assert len(calls) == 1
-        brief = calls[0]["brief"]
-
-        assert len(brief) <= triage.MAX_BRIEF_CHARS, (
-            f"brief was {len(brief)} chars, over the {triage.MAX_BRIEF_CHARS} cap"
-        )
-        assert "This alert reached the auto-triage escalation threshold" in brief, (
-            "the brief's own closing structure must survive intact — only evidence gets cut"
-        )
-        assert "CAPTURED RUNTIME STATE" in brief
-        assert "truncated to fit the brief cap" in brief, "a 40-check dump plus a 7000-char title must force evidence truncation"
 
 
 # --- grouped-source resolution (quiet timer + recovery pairing) --------------
@@ -2590,12 +2345,12 @@ def test_recovery_paired_resolves_immediately_without_waiting_for_quiet():
     this must resolve on the VERY NEXT run, not wait out quietResolveHours."""
     policy = dict(DEFAULT_POLICY, quietResolveHours=999)
     with _triage_env(policy=policy) as (conn, ctx):
-        eid = _insert_event(conn, source="slack_alert", external_id="research-gateway-job-reaped-1-15m",
+        eid = _insert_event(conn, source="slack_alert", external_id=watchdog_poll.fingerprint("🚨 research-gateway job.reaped >= 1 (15m)"),
                              title="🚨 research-gateway job.reaped >= 1 (15m) (×3 in batch)", first_seen=OLD)
         conn.execute(
             "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
             "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (eid, "slack_alert:research-gateway-job-reaped-1-15m", "vps", triage.STATE_NEW, 3,
+            (eid, "slack_alert:research-gateway-job-reaped-m", "vps", triage.STATE_NEW, 3,
              OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
         )
         conn.commit()
@@ -4451,10 +4206,10 @@ def test_liveness_failure_reopens_the_item_with_history():
         triage.maybe_check_liveness(conn, policy, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_NEW, "must reopen to `new`, not sit deployed forever"
+        assert item["state"] == triage.STATE_TRIAGED, "must reopen to `triaged`, not sit deployed forever"
         assert "pull/14" in item["note"], "the reopened item must carry the PR in its history"
         assert "Y: live threshold=9" in item["note"], "the reopened item must carry the last liveness check"
-        assert ctx.posted == [], "a reopen to `new` is silent"
+        assert ctx.posted == [], "a reopen to `triaged` is silent"
 
 
 def test_liveness_still_inside_window_neither_resolves_nor_reopens():
@@ -5433,12 +5188,12 @@ def test_recovery_paired_never_produces_fixed():
     fix." Nothing SHIPPED — the service recovered, by our hand or its own,
     and this ledger cannot tell which."""
     with _triage_env() as (conn, _ctx):
-        eid = _insert_event(conn, source="slack_alert", external_id="research-gateway-job-reaped-1-15m",
+        eid = _insert_event(conn, source="slack_alert", external_id=watchdog_poll.fingerprint("🚨 research-gateway job.reaped >= 1 (15m)"),
                              title="🚨 research-gateway job.reaped >= 1 (15m) (×3 in batch)", first_seen=OLD)
         conn.execute(
             "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
             "last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (eid, "slack_alert:research-gateway-job-reaped-1-15m", "vps", triage.STATE_NEW, 3,
+            (eid, "slack_alert:research-gateway-job-reaped-m", "vps", triage.STATE_NEW, 3,
              OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
         )
         conn.commit()
@@ -6365,6 +6120,1076 @@ def test_comment_back_is_at_most_three_lines():
         assert len(triage._comment_back_body("closed", None, {"summary": "s"}).split("\n")) == 2
 
 
+# --- the triage step (agent-platform.md §Warden step 2) -------------------------
+
+intake = triage._intake
+
+
+def _seed_row(conn, *, external_id: str, title: str = "t", repo: str | None = None,
+              state: str = triage.STATE_NEW, origin: str = "alert", source: str = "slack_alert",
+              occurrences: int = 1, updated_at: dt.datetime | None = None, pr_url: str | None = None,
+              root_cause: str | None = None, note: str | None = None, implement_job: str | None = None,
+              payload: dict[str, Any] | None = None, brief: str | None = None,
+              url: str = "", first_seen: dt.datetime = OLD) -> int:
+    """An event plus its triage_items row, in any state — for tests about what the triage step
+    reads and writes, not about how an item got there."""
+    eid = _insert_event(conn, source=source, external_id=external_id, title=title, first_seen=first_seen,
+                        payload=payload)
+    if url:
+        conn.execute("UPDATE events SET url=? WHERE id=?", (url, eid))
+    stamp = (updated_at or NOW).isoformat()
+    conn.execute(
+        "INSERT INTO triage_items(event_id, signature, repo, state, origin, occurrences, first_seen, last_seen, "
+        "created_at, updated_at, pr_url, root_cause, note, implement_job, brief) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (eid, f"{source}:{external_id}", repo, state, origin, occurrences, first_seen.isoformat(), stamp,
+         stamp, stamp, pr_url, root_cause, note, implement_job, brief))
+    conn.commit()
+    return eid
+
+
+def _fold(conn, eid: int, answer: dict[str, Any] | None, *, job_id: str = "triage-job-x",
+          status: str = "done", error: str | None = None) -> str | None:
+    """Settle `eid` with a finished triage job carrying `answer`."""
+    conn.execute("UPDATE triage_items SET triage_job=? WHERE event_id=?", (job_id, eid))
+    conn.commit()
+    job = _triage_job(answer, job_id=job_id, status=status, error=error) if answer is not None else {
+        "id": job_id, "status": "done", "result": {"result": None}}
+    return triage._fold_triage_job(conn, eid, job_id, job, NOW)
+
+
+def _rows(conn, eid: int) -> sqlite3.Row:
+    return triage._get_item(conn, eid)
+
+
+# -- label routing --
+
+def test_label_route_issue_and_human_carry_their_own_repo():
+    with _triage_env() as (conn, ctx):
+        issue = triage.open_origin_item(conn, origin="github_issue", repo="argo", brief="b", max_tier="implement",
+                                         external_id="jkrumm/argo#1", title="issue", now=NOW)
+        human = triage.open_origin_item(conn, origin="human", repo="not-a-checkout", brief="b",
+                                         max_tier="investigate", external_id="human:1", title="ask", now=NOW)
+        for eid, repo in ((issue, "argo"), (human, "not-a-checkout")):
+            assert intake.route_by_label(_rows(conn, eid), triage._get_event(conn, eid)) == repo
+
+
+def test_label_route_kuma_tag_equal_to_a_known_repo():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "weatherorb")
+        cases = [
+            ([{"name": "repo", "value": "weatherorb"}], "weatherorb"),
+            (["weatherorb"], "weatherorb"),
+            ([{"name": "WeatherOrb", "value": ""}], "weatherorb"),
+            ([{"name": "repo", "value": "no-such-repo"}], None),
+            (None, None),
+        ]
+        for i, (tags, expected) in enumerate(cases):
+            eid = _seed_row(conn, external_id=f"{i}", title=f"Monitor {i}", source="uk",
+                            payload={"type": "http", "status": 0, "tags": tags})
+            got = intake.route_by_label(_rows(conn, eid), triage._get_event(conn, eid))
+            assert got == expected, (tags, got)
+
+
+def test_label_route_docker_container_name_equal_to_a_known_repo():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "weatherorb")
+        known = _seed_row(conn, external_id="unhealthy:weatherorb", title="weatherorb unhealthy (vps)",
+                          source="docker_vps")
+        restart = _seed_row(conn, external_id="restart:weatherorb", title="weatherorb restart-loop (vps)",
+                            source="docker_homelab")
+        other = _seed_row(conn, external_id="unhealthy:redis", title="redis unhealthy (vps)", source="docker_vps")
+        for eid, expected in ((known, "weatherorb"), (restart, "weatherorb"), (other, None)):
+            assert intake.route_by_label(_rows(conn, eid), triage._get_event(conn, eid)) == expected
+
+
+def test_label_route_otel_service_name_in_an_alert_text():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "audio-gateway")
+        cases = [
+            ("🚨 podcast.failed >= 1 (15m) service.name: audio-gateway", "audio-gateway"),
+            ("🚨 p95 too high service.name=audio-gateway env=prod", "audio-gateway"),
+            ("🚨 queue deep service:audio-gateway", "audio-gateway"),
+            ("🚨 job.reaped service.name: some-unknown-service", None),
+            ("🚨 job.reaped with no label at all", None),
+        ]
+        for i, (title, expected) in enumerate(cases):
+            eid = _seed_row(conn, external_id=f"otel-{i}", title=title)
+            assert intake.route_by_label(_rows(conn, eid), triage._get_event(conn, eid)) == expected, title
+        # The label can sit in the payload text instead of the title.
+        eid = _seed_row(conn, external_id="otel-payload", title="🚨 alert",
+                        payload={"first_text": "🚨 alert (service.name: audio-gateway)"})
+        assert intake.route_by_label(_rows(conn, eid), triage._get_event(conn, eid)) == "audio-gateway"
+
+
+def test_known_repos_need_an_agents_md_and_skip_worktrees():
+    with _triage_env() as (conn, ctx):
+        root = ctx.tmp_dir / "repos-root"
+        _add_repo(ctx, "alpha")
+        (root / "no-agents").mkdir()
+        (root / "worktree").mkdir()
+        (root / "worktree" / "AGENTS.md").write_text("# w\n")
+        (root / "worktree" / ".git").write_text("gitdir: /elsewhere\n")
+        (root / ".hidden").mkdir()
+        (root / ".hidden" / "AGENTS.md").write_text("# h\n")
+        assert intake.known_repos() == ["alpha", "demo-repo"], intake.known_repos()
+
+
+# -- the prompt --
+
+def _prompt_for(conn, eid: int, candidates: list[str]) -> str:
+    return intake.build_triage_prompt(conn, _rows(conn, eid), triage._get_event(conn, eid), candidates, NOW)
+
+
+def test_prompt_carries_the_verify_and_monitor_section_only():
+    with _triage_env() as (conn, ctx):
+        agents = ctx.tmp_dir / "repos-root" / "demo-repo" / "AGENTS.md"
+        agents.write_text("# demo-repo\n\nIntro paragraph.\n\n## Validate\n\nmake check\n\n"
+                          "## Verify & Monitor\n\nHealth: https://demo.example.test/health\nKuma: Demo - HTTP\n\n"
+                          "## Gotchas\n\nsecret gotcha text\n")
+        eid = _seed_row(conn, external_id="p1", title="Demo is down")
+        prompt = _prompt_for(conn, eid, ["demo-repo"])
+        assert "## Verify & Monitor" in prompt and "Kuma: Demo - HTTP" in prompt
+        assert "secret gotcha text" not in prompt and "make check" not in prompt and "Intro paragraph" not in prompt
+
+
+def test_prompt_caps_a_long_section_and_falls_back_to_the_first_paragraph():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "long-repo")
+        _add_repo(ctx, "plain-repo")
+        (ctx.tmp_dir / "repos-root" / "long-repo" / "AGENTS.md").write_text(
+            "# long\n\n## Verify & Monitor\n\n" + "x" * 5000 + "\n")
+        (ctx.tmp_dir / "repos-root" / "plain-repo" / "AGENTS.md").write_text(
+            "# plain-repo\n\n@AGENTS-shim\n\n" + "First paragraph. " * 100 + "\n\nSecond paragraph.\n")
+        eid = _seed_row(conn, external_id="p2", title="Something")
+        assert intake.repo_description("long-repo").count("x") == intake.MAX_SECTION_CHARS - len("## Verify & Monitor\n\n")
+        plain = intake.repo_description("plain-repo")
+        assert plain.startswith("First paragraph.") and len(plain) == intake.MAX_FALLBACK_CHARS
+        assert "Second paragraph" not in plain and "@AGENTS-shim" not in plain
+        assert intake.repo_description("missing-repo") == "(no AGENTS.md)"
+
+
+def test_prompt_never_carries_a_private_repos_agents_md():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "homelab-private")
+        (ctx.tmp_dir / "repos-root" / "homelab-private" / "AGENTS.md").write_text(
+            "# homelab-private\n\n## Verify & Monitor\n\nTOP-SECRET-HOSTNAME.internal\n")
+        eid = _seed_row(conn, external_id="p3", title="Something")
+        prompt = _prompt_for(conn, eid, ["demo-repo", "homelab-private"])
+        assert "### homelab-private" in prompt, "a private repo is still a candidate, by name"
+        assert "TOP-SECRET-HOSTNAME" not in prompt
+        assert "### demo-repo\nA demo service." in prompt
+
+
+def test_prompt_lists_open_items_newest_first_capped_and_excludes_the_item_itself():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "other-repo")
+        me = _seed_row(conn, external_id="me", title="The event in question", repo="demo-repo")
+        for i in range(intake.MAX_OPEN_ITEMS + 5):
+            _seed_row(conn, external_id=f"open-{i}", title=f"Open item {i:03d}", repo="demo-repo",
+                      state=triage.STATE_WORKING, updated_at=NOW - dt.timedelta(minutes=i + 1),
+                      root_cause="the-root-cause" if i == 0 else None, note="a note" if i == 0 else None)
+        _seed_row(conn, external_id="elsewhere", title="Open in another repo", repo="other-repo",
+                  state=triage.STATE_WORKING)
+        _seed_row(conn, external_id="done", title="A closed one", repo="demo-repo", state=triage.STATE_QUIET)
+        _seed_row(conn, external_id="broken", title="A failed one", repo="demo-repo", state=triage.STATE_FAILED)
+        prompt = _prompt_for(conn, me, ["demo-repo"])
+        open_block = prompt.split("## Open items\n")[1].split("\n\n## ")[0]
+        lines = open_block.splitlines()
+        assert len(lines) == intake.MAX_OPEN_ITEMS, len(lines)
+        assert "Open item 000" in lines[0] and "root cause: the-root-cause" in lines[0] and "note: a note" in lines[0]
+        assert "Open item 001" in lines[1], "newest first"
+        assert f"Open item {intake.MAX_OPEN_ITEMS:03d}" not in prompt, "past the cap"
+        assert f"#{me} " not in open_block, "the item itself is excluded"
+        for absent in ("Open in another repo", "A closed one", "A failed one"):
+            assert absent not in prompt, absent
+        assert prompt == _prompt_for(conn, me, ["demo-repo"]), "deterministic for a given ledger"
+
+
+def test_prompt_lists_recently_fixed_items_with_pr_titles():
+    with _triage_env() as (conn, ctx):
+        me = _seed_row(conn, external_id="me2", title="Event", repo="demo-repo")
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) "
+                     "VALUES(?,?,?,?,?,?,?)",
+                     ("impl-1", "implement", "demo-repo", "b", "done",
+                      json.dumps({"prTitle": "fix(api): stop the reaper racing"}), NOW.isoformat()))
+        conn.commit()
+        _seed_row(conn, external_id="fx1", title="Reaper fires", repo="demo-repo", state=triage.STATE_FIXED,
+                  pr_url="https://github.com/jkrumm/demo-repo/pull/7", implement_job="impl-1",
+                  updated_at=NOW - dt.timedelta(days=2))
+        _seed_row(conn, external_id="fx2", title="No PR title known", repo="demo-repo", state=triage.STATE_FIXED,
+                  pr_url="https://github.com/jkrumm/demo-repo/pull/8", updated_at=NOW - dt.timedelta(days=3))
+        _seed_row(conn, external_id="fx3", title="Closed with a PR", repo="demo-repo", state=triage.STATE_CLOSED,
+                  pr_url="https://github.com/jkrumm/demo-repo/pull/9", updated_at=NOW - dt.timedelta(days=1))
+        _seed_row(conn, external_id="fx4", title="Fixed too long ago", repo="demo-repo", state=triage.STATE_FIXED,
+                  pr_url="https://github.com/jkrumm/demo-repo/pull/1", updated_at=NOW - dt.timedelta(days=15))
+        _seed_row(conn, external_id="fx5", title="Closed without a PR", repo="demo-repo",
+                  state=triage.STATE_CLOSED)
+        prompt = _prompt_for(conn, me, ["demo-repo"])
+        fixed_block = prompt.split("## Fixed in the last 14 days\n")[1]
+        assert "Reaper fires | PR: fix(api): stop the reaper racing | https://github.com/jkrumm/demo-repo/pull/7" in fixed_block
+        assert "No PR title known | PR: No PR title known | https://github.com/jkrumm/demo-repo/pull/8" in fixed_block
+        assert "Closed with a PR" in fixed_block
+        assert "Fixed too long ago" not in prompt and "Closed without a PR" not in prompt
+
+
+def test_prompt_caps_fixed_items_and_states_the_actions():
+    with _triage_env() as (conn, ctx):
+        me = _seed_row(conn, external_id="me3", title="Event", repo="demo-repo")
+        for i in range(intake.MAX_FIXED_ITEMS + 3):
+            _seed_row(conn, external_id=f"fxc-{i}", title=f"Fixed {i:03d}", repo="demo-repo",
+                      state=triage.STATE_FIXED, pr_url=f"https://github.com/jkrumm/demo-repo/pull/{i + 1}",
+                      updated_at=NOW - dt.timedelta(minutes=i))
+        prompt = _prompt_for(conn, me, ["demo-repo"])
+        assert prompt.count("| PR: ") == intake.MAX_FIXED_ITEMS
+        for token in ("attach", "fixed_by", "new", "ignore", "untrusted"):
+            assert token in prompt, token
+        assert "(none)" in prompt.split("## Open items\n")[1].split("\n\n")[0]
+
+
+def test_prompt_event_block_clips_the_payload_and_uses_the_brief_for_origin_items():
+    with _triage_env() as (conn, ctx):
+        alert = _seed_row(conn, external_id="big", title="Alert", payload={"first_text": "y" * 5000})
+        prompt = _prompt_for(conn, alert, ["demo-repo"])
+        payload_line = next(line for line in prompt.splitlines() if line.startswith("payload: "))
+        assert len(payload_line) == len("payload: ") + intake.MAX_EXCERPT_CHARS
+        issue = _seed_row(conn, external_id="o/r#1", title="An issue", origin="github_issue", source="github_go",
+                          repo="demo-repo", brief="The body of the issue", url="https://github.com/o/r/issues/1")
+        prompt = _prompt_for(conn, issue, ["demo-repo"])
+        assert "payload: The body of the issue" in prompt and "url: https://github.com/o/r/issues/1" in prompt
+
+
+def test_prompt_says_what_the_source_is_so_a_uk_status_is_not_misread():
+    with _triage_env() as (conn, ctx):
+        uk = _seed_row(conn, external_id="204", title="Brain Sync - Push", source="uk",
+                       payload={"type": "push", "status": 0})
+        prompt = _prompt_for(conn, uk, ["demo-repo"])
+        assert "source: uk — an Uptime Kuma monitor that is DOWN right now" in prompt
+        assert "status 0 means down" in prompt
+
+
+def test_submitted_prompt_for_a_labelled_alert_lists_only_the_labelled_repo():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "audio-gateway")
+        calls: list[dict[str, Any]] = []
+        title = "🚨 podcast.failed >= 1 service.name: audio-gateway"
+        triage._sideclaw.submit_triage = _fake_triage({title: "audio-gateway"}, calls=calls)
+        eid = _insert_event(conn, source="slack_alert", external_id="lbl", title=title, first_seen=OLD)
+        triage.ingest(conn, NOW)
+        _triage_pass(conn)
+        assert len(calls) == 1
+        candidates = calls[0]["prompt"].split("## Candidate repos\n")[1].split("\n\n## ")[0]
+        assert "### audio-gateway" in candidates and "### demo-repo" not in candidates
+        assert calls[0]["schema"] == intake.TRIAGE_SCHEMA
+        assert _rows(conn, eid)["state"] == triage.STATE_TRIAGED and _rows(conn, eid)["repo"] == "audio-gateway"
+
+
+def test_unlabelled_alert_prompt_lists_every_known_repo():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "zeta")
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_triage = _fake_triage({"No label": "zeta"}, calls=calls)
+        _insert_event(conn, source="slack_alert", external_id="nl", title="No label", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        _triage_pass(conn)
+        candidates = calls[0]["prompt"].split("## Candidate repos\n")[1].split("\n\n## ")[0]
+        assert "### demo-repo" in candidates and "### zeta" in candidates
+
+
+# -- the fold --
+
+def test_fold_attach_closes_the_item_onto_an_open_target_and_bumps_it():
+    with _triage_env() as (conn, ctx):
+        target = _seed_row(conn, external_id="o/r#30", title="Target", repo="demo-repo", state=triage.STATE_WORKING,
+                           occurrences=3, updated_at=OLD, origin="github_issue", source="github_go")
+        conn.execute("UPDATE triage_items SET last_seen=? WHERE event_id=?", (OLD.isoformat(), target))
+        eid = _seed_row(conn, external_id="dup", title="Same thing, other words", occurrences=2)
+        out = _fold(conn, eid, {"action": "attach", "item": target, "reason": "same defect"})
+        assert out == f"attached to #{target}", out
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_CLOSED and item["close_reason"] == triage.CLOSE_DUPLICATE
+        assert item["duplicate_of"] == target
+        assert item["note"] == f"attached to #{target}: same defect"
+        tgt = _rows(conn, target)
+        assert tgt["occurrences"] == 5 and tgt["last_seen"] == NOW.isoformat(), dict(tgt)
+        assert tgt["state"] == triage.STATE_WORKING, "the target is untouched otherwise"
+
+
+def test_fold_attach_to_a_closed_failed_missing_or_own_item_is_treated_as_new():
+    with _triage_env() as (conn, ctx):
+        quiet = _seed_row(conn, external_id="q", title="Quiet", repo="demo-repo", state=triage.STATE_QUIET)
+        failed = _seed_row(conn, external_id="f", title="Failed", repo="demo-repo", state=triage.STATE_FAILED)
+        for i, bad in enumerate((quiet, failed, 99999, None, "7")):
+            eid = _seed_row(conn, external_id=f"bad-{i}", title=f"Dup {i}")
+            answer = {"action": "attach", "reason": "r", "repo": "demo-repo", "title": "real defect"}
+            if bad is not None:
+                answer["item"] = bad
+            _fold(conn, eid, answer, job_id=f"triage-bad-{i}")
+            item = _rows(conn, eid)
+            assert item["state"] == triage.STATE_TRIAGED and item["repo"] == "demo-repo", (bad, dict(item))
+        own = _seed_row(conn, external_id="own", title="Own")
+        _fold(conn, own, {"action": "attach", "item": own, "reason": "r", "repo": "demo-repo"}, job_id="triage-own")
+        assert _rows(conn, own)["state"] == triage.STATE_TRIAGED
+
+
+def test_fold_new_sets_the_repo_and_triages_with_the_title_as_note():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "other-repo")
+        eid = _seed_row(conn, external_id="n1", title="Raw alert", occurrences=4)
+        conn.execute("UPDATE triage_items SET strikes=2, retry_at=? WHERE event_id=?", (NOW.isoformat(), eid))
+        out = _fold(conn, eid, {"action": "new", "repo": "other-repo", "title": "Reaper races the queue",
+                                "reason": "r"})
+        assert out == "triaged to other-repo"
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_TRIAGED and item["repo"] == "other-repo"
+        assert item["note"] == "Reaper races the queue"
+        assert item["strikes"] == 0 and item["retry_at"] is None, "a good answer resets the triage strikes"
+        assert item["triage_job"] == "triage-job-x", "the job that decided it stays on the row"
+
+
+def test_fold_new_naming_a_repo_outside_the_candidates_strikes_the_bad_answer():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="n2", title="Raw alert")
+        out = _fold(conn, eid, {"action": "new", "repo": "invented-repo", "title": "t", "reason": "r"})
+        assert out.startswith("retrying:") and "no candidate repo" in out, out
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_NEW and item["repo"] is None
+        assert item["strikes"] == 1 and item["triage_job"] is None and item["retry_at"]
+        miss = _seed_row(conn, external_id="n3", title="No repo given")
+        _fold(conn, miss, {"action": "new", "reason": "r"}, job_id="triage-n3")
+        assert _rows(conn, miss)["state"] == triage.STATE_NEW and _rows(conn, miss)["strikes"] == 1
+
+
+def test_fold_new_on_a_labelled_alert_always_takes_the_label_repo():
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "audio-gateway")
+        eid = _seed_row(conn, external_id="lab", title="🚨 x service.name: audio-gateway")
+        _fold(conn, eid, {"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"})
+        assert _rows(conn, eid)["repo"] == "audio-gateway"
+
+
+def test_fold_keeps_an_issues_and_a_human_items_own_repo_whatever_the_answer_says():
+    with _triage_env() as (conn, ctx):
+        issue = triage.open_origin_item(conn, origin="github_issue", repo="argo", brief="b", max_tier="implement",
+                                         external_id="jkrumm/argo#2", title="issue", now=NOW)
+        human = triage.open_origin_item(conn, origin="human", repo="gamma", brief="b", max_tier="investigate",
+                                         external_id="human:keep", title="ask", now=NOW)
+        for eid in (issue, human):
+            _fold(conn, eid, {"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"},
+                  job_id=f"triage-keep-{eid}")
+            assert _rows(conn, eid)["state"] == triage.STATE_TRIAGED
+        assert _rows(conn, issue)["repo"] == "argo" and _rows(conn, human)["repo"] == "gamma"
+
+
+def test_fold_fixed_by_an_item_or_a_pr_closes_the_alert():
+    with _triage_env() as (conn, ctx):
+        fixed = _seed_row(conn, external_id="fixed", title="Fixed", repo="demo-repo", state=triage.STATE_FIXED,
+                          pr_url="https://github.com/jkrumm/demo-repo/pull/5")
+        by_item = _seed_row(conn, external_id="a1", title="A1")
+        assert _fold(conn, by_item, {"action": "fixed_by", "item": fixed, "reason": "same fix"},
+                     job_id="t-a1") == f"fixed by #{fixed} (https://github.com/jkrumm/demo-repo/pull/5)"
+        item = _rows(conn, by_item)
+        assert item["state"] == triage.STATE_CLOSED and item["close_reason"] == triage.CLOSE_FIXED_BY
+        assert item["note"].startswith(f"fixed by #{fixed}") and "same fix" in item["note"]
+        by_pr = _seed_row(conn, external_id="a2", title="A2")
+        pr = "https://github.com/jkrumm/demo-repo/pull/5"
+        assert _fold(conn, by_pr, {"action": "fixed_by", "pr": pr, "reason": "r"}, job_id="t-a2") == f"fixed by {pr}"
+        assert _rows(conn, by_pr)["close_reason"] == triage.CLOSE_FIXED_BY
+
+
+def test_fold_fixed_by_naming_nothing_real_is_treated_as_new():
+    with _triage_env() as (conn, ctx):
+        open_item = _seed_row(conn, external_id="o", title="Open", repo="demo-repo", state=triage.STATE_WORKING)
+        for i, ref in enumerate(({"item": open_item}, {"item": 99999}, {"pr": "https://example.test/pull/404"}, {})):
+            eid = _seed_row(conn, external_id=f"fb-{i}", title=f"FB {i}")
+            _fold(conn, eid, {"action": "fixed_by", "reason": "r", "repo": "demo-repo", **ref}, job_id=f"t-fb-{i}")
+            assert _rows(conn, eid)["state"] == triage.STATE_TRIAGED, (ref, dict(_rows(conn, eid)))
+
+
+def test_fold_fixed_by_is_never_applied_to_a_human_item():
+    with _triage_env() as (conn, ctx):
+        fixed = _seed_row(conn, external_id="fixed2", title="Fixed", repo="demo-repo", state=triage.STATE_FIXED,
+                          pr_url="https://github.com/jkrumm/demo-repo/pull/6")
+        human = triage.open_origin_item(conn, origin="human", repo="demo-repo", brief="please redo it",
+                                         max_tier="implement", external_id="human:fb", title="ask", now=NOW)
+        issue = triage.open_origin_item(conn, origin="github_issue", repo="demo-repo", brief="b", max_tier="implement",
+                                         external_id="jkrumm/demo-repo#9", title="issue", now=NOW)
+        _fold(conn, human, {"action": "fixed_by", "item": fixed, "reason": "r"}, job_id="t-h")
+        assert _rows(conn, human)["state"] == triage.STATE_TRIAGED, "the owner asked explicitly"
+        _fold(conn, issue, {"action": "fixed_by", "item": fixed, "reason": "r"}, job_id="t-i")
+        assert _rows(conn, issue)["close_reason"] == triage.CLOSE_FIXED_BY, "an issue may be closed by a fix"
+
+
+def test_fold_ignore_closes_an_alert_but_never_a_human_or_an_issue():
+    with _triage_env() as (conn, ctx):
+        alert = _seed_row(conn, external_id="ig", title="Recovery notice")
+        assert _fold(conn, alert, {"action": "ignore", "reason": "a recovery"}, job_id="t-ig") == "ignored"
+        item = _rows(conn, alert)
+        assert item["state"] == triage.STATE_CLOSED and item["close_reason"] == triage.CLOSE_IGNORED
+        assert item["note"] == "ignored: a recovery"
+        human = triage.open_origin_item(conn, origin="human", repo="demo-repo", brief="b", max_tier="investigate",
+                                         external_id="human:ig", title="ask", now=NOW)
+        issue = triage.open_origin_item(conn, origin="github_issue", repo="demo-repo", brief="b", max_tier="implement",
+                                         external_id="jkrumm/demo-repo#10", title="issue", now=NOW)
+        for eid in (human, issue):
+            _fold(conn, eid, {"action": "ignore", "reason": "noise"}, job_id=f"t-ig-{eid}")
+            assert _rows(conn, eid)["state"] == triage.STATE_TRIAGED, eid
+
+
+def test_fold_a_human_item_may_attach():
+    with _triage_env() as (conn, ctx):
+        target = _seed_row(conn, external_id="t-h", title="Target", repo="demo-repo", state=triage.STATE_WORKING)
+        human = triage.open_origin_item(conn, origin="human", repo="demo-repo", brief="b", max_tier="investigate",
+                                         external_id="human:att", title="ask", now=NOW)
+        assert _fold(conn, human, {"action": "attach", "item": target, "reason": "r"}) == f"attached to #{target}"
+
+
+def test_fold_failed_job_and_unusable_answers_strike_and_the_third_fails_the_item():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="st", title="Strike")
+        out = _fold(conn, eid, {}, job_id="t-1", status="failed", error="triage: model output rejected after 2 attempts")
+        assert out.startswith("retrying:") and "rejected after 2 attempts" in out
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_NEW and item["strikes"] == 1 and item["triage_job"] is None
+        assert item["retry_at"] is not None and "retry 1/2" in item["note"]
+        _fold(conn, eid, None, job_id="t-2")      # done, but no answer object
+        assert _rows(conn, eid)["strikes"] == 2
+        _fold(conn, eid, {"action": "dance", "reason": "r"}, job_id="t-3")   # an action outside the schema
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_FAILED and item["strikes"] == 3, dict(item)
+        assert "no usable answer" in item["note"]
+
+
+def test_two_passes_over_the_same_finished_job_fold_it_once():
+    with _triage_env() as (conn, ctx):
+        target = _seed_row(conn, external_id="o/r#31", title="Target", repo="demo-repo", state=triage.STATE_WORKING,
+                           occurrences=1, origin="github_issue", source="github_go")
+        eid = _seed_row(conn, external_id="cas", title="Dup", occurrences=2)
+        conn.execute("UPDATE triage_items SET triage_job='t-cas' WHERE event_id=?", (eid,))
+        conn.commit()
+        job = _triage_job({"action": "attach", "item": target, "reason": "r"}, job_id="t-cas")
+        polled: list[str] = []
+        triage._sideclaw.get = lambda job_id: polled.append(job_id) or job
+        triage.poll_triage_jobs(conn, NOW, dry_run=False)
+        transitions = conn.execute("SELECT COUNT(*) FROM item_transitions WHERE event_id=?", (eid,)).fetchone()[0]
+        triage.poll_triage_jobs(conn, NOW, dry_run=False)
+        # A second pass that read the job before the first one folded it:
+        assert triage._fold_triage_job(conn, eid, "t-cas", job, NOW) is None
+        assert polled == ["t-cas"], "a settled item is not polled again"
+        assert _rows(conn, target)["occurrences"] == 3, "the target is bumped once, not once per pass"
+        assert conn.execute("SELECT COUNT(*) FROM item_transitions WHERE event_id=?", (eid,)).fetchone()[0] == transitions
+
+
+def test_a_fold_loses_to_a_pass_that_moved_the_item_first():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="race", title="Race")
+        conn.execute("UPDATE triage_items SET triage_job='t-race' WHERE event_id=?", (eid,))
+        conn.commit()
+        triage._set_state(conn, eid, triage.STATE_QUIET, NOW)   # silence-resolve got there first
+        assert triage._fold_triage_job(conn, eid, "t-race", _triage_job(
+            {"action": "new", "repo": "demo-repo", "reason": "r"}, job_id="t-race"), NOW) is None
+        assert _rows(conn, eid)["state"] == triage.STATE_QUIET
+
+
+# -- submit and poll --
+
+def test_submit_is_claimed_once_and_a_second_pass_does_not_resubmit():
+    with _triage_env() as (conn, ctx):
+        calls: list[dict[str, Any]] = []
+        queued = {"n": 0}
+
+        def _submit(*, prompt, schema):
+            queued["n"] += 1
+            calls.append({"prompt": prompt})
+            return {"id": f"t-q-{queued['n']}", "status": "queued"}
+
+        triage._sideclaw.submit_triage = _submit
+        eid = _seed_row(conn, external_id="once", title="Once", occurrences=3)
+        _triage_pass(conn)
+        _triage_pass(conn)
+        assert len(calls) == 1
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_NEW and item["triage_job"] == "t-q-1", dict(item)
+
+
+def test_a_lost_claim_submits_nothing():
+    with _triage_env() as (conn, ctx):
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_triage = _fake_triage({"Raced": "demo-repo"}, calls=calls)
+        eid = _seed_row(conn, external_id="raced", title="Raced")
+        item = _rows(conn, eid)
+        conn.execute("UPDATE triage_items SET triage_job='claiming:other-process' WHERE event_id=?", (eid,))
+        conn.commit()
+        assert triage._submit_triage(conn, item, NOW, DEFAULT_POLICY) is None
+        assert calls == []
+
+
+def test_poll_leaves_a_running_job_and_folds_it_when_done():
+    with _triage_env() as (conn, ctx):
+        triage._sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-slow", "status": "queued"}
+        eid = _seed_row(conn, external_id="slow", title="Slow")
+        _triage_pass(conn)
+        state = {"job": {"id": "t-slow", "status": "running"}}
+        triage._sideclaw.get = lambda job_id: state["job"]
+        triage.poll_triage_jobs(conn, NOW, dry_run=False)
+        assert _rows(conn, eid)["state"] == triage.STATE_NEW and _rows(conn, eid)["triage_job"] == "t-slow"
+        state["job"] = _triage_job({"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"},
+                                   job_id="t-slow")
+        triage.poll_triage_jobs(conn, NOW, dry_run=False)
+        assert _rows(conn, eid)["state"] == triage.STATE_TRIAGED
+
+
+def test_poll_strikes_a_failed_job_and_a_job_sideclaw_lost_and_skips_a_transient_error():
+    with _triage_env() as (conn, ctx):
+        ids = {}
+        for key in ("failed", "lost", "flaky"):
+            ids[key] = _seed_row(conn, external_id=f"poll-{key}", title=key)
+            conn.execute("UPDATE triage_items SET triage_job=? WHERE event_id=?", (f"t-{key}", ids[key]))
+        conn.commit()
+
+        def _get(job_id):
+            if job_id == "t-failed":
+                return {"id": job_id, "status": "failed", "error": "triage: transport error"}
+            if job_id == "t-lost":
+                return None
+            raise triage.RemoteError("sideclaw unreachable")
+
+        triage._sideclaw.get = _get
+        with contextlib.redirect_stderr(io.StringIO()):
+            triage.poll_triage_jobs(conn, NOW, dry_run=False)
+        assert _rows(conn, ids["failed"])["strikes"] == 1 and _rows(conn, ids["failed"])["triage_job"] is None
+        assert _rows(conn, ids["lost"])["strikes"] == 1 and "no record" in _rows(conn, ids["lost"])["note"]
+        assert _rows(conn, ids["flaky"])["strikes"] == 0 and _rows(conn, ids["flaky"])["triage_job"] == "t-flaky", (
+            "an unreachable sideclaw is not the job's failure")
+
+
+def test_poll_releases_a_stale_claim_but_not_a_fresh_one():
+    with _triage_env() as (conn, ctx):
+        stale = _seed_row(conn, external_id="stale", title="Stale")
+        fresh = _seed_row(conn, external_id="fresh", title="Fresh")
+        old_claim = f"{triage.TRIAGE_CLAIM_PREFIX}{(NOW - dt.timedelta(minutes=30)).isoformat()}"
+        new_claim = f"{triage.TRIAGE_CLAIM_PREFIX}{NOW.isoformat()}"
+        conn.execute("UPDATE triage_items SET triage_job=? WHERE event_id=?", (old_claim, stale))
+        conn.execute("UPDATE triage_items SET triage_job=? WHERE event_id=?", (new_claim, fresh))
+        conn.commit()
+        with contextlib.redirect_stderr(io.StringIO()):
+            triage.poll_triage_jobs(conn, NOW, dry_run=False)
+        assert _rows(conn, stale)["triage_job"] is None and _rows(conn, fresh)["triage_job"] == new_claim
+
+
+def test_submit_failure_strikes_and_a_sideclaw_refusal_ends_the_item_failed():
+    with _triage_env() as (conn, ctx):
+        down = _seed_row(conn, external_id="down", title="Down")
+
+        def _unreachable(*, prompt, schema):
+            raise triage.RemoteError("sideclaw triage submit failed", maybe_mutated=True)
+
+        triage._sideclaw.submit_triage = _unreachable
+        with contextlib.redirect_stderr(io.StringIO()):
+            _triage_pass(conn)
+        item = _rows(conn, down)
+        assert item["state"] == triage.STATE_NEW and item["strikes"] == 1 and item["triage_job"] is None
+        assert item["retry_at"] > NOW.isoformat(), "backoff holds the retry"
+        calls: list[dict[str, Any]] = []
+
+        def _refuse(*, prompt, schema):
+            calls.append({"prompt": prompt})
+            raise triage.SubmitRefused("sideclaw refused the job (HTTP 400): invalid params: prompt too long",
+                                       status=400)
+
+        triage._sideclaw.submit_triage = _refuse
+        _triage_pass(conn)
+        assert calls == [], "an item waiting out its backoff is not submitted"
+        _triage_pass(conn, NOW + dt.timedelta(hours=1))
+        item = _rows(conn, down)
+        assert item["state"] == triage.STATE_FAILED and "invalid params: prompt too long" in item["note"]
+        assert item["triage_job"] is None
+        _triage_pass(conn, NOW + dt.timedelta(hours=2))
+        assert len(calls) == 1, "a refused triage is never retried"
+
+
+def test_alerts_wait_for_the_debounce_but_issues_and_runs_are_immediate():
+    policy = dict(DEFAULT_POLICY, minOccurrences=5, minOpenMinutes=999999)
+    with _triage_env(policy=policy) as (conn, ctx):
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_triage = _fake_triage({"Young": "demo-repo", "Frequent": "demo-repo",
+                                                       "Issue": "demo-repo"}, calls=calls)
+        young = _seed_row(conn, external_id="young", title="Young", occurrences=1, first_seen=NOW)
+        frequent = _seed_row(conn, external_id="freq", title="Frequent", occurrences=5, first_seen=NOW)
+        issue = _seed_row(conn, external_id="o/r#3", title="Issue", origin="github_issue", source="github_go",
+                          repo="demo-repo", occurrences=1, first_seen=NOW)
+        triage.submit_triage_jobs(conn, policy, NOW, dry_run=False)
+        assert sorted(c["title"] for c in calls) == ["Frequent", "Issue"], calls
+        assert _rows(conn, young)["state"] == triage.STATE_NEW and _rows(conn, young)["triage_job"] is None
+        assert _rows(conn, frequent)["state"] == triage.STATE_TRIAGED and _rows(conn, issue)["state"] == triage.STATE_TRIAGED
+
+
+def test_a_recurrence_inside_the_cooldown_is_not_triaged_again_yet():
+    with _triage_env() as (conn, ctx):
+        _insert_dispatch_row(conn, "job-prior", NOW - dt.timedelta(hours=1))
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_triage = _fake_triage({"Cooling": "demo-repo"}, calls=calls)
+        eid = _seed_row(conn, external_id="cool", title="Cooling")
+        conn.execute("UPDATE triage_items SET dispatch_job='job-prior' WHERE event_id=?", (eid,))
+        conn.commit()
+        with contextlib.redirect_stderr(io.StringIO()):
+            _triage_pass(conn)
+        assert calls == []
+        _triage_pass(conn, NOW + dt.timedelta(hours=7))
+        assert len(calls) == 1
+
+
+def test_triage_submissions_per_run_are_capped_and_the_rest_wait_new():
+    saved = triage.MAX_TRIAGE_SUBMITS_PER_RUN
+    triage.MAX_TRIAGE_SUBMITS_PER_RUN = 3
+    try:
+        with _triage_env() as (conn, ctx):
+            titles = {f"Item {i}": "demo-repo" for i in range(5)}
+            calls: list[dict[str, Any]] = []
+            triage._sideclaw.submit_triage = _fake_triage(titles, calls=calls)
+            ids = [_seed_row(conn, external_id=f"cap-{i}", title=f"Item {i}") for i in range(5)]
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                _triage_pass(conn)
+            assert len(calls) == 3 and "wait for the next run" in err.getvalue()
+            assert [_rows(conn, e)["state"] for e in ids] == [triage.STATE_TRIAGED] * 3 + [triage.STATE_NEW] * 2
+            _triage_pass(conn)
+            assert [_rows(conn, e)["state"] for e in ids].count(triage.STATE_TRIAGED) == 5, "overflow waits, never drops"
+    finally:
+        triage.MAX_TRIAGE_SUBMITS_PER_RUN = saved
+
+
+def test_origin_items_are_triaged_before_alerts_when_the_cap_binds():
+    saved = triage.MAX_TRIAGE_SUBMITS_PER_RUN
+    triage.MAX_TRIAGE_SUBMITS_PER_RUN = 1
+    try:
+        with _triage_env() as (conn, ctx):
+            calls: list[dict[str, Any]] = []
+            triage._sideclaw.submit_triage = _fake_triage({"Alert": "demo-repo", "Issue": "demo-repo"}, calls=calls)
+            _seed_row(conn, external_id="a", title="Alert")
+            _seed_row(conn, external_id="o/r#4", title="Issue", origin="github_issue", source="github_go",
+                      repo="demo-repo")
+            with contextlib.redirect_stderr(io.StringIO()):
+                _triage_pass(conn)
+            assert [c["title"] for c in calls] == ["Issue"]
+    finally:
+        triage.MAX_TRIAGE_SUBMITS_PER_RUN = saved
+
+
+def test_a_job_that_is_already_finished_at_submit_is_folded_in_the_same_pass():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="fast", title="Fast")
+        triage._sideclaw.get = lambda job_id: (_ for _ in ()).throw(AssertionError("no poll needed"))
+        _triage_pass(conn)
+        assert _rows(conn, eid)["state"] == triage.STATE_TRIAGED
+
+
+def test_settle_polls_until_the_jobs_finish():
+    with _triage_env() as (conn, ctx):
+        triage._sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-settle", "status": "queued"}
+        eid = _seed_row(conn, external_id="settle", title="Settle")
+        _triage_pass(conn)
+        reads = {"n": 0}
+
+        def _get(job_id):
+            reads["n"] += 1
+            if reads["n"] < 3:
+                return {"id": job_id, "status": "running"}
+            return _triage_job({"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"}, job_id=job_id)
+
+        triage._sideclaw.get = _get
+        saved_sleep = triage.time.sleep
+        triage.time.sleep = lambda s: None
+        try:
+            triage.settle_triage_jobs(conn, NOW, dry_run=False)
+        finally:
+            triage.time.sleep = saved_sleep
+        assert reads["n"] == 3 and _rows(conn, eid)["state"] == triage.STATE_TRIAGED
+
+
+def test_settle_gives_up_after_the_window_without_failing_the_job():
+    saved = triage.TRIAGE_SETTLE_S
+    triage.TRIAGE_SETTLE_S = 0
+    try:
+        with _triage_env() as (conn, ctx):
+            triage._sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-never", "status": "queued"}
+            eid = _seed_row(conn, external_id="never", title="Never")
+            _triage_pass(conn)
+            triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "running"}
+            triage.settle_triage_jobs(conn, NOW, dry_run=False)
+            item = _rows(conn, eid)
+            assert item["triage_job"] == "t-never" and item["strikes"] == 0, "the next tick folds it"
+    finally:
+        triage.TRIAGE_SETTLE_S = saved
+
+
+# -- recurrence of a duplicate --
+
+def _recur_ts(conn, eid: int, ts: str) -> None:
+    conn.execute("UPDATE events SET payload_json=? WHERE id=?", (json.dumps({"ts_last": ts}), eid))
+    conn.commit()
+
+
+def test_a_recurring_duplicate_bumps_its_open_target_instead_of_reopening():
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="rd", title="Dup", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        target = _seed_row(conn, external_id="o/r#32", title="Target", repo="demo-repo", state=triage.STATE_WORKING,
+                           occurrences=2, origin="github_issue", source="github_go")
+        triage._set_state(conn, eid, triage.STATE_CLOSED, NOW, close_reason=triage.CLOSE_DUPLICATE,
+                          duplicate_of=target)
+        _recur_ts(conn, eid, "1788850795.862159")
+        triage.reopen_if_needed(conn, NOW)
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_CLOSED and item["duplicate_of"] == target
+        assert _rows(conn, target)["occurrences"] == 3
+        triage.reopen_if_needed(conn, NOW)
+        assert _rows(conn, target)["occurrences"] == 3, "one recurrence is counted once"
+        _recur_ts(conn, eid, "1788850999.000001")
+        triage.reopen_if_needed(conn, NOW)
+        assert _rows(conn, target)["occurrences"] == 4
+
+
+def test_a_recurring_duplicate_reopens_when_its_target_is_done():
+    with _triage_env() as (conn, ctx):
+        for i, end_state in enumerate((triage.STATE_FIXED, triage.STATE_QUIET, triage.STATE_FAILED)):
+            target = _seed_row(conn, external_id=f"done-{i}", title="Target", repo="demo-repo", state=end_state)
+            eid = _insert_event(conn, source="slack_alert", external_id=f"dup-{i}", title="Dup", first_seen=OLD)
+            triage.ingest(conn, NOW)
+            conn.execute("UPDATE triage_items SET triage_job='t-old' WHERE event_id=?", (eid,))
+            triage._set_state(conn, eid, triage.STATE_CLOSED, NOW, close_reason=triage.CLOSE_DUPLICATE,
+                              duplicate_of=target)
+            _recur_ts(conn, eid, "1788850795.862159")
+            triage.reopen_if_needed(conn, NOW)
+            item = _rows(conn, eid)
+            assert item["state"] == triage.STATE_NEW and item["duplicate_of"] is None, (end_state, dict(item))
+            assert item["close_reason"] is None and item["triage_job"] is None, "it is triaged afresh"
+
+
+# -- what the loop does with `triaged` --
+
+def test_escalate_picks_only_triaged_items():
+    with _triage_env() as (conn, ctx):
+        new_item = _seed_row(conn, external_id="still-new", title="N", repo="demo-repo", occurrences=5)
+        triaged = _seed_row(conn, external_id="ready", title="T", repo="demo-repo", state=triage.STATE_TRIAGED,
+                            occurrences=5)
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and _last_dispatch_origin_event_id(conn) == triaged
+        assert _rows(conn, triaged)["state"] == triage.STATE_WORKING
+        assert _rows(conn, new_item)["state"] == triage.STATE_NEW, "the triage step owns `new`"
+
+
+def test_escalate_clusters_fresh_triaged_items_by_repo_and_keeps_split_items_single():
+    with _triage_env() as (conn, ctx):
+        a = _seed_row(conn, external_id="c-a", title="A", repo="demo-repo", state=triage.STATE_TRIAGED, occurrences=5)
+        b = _seed_row(conn, external_id="c-b", title="B", repo="demo-repo", state=triage.STATE_TRIAGED, occurrences=5)
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and "c-a" in calls[0]["brief"] and "c-b" in calls[0]["brief"]
+        assert _rows(conn, a)["dispatch_job"] == _rows(conn, b)["dispatch_job"]
+
+
+def test_escalate_never_clusters_an_origin_item_into_an_alert_brief():
+    with _triage_env() as (conn, ctx):
+        _seed_row(conn, external_id="o/r#5", title="Issue", origin="github_issue", source="github_go",
+                  repo="demo-repo", state=triage.STATE_TRIAGED, occurrences=9, brief="the issue body")
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert calls == [], "an issue is dispatched by escalate_origin_items() with its own brief"
+
+
+def test_an_issue_is_triaged_and_dispatched_in_one_loop_pass():
+    with _triage_env() as (conn, ctx):
+        triage._github.search_issues = lambda *, owner, skip_label: [
+            {"repo": "demo-repo", "number": 21, "title": "Add a health check", "body": "please", "url": "u",
+             "author": triage._github.GH_OWNER, "labels": [], "updated_at": None}]
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage._sideclaw.submit_triage = _fake_triage({"Add a health check": "demo-repo"})
+        triage.run(conn, dry_run=False)
+        item = conn.execute("SELECT state, dispatch_job, triage_job FROM triage_items").fetchone()
+        assert item["state"] == triage.STATE_WORKING and item["dispatch_job"] and item["triage_job"]
+        assert len(calls) == 1 and "please" in calls[0]["brief"]
+
+
+def test_an_issue_attached_by_triage_is_never_dispatched():
+    with _triage_env() as (conn, ctx):
+        target = _seed_row(conn, external_id="tgt-i", title="Open one", repo="demo-repo", state=triage.STATE_WORKING)
+        triage._github.search_issues = lambda *, owner, skip_label: [
+            {"repo": "demo-repo", "number": 22, "title": "Same bug", "body": "b", "url": "u",
+             "author": triage._github.GH_OWNER, "labels": [], "updated_at": None}]
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage._sideclaw.submit_triage = _fake_triage(
+            {"Same bug": {"action": "attach", "item": target, "reason": "same"}})
+        triage.run(conn, dry_run=False)
+        assert calls == []
+        row = conn.execute("SELECT state, close_reason, duplicate_of FROM triage_items WHERE origin='github_issue'").fetchone()
+        assert row["state"] == triage.STATE_CLOSED and row["close_reason"] == triage.CLOSE_DUPLICATE
+        assert row["duplicate_of"] == target
+
+
+def test_triage_item_now_submits_waits_and_folds():
+    with _triage_env() as (conn, ctx):
+        eid = triage.open_origin_item(conn, origin="human", repo="demo-repo", brief="b", max_tier="investigate",
+                                       external_id="human:now", title="ask", now=NOW)
+        waits: list[dict[str, Any]] = []
+        triage._sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-now", "status": "queued"}
+
+        def _wait(job_id, *, timeout_s, interval_s, **kw):
+            waits.append({"job_id": job_id, "timeout_s": timeout_s})
+            return _triage_job({"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"}, job_id=job_id)
+
+        triage._sideclaw.wait = _wait
+        assert triage.triage_item_now(conn, eid, NOW) == "triaged to demo-repo"
+        assert waits == [{"job_id": "t-now", "timeout_s": triage.TRIAGE_WAIT_GUARD_S}]
+        assert triage.TRIAGE_WAIT_GUARD_S >= 1800, "a hang guard, never a budget (rules/agent-limits.md)"
+        assert _rows(conn, eid)["state"] == triage.STATE_TRIAGED
+        assert triage.triage_item_now(conn, eid, NOW) is None, "an item past `new` is not triaged again"
+
+
+def test_triage_item_now_that_times_out_leaves_the_job_for_the_loop():
+    with _triage_env() as (conn, ctx):
+        eid = triage.open_origin_item(conn, origin="human", repo="demo-repo", brief="b", max_tier="investigate",
+                                       external_id="human:slowjob", title="ask", now=NOW)
+        triage._sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-hang", "status": "queued"}
+        triage._sideclaw.wait = lambda job_id, **kw: None
+        assert triage.triage_item_now(conn, eid, NOW) is None
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_NEW and item["triage_job"] == "t-hang" and item["strikes"] == 0
+
+
+def test_a_reopened_item_is_triaged_again():
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="again", title="Again", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        _triage_pass(conn)
+        assert _rows(conn, eid)["triage_job"]
+        triage._set_state(conn, eid, triage.STATE_QUIET, NOW)
+        _recur_ts(conn, eid, "1788850795.862159")
+        triage.reopen_if_needed(conn, NOW)
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_NEW and item["triage_job"] is None
+
+
+def test_the_shipped_policy_keeps_the_label_rules_without_evidence():
+    policy = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())
+    assert len(policy["rules"]) == 77 and len(policy["ignore"]) == 15
+    assert not any("evidence" in r for r in policy["rules"]), "the evidence machinery is deleted"
+    loaded = triage.load_policy()
+    assert len(loaded["rules"]) == 77 and len(loaded["ignore"]) == 15 and loaded["hostVerbs"]
+
+
+# -- rules are the label tier --
+
+def test_uk_rule_routes_via_the_title_not_the_external_id():
+    """uk's external_id is an opaque monitor id, unglobbable and unstable — only the title-derived
+    match target makes a rule able to route it."""
+    policy = dict(DEFAULT_POLICY, rules=[{"match": "uk:macmini-dev-host-push", "repo": "dotfiles"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        eid = _seed_row(conn, external_id="204", title="MacMini Dev Host - Push", source="uk")
+        assert triage._label_route(_rows(conn, eid), triage._get_event(conn, eid)) == "dotfiles"
+
+
+def test_the_shipped_policy_routes_argo_infra_signals_to_vps():
+    """An infra-signal alert about a RollHook-managed app maps to the repo owning its compose file
+    and deploy target, not its source: a downed argo container, or its api-*/dashboard-* Kuma child
+    monitors, route to `vps`, never `argo`. Loads the REAL shipped policy, so an accidental revert
+    of that fix fails here."""
+    rules = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
+    cases = [
+        ("docker_vps:unhealthy:argo-web", "vps"),
+        ("docker_vps:restart:argo-worker", "vps"),
+        ("slack_alert:api-docker-red-circle-down-request-failed-with-status-code-404-channel", "vps"),
+        ("slack_alert:api-http-red-circle-down-connect-ehostunreach-172-22-0-12-4000-channel", "vps"),
+        ("slack_alert:dashboard-docker-red-circle-down-request-failed-with-status-code-404-channel", "vps"),
+        ("slack_alert:dashboard-http-red-circle-down-connect-econnrefused-100-97-220-54-443-channel", "vps"),
+    ]
+    for target, expected_repo in cases:
+        matched = triage._match_rule([target], rules)
+        assert matched is not None, f"{target!r} matched no rule in the shipped policy"
+        assert matched["repo"] == expected_repo, (target, matched)
+    assert not any(r["repo"] == "argo" for r in rules), "no rule may point at `argo` — the deploy target is `vps`"
+
+
+def test_a_rule_match_is_a_label_route_and_the_item_still_goes_through_triage():
+    policy = dict(DEFAULT_POLICY, rules=[{"match": "slack_alert:sig-rule-*", "repo": "other-repo"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        _add_repo(ctx, "other-repo")
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_triage = _fake_triage({"Ruled": "other-repo"}, calls=calls)
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-rule-1", title="Ruled", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage.classify(conn, policy, NOW)
+        _triage_pass(conn)
+        assert len(calls) == 1, "a labelled item is still triaged (dedup)"
+        candidates = calls[0]["prompt"].split("## Candidate repos\n")[1].split("\n\n## ")[0]
+        assert "### other-repo" in candidates and "### demo-repo" not in candidates
+        assert _rows(conn, eid)["state"] == triage.STATE_TRIAGED and _rows(conn, eid)["repo"] == "other-repo"
+
+
+def test_a_rule_labelled_alert_can_still_be_attached_or_ignored_by_triage():
+    policy = dict(DEFAULT_POLICY, rules=[{"match": "slack_alert:sig-rule-*", "repo": "demo-repo"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        target = _seed_row(conn, external_id="o/r#33", title="Open", repo="demo-repo", state=triage.STATE_WORKING,
+                           origin="github_issue", source="github_go")
+        triage._sideclaw.submit_triage = _fake_triage({
+            "Same": {"action": "attach", "item": target, "reason": "same"},
+            "Noise": {"action": "ignore", "reason": "noise"}})
+        same = _seed_row(conn, external_id="sig-rule-same", title="Same")
+        noise = _seed_row(conn, external_id="sig-rule-noise", title="Noise")
+        triage.submit_triage_jobs(conn, policy, NOW, dry_run=False)
+        assert _rows(conn, same)["close_reason"] == triage.CLOSE_DUPLICATE
+        assert _rows(conn, noise)["close_reason"] == triage.CLOSE_IGNORED
+
+
+def test_a_native_label_wins_over_a_rule():
+    policy = dict(DEFAULT_POLICY, rules=[{"match": "docker_vps:*", "repo": "vps"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        _add_repo(ctx, "weatherorb")
+        native = _seed_row(conn, external_id="unhealthy:weatherorb", title="weatherorb unhealthy (vps)",
+                           source="docker_vps")
+        ruled = _seed_row(conn, external_id="unhealthy:redis", title="redis unhealthy (vps)", source="docker_vps")
+        for eid, expected in ((native, "weatherorb"), (ruled, "vps")):
+            assert triage._label_route(_rows(conn, eid), triage._get_event(conn, eid)) == expected
+
+
+def test_a_corrected_rule_applies_at_the_next_triage_of_a_recurring_alert():
+    """The route is read from the CURRENT rules every time an item is triaged, never pinned on the
+    row: correcting a rule heals a recurring signature (uk:226 was once routed to `warden`)."""
+    with _triage_env(policy=dict(DEFAULT_POLICY, rules=[{"match": "uk:226", "repo": "demo-repo"}])) as (conn, ctx):
+        _add_repo(ctx, "homelab")
+        eid = _seed_row(conn, external_id="226", title="MyAnonamouse Session - Push", source="uk")
+        ev = triage._get_event(conn, eid)
+        assert triage._label_route(_rows(conn, eid), ev) == "demo-repo"
+        _write_json(triage.POLICY_PATH, dict(DEFAULT_POLICY, rules=[{"match": "uk:226", "repo": "homelab"}]))
+        assert triage._label_route(_rows(conn, eid), ev) == "homelab"
+
+
+def test_rule_routing_runs_before_the_prose_filter():
+    """A `slack_alert` that does not look like a bot alert is still matched against `rules` first:
+    Beszel's bare-sentence `HomeLab CPU above threshold` has no prefix at all, and run the other way
+    round the filter froze that whole family before a rule could claim it. A rule-LESS un-prefixed
+    message is still closed by it."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True,
+                  rules=[{"match": "slack_alert:homelab-cpu-above-threshold", "repo": "homelab"}])
+    with _triage_env(policy=policy) as (conn, ctx):
+        mapped_id = _insert_event(conn, source="slack_alert", external_id="homelab-cpu-above-threshold",
+                                  title="HomeLab CPU above threshold", first_seen=OLD)
+        prose_id = _insert_event(conn, source="slack_alert", external_id="unprefixed-no-rule",
+                                 title="HomeLab NVMe is running hot and no rule covers this yet", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage.classify(conn, policy, NOW)
+        assert _rows(conn, mapped_id)["state"] == triage.STATE_NEW
+        prose = _rows(conn, prose_id)
+        assert prose["state"] == triage.STATE_CLOSED and prose["close_reason"] == triage.CLOSE_IGNORED
+
+
+def test_the_ignore_list_closes_before_any_triage_call():
+    policy = dict(DEFAULT_POLICY, ignore=["slack_alert:ignoreme-*"])
+    with _triage_env(policy=policy) as (conn, ctx):
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_triage = _fake_triage({}, calls=calls)
+        dispatches: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(dispatches)
+        _insert_event(conn, source="slack_alert", external_id="ignoreme-recovery", title="All good now",
+                      first_seen=OLD)
+        triage.run(conn, dry_run=False)
+        assert calls == [] and dispatches == [], "no triage and no dispatch for an ignored signature"
+        assert ctx.total_calls() == 0, "an ignored signature must never post"
+        row = conn.execute("SELECT state, close_reason FROM triage_items").fetchone()
+        assert row["state"] == triage.STATE_CLOSED and row["close_reason"] == triage.CLOSE_IGNORED
+
+
+# -- a model's ignore is not forever --
+
+def _model_ignored(conn, ext: str, *, closed_at: dt.datetime) -> int:
+    """An alert the triage model closed `ignored` at `closed_at`."""
+    eid = _insert_event(conn, source="slack_alert", external_id=ext, title=f"Alert {ext}", first_seen=OLD)
+    triage.ingest(conn, NOW)
+    conn.execute("UPDATE triage_items SET triage_job='t-ign' WHERE event_id=?", (eid,))
+    conn.commit()
+    triage._set_state(conn, eid, triage.STATE_CLOSED, closed_at, close_reason=triage.CLOSE_IGNORED,
+                      note="ignored: noise")
+    conn.commit()
+    return eid
+
+
+def test_a_model_ignored_alert_reopens_after_the_cooldown_when_it_recurs():
+    with _triage_env() as (conn, ctx):
+        closed_at = NOW - dt.timedelta(hours=7)
+        eid = _model_ignored(conn, "mi-1", closed_at=closed_at)
+        _recur_ts(conn, eid, "1788850795.862159")
+        triage.reopen_if_needed(conn, closed_at + dt.timedelta(hours=5), DEFAULT_POLICY)
+        assert _rows(conn, eid)["state"] == triage.STATE_CLOSED, "inside cooldownHours it stays ignored"
+        triage.reopen_if_needed(conn, closed_at + dt.timedelta(hours=7), DEFAULT_POLICY)
+        item = _rows(conn, eid)
+        assert item["state"] == triage.STATE_NEW and item["triage_job"] is None, dict(item)
+        assert item["close_reason"] is None
+
+
+def test_a_quiet_model_ignored_alert_stays_closed():
+    with _triage_env() as (conn, ctx):
+        eid = _model_ignored(conn, "mi-2", closed_at=NOW - dt.timedelta(days=3))
+        triage.reopen_if_needed(conn, NOW, DEFAULT_POLICY)
+        assert _rows(conn, eid)["state"] == triage.STATE_CLOSED, "no recurrence, no reopen"
+
+
+def test_a_human_ignored_alert_never_reopens():
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="hi-1", title="Hand ignored", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        triage._set_state(conn, eid, triage.STATE_CLOSED, NOW - dt.timedelta(days=3), close_reason=triage.CLOSE_IGNORED)
+        conn.commit()
+        _recur_ts(conn, eid, "1788850795.862159")
+        triage.reopen_if_needed(conn, NOW, DEFAULT_POLICY)
+        assert _rows(conn, eid)["state"] == triage.STATE_CLOSED, "a deliberate human --ignore is not revisited"
+
+
+def test_a_reopened_ignore_is_closed_again_by_the_ignore_list_without_a_triage_call():
+    policy = dict(DEFAULT_POLICY, ignore=["slack_alert:mi-3"])
+    with _triage_env(policy=policy) as (conn, ctx):
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit_triage = _fake_triage({}, calls=calls)
+        eid = _model_ignored(conn, "mi-3", closed_at=NOW - dt.timedelta(hours=8))
+        _recur_ts(conn, eid, "1788850795.862159")
+        triage.reopen_if_needed(conn, NOW, policy)
+        assert _rows(conn, eid)["state"] == triage.STATE_NEW
+        triage.classify(conn, policy, NOW)
+        triage.submit_triage_jobs(conn, policy, NOW, dry_run=False)
+        assert _rows(conn, eid)["state"] == triage.STATE_CLOSED and calls == []
+
+
+def test_a_reopened_model_ignore_gets_a_fresh_triage():
+    with _triage_env() as (conn, ctx):
+        calls: list[dict[str, Any]] = []
+        eid = _model_ignored(conn, "mi-4", closed_at=NOW - dt.timedelta(hours=8))
+        triage._sideclaw.submit_triage = _fake_triage({"Alert mi-4": "demo-repo"}, calls=calls)
+        _recur_ts(conn, eid, "1788850795.862159")
+        triage.run(conn, dry_run=False)
+        assert len(calls) == 1
+        assert _rows(conn, eid)["state"] in (triage.STATE_TRIAGED, triage.STATE_WORKING)
+
+
+def test_a_recurring_duplicate_does_not_count_on_an_alert_target():
+    """ingest() rewrites an alert's occurrences from its own event on every run, so attaching to
+    an alert target writes nothing — the duplicate still stays closed while the target is open."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="rd-a", title="Dup", first_seen=OLD)
+        triage.ingest(conn, NOW)
+        target = _seed_row(conn, external_id="rt-a", title="Target", repo="demo-repo", state=triage.STATE_WORKING,
+                           occurrences=2)
+        triage._set_state(conn, eid, triage.STATE_CLOSED, NOW, close_reason=triage.CLOSE_DUPLICATE,
+                          duplicate_of=target)
+        _recur_ts(conn, eid, "1788850795.862159")
+        triage.reopen_if_needed(conn, NOW)
+        assert _rows(conn, eid)["state"] == triage.STATE_CLOSED
+        assert _rows(conn, target)["occurrences"] == 2
+
+
 # --- runner ------------------------------------------------------------------
 
 def main() -> int:
@@ -7022,7 +7847,7 @@ def test_liveness_kuma_push_fresh_never_confirmed_reopens_past_deadline():
         triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
         triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(hours=2), dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_NEW, item["state"]
+        assert item["state"] == triage.STATE_TRIAGED, item["state"]
 
 
 def test_gather_kuma_push_fresh_unparsable_since_fails_closed():
@@ -8142,69 +8967,6 @@ def test_argo_merge_of_a_needs_decision_item_with_a_pr_merges_and_routes_like_au
         assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
 
 
-# --- live read-only evidence (§95) --------------------------------------------
-
-def _fake_run(stdout: str, returncode: int = 0):
-    return lambda argv, **kw: types.SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
-
-
-def test_beszel_gatherer_renders_rules_firings_and_temps():
-    out = (
-        "rule|Temperature|90|15|2026-09-26 11:31:14.336Z\n"
-        "fired|Temperature|90|2026-09-26 11:28:14.318Z|2026-09-26 11:31:14.336Z\n"
-        'stats|2026-09-28 10:13:16Z|{"cpu":7.4,"la":[0.4,0.8,0.8],"dp":32.2,"t":{"cpu_thermal":91.5,"nvme":48}}\n'
-    )
-    with _patched(triage.subprocess, run=_fake_run(out)):
-        text = triage._gather_beszel_alerts([])
-    assert "rule Temperature: > 90 for 15 min" in text
-    assert "fired Temperature at 2026-09-26 11:28" in text and "resolved 2026-09-26 11:31" in text
-    assert "cpu_thermal=91.5" in text
-
-
-def test_beszel_gatherer_reports_a_failed_read_instead_of_raising():
-    with _patched(triage.subprocess, run=_fake_run("", returncode=255)):
-        assert triage._gather_beszel_alerts([]).startswith("beszel read failed (exit 255)")
-
-
-def test_launchd_gatherer_lists_only_nonzero_jobs():
-    listing = "PID\tStatus\tLabel\n-\t0\tcom.jkrumm.warden-loop\n-\t1\tcom.jkrumm.drift-check\n" \
-              "123\t-15\tcom.jkrumm.warden-api\n-\t0\tcom.apple.x\n"
-    with _patched(triage.subprocess, run=_fake_run(listing)), \
-            _patched(triage, DEVHOST_MARKER_DIR=Path(tempfile.mkdtemp()),
-                     RESEARCH_GATEWAY_DEPLOY_LOG=Path("/nonexistent/rg.log")):
-        text = triage._gather_launchd_restarts([])
-    assert "com.jkrumm.drift-check pid=- last_status=1" in text
-    assert "warden-loop" not in text and "warden-api" not in text
-
-
-def test_kuma_monitor_config_reads_the_public_block_and_heartbeats():
-    yaml = Path(tempfile.mkdtemp()) / "monitors.yaml"
-    yaml.write_text("groups:\n  - name: Local\n    monitors:\n      - name: Brain Sync - Push\n"
-                    "        type: push\n        interval: 600 # ten\n        maxretries: 0\n"
-                    "      - name: Other\n        type: http\n")
-
-    def _verb(argv, *, timeout):
-        if argv[1] == "monitors":
-            return {"monitors": [{"id": 7, "name": "Brain Sync - Push"}]}
-        return {"rows": "7  2026-09-28 10:00:00  1\n7  2026-09-28 10:05:00  0\n7  2026-09-28 10:10:00  1\n"}
-
-    with _patched(triage, HOMELAB_MONITORS_YAML=yaml, _run_verb=_verb):
-        text = triage._gather_kuma_monitor_config([{"source": "uk", "title": "Brain Sync - Push"}])
-    assert "type: push | interval: 600 # ten | maxretries: 0" in text and "Other" not in text
-    assert "last 3 heartbeats: 1 down, 2 up, longest gap 300s" in text
-
-
-def test_new_evidence_keys_are_allowlisted_and_wired():
-    for key in ("launchd-restarts", "beszel-alerts", "kuma-monitor-config"):
-        assert key in triage.EVIDENCE_ALLOWLIST and key in triage._EVIDENCE_GATHERERS
-    rules = json.loads((triage.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
-    first = {}
-    for r in rules:
-        first.setdefault(r["match"], r)
-    assert "launchd-restarts" in first["uk:macmini-dev-host-push"]["evidence"]
-    assert "beszel-alerts" in first["slack_alert:homelab-temperature-above-threshold"]["evidence"]
-
-
 def test_argo_merge_that_may_have_reached_github_is_not_reported_refused():
     with _triage_env() as (conn, ctx):
         eid = _seed_pr_item(conn, external_id="sig-ambiguous", state=triage.STATE_NEEDS_DECISION, pr=12)
@@ -8326,7 +9088,7 @@ def test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding():
         triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": True, "down": False}})
         triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=900), dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_NEW
+        assert item["state"] == triage.STATE_TRIAGED
         assert triage.TRIP_FAILED_NOTE_PREFIX in item["note"] and "homelab/pull/20" in item["note"]
         assert ("stop", ("904",)) in TRIP_CALLS
 
@@ -8349,7 +9111,7 @@ def test_a_shadow_that_vanishes_after_the_window_is_unproven_not_a_finding():
         assert not any(v == "stop" for v, _ in TRIP_CALLS), "the shadow stays while its answer is still readable"
         triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(hours=3), dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_NEW and "unproven, not fixed" in item["note"]
+        assert item["state"] == triage.STATE_TRIAGED and "unproven, not fixed" in item["note"]
         assert "gone before" in item["note"], "the note says WHY it is unproven"
         assert (("stop", ("907",)) in TRIP_CALLS)
 
@@ -8403,6 +9165,20 @@ def test_the_poller_never_turns_a_trip_shadow_into_an_event():
     assert [o["title"] for o in out] == ["Brain Sync - Push"]
 
 
+def test_the_uk_poller_keeps_a_monitors_tags_for_label_routing():
+    wp = triage._wp_module()
+    saved = wp.http_get
+    wp.http_get = lambda url, headers: [
+        {"id": 11, "name": "Tagged", "type": "http", "status": 0, "tags": [{"name": "repo", "value": "weatherorb"}]},
+        {"id": 12, "name": "Untagged", "type": "http", "status": 0, "tags": []}]
+    try:
+        out = {o["title"]: o["payload"] for o in wp.poll_uk({"HOMELAB_API_KEY": "k"})}
+    finally:
+        wp.http_get = saved
+    assert out["Tagged"] == {"type": "http", "status": 0, "tags": [{"name": "repo", "value": "weatherorb"}]}
+    assert out["Untagged"] == {"type": "http", "status": 0}
+
+
 def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline():
     with _triage_env() as (conn, ctx):
         armed = {"status": "armed", "shadowId": 906, "window": 780, "armedAt": NOW.isoformat(),
@@ -8415,7 +9191,7 @@ def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline(
         assert not any(v == "stop" for v, _ in TRIP_CALLS), "the shadow stays while its answer is still readable"
         triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(hours=3), dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_NEW and "unproven, not fixed" in item["note"]
+        assert item["state"] == triage.STATE_TRIAGED and "unproven, not fixed" in item["note"]
         assert ("stop", ("906",)) in TRIP_CALLS
 
 

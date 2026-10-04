@@ -474,10 +474,32 @@ def test_dispatch_wait_returns_terminal_result():
 
 # --- run (Wave 6.1: the `human` origin) --------------------------------------
 
+TRIAGE_JOB_ID = "triage-stub-1"
+
+
+def _run_routes(dispatch_job: dict[str, Any], *, extra: dict | None = None,
+                answer: dict[str, Any] | None = None) -> dict:
+    """Stub routes for `warden run`: the triage job it opens first (finished on the first read,
+    answering `new` unless `answer` says otherwise) and the investigation dispatch it opens
+    after. `extra` adds the dispatch job's own GET."""
+    def _submit(req):
+        if (req["body"] or {}).get("tool") == "triage":
+            return 200, {"job": {"id": TRIAGE_JOB_ID, "status": "running"}}
+        return 200, {"job": dispatch_job}
+
+    result = {"result": answer or {"action": "new", "reason": "stub"}}
+    return {
+        ("POST", "/api/jobs"): _submit,
+        ("GET", f"/api/jobs/{TRIAGE_JOB_ID}"): (200, {"job": {"id": TRIAGE_JOB_ID, "status": "done",
+                                                              "result": result}}),
+        **(extra or {}),
+    }
+
+
 
 def test_run_record_round_trip():
     h = Harness()
-    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-rt", "status": "running"}})})
+    srv = stubs.StubServer(_run_routes({"id": "job-run-rt", "status": "running"}))
     try:
         proc = h.run(["run", "alpha", "--json"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
     finally:
@@ -490,9 +512,60 @@ def test_run_record_round_trip():
     assert out["eventId"] is not None
 
 
+def test_run_triages_first_then_dispatches_on_new():
+    """`warden run` shares the intake pool: one triage job answers first, and `new` dispatches
+    immediately — the output names both."""
+    h = Harness()
+    db = h.new_db()
+    srv = stubs.StubServer(_run_routes({"id": "job-run-t", "status": "running"}))
+    try:
+        proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0, out
+    assert out["triage"] == "triaged to alpha" and out["state"] == "working" and out["jobId"] == "job-run-t", out
+    tools = [r["body"]["tool"] for r in srv.requests if r["method"] == "POST"]
+    assert tools == ["triage", "dispatch"], tools
+
+
+def test_run_attached_to_an_open_item_dispatches_nothing():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 50, state="working", repo="alpha")
+    answer = {"action": "attach", "item": 50, "reason": "same flaky check"}
+    srv = stubs.StubServer(_run_routes({"id": "job-never", "status": "running"}, answer=answer))
+    try:
+        proc = h.run(["run", "alpha"], env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    assert proc.returncode == 0, proc
+    assert "triage: attached to #50" in proc.stdout, proc.stdout
+    tools = [r["body"]["tool"] for r in srv.requests if r["method"] == "POST"]
+    assert tools == ["triage"], f"an attached item must never open an episode, got {tools}"
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, close_reason, duplicate_of, dispatch_job FROM triage_items WHERE event_id != 50")
+    conn.close()
+    assert row["state"] == "closed" and row["close_reason"] == "duplicate", dict(row)
+    assert row["duplicate_of"] == 50 and row["dispatch_job"] is None, dict(row)
+
+
+def test_run_with_triage_down_queues_the_item_for_the_loop():
+    """sideclaw unreachable: the item is opened and left `new` with a strike — the loop retries it."""
+    h = Harness()
+    db = h.new_db()
+    proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db), stdin=VALID_BRIEF)
+    out = _json_or_fail(proc)
+    assert out["queued"] is True and out["state"] == "new" and out["triage"] is None, out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT strikes, triage_job, retry_at FROM triage_items")
+    conn.close()
+    assert row["strikes"] == 1 and row["triage_job"] is None and row["retry_at"], dict(row)
+
+
 def test_run_text_output_prints_the_real_state_not_a_stale_literal():
     h = Harness()
-    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-txt", "status": "running"}})})
+    srv = stubs.StubServer(_run_routes({"id": "job-run-txt", "status": "running"}))
     try:
         proc = h.run(["run", "alpha"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
     finally:
@@ -508,7 +581,7 @@ def test_run_with_origin_channel_and_thread_carries_onto_the_dispatch_row():
     read it."""
     h = Harness()
     db = h.new_db()
-    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-origin", "status": "running"}})})
+    srv = stubs.StubServer(_run_routes({"id": "job-run-origin", "status": "running"}))
     try:
         proc = h.run(
             ["run", "alpha", "--origin-channel", "C0ORIGIN0001", "--origin-thread", "1111.000001", "--json"],
@@ -531,7 +604,7 @@ def test_run_without_origin_channel_uses_the_shared_card_as_before():
     or the module default) — unchanged from before these columns existed."""
     h = Harness()
     db = h.new_db()
-    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-noorigin", "status": "running"}})})
+    srv = stubs.StubServer(_run_routes({"id": "job-run-noorigin", "status": "running"}))
     try:
         proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF)
     finally:
@@ -563,7 +636,7 @@ def test_run_tier_implement_needs_no_why_like_dispatch():
     Wave 1 — `run` matches it."""
     h = Harness()
     db = h.new_db()
-    srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-run-impl", "status": "running"}})})
+    srv = stubs.StubServer(_run_routes({"id": "job-run-impl", "status": "running"}))
     try:
         proc = h.run(["run", "gamma", "--tier", "implement", "--json"], env=h.base_env(db=db, sideclaw=srv.base),
                      stdin=VALID_BRIEF)
@@ -575,11 +648,10 @@ def test_run_tier_implement_needs_no_why_like_dispatch():
 
 def test_run_wait_returns_result():
     h = Harness()
-    srv = stubs.StubServer({
-        ("POST", "/api/jobs"): (200, {"job": {"id": "job-run-w", "status": "running"}}),
+    srv = stubs.StubServer(_run_routes({"id": "job-run-w", "status": "running"}, extra={
         ("GET", "/api/jobs/job-run-w"): (200, {"job": {"id": "job-run-w", "status": "done",
                                                         "result": {"summary": "ok"}}}),
-    })
+    }))
     try:
         proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
     finally:
@@ -599,11 +671,10 @@ def test_run_wait_folds_the_verdict_before_returning():
     the same call dispatch-sweep.py's process_dispatch() makes."""
     h = Harness()
     db = h.new_db()
-    srv = stubs.StubServer({
-        ("POST", "/api/jobs"): (200, {"job": {"id": "job-run-fold", "status": "running"}}),
+    srv = stubs.StubServer(_run_routes({"id": "job-run-fold", "status": "running"}, extra={
         ("GET", "/api/jobs/job-run-fold"): (200, {"job": {"id": "job-run-fold", "status": "done",
                                                            "result": {"summary": "all good, no fix needed"}}}),
-    })
+    }))
     try:
         proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(db=db, sideclaw=srv.base),
                       stdin=VALID_BRIEF)

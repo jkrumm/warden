@@ -413,6 +413,55 @@ def test_submit_review_500_raises_remote_error():
         srv.stop()
 
 
+def test_submit_triage_body_shape_has_no_model():
+    srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "t1", "status": "queued"}})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        schema = {"type": "object", "properties": {"action": {"type": "string"}}}
+        job = sideclaw.submit_triage(prompt="decide", schema=schema)
+        assert job == {"id": "t1", "status": "queued"}, job
+        assert srv.requests[0]["body"] == {
+            "tool": "triage", "params": {"prompt": "decide", "schema": schema},
+        }, srv.requests[0]["body"]
+    finally:
+        srv.stop()
+
+
+def test_submit_triage_4xx_raises_submit_refused():
+    srv = _StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": "invalid params: prompt too long"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit_triage(prompt="x", schema={"type": "object"})
+        except SubmitRefused as e:
+            assert e.status == 400 and "invalid params: prompt too long" in str(e), e
+        else:
+            raise AssertionError("expected SubmitRefused")
+    finally:
+        srv.stop()
+
+
+def test_submit_triage_500_and_unreachable_are_remote_errors():
+    srv = _StubServer({("POST", "/api/jobs"): (500, {"error": "boom"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit_triage(prompt="x", schema={"type": "object"})
+        except RemoteError as e:
+            assert "500" in str(e), e
+        else:
+            raise AssertionError("expected RemoteError")
+    finally:
+        srv.stop()
+    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+    try:
+        sideclaw.submit_triage(prompt="x", schema={"type": "object"})
+    except RemoteError as e:
+        assert "triage submit failed" in str(e), e
+    else:
+        raise AssertionError("expected RemoteError")
+
+
 def test_assert_result_schema_ok_on_matching_version():
     sideclaw.assert_result_schema(
         {"status": "done", "result": {"schemaVersion": 2}}, 2, "implement"

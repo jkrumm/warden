@@ -15,9 +15,30 @@ are not. Check against it before every merge.
 
 ## Architecture
 
-warden is a deterministic control plane over one SQLite ledger. **No LLM call
-decides a state transition** — the dispatched episodes each run one, the loop
-never does. Pollers feed it, sideclaw executes for it, Slack and Argo render it.
+warden is a deterministic control plane over one SQLite ledger. **Code owns every
+state transition.** Its only LLM inputs are sideclaw's episode verdicts and the
+single-shot intake triage answer (sideclaw `triage`), and each is validated against
+the ledger (an open target, a candidate repo, the origin guards in
+`_fold_triage_job()`) before any item moves; an answer that fails validation is
+treated as `new` or strikes. Pollers feed it, sideclaw executes for
+it, Slack and Argo render it.
+
+**Intake is one pool.** Alerts, GitHub issues and `warden run` are `new` items;
+each gets one triage job (alerts once debounce-eligible, the rest at once), and
+`triaged` is that step's output — `escalate()`/`escalate_origin_items()` pick up
+nothing else. Before triage, `classify()` closes `ignore`-list and chat-prose alerts
+`closed(ignored)` with no model call. The signal's own label then picks the candidate
+repos (`_label_route()`): a native label first (`lifecycle/intake.py`: a Kuma tag, a
+container name, an OTel `service.name`, the issue's repo), then a policy `rules`
+match — **a rule is a label, not a route**; triage still runs for a labelled item
+(dedup: attach / fixed_by / ignore) with the label's repo as the only candidate. With no
+label every checkout under the repos root with an `AGENTS.md` is a candidate and the job
+reads their `## Verify & Monitor` sections. `rules` is the tier a later wave deletes once
+those sections cover the fleet (replay: 86/86 rule-routed alerts keep their repo as a
+label; triage alone matched 88 of 108 and misrouted a few for lack of repo knowledge).
+A model's `closed(ignored)` is not forever: on recurrence after `cooldownHours` it
+reopens to `new` (the ignore list and prose filter re-close it without a model call); a
+human `--ignore` stays closed.
 
 Six LaunchAgents, never `hermes cron` jobs, and that is the whole reason this
 repo is separate from `hermes-agent`: a gateway cron job runs *inside* the
@@ -84,7 +105,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **339/339**. Any other number is a
+`tests/test_triage.py` is the regression gate at **390/390**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -145,12 +166,18 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 - **A signal going quiet may cancel the need to *start* work. It may never
   discharge a verdict or an in-flight operation.**
   Silence-resolve applies to `new` and to nothing else.
-- **Overflow waits, never drops.** Cluster members past the cap stay `new`.
-- **The dry-run contract**: never touches Slack, never shells out, everything else
-  real. With no staging environment it is the only pre-production surface there is.
+- **Overflow waits, never drops.** Triage submissions past the per-run cap stay `new`;
+  cluster members past the cap stay `triaged`.
+- **The triage submit and fold are compare-and-set** on `triage_job` (a
+  `claiming:<time>` sentinel before the call, the job id after, a stale claim
+  released after 5 minutes). Two passes finding the same finished job fold it once.
+  Entering `new` clears `triage_job`, so a recurrence is triaged afresh. A sideclaw 4xx
+  on the triage submit ends the item `failed` like every other refused submit.
+- **The dry-run contract**: never touches Slack, never shells out, never submits a
+  triage job (it prints what it would), everything else real. With no staging environment it is the only pre-production surface there is.
 - **A policy file may name and parameterise, never express.** Config carries
-  validated values; code owns the argv array. The four closed allowlists
-  (evidence, liveness, deploy, `HOST_VERB_ALLOWLIST`) are one principle in four
+  validated values; code owns the argv array. The three closed allowlists
+  (liveness, deploy, `HOST_VERB_ALLOWLIST`) are one principle in three
   instances (the host-verb one added 2026-09-11 for the owner's host-restart
   decision — DESIGN.md § The host-verb carve-out).
 - **Deferral must be visible.** A budget hit that only reaches a `.err` file is

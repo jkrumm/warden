@@ -265,11 +265,16 @@ def poll_uk(env: dict[str, str]) -> list[dict[str, Any]]:
         mid = str(m.get("id") or m.get("monitorId") or m.get("name") or "")
         if not mid:
             continue
+        payload: dict[str, Any] = {"type": m.get("type"), "status": status}
+        # The monitor's own tags, when the endpoint carries them: triage's label routing
+        # (lifecycle/intake.py route_by_label()) reads a tag naming a repo.
+        if m.get("tags"):
+            payload["tags"] = m["tags"]
         out.append({
             "external_id": mid,
             "title": m.get("name", "monitor") or "monitor",
             "url": m.get("url") or "",
-            "payload": {"type": m.get("type"), "status": status},
+            "payload": payload,
         })
     return out
 

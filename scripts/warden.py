@@ -504,6 +504,10 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
         # dropping the brief.
         raise PreconditionError("warden run: could not open an item for this brief (no event_id returned)")
 
+    # The shared intake: one triage job decides attach / fixed_by / new before anything is
+    # dispatched, so `run` waits for it (triage_item_now() has its own hang guard) and then
+    # dispatches immediately when the answer was `new`.
+    triaged = triage.triage_item_now(conn, event_id, now)
     triage.escalate_origin_items(conn, now)
     conn.commit()
     state.did_mutate = True
@@ -516,7 +520,7 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
     out: dict[str, Any] = {
         "verb": "run", "ok": True, "eventId": event_id, "jobId": job_id, "state": item_state,
         "origin": "human", "maxTier": max_tier, "repo": name, "queued": queued,
-        "note": item["note"] if item else None,
+        "triage": triaged, "note": item["note"] if item else None,
     }
 
     if flags.wait and job_id:
@@ -928,6 +932,8 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
             print("Re-invoke without --dry-run to open the item.")
         else:
             print(f"item opened: event {out['eventId']} ({out['repo']}, state {out['state']})")
+            if out.get("triage"):
+                print(f"triage: {out['triage']}")
             if out.get("queued"):
                 print(f"queued — {out.get('note') or 'waiting for a free slot'}")
             elif out.get("jobId"):

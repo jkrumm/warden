@@ -191,6 +191,34 @@ def submit_review(*, cwd: Path, pr: int, context: str | None = None, model: str 
     return job
 
 
+def submit_triage(*, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """The single-shot `triage` job: `POST /api/jobs {"tool":"triage","params":{prompt,schema}}`.
+    sideclaw validates the model's answer against `schema` and, on a `done` job, returns it at
+    `job.result.result`. No `model` param — sideclaw routes the tool itself. Same transport and
+    error handling as `submit_review()`: a 4xx is `SubmitRefused`, anything else a `RemoteError`."""
+    body = {"tool": "triage", "params": {"prompt": prompt, "schema": schema}}
+
+    try:
+        status, text = _request("POST", "/api/jobs", body)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise RemoteError(
+            f"sideclaw triage submit failed (is the LaunchAgent up? curl {_base()}/health)",
+            maybe_mutated=True,
+        )
+
+    _raise_for_submit_status(status, text)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
+
+    job = parsed.get("job") if isinstance(parsed, dict) else None
+    if not isinstance(job, dict) or "id" not in job:
+        raise RemoteError("sideclaw accepted the triage job but returned no id")
+    return job
+
+
 # The stable substring of sideclaw's per-repo implement lease refusal. The POST is
 # accepted (HTTP 200); the job then FAILS carrying this text (an `update_pr` refusal
 # prefixes it with `update_pr refused:`). It means "another implement episode holds
