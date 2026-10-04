@@ -42,6 +42,16 @@ class ChecksFailed(PolicyError):
 class MergeInFlight(PolicyError):
     """Another caller is already landing this very pull request."""
 
+
+class AlreadyMerged(PolicyError):
+    """GitHub says the dispatch's own pull request is merged while the ledger never recorded
+    it (a merge call whose answer was lost, or a merge by hand): the change landed. The merge
+    train lands its item from here instead of failing it; `merge_commit` is GitHub's."""
+
+    def __init__(self, message: str, *, merge_commit: str | None):
+        super().__init__(message)
+        self.merge_commit = merge_commit
+
 def _nested(d: dict[str, Any], path: str) -> Any:
     cur: Any = d
     for part in path.split("."):
@@ -191,13 +201,15 @@ def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation:
 def plan_or_land(
     conn: sqlite3.Connection, *, job_id: str, why: str, confirm: bool, dry_run: bool,
     authorized_by: str, now: dt.datetime, sleep: Callable[[float], None] = time.sleep,
-    expected_sha: str | None = None,
+    expected_sha: str | None = None, require_pin: bool = False,
 ) -> MergePlan | MergeResult:
     """Inspect, gate and (confirmed) land one dispatch's pull request, squash first
     (`github.pick_merge_method()` falls back to rebase/merge only where the repo's rules
     allow nothing else). The merge call pins the head SHA every check was made against.
     `expected_sha` is the merge train's SHA: a PR whose head is anything else is refused
-    with `HeadMoved` before any gate runs; None pins whatever the head is now."""
+    with `HeadMoved` before any gate runs; None pins whatever the head is now — unless
+    `require_pin` (the owner's `warden merge`): `validation_status` says a review confirmed, not
+    of which head, so with no reviewed head to pin the merge is refused."""
     if not why:
         raise UsageError(
             'merge requires --why "<reason>". It is the audit record of why an '
@@ -242,6 +254,11 @@ def plan_or_land(
         raise PolicyError(
             f"dispatch {job_id} recorded no artifact URL — the episode pushed a branch "
             f"but never opened a pull request."
+        )
+    if require_pin and expected_sha is None:
+        raise PolicyError(
+            f"no reviewed head on record for dispatch {job_id} — review the current head first "
+            f"(its item's merge train reviews it; Argo's merge puts the item back on the train)."
         )
 
     parsed = github.parse_pr_url(artifact)
@@ -296,7 +313,9 @@ def plan_or_land(
     rules = github.branch_rules(owner, repo, default_branch)
 
     if pr_merged:
-        raise PolicyError(f"{owner}/{repo}#{pr_number} is already merged.")
+        sha = pr.get("merge_commit_sha")
+        raise AlreadyMerged(f"{owner}/{repo}#{pr_number} is already merged.",
+                            merge_commit=sha if isinstance(sha, str) and sha else None)
     if pr_state != "open":
         raise PolicyError(f"{owner}/{repo}#{pr_number} is '{pr_state}', not open.")
     if pr_base != default_branch:
@@ -379,6 +398,10 @@ def plan_or_land(
         conn.rollback()
         raise
     conn.commit()
+    # The method rides on the open operation, so a merge whose answer is lost (a crash, a
+    # timeout) still says how it landed once reconcile_operations() resolves it — a revert
+    # depends on it.
+    operations.annotate(conn, merge_op, receipt=json.dumps({"mergeMethod": method}))
 
     # Ready-for-review first: a draft cannot be merged. Done AFTER every
     # check above, so a PR that fails one is never un-drafted as a side
@@ -425,7 +448,8 @@ def plan_or_land(
         operations.complete(conn, merge_op, outcome="failed")
         raise
     except RemoteError as e:
-        operations.complete(conn, merge_op, outcome="unknown", receipt=json.dumps({"error": str(e)}))
+        operations.complete(conn, merge_op, outcome="unknown",
+                            receipt=json.dumps({"error": str(e), "mergeMethod": method}))
         raise
     merge_sha = resp.get("sha")
 

@@ -107,9 +107,11 @@ def open_episode(
     model: str | None = None,
     revision_of: str | None = None,
     now: dt.datetime | None = None,
+    count_merging: bool = True,
 ) -> Opened:
     """Submit one sideclaw episode and record it. `revision_of` (a prior episode's
     `dispatch/*` branch) makes it a revision sideclaw applies to that branch's open PR.
+    `count_merging` is check_repo_not_in_flight()'s (False for a revert).
 
     A gated tier (`implement`) is covered by an `operations` row committed
     BEFORE the submit — DESIGN.md § Crash recovery. A submit that fails definitively
@@ -140,7 +142,8 @@ def open_episode(
             # The loop's own claimed item (already carrying its claim in `implement_job`
             # from the caller, e.g. maybe_auto_implement()'s compare-and-set,
             # BEFORE it calls this function) must not refuse itself.
-            policy.check_repo_not_in_flight(conn, repo=repo, exclude_event_id=origin.event_id)
+            policy.check_repo_not_in_flight(conn, repo=repo, exclude_event_id=origin.event_id,
+                                            count_merging=count_merging)
             opened_op_id = operations.record(
                 conn,
                 event_id=origin.event_id,

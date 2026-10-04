@@ -289,8 +289,8 @@ def test_migrate_adopts_pre_versioned_database():
         "origin_channel", "origin_thread_ts", "revision_count", "close_reason", "strikes", "retry_at",
         "root_cause", "duplicate_of", "triage_job", "triage_job_at",
         "verify_started_at", "verify_mark", "verify_failures", "verify_result",
-        "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence",
-        "merged_sha", "reverting_sha", "revert_json",
+        "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
+        "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
         "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
     }, (
         f"unexpected column change on triage_items: "
@@ -1054,8 +1054,9 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 15 == ledger.LEDGER_SCHEMA_VERSION
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
-    assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence"} <= cols, cols
-    assert {"merged_sha", "reverting_sha", "revert_json"} <= cols, cols
+    assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
+            "train_pushed_at"} <= cols, cols
+    assert {"merged_sha", "merge_method", "reverting_sha", "revert_json"} <= cols, cols
     assert {"sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr"} <= cols, cols
     rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
     assert set(rows) == {"note-verifying", "note-working", "note-fixed", "note-merging"}, rows.keys()
@@ -1066,7 +1067,8 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     for row in rows.values():
         assert row["verify_mark"] is None and row["verify_result"] is None and row["verify_failures"] == 0
         assert row["train_sha"] is None and row["train_job"] is None and row["reviewed_sha"] is None
-        assert row["train_evidence"] is None
+        assert row["train_evidence"] is None and row["train_rewinds"] == 0 and row["train_pushed_at"] is None
+        assert row["merge_method"] is None
         assert row["merged_sha"] is None and row["reverting_sha"] is None and row["revert_json"] is None
         assert row["sweep_pr"] is None and row["sweep_job"] is None and row["sweep_job_at"] is None
         assert row["sweep_attempts"] == 0 and row["sweep_candidates"] is None and row["fixed_by_pr"] is None

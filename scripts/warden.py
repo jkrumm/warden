@@ -622,15 +622,20 @@ def cmd_merge(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     row = conn.execute("SELECT tier FROM dispatches WHERE job_id=?", (job_id,)).fetchone()
     if row is not None:
         state.tier = row["tier"]
-    # An item on its merge train merges the SHA the train checked and reviewed; any other PR
-    # merges the head the gate reads now.
-    train = conn.execute("SELECT train_sha FROM triage_items WHERE implement_job=? AND state=? "
-                         "AND train_sha IS NOT NULL", (job_id, triage.STATE_MERGING)).fetchone()
+    # The merge is pinned to the head a review confirmed: the train's SHA while the item is on
+    # its merge train, else the last head a review confirmed (`reviewed_sha`) —
+    # `dispatches.validation_status` says a review confirmed, not of which head. None on record:
+    # refused (plan_or_land(require_pin=True)); the item's merge train reviews the current head.
+    item = conn.execute("SELECT state, train_sha, reviewed_sha FROM triage_items WHERE implement_job=?",
+                        (job_id,)).fetchone()
+    pinned = None
+    if item is not None:
+        pinned = item["train_sha"] if item["state"] == triage.STATE_MERGING else item["reviewed_sha"]
 
     now = dt.datetime.now(dt.timezone.utc)
     result = merge.plan_or_land(
         conn, job_id=job_id, why=flags.why or "", confirm=flags.confirm, dry_run=flags.dry_run,
-        authorized_by="cli:confirm", now=now, expected_sha=train["train_sha"] if train else None,
+        authorized_by="cli:confirm", now=now, expected_sha=pinned, require_pin=True,
     )
     if isinstance(result, merge.MergeResult):
         state.did_mutate = True

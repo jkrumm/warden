@@ -10,8 +10,11 @@ Run: .venv/bin/python3 tests/test_rollout.py  (or: make test, from warden/)
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -53,6 +56,7 @@ _CLEAN_ON_MAIN = {
     "symbolic-ref": (0, "origin/main\n", ""),
     "rev-parse --abbrev-ref HEAD": (0, "main\n", ""),
     "status --porcelain": (0, "", ""),
+    "rev-parse HEAD origin/": (0, "c0ffee\nc0ffee\n", ""),
 }
 
 
@@ -73,6 +77,18 @@ def test_has_target_false_when_there_is_no_makefile_at_all():
     assert rollout.has_target(CWD, "deploy", runner=run) is False
 
 
+def test_has_target_false_on_make_381_quoting_of_the_target_itself():
+    run = Script({"-n deploy": (2, "", "make: *** No rule to make target `deploy'.  Stop.\n")})
+    assert rollout.has_target(CWD, "deploy", runner=run) is False
+
+
+def test_a_missing_prerequisite_of_the_target_reads_as_present_never_as_no_target():
+    for err in ("make: *** No rule to make target 'build/app', needed by 'deploy'.  Stop.\n",
+                "make: *** No rule to make target `build/app', needed by `deploy'.  Stop.\n"):
+        run = Script({"-n deploy": (2, "", err)})
+        assert rollout.has_target(CWD, "deploy", runner=run) is True, err
+
+
 def test_has_target_reads_any_other_failure_as_present_so_the_real_run_reports_it():
     run = Script({"-n deploy": (2, "", "Makefile:3: *** missing separator.  Stop.\n")})
     assert rollout.has_target(CWD, "deploy", runner=run) is True
@@ -87,72 +103,85 @@ def test_has_target_refuses_a_target_that_is_not_deploy_or_verify():
     raise AssertionError("expected ValueError")
 
 
-def test_deploy_fast_forwards_then_runs_make_deploy_with_the_deploy_timeout():
-    run = Script({**_CLEAN_ON_MAIN, "make": (0, "deployed ok\n", "")})
-    result = rollout.deploy(CWD, runner=run)
-    assert result == rollout.Ran(True, 0, "deployed ok\n"), result
+def test_sync_fast_forwards_to_origin_and_checks_it_landed_there():
+    run = Script(_CLEAN_ON_MAIN)
+    assert rollout.sync_checkout(CWD, runner=run) is None
     cmds = [" ".join(a) for a in run.argvs]
     assert cmds[0] == f"git -C {CWD} fetch --quiet origin"
     assert cmds[-2] == f"git -C {CWD} merge --ff-only origin/main"
-    assert cmds[-1] == f"make -C {CWD} deploy"
+    assert cmds[-1] == f"git -C {CWD} rev-parse HEAD origin/main"
+
+
+def test_sync_is_deferred_when_the_checkout_is_ahead_of_origin():
+    # `merge --ff-only` answers "Already up to date" for a checkout with unpushed commits: those
+    # must never be deployed.
+    run = Script({**_CLEAN_ON_MAIN, "rev-parse HEAD origin/": (0, "1111111111111111\n2222222222222222\n", "")})
+    result = rollout.sync_checkout(CWD, runner=run)
+    assert isinstance(result, rollout.Deferred) and "not at origin/main" in result.reason, result
+    assert "111111111111" in result.reason and "222222222222" in result.reason, result.reason
+
+
+def test_deploy_runs_only_make_deploy_with_the_deploy_timeout():
+    run = Script({"make": (0, "deployed ok\n", "")})
+    result = rollout.deploy(CWD, runner=run)
+    assert result == rollout.Ran(True, 0, "deployed ok\n"), result
+    assert run.argvs == [["make", "-C", str(CWD), "deploy"]], "the caller syncs; deploy() only runs make"
     assert run.kwargs[-1]["timeout"] == rollout.DEPLOY_TIMEOUT_S == 900
 
 
-def test_deploy_is_deferred_when_the_checkout_is_on_another_branch():
+def test_sync_is_deferred_when_the_checkout_is_on_another_branch():
     run = Script({**_CLEAN_ON_MAIN, "rev-parse --abbrev-ref HEAD": (0, "feature/x\n", "")})
-    result = rollout.deploy(CWD, runner=run)
+    result = rollout.sync_checkout(CWD, runner=run)
     assert isinstance(result, rollout.Deferred), result
     assert "checkout not clean/on main" in result.reason and "feature/x" in result.reason, result.reason
-    assert not run.ran("merge") and not run.ran("make"), "nothing may run against a checkout we did not touch"
+    assert not run.ran("merge"), "nothing may run against a checkout we did not touch"
 
 
-def test_deploy_is_deferred_when_the_checkout_has_tracked_changes():
+def test_sync_is_deferred_when_the_checkout_has_tracked_changes():
     run = Script({**_CLEAN_ON_MAIN, "status --porcelain": (0, " M scripts/app.py\n", "")})
-    result = rollout.deploy(CWD, runner=run)
+    result = rollout.sync_checkout(CWD, runner=run)
     assert isinstance(result, rollout.Deferred) and "checkout not clean/on main" in result.reason, result
     assert "--untracked-files=no" in " ".join(next(a for a in run.argvs if "status" in a))
-    assert not run.ran("merge") and not run.ran("make")
+    assert not run.ran("merge")
 
 
-def test_deploy_is_deferred_when_the_fast_forward_is_refused():
+def test_sync_is_deferred_when_the_fast_forward_is_refused():
     run = Script({**_CLEAN_ON_MAIN, "merge --ff-only": (128, "", "fatal: Not possible to fast-forward, aborting.")})
-    result = rollout.deploy(CWD, runner=run)
+    result = rollout.sync_checkout(CWD, runner=run)
     assert isinstance(result, rollout.Deferred) and "cannot fast-forward" in result.reason, result
-    assert not run.ran("make")
 
 
-def test_deploy_is_deferred_when_fetch_fails():
+def test_sync_is_deferred_when_fetch_fails():
     run = Script({"fetch": (128, "", "fatal: unable to access remote")})
-    result = rollout.deploy(CWD, runner=run)
+    result = rollout.sync_checkout(CWD, runner=run)
     assert isinstance(result, rollout.Deferred) and "git fetch failed" in result.reason, result
 
 
 def test_the_default_branch_falls_back_to_master_when_origin_head_is_unset():
     run = Script({**_CLEAN_ON_MAIN, "symbolic-ref": (128, "", "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref"),
                   "refs/remotes/origin/main": (1, "", ""),
-                  "rev-parse --abbrev-ref HEAD": (0, "master\n", ""), "make": (0, "", "")})
-    result = rollout.deploy(CWD, runner=run)
-    assert isinstance(result, rollout.Ran) and result.ok, result
-    assert run.ran("merge --ff-only origin/master")
+                  "rev-parse --abbrev-ref HEAD": (0, "master\n", "")})
+    assert rollout.sync_checkout(CWD, runner=run) is None
+    assert run.ran("merge --ff-only origin/master") and run.ran("rev-parse HEAD origin/master")
 
 
 def test_a_default_branch_that_cannot_be_determined_defers():
     run = Script({"symbolic-ref": (128, "", "x"), "refs/remotes/origin": (1, "", "")})
-    result = rollout.deploy(CWD, runner=run)
+    result = rollout.sync_checkout(CWD, runner=run)
     assert isinstance(result, rollout.Deferred) and "default branch" in result.reason, result
 
 
 def test_a_failing_deploy_reports_the_exit_code_and_a_bounded_tail():
-    run = Script({**_CLEAN_ON_MAIN, "make": (3, "x" * 3000, "y" * 3000)})
+    run = Script({"make": (3, "x" * 3000, "y" * 3000)})
     result = rollout.deploy(CWD, runner=run)
     assert isinstance(result, rollout.Ran) and not result.ok and result.exit_code == 3
     assert len(result.tail) == rollout.OUTPUT_TAIL_CHARS and result.tail.endswith("y"), len(result.tail)
 
 
 def test_a_deploy_timeout_and_a_missing_binary_never_raise():
-    timeout = Script({**_CLEAN_ON_MAIN, "make": subprocess.TimeoutExpired("make", 5)})
+    timeout = Script({"make": subprocess.TimeoutExpired("make", 5)})
     assert rollout.deploy(CWD, runner=timeout, timeout_s=5) == rollout.Ran(False, 124, "timed out after 5s")
-    missing = Script({**_CLEAN_ON_MAIN, "make": FileNotFoundError("make: not found")})
+    missing = Script({"make": FileNotFoundError("make: not found")})
     result = rollout.deploy(CWD, runner=missing)
     assert result.ok is False and result.exit_code == 127 and "not found" in result.tail, result
 
@@ -163,6 +192,38 @@ def test_verify_runs_only_make_verify_with_its_own_timeout():
     assert result == rollout.Ran(True, 0, "healthy\n")
     assert run.argvs == [["make", "-C", str(CWD), "verify"]]
     assert run.kwargs[0]["timeout"] == rollout.VERIFY_TIMEOUT_S
+
+
+def test_a_timeout_kills_the_whole_process_group_not_just_its_leader():
+    # The default runner: a recipe's background child must die with it, or a timed-out deploy
+    # keeps running while warden strikes and runs it again.
+    with tempfile.TemporaryDirectory() as tmp:
+        pidfile = Path(tmp) / "child.pid"
+        script = f"sleep 30 & echo $! > {pidfile}; wait"
+        started = time.monotonic()
+        try:
+            rollout._run_in_group(["sh", "-c", script], capture_output=True, text=True, timeout=1,
+                                  env=dict(os.environ))
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise AssertionError("expected TimeoutExpired")
+        assert time.monotonic() - started < 10, "the timeout must not wait on the orphaned child"
+        child = int(pidfile.read_text().strip())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(child, 9)
+            raise AssertionError(f"the recipe's child {child} outlived the timeout")
+
+
+def test_the_default_runner_returns_like_subprocess_run():
+    res = rollout._run(["sh", "-c", "echo out; echo err >&2; exit 3"], rollout._run_in_group, 10)
+    assert res.ok is False and res.exit_code == 3 and "out" in res.tail and "err" in res.tail, res
 
 
 def main() -> int:

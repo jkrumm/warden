@@ -636,6 +636,10 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #     owner merge of the same head need not re-review); a new implement attempt clears it.
 #   train_evidence  what ended a train in a revision (the rebase conflict, the failed checks),
 #     read by the revision brief — the update_pr job that said so is not a dispatch row.
+#   train_rewinds   times the train went back to update (the PR head moved off its SHA) since the
+#     item entered `merging`; past a small limit each rewind strikes. 0 outside `merging`.
+#   train_pushed_at when the update stage last pushed (`update_pr` -> `updated`): right after a
+#     push GitHub may not have registered the check runs yet, so "none" reads as pending.
 #
 # Items already `merging` restart the train at `update`: the review they may be in the middle
 # of read a head nobody pinned.
@@ -644,6 +648,9 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #
 #   merged_sha      the commit the item's last merge landed as; set on entering `verifying` from
 #     a merge, NULL on every other entry (a host verb has nothing to revert).
+#   merge_method    how that merge landed (`squash`/`merge`/`rebase`, `unknown` when no receipt says);
+#     NULL when the item did not enter `verifying` from a merge. Only a squash or a merge commit
+#     is one commit a mechanical revert can undo.
 #   reverting_sha   the merged commit being reverted, set from the verify failure until the
 #     revert has landed and passed `make verify`. Set at merge time, it marks a revert merge.
 #   revert_json     {sha, pr, title, evidence}: what was reverted and why — the revert's brief
@@ -678,8 +685,11 @@ ALTER TABLE triage_items ADD COLUMN train_sha TEXT;
 ALTER TABLE triage_items ADD COLUMN train_job TEXT;
 ALTER TABLE triage_items ADD COLUMN reviewed_sha TEXT;
 ALTER TABLE triage_items ADD COLUMN train_evidence TEXT;
+ALTER TABLE triage_items ADD COLUMN train_rewinds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE triage_items ADD COLUMN train_pushed_at TEXT;
 UPDATE triage_items SET train_stage = 'update' WHERE state = 'merging';
 ALTER TABLE triage_items ADD COLUMN merged_sha TEXT;
+ALTER TABLE triage_items ADD COLUMN merge_method TEXT;
 ALTER TABLE triage_items ADD COLUMN reverting_sha TEXT;
 ALTER TABLE triage_items ADD COLUMN revert_json TEXT;
 ALTER TABLE triage_items ADD COLUMN sweep_pr TEXT;

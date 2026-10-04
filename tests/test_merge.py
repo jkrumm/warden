@@ -329,6 +329,43 @@ def test_already_merged_on_github_refuses():
     _assert_refuses(exc_type=PolicyError, msg="already merged", fake={"pr": {**_DEFAULT_PR, "merged": True}})
 
 
+def test_already_merged_on_github_names_githubs_merge_commit():
+    """A merge call whose answer was lost: GitHub says merged, the ledger never heard. The refusal
+    is typed (AlreadyMerged, still a PolicyError) and carries GitHub's merge commit, so the merge
+    train lands its item instead of failing it."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        pr = {**_DEFAULT_PR, "merged": True, "state": "closed", "merge_commit_sha": "f00d" * 10}
+        with fakes(pr=pr) as fx:
+            try:
+                _land(conn)
+            except merge.AlreadyMerged as e:
+                assert isinstance(e, PolicyError) and e.merge_commit == "f00d" * 10, e
+            else:
+                raise AssertionError("expected AlreadyMerged")
+            assert "merge_pr" not in fx.calls
+    finally:
+        conn.close()
+
+
+def test_require_pin_refuses_with_no_reviewed_head_before_reading_github():
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        with fakes() as fx:
+            try:
+                merge.plan_or_land(conn, job_id=JOB_ID, why="w", confirm=True, dry_run=False,
+                                   authorized_by="cli:confirm", now=_NOW, sleep=_no_sleep, require_pin=True)
+            except PolicyError as e:
+                assert "no reviewed head on record" in str(e), e
+            else:
+                raise AssertionError("expected PolicyError")
+            assert fx.calls == {}, "nothing is read or merged without a head to pin"
+    finally:
+        conn.close()
+
+
 def test_base_retargeted_refuses():
     _assert_refuses(exc_type=PolicyError, msg="not the default branch",
                      fake={"pr": {**_DEFAULT_PR, "base": {"ref": "release"}}})
@@ -791,7 +828,27 @@ def test_merge_pr_remote_error_marks_unknown_and_propagates():
                 raise AssertionError("expected RemoteError")
         row = _op_row(conn)
         assert row["outcome"] == "unknown"
-        assert "error" in json.loads(row["receipt_json"])
+        receipt = json.loads(row["receipt_json"])
+        assert "error" in receipt and receipt["mergeMethod"] == "squash", receipt
+    finally:
+        conn.close()
+
+
+def test_the_open_merge_operation_carries_its_method_before_the_merge_call():
+    """A crash after the operation is recorded leaves it open: its receipt already says how the
+    merge would land, so reconcile_operations() can hand the method on (a revert depends on it)."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        seen: list[dict] = []
+
+        def _snapshot(node_id):
+            seen.append(json.loads(_op_row(conn)["receipt_json"]))
+
+        with fakes(mark_ready_fn=_snapshot):
+            _land(conn)
+        assert seen == [{"mergeMethod": "squash"}], seen
+        assert json.loads(_op_row(conn)["receipt_json"])["mergeMethod"] == "squash"
     finally:
         conn.close()
 

@@ -972,33 +972,35 @@ _SET_STATE_COLUMNS = (
     "verify_started_at", "verify_mark", "verify_failures", "verify_result",
     "revert_pr", "close_reason", "strikes", "retry_at", "revision_count",
     "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
-    "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence",
-    "merged_sha", "reverting_sha", "revert_json",
+    "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
+    "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
     "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
 )
 
 # The merge train's position, meaningful only while the item is `merging`: leaving it clears
 # them (_set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha` and
 # `train_evidence` are not among them — see advance_merge_trains().
-_TRAIN_POSITION = ("train_stage", "train_sha", "train_job")
+_TRAIN_POSITION = ("train_stage", "train_sha", "train_job", "train_pushed_at")
 
 # An item entering `verifying` starts with no verification history: no deploy yet
 # (`verify_started_at` NULL), no baseline, no failures. `deploy_expect_json` is the host
 # verb's monitor record — nothing else writes it. `merged_sha` is what a failed verification
-# reverts: an entry from a merge sets it over this reset (_merged_entry()), every other entry
-# (a host verb) has nothing to revert. `fixed_by_pr` marks an item a fixed-by sweep put in
-# `verifying` (signal-only); an entry that is not that sweep starts without it.
+# reverts: an entry from a merge sets it over this reset (_merged_entry()), together with how it
+# merged (`merge_method`); every other entry (a host verb) has nothing to revert. `fixed_by_pr`
+# marks an item a fixed-by sweep put in `verifying` (signal-only); an entry that is not that sweep
+# starts without it.
 _VERIFY_RESET: dict[str, Any] = {
     "verify_started_at": None, "verify_mark": None, "verify_failures": 0, "verify_result": None,
-    "deploy_expect_json": None, "merged_sha": None, "fixed_by_pr": None,
+    "deploy_expect_json": None, "merged_sha": None, "merge_method": None, "fixed_by_pr": None,
 }
 
 
-def _merged_entry(item: sqlite3.Row, sha: str | None) -> dict[str, Any]:
-    """The columns of `item` entering `verifying` from a merge that landed as `sha`. A fix's merge
-    (not a revert's: _is_revert()) also queues the fixed-by sweep of its pull request
-    (advance_fixed_by_sweeps()), whatever becomes of this item afterwards."""
-    entry = {**_VERIFY_RESET, "merged_sha": sha}
+def _merged_entry(item: sqlite3.Row, sha: str | None, method: str | None) -> dict[str, Any]:
+    """The columns of `item` entering `verifying` from a merge that landed as `sha` by `method`
+    (`unknown` when nothing on record says). A fix's merge (not a revert's: _is_revert()) also
+    queues the fixed-by sweep of its pull request (advance_fixed_by_sweeps()), whatever becomes
+    of this item afterwards."""
+    entry = {**_VERIFY_RESET, "merged_sha": sha, "merge_method": method or "unknown"}
     if item["pr_url"] and not _is_revert(item):
         entry.update(sweep_pr=item["pr_url"], sweep_job=None, sweep_job_at=None, sweep_attempts=0,
                      sweep_candidates=None)
@@ -1093,6 +1095,7 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     if state != STATE_MERGING:
         for col in _TRAIN_POSITION:
             columns.setdefault(col, None)
+        columns.setdefault("train_rewinds", 0)
     expect_eq = expect_eq or {}
     unknown = tuple(c for c in (*columns, *expect_null, *expect_eq) if c not in _SET_STATE_COLUMNS)
     if unknown:
@@ -3638,12 +3641,14 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                             # "too soon" shape), and ask again next pass.
                             continue
         elif row["kind"] == "deploy":
-            # `make deploy` is the repo's idempotent contract and the process that ran it is
-            # gone: there is nothing to ask a remote about, and no strike either — the item is
-            # still `verifying` with no `verify_started_at`, so its verify pass (maybe_verify())
-            # simply runs the deploy again.
+            # The process that ran `make deploy` is gone — most likely the deploy restarted it
+            # (a self-hosting repo): there is nothing to ask a remote about, and no strike either.
+            # The item is still `verifying` with no `verify_started_at`; its verify pass sees this
+            # `unknown` deploy of the same merged commit (_interrupted_deploy()) and goes on to
+            # `make verify` rather than deploying — and restarting — again.
             outcome = "unknown"
-            note = "deploy interrupted before recording its outcome — the verify pass runs it again"
+            note = "deploy interrupted before recording its outcome — the verify pass judges it"
+            new_receipt = {"reconciled": note}   # the receipt, not `note`: see complete_note below
         elif row["kind"] == "merge":
             d = conn.execute(
                 "SELECT job_id, artifact_url FROM dispatches WHERE job_id = "
@@ -3673,7 +3678,8 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                         "UPDATE dispatches SET merged_at=? WHERE job_id=? AND merged_at IS NULL",
                         (_now_iso(now), d["job_id"]),
                     )
-                    new_receipt = {"pullRequest": pr, "mergeCommit": sha, "reconciled": True}
+                    new_receipt = {"pullRequest": pr, "mergeCommit": sha, "reconciled": True,
+                                   "mergeMethod": receipt.get("mergeMethod")}
                 else:
                     outcome = "failed"
                     new_receipt = {"pullRequest": pr, "state": gh_resp.get("state"), "reconciled": True}
@@ -3713,7 +3719,8 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # None (a no-op COALESCE, preserving `verb=<key>`) for that kind
         # only; every other kind keeps writing `note` into `operations.note`
         # exactly as it always has.
-        complete_note = None if row["kind"] == "host" else note
+        # `deploy` keeps its note too: `sha:<merged commit>` is what _interrupted_deploy() matches.
+        complete_note = None if row["kind"] in ("host", "deploy") else note
         complete_operation(conn, row["op_id"], outcome=outcome,
                             receipt=json.dumps(new_receipt) if new_receipt is not None else None,
                             note=complete_note)
@@ -3765,7 +3772,8 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
         sha = (new_receipt or {}).get("mergeCommit")
         merged = _get_item(conn, row["event_id"])
-        _set_state(conn, row["event_id"], STATE_VERIFYING, now, **_merged_entry(merged, sha),
+        _set_state(conn, row["event_id"], STATE_VERIFYING, now,
+                   **_merged_entry(merged, sha, (new_receipt or {}).get("mergeMethod")),
                    note=f"reconciled from GitHub: merged as {sha}; deploy and verification next")
         conn.commit()
 
@@ -4503,7 +4511,8 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             # revert record stays with a revert and is spent once the attempt after it has a PR.
             claimed = _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_WORKING,
                                  expect_eq={"implement_job": job_id, "validation_job": None},
-                                 pr_url=artifact_url, strikes=0, retry_at=None, **_TRAIN_START,
+                                 pr_url=artifact_url, strikes=0, retry_at=None,
+                                 **{**_TRAIN_START, "train_pushed_at": _now_iso(now)},
                                  revert_json=item["revert_json"] if _is_revert(item) else None,
                                  note=f"{outcome}: {artifact_url} joins the merge train")
             conn.commit()
@@ -4541,22 +4550,37 @@ def _already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
 
 
 def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
-                              now: dt.datetime) -> None:
-    """A `merging` item whose implement dispatch already carries
-    `merged_at`: the loop died after `plan_or_land()` merged and stamped the
-    row but before the item's own state write. Calling merge again would refuse with "already
-    merged" and land the item `failed` for a pull request that is
-    merged and deploying — the exact misreport docs/history/state-log.md §46 measured. So the
-    item goes on to `verifying` exactly as the confirmed-merge branch does — the merge commit read
-    back from the merge operation's receipt."""
-    op = conn.execute("SELECT receipt_json FROM operations WHERE event_id=? AND kind='merge' AND outcome='done' "
-                      "ORDER BY rowid DESC LIMIT 1", (item["event_id"],)).fetchone()
-    sha = _safe_json(op["receipt_json"] if op else None).get("mergeCommit")
-    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_merged_entry(item, sha),
-               note="merged before the loop stopped; state derived from the merge receipt")
+                              now: dt.datetime, *, github_sha: str | None = None) -> bool:
+    """An item whose pull request is already merged though the item never moved on:
+
+      - its implement dispatch already carries `merged_at` — the loop died after `plan_or_land()`
+        merged and stamped the row but before the item's own state write, or
+      - GitHub says the PR is merged (`github_sha`, plan_or_land()'s AlreadyMerged) — a merge
+        call whose answer was lost (its operation resolved `unknown`), or a merge by hand.
+
+    Calling merge again would refuse with "already merged" and land the item `failed` for a pull
+    request that is merged and deploying — the exact misreport docs/history/state-log.md §46
+    measured. So the item goes on to `verifying` exactly as the confirmed-merge branch does — the
+    merge commit read back from the merge operation's receipt (or GitHub's), its method from the
+    operation. A compare-and-set on the state the caller found: a concurrent pass that already
+    landed it is never rewritten (its verify window, its sweep). Returns whether this pass moved it."""
+    ops = conn.execute("SELECT outcome, receipt_json FROM operations WHERE event_id=? AND kind='merge' "
+                       "ORDER BY rowid DESC", (item["event_id"],)).fetchall()
+    receipts = [(op["outcome"], _safe_json(op["receipt_json"])) for op in ops]
+    sha = github_sha or next((r.get("mergeCommit") for outcome, r in receipts if outcome == "done"), None)
+    method = receipts[0][1].get("mergeMethod") if receipts else None   # this merge's: the latest op
+    if github_sha:
+        conn.execute("UPDATE dispatches SET merged_at=? WHERE job_id=? AND merged_at IS NULL",
+                     (_now_iso(now), item["implement_job"]))
+    source = "GitHub" if github_sha else "the merge receipt"
+    moved = _set_state(conn, item["event_id"], STATE_VERIFYING, now, expect_state=item["state"],
+                       **_merged_entry(item, sha, method),
+                       note=f"already merged; state derived from {source}, merge not repeated")
     conn.commit()
-    print(f"triage: {item['signature']} was already merged (event {item['event_id']}) — state derived "
-          f"from the merge receipt, merge not repeated", file=sys.stderr)
+    if moved:
+        print(f"triage: {item['signature']} was already merged (event {item['event_id']}) — state derived "
+              f"from {source}, merge not repeated", file=sys.stderr)
+    return bool(moved)
 
 
 def _format_blocking_findings(blocking: list[dict[str, Any]]) -> str:
@@ -4635,8 +4659,9 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
 #           `updated` with failed checks -> a `checks_failed` revision; a lease refusal -> again
 #           in LEASE_RETRY_MINUTES; otherwise the head it reports is the train's SHA (`train_sha`).
 #   checks  GitHub's check runs on `train_sha`, read every pass, no deadline: green or none ->
-#           review; any completed failure -> a `checks_failed` revision; unreadable -> `failed`;
-#           the PR head moved off `train_sha` -> update.
+#           review (none read within CHECKS_REGISTER_GRACE of update's push is still pending);
+#           any completed failure -> a `checks_failed` revision; unreadable -> `failed`; the PR
+#           head moved off `train_sha` -> update (past TRAIN_REWIND_LIMIT rewinds, each strikes).
 #   review  the step-7 review of exactly `train_sha`, skipped when a review already confirmed
 #           that SHA (`reviewed_sha`). The PR head is checked before the submit and after the
 #           fold — the review reports no SHA of its own — and a move sends the train to update.
@@ -4657,11 +4682,20 @@ TRAIN_MERGE = "merge"
 TRAIN_CLAIM = "claiming"
 # Hops one pass may walk one item. A guard, not a budget: every real cycle ends at an async job.
 TRAIN_MAX_HOPS = 6
+# Rewinds to update (the PR head moved off the train's SHA) one `merging` stay takes as plain hops;
+# from this one on each rewind is a strike, so a branch that keeps moving ends `failed`, never a
+# loop. While past it, a stage's success does not reset `strikes`.
+TRAIN_REWIND_LIMIT = 3
+# Right after update_pr pushed, GitHub may not have registered the head's check runs yet: within
+# this grace an empty run list is "pending", not "none exist".
+CHECKS_REGISTER_GRACE = dt.timedelta(minutes=2)
 
 # What entering the train writes (poll_implement_jobs()'s handoff): a new attempt's head was
-# never reviewed and has nothing to revise from yet.
+# never reviewed and has nothing to revise from yet. The handoff stamps `train_pushed_at` itself:
+# the episode just pushed, so an `up_to_date` update must not read an empty run list as green.
 _TRAIN_START: dict[str, Any] = {"train_stage": TRAIN_UPDATE, "train_sha": None, "train_job": None,
-                                "reviewed_sha": None, "train_evidence": None}
+                                "reviewed_sha": None, "train_evidence": None, "train_rewinds": 0,
+                                "train_pushed_at": None}
 
 MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
 MERGE_PENDING_NOTE_PREFIX = "waiting for checks: "
@@ -4693,9 +4727,23 @@ def _train_strike(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
 
 def _back_to_update(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, why: str) -> bool:
     """The PR head is not the train's SHA any more: bring it up to date again. Not a strike —
-    nothing failed, the base or the branch moved."""
-    return _train_hop(conn, item, now, train_stage=TRAIN_UPDATE, train_sha=None, train_job=None,
-                      validation_job=None, retry_at=None, note=f"back to update: {why}")
+    nothing failed, the base or the branch moved — until the train has rewound
+    TRAIN_REWIND_LIMIT times in this `merging` stay: from then on every rewind strikes (backoff,
+    the third strike `failed`), so a branch that never holds still cannot spin the train forever."""
+    rewinds = item["train_rewinds"] + 1
+    rewind = {"train_stage": TRAIN_UPDATE, "train_sha": None, "train_job": None, "validation_job": None,
+              "train_rewinds": rewinds}
+    if rewinds < TRAIN_REWIND_LIMIT:
+        return _train_hop(conn, item, now, retry_at=None, note=f"back to update: {why}", **rewind)
+    _train_strike(conn, item, now, f"back to update {rewinds} times since entering the merge train: {why}",
+                  **rewind)
+    return False
+
+
+def _stage_success(item: sqlite3.Row) -> dict[str, Any]:
+    """What a stage's success writes besides its hop: the strike streak ends — unless the train is
+    past TRAIN_REWIND_LIMIT, whose strikes only merging or leaving `merging` clears."""
+    return {"strikes": 0} if item["train_rewinds"] < TRAIN_REWIND_LIMIT else {}
 
 
 def _retry_ready(item: sqlite3.Row, now: dt.datetime) -> bool:
@@ -4800,9 +4848,11 @@ def _train_update(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
                  f"base: {checks['summary']}")
         return False
     head = result["headSha"]
-    moved = "rebased and pushed" if result["status"] == "updated" else "already on the latest base"
+    pushed = result["status"] == "updated"
+    moved = "rebased and pushed" if pushed else "already on the latest base"
     return _train_hop(conn, item, now, train_stage=TRAIN_CHECKS, train_sha=head, train_job=None,
-                      strikes=0, retry_at=None, note=f"{moved} at {head[:12]}; waiting for checks")
+                      retry_at=None, train_pushed_at=_now_iso(now) if pushed else item["train_pushed_at"],
+                      note=f"{moved} at {head[:12]}; waiting for checks", **_stage_success(item))
 
 
 def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
@@ -4817,7 +4867,12 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         return _back_to_update(conn, item, now, f"the PR head is {head[:12]}, not the train's {sha[:12]}")
     owner, name, _ = _github.parse_pr_url(item["pr_url"])
     try:
-        _merge.check_runs_gate(repo=item["repo"], check_runs=_merge.read_check_runs(owner, name, sha))
+        runs = _merge.read_check_runs(owner, name, sha)
+        pushed = _parse_ts(item["train_pushed_at"])
+        if not runs and pushed is not None and now - pushed < CHECKS_REGISTER_GRACE:
+            raise _merge.ChecksPending(f"no check runs registered on {sha[:12]} yet — pushed "
+                                       f"{int((now - pushed).total_seconds())}s ago")
+        _merge.check_runs_gate(repo=item["repo"], check_runs=runs)
     except _merge.ChecksPending as e:
         _train_hop(conn, item, now, note=f"{MERGE_PENDING_NOTE_PREFIX}{e}")
         return False
@@ -4835,8 +4890,8 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
     except RemoteError as e:
         _train_strike(conn, item, now, f"could not read the check runs on {sha[:12]}: {e}")
         return False
-    return _train_hop(conn, item, now, train_stage=TRAIN_REVIEW, validation_job=None, strikes=0,
-                      note=f"checks green on {sha[:12]}")
+    return _train_hop(conn, item, now, train_stage=TRAIN_REVIEW, validation_job=None,
+                      note=f"checks green on {sha[:12]}", **_stage_success(item))
 
 
 def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
@@ -4978,11 +5033,12 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         _review_failed(str(e))
         return False
 
-    # A real verdict ends the review's strike streak. The write is also the CLAIM on acting on
-    # this result: the loser skips, and the winner's `retry_at` (the claim's expiry) keeps a
-    # third pass off until the claim is released below.
+    # The CLAIM on acting on this result: the loser skips, and the winner's `retry_at` (the
+    # claim's expiry) keeps a third pass off until the claim is released below. It does not end
+    # the strike streak — a GitHub read below that keeps failing must reach STRIKE_LIMIT; the
+    # verdict acted on does.
     claim_until = _review_claim_until(now)
-    if not _train_hop(conn, item, now, strikes=0, retry_at=claim_until):
+    if not _train_hop(conn, item, now, retry_at=claim_until):
         return False
     item = _get_item(conn, event_id)
     sha = item["train_sha"]
@@ -5035,21 +5091,23 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
 
     if validation_status == "confirmed":
         return _train_hop(conn, item, now, train_stage=TRAIN_MERGE, reviewed_sha=sha, retry_at=None,
-                          note=f"review confirmed {sha[:12]}")
+                          note=f"review confirmed {sha[:12]}", **_stage_success(item))
     if validation_status == "unknown":
-        _set_state(conn, event_id, STATE_FAILED, now, note=f"step-7 validation: {unknown_outcome_note}")
+        _set_state(conn, event_id, STATE_FAILED, now, strikes=0,
+                   note=f"step-7 validation: {unknown_outcome_note}")
     elif validation_status == "needs_decision":
         detail = process_only_note or summary
         if human_question_note:
             detail = (f"{detail} — findings the review leaves with you, reasons a human must "
                       f"look rather than a work order: {human_question_note}")
-        _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=f"step-7 validation (needs-human): {detail}")
+        _set_state(conn, event_id, STATE_NEEDS_DECISION, now, strikes=0,
+                   note=f"step-7 validation (needs-human): {detail}")
     else:
         note = f"step-7 validation (blocked): {_format_blocking_findings(blocking)}"
         if _is_revert(item):
             note = f"revert of {item['reverting_sha'][:12]} blocked, not revised — PR left open: {item['pr_url']}; {note}"
         # The findings go back to a fresh implement episode — see maybe_revise_blocked().
-        _set_state(conn, event_id, STATE_WORKING if _revisable(item) else STATE_FAILED, now, note=note)
+        _set_state(conn, event_id, STATE_WORKING if _revisable(item) else STATE_FAILED, now, strikes=0, note=note)
     conn.commit()
     _release_review_claim(conn, event_id, claim_until)
     return False
@@ -5108,11 +5166,15 @@ def advance_merge_trains(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     """Steps 7-8 — walk every repo's merge train (see the block comment above): the OLDEST
     `merging` item of each repo, and only that one, so a repo merges one pull request at a time
     and each one is checked, reviewed and merged on the exact SHA that will land. A newer item
-    of the same repo waits — even while the oldest waits out a claim or a backoff."""
+    of the same repo waits — even while the oldest waits out a claim or a backoff.
+
+    A revert (_is_revert()) goes first, ahead of older items: it undoes a change failing in
+    production, and maybe_submit_reverts() opened it without waiting for the PRs already
+    queued here."""
     if dry_run:
         return
     rows = conn.execute("SELECT event_id, repo, signature, pr_url, implement_job FROM triage_items "
-                        "WHERE state=? ORDER BY event_id", (STATE_MERGING,)).fetchall()
+                        "WHERE state=? ORDER BY reverting_sha IS NULL, event_id", (STATE_MERGING,)).fetchall()
     seen: set[str | None] = set()
     for row in rows:
         if row["repo"] in seen:
@@ -5174,6 +5236,10 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
         return "ambiguous"
     except HeadMoved:
         return "head_moved"
+    except _merge.AlreadyMerged as e:
+        # The item's own PR merged without the ledger hearing of it (a lost merge answer): land it.
+        return "merged" if _land_already_merged_item(conn, policy, item, now, github_sha=e.merge_commit) \
+            else "ambiguous"
     except _merge.ChecksPending as e:
         _set_state(conn, item["event_id"], item["state"], now, note=f"{MERGE_PENDING_NOTE_PREFIX}{e}",
                    expect_state=item["state"])
@@ -5203,7 +5269,8 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     # in `verifying` with no `verify_started_at`. A revert keeps `reverting_sha`: that is what
     # marks this merge as one (_is_revert()).
     what = f"the revert of {item['reverting_sha'][:12]}" if _is_revert(item) else "deploy and verification"
-    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_merged_entry(item, result.merge_commit),
+    _set_state(conn, item["event_id"], STATE_VERIFYING, now, expect_state=item["state"],
+               **_merged_entry(item, result.merge_commit, result.merge_method),
                note=f"merged {result.repo_slug}#{result.pull_request}; {what} next")
     conn.commit()
     return "merged"
@@ -5518,9 +5585,11 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
 #
 # A merged item waits in `verifying`, and maybe_verify() — once per loop tick — walks it:
 #
-#   1. DEPLOY (`verify_started_at` NULL): `make deploy` in the repo's checkout, if its Makefile
-#      has the target (lifecycle/rollout.py: fast-forward to origin/<default> first, a typed
-#      deferral when the checkout is not clean or not on it). A deferral or a non-zero exit is
+#   1. DEPLOY (`verify_started_at` NULL): fast-forward the repo's checkout to origin/<default>
+#      first, before its Makefile is read (lifecycle/rollout.py: a typed deferral when the checkout
+#      is not clean, not on it, or ahead of it), then `make deploy` if the Makefile has the target
+#      — not again when a deploy of the same merged commit was interrupted (it may have restarted
+#      warden itself: _interrupted_deploy()). A deferral or a non-zero exit is
 #      an infrastructure strike (backoff, third -> `failed` carrying the output tail); it never
 #      reverts — it does not prove the change is bad. Success, or no target, opens the window.
 #   2. VERIFY: `make verify` when the repo has the target, and — for an alert item — the item's
@@ -5555,14 +5624,28 @@ def _on_verify_failure(conn: sqlite3.Connection, item: sqlite3.Row, evidence: st
     item goes back to `working` carrying the evidence, marked reverting the commit its merge
     landed as (`reverting_sha`, with the record in `revert_json`), and maybe_submit_reverts()
     opens the revert episode. An item with no merge on record (a host verb's restart) has
-    nothing to revert and goes back to `triaged` with the evidence."""
-    event_id, sha = item["event_id"], item["merged_sha"]
-    if not sha:
+    nothing to revert and goes back to `triaged` with the evidence.
+
+    Only a merge that landed as ONE commit is reverted mechanically: a squash, or a merge commit
+    (`git revert -m 1`). A rebase merge's `merged_sha` is only the tip of the commits it replayed,
+    and a merge whose commit or method is not on record names nothing safe to revert — the item
+    is `failed` with the evidence and the reason, the change still deployed, for the owner."""
+    event_id, sha, method = item["event_id"], item["merged_sha"], item["merge_method"]
+    if method is None:
         _set_state(conn, event_id, STATE_TRIAGED, now, expect_state=STATE_VERIFYING,
                    note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence}", **_VERIFY_RESET)
         conn.commit()
         return
-    record = {"sha": sha, "pr": item["pr_url"], "title": _merged_title(conn, event_id, sha), "evidence": evidence}
+    if not sha or method not in REVERTIBLE_MERGE_METHODS:
+        why = ("its merge commit is not on record" if not sha else
+               f"{sha[:12]} landed as a {method} merge, not one commit")
+        _set_state(conn, event_id, STATE_FAILED, now, expect_state=STATE_VERIFYING,
+                   expect_eq={"merged_sha": sha} if sha else None, verify_result=evidence[:VERIFY_RESULT_MAX],
+                   note=f"{VERIFY_FAILED_NOTE_PREFIX}cannot auto-revert ({why}): {evidence}")
+        conn.commit()
+        return
+    record = {"sha": sha, "pr": item["pr_url"], "title": _merged_title(conn, event_id, sha), "evidence": evidence,
+              "method": method}
     _set_state(conn, event_id, STATE_WORKING, now, expect_state=STATE_VERIFYING, expect_eq={"merged_sha": sha},
                note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence} — reverting {sha[:12]}",
                reverting_sha=sha, revert_json=json.dumps(record), implement_job=None, validation_job=None,
@@ -5580,29 +5663,54 @@ def _start_verify(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
     conn.commit()
 
 
+def _interrupted_deploy(conn: sqlite3.Connection, item: sqlite3.Row) -> bool:
+    """A deploy of this item's merged commit already started and never reported back (open, or
+    resolved `unknown` by reconcile_operations()): most likely it restarted warden's own process
+    — a self-hosting repo — and running it again would restart it again, forever."""
+    if not item["merged_sha"]:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM operations WHERE event_id=? AND kind='deploy' AND note=? "
+        "AND (outcome IS NULL OR outcome='unknown') LIMIT 1",
+        (item["event_id"], f"sha:{item['merged_sha']}")).fetchone() is not None
+
+
 def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> sqlite3.Row | None:
     """The deploy stage. Returns the item with its verify window open, or None when it has to
-    wait (a strike's backoff) or just struck."""
+    wait (a strike's backoff) or just struck.
+
+    The checkout is fast-forwarded first, once, before anything reads its Makefile: a merge that
+    adds the first `deploy` target is deployed, and `make verify` (every later pass) runs on the
+    merged tree, not the one before it. A checkout that cannot be synced strikes."""
     event_id = item["event_id"]
     retry_at = _parse_ts(item["retry_at"])
     if retry_at is not None and now < retry_at:
         return None
     cwd = _repo_checkout(item)
-    if cwd is None or not _rollout.has_target(cwd, "deploy"):
-        _start_verify(conn, item, now, note="no deploy target; verifying")
+    if cwd is None:
+        _start_verify(conn, item, now, note="no checkout to deploy; verifying")
         return _get_item(conn, event_id)
-
-    # Recorded before the deploy runs (DESIGN.md § Crash recovery): a crash leaves it open and
-    # reconcile_operations() resolves it `unknown` so this stage simply runs again.
-    op_id = record_operation(conn, event_id=event_id, kind="deploy", repo=item["repo"],
-                              authorized_by="auto-verify")
-    result = _rollout.deploy(cwd)
-    if isinstance(result, _rollout.Deferred):
-        complete_operation(conn, op_id, outcome="failed", receipt=json.dumps({"deferred": result.reason}))
-        _strike(conn, event_id, now, f"deploy deferred: {result.reason}",
+    deferred = _rollout.sync_checkout(cwd)
+    if deferred is not None:
+        _strike(conn, event_id, now, f"deploy deferred: {deferred.reason}",
                 retry_state=STATE_VERIFYING, expect_state=STATE_VERIFYING)
         conn.commit()
         return None
+    if not _rollout.has_target(cwd, "deploy"):
+        _start_verify(conn, item, now, note="no deploy target; verifying")
+        return _get_item(conn, event_id)
+    if _interrupted_deploy(conn, item):
+        _start_verify(conn, item, now, note=f"the deploy of {item['merged_sha'][:12]} was interrupted (it may "
+                                            f"have restarted warden itself) — not run again; make verify judges")
+        return _get_item(conn, event_id)
+
+    # Recorded before the deploy runs (DESIGN.md § Crash recovery), keyed to the merged commit:
+    # a crash leaves it open, reconcile_operations() resolves it `unknown`, and the next pass
+    # goes on to verify (_interrupted_deploy()) instead of deploying again.
+    op_id = record_operation(conn, event_id=event_id, kind="deploy", repo=item["repo"],
+                              authorized_by="auto-verify",
+                              note=f"sha:{item['merged_sha']}" if item["merged_sha"] else None)
+    result = _rollout.deploy(cwd)
     receipt = json.dumps({"exitCode": result.exit_code, "output": result.tail})
     if not result.ok:
         complete_operation(conn, op_id, outcome="failed", receipt=receipt)
@@ -5987,6 +6095,8 @@ def advance_fixed_by_sweeps(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
 # implement an item carrying it — the automatic path ends in exactly that fresh attempt.
 
 REVERT_WHY = "triage revert: the merged change failed verification"
+# How a merge must have landed for `git revert` of its one commit to undo it (see _on_verify_failure()).
+REVERTIBLE_MERGE_METHODS = ("squash", "merge")
 AFTER_REVERT_WHY_PREFIX = "triage attempt after revert "
 REVERT_EVIDENCE_MAX = 1500
 REVERTED_DIFF_MAX = 8000
@@ -6015,17 +6125,23 @@ def _revert_record(item: sqlite3.Row) -> dict[str, Any]:
     return record
 
 
+def _revert_command(record: dict[str, Any]) -> str:
+    """`git revert` of the merged commit: `-m 1` (keep the default branch's side) for a merge commit."""
+    mainline = "-m 1 " if record.get("method") == "merge" else ""
+    return f"git revert --no-edit {mainline}{record.get('sha')}"
+
+
 def _revert_brief(record: dict[str, Any]) -> str:
     sha, pr = record.get("sha"), record.get("pr") or "a pull request"
     title = (f'titled exactly `Revert "{record["title"]}"`' if record.get("title")
              else "titled with the revert commit's own subject line")
+    kind = "the merge commit" if record.get("method") == "merge" else "the squashed commit"
     return (
-        f"Mechanical revert. {pr} was merged into the default branch as commit {sha}, and the change "
+        f"Mechanical revert. {pr} was merged into the default branch as {kind} {sha}, and the change "
         f"failed verification in production afterwards:\n{record['evidence']}\n\n"
-        f"Do exactly this and nothing else: on the latest default branch run `git revert --no-edit {sha}` "
-        f"(only if git refuses because it is a merge commit: `git revert --no-edit -m 1 {sha}`) and open a "
-        f"pull request {title} carrying that one revert commit. No other edit, no fix, no formatting, no "
-        f"follow-up — the real fix is a separate attempt once this revert has landed. If the revert does not "
+        f"Do exactly this and nothing else: on the latest default branch run `{_revert_command(record)}` "
+        f"and open a pull request {title} carrying that one revert commit. No other edit, no fix, no "
+        f"formatting, no follow-up — the real fix is a separate attempt once this revert has landed. If the revert does not "
         f"apply cleanly, do not resolve the conflict: say so in your verdict and stop."
     )
 
@@ -6037,9 +6153,9 @@ def _revert_review_context(item: sqlite3.Row) -> str:
     return (
         f"This pull request is a MECHANICAL REVERT of commit {sha} — {record.get('pr') or 'a merged pull request'}"
         f"{title} — opened by warden after that change failed verification in production:\n{record['evidence']}"
-        f"\n\nYou are the merge gate. Confirm the diff is exactly the inverse of {sha} (`git revert` of that "
-        f"commit) and nothing else: any other change is a blocking finding. Block also if reverting would "
-        f"itself break a running service or lose data (e.g. it undoes a migration that already ran). Do not "
+        f"\n\nYou are the merge gate. Confirm the diff is exactly the inverse of {sha} "
+        f"(`{_revert_command({**record, 'sha': sha})}`) and nothing else: any other change is a blocking "
+        f"finding. Block also if reverting would itself break a running service or lose data (e.g. it undoes a migration that already ran). Do not "
         f"judge whether the reverted change was right — its fix is a separate attempt after this revert."
     )[: _dispatch.MAX_CONTEXT_CHARS]
 
@@ -6102,7 +6218,11 @@ def maybe_submit_reverts(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     and `reverting_sha`, the same shape as maybe_auto_implement(), with the same failure
     handling: a refusal ends the item, an infrastructure failure strikes, an ambiguous submit
     stays claimed for reconcile_operations(), a busy repo defers. A lease refusal, a struck
-    episode or a reconciled one hands `implement_job` back to NULL, and this submits again."""
+    episode or a reconciled one hands `implement_job` back to NULL, and this submits again.
+
+    "Busy" for the revert itself is a running episode only (an implement, or a train's
+    `update_pr`): a PR merely waiting on its train never holds it back — the revert would starve
+    behind a PR waiting on CI — and its own PR then goes first on the train (advance_merge_trains())."""
     ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND implement_job IS NULL AND revert_json IS NOT NULL "
@@ -6133,7 +6253,8 @@ def maybe_submit_reverts(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         try:
             opened = _open_implement_episode(
                 conn, repo=item["repo"], tier="implement", brief=brief, context=context, why=why,
-                origin=_dispatch.Origin(event_id=event_id), authorized_by="auto-from-item", model=model)
+                origin=_dispatch.Origin(event_id=event_id), authorized_by="auto-from-item", model=model,
+                count_merging=not _is_revert(item))
         except SubmitRefused as exc:
             _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy, implement_job=None)
             continue
@@ -6351,7 +6472,10 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
     `authorized_by="owner:argo"` and the same gate (PR open, checks green on the head,
     review confirmed, GitHub allows), so an owner merge deploys and verifies
     exactly like an automatic one. Outside `merging` there is no train SHA: the merge
-    pins the PR head the gate reads now."""
+    pins the head a review confirmed (`reviewed_sha`) — `dispatches.validation_status` says
+    a review confirmed, not of which head. No reviewed head on record, or a PR head that moved
+    off it: nothing is merged, and the item rejoins its repo's merge train, which reviews the
+    current head and lands it."""
     if item["state"] not in _ARGO_MERGE_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, not needs_decision/failed"
     if item["revert_pr"] is not None:
@@ -6359,29 +6483,36 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
     if not item["implement_job"] or not item["pr_url"]:
         return "rejected", None, "no pull request on this item to merge"
 
-    outcome = _merge_and_rollout(conn, load_policy(), item, now, expected_sha=item["train_sha"],
+    def _rejoin_train(note: str) -> tuple[str, dict[str, Any] | None, str | None]:
+        # The item joins its repo's merge train (advance_merge_trains()), which brings it up to
+        # date, reviews it unless `reviewed_sha` is already its head, and lands it once the checks
+        # settle — parked here it would never be asked again.
+        moved = _set_state(conn, event_id, STATE_MERGING, now, expect_state=item["state"],
+                           train_stage=TRAIN_UPDATE, train_sha=None, train_job=None, validation_job=None)
+        conn.commit()
+        if not moved:
+            return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+        return "applied", {"merging": True, "note": note}, None
+
+    reviewed = item["reviewed_sha"]
+    if not reviewed:
+        return _rejoin_train("no review of this PR's head on record — review the current head first; "
+                             "the item rejoins the merge train")
+    outcome = _merge_and_rollout(conn, load_policy(), item, now, expected_sha=reviewed,
                                  authorized_by="owner:argo", why="owner approved via Argo")
     fresh = _get_item(conn, event_id)
     if outcome == "merged":
         return "applied", {"merged": True, "state": fresh["state"] if fresh else None}, None
     if outcome == "pending":
-        # The owner said merge and the checks are still running: that is a merge in
-        # progress, not a refusal. The item joins its repo's merge train
-        # (advance_merge_trains()), which brings it up to date and lands it once the checks
-        # settle — parked here it would never be asked again. `reviewed_sha` stays: a head a
-        # review already confirmed is not reviewed again.
-        moved = _set_state(conn, event_id, STATE_MERGING, now, expect_state=item["state"],
-                           train_stage=TRAIN_UPDATE, train_sha=None, train_job=None)
-        conn.commit()
-        if not moved:
-            return "rejected", None, "item state changed before this action could be applied — retry from Argo"
-        return "applied", {"merging": True, "note": (fresh["note"] if fresh is not None else None)
-                           or "waiting for checks"}, None
+        # The owner said merge and the checks are still running: that is a merge in progress,
+        # not a refusal.
+        return _rejoin_train((fresh["note"] if fresh is not None else None) or "waiting for checks")
     if outcome == "ambiguous":
         return "applied", {"note": "merge may have reached GitHub, outcome ambiguous — left for "
                                    "reconcile_operations()"}, None
     if outcome == "head_moved":
-        return "rejected", None, "the pull request's head moved while it was being merged — retry from Argo"
+        return _rejoin_train(f"the PR head is not the {reviewed[:12]} a review confirmed — review the current "
+                             f"head first; the item rejoins the merge train")
     return "rejected", None, (fresh["note"] if fresh is not None else None) or "merge refused"
 
 

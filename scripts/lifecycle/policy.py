@@ -157,10 +157,15 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
 # next episode). Mirrored from triage.py's own state vocabulary rather than
 # imported from it.
 _IN_FLIGHT_SQL = "(state='merging' OR (state='working' AND implement_job IS NOT NULL))"
+# The same, for a revert: a `merging` item counts only while its train's `update_pr` runs (or is
+# being submitted) — a PR waiting on CI or review holds no episode, and a revert must not starve
+# behind it. sideclaw's per-repo lease is the backstop for the race (a lease retry).
+_IN_FLIGHT_EPISODE_SQL = ("((state='merging' AND train_job IS NOT NULL) "
+                          "OR (state='working' AND implement_job IS NOT NULL))")
 
 
 def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
-                              exclude_event_id: int | None = None) -> None:
+                              exclude_event_id: int | None = None, count_merging: bool = True) -> None:
     """DESIGN.md § per-repo in-flight lock. One implement episode per repo at
     a time, checked two ways: the triage item driving it (if any) and the
     operations ledger (which also covers an episode that has no
@@ -169,8 +174,12 @@ def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
     `exclude_event_id` is the caller's OWN item — e.g. maybe_auto_implement()
     claims its item (an in-flight shape) BEFORE calling
     open_episode(), which runs this check; without the exclusion, that claim
-    would make the item refuse itself the moment open_episode() re-checks."""
-    query = f"SELECT event_id FROM triage_items WHERE repo=? AND {_IN_FLIGHT_SQL}"
+    would make the item refuse itself the moment open_episode() re-checks.
+
+    `count_merging=False` (a revert): a `merging` item counts only while an `update_pr` episode
+    runs on its train, not while its PR waits."""
+    in_flight = _IN_FLIGHT_SQL if count_merging else _IN_FLIGHT_EPISODE_SQL
+    query = f"SELECT event_id FROM triage_items WHERE repo=? AND {in_flight}"
     params: list[Any] = [repo]
     if exclude_event_id is not None:
         query += " AND event_id != ?"

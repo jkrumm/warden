@@ -844,6 +844,7 @@ def test_merge_dry_run_plan_does_not_land():
     db = h.new_db()
     _seed_dispatch(db, "job-plan", tier="implement", repo="gamma", status="done",
                     artifact_url="https://github.com/jkrumm/gamma/pull/9", validation_status="confirmed")
+    _reviewed_item(db, 4, "job-plan")
     srv = _merge_stub()
     try:
         proc = h.run(["merge", "job-plan", "--why", "land it", "--json"], env=h.base_env(db=db, gh=srv.base))
@@ -854,11 +855,21 @@ def test_merge_dry_run_plan_does_not_land():
     assert not any(r["method"] == "PUT" for r in srv.requests), srv.requests
 
 
+def _reviewed_item(db, event_id: int, job_id: str, *, state: str = "failed", sha: str = "deadbeef" * 5) -> None:
+    """The item behind `job_id`, a review having confirmed its PR at `sha` (the stub's head)."""
+    _seed_item(db, event_id, state=state, repo="gamma", implement_job=job_id)
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET reviewed_sha=? WHERE event_id=?", (sha, event_id))
+    conn.commit()
+    conn.close()
+
+
 def test_merge_confirmed_lands_the_pull_request():
     h = Harness()
     db = h.new_db()
     _seed_dispatch(db, "job-land", tier="implement", repo="gamma", status="done",
                     artifact_url="https://github.com/jkrumm/gamma/pull/9", validation_status="confirmed")
+    _reviewed_item(db, 3, "job-land")
     srv = _merge_stub()
     try:
         proc = h.run(["merge", "job-land", "--why", "land it", "--confirm", "--json"], env=h.base_env(db=db, gh=srv.base))
@@ -891,6 +902,43 @@ def test_merge_of_an_item_on_its_merge_train_is_pinned_to_the_train_sha():
         srv.stop()
     out = _json_or_fail(proc)
     assert proc.returncode == 4 and "not the aaaaaaaaaaaa" in out["error"], out
+    assert not any(r["method"] == "PUT" for r in srv.requests), srv.requests
+
+
+def test_merge_with_no_reviewed_head_is_refused_though_validation_says_confirmed():
+    """`validation_status` says a review confirmed, not of which head: with no `reviewed_sha` on
+    record (a pre-train confirm, or no item at all) nothing is pinned, so nothing is merged."""
+    h = Harness()
+    db = h.new_db()
+    _seed_dispatch(db, "job-unpinned", tier="implement", repo="gamma", status="done",
+                    artifact_url="https://github.com/jkrumm/gamma/pull/9", validation_status="confirmed")
+    _seed_item(db, 5, state="failed", repo="gamma", implement_job="job-unpinned")
+    srv = _merge_stub()
+    try:
+        proc = h.run(["merge", "job-unpinned", "--why", "land it", "--confirm", "--json"],
+                     env=h.base_env(db=db, gh=srv.base))
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 4 and "no reviewed head on record" in out["error"], out
+    assert not any(r["method"] == "PUT" for r in srv.requests), srv.requests
+
+
+def test_merge_outside_the_train_is_pinned_to_the_reviewed_head():
+    """A head that moved off the one a review confirmed is refused, nothing merged."""
+    h = Harness()
+    db = h.new_db()
+    _seed_dispatch(db, "job-moved", tier="implement", repo="gamma", status="done",
+                    artifact_url="https://github.com/jkrumm/gamma/pull/9", validation_status="confirmed")
+    _reviewed_item(db, 6, "job-moved", sha="c" * 40)
+    srv = _merge_stub()
+    try:
+        proc = h.run(["merge", "job-moved", "--why", "land it", "--confirm", "--json"],
+                     env=h.base_env(db=db, gh=srv.base))
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 4 and "not the cccccccccccc" in out["error"], out
     assert not any(r["method"] == "PUT" for r in srv.requests), srv.requests
 
 
