@@ -85,4 +85,7 @@ Requires sideclaw Wave 2 (`update_pr`, per-repo lease).
 - [ ] DESIGN.md ≤200 lines describing what exists, linking the spec; archive `docs/triage.md`, `never-auto-merge-widening.md`, `handover-field-review.md`, the state-log to `docs/history/`. AGENTS.md gets `## Validate`, `## Deploy`, `## Verify & Monitor`, `## Gotchas`; Make targets `check`, `deploy` (restart LaunchAgents, health-check, roll back to the previous commit on failure), `verify`, `logs`.
 - [ ] Split `triage.py` into modules along the loop (intake, triage, work, merge, notify) and drop history comments (git has them). No behaviour change; tests prove it.
 - [ ] Put `warden` on PATH via `make setup` (`~/.local/bin/warden`).
+- [ ] Delete the dead `warden-trip:` shadow filter in `watchdog-poll.py`.
+- [ ] Update the status table in `~/SourceRoot/dotfiles/docs/agent-platform.md` to what has landed (commit in dotfiles).
+- [ ] Once `make deploy` exists here: remove `~/SourceRoot/hermes-agent/scripts/warden-live-sync.sh` and its Hermes cron job (`hermes cron` id `e9e72d028dc5`) — commit in hermes-agent.
 **Left behind:**
