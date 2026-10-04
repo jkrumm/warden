@@ -9444,3 +9444,57 @@ redeploy).
 test_triage 302 → 318. Rejected review findings: "migration 13 already ran live"
 (live ledger is still schema 11 — the loop is paused); a claim on alert-cluster
 `escalate()` (loop-only; launchd never overlaps a job with itself).
+
+## 118. Agent-platform Wave 3 — intake and dedup (2026-10-04)
+
+Commits 98d7798, de5a620, 6635bb9, f8f237c here; the schema-v4 pin bump is the
+next commit on branch `wave-3`, deliberately not on master (see below). sideclaw
+52037de on branch `warden-w3-dispatch-schema-v4` (sideclaw W3 was live in that
+checkout).
+
+- **Fingerprint.** `watchdog_poll.fingerprint()` — title minus timestamps, UUIDs,
+  hex ids, paths, log-file names and every digit — is the identity of grouped
+  events (slack_alert, slack_update, hermes_log, the op-refs `raw:` key) and of
+  recovery pairing. Ledger replay: items 288 → 285; slack_update events 683 → 52,
+  hermes_log 141 → 91. HTTP status codes collapse by design (`…status-code`).
+  Existing open rows keep their old keys and drain; a re-keyed recurrence becomes a
+  new item that triage attaches to the old one.
+- **Triage step.** Every `new` item (alerts once debounce-eligible, issues and
+  `warden run` at once) gets one sideclaw `triage` job: `attach | new(repo) |
+  fixed_by | ignore`, validated against the ledger before it moves (`triaged` is its
+  output; `escalate()` reads nothing else). Candidate repos come from a label —
+  native (Kuma tag, container, OTel `service.name`, issue repo) then a policy rule —
+  else every repo with an AGENTS.md, whose `## Verify & Monitor` section is in the
+  prompt. Private repos are listed by name only, their items and briefs never sent;
+  event text is fenced as untrusted. `warden run` waits for its own triage job.
+- **Rules stay, as labels.** Replay of 108 rule-routed/ignored alerts against real
+  triage jobs: 88 agree, 20 differ, about 6 of them worse (thin repo knowledge —
+  3 of 26 repos carry `## Verify & Monitor`). PLAN's deletion condition ("equal or
+  better") is not met, so `rules`/`ignore` remain as the first label tier: 86/86
+  rule-routed alerts keep their repo by construction, 22/22 ignores close before
+  any triage call. Ten digit-bearing patterns rewritten to fingerprint form. Cost of
+  the replay $0.21, p50 2.7 s. The rule-selected evidence gatherers are deleted
+  (W4 scope, landed early: rules were their only selector).
+- **Revisions are attempts.** Up to 4 implement attempts per item; a blocked
+  review re-dispatches with `revisionOf` the prior `dispatch/*` branch and sideclaw
+  updates the same PR (`pr_updated`). Attempt 3+ sends the model of sideclaw's
+  `dispatch_implement_escalation` route — **that route does not exist yet**, so
+  every attempt runs on sideclaw's default until it does; a refused model
+  resubmits once without it. A struck revision rewinds to its prior attempt.
+- **New outcomes.** `conflict` re-derives from the new base, carrying the old
+  verdict, the earlier review findings and the commits' git bundle path; `pr_updated`
+  is handled as `pr_opened`; sideclaw's per-repo lease refusal retries in 10 min
+  with no strike and no attempt spent (unbounded by design).
+- **Root-cause merge.** A verdict's `rootCause` is stored; an open same-repo
+  alert with the same key merges into the older one (`closed(duplicate)`,
+  `duplicate_of`), never across origins and never over an in-flight operation.
+- **Migration 14:** `root_cause`, `duplicate_of`, `triage_job`, `triage_job_at`.
+  Verified on a copy of the live ledger (13 → 14, rows unchanged).
+
+test_triage 318 → 423. Review: sideclaw `/review` ran twice but its synthesis
+failed both times ("OAuth session expired and could not be refreshed"), so two
+independent read-only reviewers covered the diff — 6 blocking findings, all
+fixed in f8f237c. Not done from review: the lease retry stays unbounded; a
+`checks_failed` revision loses earlier review findings the way a conflict used to;
+an owner dismiss landing while a triage job is in flight still reads as a model
+ignore later.

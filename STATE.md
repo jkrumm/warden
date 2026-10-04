@@ -6,10 +6,10 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-10-02 (§117 — agent-platform Wave 2: nine states, one retry rule, one-line Slack; see the banners under *What is live*) |
-| Current wave | agent-platform rewrite — `docs/waves/PLAN.md`, Waves 1–2 done (§116, §117), Wave 3 next (needs sideclaw Wave 1). Spec: `~/SourceRoot/dotfiles/docs/agent-platform.md` |
+| Last updated | 2026-10-04 (§118 — agent-platform Wave 3: fingerprint, single-shot triage step, revisions as attempts; see the banners under *What is live*) |
+| Current wave | agent-platform rewrite — `docs/waves/PLAN.md`, Waves 1–3 done (§116–§118), Wave 4 next (needs sideclaw Wave 2, done). Spec: `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
-| Ledger | `~/.warden/warden.db`, schema 13 in code (12 drops `dispatch_approvals`, 13 maps the old states — table on the migration); the live file stays at 11 until the loop boots on the new code |
+| Ledger | `~/.warden/warden.db`, schema 14 in code (14 adds `root_cause`, `duplicate_of`, `triage_job`, `triage_job_at`); the live file migrates on the loop's first tick on this code — kickstart warden-api after it |
 | Tests | `tests/test_triage.py` — the gate count lives in AGENTS.md; `make test` runs all 15 suites |
 | Next action | see § Next action (bottom) |
 
@@ -32,6 +32,13 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 > digest of non-actionable items, watchdog-poll's raw-event Slack digest. Infra
 > failures strike (10/30 min backoff, third → `failed`); Slack hears one line on
 > `fixed`/`needs_decision` only.
+>
+> **Superseded in part by agent-platform Wave 3 (§118).** Intake is one pool:
+> every `new` item gets a sideclaw `triage` job (`attach | new | fixed_by |
+> ignore`) and `triaged` is its output. Policy `rules` are a label tier, not the
+> router; the evidence gatherers are gone. Grouped events are keyed by
+> `fingerprint()`. Revisions update the same PR (`revisionOf`), up to 4 attempts;
+> `conflict`/`pr_updated`/lease refusals are handled; `rootCause` merges alerts.
 
 Six LaunchAgents run the whole control plane; no `hermes cron` job is in the
 loop.
@@ -473,12 +480,12 @@ log's past sections.
 
 ### Next action
 
-**§117 (Wave 2) is committed but not live.** Redeploy is the orchestrator's:
-boot the loop once on this code (migration 11→13 on the live ledger — 15
-`needs_human` rows become `failed`, visible in Argo), kickstart warden-api, then
-push argo master (b9258fb, one commit ahead of origin) so Argo reads the new snapshot. Push Argo *with*
-the redeploy, not before: the old snapshot's `needs_human` rows would render
-only in Argo's "unknown" bucket. Then Wave 3 — it requires sideclaw Wave 1.
+**§118 (Wave 3) is on master except the schema-v4 pin.** The loop picks it up on
+its next tick (migration 13 → 14); kickstart warden-api after that tick. The last
+commit on branch `wave-3` bumps `DISPATCH_SCHEMA_VERSION` to 4 and must land
+**together** with sideclaw branch `warden-w3-dispatch-schema-v4` (52037de) and a
+sideclaw reload — either one alone makes every implement verdict a loud refusal.
+Then Wave 4 (merge train, deploy, verify, revert).
 
 The paragraphs below predate the agent-platform rewrite and are history.
 
