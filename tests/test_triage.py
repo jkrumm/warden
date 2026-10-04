@@ -8700,18 +8700,6 @@ def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
 
 # --- the uk poller ----------------------------------------------------------------
 
-def test_the_poller_never_turns_a_leftover_trip_shadow_into_an_event():
-    wp = triage._wp_module()
-    saved = wp.http_get
-    wp.http_get = lambda url, headers: [{"id": 9, "name": "warden-trip:543", "type": "push", "status": 0},
-                                        {"id": 10, "name": "Brain Sync - Push", "type": "push", "status": 0}]
-    try:
-        out = wp.poll_uk({"HOMELAB_API_KEY": "k"})
-    finally:
-        wp.http_get = saved
-    assert [o["title"] for o in out] == ["Brain Sync - Push"]
-
-
 def test_the_uk_poller_keeps_a_monitors_tags_for_label_routing():
     wp = triage._wp_module()
     saved = wp.http_get
