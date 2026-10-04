@@ -39,13 +39,13 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 # a loud refusal (assert_result_schema()) instead of a silently-ignored
 # verdict. Bump these ONLY after re-reading the source constants they mirror
 # — never guess a version or an outcome list.
-DISPATCH_SCHEMA_VERSION = 3
+DISPATCH_SCHEMA_VERSION = 4
 REVIEW_SCHEMA_VERSION = 1
 
 # server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES. `pr_updated` (a `revisionOf`
 # episode pushed to the same branch and updated the existing PR) and `conflict`
 # (the rebase onto the latest default branch failed; nothing pushed) arrive with
-# schema version 4 — DISPATCH_SCHEMA_VERSION moves together with sideclaw.
+# schema version 4.
 DISPATCH_OUTCOMES: tuple[str, ...] = (
     "verdict_only",
     "issue_declined",
