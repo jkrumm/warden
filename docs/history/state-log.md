@@ -9498,3 +9498,60 @@ fixed in f8f237c. Not done from review: the lease retry stays unbounded; a
 `checks_failed` revision loses earlier review findings the way a conflict used to;
 an owner dismiss landing while a triage job is in flight still reads as a model
 ignore later.
+
+## 119. Agent-platform Wave 4 — merge train, deploy, verify, revert (2026-10-04)
+
+Commits 93f9c68, e4ac47d, 0376a50, fdb5886, 6953f2a on branch `wave-4`, fast-forwarded to master.
+
+- **Deploy + verify through the repo contract.** After a merge the item waits in
+  `verifying`; the loop's verify pass (`maybe_verify()`, loop only) fast-forwards the
+  repo checkout to `origin/<default>` — only on the default branch, with no tracked
+  changes, ending exactly at origin, else a deferred strike — then runs `make deploy`
+  if the Makefile defines it (`lifecycle/rollout.py`: `make -n`, only "no rule for the
+  target itself" means absent). Deploy failure strikes (3rd → `failed`), never reverts:
+  it does not prove the change bad and self-hosting repos roll themselves back. Verify =
+  `make verify` (if defined) + the item's own signal quiet for `VERIFY_WINDOW_HOURS`
+  (2) + its own Kuma monitor UP when it has one. Recurrence = the event's occurrence
+  mark moved since the window opened (`verify_mark`). No-signal items (issues, `warden
+  run`) are fixed once `make verify` passes. `make` runs in its own process group,
+  killed on timeout; a deploy already started for a SHA is not repeated after a crash.
+  Deleted: `clients/rollout.py`, policy `repos` keys, `LIVENESS_ALLOWLIST` gatherers,
+  `kuma-trip.py` and the trip, `collect_expected_alerts`, `github.actions_runs/contents`.
+- **Merge train.** `advance_merge_trains()` walks the oldest `merging` item per repo
+  (a revert first): `update` (sideclaw `update_pr`; lease refusal retries, `conflict`
+  and red checks go to the revision path) → `checks` on `train_sha` (no deadline; an
+  empty run list within 2 min of a push is pending; unreadable runs refuse) → `review`
+  on that SHA (skipped when `reviewed_sha` equals it; after a rebase the context asks
+  for delta focus — sideclaw has no PR delta scope, so it is text only) → `merge`
+  (`plan_or_land(expected_sha=)`, squash first; a 409 head-moved rewinds to `update`).
+  Rewinds strike from the third. Argo / `warden merge` pin `reviewed_sha` (or
+  `train_sha`); none on record → the item rejoins the train. `poll_validation_jobs`
+  and its re-fold-for-checks are gone.
+- **Revert.** A failed verify on an item with `merged_sha` submits a mechanical
+  implement episode (`git revert --no-edit <sha>`, `-m 1` for a merge commit; rebase
+  merges and unknown methods are never auto-reverted → `failed`). The revert PR walks
+  the train, is never revised (blocked/conflict/red → `failed`, PR open), deploys,
+  and passes `make verify`; then the item gets a fresh implement attempt carrying the
+  evidence and the reverted diff (attempts exhausted → `failed`). `make verify`
+  failing 3× after a revert landed → `failed`. `revert_pr` stays the CLI's record only.
+- **Fixed-by sweep.** Every non-revert merge queues one sideclaw `triage` job: merged
+  PR title/body + diff (≤12k) + the repo's `triaged` and idle `working` items (human
+  origin excluded, private repos skipped). Matches validated against what was shown
+  move to `verifying` signal-only (`fixed_by_pr`): quiet → `closed(fixed_by)`,
+  recurrence → `triaged`. A failed sweep never touches the merged item.
+- **Migration 15:** verify (`verify_started_at`, `verify_mark`, `verify_failures`,
+  `verify_result`), train (`train_stage`, `train_sha`, `train_job`, `reviewed_sha`,
+  `train_evidence`, `train_rewinds`, `train_pushed_at`), revert (`merged_sha`,
+  `merge_method`, `reverting_sha`, `revert_json`), sweep (`sweep_pr`, `sweep_job`,
+  `sweep_job_at`, `sweep_attempts`, `sweep_candidates`, `fixed_by_pr`). Existing
+  `merging` rows restart at `update`; `verifying` rows skip the deploy. Verified on a
+  copy of the live ledger (14 → 15).
+
+test_triage 423 → 461 (25 deleted with their code). Review: sideclaw `/review`
+synthesis failed again ("OAuth session expired and could not be refreshed"); an
+independent read-only reviewer found 12 issues (3 blocking), 11 fixed in 6953f2a, one
+rejected with a regression test (a pre-migration review job is never polled: the
+checks→review hop clears `validation_job` and merge needs `reviewed_sha == train_sha`).
+Not done: reconcile's merge→`verifying` write is not CAS; a PR merged on GitHub
+mid-train (checks/review stage) lands `failed`; the revert does not jump an implement
+episode already running in its repo; auto-reverts are not in the metrics' revert count.

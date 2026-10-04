@@ -6,10 +6,10 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 
 | | |
 |-|-|
-| Last updated | 2026-10-04 (§118 — agent-platform Wave 3: fingerprint, single-shot triage step, revisions as attempts; see the banners under *What is live*) |
-| Current wave | agent-platform rewrite — `docs/waves/PLAN.md`, Waves 1–3 done (§116–§118), Wave 4 next (needs sideclaw Wave 2, done). Spec: `~/SourceRoot/dotfiles/docs/agent-platform.md` |
+| Last updated | 2026-10-04 (§119 — agent-platform Wave 4: merge train, `make deploy`/`make verify`, automatic revert, fixed-by sweep; see the banners under *What is live*) |
+| Current wave | agent-platform rewrite — `docs/waves/PLAN.md`, Waves 1–4 done (§116–§119), Wave 5 next (docs and shape). Spec: `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo state | `master`, six LaunchAgents on the mini |
-| Ledger | `~/.warden/warden.db`, schema 14 in code (14 adds `root_cause`, `duplicate_of`, `triage_job`, `triage_job_at`); the live file migrates on the loop's first tick on this code — kickstart warden-api after it |
+| Ledger | `~/.warden/warden.db`, schema 15 in code (15 adds the verify, merge-train, revert and sweep columns — §119); the live file migrates on the loop's first tick on this code — kickstart warden-api after it |
 | Tests | `tests/test_triage.py` — the gate count lives in AGENTS.md; `make test` runs all 15 suites |
 | Next action | see § Next action (bottom) |
 
@@ -39,6 +39,16 @@ Authority order: `DESIGN.md` → `FLOWS.md` → `REVIEW.md` → this file →
 > router; the evidence gatherers are gone. Grouped events are keyed by
 > `fingerprint()`. Revisions update the same PR (`revisionOf`), up to 4 attempts;
 > `conflict`/`pr_updated`/lease refusals are handled; `rootCause` merges alerts.
+
+> **Superseded in part by agent-platform Wave 4 (§119).** A `merging` item walks
+> its repo's merge train (oldest first, one per repo): sideclaw `update_pr` →
+> GitHub checks on that SHA → review on that SHA → squash merge pinned to it.
+> Deploy is `make deploy` in a synced clean checkout, verify is `make verify` plus
+> the item's own signal quiet for `VERIFY_WINDOW_HOURS`. A failed verify reverts
+> the merge through the same train, then gives the item a fresh attempt. After
+> every fix merge a sideclaw `triage` job sweeps the repo's idle items
+> (`closed(fixed_by)` once quiet). Gone: `clients/rollout.py`, the policy `repos`
+> keys, the liveness gatherers, the Kuma trip, `poll_validation_jobs`.
 
 Six LaunchAgents run the whole control plane; no `hermes cron` job is in the
 loop.
@@ -480,12 +490,12 @@ log's past sections.
 
 ### Next action
 
-**§118 (Wave 3) is on master except the schema-v4 pin.** The loop picks it up on
-its next tick (migration 13 → 14); kickstart warden-api after that tick. The last
-commit on branch `wave-3` bumps `DISPATCH_SCHEMA_VERSION` to 4 and must land
-**together** with sideclaw branch `warden-w3-dispatch-schema-v4` (52037de) and a
-sideclaw reload — either one alone makes every implement verdict a loud refusal.
-Then Wave 4 (merge train, deploy, verify, revert).
+**§119 (Wave 4) is on master.** The loop's next tick migrates the live ledger
+14 → 15 (verified on a copy); kickstart warden-api after it. Before trusting the
+train on a private repo, grant the PAT `Checks: Read` (see *Open — owner actions*):
+unreadable check runs refuse the merge. `vps`'s `make deploy` requires `APP=`, so
+a merged vps fix strikes to `failed` at deploy until vps meets the contract. Then
+Wave 5 (docs and shape).
 
 The paragraphs below predate the agent-platform rewrite and are history.
 
