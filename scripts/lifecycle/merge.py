@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 from clients import github, sideclaw
 from clients.errors import (
-    CheckRunsUnreadable, PolicyError, PreconditionError, RemoteError, UsageError,
+    CheckRunsUnreadable, HeadMoved, PolicyError, PreconditionError, RemoteError, UsageError,
 )
 from lifecycle import operations, policy
 
@@ -31,6 +31,12 @@ from lifecycle import operations, policy
 class ChecksPending(PolicyError):
     """CI on the head commit is still running — nothing has failed, so the caller
     waits and asks again rather than ending the item."""
+
+
+class ChecksFailed(PolicyError):
+    """A check run on the head commit completed and did not pass. A refusal to merge;
+    the merge train reads it as a finding for the implementer (a `checks_failed`
+    revision)."""
 
 
 class MergeInFlight(PolicyError):
@@ -137,9 +143,23 @@ class MergeResult:
 # rule or per-repo carve-out exists any more.
 
 
-def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation: str | None) -> None:
-    """Checks green — or none exist, which passes — and the step-7 review
-    `confirmed`. "PR open" is read off the pull request by `plan_or_land()`."""
+def read_check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
+    """Every check run on `sha`. Unreadable is not "none exist": an unknown CI state must
+    never pass the green-or-none gate, so it is a refusal (`PolicyError`). Typically a
+    fine-grained PAT without `Checks: read` on a private repository (§110: `weatherorb`)."""
+    try:
+        return github.check_runs(owner, repo, sha)
+    except CheckRunsUnreadable as e:
+        raise PolicyError(
+            f"{owner}/{repo}'s check runs on {sha[:12]} are unreadable ({e}); "
+            f"the token may lack Checks: read. CI state is unknown, so the merge is refused."
+        ) from e
+
+
+def check_runs_gate(*, repo: str, check_runs: list[dict[str, Any]]) -> None:
+    """Green — every run completed success/neutral/skipped, or none exist — returns.
+    Still running and nothing failed: `ChecksPending`. Any completed run that did not
+    pass: `ChecksFailed`."""
     bad = [
         r for r in check_runs
         if r.get("status") != "completed"
@@ -154,8 +174,13 @@ def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation:
             # Every non-green run still running (queued/in progress), none failed:
             # that is waiting, not a refusal.
             raise ChecksPending(f"{repo}'s CI is still running on the head commit: {names}.")
-        raise PolicyError(f"{repo}'s CI has not passed cleanly on the head commit: {names}.")
+        raise ChecksFailed(f"{repo}'s CI has not passed cleanly on the head commit: {names}.")
 
+
+def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation: str | None) -> None:
+    """Checks green — or none exist, which passes — and the step-7 review
+    `confirmed`. "PR open" is read off the pull request by `plan_or_land()`."""
+    check_runs_gate(repo=repo, check_runs=check_runs)
     if validation != "confirmed":
         raise PolicyError(
             f"the step-7 validation has not confirmed (status: {validation or '(none)'}). "
@@ -166,7 +191,13 @@ def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation:
 def plan_or_land(
     conn: sqlite3.Connection, *, job_id: str, why: str, confirm: bool, dry_run: bool,
     authorized_by: str, now: dt.datetime, sleep: Callable[[float], None] = time.sleep,
+    expected_sha: str | None = None,
 ) -> MergePlan | MergeResult:
+    """Inspect, gate and (confirmed) land one dispatch's pull request, squash first
+    (`github.pick_merge_method()` falls back to rebase/merge only where the repo's rules
+    allow nothing else). The merge call pins the head SHA every check was made against.
+    `expected_sha` is the merge train's SHA: a PR whose head is anything else is refused
+    with `HeadMoved` before any gate runs; None pins whatever the head is now."""
     if not why:
         raise UsageError(
             'merge requires --why "<reason>". It is the audit record of why an '
@@ -284,18 +315,14 @@ def plan_or_land(
             f"{owner}/{repo}#{pr_number} is from '{pr_head_repo}', a fork. A fork branch "
             f"was never inspected by the episode and is never merged here."
         )
+    if expected_sha is not None and pr_head_sha != expected_sha:
+        raise HeadMoved(
+            f"{owner}/{repo}#{pr_number}'s head is {pr_head_sha[:12]}, not the {expected_sha[:12]} "
+            f"that was checked and reviewed. Nothing was merged."
+        )
     lines = pr_add + pr_del
 
-    try:
-        runs = github.check_runs(owner, repo, pr_head_sha)
-    except CheckRunsUnreadable as e:
-        # Unreadable is not "none exist": an unknown CI state must never pass
-        # the green-or-none gate. Typically a fine-grained PAT without
-        # `Checks: read` on a private repository (§110: `weatherorb`).
-        raise PolicyError(
-            f"{owner}/{repo}'s check runs on the head commit are unreadable ({e}); "
-            f"the token may lack Checks: read. CI state is unknown, so the merge is refused."
-        ) from e
+    runs = read_check_runs(owner, repo, pr_head_sha)
     merge_gate_check(repo=repo, check_runs=runs, validation=validation_status)
 
     method = github.pick_merge_method(repo_json, rules)

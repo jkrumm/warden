@@ -622,11 +622,15 @@ def cmd_merge(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     row = conn.execute("SELECT tier FROM dispatches WHERE job_id=?", (job_id,)).fetchone()
     if row is not None:
         state.tier = row["tier"]
+    # An item on its merge train merges the SHA the train checked and reviewed; any other PR
+    # merges the head the gate reads now.
+    train = conn.execute("SELECT train_sha FROM triage_items WHERE implement_job=? AND state=? "
+                         "AND train_sha IS NOT NULL", (job_id, triage.STATE_MERGING)).fetchone()
 
     now = dt.datetime.now(dt.timezone.utc)
     result = merge.plan_or_land(
         conn, job_id=job_id, why=flags.why or "", confirm=flags.confirm, dry_run=flags.dry_run,
-        authorized_by="cli:confirm", now=now,
+        authorized_by="cli:confirm", now=now, expected_sha=train["train_sha"] if train else None,
     )
     if isinstance(result, merge.MergeResult):
         state.did_mutate = True
@@ -650,7 +654,8 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     state.target = str(event_id)
 
     row = conn.execute(
-        "SELECT event_id, state, dispatch_job, implement_job, validation_job FROM triage_items WHERE event_id=?",
+        "SELECT event_id, state, dispatch_job, implement_job, validation_job, train_job FROM triage_items "
+        "WHERE event_id=?",
         (event_id,),
     ).fetchone()
     if row is None:
@@ -658,12 +663,13 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 
     # The in-flight episode of a `working` item is its implement job when it has
     # one (a claim sentinel is not a job), else its investigation; of a `merging`
-    # item, its review.
+    # item, its train's `update_pr` while one runs, else its review.
     implement_job = row["implement_job"]
     if row["state"] == triage.STATE_WORKING:
         job_id = implement_job if implement_job and not triage._is_claim(implement_job) else row["dispatch_job"]
     elif row["state"] == triage.STATE_MERGING:
-        job_id = row["validation_job"]
+        train_job = row["train_job"]
+        job_id = train_job if train_job and train_job != triage.TRAIN_CLAIM else row["validation_job"]
     else:
         raise PolicyError(
             f"triage item {event_id} is in state '{row['state']}', not working/merging "

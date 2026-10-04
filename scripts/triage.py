@@ -54,7 +54,7 @@ THE LOOP, once per run — see docs/triage.md for the full state machine:
                    whether from a genuine crash or from a call site that
                    deliberately left it open on an ambiguous return (a
                    subprocess timeout, unparseable stdout — see
-                   maybe_auto_implement()/poll_validation_jobs()). Asks the
+                   maybe_auto_implement()/advance_merge_trains()). Asks the
                    external system (sideclaw, GitHub) what actually
                    happened; an operation that still cannot be resolved
                    is an infrastructure failure and strikes its item (see
@@ -221,6 +221,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from clients import argo as _argo, github as _github, sideclaw as _sideclaw  # noqa: E402
 from clients.errors import (  # noqa: E402
+    HeadMoved,
     PolicyError,
     PreconditionError,
     RemoteError,
@@ -601,7 +602,7 @@ EVIDENCE_TIMEOUT = int(os.environ.get("TRIAGE_EVIDENCE_TIMEOUT", "20"))
 # (architect, senior-dev, security, ... — its own router picks the rest) and
 # returns a TYPED verdict (`outcome`/`blocking`/...), which is what makes this
 # step machine-readable without a substring match on free text. See
-# `_open_validation_dispatch()`/`poll_validation_jobs()` below and
+# `_open_validation_dispatch()`/`advance_merge_trains()` below and
 # `clients/sideclaw.py`'s `REVIEW_SCHEMA_VERSION`/`assert_result_schema()`.
 #
 # Matches a GitHub pull-request URL's trailing `/pull/<n>` — deliberately
@@ -971,7 +972,13 @@ _SET_STATE_COLUMNS = (
     "verify_started_at", "verify_mark", "verify_failures", "verify_result",
     "revert_pr", "close_reason", "strikes", "retry_at", "revision_count",
     "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
+    "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence",
 )
+
+# The merge train's position, meaningful only while the item is `merging`: leaving it clears
+# them (_set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha` and
+# `train_evidence` are not among them — see advance_merge_trains().
+_TRAIN_POSITION = ("train_stage", "train_sha", "train_job")
 
 # An item entering `verifying` starts with no verification history: no deploy yet
 # (`verify_started_at` NULL), no baseline, no failures. `deploy_expect_json` is the host
@@ -1001,7 +1008,8 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     `closed` must carry its reason: a `close_reason` in CLOSE_REASONS is
     required, and every other state clears it (as it does `duplicate_of`, which
     only a `closed(duplicate)` item carries), so a reopened item never keeps the reason it
-    was closed with. Entering `new` clears `triage_job` (and its age, `triage_job_at`) the same way.
+    was closed with. Entering `new` clears `triage_job` (and its age, `triage_job_at`) the same way,
+    and any state but `merging` clears the merge train's position (_TRAIN_POSITION).
 
     The strike counter is owned here too: an item that advances to `merging`,
     `verifying` or `fixed` (a step SUCCEEDED — claiming `working` is not
@@ -1061,6 +1069,9 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
         columns.setdefault("triage_job", None)
     if columns.get("triage_job", "") is None:
         columns.setdefault("triage_job_at", None)   # no job, no job age
+    if state != STATE_MERGING:
+        for col in _TRAIN_POSITION:
+            columns.setdefault(col, None)
     expect_eq = expect_eq or {}
     unknown = tuple(c for c in (*columns, *expect_null, *expect_eq) if c not in _SET_STATE_COLUMNS)
     if unknown:
@@ -3538,7 +3549,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     operation this process recorded as STARTED (record_operation(), before
     the external call it covers) but never recorded the result of — either a
     genuine process crash, or a call site (maybe_auto_implement(),
-    poll_validation_jobs()) that deliberately left it open on an ambiguous
+    advance_merge_trains()) that deliberately left it open on an ambiguous
     return (a subprocess timeout, unparseable stdout) rather than guess. Both
     look identical from here, and both get the SAME treatment: ask the
     external system what actually happened, using only what the row itself
@@ -3552,7 +3563,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     if dry_run:
         # Every branch below reaches out (sideclaw, `gh pr view`) — the dry-run contract is "never shells out"/"never
         # calls a remote service", the same reason poll_implement_jobs()/
-        # poll_validation_jobs() return outright below.
+        # advance_merge_trains() return outright below.
         return
     rows = conn.execute("SELECT * FROM operations WHERE outcome IS NULL ORDER BY op_id").fetchall()
     for row in rows:
@@ -4269,28 +4280,64 @@ def _attempt_rewind_columns(conn: sqlite3.Connection, item: sqlite3.Row, job_id:
             "revision_count": max(item["revision_count"] - 1, 0)}
 
 
-def _retry_after_lease_refusal(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> None:
-    """sideclaw's per-repo implement lease refused this item's episode (another implement
-    episode holds the repo): the work is fine, the slot was taken. The item stays `working`
-    with `retry_at` pushed LEASE_RETRY_MINUTES out — no strike, no attempt spent — and the
-    attempt is submitted again from where it was (_attempt_rewind_columns()).
+def _lease_retry(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, what: str,
+                 expect_eq: dict[str, Any], **columns: Any) -> None:
+    """sideclaw's per-repo implement lease refused this item's job — an implement episode, or
+    the merge train's `update_pr` (both take the lease): the work is fine, the slot was taken.
+    The item stays where it is with `retry_at` pushed LEASE_RETRY_MINUTES out — no strike, no
+    attempt spent — and `columns` hand the refused job back so it is submitted again.
 
     Unbounded by design: sideclaw's lease is in-memory and released when its holder's job ends,
     so a refusal is always transient, and an external holder that never lets go stays visible in
     the item's note.
 
-    The write is a compare-and-set on the refused job, so two passes cannot both rewind."""
-    event_id, job_id = item["event_id"], item["implement_job"]
+    The write is a compare-and-set (`expect_eq` on the refused job), so two passes cannot both
+    hand it back."""
     won = _set_state(
-        conn, event_id, STATE_WORKING, now, expect_state=STATE_WORKING, expect_eq={"implement_job": job_id},
+        conn, item["event_id"], item["state"], now, expect_state=item["state"], expect_eq=expect_eq,
         note=f"sideclaw's implement lease for {item['repo']} is held by another episode — "
-             f"retry after {LEASE_RETRY_MINUTES} min",
-        retry_at=_now_iso(now + dt.timedelta(minutes=LEASE_RETRY_MINUTES)),
-        **_attempt_rewind_columns(conn, item, job_id))
+             f"{what} retries after {LEASE_RETRY_MINUTES} min",
+        retry_at=_now_iso(now + dt.timedelta(minutes=LEASE_RETRY_MINUTES)), **columns)
     conn.commit()
     if won:
-        print(f"triage: {item['signature']} (event {event_id}): implement lease held in {item['repo']} — "
-              f"retrying in {LEASE_RETRY_MINUTES} min", file=sys.stderr)
+        print(f"triage: {item['signature']} (event {item['event_id']}): implement lease held in {item['repo']} — "
+              f"{what} retries in {LEASE_RETRY_MINUTES} min", file=sys.stderr)
+
+
+def _retry_after_lease_refusal(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> None:
+    """An implement episode refused by the lease: the attempt is submitted again from where it
+    was (_attempt_rewind_columns()). See _lease_retry()."""
+    job_id = item["implement_job"]
+    _lease_retry(conn, item, now, what="the implement attempt", expect_eq={"implement_job": job_id},
+                 **_attempt_rewind_columns(conn, item, job_id))
+
+
+def _hand_back_for_revision(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *,
+                            outcome: str, note: str, expect_eq: dict[str, Any] | None = None,
+                            **columns: Any) -> bool:
+    """An attempt that cannot land as it is — its own checks failed or its rebase conflicted
+    (the implement episode's `checks_failed`/`conflict`, or the merge train's) — goes back to
+    `working` for a revision (maybe_revise_blocked()) while attempts are left, else `failed`.
+    `outcome` is marked on the implement dispatch row (`validation_status`), so the job is
+    judged once and the revision knows what it is for.
+
+    Attempts spent: the PR on record is left open deliberately — it holds the work for the
+    owner to take over — and the note, capped at 200 characters, says so with its URL.
+
+    A compare-and-set on the item's state as read (plus `expect_eq`); returns whether it won,
+    and marks the dispatch row only then."""
+    if _revisions_left(item):
+        won = _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=item["state"],
+                         expect_eq=expect_eq, note=f"{note} — revision pending", **columns)
+    else:
+        suffix = f" — PR left open: {item['pr_url']}" if item["pr_url"] else ""
+        head = " ".join(note.split())[: _items.NOTE_MAX - len(suffix)]
+        won = _set_state(conn, item["event_id"], STATE_FAILED, now, expect_state=item["state"],
+                         expect_eq=expect_eq, note=head + suffix, **columns)
+    if won:
+        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?", (outcome, item["implement_job"]))
+    conn.commit()
+    return bool(won)
 
 
 def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -4300,8 +4347,9 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
     `result.outcome` (clients.sideclaw.DISPATCH_OUTCOMES) rather than "read
     artifactUrl, guess the rest":
 
-      pr_opened | pr_updated                   -> opens the step-7 review (merging); a newer PR
-                                                  than the one on record closes the older
+      pr_opened | pr_updated                   -> merging, at the merge train's `update` stage
+                                                  (advance_merge_trains()); a newer PR than the
+                                                  one on record closes the older
       checks_failed | conflict                 -> a revision attempt (stays working) while any
                                                   are left, else failed — the PR on record is left
                                                   open, its URL in the note
@@ -4415,41 +4463,21 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         if result.get("nextAction") == "human":
             _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=_decision_note(result))
         elif outcome in ("pr_opened", "pr_updated") and artifact_url:
-            # CLAIM BEFORE DISPATCH, the same shape as maybe_auto_implement(): the loop and
-            # the sweep both reach this handoff, and an unclaimed one opens two reviews. The
-            # compare-and-set moves the item to `merging` only while it is still the
-            # `working` item this pass read (same implement job, no review yet); the loser
-            # skips. Its `retry_at` is the claim's expiry — poll_validation_jobs() skips a
-            # row waiting out a retry_at, so the other process cannot submit the review
-            # too, and a process that dies right here leaves a row that is picked up again
-            # once it passes.
+            # The pull request joins its repo's merge train at `update` (advance_merge_trains()).
+            # A compare-and-set on the `working` item this pass read (same implement job, no
+            # review yet): the loop and the sweep both reach this handoff, and the loser skips.
+            # A new attempt's head has never been reviewed, so `reviewed_sha` starts over.
             claimed = _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_WORKING,
                                  expect_eq={"implement_job": job_id, "validation_job": None},
-                                 pr_url=artifact_url, strikes=0, retry_at=_review_claim_until(now))
+                                 pr_url=artifact_url, strikes=0, retry_at=None, **_TRAIN_START,
+                                 note=f"{outcome}: {artifact_url} joins the merge train")
             conn.commit()
             if not claimed:
-                print(f"triage: {item['signature']} (event {event_id}) was already handed to review by "
-                      f"another pass — skipped", file=sys.stderr)
+                print(f"triage: {item['signature']} (event {event_id}) was already handed to the merge train "
+                      f"by another pass — skipped", file=sys.stderr)
                 continue
             if item["pr_url"] and item["pr_url"] != artifact_url:
                 _close_superseded_pr(item["pr_url"], artifact_url)
-            try:
-                val_job, val_err = _open_validation_dispatch(
-                    conn, repo=item["repo"], event_id=event_id, implement_job=job_id,
-                    pr_url=artifact_url, context=_validation_context(conn, item))
-            except SubmitRefused as e:
-                _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=artifact_url,
-                                retry_at=None)
-                continue
-            if val_job is None:
-                # The PR exists; only the review could not be submitted. The item is
-                # already `merging` and the review submission is what retries.
-                _strike(conn, event_id, now, val_err or "could not open the step-7 review",
-                        retry_state=STATE_MERGING, expect_state=STATE_MERGING)
-            else:
-                _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_MERGING,
-                           expect_eq={"validation_job": None}, validation_job=val_job,
-                           strikes=0, retry_at=None)
         elif outcome in ("pr_opened", "pr_updated"):
             conn.commit()
             _strike_attempt(f"implement {job_id}: {outcome} outcome carried no artifactUrl")
@@ -4460,18 +4488,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                     f"(branch {branch}): {summary[:300]}" if outcome == "checks_failed" else
                     f"implement {job_id}: the base moved and the rebase conflicted, nothing was "
                     f"pushed: {summary[:300]}")
-            # Marked on the dispatch row so this job is judged once; the revision
-            # attempt (maybe_revise_blocked()) is what follows while any are left.
-            conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?", (outcome, job_id))
-            if _revisions_left(item):
-                _set_state(conn, event_id, STATE_WORKING, now, note=f"{note} — revision pending")
-            else:
-                # Attempts spent. The PR on record (an earlier attempt's) is left open
-                # deliberately — it holds the work for the owner to take over — and the note,
-                # capped at 200 characters, says so with its URL.
-                suffix = f" — PR left open: {item['pr_url']}" if item["pr_url"] else ""
-                head = " ".join(note.split())[: _items.NOTE_MAX - len(suffix)]
-                _set_state(conn, event_id, STATE_FAILED, now, note=head + suffix)
+            _hand_back_for_revision(conn, item, now, outcome=outcome, note=note)
         else:
             # no_changes, diff_refused, branch_no_pr, pr_failed, withheld, salvaged,
             # a wrong tier's outcome, or one this switch does not know: the episode
@@ -4568,54 +4585,288 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
     )
 
 
+# --- the merge train (steps 7-8) ----------------------------------------------
+#
+# A `merging` item walks four stages, persisted on its row (`train_stage`), one item per repo
+# at a time — advance_merge_trains() walks only the oldest `merging` item of each repo, and
+# check_repo_not_in_flight() keeps a second one from getting there in the first place:
+#
+#   update  sideclaw's `update_pr` rebases the PR onto the latest default branch, re-runs the
+#           repo's checks on the result and pushes. `conflict` -> a revision from the new base;
+#           `updated` with failed checks -> a `checks_failed` revision; a lease refusal -> again
+#           in LEASE_RETRY_MINUTES; otherwise the head it reports is the train's SHA (`train_sha`).
+#   checks  GitHub's check runs on `train_sha`, read every pass, no deadline: green or none ->
+#           review; any completed failure -> a `checks_failed` revision; unreadable -> `failed`;
+#           the PR head moved off `train_sha` -> update.
+#   review  the step-7 review of exactly `train_sha`, skipped when a review already confirmed
+#           that SHA (`reviewed_sha`). The PR head is checked before the submit and after the
+#           fold — the review reports no SHA of its own — and a move sends the train to update.
+#   merge   plan_or_land() pinned to `train_sha`; GitHub refusing because the head moved
+#           (HeadMoved) -> update, no strike.
+#
+# Every hop is a compare-and-set on the row as the pass read it (_train_expect()): the loop
+# and dispatch-sweep.py both walk trains. A call that takes a while (a submit, the merge, acting
+# on a review) is claimed first — `retry_at` set to the claim's expiry — so the other process
+# skips the row until it is done.
+
+TRAIN_UPDATE = "update"
+TRAIN_CHECKS = "checks"
+TRAIN_REVIEW = "review"
+TRAIN_MERGE = "merge"
+# `train_job` while the update_pr submit is in flight. A process that dies there leaves it,
+# and the claim's `retry_at` expiring is what lets the next pass submit again.
+TRAIN_CLAIM = "claiming"
+# Hops one pass may walk one item. A guard, not a budget: every real cycle ends at an async job.
+TRAIN_MAX_HOPS = 6
+
+# What entering the train writes (poll_implement_jobs()'s handoff): a new attempt's head was
+# never reviewed and has nothing to revise from yet.
+_TRAIN_START: dict[str, Any] = {"train_stage": TRAIN_UPDATE, "train_sha": None, "train_job": None,
+                                "reviewed_sha": None, "train_evidence": None}
+
+MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
+MERGE_PENDING_NOTE_PREFIX = "waiting for checks: "
+
+
+def _train_expect(item: sqlite3.Row) -> dict[str, Any]:
+    """The row as this pass read it, for a hop's compare-and-set."""
+    return {"train_stage": item["train_stage"], "train_sha": item["train_sha"], "train_job": item["train_job"],
+            "validation_job": item["validation_job"], "retry_at": item["retry_at"]}
+
+
+def _train_hop(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, **columns: Any) -> bool:
+    """One compare-and-set write on a `merging` item; False when another pass moved it first."""
+    won = _set_state(conn, item["event_id"], STATE_MERGING, now, expect_state=STATE_MERGING,
+                     expect_eq=_train_expect(item), **columns)
+    conn.commit()
+    if not won:
+        print(f"triage: the merge train of {item['signature']} (event {item['event_id']}) was moved by "
+              f"another pass — skipped", file=sys.stderr)
+    return bool(won)
+
+
+def _train_strike(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, reason: str,
+                  **retry_columns: Any) -> None:
+    _strike(conn, item["event_id"], now, reason, retry_state=STATE_MERGING, expect_state=STATE_MERGING,
+            expect_eq=_train_expect(item), **retry_columns)
+    conn.commit()
+
+
+def _back_to_update(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, why: str) -> bool:
+    """The PR head is not the train's SHA any more: bring it up to date again. Not a strike —
+    nothing failed, the base or the branch moved."""
+    return _train_hop(conn, item, now, train_stage=TRAIN_UPDATE, train_sha=None, train_job=None,
+                      validation_job=None, retry_at=None, note=f"back to update: {why}")
+
+
+def _retry_ready(item: sqlite3.Row, now: dt.datetime) -> bool:
+    """_retry_ready_sql() for a row already read."""
+    return item["retry_at"] is None or item["retry_at"] <= _now_iso(now)
+
+
+def _open_pr_head(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> str | None:
+    """The head commit of the item's pull request, read from GitHub now — or None, with the
+    item already moved: a URL that is not a PR, or a read that failed, strikes; a PR that is no
+    longer open leaves nothing to merge and ends the item `failed`."""
+    ref = _github.parse_pr_url(item["pr_url"] or "")
+    if ref is None:
+        _train_strike(conn, item, now, f"could not parse the PR number from {item['pr_url']!r}")
+        return None
+    owner, name, number = ref
+    try:
+        pr = _github.read_pr(owner, name, number)
+    except RemoteError as e:
+        _train_strike(conn, item, now, f"could not read {owner}/{name}#{number}: {e}")
+        return None
+    if pr.get("merged") or pr.get("state") != "open":
+        state = "merged" if pr.get("merged") else pr.get("state")
+        _set_state(conn, item["event_id"], STATE_FAILED, now, expect_state=STATE_MERGING,
+                   expect_eq=_train_expect(item),
+                   note=f"{MERGE_REFUSED_NOTE_PREFIX}{owner}/{name}#{number} is {state}, not open")
+        conn.commit()
+        return None
+    head = pr.get("head")
+    sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(sha, str) or not sha:
+        _train_strike(conn, item, now, f"GitHub's response for {owner}/{name}#{number} has no head sha")
+        return None
+    return sha
+
+
+def _submit_update_pr(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                      now: dt.datetime) -> None:
+    """Claim, then submit sideclaw's `update_pr` for the item's PR. A refusal (4xx) ends the
+    item; any other submit failure strikes."""
+    ref = _github.parse_pr_url(item["pr_url"] or "")
+    if ref is None:
+        _train_strike(conn, item, now, f"could not parse the PR number from {item['pr_url']!r}", train_job=None)
+        return
+    if not _train_hop(conn, item, now, train_job=TRAIN_CLAIM, retry_at=_review_claim_until(now)):
+        return
+    item = _get_item(conn, item["event_id"])
+    try:
+        job = _sideclaw.submit_update_pr(cwd=_policy.repo_cwd(item["repo"]), pr=ref[2])
+    except SubmitRefused as e:
+        _end_on_refusal(conn, [item], e, tier="update_pr", now=now, policy=policy, retry_at=None)
+        return
+    except (RemoteError, UsageError) as e:
+        _train_strike(conn, item, now, f"update_pr could not be submitted: {e}", train_job=None)
+        return
+    _train_hop(conn, item, now, train_job=job["id"], retry_at=None)
+
+
+def _train_update(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                  now: dt.datetime) -> bool:
+    job_id = item["train_job"]
+    if job_id is None or job_id == TRAIN_CLAIM:
+        _submit_update_pr(conn, policy, item, now)
+        return False
+    try:
+        resp = _sideclaw.get(job_id)
+    except RemoteError as e:
+        print(f"triage: could not poll update_pr job {job_id} for {item['signature']}: {e}", file=sys.stderr)
+        return False
+    if resp is None:
+        _train_strike(conn, item, now, f"sideclaw has no record of update_pr job {job_id} (pruned or lost)",
+                      train_job=None)
+        return False
+    status = resp.get("status")
+    if status not in _sideclaw.TERMINAL:
+        return False
+    if _sideclaw.is_lease_refusal(resp):
+        _lease_retry(conn, item, now, what="the PR update", expect_eq=_train_expect(item), train_job=None)
+        return False
+    if status != "done":
+        reason = resp.get("error") or ("cancelled" if status == "cancelled" else "no further detail")
+        _train_strike(conn, item, now, f"update_pr {job_id} finished '{status}': {reason}", train_job=None)
+        return False
+    try:
+        result = _sideclaw.update_pr_result(resp)
+    except RemoteError as e:
+        _train_strike(conn, item, now, str(e), train_job=None)
+        return False
+
+    if result["status"] == "conflict":
+        evidence = result.get("note") or "the rebase onto the default branch failed"
+        _hand_back_for_revision(
+            conn, item, now, outcome="conflict", expect_eq=_train_expect(item), train_evidence=evidence,
+            note=f"update_pr {job_id}: the base moved and {item['pr_url']} no longer rebases onto it: {evidence}")
+        return False
+    checks = result.get("checks") or {}
+    if result["status"] == "updated" and not checks["passed"]:
+        _hand_back_for_revision(
+            conn, item, now, outcome="checks_failed", expect_eq=_train_expect(item),
+            train_evidence="\n".join(filter(None, (checks["summary"], checks.get("failed")))),
+            note=f"update_pr {job_id}: the repo's checks failed on {item['pr_url']} rebased onto the latest "
+                 f"base: {checks['summary']}")
+        return False
+    head = result["headSha"]
+    moved = "rebased and pushed" if result["status"] == "updated" else "already on the latest base"
+    return _train_hop(conn, item, now, train_stage=TRAIN_CHECKS, train_sha=head, train_job=None,
+                      strikes=0, retry_at=None, note=f"{moved} at {head[:12]}; waiting for checks")
+
+
+def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                  now: dt.datetime) -> bool:
+    sha = item["train_sha"]
+    if not sha:
+        return _back_to_update(conn, item, now, "no train SHA on record")
+    head = _open_pr_head(conn, item, now)
+    if head is None:
+        return False
+    if head != sha:
+        return _back_to_update(conn, item, now, f"the PR head is {head[:12]}, not the train's {sha[:12]}")
+    owner, name, _ = _github.parse_pr_url(item["pr_url"])
+    try:
+        _merge.check_runs_gate(repo=item["repo"], check_runs=_merge.read_check_runs(owner, name, sha))
+    except _merge.ChecksPending as e:
+        _train_hop(conn, item, now, note=f"{MERGE_PENDING_NOTE_PREFIX}{e}")
+        return False
+    except _merge.ChecksFailed as e:
+        _hand_back_for_revision(conn, item, now, outcome="checks_failed", expect_eq=_train_expect(item),
+                                train_evidence=f"GitHub check runs on {sha}: {e}",
+                                note=f"CI failed on {sha[:12]}: {e}")
+        return False
+    except (PolicyError, PreconditionError) as e:
+        # Unreadable check runs: an unknown CI state never passes, and waiting does not fix a token.
+        _set_state(conn, item["event_id"], STATE_FAILED, now, expect_state=STATE_MERGING,
+                   expect_eq=_train_expect(item), note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}")
+        conn.commit()
+        return False
+    except RemoteError as e:
+        _train_strike(conn, item, now, f"could not read the check runs on {sha[:12]}: {e}")
+        return False
+    return _train_hop(conn, item, now, train_stage=TRAIN_REVIEW, validation_job=None, strikes=0,
+                      note=f"checks green on {sha[:12]}")
+
+
+def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
+    """The review's context: the gate questions and the goal (_validation_context()), plus —
+    when a review already confirmed an earlier head of this PR — what moved since.
+
+    Text only: sideclaw's `review` job reviews the PR's whole head and has no delta/range scope,
+    so "focus on what changed" is a request to the reviewer, not a narrower diff. A real delta
+    review needs sideclaw support."""
+    base = _validation_context(conn, item)
+    reviewed, sha = item["reviewed_sha"], item["train_sha"]
+    if not reviewed or reviewed == sha:
+        return base
+    delta = (f"A review already confirmed this pull request at {reviewed}; the branch was since rebased "
+             f"onto a newer base and is now {sha}. Focus on what changed since that review.")
+    return "\n\n".join((base[: _dispatch.MAX_CONTEXT_CHARS - len(delta) - 2], delta))
+
+
 def _submit_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                    now: dt.datetime) -> None:
-    """Open the step-7 review for a `merging` item that has a pull request and no
-    review on it — the retry half of a review that failed, or one that could not
-    be submitted. A submit that fails for infrastructure reasons strikes (see
-    _strike()); a sideclaw refusal (4xx) is final.
+    """Open the step-7 review of the train's SHA. A submit that fails for infrastructure
+    reasons strikes (see _strike()); a sideclaw refusal (4xx) is final.
 
-    Claimed before the submit, like the handoff in poll_implement_jobs(): the loop and the
-    sweep both land here, and an unclaimed submit opens two reviews. The claim is a
-    compare-and-set on the row as this pass read it, and its `retry_at` is the claim's expiry."""
-    claim_until = _review_claim_until(now)
-    claimed = _set_state(conn, item["event_id"], STATE_MERGING, now, expect_state=STATE_MERGING,
-                         expect_eq={"validation_job": None, "retry_at": item["retry_at"]},
-                         retry_at=claim_until)
-    conn.commit()
-    if not claimed:
-        print(f"triage: the review of {item['signature']} (event {item['event_id']}) is already being "
-              f"submitted by another pass — skipped", file=sys.stderr)
+    Claimed before the submit: the loop and the sweep both land here, and an unclaimed submit
+    opens two reviews. The claim is a compare-and-set on the row as this pass read it, and its
+    `retry_at` is the claim's expiry."""
+    if not _train_hop(conn, item, now, retry_at=_review_claim_until(now)):
         return
+    item = _get_item(conn, item["event_id"])
     try:
         val_job, val_err = _open_validation_dispatch(
             conn, repo=item["repo"], event_id=item["event_id"], implement_job=item["implement_job"],
-            pr_url=item["pr_url"] or "", context=_validation_context(conn, item))
+            pr_url=item["pr_url"] or "", context=_review_context(conn, item))
     except SubmitRefused as e:
         _end_on_refusal(conn, [item], e, tier="review", now=now, policy=policy, pr_url=item["pr_url"],
                         retry_at=None)
         return
     if val_job is None:
-        _strike(conn, item["event_id"], now, val_err or "could not open the step-7 review",
-                retry_state=STATE_MERGING, expect_state=STATE_MERGING)
+        _train_strike(conn, item, now, val_err or "could not open the step-7 review")
     else:
-        _set_state(conn, item["event_id"], STATE_MERGING, now, expect_state=STATE_MERGING,
-                   validation_job=val_job, note=None, retry_at=None)
-    conn.commit()
+        _train_hop(conn, item, now, validation_job=val_job, retry_at=None,
+                   note=f"reviewing {item['train_sha'][:12]}")
 
 
-def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
-                          *, dry_run: bool) -> None:
-    """Step 7 -> 8. Polls every `merging` item once against sideclaw's own
-    `review` job (server/jobs/handlers/review.ts) run on the pull request's OWN
-    branch — a TYPED verdict (`outcome`/`blocking`/...), not a marker phrase
-    substring-matched out of prose. `outcome == "clean"`, or `"actionable"` with an
-    EMPTY `blocking` list, confirms and calls `merge` (via lifecycle/merge.py's
-    `plan_or_land()`, which owns its own `merge`/`deploy` operations and receipts
-    end to end); its own outcome decides the next state: landed -> `verifying`,
-    checks still pending -> stays `merging` and is polled again, transient GitHub
-    failure -> a strike, a refusal that will not clear (the merge gate, GitHub's
-    own rules, a conflict) -> `failed` with the reason.
+def _train_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                  now: dt.datetime) -> bool:
+    sha = item["train_sha"]
+    if not sha:
+        return _back_to_update(conn, item, now, "no train SHA on record")
+    if item["reviewed_sha"] == sha:
+        return _train_hop(conn, item, now, train_stage=TRAIN_MERGE,
+                          note=f"a review already confirmed {sha[:12]}")
+    if item["validation_job"]:
+        return _fold_review(conn, policy, item, now)
+    head = _open_pr_head(conn, item, now)
+    if head is None:
+        return False
+    if head != sha:
+        return _back_to_update(conn, item, now, f"the PR head is {head[:12]}, not the train's {sha[:12]}")
+    _submit_review(conn, policy, item, now)
+    return False
+
+
+def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                 now: dt.datetime) -> bool:
+    """Act on the step-7 review of the train's SHA — sideclaw's own `review` job run on the
+    pull request's OWN branch, a TYPED verdict (`outcome`/`blocking`/...), not a marker phrase
+    substring-matched out of prose. `outcome == "clean"`, or `"actionable"` with an EMPTY
+    `blocking` list, confirms: `reviewed_sha` records the SHA and the train moves to merge.
 
     A non-empty `blocking` list refuses the merge outright — never read as a pass —
     with ONE precedence above it (§115): `"needs-human"` goes to the owner
@@ -4634,201 +4885,229 @@ def poll_validation_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     `dispatches.validation_status` lands one of `confirmed | blocked | needs_decision |
     error`.
 
-    Fail-closed, the same shape `poll_implement_jobs()` uses for its own outcome
-    switch: `"clean"` confirms; `"actionable"` with nothing in `blocking` confirms;
+    Fail-closed: `"clean"` confirms; `"actionable"` with nothing in `blocking` confirms;
     `"needs-human"` goes to the owner whatever it carries; any other non-empty
     `blocking` blocks, regardless of `outcome`; anything else — missing, or an
     outcome value this switch does not otherwise recognise — is `failed`, never a
-    silent confirm. `assert_outcome()` above is the first line of defence (a value
-    outside `REVIEW_OUTCOMES` entirely is a loud `RemoteError` before this switch
-    ever runs); this switch's own `else` is the second."""
+    silent confirm. `assert_outcome()` is the first line of defence (a value outside
+    `REVIEW_OUTCOMES` entirely is a loud `RemoteError` before this switch ever runs);
+    this switch's own `else` is the second.
+
+    The review reports no SHA: the PR head is read again once the verdict is in, and a head
+    that moved off the train's SHA sends the train back to update — the verdict is about a
+    commit nobody can name."""
+    event_id, review_job = item["event_id"], item["validation_job"]
+
+    def _review_failed(reason: str) -> None:
+        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
+                     ("error", item["implement_job"]))
+        _train_strike(conn, item, now, f"step-7 review ended with no verdict: {reason}", validation_job=None)
+
+    try:
+        resp = _sideclaw.get(review_job)
+    except RemoteError as e:
+        print(f"triage: could not poll sideclaw job {review_job} for {item['signature']}: {e}", file=sys.stderr)
+        return False
+    if resp is None:
+        # Same pruned-job case as poll_implement_jobs(), same answer: the review's result is
+        # lost, so the review is run again.
+        _review_failed(f"sideclaw has no record of review job {review_job}")
+        return False
+    status = resp.get("status")
+    if status not in _sideclaw.TERMINAL:
+        return False
+
+    # Folded onto the REVIEW job's own dispatches row (opened by _open_validation_dispatch()'s
+    # open_review() — a separate row from the implement job's) before any state transition, so
+    # it is never left stale waiting on dispatch-sweep.py's own cadence.
+    _dispatch.sync_record(conn, resp, reported=False, now=now)
+    conn.commit()
+
+    if status != "done" or not resp.get("result"):
+        _review_failed(resp.get("error") or (
+            "cancelled" if status == "cancelled" else f"review job {status} with no verdict"))
+        return False
+    try:
+        _sideclaw.assert_result_schema(resp, _sideclaw.REVIEW_SCHEMA_VERSION, "review")
+        _sideclaw.assert_outcome(resp, _sideclaw.REVIEW_OUTCOMES, "review")
+    except RemoteError as e:
+        _review_failed(str(e))
+        return False
+
+    # A real verdict ends the review's strike streak. The write is also the CLAIM on acting on
+    # this result: the loser skips, and the winner's `retry_at` (the claim's expiry) keeps a
+    # third pass off until the claim is released below.
+    claim_until = _review_claim_until(now)
+    if not _train_hop(conn, item, now, strikes=0, retry_at=claim_until):
+        return False
+    item = _get_item(conn, event_id)
+    sha = item["train_sha"]
+    head = _open_pr_head(conn, item, now)
+    if head is None:
+        _release_review_claim(conn, event_id, claim_until)
+        return False
+    if head != sha:
+        return _back_to_update(conn, item, now, f"the PR head moved to {head[:12]} while {sha[:12]} was reviewed")
+
+    # Same nested envelope as poll_implement_jobs() — the verdict lives in `result`.
+    verdict = resp.get("result") if isinstance(resp.get("result"), dict) else {}
+    outcome = verdict.get("outcome")
+    blocking = verdict.get("blocking") or []
+    # §114: the wrapper class is not the implementer's — see _is_process_only_finding(). It
+    # must not read as `blocked` (that is what spends a revision) but it must not be dropped
+    # either, so it goes to the owner with the finding on the card.
+    code_blocking = [f for f in blocking if not _is_process_only_finding(f)]
+    process_blocking = [f for f in blocking if _is_process_only_finding(f)]
+    summary = verdict.get("summary") or "no further detail"
+
+    unknown_outcome_note = None
+    process_only_note = None
+    human_question_note = None
+    if outcome == "clean":
+        validation_status = "confirmed"
+    elif outcome == "actionable" and not code_blocking and not process_blocking:
+        validation_status = "confirmed"
+    elif outcome == "needs-human":
+        # §115: a needs-human review is a question, not a finding (§92). Checked BEFORE
+        # `code_blocking`: the findings still reach the card, a human is the reader now.
+        validation_status = "needs_decision"
+        if code_blocking:
+            human_question_note = _format_blocking_findings(code_blocking)
+    elif code_blocking:
+        validation_status = "blocked"
+    elif process_blocking:
+        validation_status = "needs_decision"
+        process_only_note = ("process-only finding(s), no code defect — a revision cannot "
+                             "satisfy these: "
+                             + _format_blocking_findings(process_blocking))
+    else:
+        # Missing, or an outcome value REVIEW_OUTCOMES carries but this switch does not
+        # otherwise handle (there is none today). Fail closed.
+        validation_status = "unknown"
+        unknown_outcome_note = f"unknown review outcome '{outcome or 'missing'}'"
+    conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
+                 (validation_status, item["implement_job"]))
+    conn.commit()
+
+    if validation_status == "confirmed":
+        return _train_hop(conn, item, now, train_stage=TRAIN_MERGE, reviewed_sha=sha, retry_at=None,
+                          note=f"review confirmed {sha[:12]}")
+    if validation_status == "unknown":
+        _set_state(conn, event_id, STATE_FAILED, now, note=f"step-7 validation: {unknown_outcome_note}")
+    elif validation_status == "needs_decision":
+        detail = process_only_note or summary
+        if human_question_note:
+            detail = (f"{detail} — findings the review leaves with you, reasons a human must "
+                      f"look rather than a work order: {human_question_note}")
+        _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=f"step-7 validation (needs-human): {detail}")
+    else:
+        note = f"step-7 validation (blocked): {_format_blocking_findings(blocking)}"
+        # The findings go back to a fresh implement episode — see maybe_revise_blocked().
+        _set_state(conn, event_id, STATE_WORKING if _revisions_left(item) else STATE_FAILED, now, note=note)
+    conn.commit()
+    _release_review_claim(conn, event_id, claim_until)
+    return False
+
+
+def _train_merge(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+                 now: dt.datetime) -> bool:
+    sha = item["train_sha"]
+    if not sha:
+        return _back_to_update(conn, item, now, "no train SHA on record")
+    if item["reviewed_sha"] != sha:
+        return _train_hop(conn, item, now, train_stage=TRAIN_REVIEW, validation_job=None,
+                          note=f"no confirmed review of {sha[:12]} on record")
+    if _already_merged(conn, item["implement_job"]):
+        _land_already_merged_item(conn, policy, item, now)
+        return False
+    claim_until = _review_claim_until(now)
+    if not _train_hop(conn, item, now, retry_at=claim_until):
+        return False
+    item = _get_item(conn, item["event_id"])
+    outcome = _merge_and_rollout(conn, policy, item, now, expected_sha=sha)
+    if outcome == "head_moved":
+        _back_to_update(conn, item, now, f"GitHub refused the merge: the PR head moved off {sha[:12]}")
+    elif outcome == "pending":
+        _train_hop(conn, _get_item(conn, item["event_id"]), now, train_stage=TRAIN_CHECKS, retry_at=None)
+    _release_review_claim(conn, item["event_id"], claim_until)
+    return False
+
+
+_TRAIN_STAGES = {TRAIN_UPDATE: _train_update, TRAIN_CHECKS: _train_checks,
+                 TRAIN_REVIEW: _train_review, TRAIN_MERGE: _train_merge}
+
+
+def _walk_train(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int, now: dt.datetime) -> None:
+    """Walk one item's train as far as it goes this pass: each stage returns True when it hopped
+    to a stage that can act right away, False when it waits (an async job, a claim, a backoff)
+    or the item left `merging`."""
+    for _ in range(TRAIN_MAX_HOPS):
+        item = _get_item(conn, event_id)
+        if item is None or item["state"] != STATE_MERGING or not _retry_ready(item, now):
+            break
+        stage = _TRAIN_STAGES.get(item["train_stage"])
+        if stage is None:
+            # A `merging` row on no stage (an entry path that set none): its train starts at update.
+            if not _train_hop(conn, item, now, train_stage=TRAIN_UPDATE, train_sha=None, train_job=None,
+                              validation_job=None):
+                break
+            continue
+        if not stage(conn, policy, item, now):
+            break
+    _notify_item(conn, policy, event_id)
+
+
+def advance_merge_trains(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                         *, dry_run: bool) -> None:
+    """Steps 7-8 — walk every repo's merge train (see the block comment above): the OLDEST
+    `merging` item of each repo, and only that one, so a repo merges one pull request at a time
+    and each one is checked, reviewed and merged on the exact SHA that will land. A newer item
+    of the same repo waits — even while the oldest waits out a claim or a backoff."""
     if dry_run:
         return
-    ready_sql, ready_params = _retry_ready_sql(now)
-    items = conn.execute(
-        f"SELECT * FROM triage_items WHERE state=? AND pr_url IS NOT NULL AND implement_job IS NOT NULL "
-        f"AND {ready_sql}", (STATE_MERGING, *ready_params)
-    ).fetchall()
-    for item in items:
-        event_id = item["event_id"]
-        if not item["validation_job"]:
-            _submit_review(conn, policy, item, now)
+    rows = conn.execute("SELECT event_id, repo, signature, pr_url, implement_job FROM triage_items "
+                        "WHERE state=? ORDER BY event_id", (STATE_MERGING,)).fetchall()
+    seen: set[str | None] = set()
+    for row in rows:
+        if row["repo"] in seen:
             continue
-
-        def _review_failed(reason: str) -> None:
-            conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
-                         ("error", item["implement_job"]))
-            _strike(conn, event_id, now, f"step-7 review ended with no verdict: {reason}",
-                    retry_state=STATE_MERGING, expect_state=STATE_MERGING, validation_job=None)
-            conn.commit()
-
-        try:
-            resp = _sideclaw.get(item["validation_job"])
-        except RemoteError as e:
-            print(f"triage: could not poll sideclaw job {item['validation_job']} for "
-                  f"{item['signature']}: {e}", file=sys.stderr)
+        seen.add(row["repo"])
+        if not row["pr_url"] or not row["implement_job"]:
+            print(f"triage: {row['signature']} (event {row['event_id']}) is merging with no pull request or "
+                  f"implement job on record — its train cannot move", file=sys.stderr)
             continue
-        if resp is None:
-            # Same pruned-job case as poll_implement_jobs() above, same answer: the
-            # review's result is lost, so the review is run again.
-            _review_failed(f"sideclaw has no record of review job {item['validation_job']}")
-            continue
-        status = resp.get("status")
-        if status not in ("done", "failed", "interrupted", "cancelled"):
-            continue
-
-        # Same fold as poll_implement_jobs() above, onto the REVIEW job's own
-        # dispatches row (job_id=item["validation_job"], opened by
-        # _open_validation_dispatch()'s open_review() — a separate row from
-        # the implement job's) — before any state transition, so this row is
-        # never left stale waiting on dispatch-sweep.py's own cadence either.
-        _dispatch.sync_record(conn, resp, reported=False, now=now)
-        conn.commit()
-
-        if status != "done" or not resp.get("result"):
-            reason = resp.get("error") or (
-                "cancelled" if status == "cancelled" else f"review job {status} with no verdict")
-            _review_failed(reason)
-            continue
-
-        try:
-            _sideclaw.assert_result_schema(resp, _sideclaw.REVIEW_SCHEMA_VERSION, "review")
-            _sideclaw.assert_outcome(resp, _sideclaw.REVIEW_OUTCOMES, "review")
-        except RemoteError as e:
-            _review_failed(str(e))
-            continue
-
-        # A real verdict ends the review's strike streak: whatever happens to the
-        # merge below is a different step. The write is also the CLAIM on acting on this
-        # result — the loop and the sweep both reach this point, and two passes must not
-        # both merge, revise or park the same item. It is a compare-and-set on the row as
-        # this pass read it (same review job, same retry_at); the loser skips, and the
-        # winner's `retry_at` (the claim's expiry) keeps a third pass off until
-        # _release_review_claim() below.
-        claim_until = _review_claim_until(now)
-        claimed = _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_MERGING,
-                             expect_eq={"validation_job": item["validation_job"], "retry_at": item["retry_at"]},
-                             strikes=0, retry_at=claim_until)
-        conn.commit()
-        if not claimed:
-            print(f"triage: the review result for {item['signature']} (event {event_id}) is already "
-                  f"being acted on by another pass — skipped", file=sys.stderr)
-            continue
-
-        # Same nested envelope as poll_implement_jobs() above — the verdict
-        # lives in `result`, never at the top level.
-        verdict = resp.get("result") if isinstance(resp.get("result"), dict) else {}
-        outcome = verdict.get("outcome")
-        blocking = verdict.get("blocking") or []
-        # §114: the wrapper class is not the implementer's — see
-        # _is_process_only_finding(). It must not read as `blocked` (that is what
-        # spends a revision) but it must not be dropped either, so it goes to the
-        # owner with the finding on the card.
-        code_blocking = [f for f in blocking if not _is_process_only_finding(f)]
-        process_blocking = [f for f in blocking if _is_process_only_finding(f)]
-        summary = verdict.get("summary") or "no further detail"
-
-        unknown_outcome_note = None
-        process_only_note = None
-        human_question_note = None
-        if outcome == "clean":
-            validation_status = "confirmed"
-        elif outcome == "actionable" and not code_blocking and not process_blocking:
-            validation_status = "confirmed"
-        elif outcome == "needs-human":
-            # §115: a needs-human review is a question, not a finding (§92).
-            # Checked BEFORE `code_blocking`, because the old order folded it to
-            # the revisable `blocked` whenever the review carried a finding and
-            # `_revision_findings()` sent those findings straight back to the
-            # implementer — 1289 spent both its attempts that way, on rounds
-            # whose own reviews said a human had to look. The findings still
-            # reach the card: a human is the reader now.
-            validation_status = "needs_decision"
-            if code_blocking:
-                human_question_note = _format_blocking_findings(code_blocking)
-        elif code_blocking:
-            validation_status = "blocked"
-        elif process_blocking:
-            validation_status = "needs_decision"
-            process_only_note = ("process-only finding(s), no code defect — a revision cannot "
-                                 "satisfy these: "
-                                 + _format_blocking_findings(process_blocking))
-        else:
-            # Missing, or an outcome value REVIEW_OUTCOMES carries but this
-            # switch does not otherwise handle (there is none today — this
-            # branch exists for the day there is). Fail closed.
-            validation_status = "unknown"
-            unknown_outcome_note = f"unknown review outcome '{outcome or 'missing'}'"
-        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
-                     (validation_status, item["implement_job"]))
-        conn.commit()
-
-        if validation_status == "unknown":
-            _set_state(conn, event_id, STATE_FAILED, now, note=f"step-7 validation: {unknown_outcome_note}")
-            conn.commit()
-        elif validation_status == "needs_decision":
-            detail = process_only_note or summary
-            if human_question_note:
-                detail = (f"{detail} — findings the review leaves with you, reasons a human must "
-                          f"look rather than a work order: {human_question_note}")
-            _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=f"step-7 validation (needs-human): {detail}")
-            conn.commit()
-        elif validation_status == "blocked":
-            note = f"step-7 validation (blocked): {_format_blocking_findings(blocking)}"
-            if _revisions_left(item):
-                # The findings go back to a fresh implement episode — see
-                # maybe_revise_blocked(), which picks this row up.
-                _set_state(conn, event_id, STATE_WORKING, now, note=note)
-            else:
-                _set_state(conn, event_id, STATE_FAILED, now, note=note)
-            conn.commit()
-        elif _already_merged(conn, item["implement_job"]):
-            _land_already_merged_item(conn, policy, item, now)
-        else:
-            _merge_and_rollout(conn, policy, item, now)
-        _release_review_claim(conn, event_id, claim_until)
-        _notify_item(conn, policy, event_id)
+        _walk_train(conn, policy, row["event_id"], now)
 
 
 def _release_review_claim(conn: sqlite3.Connection, event_id: int, claim_until: str) -> None:
-    """Drop the claim poll_validation_jobs() took, and only that one: a `retry_at` the acted-on
-    step wrote itself (a strike's backoff) is a different value and stays."""
+    """Drop a claim this pass took, and only that one: a `retry_at` the acted-on step wrote
+    itself (a strike's backoff) is a different value and stays."""
     conn.execute("UPDATE triage_items SET retry_at=NULL WHERE event_id=? AND retry_at=?", (event_id, claim_until))
     conn.commit()
 
 
-MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
-MERGE_PENDING_NOTE_PREFIX = "waiting for checks: "
-
-
 def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
-                      now: dt.datetime, *, authorized_by: str = "auto-from-item",
+                      now: dt.datetime, *, expected_sha: str | None, authorized_by: str = "auto-from-item",
                       why: str = "triage auto-merge: step-7 validation confirmed") -> str:
-    """Land a validation-confirmed PR and route the item on the merge outcome —
-    the tail of poll_validation_jobs(), and the owner's Argo merge.
+    """Land a validation-confirmed PR and route the item on the merge outcome — the merge
+    train's last stage, and the owner's Argo merge. `expected_sha` pins the merge to that PR
+    head (the train's SHA); None pins whatever the head is when the gate runs.
 
-    Returns "merged", "pending", "refused" or "ambiguous" — callers starting from
-    a parked state cannot read the outcome off the item's state (§96).
+    Returns "merged", "pending", "head_moved", "refused" or "ambiguous" — callers starting
+    from a parked state cannot read the outcome off the item's state (§96).
 
-    Outcomes: landed -> `verifying` (deploy and verification are maybe_verify()'s); checks still running -> unchanged (a note says
-    so, the item is polled again); a refusal that will not clear by waiting (the
-    merge gate, GitHub's rules, a conflict, a closed PR) -> `failed` with the
-    reason; a transient GitHub failure -> a strike on `merging`. Every refusal
-    writes its note only if the item is still in the state the caller found it in:
-    a concurrent pass that already landed this PR must never be clobbered by the
-    loser's refusal."""
-    # Belt-and-suspenders on top of the sync above (which folds only
-    # THIS poll's own review job): `plan_or_land()` is about to read
-    # the IMPLEMENT job's dispatches row and refuse if `status` isn't
-    # 'done' — a row this function does not own but is seconds away
-    # from depending on. A confirmed validation only ever exists once
-    # the implement job itself finished 'done' (that is what opened
-    # this validation in the first place), so re-reading it here is
-    # cheap insurance against exactly the staleness this whole fix is
-    # about, for any row that reached `merging` before this file carried
-    # the fix above. Never blocks the merge attempt on a
-    # failed re-read — plan_or_land()'s own precheck still fails
-    # closed against whatever the row already says.
+    Outcomes: landed -> `verifying` (deploy and verification are maybe_verify()'s); checks
+    still running -> unchanged but for a note, "pending"; the PR head is not `expected_sha` or
+    moved under the merge call -> unchanged, "head_moved" (the caller decides); a refusal that
+    will not clear by waiting (the merge gate, GitHub's rules, a conflict, a closed PR) ->
+    `failed` with the reason; a transient GitHub failure -> a strike on `merging`. Every
+    refusal writes its note only if the item is still in the state the caller found it in: a
+    concurrent pass that already landed this PR must never be clobbered by the loser's
+    refusal."""
+    # `plan_or_land()` is about to read the IMPLEMENT job's dispatches row and refuse if
+    # `status` isn't 'done' — a row this function does not own. Re-reading it here is cheap
+    # insurance against a stale row; a failed re-read never blocks the merge attempt, the
+    # precheck still fails closed against whatever the row already says.
     try:
         impl_resp = _sideclaw.get(item["implement_job"])
     except RemoteError as e:
@@ -4841,12 +5120,14 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     try:
         result = _merge.plan_or_land(
             conn, job_id=item["implement_job"], why=why,
-            confirm=True, dry_run=False, authorized_by=authorized_by, now=now,
+            confirm=True, dry_run=False, authorized_by=authorized_by, now=now, expected_sha=expected_sha,
         )
     except _merge.MergeInFlight:
         # Another process is landing this very PR (the loop and the sweep both
         # run this chain): its outcome is what moves the item, not this one's.
         return "ambiguous"
+    except HeadMoved:
+        return "head_moved"
     except _merge.ChecksPending as e:
         _set_state(conn, item["event_id"], item["state"], now, note=f"{MERGE_PENDING_NOTE_PREFIX}{e}",
                    expect_state=item["state"])
@@ -4860,10 +5141,9 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     except RemoteError as e:
         if e.maybe_mutated:
             # The merge may already have happened. Leave the state as the caller found it:
-            # reconcile_operations() asks GitHub directly on the very
-            # next pass, BEFORE this function gets another chance to
-            # re-attempt the merge. Striking here would be exactly DESIGN.md
-            # § Crash recovery's "silently read as failure".
+            # reconcile_operations() asks GitHub directly on the very next pass, BEFORE this
+            # function gets another chance to re-attempt the merge. Striking here would be
+            # exactly DESIGN.md § Crash recovery's "silently read as failure".
             print(f"triage: merge for {item['signature']} may have reached GitHub "
                   f"({e}) — left unresolved for reconcile_operations()", file=sys.stderr)
             return "ambiguous"
@@ -4871,14 +5151,13 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
                 retry_state=STATE_MERGING, expect_state=item["state"])
         conn.commit()
         return "refused"
-    else:
-        # plan_or_land() with confirm=True, dry_run=False always returns a MergeResult
-        # (never a MergePlan) on success — the merge operation and its receipt are already
-        # recorded, inside lifecycle/merge.py. The deploy is the verify pass's job
-        # (maybe_verify()): the item waits in `verifying` with no `verify_started_at`.
-        _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_VERIFY_RESET,
-                   note=f"merged {result.repo_slug}#{result.pull_request}; deploy and verification next")
-        conn.commit()
+    # plan_or_land() with confirm=True, dry_run=False always returns a MergeResult (never a
+    # MergePlan) on success — the merge operation and its receipt are already recorded, inside
+    # lifecycle/merge.py. The deploy is the verify pass's job (maybe_verify()): the item waits
+    # in `verifying` with no `verify_started_at`.
+    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_VERIFY_RESET,
+               note=f"merged {result.repo_slug}#{result.pull_request}; deploy and verification next")
+    conn.commit()
     return "merged"
 
 
@@ -4935,8 +5214,9 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
     a revisable one. Three shapes qualify, all a concrete defect in
     code the loop wrote itself: the independent review blocked the PR
     (`validation_status='blocked'`, findings from the review job's own
-    verdict), the repo's own checks failed before push (`checks_failed`), or the rebase
-    conflicted (`conflict`) — which also carries the findings of an earlier blocked review, if
+    verdict), the repo's own checks failed (`checks_failed` — before the episode's push, or
+    in the merge train), or the rebase conflicted (`conflict` — the episode's own, or the
+    train's `update_pr`) — which also carries the findings of an earlier blocked review, if
     any, so a conflict does not lose what the revision was for.
     Everything else — a needs-human review, a merge-gate refusal, a failed
     deploy — is a question, not a finding, and is not revised."""
@@ -4952,6 +5232,20 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
             return None
         return "The independent review BLOCKED the previous attempt:\n" + text
     result = _safe_json(impl["verdict_json"])
+    if impl["validation_status"] in ("checks_failed", "conflict") and result.get("outcome") in ("pr_opened",
+                                                                                              "pr_updated"):
+        # The merge train ended this attempt: its evidence is on the row (`train_evidence`).
+        evidence = item["train_evidence"] or "no further detail"
+        if impl["validation_status"] == "checks_failed":
+            return ("The checks FAILED on the previous attempt's pull request once it was brought up to date "
+                    f"with the latest default branch:\n{evidence}")
+        text = ("The default branch moved and the previous attempt's pull request could not be rebased onto "
+                f"it:\n{evidence}")
+        earlier = _earlier_blocked_review_findings(conn, item)
+        if earlier:
+            text += ("\n\nAn earlier attempt was BLOCKED by the independent review; its findings still "
+                     f"apply unless the conflicting attempt already fixed them:\n{earlier}")
+        return text
     if result.get("outcome") == "checks_failed":
         return ("The repo's own checks FAILED on the previous attempt before it could be pushed:\n"
                 f"{result.get('summary') or 'no further detail'}")
@@ -4980,17 +5274,29 @@ def _conflict_context(job_id: str, result: dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
+def _train_conflict_context(pr: str | None, branch: str | None, evidence: str | None) -> str:
+    """The conflict context when the merge train's `update_pr` could not rebase the previous
+    attempt's pull request: its change is still on the PR branch, which is where the new
+    attempt reads it from."""
+    parts = [f"The previous attempt's pull request {pr or '(not on record)'} could not be rebased onto the "
+             f"latest default branch: {evidence or 'no further detail'}"]
+    if branch:
+        parts.append(f"Its change is on branch {branch}: `git fetch origin {branch}` and "
+                     f"`git diff HEAD...FETCH_HEAD` to read it.")
+    return "\n\n".join(parts)
+
+
 def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                          *, dry_run: bool) -> None:
     """A blocked or unlanded implementation goes back to another implement episode on the SAME
     item — a revision is an attempt, never a new item (agent-platform.md §Warden step 4).
 
     Eligible: `working` with a real implement job on record, `max_tier='implement'`,
-    a revisable reason (_revision_findings() — a review that BLOCKED, an implement whose
-    own checks failed, or one whose rebase conflicted ever leaves that mark on the dispatch
-    row), and an attempt left (MAX_IMPLEMENT_ATTEMPTS, the first included). poll_validation_jobs()/
-    poll_implement_jobs() leave such an item in `working` while attempts remain and land it
-    `failed` carrying the findings once they are spent. The claim is a compare-and-set that
+    a revisable reason (_revision_findings() — a review that BLOCKED, checks that failed or
+    a rebase that conflicted, in the implement episode or in the merge train, ever leaves that
+    mark on the dispatch row), and an attempt left (MAX_IMPLEMENT_ATTEMPTS, the first included).
+    The merge train and poll_implement_jobs() leave such an item in `working` while attempts
+    remain and land it `failed` carrying the findings once they are spent. The claim is a compare-and-set that
     swaps the old job for IMPLEMENT_CLAIM with `revision_count+1`, before the dispatch — the
     same claim-before-dispatch shape maybe_auto_implement() uses.
 
@@ -4998,7 +5304,8 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     previous `dispatch/*` branch, so sideclaw cuts its worktree from that tip and updates the
     SAME pull request (`pr_updated`); `pr_url` stays and the step-7 review runs again on it.
     A `conflict` (the base moved; nothing was pushed): a fresh episode from the new base
-    carrying the conflicting attempt's verdict and its git bundle — without `revisionOf`; the
+    carrying the conflicting attempt's verdict and its git bundle — or, when the merge train's
+    `update_pr` could not rebase the PR, a pointer to its branch — without `revisionOf`; the
     PR on record is closed when its replacement opens (poll_implement_jobs()). Attempt
     ESCALATION_ATTEMPT and later run on the escalation model (_implement_model()); a sideclaw
     refusal of that model is retried once without it (_open_implement_episode())."""
@@ -5026,12 +5333,14 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             print(f"triage: revision of {item['signature']} deferred: {e}", file=sys.stderr)
             continue
 
-        prior = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
+        prior = conn.execute("SELECT verdict_json, validation_status FROM dispatches WHERE job_id=?",
                              (item["implement_job"],)).fetchone()
         prior_result = _safe_json(prior["verdict_json"] if prior else None)
         prior_pr = item["pr_url"] or prior_result.get("artifactUrl")
         prior_branch = prior_result.get("branch")
-        conflicted = prior_result.get("outcome") == "conflict"
+        train_conflict = (prior is not None and prior["validation_status"] == "conflict"
+                          and prior_result.get("outcome") in ("pr_opened", "pr_updated"))
+        conflicted = prior_result.get("outcome") == "conflict" or train_conflict
         revision_of = (prior_branch if prior_pr and not conflicted and isinstance(prior_branch, str)
                        and prior_branch.startswith("dispatch/") else None)
         if revision_of:
@@ -5061,8 +5370,9 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         context = (_verdict_as_context(item["dispatch_job"], _safe_json(inv["verdict_json"]))
                    if inv is not None else None)
         if conflicted:
-            context = "\n\n".join(filter(None, (_conflict_context(item["implement_job"], prior_result),
-                                               context)))[: _dispatch.MAX_CONTEXT_CHARS]
+            previous = (_train_conflict_context(prior_pr, prior_branch, item["train_evidence"]) if train_conflict
+                        else _conflict_context(item["implement_job"], prior_result))
+            context = "\n\n".join(filter(None, (previous, context)))[: _dispatch.MAX_CONTEXT_CHARS]
 
         claimed = _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=STATE_WORKING,
                              expect_eq={"implement_job": item["implement_job"],
@@ -5126,7 +5436,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     own eligibility from the DB on each call and is CAS-guarded end to end —
     `maybe_auto_implement()`'s claim-before-dispatch UPDATE only ever wins
     once (`AND state='working' AND implement_job IS NULL`), and
-    `poll_implement_jobs()`/`poll_validation_jobs()` each do their own fresh
+    `poll_implement_jobs()`/`advance_merge_trains()` each do their own fresh
     sideclaw poll per row before touching a state. A second call landing on
     a row the other process already advanced changes zero rows and moves on
     — indistinguishable from the loop calling this twice in a row, which it
@@ -5151,7 +5461,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     maybe_revise_blocked(conn, policy, now, dry_run=dry_run)
     maybe_auto_implement(conn, policy, now, dry_run=dry_run)
     poll_implement_jobs(conn, policy, now, dry_run=dry_run)
-    poll_validation_jobs(conn, policy, now, dry_run=dry_run)
+    advance_merge_trains(conn, policy, now, dry_run=dry_run)
 
 
 # --- deploy and verify (step 10) -----------------------------------------------
@@ -5474,8 +5784,10 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
                        now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
     """The owner's one-click merge. Accepted from `failed` and from `needs_decision`
     carrying a PR. Goes through _merge_and_rollout() with
-    `authorized_by="owner:argo"`, so an owner merge deploys and verifies
-    exactly like an automatic one."""
+    `authorized_by="owner:argo"` and the same gate (PR open, checks green on the head,
+    review confirmed, GitHub allows), so an owner merge deploys and verifies
+    exactly like an automatic one. Outside `merging` there is no train SHA: the merge
+    pins the PR head the gate reads now."""
     if item["state"] not in _ARGO_MERGE_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, not needs_decision/failed"
     if item["revert_pr"] is not None:
@@ -5483,16 +5795,19 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
     if not item["implement_job"] or not item["pr_url"]:
         return "rejected", None, "no pull request on this item to merge"
 
-    outcome = _merge_and_rollout(conn, load_policy(), item, now, authorized_by="owner:argo",
-                                 why="owner approved via Argo")
+    outcome = _merge_and_rollout(conn, load_policy(), item, now, expected_sha=item["train_sha"],
+                                 authorized_by="owner:argo", why="owner approved via Argo")
     fresh = _get_item(conn, event_id)
     if outcome == "merged":
         return "applied", {"merged": True, "state": fresh["state"] if fresh else None}, None
     if outcome == "pending":
         # The owner said merge and the checks are still running: that is a merge in
-        # progress, not a refusal. `merging` is the state poll_validation_jobs() re-drives
-        # until the checks settle — parked here it would never be asked again.
-        moved = _set_state(conn, event_id, STATE_MERGING, now, expect_state=item["state"])
+        # progress, not a refusal. The item joins its repo's merge train
+        # (advance_merge_trains()), which brings it up to date and lands it once the checks
+        # settle — parked here it would never be asked again. `reviewed_sha` stays: a head a
+        # review already confirmed is not reviewed again.
+        moved = _set_state(conn, event_id, STATE_MERGING, now, expect_state=item["state"],
+                           train_stage=TRAIN_UPDATE, train_sha=None, train_job=None)
         conn.commit()
         if not moved:
             return "rejected", None, "item state changed before this action could be applied — retry from Argo"
@@ -5501,6 +5816,8 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
     if outcome == "ambiguous":
         return "applied", {"note": "merge may have reached GitHub, outcome ambiguous — left for "
                                    "reconcile_operations()"}, None
+    if outcome == "head_moved":
+        return "rejected", None, "the pull request's head moved while it was being merged — retry from Argo"
     return "rejected", None, (fresh["note"] if fresh is not None else None) or "merge refused"
 
 

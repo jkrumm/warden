@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .errors import CheckRunsUnreadable, PolicyError, PreconditionError, RemoteError
+from .errors import CheckRunsUnreadable, HeadMoved, PolicyError, PreconditionError, RemoteError
 
 GH_OWNER = "jkrumm"
 _GH_TOKEN_REF = "op://mini/github/token"
@@ -192,9 +192,11 @@ def merge_pr(owner: str, repo: str, number: int, *, sha: str, method: str) -> di
     if status == 200:
         return body
     if status == 409:
-        raise PolicyError(
-            f"GitHub refused the merge (409): the head moved since it was inspected, or "
-            f"the branch is not in a mergeable state. Nothing was merged."
+        # GitHub's 409 on this endpoint is "Head branch was modified": `sha` is no longer the
+        # PR's head. (An unmergeable PR is a 405, below.)
+        raise HeadMoved(
+            f"GitHub refused the merge (409): the head moved from {sha[:12]} since it was "
+            f"inspected. Nothing was merged."
         )
     if status == 405:
         raise PolicyError(

@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from clients import argo, github, sideclaw  # noqa: E402
 from clients import slack as clients_slack  # noqa: E402
-from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused  # noqa: E402
+from clients.errors import HeadMoved, PolicyError, PreconditionError, RemoteError, SubmitRefused  # noqa: E402
 
 
 # --- stub HTTP server ----------------------------------------------------------
@@ -413,6 +413,95 @@ def test_submit_review_500_raises_remote_error():
         srv.stop()
 
 
+def test_submit_update_pr_body_shape():
+    srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "u1", "status": "queued"}})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        job = sideclaw.submit_update_pr(cwd=Path("/repo"), pr=17)
+        assert job == {"id": "u1", "status": "queued"}, job
+        assert srv.requests[0]["body"] == {"tool": "update_pr", "params": {"cwd": "/repo", "pr": 17}}, \
+            srv.requests[0]["body"]
+    finally:
+        srv.stop()
+
+
+def test_submit_update_pr_4xx_is_a_refusal_and_500_or_unreachable_a_remote_error():
+    srv = _StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": "update_pr refused: not allowed"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit_update_pr(cwd="/repo", pr=1)
+        except SubmitRefused as e:
+            assert e.status == 400 and "update_pr refused: not allowed" in str(e), e
+        else:
+            raise AssertionError("expected SubmitRefused")
+    finally:
+        srv.stop()
+    srv = _StubServer({("POST", "/api/jobs"): (500, {"error": "boom"})})
+    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    try:
+        try:
+            sideclaw.submit_update_pr(cwd="/repo", pr=1)
+        except SubmitRefused:
+            raise AssertionError("a 5xx is not a refusal")
+        except RemoteError as e:
+            assert "500" in str(e), e
+        else:
+            raise AssertionError("expected RemoteError")
+    finally:
+        srv.stop()
+    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+    try:
+        sideclaw.submit_update_pr(cwd="/repo", pr=1)
+    except RemoteError as e:
+        assert "update_pr submit failed" in str(e), e
+    else:
+        raise AssertionError("expected RemoteError")
+
+
+_SHA_A, _SHA_B = "a" * 40, "b" * 40
+
+
+def _update_pr_job(**result) -> dict:
+    base = {"status": "updated", "headSha": _SHA_B, "previousHeadSha": _SHA_A, "baseSha": "c" * 40,
+            "checks": {"passed": True, "summary": "all green"}, "prUrl": "https://github.com/jkrumm/r/pull/1"}
+    return {"id": "u1", "status": "done", "result": {**base, **result}}
+
+
+def test_update_pr_result_accepts_every_published_status():
+    assert sideclaw.update_pr_result(_update_pr_job())["status"] == "updated"
+    up = _update_pr_job(status="up_to_date", headSha=_SHA_A, checks=None)
+    up["result"].pop("checks")
+    assert sideclaw.update_pr_result(up)["headSha"] == _SHA_A
+    conflict = _update_pr_job(status="conflict", headSha=_SHA_A, note="rebase onto master failed: x")
+    conflict["result"].pop("checks")
+    assert sideclaw.update_pr_result(conflict)["note"] == "rebase onto master failed: x"
+    failed = _update_pr_job(checks={"passed": False, "summary": "1 failed", "failed": "lint"})
+    assert sideclaw.update_pr_result(failed)["checks"]["passed"] is False
+
+
+def test_update_pr_result_refuses_any_shape_it_does_not_know():
+    no_checks = _update_pr_job()
+    no_checks["result"].pop("checks")
+    bad = [
+        ("unknown status", _update_pr_job(status="rebased")),
+        ("short sha", _update_pr_job(headSha="abc123")),
+        ("missing previous", _update_pr_job(previousHeadSha=None)),
+        ("no prUrl", _update_pr_job(prUrl=None)),
+        ("updated without checks", no_checks),
+        ("checks.passed not a bool", _update_pr_job(checks={"passed": "yes", "summary": "s"})),
+        ("not done", {"id": "u1", "status": "failed", "error": "boom"}),
+        ("no result", {"id": "u1", "status": "done", "result": None}),
+    ]
+    for why, job in bad:
+        try:
+            sideclaw.update_pr_result(job)
+        except RemoteError:
+            pass
+        else:
+            raise AssertionError(f"{why}: a malformed update_pr result must be a loud refusal")
+
+
 def test_submit_triage_body_shape_has_no_model():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "t1", "status": "queued"}})})
     os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
@@ -740,16 +829,18 @@ def test_merge_pr_200_returns_body():
         _gh_cleanup()
 
 
-def test_merge_pr_409_raises_policy_error():
-    srv = _StubServer({("PUT", "/repos/jkrumm/gamma/pulls/1/merge"): (409, {"message": "conflict"})})
+def test_merge_pr_409_raises_head_moved():
+    """GitHub's 409 on the merge endpoint is "Head branch was modified": the pinned sha is not
+    the head any more. HeadMoved (a PolicyError) — the merge train brings the PR up to date again."""
+    srv = _StubServer({("PUT", "/repos/jkrumm/gamma/pulls/1/merge"): (409, {"message": "Head branch was modified"})})
     _gh_env(srv)
     try:
         try:
             github.merge_pr("jkrumm", "gamma", 1, sha="s", method="squash")
-        except PolicyError:
-            pass
+        except HeadMoved as e:
+            assert isinstance(e, PolicyError), "a moved head is still a refusal for every other caller"
         else:
-            raise AssertionError("expected PolicyError")
+            raise AssertionError("expected HeadMoved")
     finally:
         srv.stop()
         _gh_cleanup()
@@ -1502,9 +1593,14 @@ def test_dispatch_outcomes_include_pr_updated_and_conflict():
 
 
 def test_is_lease_refusal_matches_only_a_failed_job_with_the_lease_text():
-    lease = "dispatch refused: an implement episode is already running in this repo (job abc)"
+    # sideclaw server/lib/repo-lease.ts repoLeaseRefusal(holder, tool), for both tools that take the lease.
+    tail = ("an implement episode is already running in this repo (job abc) — implement episodes serialize "
+            "per repo because their edits and pushes would interleave. Re-submit once it finishes.")
+    lease = f"dispatch refused: {tail}"
     assert sideclaw.is_lease_refusal({"status": "failed", "error": lease})
-    assert sideclaw.is_lease_refusal({"status": "failed", "error": f"update_pr refused: {lease}"})
+    assert sideclaw.is_lease_refusal({"status": "failed", "error": f"update_pr refused: {tail}"})
+    assert sideclaw.is_lease_refusal({"status": "failed", "error": f"Error: update_pr refused: {tail}"})
+    assert not sideclaw.is_lease_refusal({"status": "failed", "error": "update_pr refused: PR #3 is closed, not open"})
     assert not sideclaw.is_lease_refusal({"status": "failed", "error": "worker crashed"})
     assert not sideclaw.is_lease_refusal({"status": "failed", "error": None})
     assert not sideclaw.is_lease_refusal({"status": "done", "error": lease})

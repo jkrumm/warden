@@ -67,6 +67,12 @@ DISPATCH_OUTCOMES: tuple[str, ...] = (
 # server/jobs/handlers/review.ts REVIEW_OUTCOMES at schema version 1.
 REVIEW_OUTCOMES: tuple[str, ...] = ("clean", "actionable", "needs-human")
 
+# server/jobs/handlers/update-pr.ts UPDATE_PR_OUTPUT `status`. The update_pr result carries
+# no schemaVersion, so update_pr_result() validates the whole shape instead.
+UPDATE_PR_STATUSES: tuple[str, ...] = ("updated", "up_to_date", "conflict")
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
 
 def _base() -> str:
     return os.environ.get("WARDEN_SIDECLAW_BASE", _DEFAULT_BASE)
@@ -219,11 +225,72 @@ def submit_triage(*, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     return job
 
 
-# The stable substring of sideclaw's per-repo implement lease refusal. The POST is
-# accepted (HTTP 200); the job then FAILS carrying this text (an `update_pr` refusal
-# prefixes it with `update_pr refused:`). It means "another implement episode holds
-# this repo right now" — retry later, not an infrastructure failure.
-_LEASE_REFUSAL = "an implement episode is already running in this repo"
+def submit_update_pr(*, cwd: str | Path, pr: int) -> dict[str, Any]:
+    """The merge train's `update_pr` job: `POST /api/jobs {"tool":"update_pr","params":{cwd,pr}}`
+    — rebase one `dispatch/*` PR onto the latest default branch, re-run the repo's checks,
+    force-with-lease push. Same transport and error handling as `submit_review()`: a 4xx is
+    `SubmitRefused`, anything else a `RemoteError`. The result is read with
+    `update_pr_result()`."""
+    body = {"tool": "update_pr", "params": {"cwd": str(cwd), "pr": pr}}
+
+    try:
+        status, text = _request("POST", "/api/jobs", body)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise RemoteError(
+            f"sideclaw update_pr submit failed (is the LaunchAgent up? curl {_base()}/health)",
+            maybe_mutated=True,
+        )
+
+    _raise_for_submit_status(status, text)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
+
+    job = parsed.get("job") if isinstance(parsed, dict) else None
+    if not isinstance(job, dict) or "id" not in job:
+        raise RemoteError("sideclaw accepted the update_pr job but returned no id")
+    return job
+
+
+def update_pr_result(job: dict[str, Any]) -> dict[str, Any]:
+    """The validated result of a `done` update_pr job (server/jobs/handlers/update-pr.ts
+    UPDATE_PR_OUTPUT): `status` one of UPDATE_PR_STATUSES, `headSha`/`previousHeadSha` 40-hex
+    commits, `prUrl` a string, and `checks{passed, summary}` present whenever the branch was
+    `updated` (the train decides from it). Any other shape raises a loud `RemoteError` — never a
+    best-effort read: a train that guessed would merge a SHA nobody checked."""
+    result = job.get("result")
+    if job.get("status") != "done" or not isinstance(result, dict):
+        raise RemoteError(f"sideclaw update_pr job {job.get('id')} ended '{job.get('status')}' with no result")
+    status = result.get("status")
+    if status not in UPDATE_PR_STATUSES:
+        raise RemoteError(
+            f"sideclaw update_pr result status {status!r}, warden expects one of {UPDATE_PR_STATUSES} — "
+            f"refusing to parse"
+        )
+    for key in ("headSha", "previousHeadSha"):
+        value = result.get(key)
+        if not isinstance(value, str) or not _SHA_RE.match(value):
+            raise RemoteError(f"sideclaw update_pr result {key} {value!r} is not a 40-hex commit — refusing to parse")
+    if not isinstance(result.get("prUrl"), str):
+        raise RemoteError("sideclaw update_pr result carries no prUrl — refusing to parse")
+    checks = result.get("checks")
+    if checks is None and status == "updated":
+        raise RemoteError("sideclaw update_pr result is 'updated' but carries no checks — refusing to parse")
+    if checks is not None and not (isinstance(checks, dict) and isinstance(checks.get("passed"), bool)
+                                   and isinstance(checks.get("summary"), str)):
+        raise RemoteError(f"sideclaw update_pr result checks {checks!r} are malformed — refusing to parse")
+    return result
+
+
+# sideclaw's per-repo lease refusal (server/lib/repo-lease.ts `repoLeaseRefusal(holder, tool)`):
+# `<tool> refused: an implement episode is already running in this repo (job <holder>) — …`,
+# where <tool> is `dispatch` for an implement episode and `update_pr` for the merge train's
+# rebase — both take the same lease. The POST is accepted (HTTP 200); the job then FAILS
+# carrying this text. It means "another implement episode holds this repo right now" —
+# retry later, not an infrastructure failure.
+_LEASE_REFUSAL_RE = re.compile(r"\b(?:dispatch|update_pr) refused: an implement episode is already running in this repo\b")
 
 _BUNDLE_PATH_RE = re.compile(r"bundled at (\S+?)\.?(\s|$)")
 
@@ -235,11 +302,12 @@ _escalation_cache: dict[str, str] = {}
 
 
 def is_lease_refusal(job: dict[str, Any]) -> bool:
-    """True for a FAILED job whose error is sideclaw's per-repo implement lease refusal."""
+    """True for a FAILED job whose error is sideclaw's per-repo lease refusal — of an implement
+    dispatch or of an `update_pr`."""
     if job.get("status") != "failed":
         return False
     error = job.get("error")
-    return isinstance(error, str) and _LEASE_REFUSAL in error
+    return isinstance(error, str) and bool(_LEASE_REFUSAL_RE.search(error))
 
 
 def conflict_bundle_path(result: dict[str, Any]) -> str | None:

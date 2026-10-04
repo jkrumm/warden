@@ -871,6 +871,29 @@ def test_merge_confirmed_lands_the_pull_request():
     conn.close()
 
 
+def test_merge_of_an_item_on_its_merge_train_is_pinned_to_the_train_sha():
+    """`warden merge --confirm` goes through the same gate as the train: a PR whose head is not
+    the SHA its train checked and reviewed is refused, nothing merged."""
+    h = Harness()
+    db = h.new_db()
+    _seed_dispatch(db, "job-train", tier="implement", repo="gamma", status="done",
+                    artifact_url="https://github.com/jkrumm/gamma/pull/9", validation_status="confirmed")
+    _seed_item(db, 7, state="merging", repo="gamma", implement_job="job-train")
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET train_stage='merge', train_sha=? WHERE event_id=7", ("a" * 40,))
+    conn.commit()
+    conn.close()
+    srv = _merge_stub()
+    try:
+        proc = h.run(["merge", "job-train", "--why", "land it", "--confirm", "--json"],
+                     env=h.base_env(db=db, gh=srv.base))
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 4 and "not the aaaaaaaaaaaa" in out["error"], out
+    assert not any(r["method"] == "PUT" for r in srv.requests), srv.requests
+
+
 # --- abort ---------------------------------------------------------------------------
 
 
@@ -890,6 +913,24 @@ def test_abort_cancels_running_episode_and_closes_the_item():
     assert _row(conn, "SELECT status FROM dispatches WHERE job_id='job-abort'")["status"] == "cancelled"
     assert _row(conn, "SELECT state FROM triage_items WHERE event_id=5")["state"] == "closed"
     conn.close()
+
+
+def test_abort_of_a_merging_item_cancels_its_running_update_pr():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 8, state="merging", repo="gamma", implement_job="job-impl", validation_job="job-old-review")
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET train_stage='update', train_job='job-update' WHERE event_id=8")
+    conn.commit()
+    conn.close()
+    srv = stubs.StubServer({("POST", "/api/jobs/job-update/cancel"): (200, {"job": {"id": "job-update",
+                                                                                   "status": "cancelled"}})})
+    try:
+        proc = h.run(["abort", "8", "--why", "stuck", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["cancelled"] is True and out["jobId"] == "job-update", out
 
 
 def test_abort_wrong_state_is_policy_error():

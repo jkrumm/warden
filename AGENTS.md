@@ -158,7 +158,11 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   review `confirmed`, and GitHub's own rules allowing the merge call
   (`lifecycle.merge.merge_gate_check()` / `plan_or_land()`). No path scope, size
   ceiling, per-repo carve-out or executor-repo exception; `warden merge <job>
-  --confirm` goes through the same gate.
+  --confirm` goes through the same gate. The facts hold on one SHA: a `merging` item
+  rides its repo's merge train (`triage.advance_merge_trains()`, oldest item per repo)
+  — sideclaw `update_pr` rebases it, checks are read on the resulting head, the review
+  confirms that head, and the merge is pinned to it; a head that moves goes back to
+  `update`.
 - **Deploy and verify are the repo's own Makefile.** A merged item waits in `verifying`
   and `triage.maybe_verify()` walks it: `make deploy` if the repo defines the target
   (after fast-forwarding the checkout to `origin/<default>`, only when it is on the default

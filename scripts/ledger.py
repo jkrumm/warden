@@ -623,12 +623,34 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 # VERIFY_WINDOW_HOURS); the column stays, unwritten — no table rebuild for it. Items already
 # `verifying` were deployed by the old rollout, so they start their window now and skip the
 # deploy.
+#
+# And the merge train — a `merging` item walks update -> checks -> review -> merge, one item
+# per repo at a time (scripts/triage.py advance_merge_trains()):
+#
+#   train_stage     the stage the item is on; NULL outside `merging`.
+#   train_sha       the PR head the train is checking, reviewing and will merge — set by the
+#     update stage from sideclaw's `update_pr` result; NULL outside `merging`.
+#   train_job       the in-flight `update_pr` job (or the `claiming` sentinel during its submit);
+#     NULL otherwise.
+#   reviewed_sha    the last PR head a step-7 review confirmed. Survives leaving `merging` (an
+#     owner merge of the same head need not re-review); a new implement attempt clears it.
+#   train_evidence  what ended a train in a revision (the rebase conflict, the failed checks),
+#     read by the revision brief — the update_pr job that said so is not a dispatch row.
+#
+# Items already `merging` restart the train at `update`: the review they may be in the middle
+# of read a head nobody pinned.
 _MIGRATION_15 = """
 ALTER TABLE triage_items ADD COLUMN verify_started_at TEXT;
 ALTER TABLE triage_items ADD COLUMN verify_mark TEXT;
 ALTER TABLE triage_items ADD COLUMN verify_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE triage_items ADD COLUMN verify_result TEXT;
 UPDATE triage_items SET verify_started_at = updated_at WHERE state = 'verifying';
+ALTER TABLE triage_items ADD COLUMN train_stage TEXT;
+ALTER TABLE triage_items ADD COLUMN train_sha TEXT;
+ALTER TABLE triage_items ADD COLUMN train_job TEXT;
+ALTER TABLE triage_items ADD COLUMN reviewed_sha TEXT;
+ALTER TABLE triage_items ADD COLUMN train_evidence TEXT;
+UPDATE triage_items SET train_stage = 'update' WHERE state = 'merging';
 """
 
 MIGRATIONS: dict[int, str] = {

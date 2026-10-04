@@ -82,3 +82,10 @@ class PolicyError(WardenError):
     nothing was mutated that shouldn't have been."""
 
     exit_code = 4
+
+
+class HeadMoved(PolicyError):
+    """The pull request's head is not the commit the caller pinned: GitHub's merge
+    call answered 409 for the `sha` it was given, or the PR read before it showed a
+    different head. Nothing was merged. The merge train answers by bringing the PR up
+    to date again — it is not a refusal of the change."""

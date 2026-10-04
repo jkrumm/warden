@@ -154,6 +154,31 @@ ROLLOUT_CALLS: list[tuple[str, str]] = []
 # Every PR a test's revision closed — reset per _triage_env().
 CLOSED_PRS: list[tuple[str, str, int, str | None]] = []
 
+# The merge train's GitHub reads, per _triage_env(): every PR reads back open with head TRAIN_SHA
+# unless a test moves it (PR_HEAD["sha"], PR_HEAD["state"]); check runs have no default — a test
+# that reaches the checks stage sets CHECK_RUNS["runs"] (None is a loud failure).
+TRAIN_SHA = "a" * 40
+REBASED_SHA = "b" * 40
+PR_HEAD: dict[str, Any] = {}
+CHECK_RUNS: dict[str, Any] = {}
+
+
+def _default_fake_read_pr(owner, repo, number):
+    pr = _fake_pr(number=number, head_sha=PR_HEAD["sha"], repo=repo)
+    pr["state"] = PR_HEAD["state"]
+    return pr
+
+
+def _default_fake_check_runs(owner, repo, sha):
+    if CHECK_RUNS["runs"] is None:
+        raise AssertionError(f"test: no check runs registered for {owner}/{repo}@{sha}")
+    CHECK_RUNS["asked"].append(sha)
+    return CHECK_RUNS["runs"]
+
+
+def _default_fake_submit_update_pr(*, cwd, pr):
+    raise AssertionError(f"test: no fake submit_update_pr registered (PR #{pr})")
+
 
 @contextlib.contextmanager
 def _triage_env(*, policy: dict[str, Any] | None = None):
@@ -185,6 +210,8 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_sideclaw", "submit"): triage._sideclaw.submit,
         ("_sideclaw", "submit_review"): triage._sideclaw.submit_review,
         ("_sideclaw", "submit_triage"): triage._sideclaw.submit_triage,
+        ("_sideclaw", "submit_update_pr"): triage._sideclaw.submit_update_pr,
+        ("_github", "check_runs"): triage._github.check_runs,
         ("_sideclaw", "get"): triage._sideclaw.get,
         ("_sideclaw", "wait"): triage._sideclaw.wait,
         ("_sideclaw", "cancel"): triage._sideclaw.cancel,
@@ -217,6 +244,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         triage._sideclaw.submit = _default_fake_submit
         triage._sideclaw.submit_triage = _default_fake_submit_triage
         triage._sideclaw.submit_review = _default_fake_submit_review
+        triage._sideclaw.submit_update_pr = _default_fake_submit_update_pr
         triage._sideclaw.get = _default_fake_get
         triage._sideclaw.escalation_model = lambda: None
         triage._sideclaw.cancel = lambda job_id: (_ for _ in ()).throw(
@@ -249,8 +277,12 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
             triage.RemoteError("test: no fake merge_pr registered"))
         triage._github.delete_branch = lambda owner, repo, branch: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake delete_branch registered"))
-        triage._github.read_pr = lambda owner, repo, number: (_ for _ in ()).throw(
-            triage.RemoteError("test: no fake read_pr registered"))
+        PR_HEAD.clear()
+        PR_HEAD.update(sha=TRAIN_SHA, state="open")
+        CHECK_RUNS.clear()
+        CHECK_RUNS.update(runs=None, asked=[])
+        triage._github.read_pr = _default_fake_read_pr
+        triage._github.check_runs = _default_fake_check_runs
         CLOSED_PRS.clear()
         triage._github.close_pr = lambda owner, repo, number, *, comment=None: CLOSED_PRS.append(
             (owner, repo, number, comment))
@@ -2741,7 +2773,7 @@ def test_auto_implement_refused_by_sideclaw_ends_the_item_and_is_never_retried()
         assert states == [triage.STATE_FAILED], states   # the claim is not a state change; the refusal is
 
 
-def test_implement_success_opens_a_review_validation():
+def test_implement_success_joins_the_merge_train_at_update():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-impl-ok")
         conn.execute(
@@ -2761,15 +2793,12 @@ def test_implement_success_opens_a_review_validation():
 
         triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        assert len(validation_calls) == 1, validation_calls
-        assert validation_calls[0]["pr"] == 9, validation_calls
+        assert validation_calls == [], "the review waits for the train's update and checks"
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGING
-        assert item["validation_job"] is not None
+        assert item["train_stage"] == triage.TRAIN_UPDATE and item["train_sha"] is None, dict(item)
+        assert item["train_job"] is None and item["validation_job"] is None and item["retry_at"] is None, dict(item)
         assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/9"
-        d = conn.execute("SELECT validation_job_id FROM dispatches WHERE job_id=?",
-                          ("implement-job-002",)).fetchone()
-        assert d["validation_job_id"] == item["validation_job"]
 
 
 def test_poll_reads_artifact_and_verdict_from_the_nested_result():
@@ -2823,19 +2852,19 @@ def test_poll_reads_artifact_and_verdict_from_the_nested_result():
 
         triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        assert len(validation_calls) == 1, (
-            "a nested artifactUrl must open the step-7 validation episode, not block the merge")
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_MERGING, item["state"]
+        assert item["state"] == triage.STATE_MERGING and item["train_stage"] == triage.TRAIN_UPDATE, (
+            "a nested artifactUrl must put the PR on its merge train, not block the merge")
         assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/99", item["pr_url"]
 
-        # Now drive the same item through poll_validation_jobs() with a
-        # nested envelope carrying a real `review` job's TYPED verdict.
+        # Now drive the same item's review with a nested envelope carrying a real `review`
+        # job's TYPED verdict.
         conn.execute(
             "UPDATE triage_items SET validation_job=? WHERE event_id=?",
             ("validation-job-nested", eid),
         )
         conn.commit()
+        _on_train(conn, eid)
         triage._sideclaw.get = lambda job_id: {
             "id": "validation-job-nested",
             "tool": "review",
@@ -2853,7 +2882,7 @@ def test_poll_reads_artifact_and_verdict_from_the_nested_result():
         fake_merged = types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo",
                                              pull_request=99)
         with _patched(triage._merge, plan_or_land=lambda *a, **kw: merges.append(kw) or fake_merged):
-            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert len(merges) == 1, (
             "a 'clean' review outcome must be read as confirmed and call merge")
@@ -3134,7 +3163,7 @@ def test_implement_result_schema_mismatch_is_a_loud_strike():
         assert 'refusing to parse' in item["note"], item["note"]
 
 
-def test_implement_pr_opened_with_unparseable_pr_url_strikes_the_review_submission():
+def test_implement_pr_opened_with_unparseable_pr_url_strikes_the_merge_train():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-bad-pr-url", job_id="impl-bad-pr-url")
         triage._sideclaw.get = lambda job_id: {
@@ -3142,9 +3171,10 @@ def test_implement_pr_opened_with_unparseable_pr_url_strikes_the_review_submissi
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/not-a-pr"),
         }
         triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
-        # The PR exists, only the review could not be submitted: the item moves on to
-        # `merging` and the review submission strikes.
+        # The PR exists, only its train cannot address it: the item moves on to `merging` and
+        # the update stage strikes.
         assert item["state"] == triage.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert item["validation_job"] is None and item["pr_url"], dict(item)
         assert item["note"].startswith("could not parse the PR number"), item["note"]
@@ -3158,7 +3188,7 @@ def test_blocking_validation_blocks_the_merge_and_sends_the_findings_back_for_a_
         with _triage_env() as (conn, ctx):
             eid = _seed_verdict_item(conn, external_id="sig-val-disagree")
             conn.execute(
-                "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=?, revision_count=? "
+                "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=?, revision_count=? "
                 "WHERE event_id=?",
                 (triage.STATE_MERGING, "implement-job-004", "validation-job-004",
                  "https://github.com/jkrumm/demo-repo/pull/10", revision_count, eid),
@@ -3183,7 +3213,7 @@ def test_blocking_validation_blocks_the_merge_and_sends_the_findings_back_for_a_
 
             triage._merge.plan_or_land = _unexpected_merge
 
-            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
             assert merge_calls == [], "a blocking validation must never call merge"
             item = triage._get_item(conn, eid)
@@ -3201,7 +3231,7 @@ def test_cancelled_validation_job_never_merges_and_strikes_the_review():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-cancelled")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-004b", "validation-job-004b",
              "https://github.com/jkrumm/demo-repo/pull/10", eid),
         )
@@ -3217,7 +3247,7 @@ def test_cancelled_validation_job_never_merges_and_strikes_the_review():
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == [], "a cancelled validation must never call merge"
         item = triage._get_item(conn, eid)
@@ -3230,7 +3260,7 @@ def _seed_validating_item(conn, *, external_id: str, implement_job: str, review_
     `open_review()` would have written for `review_job`."""
     eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
     conn.execute(
-        "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+        "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
         (triage.STATE_MERGING, implement_job, review_job, "https://github.com/jkrumm/demo-repo/pull/10", eid),
     )
     _seed_implement_dispatch(conn, implement_job)
@@ -3239,7 +3269,39 @@ def _seed_validating_item(conn, *, external_id: str, implement_job: str, review_
         (review_job, "review", "demo-repo", "review PR #10", "running", eid, NOW.isoformat()),
     )
     conn.commit()
+    _on_train(conn, eid)
     return eid
+
+
+def _fake_update_pr(calls: list[dict[str, Any]]):
+    """`submit_update_pr` fake: records each submit and returns a queued job."""
+    def _submit(*, cwd, pr):
+        calls.append({"cwd": str(cwd), "pr": pr})
+        return {"id": f"update-job-{len(calls):06d}", "status": "queued"}
+    return _submit
+
+
+def _update_pr_job(status: str, *, job_id: str = "update-job-000001", head: str = TRAIN_SHA,
+                   previous: str = TRAIN_SHA, passed: bool = True, note: str | None = None) -> dict[str, Any]:
+    """A `done` sideclaw update_pr job (server/jobs/handlers/update-pr.ts UPDATE_PR_OUTPUT)."""
+    result: dict[str, Any] = {"status": status, "headSha": head, "previousHeadSha": previous,
+                              "prUrl": "https://github.com/jkrumm/demo-repo/pull/10"}
+    if status != "conflict":
+        result["baseSha"] = "c" * 40
+    if status == "updated":
+        result["checks"] = {"passed": passed, "summary": "lint, test" if passed else "1 of 2 failed",
+                            **({} if passed else {"failed": "test: tests/test_x.py::test_y failed"})}
+    if note:
+        result["note"] = note
+    return {"id": job_id, "tool": "update_pr", "status": "done", "result": result}
+
+
+def _on_train(conn, eid: int, stage: str = "review", *, sha: str | None = TRAIN_SHA,
+              reviewed: str | None = None, job: str | None = None) -> None:
+    """Put a `merging` item on its merge train at `stage`, on `sha`."""
+    conn.execute("UPDATE triage_items SET train_stage=?, train_sha=?, reviewed_sha=?, train_job=? WHERE event_id=?",
+                 (stage, sha, reviewed, job, eid))
+    conn.commit()
 
 
 def test_failed_review_is_resubmitted_after_the_backoff_and_the_third_failure_fails():
@@ -3259,7 +3321,7 @@ def test_failed_review_is_resubmitted_after_the_backoff_and_the_third_failure_fa
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
         assert calls == [], "the resubmission waits out the backoff"
         assert item["state"] == triage.STATE_MERGING and item["validation_job"] is None, dict(item)
@@ -3268,25 +3330,25 @@ def test_failed_review_is_resubmitted_after_the_backoff_and_the_third_failure_fa
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-rv-infra'").fetchone()
         assert d["validation_status"] == "error"
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
         assert calls == [], "still inside the backoff"
 
         t1 = NOW + dt.timedelta(minutes=11)
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, t1, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, t1, dry_run=False)
         item = triage._get_item(conn, eid)
         assert len(calls) == 1 and calls[0]["pr"] == 10, calls
         assert item["validation_job"] == "review-job-000001" and item["state"] == triage.STATE_MERGING
         d = conn.execute("SELECT validation_job_id FROM dispatches WHERE job_id='impl-rv-infra'").fetchone()
         assert d["validation_job_id"] == "review-job-000001"
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, t1, dry_run=False)   # that review fails too
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, t1, dry_run=False)   # that review fails too
         item = triage._get_item(conn, eid)
         assert item["strikes"] == 2 and item["retry_at"] == (t1 + dt.timedelta(minutes=30)).isoformat(), dict(item)
 
         t2 = t1 + dt.timedelta(minutes=31)
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, t2, dry_run=False)   # resubmit
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, t2, dry_run=False)   # resubmit
         assert len(calls) == 2
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, t2, dry_run=False)   # third failure
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, t2, dry_run=False)   # third failure
         item = triage._get_item(conn, eid)
         assert len(calls) == 2, "the third strike must not submit a third review"
         assert item["state"] == triage.STATE_FAILED and item["strikes"] == 3, dict(item)
@@ -3300,7 +3362,7 @@ def test_done_review_with_no_result_is_an_infra_failure_too():
         triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": None}
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit_review = _fake_submit_review(calls)
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGING and item["strikes"] == 1 and item["validation_job"] is None, dict(item)
 
@@ -3320,7 +3382,7 @@ def test_a_review_with_a_verdict_resets_the_strike_count():
             raise triage.RemoteError("GitHub returned 502")
 
         triage._merge.plan_or_land = _flaky_merge
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert item["validation_job"] == "review-job-now", "the confirmed review is kept; only the merge retries"
@@ -3340,8 +3402,8 @@ def test_review_resubmit_refused_by_sideclaw_ends_the_item_without_retry():
             raise triage.SubmitRefused("sideclaw refused the job (HTTP 400): nope", status=400)
 
         triage._sideclaw.submit_review = _refuse
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_FAILED, item["state"]
         assert "nope" in (item["note"] or ""), item["note"]
@@ -3359,7 +3421,7 @@ def test_real_blocked_review_is_not_retried():
         }
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit_review = _fake_submit_review(calls)
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "a review that returned a verdict must never be re-submitted"
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_WORKING and "wrong comparator" in item["note"], dict(item)
@@ -3370,7 +3432,7 @@ def test_validation_outcome_needs_decision_routes_to_needs_decision():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-needs-human")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-needs-human", "validation-job-needs-human",
              "https://github.com/jkrumm/demo-repo/pull/20", eid),
         )
@@ -3389,7 +3451,7 @@ def test_validation_outcome_needs_decision_routes_to_needs_decision():
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
         item = triage._get_item(conn, eid)
@@ -3410,7 +3472,7 @@ def test_validation_needs_decision_with_blocking_goes_to_the_owner_and_is_never_
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-needs-human-blocking")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-nh-blocking", "validation-job-nh-blocking",
              "https://github.com/jkrumm/demo-repo/pull/22", eid),
         )
@@ -3434,7 +3496,7 @@ def test_validation_needs_decision_with_blocking_goes_to_the_owner_and_is_never_
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
         item = triage._get_item(conn, eid)
@@ -3460,7 +3522,7 @@ def test_validation_actionable_with_empty_blocking_confirms():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-actionable-clean")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-actionable", "validation-job-actionable",
              "https://github.com/jkrumm/demo-repo/pull/21", eid),
         )
@@ -3475,7 +3537,7 @@ def test_validation_actionable_with_empty_blocking_confirms():
         fake_merged = types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo",
                                              pull_request=21)
         with _patched(triage._merge, plan_or_land=lambda *a, **kw: merges.append(kw) or fake_merged):
-            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert len(merges) == 1, "'actionable' with empty blocking must confirm and call merge"
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
@@ -3492,7 +3554,7 @@ def test_confirmed_validation_auto_lands_on_every_repo_including_the_loops_own_e
         with _triage_env() as (conn, ctx):
             eid = _seed_verdict_item(conn, external_id=f"sig-val-{repo}", repo=repo)
             conn.execute(
-                "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+                "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
                 (triage.STATE_MERGING, f"implement-job-{repo}", f"validation-job-{repo}",
                  f"https://github.com/jkrumm/{repo}/pull/40", eid),
             )
@@ -3507,7 +3569,7 @@ def test_confirmed_validation_auto_lands_on_every_repo_including_the_loops_own_e
             fake_merged = types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug=f"jkrumm/{repo}",
                                                  pull_request=40)
             with _patched(triage._merge, plan_or_land=lambda *a, **kw: merges.append(kw) or fake_merged):
-                triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+                triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
             assert len(merges) == 1, f"{repo}: a confirmed validation must call merge"
             d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
@@ -3521,7 +3583,7 @@ def test_blocking_validation_on_an_executor_repo_still_blocks():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-gated-block", repo="warden")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-gated-block", "validation-job-gated-block",
              "https://github.com/jkrumm/warden/pull/42", eid),
         )
@@ -3544,7 +3606,7 @@ def test_blocking_validation_on_an_executor_repo_still_blocks():
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
         item = triage._get_item(conn, eid)
@@ -3564,7 +3626,7 @@ def test_validation_unknown_outcome_is_a_strike_never_merged():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-unknown-outcome")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-unknown-outcome", "validation-job-unknown-outcome",
              "https://github.com/jkrumm/demo-repo/pull/30", eid),
         )
@@ -3583,7 +3645,7 @@ def test_validation_unknown_outcome_is_a_strike_never_merged():
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == [], "an unrecognised review outcome must never call merge"
         item = triage._get_item(conn, eid)
@@ -3598,7 +3660,7 @@ def test_validation_missing_outcome_never_reaches_confirmed():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-missing-outcome")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-missing-outcome", "validation-job-missing-outcome",
              "https://github.com/jkrumm/demo-repo/pull/31", eid),
         )
@@ -3617,7 +3679,7 @@ def test_validation_missing_outcome_never_reaches_confirmed():
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == [], "a missing review outcome must never call merge"
         item = triage._get_item(conn, eid)
@@ -3628,7 +3690,7 @@ def test_validation_result_schema_mismatch_is_a_loud_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-schema-mismatch")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-schema-mismatch", "validation-job-schema-mismatch",
              "https://github.com/jkrumm/demo-repo/pull/22", eid),
         )
@@ -3647,7 +3709,7 @@ def test_validation_result_schema_mismatch_is_a_loud_strike():
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
         item = triage._get_item(conn, eid)
@@ -3662,7 +3724,7 @@ def test_confirmed_validation_merge_policy_error_fails_the_item():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-policy-refuse")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-005", "validation-job-005",
              "https://github.com/jkrumm/demo-repo/pull/11", eid),
         )
@@ -3676,7 +3738,7 @@ def test_confirmed_validation_merge_policy_error_fails_the_item():
         triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
             triage.PolicyError("merge gate refused: CI has not passed cleanly"))
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_FAILED
@@ -3692,7 +3754,7 @@ def test_confirmed_validation_merge_remote_error_maybe_mutated_leaves_validating
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-remote-mutated")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-006", "validation-job-006",
              "https://github.com/jkrumm/demo-repo/pull/12", eid),
         )
@@ -3706,7 +3768,7 @@ def test_confirmed_validation_merge_remote_error_maybe_mutated_leaves_validating
         triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
             triage.RemoteError("GitHub timed out mid-merge", maybe_mutated=True))
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGING, (
@@ -3721,7 +3783,7 @@ def test_confirmed_validation_merge_remote_error_not_mutated_is_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-remote-clean")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-007", "validation-job-007",
              "https://github.com/jkrumm/demo-repo/pull/13", eid),
         )
@@ -3735,7 +3797,7 @@ def test_confirmed_validation_merge_remote_error_not_mutated_is_a_strike():
         triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
             triage.RemoteError("could not reach GitHub at all"))
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGING and item["strikes"] == 1, dict(item)
@@ -3744,14 +3806,14 @@ def test_confirmed_validation_merge_remote_error_not_mutated_is_a_strike():
         calls: list[int] = []
         triage._merge.plan_or_land = lambda *a, **kw: calls.append(1) or (_ for _ in ()).throw(
             triage.RemoteError("still down"))
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "inside the backoff the merge is not re-attempted"
 
 
 def _confirmed_merging_item(conn, ext: str) -> int:
     eid = _seed_verdict_item(conn, external_id=ext)
     conn.execute(
-        "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+        "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
         (triage.STATE_MERGING, f"implement-{ext}", f"validation-{ext}",
          "https://github.com/jkrumm/demo-repo/pull/13", eid),
     )
@@ -3762,32 +3824,40 @@ def _confirmed_merging_item(conn, ext: str) -> int:
 
 
 def test_a_merge_waiting_on_pending_checks_stays_merging_without_a_strike():
-    """CI still running is waiting, not failing: the item stays `merging` (no strike,
-    no backoff) with a note saying why, and is simply polled again."""
+    """CI still running at the merge call (a run that appeared after the checks stage) is
+    waiting, not failing: the item stays `merging` (no strike, no backoff), back on the checks
+    stage with a note saying why, and the next pass merges once they are green — without a
+    second review of the same SHA."""
     with _triage_env() as (conn, ctx):
         eid = _confirmed_merging_item(conn, "sig-pending-ci")
         triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
             triage._merge.ChecksPending("demo-repo's CI is still running on the head commit: build."))
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGING and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
+        assert item["train_stage"] == triage.TRAIN_CHECKS and item["reviewed_sha"] == TRAIN_SHA, dict(item)
         assert item["note"].startswith(triage.MERGE_PENDING_NOTE_PREFIX), item["note"]
 
         merges: list[Any] = []
         fake_merged = types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo",
                                              pull_request=13)
+        CHECK_RUNS["runs"] = [{"name": "build", "status": "completed", "conclusion": "success"}]
+        triage._sideclaw.submit_review = lambda **kw: (_ for _ in ()).throw(
+            AssertionError("the SHA a review confirmed is not reviewed again"))
         with _patched(triage._merge, plan_or_land=lambda *a, **kw: merges.append(kw) or fake_merged):
-            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
+            triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
         assert len(merges) == 1 and triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
+        assert merges[0]["expected_sha"] == TRAIN_SHA, merges
 
 
 def test_a_merge_another_process_is_already_landing_changes_nothing():
     with _triage_env() as (conn, ctx):
         eid = _confirmed_merging_item(conn, "sig-merge-race")
+        _on_train(conn, eid, "merge", reviewed=TRAIN_SHA)
         triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
             triage._merge.MergeInFlight("a merge for job x is already in flight"))
         before = dict(triage._get_item(conn, eid))
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         after = triage._get_item(conn, eid)
         assert after["state"] == triage.STATE_MERGING and after["note"] == before["note"], dict(after)
 
@@ -3804,7 +3874,7 @@ def test_confirmed_validation_merges_real_path_no_deploy():
     with _triage_env(policy=_MERGE_FIXTURE_POLICY) as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-real-merge-no-deploy")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-real-1", "validation-job-real-1",
              "https://github.com/jkrumm/demo-repo/pull/30", eid),
         )
@@ -3816,8 +3886,8 @@ def test_confirmed_validation_merges_real_path_no_deploy():
             "status": "done",
             "result": _review_result("clean", summary="looks right."),
         }
-        merge_sha = "a" * 40
-        pr = _fake_pr(number=30, head_sha="b" * 40, repo="demo-repo")
+        merge_sha = "d" * 40
+        pr = _fake_pr(number=30, head_sha=TRAIN_SHA, repo="demo-repo")
 
         with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
             with _patched(
@@ -3830,7 +3900,7 @@ def test_confirmed_validation_merges_real_path_no_deploy():
                 merge_pr=lambda owner, repo, number, *, sha, method: {"sha": merge_sha},
                 delete_branch=lambda owner, repo, branch: True,
             ):
-                triage.poll_validation_jobs(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
+                triage.advance_merge_trains(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_VERIFYING, item["state"]
@@ -3892,7 +3962,7 @@ def test_poll_validation_syncs_the_review_jobs_own_dispatch_row():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-sync-val")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-sync-val", "review-sync-001",
              "https://github.com/jkrumm/demo-repo/pull/61", eid),
         )
@@ -3909,7 +3979,7 @@ def test_poll_validation_syncs_the_review_jobs_own_dispatch_row():
             "result": _review_result("needs-human", summary="ambiguous diff"),
         }
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_NEEDS_DECISION, item["state"]
@@ -3961,7 +4031,7 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-stale-impl-row")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-stale", "validation-job-stale",
              "https://github.com/jkrumm/demo-repo/pull/62", eid),
         )
@@ -3982,7 +4052,7 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
                     "result": _review_result("clean", summary="looks right.")}
         triage._sideclaw.get = _fake_get
 
-        pr = _fake_pr(number=62, head_sha="c" * 40, repo="demo-repo")
+        pr = _fake_pr(number=62, head_sha=TRAIN_SHA, repo="demo-repo")
         with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
             with _patched(
                 triage._github,
@@ -3992,7 +4062,7 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
                 check_runs=lambda owner, repo, sha: [
                     {"name": "ci", "status": "completed", "conclusion": "failure"}],
             ):
-                triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+                triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] != triage.STATE_VERIFYING, (
@@ -6935,7 +7005,7 @@ def test_merging_item_already_merged_lands_from_the_receipt_without_a_second_mer
     with _triage_env(policy=_MERGE_FIXTURE_POLICY) as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-already-merged", repo="argo")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-am", "validation-job-am",
              "https://github.com/jkrumm/argo/pull/40", eid),
         )
@@ -6951,7 +7021,7 @@ def test_merging_item_already_merged_lands_from_the_receipt_without_a_second_mer
         }
         merges: list[Any] = []
         with _patched(triage._merge, plan_or_land=lambda *a, **kw: merges.append(kw) or None):
-            triage.poll_validation_jobs(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
+            triage.advance_merge_trains(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
         assert merges == [], "merge must not be called for a dispatch that already carries merged_at"
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_VERIFYING, item["state"]
@@ -7883,9 +7953,9 @@ def test_revision_refused_by_sideclaw_ends_the_item_and_is_never_retried():
         assert CLOSED_PRS == [], "the superseded PR must stay open when no revision started"
 
 
-def test_review_dispatch_refused_by_sideclaw_ends_the_item_with_its_pr():
+def test_update_pr_refused_by_sideclaw_ends_the_item_with_its_pr():
     with _triage_env() as (conn, ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-review-refused")
+        eid = _seed_verdict_item(conn, external_id="sig-update-refused")
         conn.execute("UPDATE triage_items SET state=?, implement_job=? WHERE event_id=?",
                      (triage.STATE_WORKING, "implement-job-rr", eid))
         conn.commit()
@@ -7895,17 +7965,22 @@ def test_review_dispatch_refused_by_sideclaw_ends_the_item_with_its_pr():
             "result": {"outcome": "pr_opened", "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/9",
                        "branch": "dispatch/demo-repo-9", "schemaVersion": triage._sideclaw.DISPATCH_SCHEMA_VERSION},
         }
+        refusals: list[int] = []
 
-        def _refuse_review(*, cwd, pr, context=None, model=None):
-            raise triage.SubmitRefused("sideclaw refused the job (HTTP 400): dispatch refused: nope", status=400)
+        def _refuse(*, cwd, pr):
+            refusals.append(pr)
+            raise triage.SubmitRefused("sideclaw refused the job (HTTP 400): update_pr refused: nope", status=400)
 
-        triage._sideclaw.submit_review = _refuse_review
+        triage._sideclaw.submit_update_pr = _refuse
         triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_FAILED, item["state"]
-        assert "review" in item["note"] and "dispatch refused: nope" in item["note"], item["note"]
+        assert "update_pr" in item["note"] and "nope" in item["note"], item["note"]
         assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/9"
+        assert refusals == [9], "a refused update_pr is never submitted again"
 
 
 def test_argo_implement_refused_by_sideclaw_ends_the_item_and_reports_failed():
@@ -7933,7 +8008,7 @@ def _outcome_item_with_pr(conn, *, external_id: str, job_id: str, pr: str | None
     return eid
 
 
-def test_pr_updated_hands_the_updated_pr_to_review_without_closing_it():
+def test_pr_updated_hands_the_updated_pr_to_the_merge_train_without_closing_it():
     pr = "https://github.com/jkrumm/demo-repo/pull/7"
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-pr-updated", job_id="impl-pr-updated", pr=pr,
@@ -7943,10 +8018,13 @@ def test_pr_updated_hands_the_updated_pr_to_review_without_closing_it():
         }
         review_calls: list[dict[str, Any]] = []
         triage._sideclaw.submit_review = _fake_submit_review(review_calls)
+        conn.execute("UPDATE triage_items SET reviewed_sha=? WHERE event_id=?", (TRAIN_SHA, eid))
+        conn.commit()
         triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGING and item["pr_url"] == pr, dict(item)
-        assert item["validation_job"] and len(review_calls) == 1 and review_calls[0]["pr"] == 7, review_calls
+        assert item["train_stage"] == triage.TRAIN_UPDATE and review_calls == [], (dict(item), review_calls)
+        assert item["reviewed_sha"] is None, "a revision's head was never reviewed"
         assert CLOSED_PRS == [], "the same PR was updated, not superseded"
 
 
@@ -8340,7 +8418,7 @@ def test_a_process_only_blocking_finding_parks_for_a_human_instead_of_blocking()
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-process-only")
         conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+            "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
             (triage.STATE_MERGING, "implement-job-po", "validation-job-po",
              "https://github.com/jkrumm/demo-repo/pull/10", eid),
         )
@@ -8359,7 +8437,7 @@ def test_a_process_only_blocking_finding_parks_for_a_human_instead_of_blocking()
 
         triage._merge.plan_or_land = _unexpected_merge
 
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
         item = triage._get_item(conn, eid)
@@ -8461,7 +8539,7 @@ def _seed_validating(conn, *, external_id: str, source: str = "uk", title: str =
     eid = _seed_verdict_item(conn, event_id_source=source, external_id=external_id)
     conn.execute("UPDATE events SET title=? WHERE id=?", (title, eid))
     conn.execute(
-        "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+        "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
         (triage.STATE_MERGING, f"impl-{external_id}", f"val-{external_id}",
          "https://github.com/jkrumm/demo-repo/pull/31", eid))
     conn.commit()
@@ -8474,7 +8552,7 @@ def _confirm_and_merge(conn, policy, deploy: dict, merge_commit: str | None = No
     fake = types.SimpleNamespace(deploy=deploy, merge_commit=merge_commit, repo_slug="jkrumm/demo-repo",
                                  pull_request=31)
     with _patched(triage._merge, plan_or_land=lambda *a, **kw: fake):
-        triage.poll_validation_jobs(conn, policy, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, policy, NOW, dry_run=False)
 
 
 def test_kuma_monitor_title_from_uk_and_slack_alert():
@@ -8600,7 +8678,7 @@ def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
             raise triage.PolicyError("dispatch was already merged")
 
         with _patched(triage._merge, plan_or_land=_refuse):
-            outcome = triage._merge_and_rollout(conn, triage.load_policy(), item, NOW)
+            outcome = triage._merge_and_rollout(conn, triage.load_policy(), item, NOW, expected_sha=None)
         assert outcome == "refused"
         fresh = triage._get_item(conn, eid)
         assert fresh["state"] == triage.STATE_VERIFYING and fresh["note"] == "landed by the other pass"
@@ -8670,31 +8748,31 @@ def test_implement_handoff_that_lost_the_race_opens_no_second_review():
         assert item["validation_job"] == "review-from-the-other-cron" and item["state"] == triage.STATE_MERGING
 
 
-def test_implement_handoff_claim_is_visible_and_released():
-    """While the winner is inside the review submit, the item is already `merging` with a claim
-    expiry in `retry_at`, so the other cron's poll_validation_jobs() cannot submit a second review;
-    once the review is open the claim is gone."""
+def test_update_pr_submit_claim_is_visible_and_released():
+    """While the winner is inside the update_pr submit, the item holds the claim (`train_job`
+    the claim sentinel, its expiry in `retry_at`), so the other cron's pass cannot submit a
+    second one; once the job is open the claim is gone."""
     with _triage_env() as (conn, ctx):
-        eid = _seed_implementing_item(conn, external_id="sig-handoff-claim", job_id="impl-handoff-claim")
-        url = "https://github.com/jkrumm/demo-repo/pull/10"
-        review_calls: list[dict[str, Any]] = []
-        inner = _fake_submit_review(review_calls)
+        eid = _seed_validating_item(conn, external_id="sig-update-claim", implement_job="impl-update-claim",
+                                    review_job="unused")
+        _on_train(conn, eid, "update", sha=None)
+        calls: list[dict[str, Any]] = []
+        inner = _fake_update_pr(calls)
         seen: dict[str, Any] = {}
 
-        def _submit_review(**kw):
+        def _submit(**kw):
             mid = triage._get_item(conn, eid)
-            seen["mid"] = (mid["state"], mid["validation_job"], mid["retry_at"])
-            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
+            seen["mid"] = (mid["train_job"], mid["retry_at"])
+            triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
             return inner(**kw)
 
-        triage._sideclaw.submit_review = _submit_review
-        triage._sideclaw.get = lambda job_id: {"status": "done",
-                                               "result": _dispatch_result("pr_opened", artifact_url=url)}
-        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert seen["mid"] == (triage.STATE_MERGING, None, (NOW + dt.timedelta(minutes=5)).isoformat()), seen
-        assert len(review_calls) == 1, "the other cron's pass inside the claim window submitted a second review"
+        triage._sideclaw.submit_update_pr = _submit
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert seen["mid"] == (triage.TRAIN_CLAIM, (NOW + dt.timedelta(minutes=5)).isoformat()), seen
+        assert len(calls) == 1, "the other cron's pass inside the claim window submitted a second update_pr"
+        assert calls[0]["pr"] == 10 and calls[0]["cwd"].endswith("/demo-repo"), calls
         item = triage._get_item(conn, eid)
-        assert item["validation_job"] == "review-job-000001" and item["retry_at"] is None and item["strikes"] == 0
+        assert item["train_job"] == "update-job-000001" and item["retry_at"] is None and item["strikes"] == 0
 
 
 def test_a_crashed_handoff_claim_is_retaken_once_it_expires():
@@ -8708,9 +8786,9 @@ def test_a_crashed_handoff_claim_is_retaken_once_it_expires():
         conn.commit()
         calls: list[dict[str, Any]] = []
         triage._sideclaw.submit_review = _fake_submit_review(calls)
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=1), dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=1), dry_run=False)
         assert calls == [], "a live claim holds"
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=6), dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=6), dry_run=False)
         assert len(calls) == 1 and triage._get_item(conn, eid)["validation_job"] == "review-job-000001"
 
 
@@ -8726,12 +8804,12 @@ def test_a_review_result_is_acted_on_once_when_two_passes_race():
         def _land(conn_, **kw):
             landed.append(1)
             inside["retry_at"] = triage._get_item(conn, eid)["retry_at"]
-            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
+            triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
             raise triage._merge.ChecksPending("CI still running")
 
         triage._merge.plan_or_land = _land
         triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _review_result("clean")}
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert landed == [1], "the other cron's pass inside the claim window must not act on the result"
         assert inside["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat(), inside
         item = triage._get_item(conn, eid)
@@ -8754,7 +8832,7 @@ def test_a_review_result_claim_lost_to_another_pass_does_nothing():
 
         triage._sideclaw.get = _get
         triage._merge.plan_or_land = lambda *a, **kw: landed.append(1)
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert landed == [], "a lost claim must not merge"
         assert triage._get_item(conn, eid)["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat()
 
@@ -8832,8 +8910,12 @@ def test_cli_transition_refuses_a_close_reason_outside_the_ledger_vocabulary():
 
 
 def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_poller():
+    """The owner's merge waiting on CI joins the merge train: it is brought up to date, its
+    checks are waited out, and — the head a review already confirmed — it lands unreviewed again."""
     with _triage_env() as (conn, ctx):
         eid = _seed_pr_item(conn, external_id="sig-argo-pending", state=triage.STATE_NEEDS_DECISION, pr=12)
+        conn.execute("UPDATE triage_items SET reviewed_sha=? WHERE event_id=?", (TRAIN_SHA, eid))
+        conn.commit()
 
         def _pending(conn_, **kw):
             raise triage._merge.ChecksPending("CI is still running on the head commit: build.")
@@ -8843,11 +8925,14 @@ def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_
         triage.apply_argo_actions(conn, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_MERGING, "parked in needs_decision nothing would ever ask again"
+        assert item["train_stage"] == triage.TRAIN_UPDATE and item["reviewed_sha"] == TRAIN_SHA, dict(item)
         assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
-        # ...and the poller re-drives it: once the checks settle the merge lands.
-        conn.execute("UPDATE triage_items SET validation_job='review-argo-pending' WHERE event_id=?", (eid,))
-        conn.commit()
+        # ...and the train re-drives it: once the checks settle the merge lands.
         landed: list[int] = []
+        triage._sideclaw.submit_update_pr = _fake_update_pr([])
+        triage._sideclaw.submit_review = lambda **kw: (_ for _ in ()).throw(
+            AssertionError("the confirmed head is not reviewed again"))
+        CHECK_RUNS["runs"] = []
 
         def _land(conn_, **kw):
             landed.append(1)
@@ -8856,8 +8941,9 @@ def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_
             return types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo", pull_request=12)
 
         triage._merge.plan_or_land = _land
-        triage._sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _review_result("clean")}
-        triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+        triage._sideclaw.get = lambda job_id: _update_pr_job("up_to_date", job_id=job_id)
+        triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=11), dry_run=False)
         assert landed == [1] and triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
 
 
@@ -9593,6 +9679,448 @@ def test_open_items_are_listed_by_creation_and_fixed_items_by_when_they_got_fixe
         assert "Fixed long ago" not in titles, "the transition (20 days ago) decides, not the rewritten updated_at"
         assert fixed[0].startswith(f"- #{recent} ") and fixed[1].startswith(f"- #{bare} "), fixed
 
+
+
+# --- the merge train: update -> checks -> review -> merge, one item per repo ----------
+
+_TRAIN_PR = "https://github.com/jkrumm/demo-repo/pull/10"
+
+
+def _train_item(conn, ext: str, *, stage: str = "update", sha: str | None = None, reviewed: str | None = None,
+                job: str | None = None, revision_count: int = 0, repo: str = "demo-repo") -> int:
+    """A `merging` item whose implement episode opened _TRAIN_PR on branch dispatch/demo-repo-10."""
+    eid = _seed_verdict_item(conn, external_id=ext, investigate_job=f"inv-{ext}", repo=repo)
+    impl = f"impl-{ext}"
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,artifact_url,origin_event_id,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (impl, "implement", repo, "b", "done",
+         json.dumps(_dispatch_result("pr_opened", artifact_url=_TRAIN_PR, branch="dispatch/demo-repo-10")),
+         _TRAIN_PR, eid, NOW.isoformat()))
+    conn.execute("UPDATE triage_items SET state=?, implement_job=?, pr_url=?, revision_count=? WHERE event_id=?",
+                 (triage.STATE_MERGING, impl, _TRAIN_PR, revision_count, eid))
+    conn.commit()
+    _on_train(conn, eid, stage, sha=sha, reviewed=reviewed, job=job)
+    return eid
+
+
+def _jobs(table: dict[str, Any]):
+    """`sideclaw.get` answering from `table` (job id -> job, or a callable returning one)."""
+    def _get(job_id):
+        job = table.get(job_id)
+        return job() if callable(job) else job
+    return _get
+
+
+def _no_review(**kw):
+    raise AssertionError(f"no review may be submitted here: {kw}")
+
+
+def _train_pass(conn, minutes: float = 0) -> None:
+    triage.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=minutes), dry_run=False)
+
+
+def test_train_happy_path_updates_checks_reviews_and_merges_the_pinned_sha():
+    """pr_opened -> update (up_to_date) -> checks green -> review confirmed -> merge pinned to that
+    SHA -> verifying. Each async step is its own pass; every synchronous hop runs in the pass that
+    unblocked it."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-train-happy", job_id="impl-train-happy")
+        updates: list[dict[str, Any]] = []
+        reviews: list[dict[str, Any]] = []
+        merges: list[dict[str, Any]] = []
+        triage._sideclaw.submit_update_pr = _fake_update_pr(updates)
+        triage._sideclaw.submit_review = _fake_submit_review(reviews)
+        table: dict[str, Any] = {
+            "impl-train-happy": {"id": "impl-train-happy", "status": "done",
+                                 "result": _dispatch_result("pr_opened", artifact_url=_TRAIN_PR)},
+            "update-job-000001": _update_pr_job("up_to_date"),
+            "review-job-000001": {"id": "review-job-000001", "status": "done", "result": _review_result("clean")},
+        }
+        triage._sideclaw.get = _jobs(table)
+        CHECK_RUNS["runs"] = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+        triage._merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
+            repo_slug="jkrumm/demo-repo", pull_request=10)
+
+        triage.advance_implement_chain(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["train_stage"] == triage.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
+        assert updates == [{"cwd": updates[0]["cwd"], "pr": 10}] and reviews == [], (updates, reviews)
+
+        _train_pass(conn, 1)   # up_to_date -> checks green -> review submitted
+        item = triage._get_item(conn, eid)
+        assert item["train_stage"] == triage.TRAIN_REVIEW and item["train_sha"] == TRAIN_SHA, dict(item)
+        assert CHECK_RUNS["asked"] == [TRAIN_SHA] and len(reviews) == 1 and reviews[0]["pr"] == 10, reviews
+        assert merges == []
+
+        _train_pass(conn, 2)   # review confirmed -> merge
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERIFYING, dict(item)
+        assert len(merges) == 1 and merges[0]["expected_sha"] == TRAIN_SHA, merges
+        assert item["reviewed_sha"] == TRAIN_SHA and item["train_stage"] is None and item["train_sha"] is None
+        assert len(updates) == 1 and len(reviews) == 1
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-train-happy'").fetchone()
+        assert d["validation_status"] == "confirmed"
+
+
+def test_train_updated_branch_waits_for_pending_checks_without_a_deadline():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-pending", job="update-job-pending")
+        triage._sideclaw.get = _jobs({"update-job-pending": _update_pr_job("updated", head=REBASED_SHA)})
+        triage._sideclaw.submit_review = _fake_submit_review([])
+        PR_HEAD["sha"] = REBASED_SHA
+        CHECK_RUNS["runs"] = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+        _train_pass(conn)
+        for hours in (1, 24, 72):   # no deadline: still waiting, never a strike
+            _train_pass(conn, hours * 60)
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_MERGING and item["train_stage"] == triage.TRAIN_CHECKS, dict(item)
+            assert item["train_sha"] == REBASED_SHA and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
+            assert item["note"].startswith(triage.MERGE_PENDING_NOTE_PREFIX), item["note"]
+        CHECK_RUNS["runs"] = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+        _train_pass(conn, 73 * 60)
+        item = triage._get_item(conn, eid)
+        assert item["train_stage"] == triage.TRAIN_REVIEW and item["validation_job"] == "review-job-000001", dict(item)
+        assert set(CHECK_RUNS["asked"]) == {REBASED_SHA}
+
+
+def test_train_head_moved_during_review_goes_back_to_update():
+    """The review reports no SHA: a head that moved off the train's SHA by the time the verdict
+    is in sends the train back to update — the verdict is not acted on, not even a confirm."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-moved", stage="review", sha=TRAIN_SHA)
+        conn.execute("UPDATE triage_items SET validation_job='review-moved' WHERE event_id=?", (eid,))
+        conn.commit()
+        triage._sideclaw.get = _jobs({"review-moved": {"id": "review-moved", "status": "done",
+                                                       "result": _review_result("clean")}})
+        triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
+        updates: list[dict[str, Any]] = []
+        triage._sideclaw.submit_update_pr = _fake_update_pr(updates)
+        PR_HEAD["sha"] = REBASED_SHA   # someone pushed while the review ran
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["train_stage"] == triage.TRAIN_UPDATE, dict(item)
+        assert item["train_sha"] is None and item["validation_job"] is None and item["reviewed_sha"] is None
+        assert item["strikes"] == 0 and "back to update" in item["note"], dict(item)
+        assert len(updates) == 1 and item["train_job"] == "update-job-000001", "the update starts in the same pass"
+
+
+def test_train_head_moved_before_the_review_is_submitted_goes_back_to_update():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-moved-early", stage="review", sha=TRAIN_SHA)
+        triage._sideclaw.submit_review = _no_review
+        triage._sideclaw.submit_update_pr = _fake_update_pr([])
+        PR_HEAD["sha"] = REBASED_SHA
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["train_stage"] == triage.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
+
+
+def test_train_skips_the_review_of_a_sha_a_review_already_confirmed():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-same-sha", stage="checks", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
+        conn.execute("UPDATE dispatches SET validation_status='confirmed' WHERE job_id='impl-sig-train-same-sha'")
+        conn.commit()
+        triage._sideclaw.submit_review = _no_review
+        CHECK_RUNS["runs"] = []
+        merges: list[dict[str, Any]] = []
+        triage._merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
+            repo_slug="jkrumm/demo-repo", pull_request=10)
+        _train_pass(conn)
+        assert [m["expected_sha"] for m in merges] == [TRAIN_SHA], merges
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
+
+
+def test_train_rebased_after_a_confirmed_review_is_reviewed_again_with_delta_context():
+    """A review confirmed TRAIN_SHA; the branch was rebased (REBASED_SHA): the review runs again,
+    and its context names the confirmed SHA and asks for focus on what changed — text only,
+    sideclaw's review has no delta scope."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-delta", job="update-job-delta", reviewed=TRAIN_SHA)
+        triage._sideclaw.get = _jobs({"update-job-delta": _update_pr_job("updated", head=REBASED_SHA)})
+        PR_HEAD["sha"] = REBASED_SHA
+        CHECK_RUNS["runs"] = []
+        reviews: list[dict[str, Any]] = []
+        triage._sideclaw.submit_review = _fake_submit_review(reviews)
+        triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("not yet reviewed"))
+        _train_pass(conn)
+        assert len(reviews) == 1, reviews
+        context = reviews[0]["context"]
+        assert triage.VALIDATION_GATE_QUESTIONS in context, "the gate questions still lead"
+        assert f"confirmed this pull request at {TRAIN_SHA}" in context and REBASED_SHA in context, context
+        assert "Focus on what changed since that review" in context, context
+        item = triage._get_item(conn, eid)
+        assert item["train_stage"] == triage.TRAIN_REVIEW and item["reviewed_sha"] == TRAIN_SHA, dict(item)
+
+    with _triage_env() as (conn, ctx):   # a first review carries no delta text
+        _train_item(conn, "sig-train-first-review", stage="review", sha=TRAIN_SHA)
+        reviews = []
+        triage._sideclaw.submit_review = _fake_submit_review(reviews)
+        _train_pass(conn)
+        assert len(reviews) == 1 and "Focus on what changed" not in reviews[0]["context"], reviews
+
+
+def test_train_conflict_goes_back_to_working_for_a_revision_from_the_new_base():
+    """update_pr `conflict`: the item goes back to `working` and the revision is a fresh attempt
+    from the new base (no revisionOf), the old branch named as context; it counts as an attempt,
+    and the PR it opens supersedes the conflicting one."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-conflict", job="update-job-conflict")
+        triage._sideclaw.get = _jobs({"update-job-conflict": _update_pr_job(
+            "conflict", note="rebase onto master failed: CONFLICT (content): Merge conflict in scripts/a.py")})
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and item["train_stage"] is None, dict(item)
+        assert "no longer rebases" in item["note"] and item["strikes"] == 0, item["note"]
+        assert "Merge conflict in scripts/a.py" in item["train_evidence"], item["train_evidence"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-conflict'").fetchone()
+        assert d["validation_status"] == "conflict"
+
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1, calls
+        assert calls[0]["revision_of"] is None, "a conflicting branch is not continued — the base moved under it"
+        assert "starts from the latest default branch" in calls[0]["brief"], calls[0]["brief"]
+        assert "could not be rebased onto it" in calls[0]["brief"], calls[0]["brief"]
+        assert "Merge conflict in scripts/a.py" in calls[0]["brief"], calls[0]["brief"]
+        assert "git fetch origin dispatch/demo-repo-10" in (calls[0]["context"] or ""), calls[0]["context"]
+        item = triage._get_item(conn, eid)
+        assert item["revision_count"] == 1 and item["pr_url"] == _TRAIN_PR, dict(item)
+
+
+def test_train_conflict_with_no_attempt_left_fails_and_leaves_the_pr_open():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-conflict-spent", job="update-job-spent",
+                          revision_count=triage.MAX_IMPLEMENT_ATTEMPTS - 1)
+        triage._sideclaw.get = _jobs({"update-job-spent": _update_pr_job("conflict", note="rebase failed")})
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED, dict(item)
+        assert item["note"].endswith(f"PR left open: {_TRAIN_PR}"), item["note"]
+        assert CLOSED_PRS == []
+
+
+def test_train_failed_checks_after_the_update_is_a_checks_failed_revision_of_the_same_pr():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-red", job="update-job-red")
+        triage._sideclaw.get = _jobs({"update-job-red": _update_pr_job("updated", head=REBASED_SHA, passed=False)})
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and "checks failed" in item["note"], dict(item)
+        assert "tests/test_x.py::test_y failed" in item["train_evidence"], item["train_evidence"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-red'").fetchone()
+        assert d["validation_status"] == "checks_failed"
+
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and calls[0]["revision_of"] == "dispatch/demo-repo-10", calls
+        assert "checks FAILED" in calls[0]["brief"] and "test_x.py::test_y" in calls[0]["brief"], calls[0]["brief"]
+
+
+def test_train_failed_ci_on_the_train_sha_is_a_checks_failed_revision():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-ci-red", stage="checks", sha=TRAIN_SHA)
+        triage._sideclaw.submit_review = _no_review
+        CHECK_RUNS["runs"] = [{"name": "build", "status": "completed", "conclusion": "success"},
+                              {"name": "e2e", "status": "completed", "conclusion": "failure"}]
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and "CI failed" in item["note"], dict(item)
+        assert "e2e" in item["train_evidence"] and TRAIN_SHA in item["train_evidence"], item["train_evidence"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-ci-red'").fetchone()
+        assert d["validation_status"] == "checks_failed"
+
+
+def test_train_checks_unreadable_never_pass():
+    """W1: unreadable check runs are an unknown CI state — never green."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-unreadable", stage="checks", sha=TRAIN_SHA)
+        triage._sideclaw.submit_review = _no_review
+        triage._github.check_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
+            triage._merge.CheckRunsUnreadable("HTTP 403: Resource not accessible by personal access token"))
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED and "unreadable" in item["note"], dict(item)
+
+
+def test_train_checks_on_a_moved_head_go_back_to_update():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-checks-moved", stage="checks", sha=TRAIN_SHA)
+        triage._sideclaw.submit_update_pr = _fake_update_pr([])
+        PR_HEAD["sha"] = REBASED_SHA
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["train_stage"] == triage.TRAIN_UPDATE and CHECK_RUNS["asked"] == [], dict(item)
+
+
+def test_train_merge_refused_because_the_head_moved_goes_back_to_update_without_a_strike():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-409", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
+        triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
+            triage.HeadMoved("GitHub refused the merge (409): the head moved"))
+        triage._sideclaw.submit_update_pr = _fake_update_pr([])
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["train_stage"] == triage.TRAIN_UPDATE, dict(item)
+        assert item["strikes"] == 0 and item["retry_at"] is None and item["reviewed_sha"] == TRAIN_SHA, dict(item)
+
+
+def test_train_update_lease_refusal_retries_later_without_a_strike():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-lease", job="update-job-lease")
+        triage._sideclaw.get = _jobs({"update-job-lease": {
+            "id": "update-job-lease", "status": "failed",
+            "error": "update_pr refused: an implement episode is already running in this repo (job x) — "
+                     "implement episodes serialize per repo because their edits and pushes would interleave. "
+                     "Re-submit once it finishes."}})
+        updates: list[dict[str, Any]] = []
+        triage._sideclaw.submit_update_pr = _fake_update_pr(updates)
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["strikes"] == 0, dict(item)
+        assert item["train_job"] is None and item["train_stage"] == triage.TRAIN_UPDATE, dict(item)
+        assert item["retry_at"] == (NOW + dt.timedelta(minutes=triage.LEASE_RETRY_MINUTES)).isoformat()
+        assert "lease" in item["note"] and updates == [], item["note"]
+        _train_pass(conn, triage.LEASE_RETRY_MINUTES - 1)
+        assert updates == [], "the retry waits out LEASE_RETRY_MINUTES"
+        _train_pass(conn, triage.LEASE_RETRY_MINUTES)
+        assert len(updates) == 1 and triage._get_item(conn, eid)["strikes"] == 0
+
+
+def test_train_update_infrastructure_failures_strike():
+    """A 5xx on submit, a job that failed for any reason but the lease, and a job sideclaw no
+    longer knows are infrastructure failures: each strikes, the third lands `failed`."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-5xx")
+
+        def _down(*, cwd, pr):
+            raise triage.RemoteError("sideclaw returned HTTP 502: bad gateway")
+
+        triage._sideclaw.submit_update_pr = _down
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["strikes"] == 1, dict(item)
+        assert item["train_job"] is None and item["retry_at"] == (NOW + dt.timedelta(minutes=10)).isoformat()
+        assert "502" in item["note"], item["note"]
+
+        triage._sideclaw.submit_update_pr = _fake_update_pr([])
+        triage._sideclaw.get = _jobs({"update-job-000001": {"id": "update-job-000001", "status": "failed",
+                                                             "error": "git push --force-with-lease rejected"}})
+        _train_pass(conn, 11)   # submits
+        _train_pass(conn, 11)   # folds the failure
+        item = triage._get_item(conn, eid)
+        assert item["strikes"] == 2 and "force-with-lease rejected" in item["note"], dict(item)
+
+        triage._sideclaw.get = _default_fake_get   # the next job is pruned/lost
+        _train_pass(conn, 42)
+        _train_pass(conn, 42)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED and item["strikes"] == 3, dict(item)
+        assert "no record of update_pr job" in item["note"], item["note"]
+
+
+def test_train_malformed_update_pr_result_is_a_loud_strike():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-malformed", job="update-job-bad")
+        bad = _update_pr_job("rebased")
+        triage._sideclaw.get = _jobs({"update-job-bad": bad})
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["strikes"] == 1 and "refusing to parse" in item["note"], dict(item)
+        assert item["train_stage"] == triage.TRAIN_UPDATE and item["train_sha"] is None
+
+
+def test_train_walks_only_the_oldest_merging_item_of_a_repo():
+    with _triage_env() as (conn, ctx):
+        older = _train_item(conn, "sig-train-older")
+        newer = _train_item(conn, "sig-train-newer")
+        other = _train_item(conn, "sig-train-other-repo", repo="other-repo")
+        updates: list[dict[str, Any]] = []
+        triage._sideclaw.submit_update_pr = _fake_update_pr(updates)
+        _train_pass(conn)
+        assert len(updates) == 2, updates
+        assert triage._get_item(conn, older)["train_job"] == "update-job-000001"
+        assert triage._get_item(conn, newer)["train_job"] is None, "a newer item waits for its repo's train"
+        assert triage._get_item(conn, other)["train_job"] == "update-job-000002"
+        # The oldest waiting out a backoff still holds its repo's train.
+        conn.execute("UPDATE triage_items SET retry_at=? WHERE event_id=?",
+                     ((NOW + dt.timedelta(hours=1)).isoformat(), older))
+        conn.commit()
+        _train_pass(conn, 1)
+        assert triage._get_item(conn, newer)["train_job"] is None and len(updates) == 2
+
+
+def test_train_update_job_folded_by_two_passes_is_acted_on_once():
+    """The loop and the sweep both fold one finished update_pr job: the hop is a compare-and-set
+    on `train_job`, so exactly one of them moves the train and the other changes nothing."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-cas", job="update-job-cas")
+        hops: list[str] = []
+        done = _update_pr_job("conflict", job_id="update-job-cas", note="rebase failed")
+
+        def _get(job_id):
+            if not hops:
+                hops.append("inner")
+                _train_pass(conn)   # the other cron folds the same job first
+            return done
+
+        triage._sideclaw.get = _get
+        real_set_state = triage._set_state
+        written: list[str] = []
+
+        def _counting_set_state(conn_, event_id, state, now, **kw):
+            n = real_set_state(conn_, event_id, state, now, **kw)
+            if n and state == triage.STATE_WORKING:
+                written.append(state)
+            return n
+
+        with _patched(triage, _set_state=_counting_set_state):
+            _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING, dict(item)
+        assert written == [triage.STATE_WORKING], f"the conflict was acted on {len(written)} times"
+
+    with _triage_env() as (conn, ctx):   # an up_to_date fold: one hop to checks, no double write
+        eid = _train_item(conn, "sig-train-cas-ok", job="update-job-cas-ok")
+        triage._sideclaw.submit_review = _fake_submit_review([])
+        CHECK_RUNS["runs"] = [{"name": "ci", "status": "queued", "conclusion": None}]
+        seen: list[str] = []
+
+        def _get_ok(job_id):
+            if not seen:
+                seen.append("inner")
+                _train_pass(conn)
+            return _update_pr_job("up_to_date", job_id="update-job-cas-ok")
+
+        triage._sideclaw.get = _get_ok
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["train_stage"] == triage.TRAIN_CHECKS and item["train_sha"] == TRAIN_SHA, dict(item)
+        assert CHECK_RUNS["asked"] == [TRAIN_SHA], "only the winner reads the checks"
+
+
+def test_a_merging_item_with_no_stage_starts_its_train_at_update():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-no-stage")
+        conn.execute("UPDATE triage_items SET train_stage=NULL WHERE event_id=?", (eid,))
+        conn.commit()
+        triage._sideclaw.submit_update_pr = _fake_update_pr([])
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["train_stage"] == triage.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
+
+
+def test_leaving_merging_clears_the_train_position_but_keeps_the_reviewed_sha():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-leave", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA,
+                          job=None)
+        triage._set_state(conn, eid, triage.STATE_FAILED, NOW, note="gave up")
+        conn.commit()
+        item = triage._get_item(conn, eid)
+        assert (item["train_stage"], item["train_sha"], item["train_job"]) == (None, None, None), dict(item)
+        assert item["reviewed_sha"] == TRAIN_SHA
 
 if __name__ == "__main__":
     sys.exit(main())

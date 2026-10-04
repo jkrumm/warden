@@ -44,7 +44,7 @@ except ModuleNotFoundError:
 
 from lifecycle import merge, operations  # noqa: E402
 from clients import github  # noqa: E402
-from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError  # noqa: E402
+from clients.errors import HeadMoved, PolicyError, PreconditionError, RemoteError, UsageError  # noqa: E402
 
 _ledger_spec = importlib.util.spec_from_file_location("ledger", REPO / "scripts" / "ledger.py")
 ledger = importlib.util.module_from_spec(_ledger_spec)
@@ -730,9 +730,42 @@ def test_plan_or_land_double_confirm_race_two_connections():
 
 def test_plan_or_land_refuses_failing_ci():
     _assert_refuses(
-        exc_type=PolicyError, msg="has not passed cleanly",
+        exc_type=merge.ChecksFailed, msg="has not passed cleanly",
         fake={"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure"}]},
     )
+
+
+def test_plan_or_land_pinned_to_the_train_sha_merges_that_sha():
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        with fakes() as fx:
+            result = merge.plan_or_land(conn, job_id=JOB_ID, why="w", confirm=True, dry_run=False,
+                                        authorized_by="auto-from-item", now=_NOW, sleep=_no_sleep,
+                                        expected_sha="deadbeef" * 5)
+        assert result.merged and result.merge_method == "squash"
+        assert fx.calls["merge_pr"][0][1]["sha"] == "deadbeef" * 5
+    finally:
+        conn.close()
+
+
+def test_plan_or_land_refuses_a_head_that_is_not_the_train_sha_before_any_gate():
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        with fakes() as fx:
+            try:
+                merge.plan_or_land(conn, job_id=JOB_ID, why="w", confirm=True, dry_run=False,
+                                   authorized_by="auto-from-item", now=_NOW, sleep=_no_sleep,
+                                   expected_sha="a" * 40)
+            except HeadMoved as e:
+                assert "aaaaaaaaaaaa" in str(e) and "deadbeefdead" in str(e), e
+            else:
+                raise AssertionError("expected HeadMoved")
+        assert "check_runs" not in fx.calls and "merge_pr" not in fx.calls
+        assert _op_count(conn) == 0, "nothing was attempted, so nothing is recorded"
+    finally:
+        conn.close()
 
 
 def test_plan_or_land_refuses_validation_disagreed():
