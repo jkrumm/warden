@@ -1,6 +1,5 @@
-"""merge — the Python port of the retired bash CLI's `cmd_merge` (1896-2131),
-`merge_gate_check` (1731-1769), `collect_expected_alerts` (1798-1833) and
-`run_deploy_if_enabled` (1839-1894).
+"""merge — the Python port of the retired bash CLI's `cmd_merge` (1896-2131) and
+`merge_gate_check` (1731-1769).
 
 Land is the one door in this whole estate that changes what runs on a
 default branch, so it re-checks the pull request's CURRENT state — a stale
@@ -9,25 +8,20 @@ green (or none), review `confirmed`; GitHub's own rules answer at the merge call
 
 `plan_or_land()` is confirm-gated: a plan (no `--confirm`) changes nothing.
 
-Deploy is a second write-point since Wave 5 (docs/history/state-log.md §48's "one operation,
-not two" limitation) — `rollout_after_merge()` records its own `operations`
-row rather than riding inside the merge operation, because the ssh-argv
-path (`autoDeploy`) and the GitHub-Actions path (`deployOnMerge`) are each
-their own external mutation with their own crash window.
+Landing does not deploy: the verify pass (triage.py) runs `make deploy` through
+lifecycle/rollout.py once the item is `verifying`.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
-import os
-import re
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from clients import github, rollout, sideclaw
+from clients import github, sideclaw
 from clients.errors import (
     CheckRunsUnreadable, PolicyError, PreconditionError, RemoteError, UsageError,
 )
@@ -41,13 +35,6 @@ class ChecksPending(PolicyError):
 
 class MergeInFlight(PolicyError):
     """Another caller is already landing this very pull request."""
-
-# `deployOnMerge` only fires once a real merge commit exists — a 40-hex sha,
-# never `None`/"" (both reject) nor a malformed one (present-but-wrong is a
-# defect, not a missing value — see docs/history/state-log.md §51's mutation note on the same
-# shaped guard in triage.py).
-_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-
 
 def _nested(d: dict[str, Any], path: str) -> Any:
     cur: Any = d
@@ -110,9 +97,8 @@ class MergePlan:
 @dataclass
 class MergeResult:
     """The landed result. `to_json()` is the bash `emit_merged` dict minus
-    `verb`/`ok`. `merge_op_id`/`deploy_op_id` are the operations-ledger audit
-    ids — new in this port, not part of the external contract, so they are
-    not serialised."""
+    `verb`/`ok`. `merge_op_id` is the operations-ledger audit id — new in this
+    port, not part of the external contract, so it is not serialised."""
 
     merged: bool
     repo_slug: str
@@ -122,9 +108,7 @@ class MergeResult:
     merge_commit: str | None
     branch: str
     branch_deleted: bool
-    deploy: dict[str, Any]
     merge_op_id: str
-    deploy_op_id: str | None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -136,7 +120,6 @@ class MergeResult:
             "mergeCommit": self.merge_commit,
             "branch": self.branch,
             "branchDeleted": self.branch_deleted,
-            "deploy": self.deploy,
             "note": (
                 "This is on the default branch now. Say so plainly, with the "
                 "pull request link — a merge is the one outcome here that a human "
@@ -178,106 +161,6 @@ def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation:
             f"the step-7 validation has not confirmed (status: {validation or '(none)'}). "
             f"A missing, disagreeing, or errored validation blocks the merge."
         )
-
-
-# For every merged path matching observability/alerts/*.json, fetch its
-# content AT THE MERGE SHA — never the local checkout, which has no reason
-# to have pulled yet — and pull out name/threshold/thresholdType. Best-
-# effort: a fetch or parse failure for one path is skipped, never fatal to
-# the deploy itself, which already ran.
-def collect_expected_alerts(
-    owner: str, repo: str, files: list[dict[str, Any]], merge_sha: str | None,
-) -> list[dict[str, Any]]:
-    if not merge_sha:
-        return []
-    items: list[dict[str, Any]] = []
-    for f in files:
-        fn = f.get("filename") or ""
-        if not (fn.startswith("observability/alerts/") and fn.endswith(".json")):
-            continue
-        try:
-            content = github.contents(owner, repo, fn, ref=merge_sha)
-            if content is None:
-                continue
-            alert = json.loads(content)
-        except Exception:
-            continue
-        items.append({
-            "path": fn,
-            "name": alert.get("name"),
-            "threshold": alert.get("threshold"),
-            "thresholdType": alert.get("thresholdType"),
-        })
-    return items
-
-
-# Called only after a real merge succeeded. Never raises: every branch
-# returns a small dict describing what happened (or why nothing did) so the
-# caller can fold it straight into the merge result — deploy is best-effort
-# and must never turn a landed merge into a failure.
-#
-# `autoDeploy` and `deployOnMerge` are mutually exclusive policy shapes for
-# the same repo, and each gets its OWN operations row — the ssh-argv call
-# and the GitHub Actions push-trigger are two structurally different
-# external mutations, each with its own crash window (docs/history/state-log.md §48/§51).
-def rollout_after_merge(
-    conn: sqlite3.Connection, *, repo: str, owner: str, files: list[dict[str, Any]],
-    merge_sha: str | None, event_id: int | None, authorized_by: str,
-) -> tuple[dict[str, Any], str | None]:
-    entry = policy.triage_repo_entry(repo)
-
-    if entry.get("autoDeploy"):
-        key = entry.get("deploy")
-        if not isinstance(key, str):
-            return {
-                "attempted": False,
-                "reason": f"autoDeploy is true for {repo} but no deploy key is declared",
-            }, None
-        if rollout.argv_for(key) is None:
-            return {"attempted": False, "reason": f"deploy key {key} is not in the allowlist"}, None
-
-        op = operations.record(conn, event_id=event_id, kind="deploy", repo=repo, authorized_by=authorized_by)
-        timeout_s = int(os.environ.get("WARDEN_DEPLOY_TIMEOUT", "180"))
-        res = rollout.run(key, timeout_s=timeout_s)
-        expected = collect_expected_alerts(owner, repo, files, merge_sha) if res.ok else []
-        deploy = {
-            "attempted": True, "ok": res.ok, "key": key, "exitCode": res.exit_code,
-            "output": res.output, "expectedAlerts": expected,
-        }
-        operations.complete(conn, op, outcome="done" if res.ok else "failed", receipt=json.dumps(deploy))
-        return deploy, op
-
-    if entry.get("deployOnMerge") and isinstance(merge_sha, str) and _FULL_SHA_RE.match(merge_sha):
-        op = operations.record(conn, event_id=event_id, kind="deploy", repo=repo, authorized_by=authorized_by)
-        try:
-            runs = github.actions_runs(owner, repo, head_sha=merge_sha)
-        except RemoteError as e:
-            operations.complete(conn, op, outcome="unknown", receipt=json.dumps({"error": str(e)}))
-            return {
-                "attempted": False,
-                "reason": f"could not read GitHub Actions runs for {merge_sha}: {e}",
-                "mergeCommit": merge_sha,
-            }, op
-
-        deploy = {
-            "attempted": False,
-            "reason": "deployOnMerge: GitHub Actions deploys on push to the default branch",
-            "mergeCommit": merge_sha,
-            "actionsRuns": [
-                {"id": r.get("id"), "name": r.get("name"), "status": r.get("status"),
-                 "conclusion": r.get("conclusion"), "html_url": r.get("html_url")}
-                for r in runs
-            ],
-        }
-        if runs:
-            operations.complete(conn, op, outcome="done", receipt=json.dumps(deploy))
-        else:
-            # Left OPEN deliberately (outcome NULL) — the reconciler re-queries
-            # next pass rather than guessing whether a run will appear.
-            deploy["note"] = "no Actions run visible yet"
-        return deploy, op
-
-    return {"attempted": False, "reason": f"autoDeploy is false for {repo}"}, None
 
 
 def plan_or_land(
@@ -402,8 +285,6 @@ def plan_or_land(
             f"was never inspected by the episode and is never merged here."
         )
     lines = pr_add + pr_del
-
-    files = github.pr_files(owner, repo, pr_number)
 
     try:
         runs = github.check_runs(owner, repo, pr_head_sha)
@@ -549,13 +430,8 @@ def plan_or_land(
         "branchDeleted": deleted, "mergeMethod": method, "title": pr_title,
     }))
 
-    deploy, deploy_op = rollout_after_merge(
-        conn, repo=repo, owner=owner, files=files, merge_sha=merge_sha,
-        event_id=origin_event_id, authorized_by=authorized_by,
-    )
-
     return MergeResult(
         merged=True, repo_slug=slug, pull_request=pr_number, title=pr_title,
         merge_method=method, merge_commit=merge_sha, branch=pr_head, branch_deleted=deleted,
-        deploy=deploy, merge_op_id=merge_op, deploy_op_id=deploy_op,
+        merge_op_id=merge_op,
     )

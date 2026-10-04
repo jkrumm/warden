@@ -146,12 +146,10 @@ def _default_fake_submit_review(*, cwd, pr, context=None, model=None):
     return {"id": "review-unused-000000", "status": "queued"}
 
 
-# The real `_kuma_trip`, for the argument-validation test (it returns before
-# any ssh on a refused argument). Every other test gets a fake.
-ORIGINAL_KUMA_TRIP = triage._kuma_trip
-
-# Every synthetic-trip call a test made — reset per _triage_env().
-TRIP_CALLS: list[tuple[str, tuple[str, ...]]] = []
+# Every `make` target the rollout fakes were asked about or ran — reset per _triage_env().
+# Default fakes: the repo has neither a `deploy` nor a `verify` target, so a verifying item
+# goes straight through; a test that wants a target registers its own fake.
+ROLLOUT_CALLS: list[tuple[str, str]] = []
 
 # Every PR a test's revision closed — reset per _triage_env().
 CLOSED_PRS: list[tuple[str, str, int, str | None]] = []
@@ -173,13 +171,11 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         "POLICY_PATH": triage.POLICY_PATH,
         "resolve_slack_token": triage.resolve_slack_token,
         "post_line": triage.post_line,
-        "LIVENESS_ALLOWLIST": dict(triage.LIVENESS_ALLOWLIST),
         "MAX_OPEN_INVESTIGATIONS": triage.MAX_OPEN_INVESTIGATIONS,
         "_HERMES_OPS_BIN": triage._HERMES_OPS_BIN,
         "HOST_VERB_ALLOWLIST": dict(triage.HOST_VERB_ALLOWLIST),
         "_watchdog_poll": triage._watchdog_poll,
         "TRIAGE_REPO_DIR": triage.TRIAGE_REPO_DIR,
-        "_kuma_trip": triage._kuma_trip,
     }
     # The client-boundary modules: the SAME module objects `lifecycle`
     # itself imports (`from clients import sideclaw`, `from lifecycle import
@@ -193,7 +189,6 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_sideclaw", "wait"): triage._sideclaw.wait,
         ("_sideclaw", "cancel"): triage._sideclaw.cancel,
         ("_sideclaw", "escalation_model"): triage._sideclaw.escalation_model,
-        ("_github", "actions_runs"): triage._github.actions_runs,
         ("_github", "search_issues"): triage._github.search_issues,
         ("_github", "create_issue_comment"): triage._github.create_issue_comment,
         ("_github", "close_pr"): triage._github.close_pr,
@@ -203,6 +198,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_github", "merge_pr"): triage._github.merge_pr,
         ("_github", "delete_branch"): triage._github.delete_branch,
         ("_merge", "plan_or_land"): triage._merge.plan_or_land,
+        ("_rollout", "has_target"): triage._rollout.has_target,
+        ("_rollout", "deploy"): triage._rollout.deploy,
+        ("_rollout", "verify"): triage._rollout.verify,
         ("_argo", "push_snapshot"): triage._argo.push_snapshot,
         ("_argo", "fetch_actions"): triage._argo.fetch_actions,
         ("_argo", "ack_action"): triage._argo.ack_action,
@@ -223,10 +221,8 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         triage._sideclaw.escalation_model = lambda: None
         triage._sideclaw.cancel = lambda job_id: (_ for _ in ()).throw(
             triage.RemoteError(f"test: no fake cancel registered for {job_id}"))
-        triage._github.actions_runs = lambda owner, repo, *, head_sha: (_ for _ in ()).throw(
-            triage.RemoteError("test: no fake actions_runs registered"))
         # ingest_github_issues() runs unconditionally on every run() pass
-        # (Wave 6.1, same as ingest() itself) — unlike actions_runs above, an
+        # (Wave 6.1, same as ingest() itself) — unlike the writes below, an
         # unregistered fake here defaults to "no issues found" rather than a
         # loud throw, so every pre-existing test in this file (none of which
         # is about GitHub issues) keeps working unmodified; a test that
@@ -236,11 +232,14 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         triage._github.create_issue_comment = lambda repo_full, number, body: (_ for _ in ()).throw(
             triage.RemoteError("test: no fake create_issue_comment registered"))
         triage._github.branch_rules = lambda owner, repo, branch: []
-        # The synthetic trip's only door to the real Kuma (§103): never reached
-        # from a test. A trip test registers its own fake.
-        TRIP_CALLS.clear()
-        triage._kuma_trip = lambda verb, *args: TRIP_CALLS.append((verb, args)) or {
-            "ok": False, "error": "test: no fake kuma trip registered"}
+        # Never a real `make`/`git` from a test: no repo has a deploy or verify target unless a
+        # test says so (see ROLLOUT_CALLS), and a test that wants a run registers its own fake.
+        ROLLOUT_CALLS.clear()
+        triage._rollout.has_target = lambda cwd, target, **kw: ROLLOUT_CALLS.append(("has_target", target)) or False
+        triage._rollout.deploy = lambda cwd, **kw: (_ for _ in ()).throw(
+            AssertionError("test: no fake rollout.deploy registered"))
+        triage._rollout.verify = lambda cwd, **kw: (_ for _ in ()).throw(
+            AssertionError("test: no fake rollout.verify registered"))
         # Every GitHub WRITE a merge path can reach defaults to a loud throw: a
         # test that lands a merge must fake it explicitly (§99 — one test reached
         # the real API with a fake node id when a gate it relied on moved).
@@ -3793,42 +3792,15 @@ def test_a_merge_another_process_is_already_landing_changes_nothing():
         assert after["state"] == triage.STATE_MERGING and after["note"] == before["note"], dict(after)
 
 
-def test_a_merge_with_nothing_to_verify_goes_to_verifying_and_then_fixed_on_the_next_pass():
-    """No deploy configured: the item is `verifying` with no liveness window and no
-    expectations, and the next maybe_check_liveness() pass takes it to `fixed` — no
-    timer (W4 adds real signal-only verification)."""
-    with _triage_env() as (conn, ctx):
-        eid = _confirmed_merging_item(conn, "sig-no-deploy")
-        fake_merged = types.SimpleNamespace(deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo",
-                                             pull_request=13)
-        with _patched(triage._merge, plan_or_land=lambda *a, **kw: fake_merged):
-            triage.poll_validation_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING and item["liveness_deadline"] is None
-        assert item["deploy_expect_json"] is None, dict(item)
-
-        triage.maybe_check_liveness(conn, DEFAULT_POLICY, NOW, dry_run=True)
-        assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING, "dry-run writes nothing"
-        triage.maybe_check_liveness(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert triage._get_item(conn, eid)["state"] == triage.STATE_FIXED
-
-
-# --- the three tests that run lifecycle/merge.py's REAL plan_or_land(), with
+# --- the test that runs lifecycle/merge.py's REAL plan_or_land(), with
 # only the sideclaw/GitHub client boundary faked ----------------------------
 
-_MERGE_FIXTURE_POLICY = dict(
-    DEFAULT_POLICY,
-    repos={
-        "demo-repo": {},
-        "vps": {"autoDeploy": True, "deploy": "hyperdx-apply"},
-        "argo": {"deployOnMerge": True},
-    },
-)
+_MERGE_FIXTURE_POLICY = dict(DEFAULT_POLICY)
 
 
 def test_confirmed_validation_merges_real_path_no_deploy():
-    """Real `plan_or_land()`, happy path: a repo with no deploy configured
-    lands `merged`, no deploy attempted."""
+    """Real `plan_or_land()`, happy path: the item lands `verifying` with no deploy yet
+    (`verify_started_at` NULL — the verify pass runs it) and no deploy operation."""
     with _triage_env(policy=_MERGE_FIXTURE_POLICY) as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-real-merge-no-deploy")
         conn.execute(
@@ -3857,143 +3829,15 @@ def test_confirmed_validation_merges_real_path_no_deploy():
                 mark_ready_for_review=lambda node_id: None,
                 merge_pr=lambda owner, repo, number, *, sha, method: {"sha": merge_sha},
                 delete_branch=lambda owner, repo, branch: True,
-                actions_runs=lambda owner, repo, *, head_sha: [],
             ):
                 triage.poll_validation_jobs(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_VERIFYING, item["state"]
+        assert item["verify_started_at"] is None, "the deploy has not run yet"
+        assert conn.execute("SELECT COUNT(*) FROM operations WHERE kind='deploy'").fetchone()[0] == 0
         d = conn.execute("SELECT merged_at FROM dispatches WHERE job_id=?", ("implement-job-real-1",)).fetchone()
         assert d["merged_at"] is not None, "the real merge path must stamp merged_at"
-
-
-def test_confirmed_validation_merges_real_path_auto_deploy_ok():
-    """Real `plan_or_land()`: an `autoDeploy` repo whose rollout succeeds
-    enters `verifying`, carrying the rollout's own expectedAlerts."""
-    with _triage_env(policy=_MERGE_FIXTURE_POLICY) as (conn, ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-real-merge-autodeploy", repo="vps")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
-            (triage.STATE_MERGING, "implement-job-real-2", "validation-job-real-2",
-             "https://github.com/jkrumm/vps/pull/31", eid),
-        )
-        conn.commit()
-        _seed_mergeable_dispatch(conn, "implement-job-real-2", repo="vps", pr_number=31,
-                                  origin_event_id=eid)
-
-        triage._sideclaw.get = lambda job_id: {
-            "status": "done",
-            "result": _review_result("clean", summary="looks right."),
-        }
-        merge_sha = "c" * 40
-        pr = _fake_pr(number=31, head_sha="d" * 40, repo="vps")
-
-        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
-            with _patched(
-                triage._github,
-                read_pr=lambda owner, repo, number: pr,
-                read_repo=lambda owner, repo: _fake_repo_json(),
-                pr_files=lambda owner, repo, number: [{"filename": "src/x.py"}],
-                check_runs=lambda owner, repo, sha: [],
-                mark_ready_for_review=lambda node_id: None,
-                merge_pr=lambda owner, repo, number, *, sha, method: {"sha": merge_sha},
-                delete_branch=lambda owner, repo, branch: True,
-                actions_runs=lambda owner, repo, *, head_sha: [],
-            ), _patched(triage._merge.rollout, run=lambda key, *, timeout_s: types.SimpleNamespace(
-                    ok=True, exit_code=0, output="applied ok")):
-                triage.poll_validation_jobs(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
-
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING, item["state"]
-        assert item["liveness_deadline"] is not None
-
-
-def test_confirmed_validation_merges_real_path_auto_deploy_failure_fails_the_item():
-    """Real `plan_or_land()`: an `autoDeploy` repo whose rollout FAILS must
-    never read as a clean `merged` — the PR landed but the deploy did not,
-    which is a human-needed state, carrying the exit code and the tail of
-    the rollout's own output in the note."""
-    with _triage_env(policy=_MERGE_FIXTURE_POLICY) as (conn, ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-real-merge-autodeploy-fail", repo="vps")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
-            (triage.STATE_MERGING, "implement-job-real-2b", "validation-job-real-2b",
-             "https://github.com/jkrumm/vps/pull/31", eid),
-        )
-        conn.commit()
-        _seed_mergeable_dispatch(conn, "implement-job-real-2b", repo="vps", pr_number=31,
-                                  origin_event_id=eid)
-
-        triage._sideclaw.get = lambda job_id: {
-            "status": "done",
-            "result": _review_result("clean", summary="looks right."),
-        }
-        merge_sha = "c" * 40
-        pr = _fake_pr(number=31, head_sha="d" * 40, repo="vps")
-
-        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
-            with _patched(
-                triage._github,
-                read_pr=lambda owner, repo, number: pr,
-                read_repo=lambda owner, repo: _fake_repo_json(),
-                pr_files=lambda owner, repo, number: [{"filename": "src/x.py"}],
-                check_runs=lambda owner, repo, sha: [],
-                mark_ready_for_review=lambda node_id: None,
-                merge_pr=lambda owner, repo, number, *, sha, method: {"sha": merge_sha},
-                delete_branch=lambda owner, repo, branch: True,
-                actions_runs=lambda owner, repo, *, head_sha: [],
-            ), _patched(triage._merge.rollout, run=lambda key, *, timeout_s: types.SimpleNamespace(
-                    ok=False, exit_code=1, output="apply failed: connection refused")):
-                triage.poll_validation_jobs(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
-
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_FAILED, (
-            f"a merged PR whose deploy failed must never read as a clean merge, got {item['state']!r}")
-        assert "deploy failed" in item["note"], item["note"]
-        assert "exit 1" in item["note"], item["note"]
-        assert "connection refused" in item["note"], item["note"]
-
-
-def test_confirmed_validation_merges_real_path_deploy_on_merge():
-    """Real `plan_or_land()`: a `deployOnMerge` repo with a full-sha merge
-    commit enters `verifying` on that sha, no ssh deploy involved."""
-    with _triage_env(policy=_MERGE_FIXTURE_POLICY) as (conn, ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-real-merge-dom", repo="argo")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
-            (triage.STATE_MERGING, "implement-job-real-3", "validation-job-real-3",
-             "https://github.com/jkrumm/argo/pull/32", eid),
-        )
-        conn.commit()
-        _seed_mergeable_dispatch(conn, "implement-job-real-3", repo="argo", pr_number=32,
-                                  origin_event_id=eid)
-
-        triage._sideclaw.get = lambda job_id: {
-            "status": "done",
-            "result": _review_result("clean", summary="looks right."),
-        }
-        merge_sha = "e" * 40
-        pr = _fake_pr(number=32, head_sha="f" * 40, repo="argo")
-
-        with _env(WARDEN_TRIAGE_POLICY=str(triage.POLICY_PATH)):
-            with _patched(
-                triage._github,
-                read_pr=lambda owner, repo, number: pr,
-                read_repo=lambda owner, repo: _fake_repo_json(),
-                pr_files=lambda owner, repo, number: [{"filename": "src/x.py"}],
-                check_runs=lambda owner, repo, sha: [],
-                mark_ready_for_review=lambda node_id: None,
-                merge_pr=lambda owner, repo, number, *, sha, method: {"sha": merge_sha},
-                delete_branch=lambda owner, repo, branch: True,
-                actions_runs=lambda owner, repo, *, head_sha: [
-                    {"id": 1, "name": "Deploy", "status": "completed", "conclusion": "success"}
-                ],
-            ):
-                triage.poll_validation_jobs(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
-
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING, item["state"]
-        assert json.loads(item["deploy_expect_json"]) == [{"commit": merge_sha}]
 
 
 # --- the loop syncs its own dispatches row before any state transition ------
@@ -4159,215 +4003,268 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
             f"expected the real CI refusal, got: {item['note']!r}")
 
 
-def test_liveness_confirmed_resolves_the_item():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-live-ok")
-        deadline = (NOW + dt.timedelta(hours=1)).isoformat()
-        conn.execute(
-            "UPDATE triage_items SET state=?, pr_url=?, liveness_deadline=?, deploy_expect_json=?, "
-            "card_channel=?, card_ts=? WHERE event_id=?",
-            (triage.STATE_VERIFYING, "https://github.com/jkrumm/vps/pull/13", deadline,
-             json.dumps([{"name": "X"}]), "C0TESTCHAN01", "1000.000009", eid),
-        )
+# --- deploy and verify: maybe_verify() ------------------------------------------
+
+def _fake_rollout(*, targets=(), deploy=None, verify=None):
+    """Registers the rollout fakes: `targets` is the set of make targets the repo defines;
+    `deploy` is the result of `rollout.deploy()`; `verify` one `Ran`, or a list of them
+    consumed per call (the last repeats). Returns the list of ("deploy"|"verify", repo) runs."""
+    ran: list[tuple[str, str]] = []
+    results = list(verify) if isinstance(verify, list) else [verify]
+    triage._rollout.has_target = lambda cwd, target, **kw: target in targets
+
+    def _deploy(cwd, **kw):
+        ran.append(("deploy", cwd.name))
+        return deploy
+
+    def _verify(cwd, **kw):
+        ran.append(("verify", cwd.name))
+        return results.pop(0) if len(results) > 1 else results[0]
+
+    triage._rollout.deploy = _deploy
+    triage._rollout.verify = _verify
+    return ran
+
+
+def _seed_verifying(conn, external_id: str, *, started: dt.datetime | None = None, mark: bool = True,
+                    **columns) -> int:
+    """A `verifying` item. `started=None` is a merge that has not been deployed yet; otherwise its
+    verify window opened then, with the event's CURRENT occurrence mark as the baseline."""
+    eid = _seed_item(conn, external_id=external_id, state=triage.STATE_VERIFYING,
+                      pr_url="https://github.com/jkrumm/demo-repo/pull/9", **columns)
+    if started is not None:
+        baseline = triage._occurrence_mark(triage._get_event(conn, eid)) if mark else None
+        conn.execute("UPDATE triage_items SET verify_started_at=?, verify_mark=? WHERE event_id=?",
+                     (started.isoformat(), baseline, eid))
         conn.commit()
-
-        policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "stub-live"}})
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "matches live")
-
-        triage.maybe_check_liveness(conn, policy, NOW, dry_run=False)
-
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_FIXED, (
-            "a positive liveness probe is the only producer of STATE_FIXED in the file")
-        assert item["note"].startswith(triage.LIVENESS_CONFIRMED_NOTE_PREFIX)
-        assert len(ctx.posted) == 1 and ctx.posted[0]["text"].startswith(":white_check_mark: "), ctx.posted
+    return eid
 
 
-def test_liveness_failure_reopens_the_item_with_history():
-    """The direct fix for the 61-re-triage scenario one level up the chain:
-    an item that deployed but never verified live must not silently vanish
-    OR silently sit "deployed" forever — past the window it REOPENS to
-    `new`, carrying the PR link and the last liveness check on its note, so
-    the next escalation does not start from zero."""
+def _ran(ok=True, code=0, tail="ok"):
+    return triage._rollout.Ran(ok, code, tail)
+
+
+def test_no_deploy_target_goes_straight_to_verify_with_the_mark_as_baseline():
     with _triage_env() as (conn, ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-live-fail")
-        past_deadline = (NOW - dt.timedelta(hours=1)).isoformat()
-        conn.execute(
-            "UPDATE triage_items SET state=?, pr_url=?, liveness_deadline=?, deploy_expect_json=?, "
-            "card_channel=?, card_ts=? WHERE event_id=?",
-            (triage.STATE_VERIFYING, "https://github.com/jkrumm/vps/pull/14", past_deadline,
-             json.dumps([{"name": "Y", "threshold": 5}]), "C0TESTCHAN01", "1000.000010", eid),
-        )
-        conn.commit()
-
-        policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "stub-live-fail"}})
-        triage.LIVENESS_ALLOWLIST["stub-live-fail"] = lambda expected: (False, "Y: live threshold=9 != expected 5")
-
-        triage.maybe_check_liveness(conn, policy, NOW, dry_run=False)
-
+        eid = _seed_verifying(conn, "sig-no-deploy-target")
+        ran = _fake_rollout(targets=())
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_TRIAGED, "must reopen to `triaged`, not sit deployed forever"
-        assert "pull/14" in item["note"], "the reopened item must carry the PR in its history"
-        assert "Y: live threshold=9" in item["note"], "the reopened item must carry the last liveness check"
-        assert ctx.posted == [], "a reopen to `triaged` is silent"
+        assert ran == [] and item["state"] == triage.STATE_VERIFYING
+        assert item["verify_started_at"] == NOW.isoformat() and item["verify_failures"] == 0
+        assert item["verify_mark"] == triage._occurrence_mark(triage._get_event(conn, eid)), dict(item)
+        assert conn.execute("SELECT COUNT(*) FROM operations WHERE kind='deploy'").fetchone()[0] == 0
 
 
-def test_liveness_still_inside_window_neither_resolves_nor_reopens():
+def test_a_deploy_runs_once_records_its_operation_and_opens_the_window():
     with _triage_env() as (conn, ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-live-waiting")
-        future_deadline = (NOW + dt.timedelta(hours=1)).isoformat()
-        conn.execute(
-            "UPDATE triage_items SET state=?, pr_url=?, liveness_deadline=?, deploy_expect_json=? "
-            "WHERE event_id=?",
-            (triage.STATE_VERIFYING, "https://github.com/jkrumm/vps/pull/15", future_deadline,
-             json.dumps([{"name": "Z"}]), eid),
-        )
-        conn.commit()
-
-        policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "stub-live-waiting"}})
-        triage.LIVENESS_ALLOWLIST["stub-live-waiting"] = lambda expected: (False, "not yet")
-
-        triage.maybe_check_liveness(conn, policy, NOW, dry_run=False)
-
+        eid = _seed_verifying(conn, "sig-deploy-ok")
+        ran = _fake_rollout(targets=("deploy",), deploy=_ran(tail="deployed"))
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING, "still inside the window — neither outcome yet"
+        assert ran == [("deploy", "demo-repo")], ran
+        assert item["verify_started_at"] is not None and item["strikes"] == 0, dict(item)
+        op = conn.execute("SELECT * FROM operations WHERE kind='deploy'").fetchone()
+        assert op["outcome"] == "done" and op["event_id"] == eid and "deployed" in op["receipt_json"]
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+        assert ran == [("deploy", "demo-repo")], "a started window is never deployed again"
+
+
+def test_a_dirty_checkout_defers_the_deploy_as_a_strike_with_backoff():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-deploy-dirty")
+        reason = "checkout not clean/on main: demo-repo has uncommitted changes"
+        ran = _fake_rollout(targets=("deploy",), deploy=triage._rollout.Deferred(reason))
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERIFYING and item["strikes"] == 1, dict(item)
+        assert reason in item["note"] and item["retry_at"] and item["verify_started_at"] is None, dict(item)
+        assert conn.execute("SELECT outcome FROM operations WHERE kind='deploy'").fetchone()[0] == "failed"
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
+        assert len(ran) == 1, "inside the backoff the deploy is not attempted again"
+
+
+def test_a_failing_deploy_strikes_and_the_third_strike_fails_the_item_with_the_output_tail():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-deploy-fails")
+        ran = _fake_rollout(targets=("deploy",), deploy=_ran(False, 2, "step one ok\nstep two: connection refused"))
+        for n, minutes in enumerate((0, 11, 42), start=1):
+            triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=minutes), dry_run=False)
+            item = triage._get_item(conn, eid)
+            assert item["strikes"] == n, (n, dict(item))
+        assert len(ran) == 3
+        assert item["state"] == triage.STATE_FAILED, dict(item)
+        assert "deploy failed (exit 2)" in item["note"] and "connection refused" in item["note"], item["note"]
+        assert [r[0] for r in conn.execute("SELECT outcome FROM operations WHERE kind='deploy'")] == ["failed"] * 3
+
+
+def test_verify_passes_and_the_signal_stays_quiet_for_the_window_fixes_the_item():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-verify-ok", started=NOW - dt.timedelta(hours=1))
+        ran = _fake_rollout(targets=("verify",), verify=_ran())
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERIFYING and "window open" in item["verify_result"], dict(item)
         assert ctx.total_calls() == 0
 
-
-# --- _gather_argo_commit_live() — the deployOnMerge liveness probe itself
-# (item 1b), the real production gatherer with only urlopen stubbed --------
-
-class _FakeHealthResp:
-    def __init__(self, body: bytes):
-        self._body = body
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-
-def _stub_argo_health(body_obj: Any = None, *, raise_exc: Exception | None = None):
-    """Stubs triage.urllib.request.urlopen for the Argo health probe."""
-    def _fake_urlopen(_req, timeout=None):
-        if raise_exc is not None:
-            raise raise_exc
-        return _FakeHealthResp(json.dumps(body_obj).encode())
-    return _fake_urlopen
-
-
-def test_argo_commit_live_matches_exact_sha():
-    sha = "a" * 40
-    saved = triage.urllib.request.urlopen
-    triage.urllib.request.urlopen = _stub_argo_health({"status": "ok", "commit": sha})
-    try:
-        ok, detail = triage._gather_argo_commit_live([{"commit": sha}])
-    finally:
-        triage.urllib.request.urlopen = saved
-    assert ok is True
-    assert sha[:12] in detail
-
-
-def test_argo_commit_live_rejects_unknown_placeholder():
-    """argo's own `"unknown"` (a build made outside CI) must read as a
-    genuine mismatch, never as "not sure" — reachability alone is not proof."""
-    saved = triage.urllib.request.urlopen
-    triage.urllib.request.urlopen = _stub_argo_health({"status": "ok", "commit": "unknown"})
-    try:
-        ok, detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
-    finally:
-        triage.urllib.request.urlopen = saved
-    assert ok is False
-    assert "unknown" in detail
-
-
-def test_argo_commit_live_rejects_differing_sha():
-    saved = triage.urllib.request.urlopen
-    triage.urllib.request.urlopen = _stub_argo_health({"status": "ok", "commit": "b" * 40})
-    try:
-        ok, detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
-    finally:
-        triage.urllib.request.urlopen = saved
-    assert ok is False
-    assert "a" * 12 in detail and "b" * 12 in detail, (
-        f"the failure detail must name BOTH values compared, got {detail!r}")
-
-
-def test_argo_commit_live_rejects_missing_commit_field():
-    saved = triage.urllib.request.urlopen
-    triage.urllib.request.urlopen = _stub_argo_health({"status": "ok"})
-    try:
-        ok, _detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
-    finally:
-        triage.urllib.request.urlopen = saved
-    assert ok is False
-
-
-def test_argo_commit_live_rejects_non_200():
-    saved = triage.urllib.request.urlopen
-    triage.urllib.request.urlopen = _stub_argo_health(
-        raise_exc=triage.urllib.error.HTTPError("https://argo.jkrumm.com/api/health", 503,
-                                                  "unavailable", {}, None))
-    try:
-        ok, detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
-    finally:
-        triage.urllib.request.urlopen = saved
-    assert ok is False
-    assert "fetch failed" in detail
-
-
-def test_argo_commit_live_rejects_unparseable_json():
-    def _fake_urlopen(_req, timeout=None):
-        return _FakeHealthResp(b"not json at all {{{")
-    saved = triage.urllib.request.urlopen
-    triage.urllib.request.urlopen = _fake_urlopen
-    try:
-        ok, detail = triage._gather_argo_commit_live([{"commit": "a" * 40}])
-    finally:
-        triage.urllib.request.urlopen = saved
-    assert ok is False
-    assert "fetch failed" in detail
-
-
-def test_argo_commit_live_with_no_expected_commit_captured_is_false_not_an_error():
-    ok, _detail = triage._gather_argo_commit_live([])
-    assert ok is False
-
-
-def test_deploy_on_merge_liveness_confirmed_produces_a_fixed_row():
-    """The full positive path through the REAL production gatherer (urlopen
-    stubbed, no network) rather than a fake swapped into LIVENESS_ALLOWLIST —
-    verifying + a matching probe -> STATE_FIXED carrying
-    LIVENESS_CONFIRMED_NOTE_PREFIX, the one genuine "this is actually fixed"
-    claim in the file."""
-    with _triage_env() as (conn, ctx):
-        sha = "c" * 40
-        eid = _seed_verdict_item(conn, external_id="sig-argo-live", repo="argo")
-        deadline = (NOW + dt.timedelta(hours=1)).isoformat()
-        conn.execute(
-            "UPDATE triage_items SET state=?, pr_url=?, liveness_deadline=?, deploy_expect_json=?, "
-            "card_channel=?, card_ts=? WHERE event_id=?",
-            (triage.STATE_VERIFYING, "https://github.com/jkrumm/argo/pull/16", deadline,
-             json.dumps([{"commit": sha}]), "C0TESTCHAN01", "1000.000099", eid),
-        )
-        conn.commit()
-
-        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
-        saved_urlopen = triage.urllib.request.urlopen
-        triage.urllib.request.urlopen = _stub_argo_health({"status": "ok", "commit": sha})
-        try:
-            triage.maybe_check_liveness(conn, policy, NOW, dry_run=False)
-        finally:
-            triage.urllib.request.urlopen = saved_urlopen
-
+        later = NOW + dt.timedelta(hours=triage.VERIFY_WINDOW_HOURS)
+        triage.maybe_verify(conn, DEFAULT_POLICY, later, dry_run=False)
         item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_FIXED
-        assert item["note"].startswith(triage.LIVENESS_CONFIRMED_NOTE_PREFIX)
+        assert item["state"] == triage.STATE_FIXED, dict(item)
+        assert item["note"].startswith(triage.VERIFIED_NOTE_PREFIX) and "make verify passed" in item["note"]
         assert len(ctx.posted) == 1 and ctx.posted[0]["text"].startswith(":white_check_mark: "), ctx.posted
+        assert [r[0] for r in ran] == ["verify", "verify"]
+
+
+def test_no_signal_item_is_fixed_the_moment_verify_passes_and_waits_while_it_fails():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-issue-item", started=NOW, origin="github_issue")
+        _fake_rollout(targets=("verify",), verify=[_ran(False, 1, "boom"), _ran()])
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERIFYING and item["verify_failures"] == 1, dict(item)
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FIXED, "no window for an item with no signal"
+        assert "make verify passed" in item["note"]
+
+
+def test_a_repo_with_no_verify_target_and_no_signal_is_fixed_after_the_deploy():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-nothing-to-verify", origin="human")
+        _fake_rollout(targets=())
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FIXED and "no make verify target" in item["note"], dict(item)
+
+
+def test_a_signal_item_without_a_verify_target_verifies_by_signal_alone():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-signal-only", started=NOW - dt.timedelta(hours=3))
+        ran = _fake_rollout(targets=())
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert ran == [] and item["state"] == triage.STATE_FIXED, dict(item)
+        assert "own signal quiet" in item["note"]
+
+
+def _signal_fires_again(conn, eid: int) -> None:
+    """The item's own signal fires again: the event's occurrence mark moves (a grouped source
+    stamps `ts_last` on every occurrence)."""
+    conn.execute("UPDATE events SET payload_json=? WHERE id=?", (json.dumps({"ts_last": "1788850795.862159"}), eid))
+    conn.commit()
+
+
+def test_a_signal_recurrence_during_verification_goes_through_the_failure_seam():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-recurs", started=NOW - dt.timedelta(minutes=30))
+        ran = _fake_rollout(targets=("verify",), verify=_ran())
+        seen: list[tuple[str, str]] = []
+        real_seam = triage._on_verify_failure
+        triage._on_verify_failure = lambda c, item, evidence, now: seen.append((item["signature"], evidence)) or real_seam(
+            c, item, evidence, now)
+        try:
+            _signal_fires_again(conn, eid)
+            triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        finally:
+            triage._on_verify_failure = real_seam
+        assert len(seen) == 1 and "recurred" in seen[0][1], seen
+        assert ran == [], "no point verifying a change whose signal is already back"
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_TRIAGED and triage.VERIFY_FAILED_NOTE_PREFIX in item["note"], dict(item)
+        assert item["verify_started_at"] is None and item["verify_mark"] is None and item["verify_failures"] == 0
+
+
+def test_three_consecutive_failing_verifications_go_through_the_failure_seam():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-verify-fails", started=NOW - dt.timedelta(minutes=30))
+        _fake_rollout(targets=("verify",), verify=[_ran(False, 1, "assertion failed: health"), _ran(),
+                                                   _ran(False, 1, "x"), _ran(False, 1, "y"),
+                                                   _ran(False, 1, "final tail")])
+        for n, expected in enumerate((1, 0, 1, 2), start=0):
+            triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10 * n), dry_run=False)
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_VERIFYING and item["verify_failures"] == expected, (n, dict(item))
+        assert "make verify failed (exit 1)" in item["verify_result"]
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=40), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_TRIAGED, dict(item)
+        assert "3 consecutive failing passes" in item["note"] and "final tail" in item["note"], item["note"]
+
+
+def test_the_items_own_kuma_monitor_must_be_up_since_the_window_opened():
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-own-monitor",
+                            title="[Brain Sync - Push] is down", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, last_seen, "
+            "created_at, updated_at, verify_started_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid, "slack_alert:sig-own-monitor", "demo-repo", triage.STATE_VERIFYING, 3, OLD.isoformat(),
+             OLD.isoformat(), OLD.isoformat(), OLD.isoformat(), (NOW - dt.timedelta(hours=3)).isoformat()))
+        conn.commit()
+        _fake_rollout(targets=())
+        probes: list[Any] = []
+        saved = triage._gather_kuma_push_fresh
+        try:
+            triage._gather_kuma_push_fresh = lambda expected: probes.append(expected) or (False, "0 heartbeats")
+            triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_VERIFYING and item["verify_failures"] == 1, dict(item)
+            assert "own monitor not UP" in item["verify_result"], item["verify_result"]
+            assert probes[0][0]["monitorTitle"] == "Brain Sync - Push"
+            assert probes[0][0]["since"] == (NOW - dt.timedelta(hours=3)).isoformat()
+
+            triage._gather_kuma_push_fresh = lambda expected: (True, "heartbeat OK")
+            triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+        finally:
+            triage._gather_kuma_push_fresh = saved
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_FIXED
+
+
+def test_a_state_source_event_still_open_at_the_end_of_the_window_is_not_quiet():
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="docker_homelab", external_id="unhealthy:demo", title="demo unhealthy",
+                            first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, last_seen, "
+            "created_at, updated_at, verify_started_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (eid, "docker_homelab:unhealthy:demo", "demo-repo", triage.STATE_VERIFYING, 1, OLD.isoformat(),
+             OLD.isoformat(), OLD.isoformat(), OLD.isoformat(), (NOW - dt.timedelta(hours=3)).isoformat()))
+        conn.commit()
+        _fake_rollout(targets=())
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERIFYING and "still firing" in item["verify_result"], dict(item)
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
+        conn.commit()
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_FIXED
+
+
+def test_verify_dry_run_prints_and_runs_nothing():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-verify-dry")
+        ran = _fake_rollout(targets=("deploy", "verify"), deploy=_ran(), verify=_ran())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=True)
+        assert "[dry-run] would run make deploy, then make verify" in buf.getvalue(), buf.getvalue()
+        assert ran == [] and triage._get_item(conn, eid)["verify_started_at"] is None
+
+
+def test_an_open_deploy_operation_after_a_crash_resolves_unknown_without_a_strike_and_runs_again():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-deploy-crash")
+        op = triage.record_operation(conn, event_id=eid, kind="deploy", repo="demo-repo", authorized_by="auto-verify")
+        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        row = conn.execute("SELECT outcome, note FROM operations WHERE op_id=?", (op,)).fetchone()
+        assert row["outcome"] == "unknown" and "runs it again" in row["note"], dict(row)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERIFYING and item["strikes"] == 0 and item["verify_started_at"] is None
+        ran = _fake_rollout(targets=("deploy",), deploy=_ran())
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert ran == [("deploy", "demo-repo")]
+        assert triage._get_item(conn, eid)["verify_started_at"] is not None
 
 
 # --- Argo actions — owner-pulled implement/merge/dismiss/reinvestigate/note ---
@@ -4960,7 +4857,7 @@ def test_needs_decision_and_failed_never_expire_and_are_never_silence_resolved()
         triage.apply_resolutions(conn, far_future)
         triage.resolve_quiet_grouped(conn, DEFAULT_POLICY, far_future)
         triage.reopen_if_needed(conn, far_future)
-        triage.maybe_check_liveness(conn, DEFAULT_POLICY, far_future, dry_run=False)
+        triage.maybe_verify(conn, DEFAULT_POLICY, far_future, dry_run=False)
 
         assert calls == [], "neither state is ever re-dispatched"
         for eid, state, note in ((decide, triage.STATE_NEEDS_DECISION, "ship it or not?"),
@@ -5507,7 +5404,7 @@ def test_reconcile_merge_github_reports_merged_becomes_done_with_merge_commit_no
         receipt = json.loads(op["receipt_json"])
         assert receipt["mergeCommit"] == "9289436afde30f1ad4c0a6d82b5556ca9df9876f"
         assert receipt["pullRequest"] == 8
-        assert receipt["deploy"] == "unknown", "the deploy half has no remote answer — must be honest, not guessed"
+        assert "deploy" not in receipt, "the deploy is the verify pass's, not the merge receipt's"
 
         item = triage._get_item(conn, eid)
         assert item["state"] != triage.STATE_FAILED, (
@@ -5545,8 +5442,6 @@ def test_reconcile_merged_operation_advances_the_item_instead_of_leaving_it_to_e
         triage._run_gh_pr_view = lambda owner, repo, pr: {
             "state": "MERGED", "mergeCommit": {"oid": "deadbeef"}}
 
-        # No `repos` entry at all -> no autoDeploy -> nothing else was
-        # supposed to happen after the merge.
         triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = triage._get_item(conn, eid)
@@ -5556,178 +5451,6 @@ def test_reconcile_merged_operation_advances_the_item_instead_of_leaving_it_to_e
         assert "deadbeef" in (item["note"] or ""), item["note"]
         merged_at = conn.execute("SELECT merged_at FROM dispatches WHERE job_id='implement-job-advance'").fetchone()[0]
         assert merged_at, "a reconciled merge must stamp dispatches.merged_at — the merge budget reads it"
-
-
-def test_reconcile_merged_operation_with_autodeploy_fails_the_item_with_the_sha():
-    """Same reconciliation, but the repo auto-deploys. The deploy rode along
-    inside the same lost subprocess and `ssh <host> make <target>` leaves no
-    remote handle to ask, so whether production changed is genuinely
-    unknown. `merged` would quietly expire to `closed` after 1h, claiming a
-    clean landing nobody verified — so this one goes to a human instead."""
-    with _triage_env() as (conn, _ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-reconcile-deploy", confidence="high",
-                                  investigate_job="investigate-reconcile-deploy", repo="vps")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=? WHERE event_id=?",
-            (triage.STATE_MERGING, "implement-job-deploy", eid),
-        )
-        conn.commit()
-        _seed_implement_dispatch(conn, "implement-job-deploy", repo="vps")
-        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
-                     ("https://github.com/jkrumm/vps/pull/8", "implement-job-deploy"))
-        conn.commit()
-        triage.record_operation(conn, event_id=eid, kind="merge", repo="vps",
-                                 authorized_by="auto-from-item")
-        triage._run_gh_pr_view = lambda owner, repo, pr: {
-            "state": "MERGED", "mergeCommit": {"oid": "cafef00d"}}
-
-        policy = dict(DEFAULT_POLICY, repos={"vps": {"autoDeploy": True, "deploy": "hyperdx-apply"}})
-        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
-
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_FAILED, (
-            f"merged with an unverifiable deploy must never read as verified — "
-            f"got {item['state']!r}")
-        assert "cafef00d" in (item["note"] or ""), item["note"]
-
-
-def test_reconcile_deploy_on_merge_records_the_actions_run_status_when_readable():
-    """item 3/8: reconcile_operations() already takes `policy`, so a
-    deployOnMerge repo's reconciled merge can do better than the ssh path's
-    blanket "unknown" — it asks `gh run list` for the merge sha directly."""
-    with _triage_env() as (conn, _ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-reconcile-dom", confidence="high",
-                                  investigate_job="investigate-reconcile-dom", repo="argo")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, pr_url=? WHERE event_id=?",
-            (triage.STATE_MERGING, "implement-job-reconcile-dom",
-             "https://github.com/jkrumm/argo/pull/16", eid),
-        )
-        conn.commit()
-        _seed_implement_dispatch(conn, "implement-job-reconcile-dom", repo="argo")
-        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
-                     ("https://github.com/jkrumm/argo/pull/16", "implement-job-reconcile-dom"))
-        conn.commit()
-
-        op_id = triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
-                                         authorized_by="auto-from-item")
-        sha = "e" * 40
-        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "MERGED", "mergeCommit": {"oid": sha}}
-        run_calls: list[tuple[str, str, str]] = []
-
-        def _fake_run_list(owner, repo, commit_sha):
-            run_calls.append((owner, repo, commit_sha))
-            return [{"databaseId": 1, "status": "completed", "conclusion": "success"}]
-
-        triage._run_gh_run_list = _fake_run_list
-
-        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
-        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
-
-        assert run_calls == [("jkrumm", "argo", sha)]
-        op = conn.execute("SELECT receipt_json FROM operations WHERE op_id=?", (op_id,)).fetchone()
-        receipt = json.loads(op["receipt_json"])
-        assert receipt["deploy"] == [{"databaseId": 1, "status": "completed", "conclusion": "success"}]
-
-
-def test_reconcile_deploy_on_merge_converges_on_verifying_not_merged():
-    """Resolving the OPERATION is not enough; the ITEM has to land where the
-    live path would have put it.
-
-    A deployOnMerge repo's deploy is driven by GitHub Actions off the push,
-    NOT by the subprocess warden lost — so a crash mid-merge says nothing
-    about whether the deploy ran, and the probe can still answer. Sending the
-    item to `merged` would strand a deploy that very likely succeeded under a
-    note reading "no deploy configured for this repo", which is false for this
-    repo class; sending it to `needs_decision` (the `autoDeploy` answer) would
-    ask a person to verify something a probe verifies better. It has to
-    converge on `verifying`, carrying the same `[{"commit": sha}]`
-    shape poll_validation_jobs() writes."""
-    with _triage_env() as (conn, _ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-reconcile-converge", confidence="high",
-                                  investigate_job="investigate-reconcile-converge", repo="argo")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, pr_url=? WHERE event_id=?",
-            (triage.STATE_MERGING, "implement-job-converge",
-             "https://github.com/jkrumm/argo/pull/16", eid),
-        )
-        conn.commit()
-        _seed_implement_dispatch(conn, "implement-job-converge", repo="argo")
-        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
-                     ("https://github.com/jkrumm/argo/pull/16", "implement-job-converge"))
-        conn.commit()
-        triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
-                                 authorized_by="auto-from-item")
-        sha = "c" * 40
-        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "MERGED", "mergeCommit": {"oid": sha}}
-        triage._run_gh_run_list = lambda owner, repo, commit_sha: []
-
-        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
-        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
-
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING, (
-            f"a reconciled deployOnMerge merge must converge on the live path's own destination, "
-            f"not be stranded in `merged` — got {item['state']!r}")
-        assert json.loads(item["deploy_expect_json"]) == [{"commit": sha}], item["deploy_expect_json"]
-        assert item["liveness_deadline"] is not None, "the probe needs a window to run in"
-
-
-def test_reconcile_merge_without_deploy_on_merge_still_lands_in_merged():
-    """The other side of the same branch, so nobody widens it: a repo with
-    neither `deployOnMerge` nor `autoDeploy` has genuinely nothing left to
-    happen after the merge, and `merged` (which expires to `closed` at 1h) is
-    the honest destination."""
-    with _triage_env() as (conn, _ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-reconcile-plain", confidence="high",
-                                  investigate_job="investigate-reconcile-plain", repo="vps")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=? WHERE event_id=?",
-            (triage.STATE_MERGING, "implement-job-plain", eid),
-        )
-        conn.commit()
-        _seed_implement_dispatch(conn, "implement-job-plain", repo="vps")
-        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
-                     ("https://github.com/jkrumm/vps/pull/8", "implement-job-plain"))
-        conn.commit()
-        triage.record_operation(conn, event_id=eid, kind="merge", repo="vps",
-                                 authorized_by="auto-from-item")
-        triage._run_gh_pr_view = lambda owner, repo, pr: {
-            "state": "MERGED", "mergeCommit": {"oid": "d" * 40}}
-
-        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
-
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING, item["state"]
-
-
-def test_reconcile_deploy_on_merge_records_unknown_when_the_run_cannot_be_read():
-    with _triage_env() as (conn, _ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-reconcile-dom-unknown", confidence="high",
-                                  investigate_job="investigate-reconcile-dom-unknown", repo="argo")
-        conn.execute(
-            "UPDATE triage_items SET state=?, implement_job=?, pr_url=? WHERE event_id=?",
-            (triage.STATE_MERGING, "implement-job-reconcile-dom-unknown",
-             "https://github.com/jkrumm/argo/pull/17", eid),
-        )
-        conn.commit()
-        _seed_implement_dispatch(conn, "implement-job-reconcile-dom-unknown", repo="argo")
-        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
-                     ("https://github.com/jkrumm/argo/pull/17", "implement-job-reconcile-dom-unknown"))
-        conn.commit()
-
-        op_id = triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
-                                         authorized_by="auto-from-item")
-        sha = "f" * 40
-        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "MERGED", "mergeCommit": {"oid": sha}}
-        triage._run_gh_run_list = lambda owner, repo, commit_sha: None  # gh unreachable
-
-        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True, "liveness": "argo-commit-live"}})
-        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
-
-        op = conn.execute("SELECT receipt_json FROM operations WHERE op_id=?", (op_id,)).fetchone()
-        receipt = json.loads(op["receipt_json"])
-        assert receipt["deploy"] == "unknown", "a gh run list that could not be read must not be guessed at"
 
 
 def test_reconcile_operations_runs_before_anything_that_could_retry():
@@ -5801,88 +5524,6 @@ def test_reconcile_operation_with_no_event_id_resolves_without_touching_any_item
         assert op["reconciled_at"] is not None
         assert conn.execute("SELECT COUNT(*) c FROM triage_items").fetchone()["c"] == 0, (
             "an event_id-less operation must never invent an item to move")
-
-
-def test_reconcile_deploy_operation_with_runs_found_resolves_done_and_advances_verifying():
-    """The NEW `deploy` operation kind: an Actions run that has appeared for
-    the merge sha resolves `done`, folding the runs into the receipt — and
-    because the item is still sitting in `merged` on a `deployOnMerge` repo,
-    reconciliation advances it to `verifying`, exactly where the live
-    path (poll_validation_jobs()) would have put it."""
-    with _triage_env() as (conn, _ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-reconcile-deploy-op", confidence="high",
-                                  investigate_job="investigate-reconcile-deploy-op", repo="argo")
-        conn.execute("UPDATE triage_items SET state=? WHERE event_id=?", (triage.STATE_VERIFYING, eid))
-        conn.commit()
-        sha = "9" * 40
-        merge_op = triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
-                                            authorized_by="auto-from-item")
-        triage.complete_operation(conn, merge_op, outcome="done",
-                                   receipt=json.dumps({"mergeCommit": sha, "pullRequest": 50}))
-        deploy_op = triage.record_operation(conn, event_id=eid, kind="deploy", repo="argo",
-                                             authorized_by="auto-from-item")
-
-        triage._github.actions_runs = lambda owner, repo, *, head_sha: [
-            {"id": 1, "name": "Deploy", "status": "completed", "conclusion": "success"}
-        ]
-        policy = dict(DEFAULT_POLICY, repos={"argo": {"deployOnMerge": True}})
-        triage.reconcile_operations(conn, policy, NOW, dry_run=False)
-
-        op = conn.execute("SELECT outcome, receipt_json FROM operations WHERE op_id=?", (deploy_op,)).fetchone()
-        assert op["outcome"] == "done", op["outcome"]
-        receipt = json.loads(op["receipt_json"])
-        assert receipt["mergeCommit"] == sha
-        assert len(receipt["actionsRuns"]) == 1
-
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING, item["state"]
-        assert json.loads(item["deploy_expect_json"]) == [{"commit": sha}]
-
-
-def test_reconcile_deploy_operation_with_no_runs_and_old_start_resolves_failed():
-    """No Actions run has appeared, and the deploy operation started long
-    enough ago (>2h) that waiting further is not honest — resolves
-    `failed`."""
-    with _triage_env() as (conn, _ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-reconcile-deploy-stale", confidence="high",
-                                  investigate_job="investigate-reconcile-deploy-stale", repo="argo")
-        sha = "8" * 40
-        merge_op = triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
-                                            authorized_by="auto-from-item")
-        triage.complete_operation(conn, merge_op, outcome="done", receipt=json.dumps({"mergeCommit": sha}))
-        deploy_op = triage.record_operation(conn, event_id=eid, kind="deploy", repo="argo",
-                                             authorized_by="auto-from-item")
-        stale = (NOW - dt.timedelta(hours=3)).isoformat()
-        conn.execute("UPDATE operations SET started_at=? WHERE op_id=?", (stale, deploy_op))
-        conn.commit()
-
-        triage._github.actions_runs = lambda owner, repo, *, head_sha: []
-        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
-
-        op = conn.execute("SELECT outcome FROM operations WHERE op_id=?", (deploy_op,)).fetchone()
-        assert op["outcome"] == "failed", op["outcome"]
-
-
-def test_reconcile_deploy_operation_with_no_runs_and_recent_start_stays_open():
-    """No Actions run yet, but the deploy operation is genuinely recent — too
-    soon to tell, so the row stays open (outcome NULL, not even
-    reconciled_at stamped) for a later pass to ask again."""
-    with _triage_env() as (conn, _ctx):
-        eid = _seed_verdict_item(conn, external_id="sig-reconcile-deploy-fresh", confidence="high",
-                                  investigate_job="investigate-reconcile-deploy-fresh", repo="argo")
-        sha = "7" * 40
-        merge_op = triage.record_operation(conn, event_id=eid, kind="merge", repo="argo",
-                                            authorized_by="auto-from-item")
-        triage.complete_operation(conn, merge_op, outcome="done", receipt=json.dumps({"mergeCommit": sha}))
-        deploy_op = triage.record_operation(conn, event_id=eid, kind="deploy", repo="argo",
-                                             authorized_by="auto-from-item")
-
-        triage._github.actions_runs = lambda owner, repo, *, head_sha: []
-        triage.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
-
-        op = conn.execute("SELECT outcome, reconciled_at FROM operations WHERE op_id=?", (deploy_op,)).fetchone()
-        assert op["outcome"] is None, "too soon to tell must leave the row genuinely open"
-        assert op["reconciled_at"] is None, "a row left open must not even be stamped reconciled_at"
 
 
 # --- terse output: one Slack line on fixed / needs_decision, nothing else -----
@@ -7290,8 +6931,7 @@ def test_merging_item_already_merged_lands_from_the_receipt_without_a_second_mer
     stamped `merged_at`, the item's own state write never ran. Calling merge
     again would refuse "already merged" and the item would read
     `failed` for a pull request that is merged and deploying — the
-    §46 misreport. The post-merge state comes from the merge receipt, and
-    GitHub is never asked to merge twice."""
+    §46 misreport. The item goes on to `verifying`, and GitHub is never asked to merge twice."""
     with _triage_env(policy=_MERGE_FIXTURE_POLICY) as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-already-merged", repo="argo")
         conn.execute(
@@ -7315,7 +6955,7 @@ def test_merging_item_already_merged_lands_from_the_receipt_without_a_second_mer
         assert merges == [], "merge must not be called for a dispatch that already carries merged_at"
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_VERIFYING, item["state"]
-        assert json.loads(item["deploy_expect_json"]) == [{"commit": merge_sha}]
+        assert item["verify_started_at"] is None, "the deploy has not run yet"
 
 
 def _seed_validating_with_open_merge_op(conn, *, external_id, job, pr_url):
@@ -7389,7 +7029,6 @@ HOST_VERB_POLICY = dict(
     # docstring for why an idempotent, liveness-verified, attempt-capped
     # restart gets a lower bar than auto-implement's `high`.
     hostVerbMinConfidence="medium",
-    repos={"hermes-agent": {"liveness": "kuma-push-fresh"}},
 )
 
 
@@ -7661,7 +7300,8 @@ def test_auto_remediate_groups_every_item_sharing_a_verb_into_one_run():
         for eid in (eid1, eid2, eid3):
             item = triage._get_item(conn, eid)
             assert item["state"] == triage.STATE_VERIFYING, (eid, item["state"])
-            assert item["note"] == "restarted via restart-hermes-gateway; awaiting liveness"
+            assert item["note"] == "restarted via restart-hermes-gateway; verifying"
+            assert item["verify_started_at"] == NOW.isoformat() and item["verify_mark"] is None, dict(item)
 
 
 def _backdate_latest_host_op(conn: sqlite3.Connection, verb_key: str, started_at: dt.datetime) -> None:
@@ -7768,11 +7408,13 @@ def test_unknown_host_verb_key_is_rejected_at_policy_load():
 
 
 def _seed_verifying_host_item(conn, *, external_id="175", monitor_title="Hermes Agent - Push",
-                                      since: dt.datetime, deadline: dt.datetime) -> int:
+                                      since: dt.datetime) -> int:
+    """What maybe_auto_remediate() leaves after a successful restart: `verifying`, the window
+    already open (the restart IS the deploy), the verb's monitor on `deploy_expect_json`."""
     eid = _seed_host_verb_item(conn, external_id=external_id, confidence="high", state=triage.STATE_WORKING,
                                 investigate_job=f"investigate-live-{external_id}")
     triage._set_state(conn, eid, triage.STATE_VERIFYING, since,
-                      liveness_deadline=deadline.isoformat(),
+                      verify_started_at=since.isoformat(), verify_mark=None, verify_failures=0,
                       deploy_expect_json=json.dumps([{"monitorTitle": monitor_title, "since": since.isoformat()}]))
     conn.commit()
     return eid
@@ -7825,43 +7467,43 @@ _KUMA_MONITOR_TITLE = "Hermes Agent - Push"
 _KUMA_MONITORS = [{"id": "172", "name": _KUMA_MONITOR_TITLE, "type": "push", "active": True}]
 
 
-def test_liveness_kuma_push_fresh_positive_confirms_fixed():
+def test_a_host_verb_restart_is_fixed_once_its_monitor_is_up_and_the_window_has_passed():
     with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        _fake_rollout(targets=())
         since = NOW
-        deadline = NOW + dt.timedelta(hours=triage.LIVENESS_WINDOW_HOURS)
-        eid = _seed_verifying_host_item(conn, since=since, deadline=deadline)
+        eid = _seed_verifying_host_item(conn, since=since)
+        window_end = since + dt.timedelta(hours=triage.VERIFY_WINDOW_HOURS)
 
         # No push yet, still inside the window — stays verifying.
         triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
-        triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(minutes=5), dry_run=False)
+        triage.maybe_verify(conn, HOST_VERB_POLICY, since + dt.timedelta(minutes=5), dry_run=False)
         assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
 
-        # An UP heartbeat AFTER `since` -> STATE_FIXED, the one genuinely-verified state.
+        # An UP heartbeat AFTER `since`, the item's own event gone quiet, window over -> `fixed`.
         push_dt = since + dt.timedelta(minutes=10)
         rows = _kuma_rows((push_dt.strftime("%Y-%m-%d %H:%M:%S.000"), 1))
         triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
-        triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(minutes=15), dry_run=False)
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (window_end.isoformat(), eid))
+        conn.commit()
+        triage.maybe_verify(conn, HOST_VERB_POLICY, window_end, dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_FIXED, item["state"]
-        assert triage.LIVENESS_CONFIRMED_NOTE_PREFIX in (item["note"] or ""), item["note"]
+        assert triage.VERIFIED_NOTE_PREFIX in (item["note"] or ""), item["note"]
 
 
-def test_liveness_kuma_push_fresh_never_confirmed_reopens_past_deadline():
-    """Written against maybe_check_liveness()'s ACTUAL behaviour, not a
-    literal `STATE_QUIET` outcome: this poller only ever produces
-    STATE_FIXED (a positive probe) or a reopen to STATE_NEW past the
-    deadline — it never sets STATE_QUIET itself (that state is produced only
-    by the grouped-source silence paths, resolve_quiet_grouped()/
-    apply_resolutions()). A heartbeat that never arrives is "not proven, try
-    again as a fresh occurrence", which this asserts."""
+def test_a_host_verb_monitor_that_never_comes_up_fails_verification_after_three_passes():
     with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        _fake_rollout(targets=())
         since = NOW
-        deadline = NOW + dt.timedelta(hours=1)
-        eid = _seed_verifying_host_item(conn, since=since, deadline=deadline)
+        eid = _seed_verifying_host_item(conn, since=since)
         triage._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
-        triage.maybe_check_liveness(conn, HOST_VERB_POLICY, since + dt.timedelta(hours=2), dry_run=False)
+        window_end = since + dt.timedelta(hours=triage.VERIFY_WINDOW_HOURS)
+        for n in range(3):
+            assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
+            triage.maybe_verify(conn, HOST_VERB_POLICY, window_end + dt.timedelta(minutes=10 * n), dry_run=False)
         item = triage._get_item(conn, eid)
         assert item["state"] == triage.STATE_TRIAGED, item["state"]
+        assert "own monitor not UP" in item["note"], item["note"]
 
 
 def test_gather_kuma_push_fresh_unparsable_since_fails_closed():
@@ -8835,49 +8477,6 @@ def _confirm_and_merge(conn, policy, deploy: dict, merge_commit: str | None = No
         triage.poll_validation_jobs(conn, policy, NOW, dry_run=False)
 
 
-def test_kuma_repo_deploy_waits_on_the_items_own_monitor():
-    policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "kuma-push-fresh", "autoDeploy": True,
-                                                        "deploy": "weatherorb-pull"}})
-    with _triage_env(policy=policy) as (conn, ctx):
-        eid = _seed_validating(conn, external_id="220")
-        _confirm_and_merge(conn, triage.load_policy(), {"attempted": True, "ok": True, "key": "weatherorb-pull"})
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING
-        expected = json.loads(item["deploy_expect_json"])
-        assert expected[0]["monitorTitle"] == "WeatherOrb Watchdog - Push" and expected[0]["since"]
-
-
-def test_kuma_repo_deploy_without_a_monitor_of_its_own_is_merged_not_pending():
-    policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "kuma-push-fresh", "autoDeploy": True,
-                                                        "deploy": "uk-sync"}})
-    with _triage_env(policy=policy) as (conn, ctx):
-        eid = _seed_validating(conn, external_id="sig-nomon", source="github_go", title="issue: tidy docs")
-        _confirm_and_merge(conn, triage.load_policy(), {"attempted": True, "ok": True, "key": "uk-sync"})
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING
-        assert "no Kuma monitor" in item["note"]
-
-
-def test_poller_deployed_repo_waits_on_its_checkout():
-    policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"deployByPoller": True, "liveness": "mini-checkout-live"}})
-    sha = "a" * 40
-    with _triage_env(policy=policy) as (conn, ctx):
-        eid = _seed_validating(conn, external_id="sig-rg", source="slack_alert", title="🚨 rg")
-        _confirm_and_merge(conn, triage.load_policy(), {"attempted": False, "reason": "autoDeploy is false"},
-                           merge_commit=sha)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_VERIFYING
-        assert json.loads(item["deploy_expect_json"]) == [{"commit": sha, "repo": "demo-repo"}]
-
-
-def test_mini_checkout_live_refuses_without_a_known_checkout_or_full_sha():
-    ok, detail = triage._gather_mini_checkout_live([{"commit": "a" * 40, "repo": "nope"}])
-    assert not ok and "no mini deploy checkout" in detail
-    ok, detail = triage._gather_mini_checkout_live([{"commit": "abc", "repo": "research-gateway"}])
-    assert not ok and "no full merge sha" in detail
-    assert "mini-checkout-live" in triage.LIVENESS_ALLOWLIST
-
-
 def test_kuma_monitor_title_from_uk_and_slack_alert():
     uk = {"source": "uk", "title": "MacMini Dev Host - Push (×3 in batch)"}
     sa = {"source": "slack_alert", "title": "[Brain Sync - Push] [:red_circle: Down] No heartbeat"}
@@ -8885,14 +8484,6 @@ def test_kuma_monitor_title_from_uk_and_slack_alert():
     assert triage._kuma_monitor_title(uk) == "MacMini Dev Host - Push"
     assert triage._kuma_monitor_title(sa) == "Brain Sync - Push"
     assert triage._kuma_monitor_title(other) is None
-
-
-def test_new_rollout_keys_are_closed_argv():
-    for key in ("uk-sync", "weatherorb-pull"):
-        argv = triage._merge.rollout.argv_for(key)
-        assert argv and isinstance(argv, tuple) and all(isinstance(a, str) for a in argv)
-    assert triage._merge.rollout.argv_for("uk-sync")[:2] == ("ssh", "homelab")
-    assert "--delete-orphans" not in " ".join(triage._merge.rollout.argv_for("uk-sync"))
 
 
 def test_validation_review_gets_the_goal_and_the_gate_questions():
@@ -9015,159 +8606,9 @@ def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
         assert fresh["state"] == triage.STATE_VERIFYING and fresh["note"] == "landed by the other pass"
 
 
-# --- the synthetic trip (§103) ------------------------------------------------
+# --- the uk poller ----------------------------------------------------------------
 
-def _seed_trip_item(conn, *, external_id: str, trip: dict[str, Any]) -> int:
-    eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
-    conn.execute(
-        "UPDATE triage_items SET state=?, pr_url=?, liveness_deadline=?, deploy_expect_json=? WHERE event_id=?",
-        (triage.STATE_VERIFYING, "https://github.com/jkrumm/homelab/pull/20",
-         (NOW + dt.timedelta(hours=2)).isoformat(),
-         json.dumps([{"monitorTitle": "Brain Sync - Push", "since": NOW.isoformat(), "trip": trip}]), eid))
-    conn.commit()
-    return eid
-
-
-def _trip_fake(results: dict[str, dict[str, Any]]):
-    def fake(verb, *args):
-        TRIP_CALLS.append((verb, args))
-        return results.get(verb, {"ok": True})
-    return fake
-
-
-_LIVE_POLICY = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "stub-live"}})
-
-
-def _trip(conn, eid) -> dict[str, Any]:
-    return json.loads(triage._get_item(conn, eid)["deploy_expect_json"])[0]["trip"]
-
-
-def test_a_kuma_verified_deploy_is_armed_for_a_trip():
-    policy = dict(DEFAULT_POLICY, repos={"demo-repo": {"liveness": "kuma-push-fresh", "autoDeploy": True,
-                                                        "deploy": "uk-sync"}})
-    with _triage_env(policy=policy) as (conn, ctx):
-        eid = _seed_validating(conn, external_id="222")
-        _confirm_and_merge(conn, triage.load_policy(), {"attempted": True, "ok": True, "key": "uk-sync"})
-        assert _trip(conn, eid) == {"status": triage.TRIP_PENDING}
-
-
-def test_liveness_ok_arms_the_trip_instead_of_fixing():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_trip_item(conn, external_id="trip-arm", trip={"status": "pending"})
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
-        triage._kuma_trip = _trip_fake({"start": {"ok": True, "shadowId": 901, "interval": 600,
-                                                   "retryInterval": 600, "maxretries": 0, "armedAt": 0}})
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW, dry_run=False)
-        assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
-        assert TRIP_CALLS[0] == ("start", ("Brain Sync - Push", str(eid)))
-        trip = _trip(conn, eid)
-        assert trip["status"] == "armed" and trip["shadowId"] == 901
-        assert trip["window"] == 600 + triage.TRIP_SLACK_S
-
-
-def test_a_shadow_that_goes_down_proves_detection_and_fixes_the_item():
-    with _triage_env() as (conn, ctx):
-        armed = {"status": "armed", "shadowId": 902, "window": 780, "armedAt": NOW.isoformat(),
-                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
-        eid = _seed_trip_item(conn, external_id="trip-down", trip=armed)
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
-        triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": True, "down": True}})
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=650), dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_FIXED
-        assert "went DOWN within 650s" in item["note"] and "detection still fires" in item["note"]
-        assert ("stop", ("902",)) in TRIP_CALLS, "the shadow is removed the moment the trip ends"
-
-
-def test_a_shadow_inside_its_window_waits():
-    with _triage_env() as (conn, ctx):
-        armed = {"status": "armed", "shadowId": 903, "window": 780, "armedAt": NOW.isoformat(),
-                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
-        eid = _seed_trip_item(conn, external_id="trip-wait", trip=armed)
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
-        triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": True, "down": False}})
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=100), dry_run=False)
-        assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
-        assert not any(v == "stop" for v, _ in TRIP_CALLS)
-
-
-def test_a_shadow_that_never_goes_down_reopens_the_item_as_a_finding():
-    """The whole point: a fix that removed detection comes back UP and is
-    never heard from again. It must not reach `fixed`."""
-    with _triage_env() as (conn, ctx):
-        armed = {"status": "armed", "shadowId": 904, "window": 780, "armedAt": NOW.isoformat(),
-                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
-        eid = _seed_trip_item(conn, external_id="trip-silent", trip=armed)
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
-        triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": True, "down": False}})
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=900), dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_TRIAGED
-        assert triage.TRIP_FAILED_NOTE_PREFIX in item["note"] and "homelab/pull/20" in item["note"]
-        assert ("stop", ("904",)) in TRIP_CALLS
-
-
-def test_a_shadow_that_vanishes_after_the_window_is_unproven_not_a_finding():
-    """A shadow can be deleted before its window closes (the hourly residue
-    sweep, a hand in the Kuma UI, a restore). That is our probe missing, not
-    the fix's behaviour — it must never read as "detection no longer fires",
-    and it must never reach `fixed`. Seen live: a manual trip's shadow was
-    swept between arm and check and `check` came back `exists: false`."""
-    with _triage_env() as (conn, ctx):
-        armed = {"status": "armed", "shadowId": 907, "window": 780, "armedAt": NOW.isoformat(),
-                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
-        eid = _seed_trip_item(conn, external_id="trip-swept", trip=armed)
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
-        triage._kuma_trip = _trip_fake({"check": {"ok": True, "exists": False, "down": False}})
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=900), dry_run=False)
-        assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
-        assert "gone" in (_trip(conn, eid).get("lastError") or ""), "recorded as a probe failure, not a verdict"
-        assert not any(v == "stop" for v, _ in TRIP_CALLS), "the shadow stays while its answer is still readable"
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(hours=3), dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_TRIAGED and "unproven, not fixed" in item["note"]
-        assert "gone before" in item["note"], "the note says WHY it is unproven"
-        assert (("stop", ("907",)) in TRIP_CALLS)
-
-
-def test_a_monitor_type_without_a_residue_free_trip_is_a_named_gap_not_a_block():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_trip_item(conn, external_id="trip-gap", trip={"status": "pending"})
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
-        triage._kuma_trip = _trip_fake({"start": {"ok": False, "gap": "monitor type 'http': push only"}})
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW, dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_FIXED and "named gap: monitor type 'http'" in item["note"]
-
-
-def test_a_trip_that_cannot_be_armed_waits_and_never_claims_fixed():
-    with _triage_env() as (conn, ctx):
-        eid = _seed_trip_item(conn, external_id="trip-err", trip={"status": "pending"})
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
-        triage._kuma_trip = _trip_fake({"start": {"ok": False, "error": "ssh homelab failed"}})
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW, dry_run=False)
-        assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
-        assert _trip(conn, eid)["lastError"] == "ssh homelab failed"
-
-
-def test_the_residue_sweep_keeps_only_armed_shadows():
-    with _triage_env() as (conn, ctx):
-        _seed_trip_item(conn, external_id="trip-keep", trip={"status": "armed", "shadowId": 905})
-        triage._kuma_trip = _trip_fake({"sweep": {"ok": True, "removed": [777]}})
-        triage.sweep_trip_residue(conn, NOW, dry_run=False)
-        assert TRIP_CALLS == [("sweep", ("905",))]
-        triage.sweep_trip_residue(conn, NOW + dt.timedelta(minutes=5), dry_run=False)
-        assert len(TRIP_CALLS) == 1, "hourly, not every pass"
-
-
-def test_kuma_trip_refuses_unvalidated_arguments_before_any_ssh():
-    real = ORIGINAL_KUMA_TRIP
-    assert "unvalidated" in real("start", "x; rm -rf /", "1")["error"]
-    assert "integer" in real("check", "1 && echo")["error"]
-    assert "integer" in real("sweep", "1", "x")["error"]
-
-
-def test_the_poller_never_turns_a_trip_shadow_into_an_event():
+def test_the_poller_never_turns_a_leftover_trip_shadow_into_an_event():
     wp = triage._wp_module()
     saved = wp.http_get
     wp.http_get = lambda url, headers: [{"id": 9, "name": "warden-trip:543", "type": "push", "status": 0},
@@ -9191,22 +8632,6 @@ def test_the_uk_poller_keeps_a_monitors_tags_for_label_routing():
         wp.http_get = saved
     assert out["Tagged"] == {"type": "http", "status": 0, "tags": [{"name": "repo", "value": "weatherorb"}]}
     assert out["Untagged"] == {"type": "http", "status": 0}
-
-
-def test_a_trip_read_error_after_the_window_retries_until_the_liveness_deadline():
-    with _triage_env() as (conn, ctx):
-        armed = {"status": "armed", "shadowId": 906, "window": 780, "armedAt": NOW.isoformat(),
-                 "deadline": (NOW + dt.timedelta(seconds=780)).isoformat()}
-        eid = _seed_trip_item(conn, external_id="trip-flaky", trip=armed)
-        triage.LIVENESS_ALLOWLIST["stub-live"] = lambda expected: (True, "monitor up")
-        triage._kuma_trip = _trip_fake({"check": {"ok": False, "error": "TimeoutError: "}})
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(seconds=900), dry_run=False)
-        assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
-        assert not any(v == "stop" for v, _ in TRIP_CALLS), "the shadow stays while its answer is still readable"
-        triage.maybe_check_liveness(conn, _LIVE_POLICY, NOW + dt.timedelta(hours=3), dry_run=False)
-        item = triage._get_item(conn, eid)
-        assert item["state"] == triage.STATE_TRIAGED and "unproven, not fixed" in item["note"]
-        assert ("stop", ("906",)) in TRIP_CALLS
 
 
 # --- review fixes: claims, ambiguous submits, strike CAS, notify claim, origin answers ----

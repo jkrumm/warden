@@ -386,7 +386,7 @@ def _metric_verified_unattended_fixes_per_week(
         }
     # DISTINCT, and the unit is the ITEM, not the transition: an item can
     # enter `fixed` more than once in one window (fixed -> reopened by a
-    # failed liveness probe -> fixed again) and counts once.
+    # failed verification -> fixed again) and counts once.
     fixed_event_ids = [
         row["event_id"] for row in conn.execute(
             "SELECT DISTINCT event_id FROM item_transitions WHERE to_state=? AND at >= ?",

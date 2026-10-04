@@ -105,7 +105,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **423/423**. Any other number is a
+`tests/test_triage.py` is the regression gate at **398/398**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -159,6 +159,16 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   (`lifecycle.merge.merge_gate_check()` / `plan_or_land()`). No path scope, size
   ceiling, per-repo carve-out or executor-repo exception; `warden merge <job>
   --confirm` goes through the same gate.
+- **Deploy and verify are the repo's own Makefile.** A merged item waits in `verifying`
+  and `triage.maybe_verify()` walks it: `make deploy` if the repo defines the target
+  (after fast-forwarding the checkout to `origin/<default>`, only when it is on the default
+  branch and clean — else a strike; a failing deploy strikes, third → `failed` with the
+  output tail, and never reverts), then `make verify` if defined, and for an alert item its
+  own signal quiet for `VERIFY_WINDOW_HOURS` (the event's occurrence mark unchanged since the
+  window opened, a state-source event closed, its own Kuma monitor UP). No signal (issue,
+  `warden run`) → `fixed` once `make verify` passes. Signal recurrence or three consecutive
+  failing passes → `_on_verify_failure()`, the one seam the revert step replaces. Host-verb
+  restarts enter `verifying` with their window open and verify on `HOST_VERB_LIVENESS_MONITOR`.
 - **An episode is not contained.** `readOnly` is three tool names on a CLI flag
   under `--dangerously-skip-permissions`; `Bash` is unrestricted and the brief is
   attacker-influenceable (public issues, alert text, log lines all reach it). A
@@ -188,10 +198,10 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 - **The dry-run contract**: never touches Slack, never shells out, never submits a
   triage job (it prints what it would), everything else real. With no staging environment it is the only pre-production surface there is.
 - **A policy file may name and parameterise, never express.** Config carries
-  validated values; code owns the argv array. The three closed allowlists
-  (liveness, deploy, `HOST_VERB_ALLOWLIST`) are one principle in three
-  instances (the host-verb one added 2026-09-11 for the owner's host-restart
-  decision — DESIGN.md § The host-verb carve-out).
+  validated values; code owns the argv array: `make -C <repo> deploy|verify` (two
+  fixed targets, `lifecycle/rollout.py`) and `HOST_VERB_ALLOWLIST` (added
+  2026-09-11 for the owner's host-restart decision — DESIGN.md § The host-verb
+  carve-out) are the two instances left.
 - **Deferral must be visible.** A budget hit that only reaches a `.err` file is
   indistinguishable from a broken loop.
 - **A dispatch that ends terminal with no verdict is not a verdict.** It is an

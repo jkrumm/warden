@@ -402,24 +402,6 @@ def test_check_repo_not_in_flight_ignores_completed_operation():
     policy.check_repo_not_in_flight(conn, repo="warden")
 
 
-# --- policy: triage_repo_entry() ---------------------------------------------
-
-
-def test_triage_repo_entry_returns_entry():
-    p = _write_json({"repos": {"vps": {"autoDeploy": True}}})
-    assert policy.triage_repo_entry("vps", p) == {"autoDeploy": True}
-
-
-def test_triage_repo_entry_returns_empty_for_unknown_repo():
-    p = _write_json({"repos": {"vps": {}}})
-    assert policy.triage_repo_entry("other", p) == {}
-
-
-def test_triage_repo_entry_unreadable_raises_precondition():
-    missing = _tmp_dir("lifecycle-missing2-") / "nope.json"
-    _expect(PreconditionError, policy.triage_repo_entry, "vps", missing)
-
-
 # --- dispatch: normalize_brief() / check_context() ------------------------------
 
 def test_normalize_brief_strips_trailing_whitespace():

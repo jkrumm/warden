@@ -91,11 +91,7 @@ class Harness:
         return p
 
     def _write_triage_policy(self) -> Path:
-        return self._write_json("triage-policy.json", {
-            "repos": {
-                "gamma": {"autoDeploy": False},
-            }
-        })
+        return self._write_json("triage-policy.json", {})
 
     def new_db(self) -> Path:
         db = self.tmp / f"db-{uuid.uuid4().hex[:8]}.db"

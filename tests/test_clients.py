@@ -29,7 +29,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
-from clients import argo, github, rollout, sideclaw  # noqa: E402
+from clients import argo, github, sideclaw  # noqa: E402
 from clients import slack as clients_slack  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused  # noqa: E402
 
@@ -801,77 +801,6 @@ def test_delete_branch_204_and_422_true_else_false():
         _gh_cleanup()
 
 
-def test_contents_base64_decodes():
-    import base64
-    encoded = base64.b64encode(b'{"name": "alert"}').decode()
-    srv = _StubServer({("GET", "/repos/jkrumm/gamma/contents/a.json?ref=deadbeef"): (200, {"content": encoded})})
-    _gh_env(srv)
-    try:
-        raw = github.contents("jkrumm", "gamma", "a.json", ref="deadbeef")
-        assert raw == b'{"name": "alert"}'
-    finally:
-        srv.stop()
-        _gh_cleanup()
-
-
-def test_contents_non200_returns_none():
-    srv = _StubServer({("GET", "/repos/jkrumm/gamma/contents/missing.json?ref=deadbeef"): (404, {"message": "not found"})})
-    _gh_env(srv)
-    try:
-        assert github.contents("jkrumm", "gamma", "missing.json", ref="deadbeef") is None
-    finally:
-        srv.stop()
-        _gh_cleanup()
-
-
-def test_contents_quotes_path_and_ref_with_question_hash_traversal_and_space():
-    """A `path`/`ref` containing '?', '#', '../', or a space must reach the
-    request URL-encoded — never break the path segment or the query string,
-    or reach an unintended resource. `path` is quoted with `safe='/'`
-    (legitimate embedded slashes survive); `ref` is quoted fully."""
-    import base64
-    import urllib.parse
-    quoted_path = urllib.parse.quote("dir with space/a?b#c../d.json", safe="/")
-    quoted_ref = urllib.parse.quote("weird ref#1", safe="")
-    srv = _StubServer({
-        ("GET", f"/repos/jkrumm/gamma/contents/{quoted_path}?ref={quoted_ref}"):
-            (200, {"content": base64.b64encode(b"ok").decode()}),
-    })
-    _gh_env(srv)
-    try:
-        raw = github.contents("jkrumm", "gamma", "dir with space/a?b#c../d.json", ref="weird ref#1")
-        assert raw == b"ok", "the quoted request must reach the exact stubbed route"
-    finally:
-        srv.stop()
-        _gh_cleanup()
-
-
-def test_actions_runs_ok():
-    srv = _StubServer({("GET", f"/repos/jkrumm/gamma/actions/runs?head_sha={_FULL_SHA}&per_page=20"): (200, {"workflow_runs": [{"id": 1}]})})
-    _gh_env(srv)
-    try:
-        assert github.actions_runs("jkrumm", "gamma", head_sha=_FULL_SHA) == [{"id": 1}]
-    finally:
-        srv.stop()
-        _gh_cleanup()
-
-
-def test_actions_runs_invalid_sha_raises_precondition_error_before_any_request():
-    srv = _StubServer({})
-    _gh_env(srv)
-    try:
-        try:
-            github.actions_runs("jkrumm", "gamma", head_sha="not-a-sha")
-        except PreconditionError:
-            pass
-        else:
-            raise AssertionError("expected PreconditionError")
-        assert srv.requests == [], "a malformed sha must never reach a request"
-    finally:
-        srv.stop()
-        _gh_cleanup()
-
-
 def test_search_issues_parses_a_search_response():
     body = {
         "items": [
@@ -1141,78 +1070,6 @@ def test_pick_merge_method_order():
     assert github.pick_merge_method({"allow_squash_merge": False, "allow_rebase_merge": True}) == "rebase"
     assert github.pick_merge_method({"allow_merge_commit": True}) == "merge"
     assert github.pick_merge_method({}) is None
-
-
-# --- rollout -----------------------------------------------------------------
-
-def test_rollout_unknown_key_raises_policy_error():
-    try:
-        rollout.run("not-a-real-key")
-    except PolicyError as e:
-        assert "not-a-real-key" in str(e), e
-    else:
-        raise AssertionError("expected PolicyError")
-
-
-def test_rollout_known_key_argv():
-    assert rollout.argv_for("hyperdx-apply") == ("ssh", "vps", "cd ~/vps && make hyperdx-apply ENV=prod")
-    assert rollout.argv_for("unknown") is None
-
-
-def test_rollout_weatherorb_pull_installs_plists_then_restarts_the_daemons():
-    """§105/§107: a fast-forward rolls out the periodic jobs; ops/*.plist may
-    now merge unattended, so the repo's own idempotent `make launchd-install`
-    (bootout+bootstrap only for a changed plist — the one reload that re-reads
-    one) runs next; then tileserver and sync, KeepAlive daemons that keep their
-    loaded process, are kickstarted, or a merged tileserver fix would read
-    `fixed` against a watchdog that never ran it. Closed argv: one /bin/sh -c
-    string in that order, every step chained on the previous one, and serve —
-    the vendored binary a merge cannot change — is not touched."""
-    argv = rollout.argv_for("weatherorb-pull")
-    assert argv[:2] == ("/bin/sh", "-c") and len(argv) == 3
-    script = argv[2]
-    pull, install, kick = script.index("pull --ff-only"), script.index("launchd-install"), script.index("kickstart -k")
-    assert pull < install < kick
-    assert script.count(" && ") >= 2 and "|| exit 1" in script
-    for job in ("tileserver", "sync"):
-        assert job in script, job
-    assert "serve" not in script.replace("tileserver", "")
-    assert "FORCE" not in script  # never bounce all eight; only a changed plist reloads
-
-
-def test_rollout_run_success():
-    def fake_runner(argv, **kwargs):
-        assert argv == list(rollout.ROLLOUTS["hyperdx-apply"])
-        assert kwargs.get("capture_output") is True and kwargs.get("text") is True
-        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
-
-    result = rollout.run("hyperdx-apply", runner=fake_runner)
-    assert result.ok is True and result.exit_code == 0 and "ok" in result.output
-
-
-def test_rollout_run_timeout():
-    def fake_runner(argv, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
-
-    result = rollout.run("hyperdx-apply", timeout_s=5, runner=fake_runner)
-    assert result.ok is False and result.exit_code == 124 and "5" in result.output
-
-
-def test_rollout_run_oserror_never_raises_out_of_the_actuator():
-    def fake_runner(argv, **kwargs):
-        raise FileNotFoundError("ssh: no such file or directory")
-
-    result = rollout.run("hyperdx-apply", runner=fake_runner)
-    assert result.ok is False and result.exit_code == 127
-    assert "no such file" in result.output
-
-
-def test_rollout_run_failure_output_truncated_to_2000():
-    def fake_runner(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, 1, stdout="x" * 3000, stderr="y" * 3000)
-
-    result = rollout.run("hyperdx-apply", runner=fake_runner)
-    assert result.ok is False and result.exit_code == 1 and len(result.output) == 2000
 
 
 # --- the slack move ------------------------------------------------------------

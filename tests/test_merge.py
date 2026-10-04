@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Regression suite for scripts/lifecycle/merge.py — the Python port of
-the retired bash CLI's `cmd_merge`, `merge_gate_check`, `collect_expected_alerts` and
-`run_deploy_if_enabled`.
+the retired bash CLI's `cmd_merge` and `merge_gate_check`.
 
-Every `clients.github`/`clients.rollout` call and every `lifecycle.policy`
+Every `clients.github` call and every `lifecycle.policy`
 call is faked by assignment for the duration of a `with fakes(...):` block —
 this suite never touches the network and never depends on the sibling
 worker's real `policy.py` landing first. If the real module is not on disk
@@ -36,7 +35,7 @@ try:
     import lifecycle.policy  # noqa: F401, E402
 except ModuleNotFoundError:
     _stub = types.ModuleType("lifecycle.policy")
-    for _name in ("triage_repo_entry", "triage_policy_path"):
+    for _name in ("triage_policy_path",):
         def _unset(*_a, _n=_name, **_k):
             raise NotImplementedError(f"lifecycle.policy.{_n} stub called without a test override")
         setattr(_stub, _name, _unset)
@@ -44,7 +43,7 @@ except ModuleNotFoundError:
     lifecycle.policy = _stub
 
 from lifecycle import merge, operations  # noqa: E402
-from clients import github, rollout  # noqa: E402
+from clients import github  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError  # noqa: E402
 
 _ledger_spec = importlib.util.spec_from_file_location("ledger", REPO / "scripts" / "ledger.py")
@@ -57,7 +56,6 @@ _ledger_spec.loader.exec_module(ledger)
 JOB_ID = "merge-job-0001"
 PR_URL = "https://github.com/jkrumm/gamma/pull/7"
 _NOW = dt.datetime(2026, 9, 10, 12, 0, 0, tzinfo=dt.timezone.utc)
-_FULL_SHA = "a" * 40
 
 
 def _no_sleep(_seconds: float) -> None:
@@ -119,7 +117,7 @@ _DEFAULT_REPO = {
 
 @contextmanager
 def fakes(**overrides):
-    """Patches every clients.github / clients.rollout / lifecycle.policy
+    """Patches every clients.github / lifecycle.policy
     function `merge.py` calls, for the duration of the block, restoring the
     originals on exit — real or stub `policy` module, either way."""
     calls: dict[str, list] = {}
@@ -131,16 +129,10 @@ def fakes(**overrides):
         "check_runs_error": None,
         "merge_resp": {"sha": "mergedsha001"},
         "delete_ok": True,
-        "contents": {},
-        "actions_runs": [],
-        "actions_runs_error": None,
-        "entry": {},
         "branch_rules": [],
         "mark_ready_error": None,
         "mark_ready_fn": None,
         "merge_pr_error": None,
-        "rollout_result": rollout.RolloutResult(True, 0, "ok"),
-        "rollout_run_fn": None,
     }
     state.update(overrides)
 
@@ -182,29 +174,9 @@ def fakes(**overrides):
         record("delete_branch", owner, repo, branch)
         return state["delete_ok"]
 
-    def _contents(owner, repo, path, *, ref):
-        record("contents", owner, repo, path, ref=ref)
-        return state["contents"].get(path)
-
-    def _actions_runs(owner, repo, *, head_sha):
-        record("actions_runs", owner, repo, head_sha=head_sha)
-        if state["actions_runs_error"]:
-            raise state["actions_runs_error"]
-        return list(state["actions_runs"])
-
-    def _rollout_run(key, *, timeout_s=180, runner=None):
-        record("rollout_run", key, timeout_s)
-        if state["rollout_run_fn"]:
-            return state["rollout_run_fn"](key, timeout_s=timeout_s)
-        return state["rollout_result"]
-
     def _branch_rules(owner, repo, branch):
         record("branch_rules", owner, repo, branch)
         return list(state["branch_rules"])
-
-    def _triage_repo_entry(repo):
-        record("triage_repo_entry", repo)
-        return dict(state["entry"])
 
     def _triage_policy_path():
         return Path("/dev/null")
@@ -217,11 +189,7 @@ def fakes(**overrides):
         (github, "mark_ready_for_review", _mark_ready),
         (github, "merge_pr", _merge_pr),
         (github, "delete_branch", _delete_branch),
-        (github, "contents", _contents),
-        (github, "actions_runs", _actions_runs),
-        (rollout, "run", _rollout_run),
         (github, "branch_rules", _branch_rules),
-        (lifecycle.policy, "triage_repo_entry", _triage_repo_entry),
         (lifecycle.policy, "triage_policy_path", _triage_policy_path),
     ]
     saved = [(m, n, getattr(m, n)) for m, n, _ in patches]
@@ -531,9 +499,7 @@ def test_happy_path_merges():
         assert row["outcome"] == "done"
         receipt = json.loads(row["receipt_json"])
         assert receipt["mergeCommit"] == "mergedsha001"
-        assert result.deploy["attempted"] is False
-        assert "autoDeploy is false" in result.deploy["reason"]
-        assert _op_count(conn, kind="deploy") == 0
+        assert _op_count(conn, kind="deploy") == 0, "landing never deploys: the verify pass does"
     finally:
         conn.close()
 
@@ -695,7 +661,7 @@ def test_any_path_merges_without_a_per_repo_policy_entry():
             conn = _fresh_ledger()
             try:
                 _seed_pr_dispatch(conn, validation_status="confirmed")
-                with fakes(entry={}, files=[{"filename": path}]) as fx:
+                with fakes(files=[{"filename": path}]) as fx:
                     result = _land(conn, why="w", authorized_by=authorized_by)
                 assert result.merged, (path, authorized_by)
                 assert "merge_pr" in fx.calls, (path, authorized_by)
@@ -749,7 +715,7 @@ def test_plan_or_land_double_confirm_race_two_connections():
 
     conn3 = ledger.connect(db_path, migrate=False)
     try:
-        with fakes(entry={}, check_runs=[]):
+        with fakes(check_runs=[]):
             try:
                 _land(conn3)
             except PolicyError as e:
@@ -765,174 +731,16 @@ def test_plan_or_land_double_confirm_race_two_connections():
 def test_plan_or_land_refuses_failing_ci():
     _assert_refuses(
         exc_type=PolicyError, msg="has not passed cleanly",
-        fake={"entry": {},
-              "check_runs": [{"name": "build", "status": "completed", "conclusion": "failure"}]},
+        fake={"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure"}]},
     )
 
 
 def test_plan_or_land_refuses_validation_disagreed():
-    _assert_refuses(exc_type=PolicyError, msg="has not confirmed", seed={"validation_status": "disagreed"},
-                     fake={"entry": {}})
+    _assert_refuses(exc_type=PolicyError, msg="has not confirmed", seed={"validation_status": "disagreed"})
 
 
 def test_plan_or_land_refuses_validation_missing():
-    _assert_refuses(exc_type=PolicyError, msg="(none)", seed={"validation_status": None},
-                     fake={"entry": {}})
-
-
-# --- deploy: autoDeploy --------------------------------------------------------------
-
-def test_autodeploy_runs_rollout_with_key():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(entry={"autoDeploy": True,
-                           "deploy": "hyperdx-apply"}) as fx:
-            result = _land(conn)
-        assert fx.calls["rollout_run"][0][0][0] == "hyperdx-apply"
-        assert result.deploy["attempted"] is True and result.deploy["ok"] is True
-        assert result.deploy["key"] == "hyperdx-apply"
-        row = _op_row(conn, kind="deploy")
-        assert row["outcome"] == "done"
-        assert json.loads(row["receipt_json"])["key"] == "hyperdx-apply"
-    finally:
-        conn.close()
-
-
-def test_autodeploy_operation_recorded_before_rollout_runs():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        seen = {}
-
-        def _spy(key, *, timeout_s):
-            row = _op_row(conn, kind="deploy")
-            seen["exists_open"] = row is not None and row["outcome"] is None
-            return rollout.RolloutResult(True, 0, "ok")
-
-        with fakes(entry={"autoDeploy": True,
-                           "deploy": "hyperdx-apply"}, rollout_run_fn=_spy):
-            _land(conn)
-        assert seen.get("exists_open") is True
-    finally:
-        conn.close()
-
-
-def test_autodeploy_expected_alerts_from_contents():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        alert_bytes = json.dumps({"name": "cpu-high", "threshold": 90, "thresholdType": "gt"}).encode()
-        with fakes(entry={"autoDeploy": True,
-                           "deploy": "hyperdx-apply"},
-                   files=[{"filename": "observability/alerts/cpu.json"}],
-                   contents={"observability/alerts/cpu.json": alert_bytes}):
-            result = _land(conn)
-        alerts = result.deploy["expectedAlerts"]
-        assert len(alerts) == 1 and alerts[0]["name"] == "cpu-high" and alerts[0]["threshold"] == 90
-    finally:
-        conn.close()
-
-
-def test_autodeploy_rollout_failure_marks_op_failed():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(entry={"autoDeploy": True,
-                           "deploy": "hyperdx-apply"},
-                   rollout_result=rollout.RolloutResult(False, 1, "boom")):
-            result = _land(conn)
-        assert result.deploy["ok"] is False
-        assert _op_row(conn, kind="deploy")["outcome"] == "failed"
-    finally:
-        conn.close()
-
-
-def test_autodeploy_no_key_declared():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(entry={"autoDeploy": True}):
-            result = _land(conn)
-        assert result.deploy["attempted"] is False
-        assert "no deploy key is declared" in result.deploy["reason"]
-        assert _op_count(conn, kind="deploy") == 0
-    finally:
-        conn.close()
-
-
-def test_autodeploy_key_not_in_allowlist():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(entry={"autoDeploy": True,
-                           "deploy": "not-a-real-key"}):
-            result = _land(conn)
-        assert result.deploy["attempted"] is False
-        assert "not in the allowlist" in result.deploy["reason"]
-        assert _op_count(conn, kind="deploy") == 0
-    finally:
-        conn.close()
-
-
-# --- deploy: deployOnMerge ------------------------------------------------------------
-
-def test_deploy_on_merge_queries_actions_runs():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(entry={"deployOnMerge": True},
-                   merge_resp={"sha": _FULL_SHA},
-                   actions_runs=[{"id": 1, "name": "deploy", "status": "completed",
-                                   "conclusion": "success", "html_url": "https://x"}]):
-            result = _land(conn)
-        assert result.deploy["attempted"] is False
-        assert result.deploy["mergeCommit"] == _FULL_SHA
-        assert len(result.deploy["actionsRuns"]) == 1
-        assert _op_row(conn, kind="deploy")["outcome"] == "done"
-    finally:
-        conn.close()
-
-
-def test_deploy_on_merge_no_runs_leaves_op_open():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(entry={"deployOnMerge": True},
-                   merge_resp={"sha": _FULL_SHA}, actions_runs=[]):
-            result = _land(conn)
-        assert result.deploy.get("note") == "no Actions run visible yet"
-        assert _op_row(conn, kind="deploy")["outcome"] is None
-    finally:
-        conn.close()
-
-
-def test_deploy_on_merge_actions_runs_remote_error():
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(entry={"deployOnMerge": True},
-                   merge_resp={"sha": _FULL_SHA}, actions_runs_error=RemoteError("timeout")):
-            result = _land(conn)
-        assert result.deploy["attempted"] is False
-        assert _op_row(conn, kind="deploy")["outcome"] == "unknown"
-    finally:
-        conn.close()
-
-
-def test_deploy_on_merge_ignored_without_full_sha():
-    # merge_resp's default sha ("mergedsha001") is not 40 hex — deployOnMerge
-    # must never fire off a malformed/short sha.
-    conn = _fresh_ledger()
-    try:
-        _seed_pr_dispatch(conn)
-        with fakes(entry={"deployOnMerge": True}):
-            result = _land(conn)
-        assert result.deploy["attempted"] is False
-        assert "autoDeploy is false" in result.deploy["reason"]
-        assert _op_count(conn, kind="deploy") == 0
-    finally:
-        conn.close()
+    _assert_refuses(exc_type=PolicyError, msg="(none)", seed={"validation_status": None})
 
 
 # --- merge_pr failure handling ----------------------------------------------------------
@@ -988,43 +796,6 @@ def test_mark_ready_for_review_remote_error_marks_op_failed():
         conn.close()
 
 
-# --- collect_expected_alerts, direct -----------------------------------------------------
-
-def test_collect_expected_alerts_empty_without_merge_sha():
-    result = merge.collect_expected_alerts(
-        "jkrumm", "gamma", [{"filename": "observability/alerts/x.json"}], None
-    )
-    assert result == []
-
-
-def test_collect_expected_alerts_skips_unparseable_content():
-    orig = github.contents
-    github.contents = lambda owner, repo, path, *, ref: b"not json"
-    try:
-        result = merge.collect_expected_alerts(
-            "jkrumm", "gamma", [{"filename": "observability/alerts/x.json"}], "a" * 40
-        )
-    finally:
-        github.contents = orig
-    assert result == []
-
-
-def test_collect_expected_alerts_ignores_non_alert_paths():
-    orig = github.contents
-    calls = []
-    def _spy(owner, repo, path, *, ref):
-        calls.append(path)
-        return None
-    github.contents = _spy
-    try:
-        result = merge.collect_expected_alerts(
-            "jkrumm", "gamma", [{"filename": "src/main.py"}], "a" * 40
-        )
-    finally:
-        github.contents = orig
-    assert result == [] and calls == []
-
-
 # --- to_json shapes ------------------------------------------------------------------------
 
 def test_merge_plan_to_json_shape():
@@ -1053,12 +824,12 @@ def test_merge_result_to_json_shape():
     result = merge.MergeResult(
         merged=True, repo_slug="jkrumm/gamma", pull_request=7, title="t", merge_method="squash",
         merge_commit="abc123", branch="dispatch/x", branch_deleted=True,
-        deploy={"attempted": False, "reason": "x"}, merge_op_id="op-1", deploy_op_id=None,
+        merge_op_id="op-1",
     )
     data = result.to_json()
     assert data["merged"] is True
     assert data["mergeCommit"] == "abc123"
-    assert data["deploy"]["attempted"] is False
+    assert "deploy" not in data
     assert "verb" not in data and "ok" not in data
     assert "op-1" not in json.dumps(data)
 

@@ -808,7 +808,7 @@ _CLOSE_ALLOWED_STATES = (
     triage.STATE_FAILED, triage.STATE_QUIET,
 )
 # An episode or operation is in flight for these — `abort` is the verb for
-# that, not `close` (`verifying` is the deploy/liveness window).
+# that, not `close` (`verifying` is the deploy/verify window).
 _CLOSE_INFLIGHT_STATES = (triage.STATE_WORKING, triage.STATE_MERGING, triage.STATE_VERIFYING)
 # The narrower set `abort` discharges for the CLUSTER siblings sharing the
 # cancelled job: a sibling still `working` on that investigation (the caller also

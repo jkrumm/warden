@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 14
+LEDGER_SCHEMA_VERSION = 15
 
 
 class LedgerBehind(RuntimeError):
@@ -605,6 +605,32 @@ ALTER TABLE triage_items ADD COLUMN triage_job TEXT;
 ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 """
 
+# Version 15 — deploy and verify through the repo's own Makefile (agent-platform.md
+# §Warden, Wave 4). Four columns on triage_items describing a `verifying` item's
+# verification, all NULL / 0 on every other row:
+#
+#   verify_started_at  when the verify window opened — set once `make deploy` succeeded
+#     (or the repo has no deploy target, or a host verb restarted the process). NULL on a
+#     `verifying` item means "the deploy has not run yet": the verify pass runs it.
+#   verify_mark        the event's occurrence mark at that moment — what "the item's own
+#     signal recurred since verification started" is a comparison against (NULL: no signal
+#     to watch, so no recurrence check).
+#   verify_failures    consecutive passes in which verification failed (`make verify`
+#     non-zero, or the item's own Kuma monitor not UP after the window); 3 -> verify failure.
+#   verify_result      the last verification result, one short line, for the card/Argo.
+#
+# `liveness_deadline` is no longer written (the window is `verify_started_at` + the loop's
+# VERIFY_WINDOW_HOURS); the column stays, unwritten — no table rebuild for it. Items already
+# `verifying` were deployed by the old rollout, so they start their window now and skip the
+# deploy.
+_MIGRATION_15 = """
+ALTER TABLE triage_items ADD COLUMN verify_started_at TEXT;
+ALTER TABLE triage_items ADD COLUMN verify_mark TEXT;
+ALTER TABLE triage_items ADD COLUMN verify_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE triage_items ADD COLUMN verify_result TEXT;
+UPDATE triage_items SET verify_started_at = updated_at WHERE state = 'verifying';
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -620,6 +646,7 @@ MIGRATIONS: dict[int, str] = {
     12: _MIGRATION_12,
     13: _MIGRATION_13,
     14: _MIGRATION_14,
+    15: _MIGRATION_15,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live

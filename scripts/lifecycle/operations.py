@@ -9,11 +9,9 @@ Four kinds, each one external mutation:
 
   implement  — a sideclaw implement episode (branch + draft PR)
   merge      — ready-for-review + PUT /merge + branch delete
-  deploy     — the rollout after a merge: either the closed-allowlist argv
-               (`autoDeploy`) or the GitHub Actions run a push to the default
-               branch triggers (`deployOnMerge`). Its own write-point since
-               Wave 5 — docs/history/state-log.md §48's "one operation, not two" limitation
-               existed only because of the subprocess boundary.
+  deploy     — `make deploy` in the repo after a merge (lifecycle/rollout.py, run by
+               triage.py's verify pass). A crashed one is simply run again: the
+               repo's deploy target is idempotent by contract.
   host       — an idempotent HOST_VERB_ALLOWLIST argv (triage.py's
                maybe_auto_remediate(), STATE.md's 2026-09-11 owner decision) —
                a process restart run BY warden itself, on the same

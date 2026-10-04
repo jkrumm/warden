@@ -1,8 +1,7 @@
 """policy — origin shape checks, the per-repo in-flight lock.
 
-The Python port of the retired bash CLI's `require_auto_from_item` (639-705),
-`valid_origin` (745-766) and the `repos.<repo>` half of
-`config/triage-policy.json` that `run_deploy_if_enabled` reads (1842-1856).
+The Python port of the retired bash CLI's `require_auto_from_item` (639-705) and
+`valid_origin` (745-766).
 
 There is no repo/tier policy here: sideclaw is the only boundary (it enforces
 its own repo allowlist and tier ceilings and answers a refusal with a 4xx,
@@ -19,7 +18,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from clients.errors import PolicyError, PreconditionError, UsageError
+from clients.errors import PolicyError, UsageError
 
 from . import operations
 
@@ -189,12 +188,3 @@ def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
             f"repo '{repo}' already has an implement episode in flight (operation {ops[0]['op_id']}) — "
             "one at a time per repo"
         )
-
-
-def triage_repo_entry(repo: str, path: Path | None = None) -> dict[str, Any]:
-    p = path or triage_policy_path()
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as err:
-        raise PreconditionError(f"could not read {p}: {err}")
-    return (data.get("repos") or {}).get(repo) or {}

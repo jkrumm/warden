@@ -288,6 +288,7 @@ def test_migrate_adopts_pre_versioned_database():
         "occurrence_mark", "revert_pr", "origin", "max_tier", "brief",
         "origin_channel", "origin_thread_ts", "revision_count", "close_reason", "strikes", "retry_at",
         "root_cause", "duplicate_of", "triage_job", "triage_job_at",
+        "verify_started_at", "verify_mark", "verify_failures", "verify_result",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -1010,7 +1011,7 @@ def test_migration_14_adds_the_four_intake_columns_and_keeps_every_row():
     path = _tmp_path()
     _v13_database(path)
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 14 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     cols = _table_columns(conn, "triage_items")
     assert {"root_cause", "duplicate_of", "triage_job", "triage_job_at"} <= cols, cols
     assert "implement_branch" not in cols, "the branch lives in dispatches.verdict_json, not a second source of truth"
@@ -1022,6 +1023,45 @@ def test_migration_14_adds_the_four_intake_columns_and_keeps_every_row():
         assert row["revision_count"] == 2
     assert rows["note-closed"]["close_reason"] == "resolved"
     assert "duplicate" in ledger.CLOSE_REASONS
+    conn.close()
+
+
+def _v14_database(path):
+    conn = sqlite3.connect(path)
+    conn.executescript(ledger.BASE_SCHEMA)
+    for version in range(2, 15):
+        conn.executescript(ledger.MIGRATIONS[version])
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (14, 'test')")
+    for i, state in enumerate(("verifying", "working", "fixed"), start=1):
+        conn.execute("INSERT INTO events(source, external_id, title, first_seen) VALUES ('s', ?, 't', 'now')",
+                     (f"e{i}",))
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, state, note, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'now', '2030-01-02T00:00:00+00:00')",
+            (i, f"s:e{i}", state, f"note-{state}"))
+    conn.commit()
+    conn.close()
+
+
+def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying_items():
+    path = _tmp_path()
+    _v14_database(path)
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 15 == ledger.LEDGER_SCHEMA_VERSION
+    cols = _table_columns(conn, "triage_items")
+    assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
+    rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
+    assert set(rows) == {"note-verifying", "note-working", "note-fixed"}, rows.keys()
+    # An item already verifying was deployed by the old rollout: its window starts, no redeploy.
+    assert rows["note-verifying"]["verify_started_at"] == "2030-01-02T00:00:00+00:00"
+    for note in ("note-working", "note-fixed"):
+        assert rows[note]["verify_started_at"] is None, note
+    for row in rows.values():
+        assert row["verify_mark"] is None and row["verify_result"] is None and row["verify_failures"] == 0
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    assert _table_columns(fresh, "triage_items") == cols, "a v14-upgraded schema diverges from a fresh one"
+    fresh.close()
     conn.close()
 
 

@@ -11,7 +11,6 @@ stdin.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -31,7 +30,7 @@ _TOKEN_TIMEOUT_S = 15
 
 _PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)$")
 
-# A commit sha reaches check_runs()/actions_runs() off a pull request GitHub
+# A commit sha reaches check_runs() off a pull request GitHub
 # itself returned, but per this repo's own threat model that PR is
 # attacker-influenceable — a malformed value ('../', '?', '#') must never
 # reach a URL path segment. Validated, never quoted: a sha that isn't
@@ -228,29 +227,6 @@ def delete_branch(owner: str, repo: str, branch: str) -> bool:
     quoted_branch = urllib.parse.quote(branch, safe="/")
     status, _ = api("DELETE", f"/repos/{owner}/{repo}/git/refs/heads/{quoted_branch}")
     return status in (204, 422)
-
-
-def contents(owner: str, repo: str, path: str, *, ref: str) -> bytes | None:
-    quoted_path = urllib.parse.quote(path, safe="/")
-    quoted_ref = urllib.parse.quote(ref, safe="")
-    status, body = api("GET", f"/repos/{owner}/{repo}/contents/{quoted_path}?ref={quoted_ref}")
-    if status != 200 or not isinstance(body, dict):
-        return None
-    try:
-        return base64.b64decode(body.get("content", ""))
-    except (ValueError, TypeError):
-        return None
-
-
-def actions_runs(owner: str, repo: str, *, head_sha: str) -> list[dict[str, Any]]:
-    if not _SHA_RE.match(head_sha):
-        raise PreconditionError(f"{head_sha!r} is not a 40-hex commit sha — refusing before the request")
-    status, body = api("GET", f"/repos/{owner}/{repo}/actions/runs?head_sha={head_sha}&per_page=20")
-    if status != 200:
-        raise RemoteError(f"GitHub returned HTTP {status} reading Actions runs for {owner}/{repo}@{head_sha}")
-    if not isinstance(body, dict):
-        raise RemoteError(f"GitHub returned a non-object body reading Actions runs for {owner}/{repo}@{head_sha}")
-    return body["workflow_runs"]
 
 
 def read_issue(owner: str, repo: str, number: int) -> dict[str, Any]:

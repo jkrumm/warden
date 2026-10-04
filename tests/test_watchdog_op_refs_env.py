@@ -43,12 +43,6 @@ assert _spec is not None and _spec.loader is not None
 wp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wp)
 
-TRIAGE_PATH = REPO / "scripts" / "triage.py"
-_t_spec = importlib.util.spec_from_file_location("triage", TRIAGE_PATH)
-assert _t_spec is not None and _t_spec.loader is not None
-triage = importlib.util.module_from_spec(_t_spec)
-_t_spec.loader.exec_module(triage)
-
 failures: list[str] = []
 
 
@@ -107,29 +101,11 @@ def test_a_missing_item_is_still_reported() -> None:
     check("one item named", [e["external_id"] for e in events], ["gone"])
 
 
-def test_the_kuma_trip_path_sources_the_profile_too() -> None:
-    """triage.py's trip path runs from the 600s loop, so an unprofiled call
-    burns the budget ~144 times a day and reports its own 429 as a failed trip."""
-    seen: list[list[str]] = []
-    original = triage.subprocess.run
-    triage.subprocess.run = lambda argv, **k: (
-        seen.append(list(argv)),
-        triage.subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))[1]
-    try:
-        triage._kuma_trip("check", "1")
-    finally:
-        triage.subprocess.run = original
-    check("one ssh invocation", len(seen), 1)
-    check("trip command sources the profile",
-          seen[0][-1].startswith("[ -r ~/.profile ] && . ~/.profile;"), True)
-
-
 def main() -> int:
     tests = [
         ("probe commands source the profile", test_every_probe_sources_the_profile_before_op_run),
         ("poll_op_refs sends the profiled command", test_poll_op_refs_sends_the_profiled_command),
         ("a missing item is still reported", test_a_missing_item_is_still_reported),
-        ("the kuma trip path sources the profile", test_the_kuma_trip_path_sources_the_profile_too),
     ]
     for name, fn in tests:
         print(f"\n{name}")

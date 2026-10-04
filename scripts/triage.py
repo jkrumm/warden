@@ -206,8 +206,6 @@ import sqlite3
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -237,6 +235,7 @@ from lifecycle import (  # noqa: E402
     merge as _merge,
     operations as _operations,
     policy as _policy,
+    rollout as _rollout,
 )
 
 HERMES_HOME = Path.home() / ".hermes"
@@ -319,8 +318,8 @@ GROUPED_TRIAGE_SOURCES = ("slack_alert", "hermes_log")
 #            episode; a real implement_job whose dispatch carries
 #            validation_status blocked/checks_failed is "waiting for revision".
 # `merging`  a pull request exists; its review and the merge gate are running.
-# `verifying` merged; the deploy/liveness window is open. A merge with nothing to
-#            verify goes straight on to `fixed` on the next pass.
+# `verifying` merged; `make deploy` runs, then `make verify` and the item's own signal
+#            stay quiet for the window (maybe_verify()). Nothing to verify -> `fixed` at once.
 # `needs_decision` a verdict carried a question only the owner can answer.
 # `failed`   three infrastructure strikes, a sideclaw refusal, a merge refusal
 #            that will not clear, or revisions exhausted. Never expires, never
@@ -392,17 +391,13 @@ NOTIFY_CLAIM_PREFIX = "posting:"
 NOTIFY_CLAIM_STALE_S = 600
 
 # `triage_items.note` prefixes for the grouped-source resolve paths (see
-# resolve_quiet_grouped()/resolve_recovery_paired()) plus the liveness path
-# (see maybe_check_liveness()). Deliberately NOT "fixed"/"resolved" wording for the first
-# two — a service that is fully down also stops emitting, so silence alone is
-# never proof of a fix; see both functions' own docstrings.
-# LIVENESS_CONFIRMED_NOTE_PREFIX is the one genuine "this is actually fixed"
-# claim in the file, because it is backed by a POSITIVE probe
-# (maybe_check_liveness()'s own gatherer), not silence — it is the only prefix
-# of the three that ever lands on a STATE_FIXED row rather than STATE_QUIET.
+# resolve_quiet_grouped()/resolve_recovery_paired()). Deliberately NOT "fixed"/"resolved"
+# wording — a service that is fully down also stops emitting, so silence alone is
+# never proof of a fix; see both functions' own docstrings. The one genuine
+# "this is actually fixed" claim is VERIFIED_NOTE_PREFIX (maybe_verify()), backed by
+# `make verify` and the deployed change, not silence alone.
 QUIET_RESOLVE_NOTE_PREFIX = "signal quiet since "
 RECOVERY_PAIRED_NOTE_PREFIX = "recovery message observed: "
-LIVENESS_CONFIRMED_NOTE_PREFIX = "liveness confirmed: "
 # _dissolve_cluster()'s own note prefix — the dissolve verdict's text
 # (summary + verdict + recommendation, the same text_blob DISSOLVE_MARKER is
 # matched against), so a `triaged` row's obligation is readable on its own row,
@@ -511,8 +506,8 @@ DISSOLVE_MARKER = "UNRELATED SIGNATURES"
 DAILY_DIGEST_CURSOR_KEY = "triage_failed_digest_date"
 
 # hermes-ops.sh (62 KB) deliberately stayed behind in hermes-agent — the
-# evidence/liveness gatherers shell out to it as a live cross-repo argv, not an
-# oversight. Same env-override shape as GH_BIN above: env var first,
+# own-monitor probe (_gather_kuma_push_fresh) shells out to it as a live cross-repo argv,
+# not an oversight. Same env-override shape as GH_BIN above: env var first,
 # documented default second.
 _env_ops_bin = os.environ.get("WARDEN_HERMES_OPS_BIN")
 _HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_HOME / "scripts" / "hermes-ops.sh")
@@ -528,8 +523,7 @@ _HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_H
 # command (see DESIGN.md § Security model — the episode is not contained,
 # `Bash` unrestricted but a restart still needs judgement about WHICH host and
 # WHICH process, not just an open shell). This is that judgement, encoded
-# once, in code, the same shape LIVENESS_ALLOWLIST
-# already use: a policy rule (see
+# once, in code: a policy rule (see
 # `hostVerbs` in load_policy()) may SELECT a key from this dict, never
 # express an argv of its own — a launchd label or a container/host name
 # reaching config would be DESIGN.md's own C2 in a different costume (see
@@ -560,9 +554,8 @@ HOST_VERB_TIMEOUT = 90
 
 # The push-heartbeat UptimeKuma monitor whose Slack line PROVES a given host
 # verb's target actually came back — lives in CODE, not policy, same
-# reasoning as _gather_argo_commit_live()'s own ARGO_HEALTH_URL: a policy
-# edit must never be able to choose what a positive liveness probe is
-# confirming. Keyed by VERB, not by the triggering item's own signature —
+# reasoning: a policy edit must never be able to choose what a positive liveness
+# probe is confirming. Keyed by VERB, not by the triggering item's own signature —
 # uk:175, uk:185 and the hermes_log `session-is-closed` reconnect signal all
 # map to the SAME restart, so they share the SAME liveness check regardless
 # of which one fired first (see _gather_kuma_push_fresh()'s own docstring for
@@ -578,7 +571,7 @@ HOST_VERB_LIVENESS_MONITOR: dict[str, str] = {
 # `deploy_expect_json="[]"` on success (see maybe_auto_remediate()'s own
 # `monitor_title` branch), and _gather_kuma_push_fresh() unconditionally
 # refuses an empty `expected`, so the item would cycle verifying ->
-# new on every liveness_deadline, forever, never confirmed and never
+# new after every verify window, forever, never confirmed and never
 # reaching a human either — exactly the silently-stuck-item failure
 # DESIGN.md's own deadline table exists to close, just one level removed
 # from what that table actually checks. A missing pairing is a bug in THIS
@@ -594,9 +587,8 @@ if _missing_liveness_monitor:
 
 ALERTS_CHANNEL = "C0AS1LAUQ3C"  # #alerts — same channel watchdog-poll.py's slack_alert source reads
 
-# Every liveness probe is bounded by a hard wall-clock timeout (a hung file read
-# on a stale network mount, or a slow argo API call, must never stall a 10-minute
-# cron).
+# The own-monitor probe is bounded by a hard wall-clock timeout (a hung hermes-ops call
+# must never stall a 10-minute cron).
 EVIDENCE_TIMEOUT = int(os.environ.get("TRIAGE_EVIDENCE_TIMEOUT", "20"))
 
 # --- the auto-implement chain (steps 6-10: verdict -> implement -> validate ->
@@ -618,123 +610,12 @@ EVIDENCE_TIMEOUT = int(os.environ.get("TRIAGE_EVIDENCE_TIMEOUT", "20"))
 # the wrong number.
 _PR_NUMBER_RE = re.compile(r"/pull/(\d+)/?$")
 
-# How long a deployed-but-unverified item waits for a positive liveness signal
-# before this loop gives up and REOPENS it (see maybe_check_liveness()) rather
-# than letting it sit "deployed" forever on a probe that never resolves either
-# way. Comfortably longer than one 10-minute cron cycle so a slow-to-propagate
-# change (HyperDX's own config apply, an alert re-evaluation window) isn't
-# mistaken for a failure.
-LIVENESS_WINDOW_HOURS = float(os.environ.get("TRIAGE_LIVENESS_WINDOW_HOURS", "2"))
-
-HYPERDX_BASE = os.environ.get("TRIAGE_HYPERDX_BASE", "https://hyperdx.jkrumm.com")
-
-
-def _gather_hyperdx_alert_state(expected: list[dict[str, Any]]) -> tuple[bool, str]:
-    """Re-reads every expected alert's LIVE `threshold`/`thresholdType` from
-    HyperDX's own `GET /api/api/v2/alerts` — the SAME REST endpoint
-    vps/scripts/hyperdx-sync.sh's own `export`/`apply` already use (verified
-    by reading that script, never a fabricated endpoint) — and asserts it
-    matches what the merged diff set (captured at deploy time by
-    hermes-cc.sh's `collect_expected_alerts()`, carried on
-    triage_items.deploy_expect_json). Returns (ok, detail); `ok` is a genuine
-    POSITIVE confirmation, never inferred from silence — see the module this
-    is called from for why that distinction matters here specifically."""
-    if not expected:
-        return False, "no expected alert definitions were captured at deploy time"
-    wp = _wp_module()
-    if wp is None:
-        return False, "watchdog-poll.py sibling module did not load — cannot reach HyperDX"
-    token = wp.resolve_secret("HYPERDX_AGENT_ACCESS_KEY")
-    if not token:
-        return False, "HYPERDX_AGENT_ACCESS_KEY unresolved"
-    req = urllib.request.Request(
-        f"{HYPERDX_BASE}/api/api/v2/alerts", headers={"Authorization": f"Bearer {token}"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, OSError) as e:
-        return False, f"HyperDX alerts fetch failed: {e}"
-    live_by_name = {a.get("name"): a for a in (data.get("data") or []) if isinstance(a, dict)}
-    mismatches = []
-    for exp in expected:
-        name = exp.get("name")
-        live = live_by_name.get(name)
-        if live is None:
-            mismatches.append(f"{name}: not found live")
-            continue
-        if live.get("threshold") != exp.get("threshold") or live.get("thresholdType") != exp.get("thresholdType"):
-            mismatches.append(f"{name}: live threshold={live.get('threshold')}/{live.get('thresholdType')} "
-                              f"!= expected {exp.get('threshold')}/{exp.get('thresholdType')}")
-    if mismatches:
-        return False, "; ".join(mismatches)
-    return True, f"{len(expected)} alert definition(s) verified live"
-
-
-ARGO_HEALTH_URL = os.environ.get("TRIAGE_ARGO_HEALTH_URL", "https://argo.jkrumm.com/api/health")
-
-
-def _gather_argo_commit_live(expected: list[dict[str, Any]]) -> tuple[bool, str]:
-    """The deployOnMerge liveness probe for `argo` (item 1b, docs/history/state-log.md §47/§48).
-    Re-reads argo's own `GET /api/health` — tailnet-reachable, no auth, no
-    secret, verified directly against a real merge (jkrumm/argo#16, 56s
-    merge-to-served) — and asserts its `commit` field matches the merge
-    commit sha captured at merge time (poll_validation_jobs()'s deployOnMerge
-    branch, carried on triage_items.deploy_expect_json as the SAME
-    list-of-dicts shape `_gather_hyperdx_alert_state()` above already uses —
-    `[{"commit": sha}]` — see maybe_check_liveness()'s own docstring for why
-    that shape is fixed, not reinvented per gatherer).
-
-    `ok` is a genuine exact-sha-match POSITIVE confirmation, never inferred
-    from the service merely being reachable or having recently restarted. A
-    restart-time-only probe cannot distinguish a landed deploy from a
-    container that bounced for an unrelated reason — docs/history/state-log.md §47's own
-    research-gateway/weatherorb reconnaissance hit exactly this ambiguity, which
-    is why it stopped short of using `lastRestartAt` here. `fixed` is the
-    one state in this file that claims a change actually worked
-    (LIVENESS_CONFIRMED_NOTE_PREFIX is "the one genuine 'this is actually
-    fixed' claim in the file" — see its own comment), and REVIEW.md C3 is
-    about exactly how that claim gets gamed by a weaker probe. `"unknown"`
-    (argo's own placeholder for a build outside CI), a missing `commit`
-    field, a differing sha, a non-200, and unparseable JSON all fall through
-    to the same `!= want` comparison below and read as a genuine mismatch,
-    never as "not sure".
-
-    THE URL LIVES HERE, NOT IN THE POLICY FILE. DESIGN.md principle 4 (the
-    four closed allowlists — see this repo's own AGENTS.md): a policy file
-    may name and parameterise a behaviour, never express one.
-    LIVENESS_ALLOWLIST names a KEY ("argo-commit-live"); this function owns
-    argo's endpoint the same way _gather_hyperdx_alert_state() above owns
-    HYPERDX_BASE — one gatherer per repo is the correct shape here, not a
-    generic URL-fetcher driven by config. This will read as duplication next
-    to that gatherer; it is not — a config-driven URL would let a policy
-    edit alone decide what this loop asks an arbitrary host to confirm,
-    which is exactly what the closed-allowlist principle exists to prevent."""
-    if not expected:
-        return False, "no expected commit was captured at merge time"
-    want = expected[0].get("commit")
-    if not want:
-        return False, "expected deploy record carried no commit sha"
-    req = urllib.request.Request(ARGO_HEALTH_URL)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, OSError) as e:
-        return False, f"argo health fetch failed: {e}"
-    live = data.get("commit") if isinstance(data, dict) else None
-    if not isinstance(live, str) or live != want:
-        return False, f"live commit {str(live)[:12]!r} != expected {str(want)[:12]!r}"
-    return True, f"commit {want[:12]} live"
-
-
-# Same closed-set principle as HOST_VERB_ALLOWLIST above: a
-# repo's `config/triage-policy.json` entry names a `liveness` KEY, never a
-# probe. Seeded with the original `deploy` key plus `argo-commit-live` (item
-# 1b) for the merge-is-deploy path.
-LIVENESS_ALLOWLIST = {
-    "hyperdx-alert-state": _gather_hyperdx_alert_state,
-    "argo-commit-live": _gather_argo_commit_live,
-}
+# How long a deployed item's own signal must stay quiet before it is `fixed` (see
+# maybe_verify()). Comfortably longer than one 10-minute cron cycle so a slow-to-
+# propagate change isn't mistaken for a failure.
+VERIFY_WINDOW_HOURS = float(os.environ.get("TRIAGE_VERIFY_WINDOW_HOURS", "2"))
+# Consecutive verification passes that may fail before the failure is real.
+VERIFY_FAILURE_LIMIT = 3
 
 # scripts/ledger.py — loaded by path, the same mechanism used elsewhere in
 # this file (see the watchdog-poll.py borrow below) because the sibling
@@ -958,11 +839,6 @@ def load_policy() -> dict[str, Any]:
         # as if they were alerts (297 signatures, ~30 permanently open) —
         # routed to `closed(ignored)` (see classify()).
         "ignoreUnstructuredSlackProse": bool(data.get("ignoreUnstructuredSlackProse")),
-        # Per-repo deploy/liveness policy (deploy, autoDeploy, deployOnMerge,
-        # deployByPoller, liveness) — this file reads `liveness`
-        # (maybe_check_liveness()). Malformed entries are left as-is here and
-        # validated at the point each key is actually used.
-        "repos": data.get("repos") if isinstance(data.get("repos"), dict) else {},
     }
 
 
@@ -1091,10 +967,19 @@ _occurrence_mark = _items.occurrence_mark
 # helper's own, written on every transition, never by a caller.
 _SET_STATE_COLUMNS = (
     "note", "dispatch_job", "card_channel", "card_ts", "card_hash", "artifact_url",
-    "pr_url", "implement_job", "validation_job", "liveness_deadline", "deploy_expect_json",
+    "pr_url", "implement_job", "validation_job", "deploy_expect_json",
+    "verify_started_at", "verify_mark", "verify_failures", "verify_result",
     "revert_pr", "close_reason", "strikes", "retry_at", "revision_count",
     "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
 )
+
+# An item entering `verifying` starts with no verification history: no deploy yet
+# (`verify_started_at` NULL), no baseline, no failures. `deploy_expect_json` is the host
+# verb's monitor record — nothing else writes it.
+_VERIFY_RESET: dict[str, Any] = {
+    "verify_started_at": None, "verify_mark": None, "verify_failures": 0, "verify_result": None,
+    "deploy_expect_json": None,
+}
 
 
 class _Coalesce(NamedTuple):
@@ -1815,7 +1700,7 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
     NEITHER EVER CLAIMS A FIX." Nothing shipped by this function's own
     knowledge — the service recovered, by our hand or its own, and a ✅
     message cannot tell the two apart any more than silence can. `fixed` is
-    reserved for maybe_check_liveness()'s positive branch, the one place a
+    reserved for maybe_verify()'s positive branch, the one place a
     POSITIVE PROBE (not an inbound message, not silence) confirms a change
     that actually shipped — see STATE_QUIET's own comment."""
     if dry_run:
@@ -2463,45 +2348,26 @@ def _parse_kuma_heartbeat_rows(rows_text: str) -> list[tuple[dt.datetime, int]]:
 
 
 def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
-    """LIVENESS_ALLOWLIST gatherer for a host-verb remediation (see
-    HOST_VERB_ALLOWLIST/maybe_auto_remediate()): true only if the declared
-    push-heartbeat UptimeKuma monitor recorded an UP heartbeat AFTER the
-    restart operation's own timestamp.
+    """The generic own-monitor probe (maybe_verify()): true only if the push-heartbeat
+    UptimeKuma monitor named in `expected` recorded an UP heartbeat AFTER `since` — the start
+    of the item's verify window. Used for an item whose own signal is a monitor
+    (`_kuma_monitor_title()`) and for a host-verb remediation, whose verb names its monitor in
+    code (HOST_VERB_LIVENESS_MONITOR).
 
-    Reads UptimeKuma's own heartbeat table through hermes-ops.sh (tier A,
-    read-only) rather than #alerts: the monitor this gatherer confirms
-    against never goes DOWN across a `launchctl kickstart` restart (the push
-    window tolerates the brief gap), so no `[<title>] ... Up` recovery line
-    is ever posted to Slack for it to match — the #alerts-based version of
-    this gatherer could therefore never confirm a genuine restart, only ever
-    time out at `liveness_deadline` and reopen the item to `new`, which
-    re-escalates and restarts the same process again after
-    `hostVerbCooldownHours`. Two calls: `monitors --json` resolves the
-    monitor TITLE this item recorded to an id (titles are what
-    HOST_VERB_LIVENESS_MONITOR/deploy_expect_json carry; UptimeKuma's own
-    heartbeat table is keyed by id), then `kuma-db heartbeats <id> --json`
-    reads its last 25 beats. Both go through `_run_verb()` — same
-    never-raise, parse-`--json`-stdout contract every other bounded local
-    probe in this file already uses, reused here rather than duplicated
-    because a spawn failure, a timeout, a non-zero exit or unparsable stdout
-    must all read as "no evidence" for BOTH calls, identically.
+    Reads UptimeKuma's own heartbeat table through hermes-ops.sh (tier A, read-only) rather
+    than #alerts: a push monitor never goes DOWN across a `launchctl kickstart` restart (the
+    push window tolerates the brief gap), so no `[<title>] ... Up` recovery line is ever posted
+    to Slack for an #alerts-based probe to match. Two calls: `monitors --json` resolves the
+    monitor TITLE to an id (UptimeKuma's heartbeat table is keyed by id), then `kuma-db
+    heartbeats <id> --json` reads its last 25 beats. Both go through `_run_verb()` — the
+    never-raise, parse-`--json`-stdout contract every other bounded local probe in this file
+    uses: a spawn failure, a timeout, a non-zero exit or unparsable stdout all read as "no
+    evidence" for BOTH calls, identically.
 
-    `expected` is the same list-of-dicts shape every other LIVENESS_ALLOWLIST
-    gatherer reads off `deploy_expect_json` — here written by
-    maybe_auto_remediate() as `[{"monitorTitle": <str>, "since": <iso>}]` at
-    the moment the item entered `verifying`, never the alert/commit
-    shape the other two gatherers use. Deliberately keyed by VERB
-    (HOST_VERB_LIVENESS_MONITOR), not by the triggering item's own
-    signature — uk:175 (`Hermes Agent`), uk:185 (`Hermes Watchdog - Push`)
-    and the hermes_log `session-is-closed` reconnect signal all resolve to
-    the SAME restart-hermes-gateway verb and must therefore all confirm
-    against the SAME push monitor, regardless of which one happened to fire
-    first. A restart whose triggering item was never a `uk:` monitor at all
-    (a hermes_log-origin remediation) still gets a real monitor title this
-    way — there is no "not a uk: monitor, fall back to silence" case in this
-    design, which is a deliberate simplification from a signature-derived
-    title: this loop is checking whether the RESTARTED PROCESS is alive
-    again, not re-confirming whichever signal happened to trigger it."""
+    `expected` is a list of one dict, `[{"monitorTitle": <str>, "since": <iso>}]`. A host verb is
+    keyed by VERB, not by the triggering item's signature — uk:175, uk:185 and the hermes_log
+    `session-is-closed` signal all resolve to the SAME restart and confirm against the SAME
+    monitor: the loop is checking whether the RESTARTED PROCESS is alive again."""
     if not expected:
         return False, "no expected monitor was captured when this item entered verifying"
     monitor_title = expected[0].get("monitorTitle")
@@ -2512,8 +2378,8 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     if since_parsed is None:
         # Fail CLOSED, not open: an unparsable `since` must never read as
         # "no lower bound, any push confirms it" — that would let a
-        # corrupted or malformed deploy_expect_json record confirm liveness
-        # off a push that has nothing to do with THIS restart.
+        # corrupted or malformed record confirm liveness off a push that has
+        # nothing to do with THIS verify window.
         return False, f"unparsable since timestamp {since!r} — cannot confirm liveness against it"
     monitors_result = _run_verb([str(_HERMES_OPS_BIN), "monitors", "--json"], timeout=EVIDENCE_TIMEOUT)
     if "_error" in monitors_result:
@@ -2541,58 +2407,10 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     return False, f"{len(fresh)} heartbeats since {_fmt_ts(since)}, none up"
 
 
-# Registered here, not in the LIVENESS_ALLOWLIST literal above, because
-# _gather_kuma_push_fresh() needs `_run_verb()`/`_HERMES_OPS_BIN`, both
-# defined below that literal's own line in the file — same "assemble the
-# registry near the functions, not at the top of the module" shape
-# _EVIDENCE_GATHERERS uses for its own four entries, applied to one key
-# instead of a whole dict.
-LIVENESS_ALLOWLIST["kuma-push-fresh"] = _gather_kuma_push_fresh
-
-
-# `mini-checkout-live`: for a repo whose merge IS its deploy through a
-# mini-side poller (research-gateway's mini-deploy.sh, CI-gated, idle-gated),
-# the deploy is confirmed when the poller's own checkout contains the merge
-# commit AND the service answers healthy. Closed map, same principle as every
-# allowlist here: the policy names the repo, code owns the path and the URL.
-MINI_DEPLOYED_CHECKOUTS: dict[str, tuple[Path, str]] = {
-    "research-gateway": (Path.home() / ".research-gateway" / "app", "http://127.0.0.1:7780/health"),
-}
-
-
-def _gather_mini_checkout_live(expected: list[dict[str, Any]]) -> tuple[bool, str]:
-    rec = expected[0] if expected else {}
-    commit, repo = rec.get("commit"), rec.get("repo")
-    entry = MINI_DEPLOYED_CHECKOUTS.get(repo or "")
-    if entry is None:
-        return False, f"no mini deploy checkout is known for {repo!r}"
-    if not isinstance(commit, str) or not _FULL_SHA_RE.match(commit):
-        return False, f"no full merge sha recorded ({commit!r})"
-    checkout, health_url = entry
-    try:
-        proc = subprocess.run(["git", "-C", str(checkout), "merge-base", "--is-ancestor", commit, "HEAD"],
-                              capture_output=True, text=True, timeout=EVIDENCE_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return False, f"could not read {checkout}: {e}"
-    if proc.returncode != 0:
-        return False, f"{repo}'s deploy checkout does not contain {commit[:7]} yet"
-    try:
-        with urllib.request.urlopen(health_url, timeout=EVIDENCE_TIMEOUT) as resp:
-            body = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return False, f"{repo} contains {commit[:7]} but {health_url} did not answer: {e}"
-    if body.get("status") != "ok":
-        return False, f"{repo} contains {commit[:7]} but health says {body.get('status')!r}"
-    return True, f"{repo} deployed {commit[:7]} and answers healthy"
-
-
-LIVENESS_ALLOWLIST["mini-checkout-live"] = _gather_mini_checkout_live
-
-
 def _kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
     """The Uptime Kuma monitor an item's own signal came from, or None: a `uk`
     event's title IS the monitor name; a Kuma message in #alerts carries it
-    as its leading `[Name]`. What `kuma-push-fresh` confirms after a monitor
+    as its leading `[Name]`. What the own-monitor probe (_gather_kuma_push_fresh) confirms after a monitor
     or watchdog fix deploys — the item's own monitor reporting UP again."""
     if event_row is None:
         return None
@@ -3636,9 +3454,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 #
 # Three mutating kinds get an operation: `implement` (opens a branch + draft
 # PR), `merge` (ready-for-review + PUT /merge + branch delete) and `deploy`
-# (the rollout after a merge — its own write-point since Wave 5, STATE.md
-# §48's "one operation, not two" limitation existed only because of the old
-# subprocess boundary). `investigate`/validation-`investigate` episodes are
+# (`make deploy` after a merge, run by maybe_verify()). `investigate`/validation-`investigate` episodes are
 # deliberately excluded — they run read-only, in their own worktree, mutate
 # nothing outside sideclaw, and dispatch-sweep.py's own poll_misses path
 # already covers a forgotten job.
@@ -3663,15 +3479,6 @@ def record_operation(conn: sqlite3.Connection, *, event_id: int, kind: str, repo
 def complete_operation(conn: sqlite3.Connection, op_id: str, *, outcome: str,
                         receipt: str | None = None, note: str | None = None) -> None:
     _operations.complete(conn, op_id, outcome=outcome, receipt=receipt, note=note)
-
-
-# A full git commit sha, lowercase hex, exactly 40 chars — what hermes-cc.sh's
-# own `merge_sha` and `gh`'s `mergeCommit.oid` both produce (docs/history/state-log.md §47's
-# jkrumm/argo#16 verification). Used by the deployOnMerge branches below (item
-# 1b) to refuse a probe with nothing real to compare against, rather than
-# entering `verifying` on a short/garbled/empty value that could never
-# match a live commit and would just sit until liveness_deadline and reopen.
-_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _parse_pr_url(url: str | None) -> tuple[str, str, int] | None:
@@ -3718,41 +3525,6 @@ def _run_gh_pr_view(owner: str, repo: str, pr: int) -> dict[str, Any] | None:
         return None
 
 
-def _run_gh_run_list(owner: str, repo: str, sha: str) -> list[dict[str, Any]] | None:
-    """`gh run list --repo <owner>/<repo> --commit <sha> --json databaseId,name,status,conclusion,createdAt`
-    — read-only, used only by the deployOnMerge path (item 1b, docs/history/state-log.md §47)
-    to attach the GitHub Actions run as the merge's deploy RECEIPT. This is
-    the thing DESIGN.md § Crash recovery asks for and the ssh deploy path
-    structurally cannot provide: `ssh <host> make <target>` returns only an
-    exit code to the (now dead) process that ran it, while an Actions run has
-    an id and is queryable after the fact, by anyone, at any later time.
-
-    Same single-bounded-poll, never-raises shape as _run_gh_pr_view()/
-    `_sideclaw.get()`: `None` means the read itself failed (network,
-    non-zero exit, unparseable stdout) — never guessed at. An EMPTY list is a
-    different, legitimate answer: the workflow is queued by the push and can
-    take a moment to appear, so "no run visible yet" is normal right after a
-    merge and must not be conflated with "the read failed". Callers record
-    whichever of the two they got; neither retries in a loop."""
-    argv = [str(GH_BIN), "run", "list", "--repo", f"{owner}/{repo}", "--commit", sha,
-            "--json", "databaseId,name,status,conclusion,createdAt"]
-    try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
-    except (OSError, subprocess.SubprocessError) as e:
-        print(f"triage: gh run list failed for {owner}/{repo}@{sha}: {e}", file=sys.stderr)
-        return None
-    if r.returncode != 0:
-        print(f"triage: gh run list exited {r.returncode} for {owner}/{repo}@{sha}: "
-              f"{r.stderr.strip()[:300]}", file=sys.stderr)
-        return None
-    try:
-        data = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        print(f"triage: gh run list returned non-JSON for {owner}/{repo}@{sha}: {r.stdout[:300]}", file=sys.stderr)
-        return None
-    return data if isinstance(data, list) else None
-
-
 # An implement operation with no sideclaw job id (a timed-out submit, or a crash between the
 # operation record and the submit's answer) stays open this long before it resolves `unknown`.
 AMBIGUOUS_SUBMIT_GRACE = dt.timedelta(minutes=30)
@@ -3778,8 +3550,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     step it covered: its item strikes (see _strike()) and the step's own poller
     re-submits it, the third strike landing `failed` with the reason."""
     if dry_run:
-        # Every branch below reaches out (sideclaw, `gh pr view`, GitHub
-        # Actions) — the dry-run contract is "never shells out"/"never
+        # Every branch below reaches out (sideclaw, `gh pr view`) — the dry-run contract is "never shells out"/"never
         # calls a remote service", the same reason poll_implement_jobs()/
         # poll_validation_jobs() return outright below.
         return
@@ -3835,54 +3606,12 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                             # "too soon" shape), and ask again next pass.
                             continue
         elif row["kind"] == "deploy":
-            sha = receipt.get("mergeCommit")
-            if sha is None:
-                # The operation row itself carries no receipt (the common
-                # case: deployOnMerge's "left OPEN deliberately" branch in
-                # lifecycle/merge.py never calls operations.complete() at
-                # all, so receipt_json is NULL) — recover the merge commit
-                # from the sibling `merge` operation on the same event_id
-                # and repo, which plan_or_land() always completes, with its
-                # own mergeCommit receipt, BEFORE this deploy operation is
-                # even recorded.
-                sibling = conn.execute(
-                    "SELECT receipt_json FROM operations WHERE event_id=? AND repo=? AND kind='merge' "
-                    "AND outcome='done' ORDER BY outcome_at DESC LIMIT 1",
-                    (row["event_id"], row["repo"]),
-                ).fetchone()
-                sha = _safe_json(sibling["receipt_json"]).get("mergeCommit") if sibling else None
-            if sha is None and receipt.get("key"):
-                # The ssh (autoDeploy) rollout — no remote receipt exists to
-                # ask for; `ssh <host> make <target>` answers only the
-                # (now-dead) process that ran it.
-                outcome = "unknown"
-                note = f"deploy via ssh key {receipt['key']!r} has no remote receipt to reconcile"
-            elif sha is None:
-                outcome = "unknown"
-                note = "deploy operation recorded no mergeCommit, and none could be recovered from its merge operation"
-            else:
-                try:
-                    runs = _github.actions_runs(_github.GH_OWNER, row["repo"], head_sha=sha)
-                except (RemoteError, PreconditionError) as e:
-                    # PreconditionError: `sha` failed actions_runs()'s own
-                    # 40-hex validation — a corrupted receipt, not a remote
-                    # failure, but the same "cannot resolve this pass"
-                    # answer either way.
-                    outcome = "unknown"
-                    note = f"could not read GitHub Actions runs for {sha}: {e}"
-                else:
-                    if runs:
-                        outcome, new_receipt = "done", {**receipt, "mergeCommit": sha, "actionsRuns": runs}
-                    else:
-                        started = _parse_ts(row["started_at"])
-                        if started is not None and (now - started).total_seconds() >= 2 * 3600:
-                            outcome = "failed"
-                            new_receipt = {**receipt, "mergeCommit": sha}
-                            note = "no GitHub Actions run appeared within 2h of the merge"
-                        else:
-                            # Genuinely too soon to tell — leave the row
-                            # open, no write at all, and ask again next pass.
-                            continue
+            # `make deploy` is the repo's idempotent contract and the process that ran it is
+            # gone: there is nothing to ask a remote about, and no strike either — the item is
+            # still `verifying` with no `verify_started_at`, so its verify pass (maybe_verify())
+            # simply runs the deploy again.
+            outcome = "unknown"
+            note = "deploy interrupted before recording its outcome — the verify pass runs it again"
         elif row["kind"] == "merge":
             d = conn.execute(
                 "SELECT job_id, artifact_url FROM dispatches WHERE job_id = "
@@ -3912,35 +3641,15 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                         "UPDATE dispatches SET merged_at=? WHERE job_id=? AND merged_at IS NULL",
                         (_now_iso(now), d["job_id"]),
                     )
-                    repo_policy = (policy.get("repos") or {}).get(row["repo"] or "") or {}
-                    if repo_policy.get("deployOnMerge") and isinstance(sha, str) and _FULL_SHA_RE.match(sha):
-                        # Unlike the ssh path, this repo's deploy DOES have a
-                        # remote receipt to ask for — the Actions run against
-                        # this exact sha. Read what is there; a run that has
-                        # not appeared yet (_run_gh_run_list returns []) is
-                        # recorded as such, not retried in a loop.
-                        runs = _run_gh_run_list(owner, repo_name, sha)
-                        deploy_value: Any = runs if runs is not None else "unknown"
-                    else:
-                        # The ssh deploy half has no remote answer — `ssh
-                        # <host> make <target>` returns only an exit code to
-                        # the (now dead) process that ran it. Recorded
-                        # honestly as "unknown" rather than guessed, per
-                        # DESIGN.md § Crash recovery.
-                        deploy_value = "unknown"
-                    new_receipt = {
-                        "pullRequest": pr, "mergeCommit": sha, "reconciled": True, "deploy": deploy_value,
-                    }
+                    new_receipt = {"pullRequest": pr, "mergeCommit": sha, "reconciled": True}
                 else:
                     outcome = "failed"
                     new_receipt = {"pullRequest": pr, "state": gh_resp.get("state"), "reconciled": True}
         elif row["kind"] == "host":
             # A host verb (`launchctl kickstart`, an ssh `docker restart`)
-            # has no remote receipt to ask for — same shape as the ssh
-            # (autoDeploy) branch above, not the Actions-run branch: a crash
-            # between the subprocess returning and complete_operation()
-            # running genuinely cannot be told apart from one that crashed
-            # BEFORE the verb ran at all. Always unknown, never guessed
+            # has no remote receipt to ask for: a crash between the subprocess
+            # returning and complete_operation() running genuinely cannot be
+            # told apart from one that crashed BEFORE the verb ran at all. Always unknown, never guessed
             # either way — see HOST_VERB_ALLOWLIST's own docstring for why a
             # host verb must stay idempotent, which is what makes "run it
             # again from `needs_decision`" a safe human decision either way.
@@ -3984,9 +3693,9 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
         if outcome == "unknown":
             # A lost in-flight operation is an infrastructure failure: strike it
-            # and let the step's own poller re-submit (see _strike()). A `deploy`
-            # has no poller to re-run it — the verifying item's own liveness probe
-            # is what tells whether it landed — so it only records the outcome.
+            # and let the step's own poller re-submit (see _strike()). A `deploy` is
+            # re-run by the verify pass with no strike (see its branch above), so it
+            # only records the outcome.
             retry = _RECONCILE_RETRY.get(row["kind"])
             if retry is not None:
                 retry_state, retry_columns = retry
@@ -4004,28 +3713,6 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # the item still waits to merge it (docs/history/state-log.md §46's
         # merged-but-recorded-as-failure bug wearing a different hat).
         #
-        # `deploy`, resolved `done`: only worth an item transition when the
-        # item is still sitting in `verifying` with nothing to verify against — a
-        # deployOnMerge repo whose Actions run just appeared. Nothing else
-        # reads a resolved deploy operation directly (dispatch-sweep.py and
-        # the merge path above already moved the item for every other
-        # outcome), so this is the only advancement to make.
-        if row["kind"] == "deploy":
-            item_row = conn.execute(
-                "SELECT state, liveness_deadline FROM triage_items WHERE event_id=?", (row["event_id"],)
-            ).fetchone()
-            repo_entry = (policy.get("repos") or {}).get(row["repo"] or "") or {}
-            if (item_row is not None and item_row["state"] == STATE_VERIFYING
-                    and item_row["liveness_deadline"] is None and repo_entry.get("deployOnMerge")):
-                sha = (new_receipt or {}).get("mergeCommit")
-                deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-                _set_state(conn, row["event_id"], STATE_VERIFYING, now,
-                           liveness_deadline=deadline,
-                           deploy_expect_json=json.dumps([{"commit": sha}] if sha else []),
-                           note=None)
-                conn.commit()
-            continue
-
         # Only `merge` needs the rest of this. An `implement` operation
         # cannot reach `done` here in practice: the only way its receipt
         # carries a jobId is complete_operation() having already been called
@@ -4045,40 +3732,8 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             conn.commit()
             continue
         sha = (new_receipt or {}).get("mergeCommit")
-        repo_entry = (policy.get("repos") or {}).get(row["repo"] or "") or {}
-        if repo_entry.get("deployOnMerge") and isinstance(sha, str) and _FULL_SHA_RE.match(sha):
-            # RECONCILIATION CONVERGES ON THE LIVE PATH, and that is the whole
-            # point of this branch. A deployOnMerge repo's deploy is driven by
-            # GitHub Actions off the push, NOT by the subprocess warden lost —
-            # so a crash here says nothing about whether the deploy ran, and
-            # the probe can still answer. It lands exactly where
-            # poll_validation_jobs() would have put it: `verifying` on the same
-            # `[{"commit": sha}]` shape, with a fresh window measured from NOW
-            # rather than from the lost merge — the probe is idempotent and the
-            # deadline is a bound on how long we wait for it, not a claim about
-            # when the deploy happened.
-            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-            _set_state(conn, row["event_id"], STATE_VERIFYING, now,
-                       liveness_deadline=deadline,
-                       deploy_expect_json=json.dumps([{"commit": sha}]),
-                       note=None)
-        elif repo_entry.get("autoDeploy"):
-            # Merged, and the deploy rode along inside the same lost
-            # subprocess. `ssh <host> make <target>` leaves no remote handle
-            # to ask (docs/history/state-log.md §46), so whether production changed is
-            # genuinely unknown — and `verifying` with nothing to verify would
-            # go straight to `fixed`, claiming a clean landing nobody verified.
-            _set_state(conn, row["event_id"], STATE_FAILED, now,
-                       note=(f"reconciled from GitHub: merged as {sha}, but this repo auto-deploys and the "
-                             f"deploy ran inside the same lost call — whether it completed cannot be "
-                             f"determined remotely. Verify the deployment before acting on this item."))
-        else:
-            # No deploy was configured, so nothing else was supposed to
-            # happen — this is exactly where the live path puts a merge with
-            # no deploy target: `verifying` with nothing to verify, which
-            # maybe_check_liveness() takes to `fixed` on its next pass.
-            _set_state(conn, row["event_id"], STATE_VERIFYING, now,
-                       note=f"reconciled from GitHub: merged as {sha}; no deploy configured for this repo")
+        _set_state(conn, row["event_id"], STATE_VERIFYING, now, **_VERIFY_RESET,
+                   note=f"reconciled from GitHub: merged as {sha}; deploy and verification next")
         conn.commit()
 
 
@@ -4293,11 +3948,14 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             deploy_expect = (
                 json.dumps([{"monitorTitle": monitor_title, "since": _now_iso(now)}]) if monitor_title else "[]"
             )
-            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-            note = f"restarted via {verb_key}; awaiting liveness"
+            note = f"restarted via {verb_key}; verifying"
             for item in claimed:
-                _set_state(conn, item["event_id"], STATE_VERIFYING, now, implement_job=None,
-                           liveness_deadline=deadline, deploy_expect_json=deploy_expect, note=note)
+                # The restart IS the deploy: the verify window opens now, on the verb's own
+                # monitor (`deploy_expect_json`); no baseline mark — the restart may itself blip
+                # the item's own signal.
+                _set_state(conn, item["event_id"], STATE_VERIFYING, now, implement_job=None, note=note,
+                           **{**_VERIFY_RESET, "verify_started_at": _now_iso(now),
+                              "deploy_expect_json": deploy_expect})
         else:
             complete_operation(conn, op_id, outcome="failed", receipt=receipt)
             note = (f"host verb {verb_key!r} failed (exit {result['exitCode']}): "
@@ -4837,23 +4495,9 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
     row but before the item's own state write. Calling merge again would refuse with "already
     merged" and land the item `failed` for a pull request that is
     merged and deploying — the exact misreport docs/history/state-log.md §46 measured. So the
-    post-merge state is derived from the merge operation's receipt instead,
-    the same way the confirmed-merge branch derives it from a fresh result."""
-    op = conn.execute(
-        "SELECT receipt_json FROM operations WHERE event_id=? AND kind='merge' AND outcome='done' "
-        "ORDER BY outcome_at DESC LIMIT 1", (item["event_id"],),
-    ).fetchone()
-    receipt = _safe_json(op["receipt_json"]) if op and op["receipt_json"] else {}
-    sha = receipt.get("mergeCommit")
-    repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
-    if repo_entry.get("deployOnMerge") and isinstance(sha, str) and _FULL_SHA_RE.match(sha):
-        deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-        _set_state(conn, item["event_id"], STATE_VERIFYING, now, liveness_deadline=deadline,
-                   deploy_expect_json=json.dumps([{"commit": sha}]),
-                   note="merged before the loop stopped; state derived from the merge receipt")
-    else:
-        _set_state(conn, item["event_id"], STATE_VERIFYING, now,
-                   note="merged before the loop stopped; state derived from the merge receipt")
+    item goes on to `verifying` exactly as the confirmed-merge branch does."""
+    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_VERIFY_RESET,
+               note="merged before the loop stopped; state derived from the merge receipt")
     conn.commit()
     print(f"triage: {item['signature']} was already merged (event {item['event_id']}) — state derived "
           f"from the merge receipt, merge not repeated", file=sys.stderr)
@@ -5160,13 +4804,13 @@ MERGE_PENDING_NOTE_PREFIX = "waiting for checks: "
 def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                       now: dt.datetime, *, authorized_by: str = "auto-from-item",
                       why: str = "triage auto-merge: step-7 validation confirmed") -> str:
-    """Land a validation-confirmed PR and route the item on the merge/deploy
-    outcome — the tail of poll_validation_jobs(), and the owner's Argo merge.
+    """Land a validation-confirmed PR and route the item on the merge outcome —
+    the tail of poll_validation_jobs(), and the owner's Argo merge.
 
     Returns "merged", "pending", "refused" or "ambiguous" — callers starting from
     a parked state cannot read the outcome off the item's state (§96).
 
-    Outcomes: landed -> `verifying`; checks still running -> unchanged (a note says
+    Outcomes: landed -> `verifying` (deploy and verification are maybe_verify()'s); checks still running -> unchanged (a note says
     so, the item is polled again); a refusal that will not clear by waiting (the
     merge gate, GitHub's rules, a conflict, a closed PR) -> `failed` with the
     reason; a transient GitHub failure -> a strike on `merging`. Every refusal
@@ -5215,8 +4859,7 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
         return "refused"
     except RemoteError as e:
         if e.maybe_mutated:
-            # The merge (and its bundled deploy) may already have
-            # happened. Leave the state as the caller found it:
+            # The merge may already have happened. Leave the state as the caller found it:
             # reconcile_operations() asks GitHub directly on the very
             # next pass, BEFORE this function gets another chance to
             # re-attempt the merge. Striking here would be exactly DESIGN.md
@@ -5229,58 +4872,12 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
         conn.commit()
         return "refused"
     else:
-        # plan_or_land() with confirm=True, dry_run=False always
-        # returns a MergeResult (never a MergePlan) on success — the
-        # operation and its receipt are already recorded, inside
-        # lifecycle/merge.py, by the time control returns here.
-        deploy = result.deploy or {}
-        repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
-        kuma_title = (_kuma_monitor_title(_get_event(conn, item["event_id"]))
-                      if repo_entry.get("liveness") == "kuma-push-fresh" else None)
-        # `verifying` with no liveness window and no expectations is "nothing to
-        # verify": maybe_check_liveness() takes it to `fixed` on its next pass.
-        nothing = {"liveness_deadline": None, "deploy_expect_json": None}
-        if deploy.get("attempted") and deploy.get("ok") and repo_entry.get("liveness") == "kuma-push-fresh" \
-                and kuma_title is None:
-            # Deployed, but this item did not come from a Kuma monitor, so there
-            # is no monitor of its own to confirm against.
-            _set_state(conn, item["event_id"], STATE_VERIFYING, now, **nothing,
-                       note=f"merged and deployed ({deploy.get('key')}); no Kuma monitor of its own to verify")
-        elif deploy.get("attempted") and deploy.get("ok"):
-            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-            expected = (deploy.get("expectedAlerts") or []) if kuma_title is None else [
-                {"monitorTitle": kuma_title, "since": _now_iso(now), "trip": {"status": TRIP_PENDING}}]
-            _set_state(conn, item["event_id"], STATE_VERIFYING, now,
-                       liveness_deadline=deadline,
-                       deploy_expect_json=json.dumps(expected), note=None)
-        elif (repo_entry.get("deployByPoller") and isinstance(result.merge_commit, str)
-              and _FULL_SHA_RE.match(result.merge_commit)):
-            # Merge IS deploy through a mini-side poller (research-gateway):
-            # nothing to run, the liveness probe reads the poller's checkout.
-            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-            _set_state(conn, item["event_id"], STATE_VERIFYING, now,
-                       liveness_deadline=deadline,
-                       deploy_expect_json=json.dumps([{"commit": result.merge_commit, "repo": item["repo"]}]),
-                       note=None)
-        elif (repo_entry.get("deployOnMerge") and isinstance(result.merge_commit, str)
-              and _FULL_SHA_RE.match(result.merge_commit)):
-            # The Actions run identity is already on the `deploy`
-            # operation lifecycle/merge.py just recorded — no second
-            # `_run_gh_run_list()` read needed here.
-            deadline = (now + dt.timedelta(hours=LIVENESS_WINDOW_HOURS)).isoformat()
-            _set_state(conn, item["event_id"], STATE_VERIFYING, now,
-                       liveness_deadline=deadline,
-                       deploy_expect_json=json.dumps([{"commit": result.merge_commit}]), note=None)
-        elif deploy.get("attempted") and not deploy.get("ok"):
-            # autoDeploy ran and failed — this must never read as a
-            # clean merge. A merged PR with a failed rollout is `failed`.
-            output_tail = (deploy.get("output") or "")[-300:]
-            note = (f"merged {result.repo_slug}#{result.pull_request} but the deploy failed "
-                    f"(exit {deploy.get('exitCode')}): {output_tail}")
-            _set_state(conn, item["event_id"], STATE_FAILED, now, note=note)
-        else:
-            reason = deploy.get("reason") or "merged; no deploy configured for this repo"
-            _set_state(conn, item["event_id"], STATE_VERIFYING, now, **nothing, note=reason)
+        # plan_or_land() with confirm=True, dry_run=False always returns a MergeResult
+        # (never a MergePlan) on success — the merge operation and its receipt are already
+        # recorded, inside lifecycle/merge.py. The deploy is the verify pass's job
+        # (maybe_verify()): the item waits in `verifying` with no `verify_started_at`.
+        _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_VERIFY_RESET,
+                   note=f"merged {result.repo_slug}#{result.pull_request}; deploy and verification next")
         conn.commit()
     return "merged"
 
@@ -5547,8 +5144,8 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     same three functions, called once more often, from the one process
     already watching for exactly this signal.
 
-    `maybe_check_liveness()` (step 10) is deliberately NOT part of this
-    chain: its own window is hours (LIVENESS_WINDOW_HOURS), not seconds, so
+    `maybe_verify()` (step 10) is deliberately NOT part of this
+    chain: its own window is hours (VERIFY_WINDOW_HOURS), not seconds, so
     the 600s tick already covers it with room to spare — see docs/history/state-log.md
     §87 for the measurement this rests on."""
     maybe_revise_blocked(conn, policy, now, dry_run=dry_run)
@@ -5557,239 +5154,174 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     poll_validation_jobs(conn, policy, now, dry_run=dry_run)
 
 
-# --- the synthetic trip (§103) -------------------------------------------------
+# --- deploy and verify (step 10) -----------------------------------------------
 #
-# A liveness probe proves the fixed thing is up again. It cannot prove the
-# monitor could still go DOWN: a fix that silently removes detection (a push
-# window stretched past any real outage, a watchdog that no longer pushes on
-# failure) comes back UP and then never fires again — no recurrence, so
-# reopen_if_needed() never sees it. The trip closes that: after a Kuma-verified
-# deploy, a SHADOW copy of the monitor's live detection config (interval, retry
-# interval, retries) is armed with one UP push and left silent; it must go DOWN
-# inside its own window. Only then is the item `fixed`. The productive monitor
-# is never touched and the shadow carries no notification provider, so nothing
-# can page; the shadow is deleted when the trip ends and swept hourly otherwise.
+# A merged item waits in `verifying`, and maybe_verify() — once per loop tick — walks it:
+#
+#   1. DEPLOY (`verify_started_at` NULL): `make deploy` in the repo's checkout, if its Makefile
+#      has the target (lifecycle/rollout.py: fast-forward to origin/<default> first, a typed
+#      deferral when the checkout is not clean or not on it). A deferral or a non-zero exit is
+#      an infrastructure strike (backoff, third -> `failed` carrying the output tail); it never
+#      reverts — it does not prove the change is bad. Success, or no target, opens the window.
+#   2. VERIFY: `make verify` when the repo has the target, and — for an alert item — the item's
+#      own signal quiet for VERIFY_WINDOW_HOURS: its event's occurrence mark unchanged since
+#      the window opened (the same mark reopen_if_needed() reads, so an occurrence reaches both
+#      the same way), a state-source event no longer open, and the item's own Kuma monitor UP
+#      since. An item with no signal (issue, `warden run`) is `fixed` as soon as `make verify`
+#      passes. A host-verb remediation (maybe_auto_remediate()) enters here with its window
+#      already open and its verb's monitor in `deploy_expect_json`.
+#   3. FAILURE: the signal recurred, or verification fails VERIFY_FAILURE_LIMIT passes in a
+#      row -> _on_verify_failure(), the seam the revert step replaces.
 
-TRIP_PENDING, TRIP_ARMED, TRIP_TRIPPED, TRIP_GAP = "pending", "armed", "tripped", "gap"
-TRIP_SLACK_S = 180           # Kuma evaluates push monitors on its own tick
-TRIP_SSH_TIMEOUT = 90        # one bounded CLI call to a non-LLM helper
-TRIP_SWEEP_CURSOR_KEY = "kuma_trip_sweep"
-TRIP_SWEEP_INTERVAL_S = 3600
-KUMA_TRIP_SCRIPT = Path(__file__).resolve().parent / "kuma-trip.py"
-_KUMA_NAME_RE = re.compile(r"^[A-Za-z0-9 ._()/:+\-]{1,120}$")
-TRIP_FAILED_NOTE_PREFIX = "detection no longer fires: "
-
-
-# Same prefix as watchdog-poll.py's OP_REF_PROFILE, and for the same reason: the
-# op-wrapped crons source the profile before `op run` because OP_SOCK is pinned
-# there. A remote `op run` without it has no daemon socket, misses the cache, and
-# spends the shared account budget on every call. The sweep is hourly by cursor,
-# but the cursor is only written on success, so a failing sweep re-attempts on
-# every 600s tick until it lands — and under an exhausted budget `op run` does not
-# fail fast, so TRIP_SSH_TIMEOUT (90s) surfaces it as `trip residue sweep failed:
-# TimeoutError` alongside the direct 429 (warden-loop.err, 2026-09-29). The
-# [ -r ] guard is load-bearing: `.` is a POSIX special builtin, so dash aborts the
-# whole line on an absent profile.
-OP_PROFILE_SRC = "[ -r ~/.profile ] && . ~/.profile; "
+VERIFIED_NOTE_PREFIX = "verified: "
+VERIFY_FAILED_NOTE_PREFIX = "verification failed: "
+VERIFY_RESULT_MAX = 300
 
 
-def _kuma_trip(verb: str, *args: str) -> dict[str, Any]:
-    """One call to scripts/kuma-trip.py on the homelab server. Arguments are
-    validated here and shell-quoted: ssh joins the remote command into a
-    string. Never raises — a failed call is `{"ok": False, "error": ...}`."""
-    import shlex
-    if verb == "start" and not (len(args) == 2 and _KUMA_NAME_RE.match(args[0]) and args[1].isdigit()):
-        return {"ok": False, "error": f"refusing to trip an unvalidated monitor name {args[:1]!r}"}
-    if verb in ("check", "stop") and not (len(args) == 1 and args[0].isdigit()):
-        return {"ok": False, "error": "shadow id must be an integer"}
-    if verb == "sweep" and not all(a.isdigit() for a in args):
-        return {"ok": False, "error": "keep ids must be integers"}
-    remote = (OP_PROFILE_SRC + "cd ~/homelab && op run --env-file=.env.tpl -- uptime-kuma/.venv/bin/python - "
-              + " ".join(shlex.quote(a) for a in (verb, *args)))
+def _repo_checkout(item: sqlite3.Row) -> Path | None:
     try:
-        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "homelab", remote],
-                              input=KUMA_TRIP_SCRIPT.read_text(), capture_output=True, text=True,
-                              timeout=TRIP_SSH_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return {"ok": False, "error": f"ssh homelab failed: {e}"}
-    line = next((ln for ln in reversed(proc.stdout.splitlines()) if ln.strip().startswith("{")), "")
-    try:
-        return json.loads(line)
-    except ValueError:
-        return {"ok": False, "error": f"no result (exit {proc.returncode}): {proc.stderr.strip()[-300:]}"}
+        return _policy.repo_cwd(item["repo"] or "")
+    except UsageError:
+        return None
 
 
-def _advance_trip(item: sqlite3.Row, expected: list[dict[str, Any]], now: dt.datetime) -> tuple[str, str]:
-    """One step of the trip for an item whose liveness just confirmed.
-    Mutates `expected[0]["trip"]` in place and returns (verdict, detail):
-    `fixed` (the shadow went DOWN, or the monitor type is a named gap),
-    `wait` (armed, still inside its window, or a transient failure), or
-    `reopen` (no DOWN inside the window — the fix removed detection)."""
-    rec = expected[0]
-    trip = rec.setdefault("trip", {"status": TRIP_PENDING})
-    status = trip.get("status")
-    if status == TRIP_PENDING:
-        res = _kuma_trip("start", rec["monitorTitle"], str(item["event_id"]))
-        if res.get("gap"):
-            trip.update(status=TRIP_GAP, gap=res["gap"])
-            return "fixed", f"no synthetic trip — named gap: {res['gap']}"
-        if not res.get("ok"):
-            trip["lastError"] = res.get("error")
-            return "wait", f"trip not armed yet: {res.get('error')}"
-        window = res["interval"] + res["retryInterval"] * res["maxretries"] + TRIP_SLACK_S
-        trip.update(status=TRIP_ARMED, shadowId=res["shadowId"], window=window,
-                    armedAt=now.isoformat(), deadline=(now + dt.timedelta(seconds=window)).isoformat())
-        return "wait", f"trip armed on a shadow of {rec['monitorTitle']} (window {window}s)"
-    if status == TRIP_ARMED:
-        res = _kuma_trip("check", str(trip["shadowId"]))
-        overdue = now >= (_parse_ts(trip.get("deadline")) or now)
-        if res.get("ok") and res.get("down"):
-            _kuma_trip("stop", str(trip["shadowId"]))
-            took = int((now - (_parse_ts(trip.get("armedAt")) or now)).total_seconds())
-            trip.update(status=TRIP_TRIPPED, trippedAfterS=took)
-            return "fixed", (f"synthetic trip: a silent shadow of {rec['monitorTitle']} went DOWN within "
-                             f"{took}s (window {trip['window']}s) — detection still fires")
-        if not overdue:
-            return "wait", "trip armed, window still open"
-        if res.get("ok") and res.get("exists") is False:
-            # A shadow that is GONE is not a shadow that stayed up. The residue
-            # sweep, a hand in the Kuma UI or a restore can delete it, and none
-            # of those is an observation of the deployed detection config — so
-            # this must never read as "detection no longer fires". Same door as
-            # a read error: retry until the item's own liveness window closes,
-            # and only then "unproven, not fixed".
-            if now < (_parse_ts(item["liveness_deadline"]) or now):
-                trip["lastError"] = "shadow gone (deleted or swept) before its window closed"
-                return "wait", "trip shadow gone, retrying"
-            _kuma_trip("stop", str(trip["shadowId"]))
-            return "reopen", (f"{TRIP_FAILED_NOTE_PREFIX}the shadow of {rec['monitorTitle']} was gone before "
-                              f"its window closed (deleted or swept) — unproven, not fixed")
-        if not res.get("ok"):
-            # A read error is not an answer (Kuma's socket API times out now and
-            # then — seen live during the §103 proof). Retry until the item's own
-            # liveness window closes; only then is "could not read" the verdict.
-            if now < (_parse_ts(item["liveness_deadline"]) or now):
-                trip["lastError"] = res.get("error")
-                return "wait", f"trip check failed, retrying: {res.get('error')}"
-            _kuma_trip("stop", str(trip["shadowId"]))
-            return "reopen", (f"{TRIP_FAILED_NOTE_PREFIX}could not read the shadow of {rec['monitorTitle']} "
-                              f"before the liveness window closed ({res.get('error')}) — unproven, not fixed")
-        _kuma_trip("stop", str(trip["shadowId"]))
-        return "reopen", (f"{TRIP_FAILED_NOTE_PREFIX}a silent shadow of {rec['monitorTitle']} with the deployed "
-                          f"config did not go DOWN within {trip['window']}s. The fix is a finding: whatever it "
-                          f"changed, this monitor no longer detects the failure it exists for.")
-    return "fixed", f"synthetic trip already {status}"
+def _tail_for_note(text: str, limit: int = 120) -> str:
+    collapsed = " ".join(text.split())
+    return collapsed[-limit:] if collapsed else "(no output)"
 
 
-def sweep_trip_residue(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
-    """Hourly: delete every `warden-trip:` shadow in Kuma that no pending trip
-    still owns — a crash between arm and stop must not leave one behind."""
-    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (TRIP_SWEEP_CURSOR_KEY,)).fetchone()
-    last = _parse_ts(row["updated_at"]) if row else None
-    if dry_run or (last is not None and (now - last).total_seconds() < TRIP_SWEEP_INTERVAL_S):
-        return
-    keep = []
-    for r in conn.execute("SELECT deploy_expect_json FROM triage_items WHERE state=?", (STATE_VERIFYING,)):
-        for rec in _safe_json_list(r["deploy_expect_json"]):
-            trip = rec.get("trip") or {}
-            if trip.get("status") == TRIP_ARMED and isinstance(trip.get("shadowId"), int):
-                keep.append(str(trip["shadowId"]))
-    res = _kuma_trip("sweep", *keep)
-    if not res.get("ok"):
-        print(f"triage: trip residue sweep failed: {res.get('error')}", file=sys.stderr)
-        return
-    if res.get("removed"):
-        print(f"triage: removed orphaned trip shadow(s) {res['removed']}", file=sys.stderr)
-    conn.execute(
-        "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (TRIP_SWEEP_CURSOR_KEY, json.dumps(res), _now_iso(now)),
-    )
+def _on_verify_failure(conn: sqlite3.Connection, item: sqlite3.Row, evidence: str, now: dt.datetime) -> None:
+    """The one door every verification failure goes through. For now the item goes back to
+    `triaged` carrying the evidence in its note, the shape the old liveness reopen had; the
+    revert step replaces this body (item back to `working` through a revert PR)."""
+    _set_state(conn, item["event_id"], STATE_TRIAGED, now, expect_state=STATE_VERIFYING,
+               note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence}", **_VERIFY_RESET)
     conn.commit()
 
 
-def maybe_check_liveness(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
-                          *, dry_run: bool) -> None:
-    """Step 10. Walks every `verifying` item. One with nothing to verify (a merge
-    with no deploy configured: no liveness window, no expectations) goes to
-    `fixed` on this pass — W4 adds real signal-only verification; there is no
-    timer here. Otherwise the item must not close because the alert went quiet —
-    a fully-down service is also quiet, same principle as
-    resolve_quiet_grouped()/resolve_recovery_paired() above. Runs the
-    repo's declared `liveness` probe (config/triage-policy.json's
-    `repos.<repo>.liveness`, same closed-allowlist shape as `verb`/
-    `evidence`) against the alert definition(s) captured at deploy time.
-    Only a genuine POSITIVE match resolves the item. Past
-    `liveness_deadline` with no positive match, the item REOPENS to `new`,
-    carrying the full history (the pull request, the last liveness check) —
-    the exact context that was missing when the same alert was
-    re-diagnosed 61 times before this file existed."""
-    items = conn.execute("SELECT * FROM triage_items WHERE state=?", (STATE_VERIFYING,)).fetchall()
-    for item in items:
-        if item["liveness_deadline"] is None and not item["deploy_expect_json"]:
-            if dry_run:
-                print(f"[dry-run] would mark {item['signature']} fixed: merged, nothing to verify")
-                continue
-            _set_state(conn, item["event_id"], STATE_FIXED, now)
-            conn.commit()
-            _notify_item(conn, policy, item["event_id"])
-            continue
-        repo_entry = (policy.get("repos") or {}).get(item["repo"] or "") or {}
-        key = repo_entry.get("liveness")
-        gatherer = LIVENESS_ALLOWLIST.get(key) if key else None
-        try:
-            expected = json.loads(item["deploy_expect_json"] or "[]")
-        except json.JSONDecodeError:
-            expected = []
+def _start_verify(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, note: str) -> None:
+    """Open the verify window: stamp its start and, for an alert item, the event's occurrence
+    mark every later occurrence is compared against."""
+    mark = _occurrence_mark(_get_event(conn, item["event_id"])) if item["origin"] == "alert" else None
+    _set_state(conn, item["event_id"], STATE_VERIFYING, now, expect_state=STATE_VERIFYING, note=note,
+               verify_started_at=_now_iso(now), verify_mark=mark, verify_failures=0, verify_result=None,
+               strikes=0, retry_at=None)
+    conn.commit()
 
-        if gatherer is None:
-            live_ok, detail = False, f"no liveness key declared for repo {item['repo']!r}"
-        else:
-            ran_ok, result = _run_bounded(gatherer, expected, timeout=EVIDENCE_TIMEOUT)
-            live_ok, detail = result if ran_ok else (False, f"liveness probe error: {result}")
 
-        now_iso = _now_iso(now)
-        if live_ok:
-            if dry_run:
-                print(f"[dry-run] would resolve {item['signature']} on confirmed liveness: {detail}")
-                continue
-            if expected and isinstance(expected[0], dict) and "trip" in expected[0]:
-                verdict, trip_detail = _advance_trip(item, expected, now)
-                conn.execute("UPDATE triage_items SET deploy_expect_json=?, updated_at=? WHERE event_id=?",
-                             (json.dumps(expected), now_iso, item["event_id"]))
-                conn.commit()
-                if verdict == "wait":
-                    continue
-                if verdict == "reopen":
-                    _set_state(conn, item["event_id"], STATE_TRIAGED, now,
-                               note=f"PR: {item['pr_url'] or '(none)'} — {trip_detail}")
-                    conn.commit()
-                    continue
-                detail = f"{detail}; {trip_detail}"
-            note = f"{LIVENESS_CONFIRMED_NOTE_PREFIX}{detail}"
-            # -> STATE_FIXED, the only producer of it in this file: a change
-            # landed (merged + deployed) AND a live probe confirmed it, the
-            # one place a POSITIVE PROBE — not silence, not an inbound
-            # message — backs the claim.
-            _set_state(conn, item["event_id"], STATE_FIXED, now, note=note)
-            conn.commit()
-            _notify_item(conn, policy, item["event_id"])
-            continue
+def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> sqlite3.Row | None:
+    """The deploy stage. Returns the item with its verify window open, or None when it has to
+    wait (a strike's backoff) or just struck."""
+    event_id = item["event_id"]
+    retry_at = _parse_ts(item["retry_at"])
+    if retry_at is not None and now < retry_at:
+        return None
+    cwd = _repo_checkout(item)
+    if cwd is None or not _rollout.has_target(cwd, "deploy"):
+        _start_verify(conn, item, now, note="no deploy target; verifying")
+        return _get_item(conn, event_id)
 
-        deadline = _parse_ts(item["liveness_deadline"])
-        if deadline is not None and now < deadline:
-            continue  # still inside the window — try again next run
-        if dry_run:
-            print(f"[dry-run] would REOPEN {item['signature']} — liveness never confirmed: {detail}")
-            continue
-
-        # The row goes back to `triaged` — its repo is already decided, so it skips the triage
-        # step — which Slack never hears about; the reason rides on its note.
-        history = (f"PR: {item['pr_url'] or '(none)'} — reopened, liveness never confirmed "
-                   f"within the window. Last check: {detail}. Still failing as of "
-                   f"{_fmt_ts(now_iso)}.")
-        _set_state(conn, item["event_id"], STATE_TRIAGED, now, note=history)
+    # Recorded before the deploy runs (DESIGN.md § Crash recovery): a crash leaves it open and
+    # reconcile_operations() resolves it `unknown` so this stage simply runs again.
+    op_id = record_operation(conn, event_id=event_id, kind="deploy", repo=item["repo"],
+                              authorized_by="auto-verify")
+    result = _rollout.deploy(cwd)
+    if isinstance(result, _rollout.Deferred):
+        complete_operation(conn, op_id, outcome="failed", receipt=json.dumps({"deferred": result.reason}))
+        _strike(conn, event_id, now, f"deploy deferred: {result.reason}",
+                retry_state=STATE_VERIFYING, expect_state=STATE_VERIFYING)
         conn.commit()
+        return None
+    receipt = json.dumps({"exitCode": result.exit_code, "output": result.tail})
+    if not result.ok:
+        complete_operation(conn, op_id, outcome="failed", receipt=receipt)
+        _strike(conn, event_id, now, f"deploy failed (exit {result.exit_code}): {_tail_for_note(result.tail)}",
+                retry_state=STATE_VERIFYING, expect_state=STATE_VERIFYING)
+        conn.commit()
+        return None
+    complete_operation(conn, op_id, outcome="done", receipt=receipt)
+    _start_verify(conn, item, now, note="deployed via make deploy; verifying")
+    return _get_item(conn, event_id)
+
+
+def _signal_not_quiet(item: sqlite3.Row, event: sqlite3.Row) -> list[str]:
+    """Why the item's own signal is not quiet at the end of its window, empty when it is."""
+    problems: list[str] = []
+    if event["source"] not in GROUPED_TRIAGE_SOURCES and event["resolved_at"] is None:
+        problems.append(f"{event['title']} is still firing")
+    records = _safe_json_list(item["deploy_expect_json"])
+    title = (records[0].get("monitorTitle") if records else None) or _kuma_monitor_title(event)
+    if title:
+        ran_ok, result = _run_bounded(_gather_kuma_push_fresh,
+                                      [{"monitorTitle": title, "since": item["verify_started_at"]}],
+                                      timeout=EVIDENCE_TIMEOUT)
+        live_ok, detail = result if ran_ok else (False, f"monitor probe error: {result}")
+        if not live_ok:
+            problems.append(f"own monitor not UP: {detail}")
+    return problems
+
+
+def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row, now: dt.datetime) -> None:
+    event_id = item["event_id"]
+    event = _get_event(conn, event_id)
+    signal = item["origin"] == "alert" and event is not None
+    started = _parse_ts(item["verify_started_at"]) or now
+    window_over = now - started >= dt.timedelta(hours=VERIFY_WINDOW_HOURS)
+
+    if signal and item["verify_mark"] is not None and _occurrence_mark(event) != item["verify_mark"]:
+        _on_verify_failure(conn, item, f"own signal recurred while verifying: {event['title']}", now)
+        return
+
+    problems: list[str] = []
+    verify_note = "no make verify target"
+    cwd = _repo_checkout(item)
+    if cwd is not None and _rollout.has_target(cwd, "verify"):
+        res = _rollout.verify(cwd)
+        if res.ok:
+            verify_note = "make verify passed"
+        else:
+            problems.append(f"make verify failed (exit {res.exit_code}): {_tail_for_note(res.tail)}")
+    if signal and window_over:
+        problems += _signal_not_quiet(item, event)
+
+    if problems:
+        failures = item["verify_failures"] + 1
+        evidence = "; ".join(problems)
+        if failures >= VERIFY_FAILURE_LIMIT:
+            _on_verify_failure(conn, item, f"{failures} consecutive failing passes — {evidence}", now)
+            return
+        _set_state(conn, event_id, STATE_VERIFYING, now, expect_state=STATE_VERIFYING,
+                   verify_failures=failures, verify_result=evidence[:VERIFY_RESULT_MAX])
+        conn.commit()
+        return
+    if signal and not window_over:
+        _set_state(conn, event_id, STATE_VERIFYING, now, expect_state=STATE_VERIFYING, verify_failures=0,
+                   verify_result=f"{verify_note}; signal window open ({VERIFY_WINDOW_HOURS:g}h)")
+        conn.commit()
+        return
+
+    note = f"{VERIFIED_NOTE_PREFIX}{verify_note}" + (f"; own signal quiet {VERIFY_WINDOW_HOURS:g}h" if signal else "")
+    moved = _set_state(conn, event_id, STATE_FIXED, now, expect_state=STATE_VERIFYING, note=note,
+                       verify_failures=0, verify_result=note)
+    conn.commit()
+    if moved:
+        _notify_item(conn, policy, event_id)
+
+
+def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
+    """Step 10 — see the block comment above. Dry-run prints what each item would run and
+    shells out to nothing."""
+    for item in conn.execute("SELECT * FROM triage_items WHERE state=? ORDER BY event_id",
+                             (STATE_VERIFYING,)).fetchall():
+        if dry_run:
+            what = "make deploy, then make verify" if item["verify_started_at"] is None else "make verify"
+            print(f"[dry-run] would run {what} for {item['signature']} ({item['repo']})")
+            continue
+        if item["verify_started_at"] is None:
+            item = _deploy_item(conn, item, now)
+            if item is None:
+                continue
+        _verify_item(conn, policy, item, now)
 
 
 # --- failed digest -------------------------------------------------------------
@@ -6206,7 +5738,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     # Steps 6-10 — verdict -> implement -> validate -> merge -> deploy ->
     # verify. Each is a poll-once-per-run step over its own state, so this
-    # ordering (implement before validation before liveness) lets an item
+    # ordering (implement before validation before verify) lets an item
     # that crossed a stage earlier THIS SAME RUN also be picked up by the
     # next stage rather than waiting a full 10 minutes — never required for
     # correctness (each stage re-derives its own eligibility from the DB
@@ -6214,8 +5746,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # dispatch-sweep.py's own 300s call, via advance_implement_chain() — see
     # that function's docstring for why the same code runs from both places.
     advance_implement_chain(conn, policy, now, dry_run=dry_run)
-    maybe_check_liveness(conn, policy, now, dry_run=dry_run)
-    sweep_trip_residue(conn, now, dry_run=dry_run)
+    maybe_verify(conn, policy, now, dry_run=dry_run)
 
     for _key, members in _cluster_groups(conn).items():
         members = sorted(members, key=lambda r: r["event_id"])

@@ -50,11 +50,7 @@
     "`verb` names a KEY of HOST_VERB_ALLOWLIST in scripts/triage.py, never an argv, and an unknown key drops the",
     "rule at load. maybe_auto_remediate() also needs the item's own investigation verdict to rank at or above",
     "`hostVerbMinConfidence` (high/medium/low, default medium). `hostVerbCooldownHours` (default 6) and",
-    "`hostVerbMaxAttempts` (default 2) bound repeats of one verb.",
-    "",
-    "`repos` (object, keyed by repo name) is per-repo deploy/liveness policy for what happens after a PR merged:",
-    "`deploy` and `liveness` name KEYS from scripts/clients/rollout.py and LIVENESS_ALLOWLIST, `autoDeploy`,",
-    "`deployOnMerge` and `deployByPoller` are flags. Wave 4 replaces it with `make deploy` and `make verify`."
+    "`hostVerbMaxAttempts` (default 2) bound repeats of one verb."
   ],
   "cardChannel": "C0BVDE5R562",
   "minOccurrences": 3,
@@ -65,38 +61,6 @@
   "hostVerbMaxAttempts": 2,
   "hostVerbMinConfidence": "medium",
   "ignoreUnstructuredSlackProse": true,
-  "repos": {
-    "vps": {
-      "deploy": "hyperdx-apply",
-      "autoDeploy": true,
-      "liveness": "hyperdx-alert-state"
-    },
-    "argo": {
-      "deployOnMerge": true,
-      "liveness": "argo-commit-live"
-    },
-    "hermes-agent": {
-      "_note": "`liveness` is here only so a host-verb restart (maybe_auto_remediate(), STATE_LIVENESS_PENDING) has a repo-scoped key to read; hermes-agent has no deploy.",
-      "liveness": "kuma-push-fresh"
-    },
-    "homelab": {
-      "_note": "\u00a793 \u2014 a Kuma monitor fix lands, `uk-sync` applies it on the homelab server, and the item's own monitor must report UP afterwards (kuma-push-fresh). homelab has no PR-time CI; the gate is the independent step-7 review, which blocks a change that loosens detection without evidence (VALIDATION_GATE_QUESTIONS).",
-      "deploy": "uk-sync",
-      "autoDeploy": true,
-      "liveness": "kuma-push-fresh"
-    },
-    "weatherorb": {
-      "_note": "`weatherorb-pull` fast-forwards the live checkout AND kickstarts tileserver/sync, so a merge is the rollout for the periodic jobs and the long-running ones alike; the WeatherOrb Watchdog push monitor reporting UP plus its synthetic trip (\u00a7103) is the proof for a uk-origin item, an issue-origin item lands `merged` with no monitor of its own. No PR-time CI; the step-7 review is the gate.",
-      "deploy": "weatherorb-pull",
-      "autoDeploy": true,
-      "liveness": "kuma-push-fresh"
-    },
-    "research-gateway": {
-      "_note": "\u00a793 \u2014 merge IS deploy: the mini's CI-gated, idle-gated poller (scripts/mini-deploy.sh) rolls master out, and mini-checkout-live confirms the poller's checkout carries the merge commit and /health answers ok. CI runs on push to master only (no PR checks), so the implement tier's own pre-push checks plus the step-7 review gate the merge, and CI still gates the deploy: a red master never reaches the checkout, liveness times out, the item reopens with the PR in its history.",
-      "deployByPoller": true,
-      "liveness": "mini-checkout-live"
-    }
-  },
   "hostVerbs": [
     {
       "match": "uk:hermes-agent",
