@@ -99,7 +99,7 @@ print("\n2. a real 404 for the configured brain model is still reported")
 got = poll([REAL_LINE], "real")
 check("one signature", len(got), 1)
 check("keyed on the streaming line", list(got)[0].startswith(
-    "agent-chat-completion-helpers-streaming-failed-before-delivery-error-code-404-no-suitable-backend"), True)
+    "agent-chat-completion-helpers-streaming-failed-before-delivery-error-code-no-suitable-backend"), True)
 check("carries the real model id", "deepseek-v4.1-flash'" in list(got.values())[0]["payload"]["first_line"], True)
 
 print("\n3. an unrelated ERROR is untouched")

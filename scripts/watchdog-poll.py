@@ -151,34 +151,6 @@ OP_REF_HOSTS: dict[str, str] = {
 OP_RUN_MISSING_ITEM_RE = re.compile(r"could not find item (\S+) in vault")
 OP_RUN_MISSING_UUID_RE = re.compile(r"could not resolve item UUID for item ([^:\s]+)")
 
-# Timestamp shapes to strip from the `raw:` op-refs fallback signature (see
-# poll_op_refs()) BEFORE it reaches normalize_title() — deliberately NOT a
-# change to normalize_title() itself, which every other source depends on
-# unchanged. Without this, a real op run error like "[ERROR] 2026/09/01
-# 15:00:34 (504) Unknown: An unknown error occurred." mints a fresh
-# external_id every 30-min poll (the timestamp differs each time), so
-# reconcile()'s disappearance logic resolves the "old" row and inserts a
-# "new" one every cycle — the DB reports the dangling ref clearing every 30
-# minutes while it stays dead indefinitely. Matches an ISO-ish date
-# (dash OR slash separated) with an optional attached time, and separately
-# any standalone run of 6+ digits (epoch-like numbers, long ids) — applied
-# on the RAW pre-normalization text, since the timestamp appears in its
-# original punctuated form there, not yet collapsed to normalize_title()'s
-# dash-joined shape.
-OP_REFS_TIMESTAMP_RE = re.compile(
-    r"\d{4}[-/]\d{2}[-/]\d{2}(?:[ T]\d{2}[:-]\d{2}[:-]\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
-)
-OP_REFS_LONG_DIGIT_RUN_RE = re.compile(r"\d{6,}")
-
-
-def _strip_op_refs_timestamps(text: str) -> str:
-    """See OP_REFS_TIMESTAMP_RE above — used ONLY by poll_op_refs()'s `raw:`
-    fallback dedup key, never by normalize_title()'s other callers."""
-    text = OP_REFS_TIMESTAMP_RE.sub(" ", text)
-    text = OP_REFS_LONG_DIGIT_RUN_RE.sub(" ", text)
-    return text
-
-
 # op:// refs the watchdog needs. When it runs inside the gateway, the cron
 # scheduler's subprocess sanitizer (tools/environments/local.py) strips high-value
 # secrets such as GITHUB_TOKEN from the inherited env, and there is no plaintext
@@ -525,7 +497,7 @@ def poll_hermes_logs(conn: sqlite3.Connection, now: dt.datetime, now_iso: str) -
                 sig_text = f"{module}: {msg[:120]}"
             else:
                 sig_text = line[:160]
-            key = normalize_title(sig_text)
+            key = fingerprint(sig_text)
             if not key:
                 continue
             g = sigs.setdefault(key, {
@@ -594,11 +566,12 @@ def poll_op_refs(host: str, remote_cmd: str) -> tuple[list[dict[str, Any]], bool
         # op failed for a reason we can't name a specific item for — degrade to
         # host + the raw error's first line, never to a bare boolean.
         first_line = next((ln.strip() for ln in out.splitlines() if ln.strip()), "op run failed (no output)")
-        # The dedup key strips timestamps (see OP_REFS_TIMESTAMP_RE) so the
-        # SAME underlying error mints the SAME external_id every poll — the
-        # displayed title below deliberately keeps the raw, timestamped
-        # first_line, only the dedup key is normalized differently.
-        key = normalize_title(_strip_op_refs_timestamps(first_line))[:80] or "unknown"
+        # The dedup key is the event fingerprint (timestamps, ids and numbers
+        # stripped) so the SAME underlying error mints the SAME external_id every
+        # poll — a real "[ERROR] 2026/09/01 15:00:34 (504) Unknown: …" would
+        # otherwise read as the dangling ref clearing and reappearing every 30
+        # minutes. The displayed title below keeps the raw first_line.
+        key = fingerprint(first_line)[:80] or "unknown"
         return [{
             "external_id": f"raw:{key}",
             "title": f"1Password refs unresolved on {host} (.env.tpl) — {first_line[:160]}",
@@ -844,11 +817,59 @@ def normalize_title(text: str) -> str:
     return _DEDUP_NORMALIZE.sub("-", text.lower()).strip("-")[:120]
 
 
+# The event fingerprint — the identity of every grouped/derived source (slack_alert,
+# slack_update, hermes_log, the op-refs `raw:` key): the title with everything that
+# varies between two occurrences of the SAME event stripped, so the same line from
+# two log files, or the same alert an hour later, is one event. State sources
+# (uk monitor id, docker `unhealthy:{name}`, github `repo#num`) keep their native
+# ids; they are not fingerprinted.
+#
+# Order matters: each class removes the longer shape before a shorter rule can
+# half-eat it (a UUID or ISO timestamp is gone before the digit-run rule runs; a
+# URL's path before the path rule). Every class is replaced by a space, never
+# deleted, so neighbours cannot fuse into a new token.
+_FP_URL_PATH_RE = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^/\s'\"`)\]>]*)/[^\s'\"`)\]>]*", re.I)
+_FP_UUID_RE = re.compile(
+    r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])", re.I)
+_FP_ISO_TS_RE = re.compile(
+    r"\d{4}[-/]\d{2}[-/]\d{2}(?:[ T_]\d{2}[:-]?\d{2}[:-]?\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?")
+_FP_RFC_TS_RE = re.compile(
+    r"(?:\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+)?\d{1,2}\s+"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}"
+    r"(?:\s+\d{2}:\d{2}(?::\d{2})?(?:\s*(?:GMT|UTC|Z|[+-]\d{4}))?)?", re.I)
+_FP_DATE_RE = re.compile(r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
+_FP_TIME_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:\s*[AP]M)?(?:Z|[+-]\d{2}:?\d{2})?", re.I)
+_FP_HEX_LITERAL_RE = re.compile(r"\b0x[0-9a-f]+\b", re.I)
+# `/a/b`, `~/a`, `./a`, `../a` — not preceded by a word char, so "and/or" and a
+# date's inner slashes are left alone.
+_FP_PATH_RE = re.compile(r"(?<![\w.~:/-])(?:~|\.{1,2})?/[^\s'\"`),;\]>]+")
+_FP_LOGFILE_RE = re.compile(r"(?<![\w-])[\w.-]+\.log(?:\.\d+)*(?:\.gz)?(?![\w])")
+# 6+ hex chars with at least one digit (git SHAs, session/request ids): pure-letter
+# words like "decade" survive; bounded by non-alphanumerics so `_ea474d_` matches.
+_FP_HEX_ID_RE = re.compile(r"(?<![A-Za-z0-9])(?=[0-9a-f]*\d)[0-9a-f]{6,}(?![A-Za-z0-9])", re.I)
+_FP_NUMBER_RE = re.compile(r"\d+")
+_FP_STRIP_ORDER = (
+    (_FP_URL_PATH_RE, r"\1 "), (_FP_UUID_RE, " "), (_FP_ISO_TS_RE, " "), (_FP_RFC_TS_RE, " "),
+    (_FP_DATE_RE, " "), (_FP_TIME_RE, " "), (_FP_HEX_LITERAL_RE, " "), (_FP_PATH_RE, " "),
+    (_FP_LOGFILE_RE, " "), (_FP_HEX_ID_RE, " "), (_FP_NUMBER_RE, " "),
+)
+
+
+def fingerprint(title: str) -> str:
+    """Event identity: `title` minus timestamps, UUIDs, hex ids, paths, log-file
+    names and numbers, then normalize_title()'d. Falls back to normalize_title()
+    of the raw title when stripping leaves nothing (an all-numbers title)."""
+    stripped = title
+    for pattern, repl in _FP_STRIP_ORDER:
+        stripped = pattern.sub(repl, stripped)
+    return normalize_title(stripped) or normalize_title(title)
+
+
 def aggregate_slack_batch(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group raw slack messages by normalized title. Returns list of grouped dicts."""
+    """Group raw slack messages by event fingerprint. Returns list of grouped dicts."""
     groups: dict[str, dict[str, Any]] = {}
     for m in msgs:
-        key = normalize_title(m["title"])
+        key = fingerprint(m["title"])
         if not key:
             continue
         g = groups.setdefault(key, {

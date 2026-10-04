@@ -2196,8 +2196,8 @@ def test_op_refs_raw_fallback_dedups_across_timestamps():
     a fresh row and the dangling ref never stays flagged."""
     s1 = "[ERROR] 2026/09/01 15:00:34 (504) Unknown: An unknown error occurred."
     s2 = "[ERROR] 2026/09/02 03:11:09 (504) Unknown: An unknown error occurred."
-    key1 = watchdog_poll.normalize_title(watchdog_poll._strip_op_refs_timestamps(s1))[:80]
-    key2 = watchdog_poll.normalize_title(watchdog_poll._strip_op_refs_timestamps(s2))[:80]
+    key1 = watchdog_poll.fingerprint(s1)[:80]
+    key2 = watchdog_poll.fingerprint(s2)[:80]
     assert key1 == key2, f"timestamps must not survive into the dedup key: {key1!r} != {key2!r}"
     assert "2026" not in key1 and "01" not in key1.split("-")
 
@@ -2205,8 +2205,8 @@ def test_op_refs_raw_fallback_dedups_across_timestamps():
     # normalize into) must also collapse identically.
     s3 = "op run failed: timeout at 2026-09-01T15:00:34.504Z during resolve"
     s4 = "op run failed: timeout at 2026-09-02T03:11:09.118Z during resolve"
-    key3 = watchdog_poll.normalize_title(watchdog_poll._strip_op_refs_timestamps(s3))[:80]
-    key4 = watchdog_poll.normalize_title(watchdog_poll._strip_op_refs_timestamps(s4))[:80]
+    key3 = watchdog_poll.fingerprint(s3)[:80]
+    key4 = watchdog_poll.fingerprint(s4)[:80]
     assert key3 == key4
 
 
