@@ -973,6 +973,7 @@ _SET_STATE_COLUMNS = (
     "revert_pr", "close_reason", "strikes", "retry_at", "revision_count",
     "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
     "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence",
+    "merged_sha", "reverting_sha", "revert_json",
 )
 
 # The merge train's position, meaningful only while the item is `merging`: leaving it clears
@@ -982,11 +983,18 @@ _TRAIN_POSITION = ("train_stage", "train_sha", "train_job")
 
 # An item entering `verifying` starts with no verification history: no deploy yet
 # (`verify_started_at` NULL), no baseline, no failures. `deploy_expect_json` is the host
-# verb's monitor record — nothing else writes it.
+# verb's monitor record — nothing else writes it. `merged_sha` is what a failed verification
+# reverts: an entry from a merge sets it over this reset (_merged_entry()), every other entry
+# (a host verb) has nothing to revert.
 _VERIFY_RESET: dict[str, Any] = {
     "verify_started_at": None, "verify_mark": None, "verify_failures": 0, "verify_result": None,
-    "deploy_expect_json": None,
+    "deploy_expect_json": None, "merged_sha": None,
 }
+
+
+def _merged_entry(sha: str | None) -> dict[str, Any]:
+    """The columns of entering `verifying` from a merge that landed as `sha`."""
+    return {**_VERIFY_RESET, "merged_sha": sha}
 
 
 class _Coalesce(NamedTuple):
@@ -1009,7 +1017,9 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     required, and every other state clears it (as it does `duplicate_of`, which
     only a `closed(duplicate)` item carries), so a reopened item never keeps the reason it
     was closed with. Entering `new` clears `triage_job` (and its age, `triage_job_at`) the same way,
-    and any state but `merging` clears the merge train's position (_TRAIN_POSITION).
+    any state but `merging` clears the merge train's position (_TRAIN_POSITION), and entering
+    `new` or `triaged` clears the revert record (`reverting_sha`, `revert_json`): an item back
+    before its investigation starts over, and must not reopen an old revert.
 
     The strike counter is owned here too: an item that advances to `merging`,
     `verifying` or `fixed` (a step SUCCEEDED — claiming `working` is not
@@ -1067,6 +1077,9 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
         # `new` means "not yet through the triage step": a triage job left on a row that
         # re-enters it (a recurrence, a manual reopen) would never be submitted again.
         columns.setdefault("triage_job", None)
+    if state in (STATE_NEW, STATE_TRIAGED):
+        columns.setdefault("reverting_sha", None)
+        columns.setdefault("revert_json", None)
     if columns.get("triage_job", "") is None:
         columns.setdefault("triage_job_at", None)   # no job, no job age
     if state != STATE_MERGING:
@@ -2891,7 +2904,7 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
         stale_before = _now_iso(now - dt.timedelta(minutes=ORIGIN_CLAIM_STALE_MINUTES))
         orphans = conn.execute(
             "SELECT * FROM triage_items WHERE state=? AND origin != 'alert' AND dispatch_job IS NULL "
-            "AND implement_job IS NULL AND updated_at < ?",
+            "AND implement_job IS NULL AND revert_json IS NULL AND updated_at < ?",
             (STATE_WORKING, stale_before),
         ).fetchall()
         for orphan in orphans:
@@ -3743,7 +3756,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             conn.commit()
             continue
         sha = (new_receipt or {}).get("mergeCommit")
-        _set_state(conn, row["event_id"], STATE_VERIFYING, now, **_VERIFY_RESET,
+        _set_state(conn, row["event_id"], STATE_VERIFYING, now, **_merged_entry(sha),
                    note=f"reconciled from GitHub: merged as {sha}; deploy and verification next")
         conn.commit()
 
@@ -3865,7 +3878,7 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state IN (?, ?) AND dispatch_job IS NOT NULL "
-        f"AND implement_job IS NULL AND {ready_sql} ORDER BY event_id",
+        f"AND implement_job IS NULL AND revert_json IS NULL AND {ready_sql} ORDER BY event_id",
         (STATE_WORKING, STATE_NEEDS_DECISION, *ready_params),
     ).fetchall()
 
@@ -4024,7 +4037,8 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     ready_sql, ready_params = _retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND dispatch_job IS NOT NULL AND implement_job IS NULL "
-        f"AND max_tier = 'implement' AND {ready_sql} ORDER BY event_id", (STATE_WORKING, *ready_params)
+        f"AND max_tier = 'implement' AND revert_json IS NULL AND {ready_sql} ORDER BY event_id",
+        (STATE_WORKING, *ready_params)
     ).fetchall()
     for item in candidates:
         if item["repo"] is None:
@@ -4211,6 +4225,13 @@ def _revisions_left(item: sqlite3.Row) -> bool:
     return item["max_tier"] == "implement" and item["revision_count"] + 1 < MAX_IMPLEMENT_ATTEMPTS
 
 
+def _revisable(item: sqlite3.Row) -> bool:
+    """A revision may follow the attempt on record: attempts are left and it is not a revert. A
+    revert that cannot land as it is (blocked, failing checks, conflicting) is a question for the
+    owner, never another episode spinning on a mechanical change."""
+    return _revisions_left(item) and not _is_revert(item)
+
+
 def _implement_model(attempt: int) -> str | None:
     """The `model` an implement attempt is submitted with. Attempts 1 and 2 send none
     (sideclaw's own default); attempt ESCALATION_ATTEMPT and later send the escalation
@@ -4322,15 +4343,18 @@ def _hand_back_for_revision(conn: sqlite3.Connection, item: sqlite3.Row, now: dt
     judged once and the revision knows what it is for.
 
     Attempts spent: the PR on record is left open deliberately — it holds the work for the
-    owner to take over — and the note, capped at 200 characters, says so with its URL.
+    owner to take over — and the note, capped at 200 characters, says so with its URL. A revert
+    (_is_revert()) is never revised: it is `failed` at once, its PR left open the same way.
 
     A compare-and-set on the item's state as read (plus `expect_eq`); returns whether it won,
     and marks the dispatch row only then."""
-    if _revisions_left(item):
+    if _revisable(item):
         won = _set_state(conn, item["event_id"], STATE_WORKING, now, expect_state=item["state"],
                          expect_eq=expect_eq, note=f"{note} — revision pending", **columns)
     else:
         suffix = f" — PR left open: {item['pr_url']}" if item["pr_url"] else ""
+        if _is_revert(item):
+            note = f"revert of {item['reverting_sha'][:12]}, not revised: {note}"
         head = " ".join(note.split())[: _items.NOTE_MAX - len(suffix)]
         won = _set_state(conn, item["event_id"], STATE_FAILED, now, expect_state=item["state"],
                          expect_eq=expect_eq, note=head + suffix, **columns)
@@ -4466,10 +4490,12 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             # The pull request joins its repo's merge train at `update` (advance_merge_trains()).
             # A compare-and-set on the `working` item this pass read (same implement job, no
             # review yet): the loop and the sweep both reach this handoff, and the loser skips.
-            # A new attempt's head has never been reviewed, so `reviewed_sha` starts over.
+            # A new attempt's head has never been reviewed, so `reviewed_sha` starts over. The
+            # revert record stays with a revert and is spent once the attempt after it has a PR.
             claimed = _set_state(conn, event_id, STATE_MERGING, now, expect_state=STATE_WORKING,
                                  expect_eq={"implement_job": job_id, "validation_job": None},
                                  pr_url=artifact_url, strikes=0, retry_at=None, **_TRAIN_START,
+                                 revert_json=item["revert_json"] if _is_revert(item) else None,
                                  note=f"{outcome}: {artifact_url} joins the merge train")
             conn.commit()
             if not claimed:
@@ -4512,8 +4538,12 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
     row but before the item's own state write. Calling merge again would refuse with "already
     merged" and land the item `failed` for a pull request that is
     merged and deploying — the exact misreport docs/history/state-log.md §46 measured. So the
-    item goes on to `verifying` exactly as the confirmed-merge branch does."""
-    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_VERIFY_RESET,
+    item goes on to `verifying` exactly as the confirmed-merge branch does — the merge commit read
+    back from the merge operation's receipt."""
+    op = conn.execute("SELECT receipt_json FROM operations WHERE event_id=? AND kind='merge' AND outcome='done' "
+                      "ORDER BY rowid DESC LIMIT 1", (item["event_id"],)).fetchone()
+    sha = _safe_json(op["receipt_json"] if op else None).get("mergeCommit")
+    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_merged_entry(sha),
                note="merged before the loop stopped; state derived from the merge receipt")
     conn.commit()
     print(f"triage: {item['signature']} was already merged (event {item['event_id']}) — state derived "
@@ -4806,7 +4836,12 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
 
     Text only: sideclaw's `review` job reviews the PR's whole head and has no delta/range scope,
     so "focus on what changed" is a request to the reviewer, not a narrower diff. A real delta
-    review needs sideclaw support."""
+    review needs sideclaw support.
+
+    A revert (_is_revert()) is judged as one: the exact inverse of the reverted commit, nothing
+    else — not whether the change it undoes was right."""
+    if _is_revert(item):
+        return _revert_review_context(item)
     base = _validation_context(conn, item)
     reviewed, sha = item["reviewed_sha"], item["train_sha"]
     if not reviewed or reviewed == sha:
@@ -5002,8 +5037,10 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         _set_state(conn, event_id, STATE_NEEDS_DECISION, now, note=f"step-7 validation (needs-human): {detail}")
     else:
         note = f"step-7 validation (blocked): {_format_blocking_findings(blocking)}"
+        if _is_revert(item):
+            note = f"revert of {item['reverting_sha'][:12]} blocked, not revised — PR left open: {item['pr_url']}; {note}"
         # The findings go back to a fresh implement episode — see maybe_revise_blocked().
-        _set_state(conn, event_id, STATE_WORKING if _revisions_left(item) else STATE_FAILED, now, note=note)
+        _set_state(conn, event_id, STATE_WORKING if _revisable(item) else STATE_FAILED, now, note=note)
     conn.commit()
     _release_review_claim(conn, event_id, claim_until)
     return False
@@ -5154,9 +5191,11 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     # plan_or_land() with confirm=True, dry_run=False always returns a MergeResult (never a
     # MergePlan) on success — the merge operation and its receipt are already recorded, inside
     # lifecycle/merge.py. The deploy is the verify pass's job (maybe_verify()): the item waits
-    # in `verifying` with no `verify_started_at`.
-    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_VERIFY_RESET,
-               note=f"merged {result.repo_slug}#{result.pull_request}; deploy and verification next")
+    # in `verifying` with no `verify_started_at`. A revert keeps `reverting_sha`: that is what
+    # marks this merge as one (_is_revert()).
+    what = f"the revert of {item['reverting_sha'][:12]}" if _is_revert(item) else "deploy and verification"
+    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_merged_entry(result.merge_commit),
+               note=f"merged {result.repo_slug}#{result.pull_request}; {what} next")
     conn.commit()
     return "merged"
 
@@ -5458,6 +5497,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     chain: its own window is hours (VERIFY_WINDOW_HOURS), not seconds, so
     the 600s tick already covers it with room to spare — see docs/history/state-log.md
     §87 for the measurement this rests on."""
+    maybe_submit_reverts(conn, policy, now, dry_run=dry_run)
     maybe_revise_blocked(conn, policy, now, dry_run=dry_run)
     maybe_auto_implement(conn, policy, now, dry_run=dry_run)
     poll_implement_jobs(conn, policy, now, dry_run=dry_run)
@@ -5481,7 +5521,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
 #      passes. A host-verb remediation (maybe_auto_remediate()) enters here with its window
 #      already open and its verb's monitor in `deploy_expect_json`.
 #   3. FAILURE: the signal recurred, or verification fails VERIFY_FAILURE_LIMIT passes in a
-#      row -> _on_verify_failure(), the seam the revert step replaces.
+#      row -> _on_verify_failure(): the merged change is reverted (see the revert block below).
 
 VERIFIED_NOTE_PREFIX = "verified: "
 VERIFY_FAILED_NOTE_PREFIX = "verification failed: "
@@ -5501,11 +5541,22 @@ def _tail_for_note(text: str, limit: int = 120) -> str:
 
 
 def _on_verify_failure(conn: sqlite3.Connection, item: sqlite3.Row, evidence: str, now: dt.datetime) -> None:
-    """The one door every verification failure goes through. For now the item goes back to
-    `triaged` carrying the evidence in its note, the shape the old liveness reopen had; the
-    revert step replaces this body (item back to `working` through a revert PR)."""
-    _set_state(conn, item["event_id"], STATE_TRIAGED, now, expect_state=STATE_VERIFYING,
-               note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence}", **_VERIFY_RESET)
+    """The one door every verification failure goes through. A merged change is reverted: the
+    item goes back to `working` carrying the evidence, marked reverting the commit its merge
+    landed as (`reverting_sha`, with the record in `revert_json`), and maybe_submit_reverts()
+    opens the revert episode. An item with no merge on record (a host verb's restart) has
+    nothing to revert and goes back to `triaged` with the evidence."""
+    event_id, sha = item["event_id"], item["merged_sha"]
+    if not sha:
+        _set_state(conn, event_id, STATE_TRIAGED, now, expect_state=STATE_VERIFYING,
+                   note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence}", **_VERIFY_RESET)
+        conn.commit()
+        return
+    record = {"sha": sha, "pr": item["pr_url"], "title": _merged_title(conn, event_id, sha), "evidence": evidence}
+    _set_state(conn, event_id, STATE_WORKING, now, expect_state=STATE_VERIFYING, expect_eq={"merged_sha": sha},
+               note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence} — reverting {sha[:12]}",
+               reverting_sha=sha, revert_json=json.dumps(record), implement_job=None, validation_job=None,
+               pr_url=None, reviewed_sha=None, strikes=0, retry_at=None, **_VERIFY_RESET)
     conn.commit()
 
 
@@ -5572,6 +5623,9 @@ def _signal_not_quiet(item: sqlite3.Row, event: sqlite3.Row) -> list[str]:
 
 
 def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row, now: dt.datetime) -> None:
+    if _is_revert(item):
+        _verify_revert(conn, item, now)
+        return
     event_id = item["event_id"]
     event = _get_event(conn, event_id)
     signal = item["origin"] == "alert" and event is not None
@@ -5632,6 +5686,234 @@ def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datet
             if item is None:
                 continue
         _verify_item(conn, policy, item, now)
+    if not dry_run:
+        # A verification that just failed opens its revert now, not a sweep later.
+        maybe_submit_reverts(conn, policy, now, dry_run=False)
+
+
+# --- revert after a failed verification (step 10, decision 4) --------------------
+#
+#   1. _on_verify_failure(): `verifying` -> `working`, `reverting_sha` = the merged commit,
+#      `revert_json` = {sha, pr, title, evidence}, the PR and jobs of the failed fix cleared.
+#   2. maybe_submit_reverts(): an implement episode whose brief is `git revert --no-edit <sha>`
+#      and nothing else. It goes through the implement path unchanged: the lease, a refusal
+#      (`failed`), a strike, an ambiguous submit. Not an attempt — `revision_count` stays.
+#   3. Its PR is a `dispatch/*` PR: poll_implement_jobs() hands it to the merge train like any
+#      other, the review is told it is a mechanical revert (_revert_review_context()), and a
+#      block, failing checks or a conflict end it `failed` with the PR left open — never a
+#      revision (_revisable()). A revert merge keeps `reverting_sha`: that is _is_revert().
+#   4. Deploy as usual, then _verify_revert(): `make verify` only, no signal window. Passing
+#      clears `reverting_sha`, counts the next attempt (the failed fix was one) and sends the
+#      item to `working`, where maybe_submit_reverts() opens a fresh attempt from the latest
+#      base with the evidence and the reverted change as its context; attempts spent ->
+#      `failed`. Failing VERIFY_FAILURE_LIMIT passes in a row -> `failed`, production
+#      unhealthy after the revert.
+#
+# `revert_pr` is not written: it is the owner's own `warden revert` record, and Argo refuses to
+# implement an item carrying it — the automatic path ends in exactly that fresh attempt.
+
+REVERT_WHY = "triage revert: the merged change failed verification"
+AFTER_REVERT_WHY_PREFIX = "triage attempt after revert "
+REVERT_EVIDENCE_MAX = 1500
+REVERTED_DIFF_MAX = 8000
+
+
+def _is_revert(item: sqlite3.Row) -> bool:
+    """The item's change in flight is warden's revert of a merged fix, not a fix. True from the
+    verify failure until the revert passed `make verify` — in particular when the revert merges,
+    which is the predicate a fixed-by sweep after a fix's merge must skip on."""
+    return item["reverting_sha"] is not None
+
+
+def _merged_title(conn: sqlite3.Connection, event_id: int, sha: str) -> str | None:
+    """The title of the pull request that merged as `sha`, from its merge operation's receipt."""
+    for op in conn.execute("SELECT receipt_json FROM operations WHERE event_id=? AND kind='merge' "
+                           "AND outcome='done' ORDER BY rowid DESC", (event_id,)):
+        receipt = _safe_json(op["receipt_json"])
+        if receipt.get("mergeCommit") == sha:
+            return receipt.get("title")
+    return None
+
+
+def _revert_record(item: sqlite3.Row) -> dict[str, Any]:
+    record = _safe_json(item["revert_json"])
+    record["evidence"] = str(record.get("evidence") or "no evidence on record")[:REVERT_EVIDENCE_MAX]
+    return record
+
+
+def _revert_brief(record: dict[str, Any]) -> str:
+    sha, pr = record.get("sha"), record.get("pr") or "a pull request"
+    title = (f'titled exactly `Revert "{record["title"]}"`' if record.get("title")
+             else "titled with the revert commit's own subject line")
+    return (
+        f"Mechanical revert. {pr} was merged into the default branch as commit {sha}, and the change "
+        f"failed verification in production afterwards:\n{record['evidence']}\n\n"
+        f"Do exactly this and nothing else: on the latest default branch run `git revert --no-edit {sha}` "
+        f"(only if git refuses because it is a merge commit: `git revert --no-edit -m 1 {sha}`) and open a "
+        f"pull request {title} carrying that one revert commit. No other edit, no fix, no formatting, no "
+        f"follow-up — the real fix is a separate attempt once this revert has landed. If the revert does not "
+        f"apply cleanly, do not resolve the conflict: say so in your verdict and stop."
+    )
+
+
+def _revert_review_context(item: sqlite3.Row) -> str:
+    record = _revert_record(item)
+    sha = record.get("sha") or item["reverting_sha"]
+    title = f" ({record['title']})" if record.get("title") else ""
+    return (
+        f"This pull request is a MECHANICAL REVERT of commit {sha} — {record.get('pr') or 'a merged pull request'}"
+        f"{title} — opened by warden after that change failed verification in production:\n{record['evidence']}"
+        f"\n\nYou are the merge gate. Confirm the diff is exactly the inverse of {sha} (`git revert` of that "
+        f"commit) and nothing else: any other change is a blocking finding. Block also if reverting would "
+        f"itself break a running service or lose data (e.g. it undoes a migration that already ran). Do not "
+        f"judge whether the reverted change was right — its fix is a separate attempt after this revert."
+    )[: _dispatch.MAX_CONTEXT_CHARS]
+
+
+def _reverted_diff(pr_url: str | None) -> str | None:
+    """The reverted pull request's diff, file by file from GitHub, capped — or None when it cannot
+    be read (the episode is then told to read it with `git show`)."""
+    ref = _github.parse_pr_url(pr_url or "")
+    if ref is None:
+        return None
+    try:
+        files = _github.pr_files(*ref)
+    except RemoteError as e:
+        print(f"triage: could not read the files of {pr_url}: {e}", file=sys.stderr)
+        return None
+    parts = [f"--- {f.get('filename') or '?'}\n{f.get('patch') or '(no textual diff)'}"
+             for f in files if isinstance(f, dict)]
+    return "\n".join(parts)[:REVERTED_DIFF_MAX] if parts else None
+
+
+def _after_revert_episode(conn: sqlite3.Connection, item: sqlite3.Row, record: dict[str, Any],
+                          attempt: int) -> tuple[str, str]:
+    """The brief and context of the fresh attempt that follows a landed revert."""
+    sha, pr = record.get("sha"), record.get("pr") or "(not on record)"
+    brief = (
+        f"Attempt {attempt} of {MAX_IMPLEMENT_ATTEMPTS} of a fix the alert triage loop already shipped once: "
+        f"{pr} was merged as {sha}, failed verification in production and has been reverted. Your worktree "
+        f"starts from the latest default branch, without that change. The context below has the "
+        f"verification failure and the reverted change: work out why it did not hold, then implement a fix "
+        f"that does — do not re-apply the reverted change unchanged. If the evidence shows the problem "
+        f"cannot be fixed from inside this repo, say so and stop.\n\n"
+        f"{_issue_closing_instruction(conn, item)}"
+    )
+    title = f" ({record['title']})" if record.get("title") else ""
+    diff = _reverted_diff(record.get("pr"))
+    parts = [f"Verification failure after {sha} was merged:\n{record['evidence']}",
+             f"Reverted pull request: {pr}{title}. Read the reverted change with `git show {sha}`."]
+    if diff:
+        parts.append(f"The reverted change, as GitHub shows it (capped):\n{diff}")
+    if item["dispatch_job"]:
+        inv = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone()
+        if inv is not None:
+            parts.append(_verdict_as_context(item["dispatch_job"], _safe_json(inv["verdict_json"])))
+    elif item["brief"]:
+        parts.append(f"The owner's brief: {item['brief']}")
+    return brief, "\n\n".join(parts)[: _dispatch.MAX_CONTEXT_CHARS]
+
+
+def maybe_submit_reverts(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                         *, dry_run: bool) -> None:
+    """Open the episode a `working` item with a revert record (`revert_json`) and no implement job
+    waits for: the revert itself while `reverting_sha` is set, else the fresh attempt after it
+    (see the block comment above). Claim before dispatch, a compare-and-set on `implement_job`
+    and `reverting_sha`, the same shape as maybe_auto_implement(), with the same failure
+    handling: a refusal ends the item, an infrastructure failure strikes, an ambiguous submit
+    stays claimed for reconcile_operations(), a busy repo defers. A lease refusal, a struck
+    episode or a reconciled one hands `implement_job` back to NULL, and this submits again."""
+    ready_sql, ready_params = _retry_ready_sql(now)
+    candidates = conn.execute(
+        f"SELECT * FROM triage_items WHERE state=? AND implement_job IS NULL AND revert_json IS NOT NULL "
+        f"AND {ready_sql} ORDER BY event_id", (STATE_WORKING, *ready_params)).fetchall()
+    for item in candidates:
+        if item["repo"] is None:
+            continue
+        event_id, record = item["event_id"], _revert_record(item)
+        if _is_revert(item):
+            what, model, why = f"the revert of {item['reverting_sha'][:12]}", None, REVERT_WHY
+            brief, context = _revert_brief(record), None
+        else:
+            attempt = item["revision_count"] + 1
+            what, model = f"attempt {attempt}/{MAX_IMPLEMENT_ATTEMPTS} after a revert", _implement_model(attempt)
+            why = f"{AFTER_REVERT_WHY_PREFIX}{attempt}: the reverted change failed verification"
+            brief = context = None
+        if dry_run:
+            print(f"[dry-run] would submit {what} for {item['signature']} in {item['repo']}")
+            continue
+        claimed = _set_state(conn, event_id, STATE_WORKING, now, expect_state=STATE_WORKING,
+                             expect_null=("implement_job",), expect_eq={"reverting_sha": item["reverting_sha"]},
+                             implement_job=IMPLEMENT_CLAIM)
+        conn.commit()
+        if not claimed:
+            continue
+        if brief is None:
+            brief, context = _after_revert_episode(conn, item, record, item["revision_count"] + 1)
+        try:
+            opened = _open_implement_episode(
+                conn, repo=item["repo"], tier="implement", brief=brief, context=context, why=why,
+                origin=_dispatch.Origin(event_id=event_id), authorized_by="auto-from-item", model=model)
+        except SubmitRefused as exc:
+            _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy, implement_job=None)
+            continue
+        except RemoteError as exc:
+            if exc.maybe_mutated:
+                _hold_ambiguous_submit(item, exc)
+                continue
+            _strike(conn, event_id, now, f"{what} could not be submitted: {exc}", retry_state=STATE_WORKING,
+                    expect_state=STATE_WORKING, implement_job=None)
+            conn.commit()
+            continue
+        except (PolicyError, PreconditionError, UsageError) as e:
+            _set_state(conn, event_id, STATE_WORKING, now, expect_state=STATE_WORKING, implement_job=None,
+                       note=f"deferred: {e}")
+            conn.commit()
+            continue
+        conn.execute("UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
+                     (opened.job_id, _now_iso(now), event_id))
+        conn.commit()
+
+
+def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> None:
+    """Verify a landed revert: `make verify` only (no signal window — the signal is expected back
+    until the real fix lands). See the block comment above for where each outcome goes."""
+    event_id, sha = item["event_id"], item["reverting_sha"]
+    verify_note = "no make verify target"
+    cwd = _repo_checkout(item)
+    if cwd is not None and _rollout.has_target(cwd, "verify"):
+        res = _rollout.verify(cwd)
+        if not res.ok:
+            failures = item["verify_failures"] + 1
+            evidence = f"make verify failed (exit {res.exit_code}): {_tail_for_note(res.tail)}"
+            if failures >= VERIFY_FAILURE_LIMIT:
+                _set_state(conn, event_id, STATE_FAILED, now, expect_state=STATE_VERIFYING,
+                           expect_eq={"reverting_sha": sha}, verify_failures=failures,
+                           verify_result=evidence[:VERIFY_RESULT_MAX],
+                           note=f"production unhealthy after revert of {sha[:12]}: {failures} consecutive "
+                                f"failing passes — {evidence}")
+            else:
+                _set_state(conn, event_id, STATE_VERIFYING, now, expect_state=STATE_VERIFYING,
+                           expect_eq={"reverting_sha": sha}, verify_failures=failures,
+                           verify_result=evidence[:VERIFY_RESULT_MAX])
+            conn.commit()
+            return
+        verify_note = "make verify passed"
+
+    record = _revert_record(item)
+    if not _revisions_left(item):
+        _set_state(conn, event_id, STATE_FAILED, now, expect_state=STATE_VERIFYING,
+                   expect_eq={"reverting_sha": sha}, reverting_sha=None, verify_failures=0, verify_result=verify_note,
+                   note=f"reverted {sha[:12]} ({verify_note}); no implement attempt left — "
+                        f"verification failure: {record['evidence']}")
+        conn.commit()
+        return
+    attempt = item["revision_count"] + 2
+    _set_state(conn, event_id, STATE_WORKING, now, expect_state=STATE_VERIFYING, expect_eq={"reverting_sha": sha},
+               note=f"reverted {sha[:12]} ({verify_note}); attempt {attempt}/{MAX_IMPLEMENT_ATTEMPTS} next",
+               reverting_sha=None, revision_count=item["revision_count"] + 1, implement_job=None,
+               validation_job=None, pr_url=None, reviewed_sha=None, strikes=0, retry_at=None, **_VERIFY_RESET)
+    conn.commit()
 
 
 # --- failed digest -------------------------------------------------------------
@@ -5721,9 +6003,11 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
     # own claim): this handler accepts `needs_decision`/`failed` items that carry
     # a STALE implement_job from a prior attempt — refusing a re-implement on that
     # column alone would make retrying from Argo permanently impossible for exactly
-    # the item this action exists to unstick. Overwritten below on success.
+    # the item this action exists to unstick. Overwritten below on success. The owner's attempt
+    # replaces whatever automatic revert the item was on (maybe_submit_reverts()).
     claimed = _set_state(conn, event_id, STATE_WORKING, now, expect_state=item["state"],
-                         implement_job=IMPLEMENT_CLAIM, validation_job=None, pr_url=None)
+                         implement_job=IMPLEMENT_CLAIM, validation_job=None, pr_url=None,
+                         reverting_sha=None, revert_json=None)
     conn.commit()
     if not claimed:
         return "rejected", None, "item state changed before this action could be applied — retry from Argo"
@@ -5748,7 +6032,7 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
     def _hand_back(note: str) -> None:
         _set_state(conn, event_id, item["state"], now, expect_state=STATE_WORKING, note=note,
                    implement_job=item["implement_job"], validation_job=item["validation_job"],
-                   pr_url=item["pr_url"])
+                   pr_url=item["pr_url"], reverting_sha=item["reverting_sha"], revert_json=item["revert_json"])
         conn.commit()
 
     try:

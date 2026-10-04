@@ -639,6 +639,16 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #
 # Items already `merging` restart the train at `update`: the review they may be in the middle
 # of read a head nobody pinned.
+#
+# And the automatic revert of a change that failed verification (triage.py _on_verify_failure()):
+#
+#   merged_sha      the commit the item's last merge landed as; set on entering `verifying` from
+#     a merge, NULL on every other entry (a host verb has nothing to revert).
+#   reverting_sha   the merged commit being reverted, set from the verify failure until the
+#     revert has landed and passed `make verify`. Set at merge time, it marks a revert merge.
+#   revert_json     {sha, pr, title, evidence}: what was reverted and why — the revert's brief
+#     and review context, then the fresh attempt's context. Cleared when that attempt's PR
+#     joins the merge train.
 _MIGRATION_15 = """
 ALTER TABLE triage_items ADD COLUMN verify_started_at TEXT;
 ALTER TABLE triage_items ADD COLUMN verify_mark TEXT;
@@ -651,6 +661,9 @@ ALTER TABLE triage_items ADD COLUMN train_job TEXT;
 ALTER TABLE triage_items ADD COLUMN reviewed_sha TEXT;
 ALTER TABLE triage_items ADD COLUMN train_evidence TEXT;
 UPDATE triage_items SET train_stage = 'update' WHERE state = 'merging';
+ALTER TABLE triage_items ADD COLUMN merged_sha TEXT;
+ALTER TABLE triage_items ADD COLUMN reverting_sha TEXT;
+ALTER TABLE triage_items ADD COLUMN revert_json TEXT;
 """
 
 MIGRATIONS: dict[int, str] = {

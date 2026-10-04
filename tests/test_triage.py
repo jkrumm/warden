@@ -220,6 +220,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_github", "create_issue_comment"): triage._github.create_issue_comment,
         ("_github", "close_pr"): triage._github.close_pr,
         ("_github", "read_pr"): triage._github.read_pr,
+        ("_github", "pr_files"): triage._github.pr_files,
         ("_github", "branch_rules"): triage._github.branch_rules,
         ("_github", "mark_ready_for_review"): triage._github.mark_ready_for_review,
         ("_github", "merge_pr"): triage._github.merge_pr,
@@ -282,6 +283,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         CHECK_RUNS.clear()
         CHECK_RUNS.update(runs=None, asked=[])
         triage._github.read_pr = _default_fake_read_pr
+        # A revert's fresh attempt reads the reverted PR's diff; unregistered, GitHub "fails".
+        triage._github.pr_files = lambda owner, repo, number: (_ for _ in ()).throw(
+            triage.RemoteError("test: no fake pr_files registered"))
         triage._github.check_runs = _default_fake_check_runs
         CLOSED_PRS.clear()
         triage._github.close_pr = lambda owner, repo, number, *, comment=None: CLOSED_PRS.append(
@@ -9740,7 +9744,7 @@ def test_train_happy_path_updates_checks_reviews_and_merges_the_pinned_sha():
         triage._sideclaw.get = _jobs(table)
         CHECK_RUNS["runs"] = [{"name": "ci", "status": "completed", "conclusion": "success"}]
         triage._merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
-            repo_slug="jkrumm/demo-repo", pull_request=10)
+            repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="d" * 40)
 
         triage.advance_implement_chain(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = triage._get_item(conn, eid)
@@ -9825,7 +9829,7 @@ def test_train_skips_the_review_of_a_sha_a_review_already_confirmed():
         CHECK_RUNS["runs"] = []
         merges: list[dict[str, Any]] = []
         triage._merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
-            repo_slug="jkrumm/demo-repo", pull_request=10)
+            repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="d" * 40)
         _train_pass(conn)
         assert [m["expected_sha"] for m in merges] == [TRAIN_SHA], merges
         assert triage._get_item(conn, eid)["state"] == triage.STATE_VERIFYING
@@ -10121,6 +10125,283 @@ def test_leaving_merging_clears_the_train_position_but_keeps_the_reviewed_sha():
         item = triage._get_item(conn, eid)
         assert (item["train_stage"], item["train_sha"], item["train_job"]) == (None, None, None), dict(item)
         assert item["reviewed_sha"] == TRAIN_SHA
+
+
+# --- revert after a failed verification (decision 4) ---------------------------
+
+MERGED_SHA = "d" * 40
+REVERT_SHA = "e" * 40
+_FIX_PR = "https://github.com/jkrumm/demo-repo/pull/9"
+_EVIDENCE = "own signal recurred while verifying: Seeded sig-x"
+_LEASE_ERROR = ("dispatch refused: an implement episode is already running in this repo (job x) — "
+                "implement episodes serialize per repo because their edits and pushes would interleave. "
+                "Re-submit once it finishes.")
+
+
+def _merged_fix(conn, ext: str, *, started: dt.datetime | None = None, revision_count: int = 0) -> int:
+    """A fix merged as MERGED_SHA (its merge operation's receipt carries the PR title), verifying,
+    with an investigation on record."""
+    eid = _seed_verifying(conn, ext, started=started or NOW - dt.timedelta(minutes=30), merged_sha=MERGED_SHA,
+                          revision_count=revision_count, dispatch_job=f"inv-{ext}", max_tier="implement")
+    conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                 (f"inv-{ext}", "investigate", "demo-repo", "b", "done",
+                  json.dumps({"summary": "the watchdog threshold is too tight", "nextAction": "implement"}),
+                  NOW.isoformat()))
+    conn.commit()
+    op = triage.record_operation(conn, event_id=eid, kind="merge", repo="demo-repo", authorized_by="auto-from-item")
+    triage.complete_operation(conn, op, outcome="done", receipt=json.dumps(
+        {"pullRequest": 9, "mergeCommit": MERGED_SHA, "title": "Loosen the watchdog threshold"}))
+    return eid
+
+
+def _reverting(conn, ext: str, *, state: str, revision_count: int = 0, **columns) -> int:
+    """An item on its revert of MERGED_SHA, in `state`."""
+    record = {"sha": MERGED_SHA, "pr": _FIX_PR, "title": "Loosen the watchdog threshold", "evidence": _EVIDENCE}
+    return _seed_item(conn, external_id=ext, state=state, reverting_sha=MERGED_SHA, revert_json=json.dumps(record),
+                      revision_count=revision_count, max_tier="implement", **columns)
+
+
+def test_a_verify_failure_reverts_the_merged_commit_through_an_implement_episode():
+    with _triage_env() as (conn, ctx):
+        eid = _merged_fix(conn, "sig-revert-recurs")
+        _fake_rollout(targets=("verify",), verify=_ran())
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        _signal_fires_again(conn, eid)
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and item["reverting_sha"] == MERGED_SHA, dict(item)
+        assert item["implement_job"] == "job-000001" and item["pr_url"] is None, dict(item)
+        assert item["revision_count"] == 0 and item["strikes"] == 0, "a revert is not an attempt"
+        assert item["revert_pr"] is None, "revert_pr is the owner's own `warden revert` record"
+        assert triage.VERIFY_FAILED_NOTE_PREFIX in item["note"] and "recurred" in item["note"], item["note"]
+        record = json.loads(item["revert_json"])
+        assert record["sha"] == MERGED_SHA and record["pr"] == _FIX_PR and "recurred" in record["evidence"], record
+        history = [r["note"] for r in conn.execute("SELECT note FROM item_transitions WHERE event_id=? AND "
+                                                   "to_state='working'", (eid,))]
+        assert any("recurred" in (n or "") for n in history), history
+
+        assert len(calls) == 1 and calls[0]["tier"] == "implement", calls
+        brief = calls[0]["brief"]
+        assert f"git revert --no-edit {MERGED_SHA}" in brief, brief
+        assert 'Revert "Loosen the watchdog threshold"' in brief and "nothing else" in brief, brief
+        assert calls[0]["revision_of"] is None and calls[0]["model"] is None and calls[0]["context"] is None
+        d = conn.execute("SELECT why FROM dispatches WHERE job_id='job-000001'").fetchone()
+        assert d["why"] == triage.REVERT_WHY
+
+
+def test_a_host_verb_verify_failure_has_nothing_to_revert_and_goes_back_to_triaged():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-revert-nothing", started=NOW - dt.timedelta(minutes=30))
+        _fake_rollout(targets=())
+        triage._sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
+        _signal_fires_again(conn, eid)
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_TRIAGED and item["reverting_sha"] is None, dict(item)
+
+
+def test_the_revert_rides_the_train_then_a_verified_revert_starts_a_fresh_attempt_with_the_evidence():
+    with _triage_env() as (conn, ctx):
+        eid = _merged_fix(conn, "sig-revert-chain")
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        _fake_rollout(targets=("verify",), verify=_ran())
+        _signal_fires_again(conn, eid)
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1
+
+        reviews: list[dict[str, Any]] = []
+        merges: list[dict[str, Any]] = []
+        triage._sideclaw.submit_update_pr = _fake_update_pr([])
+        triage._sideclaw.submit_review = _fake_submit_review(reviews)
+        triage._sideclaw.get = _jobs({
+            "job-000001": {"id": "job-000001", "status": "done",
+                           "result": _dispatch_result("pr_opened", artifact_url=_TRAIN_PR, branch="dispatch/r")},
+            "update-job-000001": _update_pr_job("up_to_date"),
+            "review-job-000001": {"id": "review-job-000001", "status": "done", "result": _review_result("clean")},
+            "job-000002": {"id": "job-000002", "status": "done",
+                           "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/11")},
+        })
+        CHECK_RUNS["runs"] = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+        triage._merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
+            repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit=REVERT_SHA)
+
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["pr_url"] == _TRAIN_PR, dict(item)
+        assert item["reverting_sha"] == MERGED_SHA and item["revert_json"], "the revert keeps its record"
+        assert CLOSED_PRS == [], "the merged fix is not a superseded PR"
+        _train_pass(conn)      # update_pr submitted
+        _train_pass(conn, 1)   # up_to_date -> checks green -> review submitted
+        assert len(reviews) == 1, reviews
+        context = reviews[0]["context"]
+        assert "MECHANICAL REVERT" in context and MERGED_SHA in context and "recurred" in context, context
+        _train_pass(conn, 2)
+        item = triage._get_item(conn, eid)
+        assert len(merges) == 1 and item["state"] == triage.STATE_VERIFYING, dict(item)
+        assert triage._is_revert(item) and item["merged_sha"] == REVERT_SHA, "a revert merge is marked as one"
+
+        ran = _fake_rollout(targets=("deploy", "verify"), deploy=_ran(), verify=_ran())
+        triage._github.pr_files = lambda owner, repo, number: [
+            {"filename": "watchdog.json", "patch": "@@ -1 +1 @@\n-\"threshold\": 3\n+\"threshold\": 30"}]
+        _signal_fires_again(conn, eid)   # the signal is back after a revert, by design: no window
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=30), dry_run=False)
+        assert ran == [("deploy", "demo-repo"), ("verify", "demo-repo")], ran
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and item["reverting_sha"] is None, dict(item)
+        assert item["revision_count"] == 1 and item["implement_job"] == "job-000002", dict(item)
+        assert item["pr_url"] is None and item["merged_sha"] is None, dict(item)
+
+        assert len(calls) == 2, calls
+        fresh = calls[1]
+        assert fresh["revision_of"] is None, "the reverted branch is merged — nothing to continue"
+        assert f"Attempt 2 of {triage.MAX_IMPLEMENT_ATTEMPTS}" in fresh["brief"], fresh["brief"]
+        assert "do not re-apply the reverted change unchanged" in fresh["brief"], fresh["brief"]
+        assert "recurred" in fresh["context"] and f"git show {MERGED_SHA}" in fresh["context"], fresh["context"]
+        assert "\"threshold\": 30" in fresh["context"] and _FIX_PR in fresh["context"], fresh["context"]
+        assert "the watchdog threshold is too tight" in fresh["context"], "the investigation stays the goal"
+
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=40), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_MERGING and item["revert_json"] is None, dict(item)
+        assert not triage._is_revert(item)
+
+
+def test_a_revert_whose_make_verify_fails_three_passes_fails_the_item():
+    with _triage_env() as (conn, ctx):
+        eid = _reverting(conn, "sig-revert-unhealthy", state=triage.STATE_VERIFYING,
+                         verify_started_at=NOW.isoformat(), merged_sha=REVERT_SHA)
+        _fake_rollout(targets=("verify",), verify=[_ran(False, 1, "x"), _ran(False, 1, "y"), _ran(False, 2, "db down")])
+        triage._sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
+        for n in (1, 2):
+            triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10 * n), dry_run=False)
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_VERIFYING and item["verify_failures"] == n, dict(item)
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=30), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED, dict(item)
+        assert "production unhealthy after revert" in item["note"] and "db down" in item["note"], item["note"]
+
+
+def test_a_landed_revert_with_no_attempt_left_fails_with_the_evidence():
+    with _triage_env() as (conn, ctx):
+        eid = _reverting(conn, "sig-revert-spent", state=triage.STATE_VERIFYING, verify_started_at=NOW.isoformat(),
+                         revision_count=triage.MAX_IMPLEMENT_ATTEMPTS - 1)
+        _fake_rollout(targets=("verify",), verify=_ran())
+        triage._sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED and item["reverting_sha"] is None, dict(item)
+        assert "no implement attempt left" in item["note"] and "recurred" in item["note"], item["note"]
+        assert item["revision_count"] == triage.MAX_IMPLEMENT_ATTEMPTS - 1
+
+
+def test_a_blocked_revert_review_fails_the_item_with_the_pr_left_open_and_no_revision():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-revert-blocked", stage="review", sha=TRAIN_SHA)
+        record = {"sha": MERGED_SHA, "pr": _FIX_PR, "title": "t", "evidence": _EVIDENCE}
+        conn.execute("UPDATE triage_items SET validation_job='review-blocked', reverting_sha=?, revert_json=? "
+                     "WHERE event_id=?", (MERGED_SHA, json.dumps(record), eid))
+        conn.commit()
+        triage._sideclaw.get = _jobs({"review-blocked": {"id": "review-blocked", "status": "done", "result":
+                                      _review_result("actionable", blocking=[{"file": "a.py", "line": 1,
+                                                                              "message": "more than a revert"}])}})
+        triage._merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED, dict(item)
+        assert "not revised" in item["note"] and _TRAIN_PR in item["note"], item["note"]
+        assert CLOSED_PRS == []
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.advance_implement_chain(conn, DEFAULT_POLICY, NOW + dt.timedelta(hours=1), dry_run=False)
+        assert calls == [], "a revert is never revised"
+
+
+def test_a_conflicting_revert_update_fails_instead_of_revising():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-revert-conflict", job="update-job-conflict")
+        conn.execute("UPDATE triage_items SET reverting_sha=?, revert_json='{}' WHERE event_id=?", (MERGED_SHA, eid))
+        conn.commit()
+        triage._sideclaw.get = _jobs({"update-job-conflict": _update_pr_job("conflict", note="rebase failed")})
+        _train_pass(conn)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_FAILED and "not revised" in item["note"], dict(item)
+        assert item["note"].endswith(f"PR left open: {_TRAIN_PR}"), item["note"]
+
+
+def test_a_lease_refused_revert_is_submitted_again_later_without_a_strike():
+    with _triage_env() as (conn, ctx):
+        eid = _reverting(conn, "sig-revert-lease", state=triage.STATE_WORKING)
+        calls: list[dict[str, Any]] = []
+        triage._sideclaw.submit = _fake_submit(calls)
+        triage.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and triage._get_item(conn, eid)["implement_job"] == "job-000001"
+        triage._sideclaw.get = _jobs({"job-000001": {"id": "job-000001", "status": "failed", "error": _LEASE_ERROR},
+                                      "job-000002": {"id": "job-000002", "status": "running"}})
+        triage.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_WORKING and item["strikes"] == 0, dict(item)
+        assert item["implement_job"] is None and item["reverting_sha"] == MERGED_SHA, dict(item)
+        assert item["retry_at"] == (NOW + dt.timedelta(minutes=triage.LEASE_RETRY_MINUTES)).isoformat()
+
+        triage.advance_implement_chain(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
+        assert len(calls) == 1, "the retry waits out LEASE_RETRY_MINUTES"
+        triage.advance_implement_chain(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=triage.LEASE_RETRY_MINUTES),
+                                       dry_run=False)
+        assert len(calls) == 2 and f"git revert --no-edit {MERGED_SHA}" in calls[1]["brief"], calls
+        item = triage._get_item(conn, eid)
+        assert item["strikes"] == 0 and item["revision_count"] == 0, dict(item)
+
+
+def test_a_refused_revert_submit_fails_the_item_and_a_5xx_strikes():
+    with _triage_env() as (conn, ctx):
+        struck = _reverting(conn, "sig-revert-5xx", state=triage.STATE_WORKING)
+        triage._sideclaw.submit = _fake_submit([], ok=False)
+        triage.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, struck)
+        assert item["state"] == triage.STATE_WORKING and item["strikes"] == 1, dict(item)
+        assert item["implement_job"] is None and item["retry_at"], dict(item)
+
+        refused = _reverting(conn, "sig-revert-4xx", state=triage.STATE_WORKING)
+        triage._sideclaw.submit = _refusing_submit([])
+        triage.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, refused)["state"] == triage.STATE_FAILED
+
+
+def test_revert_dry_run_submits_nothing():
+    with _triage_env() as (conn, ctx):
+        eid = _reverting(conn, "sig-revert-dry", state=triage.STATE_WORKING)
+        triage._sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"dry-run submitted: {kw}"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            triage.advance_implement_chain(conn, DEFAULT_POLICY, NOW, dry_run=True)
+        assert f"[dry-run] would submit the revert of {MERGED_SHA[:12]}" in buf.getvalue(), buf.getvalue()
+        item = triage._get_item(conn, eid)
+        assert item["implement_job"] is None and item["state"] == triage.STATE_WORKING, dict(item)
+
+
+def test_auto_implement_leaves_an_item_on_its_revert_alone():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-revert-not-auto", investigate_job="inv-not-auto")
+        conn.execute("UPDATE triage_items SET reverting_sha=?, revert_json='{}', retry_at=? WHERE event_id=?",
+                     (MERGED_SHA, (NOW + dt.timedelta(hours=1)).isoformat(), eid))
+        conn.commit()
+        triage._sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"auto-implemented: {kw}"))
+        triage.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert triage._get_item(conn, eid)["implement_job"] is None
+
+
+def test_an_item_back_before_its_investigation_forgets_its_revert():
+    with _triage_env() as (conn, ctx):
+        eid = _reverting(conn, "sig-revert-forgotten", state=triage.STATE_FAILED)
+        triage._set_state(conn, eid, triage.STATE_TRIAGED, NOW, note="reinvestigate")
+        conn.commit()
+        item = triage._get_item(conn, eid)
+        assert item["reverting_sha"] is None and item["revert_json"] is None, dict(item)
+
 
 if __name__ == "__main__":
     sys.exit(main())

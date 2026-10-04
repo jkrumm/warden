@@ -290,6 +290,7 @@ def test_migrate_adopts_pre_versioned_database():
         "root_cause", "duplicate_of", "triage_job", "triage_job_at",
         "verify_started_at", "verify_mark", "verify_failures", "verify_result",
         "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence",
+        "merged_sha", "reverting_sha", "revert_json",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -1053,6 +1054,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
     assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence"} <= cols, cols
+    assert {"merged_sha", "reverting_sha", "revert_json"} <= cols, cols
     rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
     assert set(rows) == {"note-verifying", "note-working", "note-fixed", "note-merging"}, rows.keys()
     # An item already verifying was deployed by the old rollout: its window starts, no redeploy.
@@ -1063,6 +1065,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
         assert row["verify_mark"] is None and row["verify_result"] is None and row["verify_failures"] == 0
         assert row["train_sha"] is None and row["train_job"] is None and row["reviewed_sha"] is None
         assert row["train_evidence"] is None
+        assert row["merged_sha"] is None and row["reverting_sha"] is None and row["revert_json"] is None
     # An item already merging restarts its train at `update`; nothing else is on one.
     assert rows["note-merging"]["train_stage"] == "update"
     for note in ("note-verifying", "note-working", "note-fixed"):

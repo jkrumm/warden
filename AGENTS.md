@@ -171,8 +171,15 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   own signal quiet for `VERIFY_WINDOW_HOURS` (the event's occurrence mark unchanged since the
   window opened, a state-source event closed, its own Kuma monitor UP). No signal (issue,
   `warden run`) → `fixed` once `make verify` passes. Signal recurrence or three consecutive
-  failing passes → `_on_verify_failure()`, the one seam the revert step replaces. Host-verb
-  restarts enter `verifying` with their window open and verify on `HOST_VERB_LIVENESS_MONITOR`.
+  failing passes → `_on_verify_failure()`: the merged commit (`merged_sha`) is reverted by an
+  implement episode (`git revert --no-edit <sha>`, nothing else; `reverting_sha` marks the
+  item, `revert_pr` stays the owner's `warden revert` record) whose PR rides the same train
+  with no revisions (blocked/checks/conflict → `failed`, PR left open), deploys, and verifies
+  on `make verify` alone — three failing passes → `failed`; a pass → a fresh attempt with the
+  evidence and the reverted diff (the failed fix counts as an attempt, the revert does not),
+  or `failed` when attempts are spent. Host-verb
+  restarts enter `verifying` with their window open and verify on `HOST_VERB_LIVENESS_MONITOR`
+  (no merge to revert: a failure goes back to `triaged`).
 - **An episode is not contained.** `readOnly` is three tool names on a CLI flag
   under `--dangerously-skip-permissions`; `Bash` is unrestricted and the brief is
   attacker-influenceable (public issues, alert text, log lines all reach it). A
