@@ -291,6 +291,7 @@ def test_migrate_adopts_pre_versioned_database():
         "verify_started_at", "verify_mark", "verify_failures", "verify_result",
         "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence",
         "merged_sha", "reverting_sha", "revert_json",
+        "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -1055,6 +1056,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
     assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence"} <= cols, cols
     assert {"merged_sha", "reverting_sha", "revert_json"} <= cols, cols
+    assert {"sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr"} <= cols, cols
     rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
     assert set(rows) == {"note-verifying", "note-working", "note-fixed", "note-merging"}, rows.keys()
     # An item already verifying was deployed by the old rollout: its window starts, no redeploy.
@@ -1066,6 +1068,8 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
         assert row["train_sha"] is None and row["train_job"] is None and row["reviewed_sha"] is None
         assert row["train_evidence"] is None
         assert row["merged_sha"] is None and row["reverting_sha"] is None and row["revert_json"] is None
+        assert row["sweep_pr"] is None and row["sweep_job"] is None and row["sweep_job_at"] is None
+        assert row["sweep_attempts"] == 0 and row["sweep_candidates"] is None and row["fixed_by_pr"] is None
     # An item already merging restarts its train at `update`; nothing else is on one.
     assert rows["note-merging"]["train_stage"] == "update"
     for note in ("note-verifying", "note-working", "note-fixed"):

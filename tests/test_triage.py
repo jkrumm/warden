@@ -10403,5 +10403,340 @@ def test_an_item_back_before_its_investigation_forgets_its_revert():
         assert item["reverting_sha"] is None and item["revert_json"] is None, dict(item)
 
 
+# --- the fixed-by sweep after a fix merge (decision 5) -------------------------------
+
+SWEEP_JOB = "sweep-job-000001"
+
+
+def _sweep_env(*, matches: list[dict[str, Any]] | None = None, job_status: str = "done"):
+    """Fakes for a sweep: the merged PR reads back with a title, body and one patch; the sweep's
+    job is `SWEEP_JOB`, still `queued` when submitted and `job_status` with `matches` afterwards.
+    Returns the list of submitted triage prompts (with their schemas)."""
+    submitted: list[dict[str, Any]] = []
+    triage._github.read_pr = lambda owner, repo, number: {"title": "Loosen the watchdog threshold",
+                                                          "body": "Stops the flapping alert."}
+    triage._github.pr_files = lambda owner, repo, number: [
+        {"filename": "watchdog.json", "patch": "@@ -1 +1 @@\n-\"threshold\": 3\n+\"threshold\": 30"}]
+    triage._sideclaw.submit_triage = lambda *, prompt, schema: submitted.append(
+        {"prompt": prompt, "schema": schema}) or {"id": SWEEP_JOB, "status": "queued"}
+    triage._sideclaw.get = lambda job_id: _triage_job(
+        {"matches": matches if matches is not None else []}, job_id=job_id, status=job_status)
+    return submitted
+
+
+def _merged_with_sweep(conn, ext: str, *, repo: str = "demo-repo") -> int:
+    """A merged fix, verifying, with its sweep queued on the TRAIN PR."""
+    return _seed_verifying(conn, ext, started=NOW - dt.timedelta(minutes=5), merged_sha=MERGED_SHA, repo=repo,
+                           sweep_pr=_TRAIN_PR)
+
+
+def _sweep_pass(conn, minutes: float = 0) -> None:
+    triage.advance_fixed_by_sweeps(conn, NOW + dt.timedelta(minutes=minutes), dry_run=False)
+
+
+def _sweep_untouched(conn, eid: int) -> None:
+    item = triage._get_item(conn, eid)
+    assert item["state"] == triage.STATE_VERIFYING and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
+    assert item["merged_sha"] == MERGED_SHA and item["fixed_by_pr"] is None, dict(item)
+
+
+def test_a_fix_merge_queues_the_sweep_and_a_revert_merge_does_not():
+    with _triage_env() as (conn, ctx):
+        merges: list[dict[str, Any]] = []
+        triage._merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
+            repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit=REVERT_SHA)
+        fix = _train_item(conn, "sig-sweep-fix", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
+        _train_pass(conn)
+        item = triage._get_item(conn, fix)
+        assert item["state"] == triage.STATE_VERIFYING, dict(item)
+        assert item["sweep_pr"] == _TRAIN_PR and item["sweep_job"] is None and item["sweep_attempts"] == 0, dict(item)
+
+        revert = _train_item(conn, "sig-sweep-revert", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA,
+                             repo="other-repo")
+        conn.execute("UPDATE triage_items SET reverting_sha=?, revert_json='{}' WHERE event_id=?", (MERGED_SHA, revert))
+        conn.commit()
+        _train_pass(conn)
+        item = triage._get_item(conn, revert)
+        assert item["state"] == triage.STATE_VERIFYING and triage._is_revert(item), dict(item)
+        assert item["sweep_pr"] is None, "a revert's merge is never swept"
+        assert len(merges) == 2
+
+
+def test_the_other_merge_paths_queue_the_sweep_too():
+    with _triage_env(policy=_MERGE_FIXTURE_POLICY) as (conn, ctx):
+        # Already merged: the loop died between plan_or_land() and the item's own write.
+        eid = _seed_verdict_item(conn, external_id="sig-sweep-already", repo="argo")
+        conn.execute("UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+                     (triage.STATE_MERGING, "implement-job-sw", "validation-job-sw",
+                      "https://github.com/jkrumm/argo/pull/40", eid))
+        conn.commit()
+        triage._land_already_merged_item(conn, _MERGE_FIXTURE_POLICY, triage._get_item(conn, eid), NOW)
+        assert triage._get_item(conn, eid)["sweep_pr"] == "https://github.com/jkrumm/argo/pull/40"
+
+        # Reconcile: GitHub says a crashed merge did land.
+        rec = _seed_verdict_item(conn, external_id="sig-sweep-reconcile", investigate_job="inv-sw-rec", repo="vps")
+        conn.execute("UPDATE triage_items SET state=?, implement_job=?, pr_url=? WHERE event_id=?",
+                     (triage.STATE_MERGING, "implement-job-rec", "https://github.com/jkrumm/vps/pull/8", rec))
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-rec", repo="vps")
+        conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id=?",
+                     ("https://github.com/jkrumm/vps/pull/8", "implement-job-rec"))
+        conn.commit()
+        triage.record_operation(conn, event_id=rec, kind="merge", repo="vps", authorized_by="auto-from-item")
+        triage._run_gh_pr_view = lambda owner, repo, pr: {"state": "MERGED", "mergeCommit": {"oid": "deadbeef"}}
+        triage.reconcile_operations(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, rec)
+        assert item["state"] == triage.STATE_VERIFYING, dict(item)
+        assert item["sweep_pr"] == "https://github.com/jkrumm/vps/pull/8", dict(item)
+
+
+def test_a_queued_sweep_submits_one_job_with_the_diff_and_only_the_idle_candidates():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-merged")
+        triaged = _seed_item(conn, external_id="sig-sweep-triaged", state=triage.STATE_TRIAGED)
+        idle = _seed_item(conn, external_id="sig-sweep-idle", state=triage.STATE_WORKING)
+        busy = _seed_item(conn, external_id="sig-sweep-busy", state=triage.STATE_WORKING, implement_job="impl-busy")
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) VALUES(?,?,?,?,?,?)",
+                     ("inv-running", "investigate", "demo-repo", "b", "running", NOW.isoformat()))
+        investigating = _seed_item(conn, external_id="sig-sweep-investigating", state=triage.STATE_WORKING,
+                                   dispatch_job="inv-running")
+        elsewhere = _seed_item(conn, external_id="sig-sweep-elsewhere", state=triage.STATE_TRIAGED, repo="other-repo")
+        owners = _seed_item(conn, external_id="sig-sweep-owner", state=triage.STATE_TRIAGED, origin="human")
+        submitted = _sweep_env()
+
+        _sweep_pass(conn)
+        assert len(submitted) == 1, submitted
+        prompt = submitted[0]["prompt"]
+        assert submitted[0]["schema"] is triage._intake.SWEEP_SCHEMA
+        assert "Loosen the watchdog threshold" in prompt and '"threshold": 30' in prompt, prompt
+        assert triage._intake.UNTRUSTED_BEGIN in prompt, "the PR text and the diff are fenced as untrusted"
+        for eid in (triaged, idle):
+            assert f"#{eid} " in prompt, (eid, prompt)
+        for eid in (merged, busy, investigating, elsewhere, owners):
+            assert f"#{eid} " not in prompt, (eid, prompt)
+        row = triage._get_item(conn, merged)
+        assert row["sweep_job"] == SWEEP_JOB and row["sweep_pr"] == _TRAIN_PR, dict(row)
+        assert json.loads(row["sweep_candidates"]) == {str(triaged): "triaged", str(idle): "working"}
+        _sweep_untouched(conn, merged)
+        _sweep_pass(conn, 1)   # a job that is still running folds nothing and is not resubmitted
+        assert len(submitted) == 1
+
+
+def test_the_diff_in_the_prompt_is_truncated():
+    with _triage_env() as (conn, ctx):
+        _merged_with_sweep(conn, "sig-sweep-big")
+        _seed_item(conn, external_id="sig-sweep-big-cand", state=triage.STATE_TRIAGED)
+        submitted = _sweep_env()
+        triage._github.pr_files = lambda owner, repo, number: [{"filename": "big.txt", "patch": "x" * 50000}]
+        _sweep_pass(conn)
+        assert 12000 <= len(submitted[0]["prompt"]) < 16000, len(submitted[0]["prompt"])
+
+
+def test_a_finished_sweep_moves_only_the_valid_match_to_verifying_by_signal():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-fold")
+        valid = _seed_item(conn, external_id="sig-sweep-valid", state=triage.STATE_TRIAGED)
+        working = _seed_item(conn, external_id="sig-sweep-w", state=triage.STATE_WORKING)
+        stale = _seed_item(conn, external_id="sig-sweep-stale", state=triage.STATE_TRIAGED)
+        started = _seed_item(conn, external_id="sig-sweep-started", state=triage.STATE_TRIAGED)
+        investigating = _seed_item(conn, external_id="sig-sweep-late-inv", state=triage.STATE_WORKING)
+        foreign = _seed_item(conn, external_id="sig-sweep-foreign", state=triage.STATE_TRIAGED, repo="other-repo")
+        reason = "the threshold change " + "x" * 300
+        _sweep_env()
+        _sweep_pass(conn)
+        # Between the submit and the fold: one item moved on, one got an episode, one an investigation.
+        triage._set_state(conn, stale, triage.STATE_NEEDS_DECISION, NOW, note="human please")
+        conn.execute("UPDATE triage_items SET implement_job='impl-late' WHERE event_id=?", (started,))
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) VALUES(?,?,?,?,?,?)",
+                     ("inv-late", "investigate", "demo-repo", "b", "running", NOW.isoformat()))
+        conn.execute("UPDATE triage_items SET dispatch_job='inv-late' WHERE event_id=?", (investigating,))
+        conn.commit()
+        triage._sideclaw.get = lambda job_id: _triage_job({"matches": [
+            {"item": valid, "reason": reason}, {"item": working, "reason": "same defect"},
+            {"item": stale, "reason": "r"}, {"item": started, "reason": "r"}, {"item": investigating, "reason": "r"},
+            {"item": foreign, "reason": "r"}, {"item": merged, "reason": "r"}, {"item": 9999, "reason": "r"},
+            {"item": "x", "reason": "r"}, {"item": valid, "reason": "twice"}, "nonsense"]}, job_id=job_id)
+        _sweep_pass(conn, 1)
+
+        item = triage._get_item(conn, valid)
+        assert item["state"] == triage.STATE_VERIFYING and item["fixed_by_pr"] == _TRAIN_PR, dict(item)
+        assert item["note"].startswith(f"fixed by {_TRAIN_PR}: the threshold change") and len(item["note"]) <= 200
+        assert item["verify_started_at"] == (NOW + dt.timedelta(minutes=1)).isoformat(), dict(item)
+        assert item["verify_mark"] == triage._occurrence_mark(triage._get_event(conn, valid)), dict(item)
+        assert item["merged_sha"] is None and item["verify_failures"] == 0, dict(item)
+        assert triage._get_item(conn, working)["state"] == triage.STATE_VERIFYING
+        for eid, state in ((stale, triage.STATE_NEEDS_DECISION), (started, triage.STATE_TRIAGED),
+                           (investigating, triage.STATE_WORKING), (foreign, triage.STATE_TRIAGED)):
+            other = triage._get_item(conn, eid)
+            assert other["state"] == state and other["fixed_by_pr"] is None, (eid, dict(other))
+        row = triage._get_item(conn, merged)
+        assert row["sweep_pr"] is None and row["sweep_job"] is None and row["sweep_candidates"] is None, dict(row)
+        _sweep_untouched(conn, merged)
+
+
+def test_folding_the_same_finished_sweep_twice_acts_once():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-cas")
+        match = _seed_item(conn, external_id="sig-sweep-cas-match", state=triage.STATE_TRIAGED)
+        _sweep_env(matches=[{"item": match, "reason": "same defect"}])
+        _sweep_pass(conn)
+        job = _triage_job({"matches": [{"item": match, "reason": "same defect"}]}, job_id=SWEEP_JOB)
+        first = triage._fold_sweep_job(conn, merged, SWEEP_JOB, job, NOW)
+        second = triage._fold_sweep_job(conn, merged, SWEEP_JOB, job, NOW)
+        _sweep_pass(conn, 1)
+        assert first and "swept" in first and second is None
+        moves = conn.execute("SELECT count(*) FROM item_transitions WHERE event_id=? AND to_state='verifying'",
+                             (match,)).fetchone()[0]
+        assert moves == 1, moves
+
+
+def test_a_swept_item_quiet_for_the_window_closes_fixed_by_with_no_make_verify_and_no_slack():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-swept-quiet", started=NOW - dt.timedelta(hours=1), fixed_by_pr=_TRAIN_PR,
+                              note=f"fixed by {_TRAIN_PR}: same defect", repo="demo-repo")
+        triage._rollout.verify = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("a swept item never runs make verify"))
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_VERIFYING, "the window is still open"
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(hours=triage.VERIFY_WINDOW_HOURS), dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_CLOSED and item["close_reason"] == triage.CLOSE_FIXED_BY, dict(item)
+        assert _TRAIN_PR in item["note"] and ctx.posted == [], (item["note"], ctx.posted)
+        assert not conn.execute("SELECT 1 FROM operations WHERE kind='deploy'").fetchone()
+
+
+def test_a_swept_item_whose_signal_recurs_goes_back_to_triaged_without_a_revert():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-swept-recurs", started=NOW - dt.timedelta(minutes=30), fixed_by_pr=_TRAIN_PR)
+        triage._sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"a revert was submitted: {kw}"))
+        _signal_fires_again(conn, eid)
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_TRIAGED and item["fixed_by_pr"] is None, dict(item)
+        assert item["note"].startswith(triage.SWEPT_BACK_NOTE_PREFIX) and "recurred" in item["note"], item["note"]
+        assert item["reverting_sha"] is None and item["verify_started_at"] is None, dict(item)
+
+
+def test_a_swept_item_still_firing_at_the_window_end_goes_back_after_three_passes():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-swept-firing", started=NOW - dt.timedelta(hours=3), fixed_by_pr=_TRAIN_PR,
+                              origin="alert")
+        conn.execute("UPDATE events SET source='uk', resolved_at=NULL WHERE id=?", (eid,))
+        conn.commit()
+        for n in (1, 2):
+            triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=n), dry_run=False)
+            item = triage._get_item(conn, eid)
+            assert item["state"] == triage.STATE_VERIFYING and item["verify_failures"] == n, dict(item)
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=3), dry_run=False)
+        assert triage._get_item(conn, eid)["state"] == triage.STATE_TRIAGED
+
+
+def test_a_swept_issue_closes_at_the_window_end_and_the_owner_is_told():
+    with _triage_env() as (conn, ctx):
+        eid = triage.open_origin_item(
+            conn, origin="github_issue", repo="demo-repo", brief="fix it", max_tier="implement",
+            external_id="jkrumm/demo-repo#21", title="fix it", url="https://github.com/jkrumm/demo-repo/issues/21",
+            payload={"repo": "demo-repo", "number": 21, "author": triage._github.GH_OWNER}, now=NOW)
+        triage._set_state(conn, eid, triage.STATE_VERIFYING, NOW - dt.timedelta(hours=3),
+                          **{**triage._VERIFY_RESET, "verify_started_at": (NOW - dt.timedelta(hours=3)).isoformat(),
+                             "fixed_by_pr": _TRAIN_PR}, note=f"fixed by {_TRAIN_PR}: same defect")
+        conn.commit()
+        comments: list[dict[str, Any]] = []
+        triage._github.create_issue_comment = lambda repo_full, number, body: comments.append(
+            {"number": number, "body": body}) or {"id": 1}
+        triage.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = triage._get_item(conn, eid)
+        assert item["state"] == triage.STATE_CLOSED and item["close_reason"] == triage.CLOSE_FIXED_BY, dict(item)
+        assert len(comments) == 1 and comments[0]["number"] == 21 and _TRAIN_PR in comments[0]["body"], comments
+        assert comments[0]["body"].count("\n") <= 2 and ctx.posted == []
+
+
+def test_a_private_repo_is_never_swept_and_nothing_is_submitted():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-private", repo="demo-private")
+        _seed_item(conn, external_id="sig-sweep-private-cand", state=triage.STATE_TRIAGED, repo="demo-private")
+        submitted = _sweep_env()
+        _sweep_pass(conn)
+        assert submitted == []
+        row = triage._get_item(conn, merged)
+        assert row["sweep_pr"] is None and row["sweep_job"] is None, dict(row)
+        _sweep_untouched(conn, merged)
+
+
+def test_no_candidate_means_no_job():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-alone")
+        submitted = _sweep_env()
+        _sweep_pass(conn)
+        assert submitted == [] and triage._get_item(conn, merged)["sweep_pr"] is None
+
+
+def test_sweep_dry_run_prints_what_it_would_submit_and_submits_nothing():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-dry")
+        _seed_item(conn, external_id="sig-sweep-dry-cand", state=triage.STATE_TRIAGED)
+        triage._sideclaw.submit_triage = lambda **kw: (_ for _ in ()).throw(AssertionError(f"dry-run submitted: {kw}"))
+        triage._github.read_pr = lambda *a: (_ for _ in ()).throw(AssertionError("dry-run read GitHub"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            triage.advance_implement_chain(conn, DEFAULT_POLICY, NOW, dry_run=True)
+        assert f"[dry-run] would submit a fixed-by sweep for {_TRAIN_PR} (1 candidate item(s))" in buf.getvalue(), buf.getvalue()
+        row = triage._get_item(conn, merged)
+        assert row["sweep_pr"] == _TRAIN_PR and row["sweep_job"] is None and row["sweep_attempts"] == 0, dict(row)
+
+
+def test_a_failing_sweep_never_touches_the_merged_item_and_gives_up_after_the_limit():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-fails")
+        cand = _seed_item(conn, external_id="sig-sweep-fails-cand", state=triage.STATE_TRIAGED)
+        _sweep_env()
+        triage._sideclaw.submit_triage = lambda **kw: (_ for _ in ()).throw(triage.RemoteError("sideclaw is down"))
+        for n in range(1, triage.SWEEP_ATTEMPT_LIMIT):
+            _sweep_pass(conn, n)
+            row = triage._get_item(conn, merged)
+            assert row["sweep_pr"] == _TRAIN_PR and row["sweep_job"] is None and row["sweep_attempts"] == n, dict(row)
+            _sweep_untouched(conn, merged)
+        _sweep_pass(conn, 10)
+        row = triage._get_item(conn, merged)
+        assert row["sweep_pr"] is None and row["sweep_attempts"] == 0, dict(row)
+        _sweep_untouched(conn, merged)
+        assert triage._get_item(conn, cand)["state"] == triage.STATE_TRIAGED
+
+
+def test_a_failed_sweep_job_and_an_unusable_answer_are_failed_attempts_not_folds():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-badjob")
+        cand = _seed_item(conn, external_id="sig-sweep-badjob-cand", state=triage.STATE_TRIAGED)
+        _sweep_env(job_status="failed")
+        _sweep_pass(conn)
+        _sweep_pass(conn, 1)   # the job is failed: attempt 1
+        row = triage._get_item(conn, merged)
+        assert row["sweep_job"] is None and row["sweep_attempts"] == 1, dict(row)
+        triage._sideclaw.get = lambda job_id: _triage_job({"matches": "not-a-list"}, job_id=job_id)
+        _sweep_pass(conn, 2)   # resubmitted
+        _sweep_pass(conn, 3)   # unusable answer: attempt 2
+        assert triage._get_item(conn, merged)["sweep_attempts"] == 2
+        assert triage._get_item(conn, cand)["state"] == triage.STATE_TRIAGED
+        _sweep_untouched(conn, merged)
+
+
+def test_a_stale_sweep_claim_is_released_as_a_failed_attempt():
+    with _triage_env() as (conn, ctx):
+        merged = _merged_with_sweep(conn, "sig-sweep-claim")
+        claim = f"{triage.TRIAGE_CLAIM_PREFIX}{(NOW - dt.timedelta(minutes=10)).isoformat()}"
+        conn.execute("UPDATE triage_items SET sweep_job=? WHERE event_id=?", (claim, merged))
+        conn.commit()
+        _sweep_pass(conn)
+        row = triage._get_item(conn, merged)
+        assert row["sweep_job"] is None and row["sweep_attempts"] == 1, dict(row)
+
+
+def test_a_verifying_entry_that_is_not_a_sweep_starts_without_fixed_by_pr():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-fixed-by-reset", state=triage.STATE_VERIFYING, fixed_by_pr=_TRAIN_PR)
+        triage._set_state(conn, eid, triage.STATE_VERIFYING, NOW, **triage._VERIFY_RESET)
+        assert triage._get_item(conn, eid)["fixed_by_pr"] is None
+
+
 if __name__ == "__main__":
     sys.exit(main())

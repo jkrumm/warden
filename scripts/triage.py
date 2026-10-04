@@ -974,6 +974,7 @@ _SET_STATE_COLUMNS = (
     "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
     "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence",
     "merged_sha", "reverting_sha", "revert_json",
+    "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
 )
 
 # The merge train's position, meaningful only while the item is `merging`: leaving it clears
@@ -985,16 +986,23 @@ _TRAIN_POSITION = ("train_stage", "train_sha", "train_job")
 # (`verify_started_at` NULL), no baseline, no failures. `deploy_expect_json` is the host
 # verb's monitor record — nothing else writes it. `merged_sha` is what a failed verification
 # reverts: an entry from a merge sets it over this reset (_merged_entry()), every other entry
-# (a host verb) has nothing to revert.
+# (a host verb) has nothing to revert. `fixed_by_pr` marks an item a fixed-by sweep put in
+# `verifying` (signal-only); an entry that is not that sweep starts without it.
 _VERIFY_RESET: dict[str, Any] = {
     "verify_started_at": None, "verify_mark": None, "verify_failures": 0, "verify_result": None,
-    "deploy_expect_json": None, "merged_sha": None,
+    "deploy_expect_json": None, "merged_sha": None, "fixed_by_pr": None,
 }
 
 
-def _merged_entry(sha: str | None) -> dict[str, Any]:
-    """The columns of entering `verifying` from a merge that landed as `sha`."""
-    return {**_VERIFY_RESET, "merged_sha": sha}
+def _merged_entry(item: sqlite3.Row, sha: str | None) -> dict[str, Any]:
+    """The columns of `item` entering `verifying` from a merge that landed as `sha`. A fix's merge
+    (not a revert's: _is_revert()) also queues the fixed-by sweep of its pull request
+    (advance_fixed_by_sweeps()), whatever becomes of this item afterwards."""
+    entry = {**_VERIFY_RESET, "merged_sha": sha}
+    if item["pr_url"] and not _is_revert(item):
+        entry.update(sweep_pr=item["pr_url"], sweep_job=None, sweep_job_at=None, sweep_attempts=0,
+                     sweep_candidates=None)
+    return entry
 
 
 class _Coalesce(NamedTuple):
@@ -3756,7 +3764,8 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             conn.commit()
             continue
         sha = (new_receipt or {}).get("mergeCommit")
-        _set_state(conn, row["event_id"], STATE_VERIFYING, now, **_merged_entry(sha),
+        merged = _get_item(conn, row["event_id"])
+        _set_state(conn, row["event_id"], STATE_VERIFYING, now, **_merged_entry(merged, sha),
                    note=f"reconciled from GitHub: merged as {sha}; deploy and verification next")
         conn.commit()
 
@@ -4543,7 +4552,7 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
     op = conn.execute("SELECT receipt_json FROM operations WHERE event_id=? AND kind='merge' AND outcome='done' "
                       "ORDER BY rowid DESC LIMIT 1", (item["event_id"],)).fetchone()
     sha = _safe_json(op["receipt_json"] if op else None).get("mergeCommit")
-    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_merged_entry(sha),
+    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_merged_entry(item, sha),
                note="merged before the loop stopped; state derived from the merge receipt")
     conn.commit()
     print(f"triage: {item['signature']} was already merged (event {item['event_id']}) — state derived "
@@ -5194,7 +5203,7 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     # in `verifying` with no `verify_started_at`. A revert keeps `reverting_sha`: that is what
     # marks this merge as one (_is_revert()).
     what = f"the revert of {item['reverting_sha'][:12]}" if _is_revert(item) else "deploy and verification"
-    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_merged_entry(result.merge_commit),
+    _set_state(conn, item["event_id"], STATE_VERIFYING, now, **_merged_entry(item, result.merge_commit),
                note=f"merged {result.repo_slug}#{result.pull_request}; {what} next")
     conn.commit()
     return "merged"
@@ -5502,6 +5511,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     maybe_auto_implement(conn, policy, now, dry_run=dry_run)
     poll_implement_jobs(conn, policy, now, dry_run=dry_run)
     advance_merge_trains(conn, policy, now, dry_run=dry_run)
+    advance_fixed_by_sweeps(conn, now, dry_run=dry_run)
 
 
 # --- deploy and verify (step 10) -----------------------------------------------
@@ -5623,6 +5633,9 @@ def _signal_not_quiet(item: sqlite3.Row, event: sqlite3.Row) -> list[str]:
 
 
 def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row, now: dt.datetime) -> None:
+    if item["fixed_by_pr"]:
+        _verify_swept(conn, item, now)
+        return
     if _is_revert(item):
         _verify_revert(conn, item, now)
         return
@@ -5678,7 +5691,8 @@ def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datet
     for item in conn.execute("SELECT * FROM triage_items WHERE state=? ORDER BY event_id",
                              (STATE_VERIFYING,)).fetchall():
         if dry_run:
-            what = "make deploy, then make verify" if item["verify_started_at"] is None else "make verify"
+            what = (f"signal-only verification (swept by {item['fixed_by_pr']})" if item["fixed_by_pr"]
+                    else "make deploy, then make verify" if item["verify_started_at"] is None else "make verify")
             print(f"[dry-run] would run {what} for {item['signature']} ({item['repo']})")
             continue
         if item["verify_started_at"] is None:
@@ -5689,6 +5703,266 @@ def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datet
     if not dry_run:
         # A verification that just failed opens its revert now, not a sweep later.
         maybe_submit_reverts(conn, policy, now, dry_run=False)
+
+
+# --- the fixed-by sweep after a fix merge (step 10, decision 5) ------------------------
+#
+# A merged fix may also fix other items waiting in its repo. When a fix's merge lands (a revert's
+# never does: _is_revert()) _merged_entry() queues the sweep on the merged item (`sweep_pr`), and
+# advance_fixed_by_sweeps() — in the implement chain, so both crons run it — turns that into one
+# sideclaw `triage` job: the merged PR's title, body and diff against the repo's `triaged` items
+# and its `working` items with no episode in flight, answering `{matches: [{item, reason}]}`. It
+# follows the intake triage pattern: a claim sentinel, then the job id, then a compare-and-set
+# fold. A match is validated against the ledger (an id the prompt showed, still in the state it was
+# shown in, still no episode in flight); a valid one enters `verifying` on signal alone
+# (`fixed_by_pr`, _verify_swept()): quiet for the window -> `closed(fixed_by)`, recurrence -> back
+# to `triaged`. The sweep never moves the merged item: a submit failure or a bad answer is a
+# stderr line and another attempt, and after SWEEP_ATTEMPT_LIMIT the sweep is dropped. A `-private`
+# repo is never swept — nothing in it may reach the model. Dry-run prints, never submits.
+
+SWEEP_ATTEMPT_LIMIT = 3
+# `triaged`, or `working` with no implement/review episode, no revert in progress and no
+# investigation still running: the items a fix may pre-empt. Also re-checked at fold time.
+_SWEEPABLE_SQL = (
+    "(state='triaged' OR (state='working' AND implement_job IS NULL AND validation_job IS NULL "
+    "AND reverting_sha IS NULL AND NOT (dispatch_job IS NOT NULL AND NOT EXISTS "
+    "(SELECT 1 FROM dispatches d WHERE d.job_id = triage_items.dispatch_job AND d.finished_at IS NOT NULL))))"
+)
+_SWEEP_COLUMNS = ("sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates")
+_SWEEP_DONE: dict[str, Any] = {"sweep_pr": None, "sweep_job": None, "sweep_job_at": None,
+                               "sweep_attempts": 0, "sweep_candidates": None}
+SWEPT_BACK_NOTE_PREFIX = "fixed-by sweep did not hold: "
+
+
+def _sweep_cas(conn: sqlite3.Connection, event_id: int, expect_job: str | None, **columns: Any) -> bool:
+    """Write the sweep's bookkeeping on the merged item, compare-and-set on `sweep_job` being
+    `expect_job` (NULL included) while a sweep is still queued. Not a state transition: the merged
+    item's own state is never the sweep's to touch."""
+    unknown = tuple(c for c in columns if c not in _SWEEP_COLUMNS)
+    if unknown:
+        raise ValueError(f"{unknown} are not sweep columns")
+    sql = f"UPDATE triage_items SET {', '.join(f'{c}=?' for c in columns)} WHERE event_id=? AND sweep_pr IS NOT NULL"
+    params: list[Any] = [*columns.values(), event_id]
+    if expect_job is None:
+        sql += " AND sweep_job IS NULL"
+    else:
+        sql += " AND sweep_job=?"
+        params.append(expect_job)
+    won = conn.execute(sql, params).rowcount > 0
+    conn.commit()
+    return won
+
+
+def _sweep_drop(conn: sqlite3.Connection, row: sqlite3.Row, expect_job: str | None, why: str) -> bool:
+    """End a sweep without running it (or after its last failure): quiet, a stderr line."""
+    won = _sweep_cas(conn, row["event_id"], expect_job, **_SWEEP_DONE)
+    if won:
+        print(f"triage: fixed-by sweep of {row['sweep_pr']} dropped: {why}", file=sys.stderr)
+    return won
+
+
+def _sweep_failed(conn: sqlite3.Connection, row: sqlite3.Row, expect_job: str | None, why: str) -> None:
+    """One failed attempt: another next pass, until SWEEP_ATTEMPT_LIMIT, then the sweep is dropped."""
+    attempts = row["sweep_attempts"] + 1
+    if attempts >= SWEEP_ATTEMPT_LIMIT:
+        _sweep_drop(conn, row, expect_job, f"{why} (attempt {attempts} of {SWEEP_ATTEMPT_LIMIT})")
+        return
+    if _sweep_cas(conn, row["event_id"], expect_job, sweep_job=None, sweep_job_at=None, sweep_attempts=attempts):
+        print(f"triage: fixed-by sweep of {row['sweep_pr']} failed, will retry: {why} "
+              f"(attempt {attempts} of {SWEEP_ATTEMPT_LIMIT})", file=sys.stderr)
+
+
+def _sweep_candidates(conn: sqlite3.Connection, row: sqlite3.Row) -> list[dict[str, Any]]:
+    """The items of the merged item's repo a fix may pre-empt (_SWEEPABLE_SQL), newest first. Never
+    the merged item itself and never the owner's own request (`human`): nothing owner-asked closes
+    on a model's say-so."""
+    out = []
+    for r in conn.execute(
+            f"SELECT event_id, state, root_cause, note FROM triage_items WHERE repo=? AND event_id != ? "
+            f"AND origin != 'human' AND {_SWEEPABLE_SQL} ORDER BY created_at DESC, event_id DESC LIMIT ?",
+            (row["repo"], row["event_id"], _intake.MAX_OPEN_ITEMS)):
+        event = _get_event(conn, r["event_id"])
+        out.append({"id": r["event_id"], "state": r["state"], "title": event["title"] if event else "",
+                    "root_cause": r["root_cause"], "note": r["note"]})
+    return out
+
+
+def _submit_sweep(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) -> dict[str, Any] | None:
+    """Claim one queued sweep, submit its job, record the job id. Returns the job, or None when
+    nothing is in flight afterwards (dropped, the claim lost, or a failed attempt)."""
+    event_id, pr_url = row["event_id"], row["sweep_pr"]
+    if not row["repo"] or _intake.is_private(row["repo"]):
+        _sweep_drop(conn, row, None, "private or unknown repo, nothing safe to show the model")
+        return None
+    ref = _github.parse_pr_url(pr_url)
+    if ref is None:
+        _sweep_drop(conn, row, None, "not a pull request URL")
+        return None
+    candidates = _sweep_candidates(conn, row)
+    if not candidates:
+        _sweep_drop(conn, row, None, "no item waiting in the repo")
+        return None
+    claim = f"{TRIAGE_CLAIM_PREFIX}{_now_iso(now)}"
+    if not _sweep_cas(conn, event_id, None, sweep_job=claim, sweep_job_at=_now_iso(now),
+                      sweep_candidates=json.dumps({str(c["id"]): c["state"] for c in candidates})):
+        return None
+    row = _get_item(conn, event_id)
+    try:
+        pr = _github.read_pr(*ref)
+    except WardenError as e:
+        _sweep_failed(conn, row, claim, f"could not read {pr_url}: {e}")
+        return None
+    diff = _pr_diff(pr_url, _intake.MAX_SWEEP_DIFF_CHARS)
+    if diff is None:
+        _sweep_failed(conn, row, claim, f"no diff of {pr_url}")
+        return None
+    prompt = _intake.build_sweep_prompt(repo=row["repo"], pr_title=str(pr.get("title") or ""),
+                                        pr_body=str(pr.get("body") or ""), diff=diff, candidates=candidates)
+    try:
+        job = _sideclaw.submit_triage(prompt=prompt, schema=_intake.SWEEP_SCHEMA)
+    except WardenError as e:
+        _sweep_failed(conn, row, claim, f"submit failed: {e}")
+        return None
+    if not _sweep_cas(conn, event_id, claim, sweep_job=job["id"], sweep_job_at=_now_iso(now)):
+        print(f"triage: fixed-by sweep job {job['id']} for {pr_url} lost its claim (released as stale "
+              f"while submitting) — its answer is dropped", file=sys.stderr)
+        return None
+    return job
+
+
+def _fold_sweep_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: dict[str, Any],
+                    now: dt.datetime) -> str | None:
+    """Settle one finished sweep job. The queued sweep is cleared first, compare-and-set on the job
+    id, so a second pass finding the same finished job does nothing; then every match is validated
+    and applied on its own (see the block comment). Returns what happened in a few words, or None
+    when another pass already folded it or the job failed (a failed attempt)."""
+    row = _get_item(conn, event_id)
+    if row is None or row["sweep_job"] != job_id:
+        return None
+    result = job.get("result")
+    answer = result.get("result") if job.get("status") == "done" and isinstance(result, dict) else None
+    matches = answer.get("matches") if isinstance(answer, dict) else None
+    if not isinstance(matches, list):
+        _sweep_failed(conn, row, job_id, f"job {job_id} {job.get('status')}: "
+                      f"{job.get('error') or 'no usable answer'}")
+        return None
+    pr_url = row["sweep_pr"]
+    shown = _safe_json(row["sweep_candidates"])
+    if not _sweep_cas(conn, event_id, job_id, **_SWEEP_DONE):
+        return None
+    swept: list[int] = []
+    for match in matches:
+        target_id = match.get("item") if isinstance(match, dict) else None
+        if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id in swept:
+            continue
+        shown_state = shown.get(str(target_id))
+        target = _get_item(conn, target_id)
+        if shown_state is None or target is None or target["repo"] != row["repo"] or target_id == event_id:
+            continue
+        if not conn.execute(f"SELECT 1 FROM triage_items WHERE event_id=? AND state=? AND {_SWEEPABLE_SQL}",
+                            (target_id, shown_state)).fetchone():
+            continue
+        event = _get_event(conn, target_id)
+        reason = " ".join(str(match.get("reason") or "").split())[:200] or "no reason given"
+        mark = _occurrence_mark(event) if target["origin"] == "alert" and event is not None else None
+        moved = _set_state(
+            conn, target_id, STATE_VERIFYING, now, expect_state=shown_state,
+            expect_null=("implement_job", "validation_job"), note=f"fixed by {pr_url}: {reason}",
+            **{**_VERIFY_RESET, "verify_started_at": _now_iso(now), "verify_mark": mark, "fixed_by_pr": pr_url})
+        conn.commit()
+        if moved:
+            swept.append(target_id)
+    return f"swept {swept} by {pr_url}" if swept else "swept nothing"
+
+
+def _verify_swept(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> None:
+    """Verification of an item a fixed-by sweep put in `verifying`: its own signal only. No
+    deploy and no `make verify` — the merging item already ran both. The signal recurring, or
+    not quiet at the end of the window VERIFY_FAILURE_LIMIT passes in a row, sends it back to
+    `triaged` with the evidence (never `_on_verify_failure()`: it was not this item's merge, so
+    there is nothing to revert); the window over and the signal quiet closes it
+    `closed(fixed_by)`, with no Slack line. An item with no signal (an issue) closes at the end of
+    the window; an owner's issue is told, like any other issue verdict."""
+    event_id, pr_url = item["event_id"], item["fixed_by_pr"]
+    event = _get_event(conn, event_id)
+    signal = item["origin"] == "alert" and event is not None
+
+    def back(evidence: str) -> None:
+        _set_state(conn, event_id, STATE_TRIAGED, now, expect_state=STATE_VERIFYING,
+                   expect_eq={"fixed_by_pr": pr_url}, note=f"{SWEPT_BACK_NOTE_PREFIX}{evidence}", **_VERIFY_RESET)
+        conn.commit()
+
+    if signal and item["verify_mark"] is not None and _occurrence_mark(event) != item["verify_mark"]:
+        back(f"own signal recurred after {pr_url}: {event['title']}")
+        return
+    started = _parse_ts(item["verify_started_at"]) or now
+    if now - started < dt.timedelta(hours=VERIFY_WINDOW_HOURS):
+        return
+    problems = _signal_not_quiet(item, event) if signal else []
+    if problems:
+        failures = item["verify_failures"] + 1
+        evidence = "; ".join(problems)
+        if failures >= VERIFY_FAILURE_LIMIT:
+            back(f"{failures} consecutive failing passes after {pr_url} — {evidence}")
+            return
+        _set_state(conn, event_id, STATE_VERIFYING, now, expect_state=STATE_VERIFYING,
+                   verify_failures=failures, verify_result=evidence[:VERIFY_RESULT_MAX])
+        conn.commit()
+        return
+    note = item["note"] or f"fixed by {pr_url}"
+    won = _set_state(conn, event_id, STATE_CLOSED, now, expect_state=STATE_VERIFYING,
+                     expect_eq={"fixed_by_pr": pr_url}, close_reason=CLOSE_FIXED_BY, note=note,
+                     verify_failures=0, verify_result=f"quiet {VERIFY_WINDOW_HOURS:g}h")
+    conn.commit()
+    if won and event is not None:
+        _maybe_comment_back_on_issue(conn, item, event, {}, now, state="fixed",
+                                     note=note.removeprefix("fixed by "), dry_run=False)
+
+
+def advance_fixed_by_sweeps(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
+    """Move every queued sweep (`sweep_pr` set on a merged item) one step: submit its job, release a
+    stale claim (TRIAGE_CLAIM_STALE_MINUTES), fold a finished job, and cancel a job still not
+    terminal TRIAGE_JOB_STALE_MINUTES after its submit. Called from the implement chain, so the loop
+    and the sweep cron both run it; every write is a compare-and-set. A failure never touches the
+    merged item (see the block comment). Dry-run prints what it would submit and nothing else."""
+    for row in conn.execute("SELECT * FROM triage_items WHERE sweep_pr IS NOT NULL ORDER BY event_id").fetchall():
+        job_id = row["sweep_job"]
+        if dry_run:
+            if job_id is None:
+                private = not row["repo"] or _intake.is_private(row["repo"])
+                print(f"[dry-run] would {'skip the private' if private else 'submit a'} fixed-by sweep "
+                      f"for {row['sweep_pr']} ({len(_sweep_candidates(conn, row))} candidate item(s))")
+            continue
+        if job_id is None:
+            job = _submit_sweep(conn, row, now)
+            if job is not None and job.get("status") in _sideclaw.TERMINAL:
+                _fold_sweep_job(conn, row["event_id"], job["id"], job, now)
+            continue
+        if _is_triage_claim(job_id):
+            claimed_at = _parse_ts(job_id[len(TRIAGE_CLAIM_PREFIX):])
+            if claimed_at is None or claimed_at < now - dt.timedelta(minutes=TRIAGE_CLAIM_STALE_MINUTES):
+                _sweep_failed(conn, row, job_id, "a stale claim (the submitter died)")
+            continue
+        try:
+            job = _sideclaw.get(job_id)
+        except RemoteError as e:
+            print(f"triage: could not poll fixed-by sweep job {job_id}: {e}", file=sys.stderr)
+            continue
+        if job is None:
+            _sweep_failed(conn, row, job_id, f"sideclaw has no record of job {job_id}")
+            continue
+        if job.get("status") in _sideclaw.TERMINAL:
+            _fold_sweep_job(conn, row["event_id"], job_id, job, now)
+            continue
+        submitted_at = _parse_ts(row["sweep_job_at"])
+        if submitted_at is None or now - submitted_at < dt.timedelta(minutes=TRIAGE_JOB_STALE_MINUTES):
+            continue
+        try:
+            _sideclaw.cancel(job_id)
+        except WardenError as e:
+            print(f"triage: could not cancel stuck fixed-by sweep job {job_id}: {e}", file=sys.stderr)
+        _sweep_failed(conn, row, job_id, f"job {job_id} still {job.get('status')} after "
+                      f"{TRIAGE_JOB_STALE_MINUTES} min — cancelled")
 
 
 # --- revert after a failed verification (step 10, decision 4) --------------------
@@ -5771,8 +6045,14 @@ def _revert_review_context(item: sqlite3.Row) -> str:
 
 
 def _reverted_diff(pr_url: str | None) -> str | None:
-    """The reverted pull request's diff, file by file from GitHub, capped — or None when it cannot
-    be read (the episode is then told to read it with `git show`)."""
+    """The reverted pull request's diff, capped — or None when it cannot be read (the episode is
+    then told to read it with `git show`)."""
+    return _pr_diff(pr_url, REVERTED_DIFF_MAX)
+
+
+def _pr_diff(pr_url: str | None, limit: int) -> str | None:
+    """A pull request's diff, file by file from GitHub, capped at `limit` chars — or None when it
+    cannot be read."""
     ref = _github.parse_pr_url(pr_url or "")
     if ref is None:
         return None
@@ -5783,7 +6063,7 @@ def _reverted_diff(pr_url: str | None) -> str | None:
         return None
     parts = [f"--- {f.get('filename') or '?'}\n{f.get('patch') or '(no textual diff)'}"
              for f in files if isinstance(f, dict)]
-    return "\n".join(parts)[:REVERTED_DIFF_MAX] if parts else None
+    return "\n".join(parts)[:limit] if parts else None
 
 
 def _after_revert_episode(conn: sqlite3.Connection, item: sqlite3.Row, record: dict[str, Any],

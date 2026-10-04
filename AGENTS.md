@@ -180,6 +180,16 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   or `failed` when attempts are spent. Host-verb
   restarts enter `verifying` with their window open and verify on `HOST_VERB_LIVENESS_MONITOR`
   (no merge to revert: a failure goes back to `triaged`).
+- **A fix's merge is followed by a fixed-by sweep** (never a revert's: `_is_revert()`).
+  `_merged_entry()` queues it on the merged item (`sweep_pr`); `advance_fixed_by_sweeps()`
+  (in the implement chain, so both crons) submits one sideclaw `triage` job per merge — the PR
+  title, body and diff (≤12k chars) against the repo's `triaged` and idle `working` items —
+  and folds `{matches: [{item, reason}]}` under a compare-and-set, accepting only an id the
+  prompt showed that is still in that state with no episode in flight. A match enters
+  `verifying` with `fixed_by_pr` set and verifies by signal alone (`_verify_swept()`): quiet
+  for the window → `closed(fixed_by)` with no Slack line, recurrence → back to `triaged`
+  (never a revert: it was not its merge). A `-private` repo is never swept, and a failing sweep
+  never touches the merged item: stderr, three attempts, then dropped.
 - **An episode is not contained.** `readOnly` is three tool names on a CLI flag
   under `--dangerously-skip-permissions`; `Bash` is unrestricted and the brief is
   attacker-influenceable (public issues, alert text, log lines all reach it). A

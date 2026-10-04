@@ -649,6 +649,24 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #   revert_json     {sha, pr, title, evidence}: what was reverted and why — the revert's brief
 #     and review context, then the fresh attempt's context. Cleared when that attempt's PR
 #     joins the merge train.
+#
+# And the fixed-by sweep after every fix merge (triage.py advance_fixed_by_sweeps()), whose
+# bookkeeping lives on the MERGED item, independent of that item's own state:
+#
+#   sweep_pr          the merged pull request awaiting its sweep; set when a non-revert merge lands,
+#     NULL once the sweep folded or gave up.
+#   sweep_job         the sideclaw `triage` job deciding the sweep (or its `claiming:<time>`
+#     sentinel during the submit); NULL until submitted.
+#   sweep_job_at      when `sweep_job` was claimed/submitted — what a stuck job is aged from.
+#   sweep_attempts    failed submits/jobs so far; the sweep gives up (quietly) at the limit.
+#   sweep_candidates  JSON {event_id: state} of the items the prompt showed — the only ids a
+#     match may name.
+#
+# and on the SWEPT item:
+#
+#   fixed_by_pr       the merged PR a sweep matched this item to; set while the item is `verifying`
+#     on signal alone (no deploy, no `make verify` — the merging item already ran both), NULL on
+#     every other row.
 _MIGRATION_15 = """
 ALTER TABLE triage_items ADD COLUMN verify_started_at TEXT;
 ALTER TABLE triage_items ADD COLUMN verify_mark TEXT;
@@ -664,6 +682,12 @@ UPDATE triage_items SET train_stage = 'update' WHERE state = 'merging';
 ALTER TABLE triage_items ADD COLUMN merged_sha TEXT;
 ALTER TABLE triage_items ADD COLUMN reverting_sha TEXT;
 ALTER TABLE triage_items ADD COLUMN revert_json TEXT;
+ALTER TABLE triage_items ADD COLUMN sweep_pr TEXT;
+ALTER TABLE triage_items ADD COLUMN sweep_job TEXT;
+ALTER TABLE triage_items ADD COLUMN sweep_job_at TEXT;
+ALTER TABLE triage_items ADD COLUMN sweep_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE triage_items ADD COLUMN sweep_candidates TEXT;
+ALTER TABLE triage_items ADD COLUMN fixed_by_pr TEXT;
 """
 
 MIGRATIONS: dict[int, str] = {
