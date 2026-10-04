@@ -12,7 +12,10 @@
     "MATCH TARGETS. `rules`, `ignore` and `hostVerbs` are matched against TWO candidate strings per event, in",
     "order, first match wins across BOTH: `source:external_id` (the raw form) and",
     "`source:normalize_title(title)` (the human-readable form, normalize_title() from scripts/watchdog-poll.py).",
-    "For a grouped source (slack_alert, hermes_log) they are usually the same string. For a state source (uk,",
+    "For a grouped source (slack_alert, slack_update, hermes_log) the second form is fingerprint() of the title",
+    "(timestamps, ids, paths and ALL digits stripped, then normalized) and equals the first: write such a pattern",
+    "digit-free (`homelab-5m-load-above-threshold` is `homelab-m-load-above-threshold`; a truncated key ends in `*`).",
+    "For a state source (uk,",
     "docker_homelab, docker_vps, op_refs_*) they differ: uk's external_id is an opaque UptimeKuma monitor id",
     "('204'), so `uk:macmini-dev-host-push` (the title-derived target) is what makes that source matchable at all.",
     "Matching is glob-style (Python fnmatch: `*`, `?`, `[seq]`), `rules` top to bottom.",
@@ -242,7 +245,7 @@
       "repo": "hermes-agent"
     },
     {
-      "match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-1-persisting-past-the-2h-grace-window-locally-atrisk-1-we-are-actually-not-",
+      "match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-persisting-past-the-h-grace-window-locally-atrisk-we-are-actually-not*",
       "repo": "homelab",
       "proposedAt": "2026-09-11T23:19:27.263532+00:00",
       "proposedBy": "triage-auto",
@@ -326,7 +329,7 @@
       "reason": "The alert is explicitly associated with VPS infrastructure."
     },
     {
-      "match": "slack_alert:homelab-5m-load-above-threshold",
+      "match": "slack_alert:homelab-m-load-above-threshold",
       "repo": "homelab",
       "proposedAt": "2026-09-11T23:19:27.263532+00:00",
       "proposedBy": "triage-auto",
@@ -354,7 +357,7 @@
       "reason": "Brain Sync child monitor down; brain owns sync service."
     },
     {
-      "match": "slack_alert:hermes-http-red-circle-down-request-failed-with-status-code-404",
+      "match": "slack_alert:hermes-http-red-circle-down-request-failed-with-status-code",
       "repo": "hermes-agent",
       "proposedAt": "2026-09-14T23:27:43.175251+00:00",
       "proposedBy": "triage-auto",
@@ -368,7 +371,7 @@
       "reason": "Warden Backup monitor firing repeatedly; warden owns backups."
     },
     {
-      "match": "slack_alert:research-gateway-http-red-circle-down-200-ok-but-keyword-is-not-in-status-ok-lastrestartat-2026-09-08t06-5",
+      "match": "slack_alert:research-gateway-http-red-circle-down-ok-but-keyword-is-not-in-status-ok-lastrestartat*",
       "repo": "research-gateway",
       "proposedAt": "2026-09-15T23:32:21.345170+00:00",
       "proposedBy": "triage-auto",
@@ -396,7 +399,7 @@
       "reason": "HomeLab temperature below threshold alert"
     },
     {
-      "match": "slack_alert:homelab-5m-load-below-threshold",
+      "match": "slack_alert:homelab-m-load-below-threshold",
       "repo": "homelab",
       "proposedAt": "2026-09-18T23:46:49.411032+00:00",
       "proposedBy": "triage-auto",
@@ -466,7 +469,7 @@
       "reason": "MAM seed-obligation monitoring is part of homelab torrent stack."
     },
     {
-      "match": "slack_alert:research-gateway-job-error-1-15m",
+      "match": "slack_alert:research-gateway-job-error-m",
       "repo": "research-gateway",
       "proposedAt": "2026-09-23T00:05:38.312526+00:00",
       "proposedBy": "triage-auto",
@@ -515,14 +518,14 @@
       "reason": "Home Line monitor matches linewatch repo"
     },
     {
-      "match": "slack_alert:research-gateway-http-red-circle-down-request-failed-with-status-code-404",
+      "match": "slack_alert:research-gateway-http-red-circle-down-request-failed-with-status-code",
       "repo": "research-gateway",
       "proposedAt": "2026-09-28T00:29:42.370225+00:00",
       "proposedBy": "triage-auto",
       "reason": "Service name matches research-gateway repo"
     },
     {
-      "match": "slack_alert:research-gateway-renderer-http-red-circle-down-request-failed-with-status-code-404",
+      "match": "slack_alert:research-gateway-renderer-http-red-circle-down-request-failed-with-status-code",
       "repo": "research-gateway",
       "proposedAt": "2026-09-28T00:29:42.370225+00:00",
       "proposedBy": "triage-auto",
@@ -536,7 +539,7 @@
       "reason": "FPP MySQL connection failure points to the free-planning-poker database."
     },
     {
-      "match": "slack_alert:hermes-http-red-circle-down-timeout-of-90000ms-exceeded",
+      "match": "slack_alert:hermes-http-red-circle-down-timeout-of-ms-exceeded",
       "repo": "hermes-agent",
       "proposedAt": "2026-10-01T00:45:48.476425+00:00",
       "proposedBy": "triage-auto",
@@ -556,7 +559,7 @@
     "slack_alert:*-white-check-mark-up-*",
     "slack_alert:automatically-resolved-*",
     {
-      "match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-1-persisting-past-the-2h-grace-window-locally-atrisk-0-mam-hasn-t-caught-up",
+      "match": "slack_alert:myanonamouse-seed-obligation-risk-inactunsat-persisting-past-the-h-grace-window-locally-atrisk-mam-hasn-t-caught-up*",
       "proposedAt": "2026-09-11T23:19:27.263532+00:00",
       "proposedBy": "triage-auto",
       "reason": "MAM has not caught up, while local atRisk=0 confirms this is not an issue on our side."
@@ -568,7 +571,7 @@
       "reason": "A below-threshold temperature is a recovery or safe-state notification."
     },
     {
-      "match": "slack_alert:homelab-5m-load-below-threshold",
+      "match": "slack_alert:homelab-m-load-below-threshold",
       "proposedAt": "2026-09-11T23:19:27.263532+00:00",
       "proposedBy": "triage-auto",
       "reason": "A below-threshold load is a recovery or safe-state notification."

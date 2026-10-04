@@ -105,7 +105,7 @@ make test                                  # all suites
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
 
-`tests/test_triage.py` is the regression gate at **390/390**. Any other number is a
+`tests/test_triage.py` is the regression gate at **423/423**. Any other number is a
 finding to report, not a count to edit. `_triage_env()` builds a throwaway DB in a
 temp dir and monkeypatches the module globals and every client boundary
 (`_sideclaw`, `_github`, `_argo`, the Slack posters), so nothing reaches Slack,
@@ -148,7 +148,10 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
   sideclaw enforces its own allowlist (`GET /api/dispatch-policy`) and routes each
   tier (`GET /api/routing`). A sideclaw **4xx on submit is a refusal**
   (`clients.errors.SubmitRefused`): the item ends `failed` carrying sideclaw's
-  message (`triage._end_on_refusal()`) and is never retried; 5xx and connection
+  message (`triage._end_on_refusal()`) and is never retried — except a refused
+  escalation `model` (attempt 3+), resubmitted once without it, and a refused
+  **triage** submit, which strikes like any other failure (a triage refusal is never
+  the item's fault); 5xx and connection
   errors strike (`triage._strike()`: 10/30 min backoff, third strike → `failed`). `warden dispatch --model` stays — it is the
   owner's explicit choice, not policy.
 - **The merge gate is four facts**: PR open, checks green (or none exist), step-7
@@ -171,8 +174,17 @@ and `get(jobId) -> {status, result}`. Everything else about sideclaw is its own.
 - **The triage submit and fold are compare-and-set** on `triage_job` (a
   `claiming:<time>` sentinel before the call, the job id after, a stale claim
   released after 5 minutes). Two passes finding the same finished job fold it once.
-  Entering `new` clears `triage_job`, so a recurrence is triaged afresh. A sideclaw 4xx
-  on the triage submit ends the item `failed` like every other refused submit.
+  Entering `new` clears `triage_job`, so a recurrence is triaged afresh; the fold clears it
+  on every outcome except `ignore`, so a row that still carries one is a *model's* ignore
+  (revisited after `cooldownHours`) and an owner's dismiss never reopens. Every triage
+  submit failure, a sideclaw 4xx included, strikes under a CAS on the claim (`failed` on
+  the third); a job still not terminal 30 minutes after submit (`triage_job_at`) is
+  cancelled best-effort and struck.
+- **Triage never leaks a private repo.** A `-private` candidate is a name only (no item
+  lines), and an item in one sends the model `(private repo — content withheld)` instead
+  of its title/payload; everything else the event says is fenced as untrusted data.
+  Grouped-source policy patterns (`slack_alert`, `slack_update`, `hermes_log`) match
+  `fingerprint(title)`, which has no digits — a pattern with one is dead.
 - **The dry-run contract**: never touches Slack, never shells out, never submits a
   triage job (it prints what it would), everything else real. With no staging environment it is the only pre-production surface there is.
 - **A policy file may name and parameterise, never express.** Config carries

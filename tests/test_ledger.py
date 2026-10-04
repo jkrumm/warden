@@ -287,7 +287,7 @@ def test_migrate_adopts_pre_versioned_database():
     assert post_cols["triage_items"] - pre_cols["triage_items"] == {
         "occurrence_mark", "revert_pr", "origin", "max_tier", "brief",
         "origin_channel", "origin_thread_ts", "revision_count", "close_reason", "strikes", "retry_at",
-        "root_cause", "duplicate_of", "triage_job",
+        "root_cause", "duplicate_of", "triage_job", "triage_job_at",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -1006,18 +1006,19 @@ def _v13_database(path):
     conn.close()
 
 
-def test_migration_14_adds_the_three_intake_columns_and_keeps_every_row():
+def test_migration_14_adds_the_four_intake_columns_and_keeps_every_row():
     path = _tmp_path()
     _v13_database(path)
     conn = ledger.connect(path, migrate=True)
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 14 == ledger.LEDGER_SCHEMA_VERSION
     cols = _table_columns(conn, "triage_items")
-    assert {"root_cause", "duplicate_of", "triage_job"} <= cols, cols
+    assert {"root_cause", "duplicate_of", "triage_job", "triage_job_at"} <= cols, cols
     assert "implement_branch" not in cols, "the branch lives in dispatches.verdict_json, not a second source of truth"
     rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
     assert set(rows) == {"note-working", "note-closed", "note-failed"}, rows.keys()
     for row in rows.values():
         assert row["root_cause"] is None and row["duplicate_of"] is None and row["triage_job"] is None, dict(row)
+        assert row["triage_job_at"] is None, dict(row)
         assert row["revision_count"] == 2
     assert rows["note-closed"]["close_reason"] == "resolved"
     assert "duplicate" in ledger.CLOSE_REASONS

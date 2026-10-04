@@ -580,7 +580,7 @@ UPDATE item_transitions SET
   to_state = {_case_13("to_state")};
 """
 
-# Version 14 — intake and dedup (agent-platform.md §Warden steps 2-3). Three nullable
+# Version 14 — intake and dedup (agent-platform.md §Warden steps 2-3). Four nullable
 # columns on triage_items, all correct as NULL on every existing row:
 #
 #   root_cause    the verdict's own `rootCause` key (kebab, <=80) — what a later
@@ -588,7 +588,12 @@ UPDATE item_transitions SET
 #   duplicate_of  event_id of the item this one was merged into; set together with
 #     state closed / close_reason duplicate. NULL on every other row.
 #   triage_job    the sideclaw `triage` job that is deciding this item's intake
-#     (the single-shot triage step); NULL until one is opened.
+#     (the single-shot triage step); NULL until one is opened. Cleared again when the
+#     fold settles it (except an `ignore`, which is how a model's ignore is told from a
+#     human's).
+#   triage_job_at when `triage_job` was claimed/submitted — what a job stuck non-terminal is
+#     aged from (cancelled and struck after TRIAGE_JOB_STALE_MINUTES). Written with
+#     `triage_job`, NULL whenever that is.
 #
 # The last implement episode's `dispatch/*` branch gets NO column: it already lives
 # in dispatches.verdict_json (`result.branch`) of the item's `implement_job`, which
@@ -597,6 +602,7 @@ _MIGRATION_14 = """
 ALTER TABLE triage_items ADD COLUMN root_cause TEXT;
 ALTER TABLE triage_items ADD COLUMN duplicate_of INTEGER;
 ALTER TABLE triage_items ADD COLUMN triage_job TEXT;
+ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 """
 
 MIGRATIONS: dict[int, str] = {

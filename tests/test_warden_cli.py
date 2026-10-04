@@ -529,7 +529,10 @@ def test_run_triages_first_then_dispatches_on_new():
     assert tools == ["triage", "dispatch"], tools
 
 
-def test_run_attached_to_an_open_item_dispatches_nothing():
+def test_run_never_attaches_the_owners_own_request_to_another_item():
+    """An attach answer for a `warden run` item is treated as `new` (I6): the owner asked for this
+    run explicitly, so closing it as a duplicate would drop his request without a word. It is
+    triaged to its own repo and dispatched like any other."""
     h = Harness()
     db = h.new_db()
     _seed_item(db, 50, state="working", repo="alpha")
@@ -540,14 +543,14 @@ def test_run_attached_to_an_open_item_dispatches_nothing():
     finally:
         srv.stop()
     assert proc.returncode == 0, proc
-    assert "triage: attached to #50" in proc.stdout, proc.stdout
+    assert "triage: attached" not in proc.stdout, proc.stdout
     tools = [r["body"]["tool"] for r in srv.requests if r["method"] == "POST"]
-    assert tools == ["triage"], f"an attached item must never open an episode, got {tools}"
+    assert tools == ["triage", "dispatch"], tools
     conn, _ = _connect(db)
     row = _row(conn, "SELECT state, close_reason, duplicate_of, dispatch_job FROM triage_items WHERE event_id != 50")
     conn.close()
-    assert row["state"] == "closed" and row["close_reason"] == "duplicate", dict(row)
-    assert row["duplicate_of"] == 50 and row["dispatch_job"] is None, dict(row)
+    assert row["state"] == "working" and row["close_reason"] is None, dict(row)
+    assert row["duplicate_of"] is None and row["dispatch_job"] == "job-never", dict(row)
 
 
 def test_run_with_triage_down_queues_the_item_for_the_loop():
