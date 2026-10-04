@@ -50,7 +50,7 @@ WARDEN_HOME = (
 # argument, and every function below re-reads it at call time rather than
 # capturing it at import — that is what lets a test (or a script's own `--db`
 # override) monkeypatch `ledger.DB_PATH` and have `connect()` see the new
-# value on its very next call, exactly like triage.py's own DB_PATH already
+# value on its very next call, exactly like loop/core.py's own DB_PATH already
 # works today.
 DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db"
 
@@ -186,7 +186,7 @@ CREATE INDEX IF NOT EXISTS idx_triage_state ON triage_items(state);
 # question nothing could answer.
 #
 # NULL means "no deadline applies" — a terminal state, or `new`, which is bounded
-# by silence-resolve rather than by a clock (see triage.py's
+# by silence-resolve rather than by a clock (see loop/intake.py's
 # _SILENCE_RESOLVE_ELIGIBLE_STATES). It is NOT "the deadline was forgotten": the
 # sweeper treats NULL on a non-terminal state as a finding, not as permission.
 #
@@ -198,7 +198,7 @@ ALTER TABLE triage_items ADD COLUMN state_deadline TEXT;
 CREATE INDEX IF NOT EXISTS idx_triage_state_deadline ON triage_items(state_deadline);
 """
 
-# Version 3 — `occurrence_mark`, one column, so triage.py's reopen_if_needed()
+# Version 3 — `occurrence_mark`, one column, so loop/intake.py's reopen_if_needed()
 # can tell "this resolved/dismissed row is still quiet" from "a new occurrence
 # arrived" without asking `events.resolved_at IS NULL` — which for a GROUPED
 # source (slack_alert, hermes_log) stays NULL for up to 7 idle days by design,
@@ -207,7 +207,7 @@ CREATE INDEX IF NOT EXISTS idx_triage_state_deadline ON triage_items(state_deadl
 # Measured on the live ledger 2026-09-09: 23 of 30 `resolved` rows were stuck
 # in that loop, invisible only because the re-rendered card is byte-identical
 # and card_hash short-circuited the Slack call. It had already destroyed
-# history twice — see triage.py's reopen_if_needed() and docs/triage.md.
+# history twice — see loop/intake.py's reopen_if_needed() and docs/history/triage.md.
 #
 # NULL here is NOT a forgotten stamp — it is a row that closed before this
 # column existed. reopen_if_needed() treats NULL as "baseline unknown",
@@ -216,17 +216,17 @@ CREATE INDEX IF NOT EXISTS idx_triage_state_deadline ON triage_items(state_deadl
 # data itself.
 _MIGRATION_3 = "ALTER TABLE triage_items ADD COLUMN occurrence_mark TEXT;"
 
-# Version 4 — the `resolved` -> `fixed`/`quiet`/`closed` split (triage.py's
-# module docstring, DESIGN.md § the state machine) plus `item_transitions`, an
+# Version 4 — the `resolved` -> `fixed`/`quiet`/`closed` split (the state machine
+# in loop/core.py, DESIGN.md § the state machine) plus `item_transitions`, an
 # append-only history table. Three of the six /metrics funnel numbers (median
 # needs_human -> decision, verified unattended fixes per week, reopen-after-
 # `fixed`) are not derivable from the ledger without it: `triage_items.
 # updated_at` cannot serve — ingest() rewrites it on every open row on every
-# pass regardless of state (see triage.py's _set_state() docstring), so it
+# pass regardless of state (see loop/core.py's _set_state() docstring), so it
 # cannot answer "when did this item enter/leave a state" at all.
 #
 # The literal 'resolved' below, not a symbolic constant: STATE_RESOLVED no
-# longer exists in triage.py after this migration lands, and this module owns
+# longer exists in loop/core.py after this migration lands, and this module owns
 # the schema and must not import triage's constants to migrate triage's own
 # data. On a fresh database the UPDATE is a harmless no-op — nothing to match.
 #
@@ -271,7 +271,7 @@ CREATE INDEX IF NOT EXISTS idx_item_transitions_event ON item_transitions(event_
 # before it could, or because the external call it covers (`warden dispatch
 # --tier implement`, `warden merge --confirm`) returned ambiguously (a
 # subprocess timeout, unparseable stdout) and the call site deliberately left
-# it open for triage.py's reconcile_operations() to resolve on the very next
+# it open for loop/work.py's reconcile_operations() to resolve on the very next
 # pass, before anything else acts on the item (see that file's module
 # docstring, step 0). The partial index below is what makes that scan cheap —
 # the whole point of recording the id BEFORE the external call is that this
@@ -533,7 +533,7 @@ DROP TABLE IF EXISTS dispatch_approvals;
 # `close_reason` is only written on triage_items (history has no reason column).
 #
 # `triage_items.card_hash` changes meaning: it used to be a hash of a rendered Slack
-# card, it is now the state a one-line Slack post was made for (triage.py
+# card, it is now the state a one-line Slack post was made for (loop/notify.py
 # `notify_cluster()` posts when an item is in `fixed`/`needs_decision` and
 # `card_hash` differs from that state). Every item already `fixed` has been dealt
 # with, so it is stamped `fixed` here — otherwise the first pass on this schema would
@@ -625,7 +625,7 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 # deploy.
 #
 # And the merge train — a `merging` item walks update -> checks -> review -> merge, one item
-# per repo at a time (scripts/triage.py advance_merge_trains()):
+# per repo at a time (scripts/loop/train.py advance_merge_trains()):
 #
 #   train_stage     the stage the item is on; NULL outside `merging`.
 #   train_sha       the PR head the train is checking, reviewing and will merge — set by the
@@ -644,7 +644,7 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 # Items already `merging` restart the train at `update`: the review they may be in the middle
 # of read a head nobody pinned.
 #
-# And the automatic revert of a change that failed verification (triage.py _on_verify_failure()):
+# And the automatic revert of a change that failed verification (loop/verify.py _on_verify_failure()):
 #
 #   merged_sha      the commit the item's last merge landed as; set on entering `verifying` from
 #     a merge, NULL on every other entry (a host verb has nothing to revert).
@@ -657,7 +657,7 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #     and review context, then the fresh attempt's context. Cleared when that attempt's PR
 #     joins the merge train.
 #
-# And the fixed-by sweep after every fix merge (triage.py advance_fixed_by_sweeps()), whose
+# And the fixed-by sweep after every fix merge (loop/verify.py advance_fixed_by_sweeps()), whose
 # bookkeeping lives on the MERGED item, independent of that item's own state:
 #
 #   sweep_pr          the merged pull request awaiting its sweep; set when a non-revert merge lands,
@@ -739,7 +739,7 @@ _ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "triage_items")
 # _verify_columns(), because it only ever walked _ADOPTABLE_TABLES.
 _VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
 
-# triage_items.state vocabulary, mirrored from scripts/triage.py's own STATE_*
+# triage_items.state vocabulary, mirrored from scripts/loop/core.py's own STATE_*
 # constants. ledger.py is the schema owner, so it is the home for the state names
 # that OTHER files need without pulling in triage.py itself — chiefly api.py and
 # warden.py's item transitions, which triage.py imports and so cannot import back.
@@ -766,7 +766,7 @@ def _now_iso() -> str:
 # Public alias — scripts/lifecycle/operations.py used to carry a
 # byte-identical zero-arg copy of this; it now calls this one instead of
 # hand-mirroring it. (scripts/lifecycle/items.py's and
-# scripts/triage.py's own `_now_iso(now)` take an argument and are
+# scripts/loop/core.py's own `_now_iso(now)` take an argument and are
 # deliberately NOT this function — see the one-line comment on each.)
 now_iso = _now_iso
 

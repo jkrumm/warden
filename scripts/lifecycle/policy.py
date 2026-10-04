@@ -85,7 +85,7 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
     allowlist. `"auto-remediate"`, `"auto-from-item"`, `"cli:confirm"` and
     `"cli:dispatch"` are conventional string shapes a human reader relies on,
     never values this module parses or checks. `"owner:argo"`
-    (`triage.apply_argo_actions()`) is another such convention: an action the
+    (`notify.apply_argo_actions()`) is another such convention: an action the
     owner pulled off Argo's own pending-actions queue is the owner himself —
     tailnet access to Argo IS him. Nothing here checks the string."""
     if tier != "implement":
@@ -154,7 +154,7 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
 # "An implement episode is already running against this repo": an item in
 # `merging` (its PR is being reviewed and merged), or a `working` item with an
 # implement_job on record (a claim, an episode, or a revision waiting for its
-# next episode). Mirrored from triage.py's own state vocabulary rather than
+# next episode). Mirrored from loop/core.py's own state vocabulary rather than
 # imported from it.
 _IN_FLIGHT_SQL = "(state='merging' OR (state='working' AND implement_job IS NOT NULL))"
 # The same, for a revert: a `merging` item counts only while its train's `update_pr` runs (or is

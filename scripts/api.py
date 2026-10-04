@@ -1,23 +1,13 @@
 """warden HTTP API — GET /metrics, /health, /board, /items/<event_id>, read-only.
 
-WHAT THIS IS STILL NOT. `POST /items/:id/note` is DESIGN.md's real contract
-(§ HTTP API) and is Wave 4, built alongside Argo — the only consumer of the
-write-adjacent endpoints. Building it now, unconsumed, would be dead surface with
-no caller to prove it correct. `/board` and `/items/<event_id>` (Wave 6.3) are the
-two read-only projections that ARE useful the moment they exist: a
-funnel-snapshot list of every non-terminal item, and the full detail behind any
-one item — dispatches, verdicts, operations, transition history.
+`/board` lists every non-terminal item; `/items/<event_id>` is the full detail
+behind one — dispatches, verdicts, operations, transition history. Owner actions are
+not served here: the loop pulls them from Argo (`loop/notify.apply_argo_actions()`).
 
-BIND AND AUTH. `127.0.0.1:7735` (reserved by comment in dotfiles' Caddyfile
-registry; it sat on 7734 until 2026-09-11, where sy-serendipity's `kill-port
-7734` dev script would have killed it), loopback only, no bearer token. Per DESIGN.md § Security
-model, an episode on this host runs unrestricted `Bash` under
-`--dangerously-skip-permissions` — a bearer token would be theatre, not a
-boundary, because anything that can read a token file can also just query this
-socket directly from the same host. The actual protections are the loopback
-bind (nothing off-box can reach it at all) and the read-only handle (nothing
-that *does* reach it can write). No Caddy or tailnet door is added in this
-wave — that belongs with Argo (Wave 4), the only intended remote consumer.
+BIND AND AUTH. `127.0.0.1:7735`, loopback only, no bearer token. An episode on this
+host runs unrestricted `Bash` (DESIGN.md § Boundaries), so a token would be theatre:
+anything that can read a token file can query this socket directly. The protections
+are the loopback bind and the read-only handle.
 
 GET ONLY. Every other method is 405; an unknown path is 404. Both as JSON.
 
@@ -123,7 +113,7 @@ CHAIN_STATES = (
 
 # --- /board's per-item `availableActions` ---------------------------------
 #
-# Mirrors triage.py's apply_argo_actions() per-verb allowed-state sets
+# Mirrors loop/notify.py's apply_argo_actions() per-verb allowed-state sets
 # (ARGO_ACTION_VERBS = {"implement", "merge", "dismiss", "reinvestigate",
 # "note"}). Must stay in sync by hand with apply_argo_actions()'s handlers if
 # either changes. implement and merge share one set: both act on an item that is
@@ -136,7 +126,7 @@ _REINVESTIGATE_STATES = (*_OWNER_STATES, _ledger.STATE_QUIET)
 def _available_actions(state: str, mergeable: bool = False, reverted: bool = False) -> list[str]:
     """Zero or more of `implement`/`merge`/`dismiss`/`reinvestigate`/`note` —
     what the owner could click for a card in `state`, from state alone. The
-    real per-repo/per-tier gate runs server-side in triage.py's
+    real per-repo/per-tier gate runs server-side in loop/notify.py's
     apply_argo_actions() when an action is actually applied; this list is
     only what the UI offers. A `reverted` item (`revert_pr` set) already merged and was
     rolled back by hand: re-implementing or re-merging it would redo the very change
@@ -652,7 +642,7 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
 
 def _board_item_issue(row: sqlite3.Row) -> dict[str, Any] | None:
     """The `issue` sub-object for a `github_issue`-origin row, sourced from
-    the parent event's `payload_json` (written by triage.py's
+    the parent event's `payload_json` (written by loop/intake.py's
     ingest_github_issues()) and `url`. `None` for any other origin, and
     `None` (never a raise) if the payload is missing or not valid JSON."""
     if row["origin"] != "github_issue":

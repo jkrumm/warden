@@ -2,7 +2,7 @@
 
 An operation row is committed BEFORE the external call it covers, and that
 commit is the whole contract: a crash inside the call leaves a row with
-`outcome IS NULL` that `reconcile_operations()` (triage.py) resolves on the
+`outcome IS NULL` that `reconcile_operations()` (loop/work.py) resolves on the
 next pass, before anything could retry.
 
 Four kinds, each one external mutation:
@@ -10,9 +10,9 @@ Four kinds, each one external mutation:
   implement  — a sideclaw implement episode (branch + draft PR)
   merge      — ready-for-review + PUT /merge + branch delete
   deploy     — `make deploy` in the repo after a merge (lifecycle/rollout.py, run by
-               triage.py's verify pass). A crashed one is simply run again: the
+               loop/verify.py's verify pass). A crashed one is simply run again: the
                repo's deploy target is idempotent by contract.
-  host       — an idempotent HOST_VERB_ALLOWLIST argv (triage.py's
+  host       — an idempotent HOST_VERB_ALLOWLIST argv (loop/work.py's
                maybe_auto_remediate(), STATE.md's 2026-09-11 owner decision) —
                a process restart run BY warden itself, on the same
                crash-recovery contract as the other three: recorded before

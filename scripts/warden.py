@@ -51,13 +51,11 @@ if str(REPO_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(REPO_SCRIPTS))
 
 import ledger  # noqa: E402
-# Wave 6.1's `run` verb opens a triage_items row through triage.py's own
-# open_origin_item()/escalate_origin_items() — the same functions the loop
-# calls — rather than a second copy of that logic here.
-import triage  # noqa: E402
 from clients import github, sideclaw  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError, WardenError  # noqa: E402
 from lifecycle import dispatch, items, merge, operations, policy  # noqa: E402
+# The `run` verb opens its triage_items row through the loop's own functions, not a copy.
+from loop import core, intake, train, triaging, work  # noqa: E402
 
 WAIT_TIMEOUT = 170
 WAIT_INTERVAL = 5
@@ -489,7 +487,7 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
     if flags.dry_run:
         return _run_plan_payload(conn, name=name, tier=tier, brief=brief, why=flags.why, now=now)
 
-    event_id = triage.open_origin_item(
+    event_id = intake.open_origin_item(
         conn, origin="human", repo=name, brief=brief, max_tier=max_tier,
         external_id=f"human:{uuid.uuid4()}", title=(flags.why or brief.splitlines()[0] or name)[:200],
         payload={"why": flags.why}, now=now,
@@ -507,15 +505,15 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
     # The shared intake: one triage job decides attach / fixed_by / new before anything is
     # dispatched, so `run` waits for it (triage_item_now() has its own hang guard) and then
     # dispatches immediately when the answer was `new`.
-    triaged = triage.triage_item_now(conn, event_id, now)
-    triage.escalate_origin_items(conn, now)
+    triaged = triaging.triage_item_now(conn, event_id, now)
+    work.escalate_origin_items(conn, now)
     conn.commit()
     state.did_mutate = True
 
     item = conn.execute("SELECT * FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
     item_state = item["state"] if item else None
     job_id = item["dispatch_job"] if item else None
-    queued = item_state in (triage.STATE_NEW, triage.STATE_TRIAGED)
+    queued = item_state in (core.STATE_NEW, core.STATE_TRIAGED)
 
     out: dict[str, Any] = {
         "verb": "run", "ok": True, "eventId": event_id, "jobId": job_id, "state": item_state,
@@ -545,8 +543,8 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
         # unaffected: it always folds before it ever reports, so a dispatch
         # this call already folded is simply a no-op repeat fold for it.
         try:
-            triage.fold_dispatch_verdict(conn, origin_event_id=event_id, job_id=job_id,
-                                          now=dt.datetime.now(dt.timezone.utc), dry_run=False)
+            work.fold_dispatch_verdict(conn, origin_event_id=event_id, job_id=job_id,
+                                        now=dt.datetime.now(dt.timezone.utc), dry_run=False)
         except Exception as e:  # a folding failure must never hide the verdict itself
             print(f"warden: run --wait: folding the verdict onto the item failed: {e}", file=sys.stderr)
         folded_item = conn.execute("SELECT * FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
@@ -630,7 +628,7 @@ def cmd_merge(conn, flags: Flags, positional: list[str], state: _State) -> dict[
                         (job_id,)).fetchone()
     pinned = None
     if item is not None:
-        pinned = item["train_sha"] if item["state"] == triage.STATE_MERGING else item["reviewed_sha"]
+        pinned = item["train_sha"] if item["state"] == core.STATE_MERGING else item["reviewed_sha"]
 
     now = dt.datetime.now(dt.timezone.utc)
     result = merge.plan_or_land(
@@ -670,11 +668,11 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     # one (a claim sentinel is not a job), else its investigation; of a `merging`
     # item, its train's `update_pr` while one runs, else its review.
     implement_job = row["implement_job"]
-    if row["state"] == triage.STATE_WORKING:
-        job_id = implement_job if implement_job and not triage._is_claim(implement_job) else row["dispatch_job"]
-    elif row["state"] == triage.STATE_MERGING:
+    if row["state"] == core.STATE_WORKING:
+        job_id = implement_job if implement_job and not core._is_claim(implement_job) else row["dispatch_job"]
+    elif row["state"] == core.STATE_MERGING:
         train_job = row["train_job"]
-        job_id = train_job if train_job and train_job != triage.TRAIN_CLAIM else row["validation_job"]
+        job_id = train_job if train_job and train_job != train.TRAIN_CLAIM else row["validation_job"]
     else:
         raise PolicyError(
             f"triage item {event_id} is in state '{row['state']}', not working/merging "
@@ -727,10 +725,10 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
         operations.complete(conn, op["op_id"], outcome="failed", receipt=json.dumps({"aborted": flags.why}))
 
     items.transition(conn, event_id, to_state=ledger.STATE_CLOSED, now=now, note=f"aborted: {flags.why}",
-                     extra={"close_reason": triage.CLOSE_IGNORED})
+                     extra={"close_reason": core.CLOSE_IGNORED})
 
     # A cluster shares ONE `dispatch_job` (the same membership rule
-    # `triage.fold_dispatch_verdict()` uses to fold a verdict onto every row),
+    # `work.fold_dispatch_verdict()` uses to fold a verdict onto every row),
     # so cancelling that job ends the episode for every member — not just the
     # one named here. Leaving the siblings in an in-flight state strands them
     # with no exit at all: `close` refuses in-flight states by design, a second
@@ -747,7 +745,7 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
         ).fetchall():
             if member["state"] in _CLUSTER_ABORT_STATES and member["implement_job"] is None:
                 items.transition(conn, member["event_id"], to_state=ledger.STATE_CLOSED, now=now,
-                                 note=f"aborted: {flags.why}", extra={"close_reason": triage.CLOSE_IGNORED})
+                                 note=f"aborted: {flags.why}", extra={"close_reason": core.CLOSE_IGNORED})
                 discharged.append(member["event_id"])
 
     conn.commit()
@@ -759,7 +757,7 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     }
 
 
-_REVERTABLE_STATES = (triage.STATE_VERIFYING, triage.STATE_FIXED)
+_REVERTABLE_STATES = (core.STATE_VERIFYING, core.STATE_FIXED)
 
 
 def cmd_revert(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
@@ -811,27 +809,27 @@ def cmd_revert(conn, flags: Flags, positional: list[str], state: _State) -> dict
 
 # States a human can resolve by hand: no episode or operation is in flight,
 # and the item is not already terminal. Mirrors the closed-allowlist shape
-# used elsewhere in this repo (items._EXTRA_COLUMNS, triage.py's own
+# used elsewhere in this repo (items._EXTRA_COLUMNS, loop/core.py's own
 # NOTIFY_STATES) — a state not named here is refused, never
 # silently allowed.
 _CLOSE_ALLOWED_STATES = (
-    triage.STATE_NEW, triage.STATE_TRIAGED, triage.STATE_NEEDS_DECISION,
-    triage.STATE_FAILED, triage.STATE_QUIET,
+    core.STATE_NEW, core.STATE_TRIAGED, core.STATE_NEEDS_DECISION,
+    core.STATE_FAILED, core.STATE_QUIET,
 )
 # An episode or operation is in flight for these — `abort` is the verb for
 # that, not `close` (`verifying` is the deploy/verify window).
-_CLOSE_INFLIGHT_STATES = (triage.STATE_WORKING, triage.STATE_MERGING, triage.STATE_VERIFYING)
+_CLOSE_INFLIGHT_STATES = (core.STATE_WORKING, core.STATE_MERGING, core.STATE_VERIFYING)
 # The narrower set `abort` discharges for the CLUSTER siblings sharing the
 # cancelled job: a sibling still `working` on that investigation (the caller also
 # requires it to have no implement episode of its own). A sibling that has already
 # moved past the episode carries work of its own — a PR a human must review — and
 # is never closed behind their back by cancelling the job.
-_CLUSTER_ABORT_STATES = (triage.STATE_WORKING,)
+_CLUSTER_ABORT_STATES = (core.STATE_WORKING,)
 # What a human may say a hand-close means: dealt with, or noise. `duplicate`/`fixed_by`
 # belong to the loop's own bookkeeping.
-_CLOSE_REASONS_BY_HAND = (triage.CLOSE_RESOLVED, triage.CLOSE_IGNORED)
+_CLOSE_REASONS_BY_HAND = (core.CLOSE_RESOLVED, core.CLOSE_IGNORED)
 # Already terminal — closing again is a no-op, not a refusal.
-_CLOSE_TERMINAL_STATES = (ledger.STATE_CLOSED, triage.STATE_FIXED)
+_CLOSE_TERMINAL_STATES = (ledger.STATE_CLOSED, core.STATE_FIXED)
 
 
 def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
@@ -879,7 +877,7 @@ def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 
     to_state = ledger.STATE_CLOSED
     note = f"closed by hand: {flags.why}"
-    reason = flags.reason or triage.CLOSE_RESOLVED
+    reason = flags.reason or core.CLOSE_RESOLVED
     if reason not in _CLOSE_REASONS_BY_HAND:
         raise UsageError(f"--reason must be one of {'/'.join(_CLOSE_REASONS_BY_HAND)} (got: {reason})")
 

@@ -404,7 +404,7 @@ def test_snapshot_copies_rows_and_refuses_to_overwrite():
 # --- runner ------------------------------------------------------------------
 
 def test_migration_3_adds_occurrence_mark():
-    """See _MIGRATION_3 / triage.py's _occurrence_mark() and reopen_if_needed()
+    """See _MIGRATION_3 / loop/core.py's _occurrence_mark() and loop/intake.py's reopen_if_needed()
     — the column that stops a quiet-resolved grouped item from being reopened
     and re-resolved every ten minutes."""
     conn = ledger.connect(_tmp_path(), migrate=True)
@@ -541,7 +541,7 @@ def test_adoption_tolerates_an_unexpected_extra_column() -> None:
 
 
 def test_migration_5_creates_operations_table_and_indexes():
-    """See _MIGRATION_5 / triage.py's record_operation()/complete_operation()/
+    """See _MIGRATION_5 / loop/work.py's record_operation()/complete_operation()/
     reconcile_operations() — the crash-recovery unit DESIGN.md § Crash
     recovery asks for."""
     conn = ledger.connect(_tmp_path(), migrate=True)

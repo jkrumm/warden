@@ -1,13 +1,13 @@
-"""items — the one place outside triage.py that moves a `triage_items` row
+"""items — the one place outside the loop that moves a `triage_items` row
 between states, for the CLI-only transitions (`warden abort`, `warden revert`,
-`warden close`) that triage.py's own state machine does not drive.
+`warden close`) that the loop's own state machine does not drive.
 
-Deliberately NOT a general-purpose port of triage.py's `_set_state()`: this
+Deliberately NOT a general-purpose port of loop/core.py's `_set_state()`: this
 module owns exactly two target states (`closed`, `failed`), so it skips
 `_set_state()`'s strike bookkeeping, which exists only for the pipeline
 transitions this module never makes. What it keeps, because it is the
 load-bearing part: `triage_items.state` has exactly ONE additional writer
-outside triage.py, this function, and it appends exactly one
+outside the loop, this function, and it appends exactly one
 `item_transitions` row on a REAL state change (rowcount>0 from the UPDATE AND
 the prior state differs from the new one) — the same guard, for the same
 reason, as `_set_state()`'s own docstring.
@@ -24,14 +24,14 @@ import ledger
 
 # Closed allowlist of extra columns a caller may set alongside `state` and
 # `note` — column names reach SQL here, so the list stays closed on purpose,
-# same principle as triage.py's own `_SET_STATE_COLUMNS`. `revert_pr` is what
+# same principle as loop/core.py's own `_SET_STATE_COLUMNS`. `revert_pr` is what
 # `warden revert` needs, `close_reason` what every `closed` target carries; add to
 # this tuple only for a new verb that writes a specific column, never as a general
 # escape hatch.
 _EXTRA_COLUMNS = ("revert_pr", "close_reason")
 
 # An item `note` is one short line: it is what Slack and Argo show. Both writers of
-# the column (this module and triage.py's `_set_state()`) cap it here.
+# the column (this module and loop/core.py's `_set_state()`) cap it here.
 NOTE_MAX = 200
 
 
@@ -58,7 +58,7 @@ def _payload(raw: str | None) -> dict[str, Any]:
 
 def occurrence_mark(event: sqlite3.Row | dict[str, Any] | None) -> str | None:
     """An opaque fingerprint of which occurrences `event` has produced so far,
-    for triage.py's reopen_if_needed() to compare with `!=` — never with `>` or `MAX()`.
+    for loop/intake.py's reopen_if_needed() to compare with `!=` — never with `>` or `MAX()`.
 
     Five `|`-separated slots, each the raw string value (empty for None/missing),
     in fixed position:
@@ -124,7 +124,7 @@ def transition(
         raise ValueError(f"{unknown} not in _EXTRA_COLUMNS={_EXTRA_COLUMNS} — column names reach SQL here")
 
     # `closed` always carries its reason; every other state clears it — the same
-    # invariant triage.py's `_set_state()` enforces.
+    # invariant loop/core.py's `_set_state()` enforces.
     if to_state == "closed":
         if extra.get("close_reason") not in ledger.CLOSE_REASONS:
             raise ValueError(f"a `closed` transition must carry extra={{'close_reason': one of {ledger.CLOSE_REASONS}}}")
@@ -137,8 +137,8 @@ def transition(
     prev_state = prev_row["state"] if prev_row is not None else None
 
     # card_hash records the state a Slack line was posted for; entering a different state
-    # clears it so a later re-entry posts again (triage.py `notify_cluster()`).
-    # Stamped on EVERY transition, exactly as triage.py's `_set_state()` does: a human
+    # clears it so a later re-entry posts again (loop/notify.py `notify_cluster()`).
+    # Stamped on EVERY transition, exactly as loop/core.py's `_set_state()` does: a human
     # `warden close` must record the occurrence it closed against, or reopen_if_needed()
     # reads the stale mark as a fresh occurrence and undoes it.
     event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()

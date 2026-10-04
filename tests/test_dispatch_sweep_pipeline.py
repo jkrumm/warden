@@ -7,7 +7,7 @@
      happened to observe the terminal status — see clients/sideclaw.py's
      `finished_at_iso()` and its own dedicated tests in test_clients.py.
 
-  2. `main()` calls `triage.advance_implement_chain()` — the same
+  2. `main()` calls `work.advance_implement_chain()` — the same
      verdict -> implement -> review -> merge code
      triage.py's own 600s loop tick calls — once per pass, unconditionally,
      so an item does not wait for that tick to cross its next stage
@@ -152,7 +152,7 @@ def test_main_calls_advance_implement_chain_once_per_pass_even_with_nothing_to_r
     def _fake_advance(conn, policy, now, *, dry_run):
         calls.append({"now": now, "dry_run": dry_run})
 
-    with _patch(dispatch_sweep._triage, "advance_implement_chain", _fake_advance):
+    with _patch(dispatch_sweep.work, "advance_implement_chain", _fake_advance):
         rc = dispatch_sweep.main(["--db", str(db_path)])
 
     assert rc == 0
@@ -167,7 +167,7 @@ def test_main_dry_run_passes_dry_run_through_to_advance_implement_chain():
     def _fake_advance(conn, policy, now, *, dry_run):
         calls.append(dry_run)
 
-    with _patch(dispatch_sweep._triage, "advance_implement_chain", _fake_advance):
+    with _patch(dispatch_sweep.work, "advance_implement_chain", _fake_advance):
         rc = dispatch_sweep.main(["--db", str(db_path), "--dry-run"])
 
     assert rc == 0
@@ -180,7 +180,7 @@ def test_advance_implement_chain_failure_does_not_crash_the_sweep():
     def _raise(conn, policy, now, *, dry_run):
         raise RuntimeError("boom")
 
-    with _patch(dispatch_sweep._triage, "advance_implement_chain", _raise):
+    with _patch(dispatch_sweep.work, "advance_implement_chain", _raise):
         rc = dispatch_sweep.main(["--db", str(db_path)])
 
     assert rc == 0, "one bad pipeline pass must not take the whole sweep down"
@@ -226,7 +226,7 @@ def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
             seen_states.append(item["state"])
 
         with _patch(dispatch_sweep, "poll_job", lambda job_id: job), \
-             _patch(dispatch_sweep._triage, "advance_implement_chain", _fake_advance):
+             _patch(dispatch_sweep.work, "advance_implement_chain", _fake_advance):
             dispatch_sweep.main(["--db", str(db_path)])
 
         assert seen_states == ["needs_decision"], (

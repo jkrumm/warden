@@ -2,7 +2,7 @@
 prompt for the single-shot sideclaw `triage` job (agent-platform.md §Warden step 2).
 
 Pure functions plus two read-only queries; nothing here writes the ledger or
-calls sideclaw. triage.py owns the submit, the fold and every state change.
+calls sideclaw. loop/triaging.py owns the submit, the fold and every state change.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ TRIAGE_SCHEMA: dict[str, Any] = {
     "required": ["action", "reason"],
 }
 
-# The fixed-by sweep after a fix merge (triage.py advance_fixed_by_sweeps()): one single-shot
+# The fixed-by sweep after a fix merge (loop/verify.py advance_fixed_by_sweeps()): one single-shot
 # `triage` job per merged PR answering which waiting items the change plausibly fixes.
 SWEEP_SCHEMA: dict[str, Any] = {
     "type": "object",

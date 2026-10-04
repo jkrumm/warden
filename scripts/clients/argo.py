@@ -8,7 +8,7 @@ docstring). So the direction has to reverse: the mini pushes, Argo just
 holds the last snapshot it was handed. `POST /warden/snapshot` is being
 built in parallel on the Argo side; until it deploys every push here 404s,
 which is a logged non-event, never a failed tick — see
-`triage.push_argo_snapshot()`.
+`notify.push_argo_snapshot()`.
 
 Same shape as `scripts/clients/slack.py`: one token resolver, one thin
 `urllib`-only POST, never raises. stdlib only.
@@ -105,7 +105,7 @@ def fetch_actions(machine: str, *, token: str | None = None, timeout: float = 15
     `actions` is `[]` unless `status` is `"ok"`. Each entry is expected to
     carry `id`, `event_id`, `verb` and `payload`, but this function does not
     validate that shape — it only decodes JSON and hands it back; the caller
-    (`triage.apply_argo_actions()`) owns validation."""
+    (`notify.apply_argo_actions()`) owns validation."""
     resolved_token = token if token is not None else resolve_argo_token()
     if not resolved_token:
         return "no-secret", []

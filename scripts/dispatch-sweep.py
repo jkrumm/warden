@@ -38,12 +38,12 @@ ITEM-BACKED DISPATCHES post nothing. A dispatch opened for a triage item
 `delivery_status = ITEM_TRACKED` — a dispatch sideclaw PRUNED is folded too, as a
 terminal dispatch with no verdict, so its item strikes and retries rather than
 staying `working` forever; Slack hears about the item itself, once, when it
-enters `fixed` or `needs_decision` (triage.py `notify_cluster()`, a one-line post
+enters `fixed` or `needs_decision` (loop/notify.py `notify_cluster()`, a one-line post
 into the item's own origin thread when it has one). Only a dispatch with no item —
 a `warden dispatch` somebody asked for — is delivered as described above.
 
 ADVANCE ON COMPLETION (docs/history/state-log.md §87). After that per-row
-pass, every pass also calls `triage.advance_implement_chain()` — the same
+pass, every pass also calls `work.advance_implement_chain()` — the same
 verdict -> implement -> review -> merge code
 `triage.run()` calls on its own 600s tick. Before this, an item that just
 crossed a stage boundary (its verdict folded above, or the row loop
@@ -208,7 +208,7 @@ UNDELIVERABLE_SENTINEL = "undeliverable:no-origin-channel"
 
 # A dispatch opened for a triage item (`origin_event_id` set) is never reported on its
 # own: Slack hears about the ITEM, once, when it enters `fixed` or `needs_decision`
-# (triage.py `notify_cluster()`), and the sweep only closes the row with this status.
+# (loop/notify.py `notify_cluster()`), and the sweep only closes the row with this status.
 ITEM_TRACKED = "item-tracked"
 
 # Slack mrkdwn block limit is 4000 chars; this leaves headroom for the
@@ -216,22 +216,13 @@ ITEM_TRACKED = "item-tracked"
 BODY_CHAR_LIMIT = 3800
 EVIDENCE_CAP = 5
 
-# scripts/triage.py's fold_dispatch_verdict() — loaded by path, the same
-# mechanism the cron entry-point wrappers use (the filename is not
-# importable). A dispatch tied to a triage item (origin_event_id set) needs
-# its card folded to the terminal verdict as soon as this sweeper sees it,
-# rather than waiting for triage.py's own next 10-minute pass. Import at
-# module load, not lazily inside process_dispatch, so a broken sibling
-# script fails loudly at import time instead of on the first row that
-# happens to need it.
-_TRIAGE_PATH = Path(__file__).resolve().parent / "triage.py"
-_triage_spec = importlib.util.spec_from_file_location("triage", _TRIAGE_PATH)
-assert _triage_spec and _triage_spec.loader, "Failed to load scripts/triage.py"
-_triage = importlib.util.module_from_spec(_triage_spec)
-_triage_spec.loader.exec_module(_triage)
+# The loop's fold_dispatch_verdict() and advance_implement_chain(): a dispatch tied to a triage
+# item (origin_event_id set) folds to its terminal verdict as soon as this sweeper sees it, not
+# at the loop's next 10-minute pass. Imported at module load so a broken loop module fails
+# loudly at import time, not on the first row that needs it.
+from loop import core, work  # noqa: E402
 
-# scripts/ledger.py — same by-path loading mechanism as the triage.py load
-# just above. ledger.py is now the sole owner of the schema and migrations
+# scripts/ledger.py — loaded by path. ledger.py is now the sole owner of the schema and migrations
 # that used to live inline here as DB_SCHEMA plus an ALTER TABLE block.
 _LEDGER_PATH = Path(__file__).resolve().parent / "ledger.py"
 _ledger_spec = importlib.util.spec_from_file_location("ledger", _LEDGER_PATH)
@@ -609,7 +600,7 @@ def _mark_pruned(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry
         # exactly like the terminal path in process_dispatch(), so the item strikes and retries
         # (fold_dispatch_verdict()'s no-verdict path) instead of sitting `working` forever.
         try:
-            _triage.fold_dispatch_verdict(
+            work.fold_dispatch_verdict(
                 conn, origin_event_id=row["origin_event_id"], job_id=job_id,
                 now=dt.datetime.now(dt.timezone.utc), dry_run=False,
             )
@@ -697,7 +688,7 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
     # reader of this column (and the actionable predicate below) filters on
     # IS NOT NULL / truthiness.
     artifact_url = ((result.get("artifactUrl") if isinstance(result, dict) else None) or "").strip() or None
-    # Same normalization as artifact_url above, for the same reason: triage.py's
+    # Same normalization as artifact_url above, for the same reason: loop/work.py's
     # fold_dispatch_verdict() (ledger.py migration 10) reads this column to know
     # WHY a terminal dispatch carries no verdict, and "" vs NULL must not become
     # two shapes of "no reason recorded".
@@ -739,7 +730,7 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
     origin_event_id = row["origin_event_id"] if "origin_event_id" in row.keys() else None
     if origin_event_id:
         try:
-            _triage.fold_dispatch_verdict(
+            work.fold_dispatch_verdict(
                 conn, origin_event_id=origin_event_id, job_id=job_id,
                 now=dt.datetime.now(dt.timezone.utc), dry_run=dry_run,
             )
@@ -889,7 +880,7 @@ def main(argv: list[str] | None = None) -> int:
         # this pass just folded above (fold_dispatch_verdict(), inside
         # process_dispatch()) can make an item eligible for its next
         # deterministic transition RIGHT NOW rather than at the loop's next
-        # 600s tick — triage.advance_implement_chain() is the exact same
+        # 600s tick — work.advance_implement_chain() is the exact same
         # verdict -> implement -> review -> merge code
         # run() itself calls, see that function's own docstring for why
         # calling it from here, on this 300s cadence, needs no new lock and
@@ -897,8 +888,8 @@ def main(argv: list[str] | None = None) -> int:
         # like run() does — every step re-derives its own eligibility from
         # the DB, so an empty ledger costs one cheap SELECT per step.
         try:
-            _triage.advance_implement_chain(conn, _triage.load_policy(),
-                                             dt.datetime.now(dt.timezone.utc), dry_run=dry_run)
+            work.advance_implement_chain(conn, core.load_policy(),
+                                          dt.datetime.now(dt.timezone.utc), dry_run=dry_run)
         except Exception as e:  # this chain must never take the sweep itself down
             errors += 1
             print(f"dispatch-sweep: advance_implement_chain raised: {e} — the loop's own "

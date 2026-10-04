@@ -8,7 +8,7 @@ green (or none), review `confirmed`; GitHub's own rules answer at the merge call
 
 `plan_or_land()` is confirm-gated: a plan (no `--confirm`) changes nothing.
 
-Landing does not deploy: the verify pass (triage.py) runs `make deploy` through
+Landing does not deploy: the verify pass (loop/verify.py) runs `make deploy` through
 lifecycle/rollout.py once the item is `verifying`.
 """
 

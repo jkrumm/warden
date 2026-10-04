@@ -8,7 +8,7 @@ later from silent heartbeats), and stray agent-created skills under
 ~/.hermes/skills/ (untracked, unreviewed — the failure class behind the
 2026-08-02 skill-sprawl cleanup). Reconciles against ~/.hermes/watchdog.db
 (SQLite). Posts nothing to Slack: the New/Resolved raw-event digest is gone (a
-warden item reaches Slack only as `fixed`/`needs_decision`, triage.py's
+warden item reaches Slack only as `fixed`/`needs_decision`, loop/notify.py's
 notify_cluster(); everything else lives in Argo). What stays is the poller's own
 health: the blind-Slack-poll alarm on stderr and the exit code, and the UptimeKuma
 heartbeat on a clean run.
@@ -78,7 +78,7 @@ GH_OWNER = "jkrumm"
 CH_ALERTS = "C0AS1LAUQ3C"
 CH_UPDATES = "C0ARZJD824W"
 
-# Same env-first, absolute-default shape as triage.py's GH_BIN: launchd hands
+# Same env-first, absolute-default shape as loop/core.py's GH_BIN: launchd hands
 # this job PATH=/usr/bin:/bin, where a bare `gh` does not exist.
 _env_gh_bin = os.environ.get("GH_BIN")
 GH_BIN = Path(_env_gh_bin).expanduser() if _env_gh_bin else Path("/opt/homebrew/bin/gh")

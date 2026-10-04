@@ -630,7 +630,7 @@ def main() -> int:
 
     # --- dispatches.error: a terminal failed job persists sideclaw's reason ---
     #
-    # See ledger.py migration 10 and triage.py's fold_dispatch_verdict() — the
+    # See ledger.py migration 10 and loop/work.py's fold_dispatch_verdict() — the
     # 2026-09-12 defect (item 253) where a timed-out episode's failure text
     # reached Slack but was never recorded anywhere on the row.
     error_checks: list[tuple[str, bool]] = []

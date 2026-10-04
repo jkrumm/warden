@@ -253,7 +253,7 @@ _SEARCH_MAX_PAGES = 10
 def search_issues(*, owner: str, skip_label: str) -> list[dict[str, Any]]:
     """`GET /search/issues` for every OPEN issue in an `owner` repo, minus
     anyone carrying `skip_label` — the poll behind no-label issue intake
-    (triage.py's `ingest_github_issues()`). Every open issue is a warden item
+    (loop/intake.py's `ingest_github_issues()`). Every open issue is a warden item
     by default; `skip_label` is the one opt-out a human can apply to keep a
     specific issue out, not a gate an issue has to earn its way through.
     `repo` in each returned dict is the SHORT name (`nameWithOwner`'s tail,
