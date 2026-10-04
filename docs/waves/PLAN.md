@@ -20,6 +20,11 @@ against the live file by a wave.
 
 **Model:** spawn successors with `RD_WAVE_MODEL=opus`.
 
+**From Wave 3 on the loop is LIVE from this checkout.** Do all work in a git worktree
+(`git worktree add ../warden-wN -b wave-N`), run `make test` there, and fast-forward
+master only at close-out (`git -C ~/SourceRoot/warden merge --ff-only wave-N`), then remove
+the worktree. A half-edited `triage.py` in the live checkout gets imported by the next tick.
+
 **Deleting is the job.** Delete code together with its tests and docs. No
 compatibility shims, no feature flags for removed gates. Git history is the archive.
 
@@ -53,6 +58,7 @@ Requires sideclaw Wave 1 (`triage` job, `rootCause`) — check `~/SourceRoot/sid
 - [ ] Fingerprint: normalize titles (strip timestamps, hex ids, UUIDs, paths, numbers, log-file name) in `watchdog-poll.py` and intake; the same line from two log files is one event. Backfill-test against the 1,406 events in a ledger copy: report the item count before vs after.
 - [ ] Triage step via sideclaw `triage`: input = new event + open items of candidate repos + items fixed in the last 14 days with PR titles; output `attach | new(repo,title) | fixed_by | ignore`. Issues, alerts and `warden run` share one pool. Route by the signal's own label (Kuma tag, OTel `service.name`, GitHub repo) first; triage decides the rest from the candidate repos' `## Verify & Monitor` sections. Delete the 77 glob rules and 15 ignores once the replay shows equal or better routing.
 - [ ] Revisions are attempts on the same item (sideclaw `revisionOf`, W2 there), never new items. Up to 4 attempts; attempt 3+ uses the escalation implement model from sideclaw's registry.
+- [ ] Handle sideclaw's new implement outcomes `conflict` (base moved; re-dispatch from the new base with the old diff as context, counts as an attempt) and `pr_updated` (a `revisionOf` episode updated the existing PR) in `clients/sideclaw.py` + the loop, then bump the pinned `DISPATCH_SCHEMA_VERSION` to 4 together with sideclaw (one commit there: `server/jobs/handlers/dispatch.ts`). sideclaw's per-repo lease *refuses* a second implement/`update_pr` — treat that refusal as retry-later, not `failed`.
 - [ ] Root-cause merge: a verdict whose `rootCause` matches another open item's merges them (keep the older item, close the other `closed(duplicate)`).
 **Left behind:**
 
