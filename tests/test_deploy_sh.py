@@ -5,6 +5,8 @@
 deploy.sh is sourceable: the function tests source it into `bash -c` and call the functions, with
 `launchctl` and `curl` replaced by stubs first on PATH (and REPO/LIVE_REPO pointed at a throwaway
 git repo for the rollback cases), so nothing reaches launchd, the live checkout or the ledger.
+Every invocation also gets WARDEN_LIVE_REPO pointed at a temp dir, so the live-checkout guard in
+deploy() refuses from any cwd — even when the suite itself runs inside the live checkout.
 The lock tests run the script itself against a lock file in a temp dir.
 
 Run: .venv/bin/python3 tests/test_deploy_sh.py  (or: make test, from warden/)
@@ -56,7 +58,8 @@ class Sandbox:
         for stub in self.bin.iterdir():
             stub.chmod(0o755)
         self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", **_GIT_ENV,
-                    "WARDEN_DEPLOY_LOCK": str(self.dir / "deploy.lock"), "WARDEN_DEPLOY_LOCK_WAIT": "0.3"}
+                    "WARDEN_DEPLOY_LOCK": str(self.dir / "deploy.lock"), "WARDEN_DEPLOY_LOCK_WAIT": "0.3",
+                    "WARDEN_LIVE_REPO": str(self.dir / "not-the-live-checkout")}
         self.env.pop("WARDEN_DEPLOY_LOCKED", None)
         self.env.pop("WARDEN_DEPLOY_PREV", None)
         self.env.pop("WARDEN_DEPLOY_HEAD", None)
@@ -243,6 +246,27 @@ def test_deploy_still_refuses_outside_the_live_checkout():
     with Sandbox() as sb:
         res = sb.bash(f'PY="{PY}"\ndeploy; echo rc=$?')
         assert "deploy runs only in" in res.stdout and res.stdout.strip().endswith("rc=1"), res.stdout
+        assert sb.logged() == "", "a refused deploy must not reach launchctl or curl"
+
+
+def test_deploy_refuses_when_the_script_sits_in_what_would_be_the_live_checkout():
+    # The original bug: run from the live checkout, REPO == the hardcoded LIVE_REPO and the "refusal"
+    # test did a real deploy. Reproduce that layout in a sandbox HOME: a copy of deploy.sh at
+    # $HOME/SourceRoot/warden/scripts. The sandbox's WARDEN_LIVE_REPO must still make it refuse.
+    with Sandbox() as sb:
+        fake_live = sb.dir / "SourceRoot" / "warden"
+        (fake_live / "scripts").mkdir(parents=True)
+        script = fake_live / "scripts" / "deploy.sh"
+        script.write_text(DEPLOY_SH.read_text())
+        run = lambda env: subprocess.run(["bash", "-c", f'source "{script}"\ndeploy; echo rc=$?'], capture_output=True,
+                                         text=True, env=env, timeout=60)
+        home_env = {**sb.env, "HOME": str(sb.dir)}
+        # control: without the override this layout passes the guard (and stops at the missing venv)
+        control = run({k: v for k, v in home_env.items() if k != "WARDEN_LIVE_REPO"})
+        assert "no venv" in control.stdout, ("the layout no longer reproduces the live checkout", control.stdout)
+        res = run(home_env)
+        assert "deploy runs only in" in res.stdout and res.stdout.strip().endswith("rc=1"), res.stdout
+        assert sb.logged() == "", "no launchctl/curl call may happen"
 
 
 # --- the lock -----------------------------------------------------------------------------------

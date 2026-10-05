@@ -24,7 +24,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-LIVE_REPO="$HOME/SourceRoot/warden"
+LIVE_REPO="${WARDEN_LIVE_REPO:-$HOME/SourceRoot/warden}"
 PY="$REPO/.venv/bin/python3"
 API_URL="${WARDEN_API_URL:-http://127.0.0.1:7735}"
 API_LABEL="gui/$(id -u)/com.jkrumm.warden-api"
