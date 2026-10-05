@@ -10,7 +10,8 @@ Three questions live here and nowhere else:
   sync_checkout()  fast-forward the checkout to `origin/<default>` — only when it is on
                 the default branch with no tracked changes and ends exactly AT
                 `origin/<default>` (not ahead of it: unpushed commits are never deployed),
-                else a typed `Deferred` (never a surprise merge into someone's work tree).
+                else a typed `Deferred` (never a surprise merge into someone's work tree);
+                on success a `Synced(before, head)` that the caller hands to deploy().
                 The caller syncs once, before asking has_target(): a merge that adds the
                 first `deploy` target must be seen, and `make verify` must judge the
                 merged tree.

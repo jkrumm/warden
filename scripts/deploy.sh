@@ -102,13 +102,14 @@ rollback_target() {
 deploy() {
   [ "$REPO" = "$LIVE_REPO" ] || { echo "warden: deploy runs only in $LIVE_REPO, the checkout the agents run"; return 1; }
   [ -x "$PY" ] || { echo "warden: no venv — run 'make venv'"; return 1; }
-  local prev moved=0
+  local prev start head
   prev=$(rollback_target || true)
-  if [ -n "${WARDEN_DEPLOY_HEAD:-}" ] && [ "$WARDEN_DEPLOY_HEAD" != "$(git -C "$REPO" rev-parse HEAD)" ]; then
-    moved=1
-  fi
+  start=$(git -C "$REPO" rev-parse HEAD)
   health && { echo "  ✓ deployed $(git -C "$REPO" rev-parse --short HEAD)"; return 0; }
-  if [ "$moved" = 1 ]; then
+  # Sampled after the health check, right before the reset: HEAD must still be what the
+  # sync landed on AND what this run started from, or the reset would drop unseen commits.
+  head=$(git -C "$REPO" rev-parse HEAD)
+  if [ "$head" != "$start" ] || { [ -n "${WARDEN_DEPLOY_HEAD:-}" ] && [ "$WARDEN_DEPLOY_HEAD" != "$head" ]; }; then
     echo "  ✗ deploy failed — checkout moved since sync, not rolling back"; return 1
   fi
   if [ -z "$prev" ]; then

@@ -212,6 +212,17 @@ def test_a_failed_deploy_does_not_roll_back_when_the_checkout_moved_since_the_sy
         assert sb.git(repo, "rev-parse", "HEAD") == sha["C"], "HEAD must not move"
 
 
+def test_a_checkout_that_moves_during_the_health_check_is_not_rolled_back():
+    # HEAD == the synced commit when deploy starts; the checkout moves (C -> D) while health() runs.
+    # The move must be seen at reset time, not at the start, or the reset would discard D.
+    with Sandbox() as sb:
+        repo, sha = sb.make_repo()
+        res = sb.bash(_point_at(repo) + f'health() {{ git -C "{repo}" reset -q --keep {sha["D"]}; return 1; }}\n'
+                      "deploy; echo rc=$?", WARDEN_DEPLOY_PREV=sha["B"], WARDEN_DEPLOY_HEAD=sha["C"])
+        assert "checkout moved since sync, not rolling back" in res.stdout, (res.stdout, res.stderr)
+        assert sb.git(repo, "rev-parse", "HEAD") == sha["D"], "the reset discarded a commit that landed mid-health"
+
+
 def test_a_moved_checkout_that_still_passes_health_is_a_successful_deploy():
     with Sandbox() as sb:
         repo, sha = sb.make_repo()
