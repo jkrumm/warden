@@ -41,7 +41,7 @@ whether to touch production.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**461/461** — any other number is a finding to report, not a count to edit.
+**466/466** — any other number is a finding to report, not a count to edit.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary, so nothing reaches Slack, sideclaw, GitHub or Argo.
 Patch a name on the module that defines it (`loop.core.DB_PATH`, `loop.core.post_line`) —
@@ -56,7 +56,9 @@ warden deploys itself from this checkout, which the LaunchAgents run directly.
 ```bash
 make setup     # venv + plists + load the agents + ~/.local/bin/warden
 make deploy    # compile + import smoke, kickstart warden-api, wait for /health;
-               # on failure roll back to HEAD@{1} (git reset --keep) — scripts/deploy.sh
+               # on failure roll back to the pre-merge commit (git reset --keep),
+               # never past a checkout that moved since the sync — scripts/deploy.sh;
+               # deploy/verify hold ~/.warden/deploy.lock with the loop's sync
 make agents    # (re)load the LaunchAgents — needed when a plist template changed
 make unload    # stop the agents
 ```

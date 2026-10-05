@@ -9590,3 +9590,43 @@ failed again (Max OAuth expired); an independent reviewer's two blocking finding
 deploy/verify draft are fixed (above); the split and the docs came back clean. The split
 worker once ran `triage.py --help`, which `main()` treats as a live pass: verified on a
 ledger copy that it wrote no transition and no dispatch — an extra tick.
+
+## 121. Agent-platform Wave 6 — review fixes (2026-10-05)
+
+Commits 24a30cc..c701098 + close-out on branch `wave-6`, fast-forwarded to master. Fixes
+from the `/review` of `67463ac..afd348d`.
+
+- **Merge gate.** An empty Actions fallback is `ChecksPending`, never "no CI" — only a
+  readable check-runs API may say none. Check-runs and workflow-runs are paginated to
+  `total_count` (a body without it refuses). A workflow's newest run id wins;
+  `run_attempt` only breaks ties within one run. `plan_or_land()` runs base/head/fork
+  guards before the merged check and raises `AlreadyMerged` only at the pinned head; a
+  hand merge whose head no review confirmed verifies by signal only (the fixed-by
+  sweep's mode) and its note says so. `warden merge --confirm` needing a reviewed pin is
+  documented as intended.
+- **Deploy.** `deploy.sh` re-execs under `rollout.exec_locked` (fcntl.flock on
+  `~/.warden/deploy.lock`, shared with `sync_checkout` of warden's own checkout).
+  `sync_checkout` returns `Synced(before, head)`; `deploy()` passes both, and deploy.sh
+  rolls back only to an ancestor of HEAD and never when HEAD moved since the sync. A
+  503 passes only when ledger schema < code schema. `_run_in_group`'s post-kill drain
+  is bounded.
+- **Resilience.** Tracebacks logged in `run_bounded` and dispatch-sweep; dispatch-sweep
+  stages and `advance_implement_chain` steps are isolated (rollback, log, re-raise the
+  first error after all ran). The normalize fallback logs when taken.
+- **Ledger.** Migration 15's backfill stamps the migration time. Every pending
+  migration snapshots first (`VACUUM INTO <db dir>/backups/pre-migration-…-<pid>.db`);
+  a failed snapshot aborts the migration. No schema change.
+- **Shape.** 66 cross-module helpers lost their underscore (`set_state`, `get_item`,
+  `now_iso`, `strike`, `is_claim`, …); `intake.is_private` without alias; policy's
+  in-flight SQL built from core's state constants; `tests/test_loop_imports.py` imports
+  each loop module first in a fresh interpreter. One `_submit_job` in the sideclaw
+  client; the owner-note idempotency tag survives the note cap; `make -n check` runs
+  nothing.
+
+`make check` green, test_triage 461 → 466. sideclaw `/review` worked again: 3 blocking
+(lock released between sync and deploy could roll back past unseen commits; snapshot
+name collision; missing `total_count` read as complete) — all fixed in c701098. A second
+review of that fix found HEAD sampled before the health check (a move during it could be
+reset away) — fixed with a regression test. Decided: a deploy whose checkout moved and
+whose health fails does not roll back (fail closed; the next sync deploys again).
+
