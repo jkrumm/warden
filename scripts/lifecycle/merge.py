@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -154,16 +155,23 @@ class MergeResult:
 
 
 def read_check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
-    """Every check run on `sha`. Unreadable is not "none exist": an unknown CI state must
-    never pass the green-or-none gate, so it is a refusal (`PolicyError`). Typically a
-    fine-grained PAT without `Checks: read` on a private repository (§110: `weatherorb`)."""
+    """Every check run on `sha`, mapped to the shape the gate consumes.
+
+    A 403 (a fine-grained PAT without `Checks: read` on a private repository, §110:
+    `weatherorb`) falls back to the commit's GitHub Actions workflow runs, mapped to
+    the same shape — the same credential can often read those. Unreadable is still not
+    "none exist": if the fallback is unreadable too, the unknown CI state refuses with
+    the fallback's own `RemoteError`, never passes the green-or-none gate."""
     try:
         return github.check_runs(owner, repo, sha)
     except CheckRunsUnreadable as e:
-        raise PolicyError(
-            f"{owner}/{repo}'s check runs on {sha[:12]} are unreadable ({e}); "
-            f"the token may lack Checks: read. CI state is unknown, so the merge is refused."
-        ) from e
+        runs = github.workflow_runs(owner, repo, sha)
+        print(
+            f"merge: check runs unreadable on {owner}/{repo}@{sha[:12]} ({e}); gating on "
+            f"{len(runs)} GitHub Actions workflow run(s) instead",
+            file=sys.stderr,
+        )
+        return runs
 
 
 def check_runs_gate(*, repo: str, check_runs: list[dict[str, Any]]) -> None:

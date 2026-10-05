@@ -775,6 +775,65 @@ def test_check_runs_invalid_sha_raises_precondition_error_before_any_request():
         _gh_cleanup()
 
 
+def test_workflow_runs_maps_to_check_run_shape_keeping_the_latest_per_workflow():
+    """The Actions-runs fallback reader maps runs to the check-run shape the merge
+    gate consumes, keeping only the latest attempt per workflow so a stale green
+    re-run cannot mask the run that matters."""
+    srv = _StubServer({("GET", f"/repos/jkrumm/gamma/actions/runs?head_sha={_FULL_SHA}&per_page=100"): (
+        200,
+        {"workflow_runs": [
+            {"workflow_id": 1, "name": "CI", "status": "completed", "conclusion": "failure",
+             "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z"},
+            {"workflow_id": 1, "name": "CI", "status": "completed", "conclusion": "success",
+             "run_attempt": 2, "created_at": "2026-01-01T01:00:00Z"},
+            {"workflow_id": 2, "name": "lint", "status": "in_progress", "conclusion": None,
+             "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z"},
+        ]},
+    )})
+    _gh_env(srv)
+    try:
+        runs = github.workflow_runs("jkrumm", "gamma", _FULL_SHA)
+        assert sorted(runs, key=lambda r: r["name"]) == [
+            {"name": "CI", "status": "completed", "conclusion": "success"},
+            {"name": "lint", "status": "in_progress", "conclusion": None},
+        ], runs
+    finally:
+        srv.stop()
+        _gh_cleanup()
+
+
+def test_workflow_runs_non_200_raises_remote_error():
+    srv = _StubServer({("GET", f"/repos/jkrumm/gamma/actions/runs?head_sha={_FULL_SHA}&per_page=100"): (
+        403, {"message": "Resource not accessible by personal access token"})})
+    _gh_env(srv)
+    try:
+        try:
+            github.workflow_runs("jkrumm", "gamma", _FULL_SHA)
+        except RemoteError as e:
+            assert "403" in str(e)
+        else:
+            raise AssertionError("expected RemoteError")
+    finally:
+        srv.stop()
+        _gh_cleanup()
+
+
+def test_workflow_runs_invalid_sha_raises_precondition_error_before_any_request():
+    srv = _StubServer({})
+    _gh_env(srv)
+    try:
+        try:
+            github.workflow_runs("jkrumm", "gamma", "../../etc/passwd")
+        except PreconditionError:
+            pass
+        else:
+            raise AssertionError("expected PreconditionError")
+        assert srv.requests == [], "a malformed sha must never reach a request"
+    finally:
+        srv.stop()
+        _gh_cleanup()
+
+
 def test_mark_ready_for_review_non200_raises():
     srv = _StubServer({("POST", "/graphql"): (500, {"message": "boom"})})
     _gh_env(srv)

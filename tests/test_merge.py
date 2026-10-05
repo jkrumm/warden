@@ -127,6 +127,8 @@ def fakes(**overrides):
         "files": [],
         "check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}],
         "check_runs_error": None,
+        "workflow_runs": [],
+        "workflow_runs_error": None,
         "merge_resp": {"sha": "mergedsha001"},
         "delete_ok": True,
         "branch_rules": [],
@@ -157,6 +159,12 @@ def fakes(**overrides):
             raise state["check_runs_error"]
         return list(state["check_runs"])
 
+    def _workflow_runs(owner, repo, sha):
+        record("workflow_runs", owner, repo, sha)
+        if state["workflow_runs_error"]:
+            raise state["workflow_runs_error"]
+        return list(state["workflow_runs"])
+
     def _mark_ready(node_id):
         record("mark_ready_for_review", node_id)
         if state["mark_ready_fn"]:
@@ -186,6 +194,7 @@ def fakes(**overrides):
         (github, "read_repo", _read_repo),
         (github, "pr_files", _pr_files),
         (github, "check_runs", _check_runs),
+        (github, "workflow_runs", _workflow_runs),
         (github, "mark_ready_for_review", _mark_ready),
         (github, "merge_pr", _merge_pr),
         (github, "delete_branch", _delete_branch),
@@ -311,14 +320,97 @@ def test_github_ruleset_requiring_zero_reviews_is_not_a_human_gate():
     assert fx.calls["merge_pr"][0][1]["method"] != "merge", "linear history rules out a merge commit"
 
 
-def test_unreadable_check_runs_refuse_the_merge():
+def test_unreadable_check_runs_fall_back_to_actions_runs_and_pass_when_green():
     """§110 — `weatherorb` is private and a fine-grained PAT without `Checks: read`
-    403s the check-runs read. Unreadable is not "none exist": an unknown CI state
-    must not pass the green-or-none gate, so the merge is refused and the item
-    takes the not-mergeable-yet path."""
-    _assert_refuses(exc_type=PolicyError, msg="Checks: read",
-                    seed={"validation_status": "confirmed"},
-                    fake={"check_runs_error": github.CheckRunsUnreadable("GitHub returned HTTP 403 reading check-runs")})
+    403s the check-runs read. The same credential can read the commit's Actions
+    workflow runs, so the gate falls back to those: a green run passes the merge."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, validation_status="confirmed")
+        with fakes(
+            check_runs_error=github.CheckRunsUnreadable("GitHub returned HTTP 403 reading check-runs"),
+            workflow_runs=[{"name": "CI", "status": "completed", "conclusion": "success"}],
+        ) as fx:
+            result = _land(conn)
+        assert result.merged is True
+        assert fx.calls.get("workflow_runs"), "the fallback reader must be the one used"
+        assert "merge_pr" in fx.calls
+    finally:
+        conn.close()
+
+
+def test_fallback_actions_run_failed_refuses():
+    """The fallback keeps the green-or-none semantics: a completed Actions run
+    that did not pass refuses the merge exactly as a bad check-run would."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, validation_status="confirmed")
+        with fakes(
+            check_runs_error=github.CheckRunsUnreadable("HTTP 403"),
+            workflow_runs=[{"name": "CI", "status": "completed", "conclusion": "failure"}],
+        ) as fx:
+            try:
+                _land(conn)
+            except merge.ChecksFailed as e:
+                assert "has not passed cleanly" in str(e) and "CI" in str(e), e
+            else:
+                raise AssertionError("expected ChecksFailed")
+        assert "merge_pr" not in fx.calls
+    finally:
+        conn.close()
+
+
+def test_fallback_zero_actions_runs_passes():
+    """A 403 with no Actions runs to gate on is not a refusal: green-or-none still
+    means an empty set passes. (This is the same vacuous-clean case the check-runs
+    gate already had.)"""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, validation_status="confirmed")
+        with fakes(
+            check_runs_error=github.CheckRunsUnreadable("HTTP 403"),
+            workflow_runs=[],
+        ) as fx:
+            result = _land(conn)
+        assert result.merged is True
+        assert fx.calls.get("workflow_runs")
+    finally:
+        conn.close()
+
+
+def test_fallback_actions_runs_unreadable_refuses():
+    """The fallback only helps where the credential can read Actions runs. If it
+    cannot either, the unknown CI state still refuses — fail closed, never merge."""
+    _assert_refuses(
+        exc_type=RemoteError, msg="reading Actions runs",
+        seed={"validation_status": "confirmed"},
+        fake={
+            "check_runs_error": github.CheckRunsUnreadable("HTTP 403"),
+            "workflow_runs_error": RemoteError("GitHub returned HTTP 403 reading Actions runs"),
+        },
+    )
+
+
+def test_non_403_check_runs_error_still_refuses_without_fallback():
+    """Only the check-runs 403 falls back. Any other error (a 404, a 500) is a loud
+    refusal; the Actions reader must never be reached for it."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, validation_status="confirmed")
+        with fakes(
+            check_runs_error=RemoteError("GitHub returned HTTP 500 reading check-runs"),
+            workflow_runs=[{"name": "CI", "status": "completed", "conclusion": "success"}],
+        ) as fx:
+            try:
+                _land(conn)
+            except RemoteError as e:
+                assert "500" in str(e), e
+            else:
+                raise AssertionError("expected RemoteError")
+        assert "workflow_runs" not in fx.calls, "a non-403 must not fall back"
+        assert "merge_pr" not in fx.calls
+    finally:
+        conn.close()
 
 
 def test_pull_request_closed_refuses():

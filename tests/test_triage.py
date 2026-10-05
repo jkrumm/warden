@@ -229,6 +229,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_sideclaw", "submit_triage"): _sideclaw.submit_triage,
         ("_sideclaw", "submit_update_pr"): _sideclaw.submit_update_pr,
         ("_github", "check_runs"): _github.check_runs,
+        ("_github", "workflow_runs"): _github.workflow_runs,
         ("_sideclaw", "get"): _sideclaw.get,
         ("_sideclaw", "wait"): _sideclaw.wait,
         ("_sideclaw", "cancel"): _sideclaw.cancel,
@@ -307,6 +308,10 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         _github.pr_files = lambda owner, repo, number: (_ for _ in ()).throw(
             RemoteError("test: no fake pr_files registered"))
         _github.check_runs = _default_fake_check_runs
+        # The fallback `read_check_runs()` reaches on a check-runs 403: loud unless a
+        # test registers it, the same shape as every other write-ish client boundary.
+        _github.workflow_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
+            RemoteError("test: no fake workflow_runs registered"))
         CLOSED_PRS.clear()
         _github.close_pr = lambda owner, repo, number, *, comment=None: CLOSED_PRS.append(
             (owner, repo, number, comment))
@@ -9949,16 +9954,38 @@ def test_train_failed_ci_on_the_train_sha_is_a_checks_failed_revision():
         assert d["validation_status"] == "checks_failed"
 
 
+def test_train_checks_403_falls_back_to_actions_runs():
+    """The train reads checks through `lifecycle.merge.read_check_runs`, so the
+    check-runs 403 -> Actions-runs fallback applies here too: a green fallback
+    advances the train on to review instead of failing the item."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-fallback", stage="checks", sha=TRAIN_SHA)
+        _github.check_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
+            _merge.CheckRunsUnreadable("HTTP 403: Resource not accessible by personal access token"))
+        _github.workflow_runs = lambda owner, repo, sha: [
+            {"name": "CI", "status": "completed", "conclusion": "success"}]
+        _sideclaw.submit_review = _fake_submit_review([])
+        _train_pass(conn)
+        item = core._get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
+        assert item["train_stage"] == train.TRAIN_REVIEW, dict(item)
+
+
 def test_train_checks_unreadable_never_pass():
-    """W1: unreadable check runs are an unknown CI state — never green."""
+    """W1: unreadable check runs are an unknown CI state — never green. The
+    check-runs 403 falls back to Actions runs; when those are unreadable too, the
+    train strikes and stays off `review` rather than advancing on an unknown state."""
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-unreadable", stage="checks", sha=TRAIN_SHA)
         _sideclaw.submit_review = _no_review
         _github.check_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
             _merge.CheckRunsUnreadable("HTTP 403: Resource not accessible by personal access token"))
+        _github.workflow_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
+            RemoteError("HTTP 403 reading Actions runs"))
         _train_pass(conn)
         item = core._get_item(conn, eid)
-        assert item["state"] == core.STATE_FAILED and "unreadable" in item["note"], dict(item)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
+        assert item["train_stage"] == train.TRAIN_CHECKS, dict(item)
 
 
 def test_train_checks_on_a_moved_head_go_back_to_update():

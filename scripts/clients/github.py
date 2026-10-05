@@ -164,6 +164,47 @@ def check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     return body["check_runs"]
 
 
+def _workflow_run_recency(run: dict[str, Any]) -> tuple[int, str]:
+    """Latest attempt of one workflow run wins: `run_attempt` first (a re-run
+    increments it on the same run), then `created_at` for two distinct runs of
+    one workflow on the same commit."""
+    attempt = run.get("run_attempt")
+    return (attempt if isinstance(attempt, int) else 0, str(run.get("created_at") or ""))
+
+
+def workflow_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
+    """Every GitHub Actions workflow run on `sha`, mapped to the check-run shape
+    `lifecycle/merge.py`'s green-or-none gate consumes ({name, status, conclusion}).
+
+    The fallback when `check_runs()` is unreadable (a fine-grained PAT without
+    `Checks: read` on a private repository, §110): the same credential can often
+    still read Actions runs. Only the latest run per workflow is kept — a re-run
+    or a second trigger of one workflow for one commit must not let a stale green
+    run mask the current one. A non-200 here raises a plain `RemoteError`: with no
+    check-runs to fall back to, an unreadable CI state still refuses."""
+    if not _SHA_RE.match(sha):
+        raise PreconditionError(f"{sha!r} is not a 40-hex commit sha — refusing before the request")
+    status, body = api("GET", f"/repos/{owner}/{repo}/actions/runs?head_sha={sha}&per_page=100")
+    if status != 200:
+        raise RemoteError(f"GitHub returned HTTP {status} reading Actions runs for {owner}/{repo}@{sha}")
+    if not isinstance(body, dict) or not isinstance(body.get("workflow_runs"), list):
+        raise RemoteError(f"GitHub returned an unusable body reading Actions runs for {owner}/{repo}@{sha}")
+    latest: dict[Any, dict[str, Any]] = {}
+    for run in body["workflow_runs"]:
+        if not isinstance(run, dict):
+            continue
+        key = run.get("workflow_id")
+        if key is None:
+            key = run.get("name")
+        current = latest.get(key)
+        if current is None or _workflow_run_recency(run) > _workflow_run_recency(current):
+            latest[key] = run
+    return [
+        {"name": r.get("name") or "workflow", "status": r.get("status"), "conclusion": r.get("conclusion")}
+        for r in latest.values()
+    ]
+
+
 def mark_ready_for_review(node_id: str) -> None:
     """Un-drafting is GraphQL-only — REST has no ready-for-review
     transition."""
