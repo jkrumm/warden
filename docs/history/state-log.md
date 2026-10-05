@@ -9630,3 +9630,21 @@ review of that fix found HEAD sampled before the health check (a move during it 
 reset away) — fixed with a regression test. Decided: a deploy whose checkout moved and
 whose health fails does not roll back (fail closed; the next sync deploys again).
 
+## 122. A bold-wrapped bot alert is not unstructured prose (2026-10-05)
+
+An alert whose Slack mrkdwn bolds its leading emoji — `*🚨 ...` — was closed `ignored`
+on intake, before any triage call. `looks_like_bot_alert()` tested the raw `lstrip()`ed
+title against `_BOT_ALERT_PREFIXES`, which carried only the literal `*⚠️` bold form, so
+`*🚨` (and any other bold-wrapped prefix) failed. With
+`ignoreUnstructuredSlackProse: true` and no repo label, `intake.classify()` closes such a
+row `closed(ignored)` as "unstructured #alerts prose" — a real siren lost.
+
+`looks_like_bot_alert()` now strips a single leading `*` before the prefix test, so the
+`*` is markup, not content; the redundant `*⚠️` tuple entry is gone (`*⚠️` still matches
+via the plain `⚠️`). `test_triage.py` gains
+`test_bold_wrapped_bot_alert_prefixes_are_not_unstructured_prose`: the helper on
+`*🚨`/`*⚠️`/plain prose, and both bold-wrapped alerts reaching the triage step instead of
+closing.
+
+`make check` green, test_triage 466 → 467.
+

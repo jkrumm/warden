@@ -535,12 +535,13 @@ def match_rule(targets: list[str], rules: list[dict[str, Any]]) -> dict[str, Any
 
 
 # `[`  — UptimeKuma's own bracketed monitor-name format: "[X] [:red_circle: Down] ..."
-# emoji — HyperDX/argo-alert style: "🚨 ...", "✅ ...", "⚠️ ...", "*⚠️ ..." (bold mrkdwn)
-_BOT_ALERT_PREFIXES = ("[", "\U0001F6A8", "✅", "⚠️", "*⚠️")
+# emoji — HyperDX/argo-alert style: "🚨 ...", "✅ ...", "⚠️ ..."; a single leading `*` marks
+# the same prefixes bold in Slack mrkdwn ("*🚨 ..."), so it is stripped before the test.
+_BOT_ALERT_PREFIXES = ("[", "\U0001F6A8", "✅", "⚠️")
 
 
 def looks_like_bot_alert(title: str) -> bool:
-    return (title or "").lstrip().startswith(_BOT_ALERT_PREFIXES)
+    return (title or "").lstrip().removeprefix("*").startswith(_BOT_ALERT_PREFIXES)
 
 
 def now_iso(now: dt.datetime) -> str:

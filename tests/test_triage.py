@@ -686,6 +686,34 @@ def test_unstructured_prose_is_closed_ignored_and_never_escalates_or_posts():
         assert ctx.posted == [], "a closed(ignored) row must produce zero Slack posts"
 
 
+def test_bold_wrapped_bot_alert_prefixes_are_not_unstructured_prose():
+    """A bot alert may arrive bold-wrapped in Slack mrkdwn: `*🚨 ...` is the same alert shape as
+    `🚨 ...` (the `*` is markup), so the prose filter must not close it as unstructured prose.
+    `*⚠️` still matches via its plain entry; bold-wrapped prose is still closed."""
+    policy = dict(DEFAULT_POLICY, ignoreUnstructuredSlackProse=True)
+    with _triage_env(policy=policy) as (conn, ctx):
+        assert core.looks_like_bot_alert("*🚨 Disk almost full") is True
+        assert core.looks_like_bot_alert("*⚠️ Queue backed up") is True
+        assert core.looks_like_bot_alert("HomeLab NVMe is running hot, no rule covers this yet") is False
+
+        _insert_event(conn, source="slack_alert", external_id="bold-siren-alert",
+                      title="*🚨 Disk almost full on mini", first_seen=OLD)
+        _insert_event(conn, source="slack_alert", external_id="bold-warning-alert",
+                      title="*⚠️ Queue backed up", first_seen=OLD)
+        triage_calls: list[dict[str, Any]] = []
+        _sideclaw.submit_triage = _fake_triage({
+            "*🚨 Disk almost full on mini": "demo-repo",
+            "*⚠️ Queue backed up": "demo-repo",
+        }, calls=triage_calls)
+        triage.run(conn, dry_run=False)
+
+        rows = {r["signature"]: r for r in conn.execute(
+            "SELECT signature, state, close_reason FROM triage_items").fetchall()}
+        for sig in ("slack_alert:bold-siren-alert", "slack_alert:bold-warning-alert"):
+            assert rows[sig]["state"] == core.STATE_WORKING and rows[sig]["close_reason"] is None
+        assert len(triage_calls) == 2, "both bold-wrapped bot alerts reach the triage step"
+
+
 def test_mapped_row_survives_a_second_classify_pass():
     """A row routed on an EARLIER pass (item 121, 2026-09-20: quiet -> new -> note with
     repo=homelab intact) — back in `new` because its signature recurred — must not fall
