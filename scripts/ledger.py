@@ -679,7 +679,7 @@ ALTER TABLE triage_items ADD COLUMN verify_started_at TEXT;
 ALTER TABLE triage_items ADD COLUMN verify_mark TEXT;
 ALTER TABLE triage_items ADD COLUMN verify_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE triage_items ADD COLUMN verify_result TEXT;
-UPDATE triage_items SET verify_started_at = updated_at WHERE state = 'verifying';
+UPDATE triage_items SET verify_started_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') WHERE state = 'verifying';
 ALTER TABLE triage_items ADD COLUMN train_stage TEXT;
 ALTER TABLE triage_items ADD COLUMN train_sha TEXT;
 ALTER TABLE triage_items ADD COLUMN train_job TEXT;
@@ -804,6 +804,34 @@ def _tables_exist(conn: sqlite3.Connection, names: tuple[str, ...]) -> bool:
     return all(name in present for name in names)
 
 
+def _snapshot_before_migrating(conn: sqlite3.Connection, current: int) -> None:
+    """`VACUUM INTO` <db dir>/backups/pre-migration-v<from>-to-<to>-<UTC stamp>.db,
+    but only when a migration is actually pending AND there is a ledger to lose
+    (a file-backed database that already carries its four tables — a fresh or
+    in-memory one has nothing to back up). One implementation: `snapshot()`.
+
+    A failed snapshot raises, so the migration never runs without its backup.
+    The directory comes from the connection's own file, never `~/.warden`, so a
+    test's temp database snapshots into temp. The name deliberately does not match
+    scripts/warden-backup.sh's `warden-*.db` rotation glob: these are rare, and
+    the daily rotation must not count them against (or prune) its own seven."""
+    if current >= LEDGER_SCHEMA_VERSION or not _tables_exist(conn, _ADOPTABLE_TABLES):
+        return
+    db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+    if not db_file:
+        return
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = Path(db_file).parent / "backups" / f"pre-migration-v{current}-to-{LEDGER_SCHEMA_VERSION}-{stamp}.db"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        snapshot(conn, dest)
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(
+            f"refusing to migrate ledger {db_file} from schema_version={current} to {LEDGER_SCHEMA_VERSION}: "
+            f"the pre-migration snapshot {dest} failed ({exc}). Fix the cause (disk space, permissions) and rerun."
+        ) from exc
+
+
 def _run_migrations(conn: sqlite3.Connection) -> None:
     """The single most dangerous function in this repo — read this before
     changing it.
@@ -849,6 +877,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             "how data gets destroyed. Upgrade this warden (or point it at a different database) before "
             "running it against this ledger again."
         )
+
+    _snapshot_before_migrating(conn, current)
 
     if current == 0 and _tables_exist(conn, _ADOPTABLE_TABLES):
         # Adopting the live, pre-versioned ledger — see this function's own

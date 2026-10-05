@@ -13,6 +13,7 @@ separately from every later schema version.
 Run: .venv/bin/python3 tests/test_ledger.py
 """
 
+import datetime as dt
 import importlib.util
 import sqlite3
 import sys
@@ -1050,7 +1051,9 @@ def _v14_database(path):
 def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying_items():
     path = _tmp_path()
     _v14_database(path)
+    before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     conn = ledger.connect(path, migrate=True)
+    after = dt.datetime.now(dt.timezone.utc)
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 15 == ledger.LEDGER_SCHEMA_VERSION
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
@@ -1060,8 +1063,12 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     assert {"sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr"} <= cols, cols
     rows = {r["note"]: r for r in conn.execute("SELECT * FROM triage_items")}
     assert set(rows) == {"note-verifying", "note-working", "note-fixed", "note-merging"}, rows.keys()
-    # An item already verifying was deployed by the old rollout: its window starts, no redeploy.
-    assert rows["note-verifying"]["verify_started_at"] == "2030-01-02T00:00:00+00:00"
+    # An item already verifying was deployed by the old rollout: its window starts at the migration
+    # (not at its stale updated_at — a replay must not hand it an already-expired window), no redeploy.
+    started = rows["note-verifying"]["verify_started_at"]
+    assert started != "2030-01-02T00:00:00+00:00", "the window must not be backfilled from updated_at"
+    assert started.endswith("+00:00"), started
+    assert before <= dt.datetime.fromisoformat(started) <= after, (before, started, after)
     for note in ("note-working", "note-fixed", "note-merging"):
         assert rows[note]["verify_started_at"] is None, note
     for row in rows.values():
@@ -1080,6 +1087,55 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     assert _table_columns(fresh, "triage_items") == cols, "a v14-upgraded schema diverges from a fresh one"
     fresh.close()
     conn.close()
+
+
+def _snapshots(path: Path) -> list[Path]:
+    return sorted((path.parent / "backups").glob("pre-migration-*.db"))
+
+
+def test_pending_migration_takes_a_snapshot_beside_the_database_first():
+    path = _tmp_path()
+    _v14_database(path)
+    conn = ledger.connect(path, migrate=True)
+    snaps = _snapshots(path)
+    assert len(snaps) == 1, snaps
+    assert snaps[0].name.startswith(f"pre-migration-v14-to-{ledger.LEDGER_SCHEMA_VERSION}-"), snaps[0].name
+    # The snapshot is the pre-migration ledger: still v14, rows intact.
+    snap = sqlite3.connect(snaps[0])
+    assert snap.execute("SELECT version FROM schema_version").fetchone()[0] == 14
+    assert snap.execute("SELECT COUNT(*) FROM triage_items").fetchone()[0] == 4
+    snap.close()
+    conn.close()
+
+
+def test_adopting_a_pre_versioned_ledger_snapshots_from_v0():
+    path = _tmp_path()
+    _build_old_style_db(path)
+    ledger.connect(path, migrate=True).close()
+    snaps = _snapshots(path)
+    assert len(snaps) == 1 and f"-v0-to-{ledger.LEDGER_SCHEMA_VERSION}-" in snaps[0].name, snaps
+
+
+def test_no_snapshot_on_a_fresh_database_or_when_nothing_is_pending():
+    path = _tmp_path()
+    ledger.connect(path, migrate=True).close()
+    assert _snapshots(path) == [], "a fresh database has nothing to back up"
+    ledger.connect(path, migrate=True).close()
+    assert _snapshots(path) == [], "an up-to-date ledger must not snapshot on every boot"
+
+
+def test_failed_snapshot_aborts_the_migration():
+    path = _tmp_path()
+    _v14_database(path)
+    (path.parent / "backups").write_text("a file where the directory must go")
+    try:
+        ledger.connect(path, migrate=True)
+        raise AssertionError("expected the migration to refuse without a snapshot")
+    except RuntimeError as exc:
+        assert "snapshot" in str(exc) and "refusing to migrate" in str(exc), exc
+    check = sqlite3.connect(path)
+    assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 14, "migrated without a backup"
+    check.close()
 
 
 def main() -> int:
