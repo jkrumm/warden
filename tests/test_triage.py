@@ -5873,9 +5873,11 @@ def test_notify_dry_run_never_posts():
 
 
 def test_failed_entry_never_posts_but_the_daily_digest_counts_failed_items():
+    # Pinned early in a UTC day: NOW is the wall clock, and after 21:00 UTC `+3 hours` is tomorrow.
+    day = NOW.replace(hour=1, minute=0, second=0, microsecond=0)
     with _triage_env() as (conn, ctx), _argo_url():
         # silent at zero
-        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, day, dry_run=False)
         assert ctx.posted == []
 
         e1 = _seed_item(conn, external_id="sig-failed-a", state=core.STATE_FAILED, note="merge refused")
@@ -5883,21 +5885,21 @@ def test_failed_entry_never_posts_but_the_daily_digest_counts_failed_items():
         _notify(conn, e1)
         assert ctx.posted == [], "entering `failed` must not post"
 
-        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW, dry_run=True)
+        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, day, dry_run=True)
         assert ctx.posted == [], "dry-run never posts the digest"
 
-        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW + dt.timedelta(hours=3), dry_run=False)
+        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, day, dry_run=False)
+        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, day + dt.timedelta(hours=3), dry_run=False)
         assert [p["text"] for p in ctx.posted] == [":x: 2 failed — <https://argo.example.test/warden|Argo>"], ctx.posted
 
         # the next UTC day posts again
-        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
+        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, day + dt.timedelta(days=1), dry_run=False)
         assert len(ctx.posted) == 2
 
         # nothing failed any more: silent again
         conn.execute("UPDATE triage_items SET state=?", (core.STATE_QUIET,))
         conn.commit()
-        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=2), dry_run=False)
+        notify.maybe_post_daily_digest(conn, DEFAULT_POLICY, day + dt.timedelta(days=2), dry_run=False)
         assert len(ctx.posted) == 2
 
 
