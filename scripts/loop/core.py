@@ -1,6 +1,6 @@
 """Shared foundation of the loop stages: paths and env, the state vocabulary, strike/claim
 constants, every tunable, the policy file, the ledger connection and the one state writer
-(`_set_state`) with the retry rule (`_strike`). A leaf: it imports no other loop module."""
+(`set_state`) with the retry rule (`strike`). A leaf: it imports no other loop module."""
 
 from __future__ import annotations
 
@@ -112,14 +112,14 @@ CLOSE_IGNORED = "ignored"
 CLOSE_RESOLVED = "resolved"
 CLOSE_REASONS = (CLOSE_DUPLICATE, CLOSE_FIXED_BY, CLOSE_IGNORED, CLOSE_RESOLVED)
 
-# Forward order of the pipeline. _set_state() resets the strike counter when an
+# Forward order of the pipeline. set_state() resets the strike counter when an
 # item advances to merging or beyond (or leaves an end state), so "three strikes"
 # always means three consecutive failures of ONE step.
 _PIPELINE_RANK = {STATE_NEW: 0, STATE_TRIAGED: 1, STATE_WORKING: 2, STATE_MERGING: 3,
                   STATE_VERIFYING: 4, STATE_FIXED: 5}
 _END_STATES = (STATE_NEEDS_DECISION, STATE_FAILED, *TERMINAL_STATES)
 # An item in one of these is no longer open: not a target to attach or merge another into.
-_NOT_OPEN_STATES = (*TERMINAL_STATES, STATE_FAILED)
+NOT_OPEN_STATES = (*TERMINAL_STATES, STATE_FAILED)
 
 # The one retry rule. An INFRASTRUCTURE failure (sideclaw 5xx or unreachable, a terminal episode
 # with no verdict, a review that produced no verdict, an implement episode that ended without a
@@ -136,7 +136,7 @@ IMPLEMENT_CLAIM = "claiming"
 HOST_VERB_CLAIM_PREFIX = "host-verb:"
 
 
-def _is_claim(value: str | None) -> bool:
+def is_claim(value: str | None) -> bool:
     return bool(value) and (value == IMPLEMENT_CLAIM or value.startswith(HOST_VERB_CLAIM_PREFIX))
 
 
@@ -198,7 +198,7 @@ DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 MAX_IMPLEMENT_ATTEMPTS = 4
 
 # Attempt N >= this one runs on sideclaw's escalation implement model (GET /api/routing), when
-# it has one; see _implement_model().
+# it has one; see implement_model().
 ESCALATION_ATTEMPT = 3
 
 # How long an item waits after sideclaw's per-repo implement lease refused its episode (another
@@ -217,7 +217,7 @@ DEFAULT_HOST_VERB_MAX_ATTEMPTS = 2
 # item is marked done, and capped at `hostVerbMaxAttempts`, so a wrong guess costs one restart and
 # a `failed` card with the receipt, cheaper than a human running the same restart. The default is
 # `medium`; a policy may choose another bar from this closed vocabulary.
-_CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 DEFAULT_HOST_VERB_MIN_CONFIDENCE = "medium"
 
 # Concurrency ceiling: simultaneously-open CLUSTERS (distinct dispatch_job values of a `working`
@@ -242,10 +242,10 @@ DISSOLVE_MARKER = "UNRELATED SIGNATURES"
 DAILY_DIGEST_CURSOR_KEY = "triage_failed_digest_date"
 
 # hermes-ops.sh deliberately lives in hermes-agent: the own-monitor probe
-# (_gather_kuma_push_fresh) shells out to it as a live cross-repo argv. Same env-override shape as
+# (gather_kuma_push_fresh) shells out to it as a live cross-repo argv. Same env-override shape as
 # GH_BIN: env var first, documented default second.
 _env_ops_bin = os.environ.get("WARDEN_HERMES_OPS_BIN")
-_HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_HOME / "scripts" / "hermes-ops.sh")
+HERMES_OPS_BIN = Path(_env_ops_bin).expanduser() if _env_ops_bin else (HERMES_HOME / "scripts" / "hermes-ops.sh")
 
 # Host verbs: a closed allowlist. A policy rule (`hostVerbs` in load_policy()) may SELECT a key
 # from this dict, never express an argv of its own: a launchd label or container name reaching
@@ -267,7 +267,7 @@ HOST_VERB_LIVENESS_MONITOR: dict[str, str] = {
 
 # Enforced at IMPORT time: a HOST_VERB_ALLOWLIST key with no HOST_VERB_LIVENESS_MONITOR entry
 # would still run, but its item would get `deploy_expect_json="[]"` on success, and
-# _gather_kuma_push_fresh() refuses an empty `expected`, so the item would cycle verifying -> new
+# gather_kuma_push_fresh() refuses an empty `expected`, so the item would cycle verifying -> new
 # after every verify window, never confirmed and never reaching a human. A missing pairing is a
 # bug in THIS FILE, not a policy mistake, so it fails the module import.
 _missing_liveness_monitor = sorted(set(HOST_VERB_ALLOWLIST) - set(HOST_VERB_LIVENESS_MONITOR))
@@ -285,12 +285,12 @@ EVIDENCE_TIMEOUT = int(os.environ.get("TRIAGE_EVIDENCE_TIMEOUT", "20"))
 
 # Step 7 is a genuinely SEPARATE read of the implement episode's diff: sideclaw's `review` job,
 # which returns a TYPED verdict (`outcome`/`blocking`/...), so the step is machine-readable without
-# a substring match on prose. See _open_validation_dispatch(), advance_merge_trains() and
+# a substring match on prose. See open_validation_dispatch(), advance_merge_trains() and
 # clients/sideclaw.py's REVIEW_SCHEMA_VERSION/assert_result_schema().
 #
 # Matches a GitHub pull-request URL's trailing `/pull/<n>`, deliberately strict (anchored at the
 # end, digits only) so an unexpected URL fails loudly rather than reviewing the wrong number.
-_PR_NUMBER_RE = re.compile(r"/pull/(\d+)/?$")
+PR_NUMBER_RE = re.compile(r"/pull/(\d+)/?$")
 
 # How long a deployed item's own signal must stay quiet before it is `fixed` (maybe_verify()).
 # Comfortably longer than one 10-minute cron cycle, so a slow-to-propagate change is not mistaken
@@ -315,8 +315,8 @@ _ledger_spec.loader.exec_module(_ledger)
 _API_PATH = _SCRIPTS_DIR / "api.py"
 _api_spec = importlib.util.spec_from_file_location("warden_api", _API_PATH)
 assert _api_spec and _api_spec.loader, "Failed to load scripts/api.py"
-_api = importlib.util.module_from_spec(_api_spec)
-_api_spec.loader.exec_module(_api)
+api = importlib.util.module_from_spec(_api_spec)
+_api_spec.loader.exec_module(api)
 
 
 def db_connect() -> sqlite3.Connection:
@@ -328,7 +328,7 @@ def db_connect() -> sqlite3.Connection:
     return _ledger.connect(DB_PATH, migrate=True)
 
 
-def _apply_db_override(argv: list[str]) -> None:
+def apply_db_override(argv: list[str]) -> None:
     """--db PATH, or the HERMES_CC_DB env var hermes-cc.sh/dispatch-sweep.py also honor: points the
     loop at a throwaway copy of the DB. Thin wrapper over ledger.apply_db_override(), which owns no
     DB_PATH of its own; this module's global is rebound via the setter below."""
@@ -409,7 +409,7 @@ def _valid_host_verb_rule(r: Any) -> bool:
 
 
 def _valid_host_verb_min_confidence(value: Any) -> str:
-    """`hostVerbMinConfidence` names a level from `_CONFIDENCE_RANK` (`high`/`medium`/`low`), never a
+    """`hostVerbMinConfidence` names a level from `CONFIDENCE_RANK` (`high`/`medium`/`low`), never a
     number: the same closed-vocabulary validate-at-load shape as `_valid_host_verb_rule()`. An absent
     value defaults to DEFAULT_HOST_VERB_MIN_CONFIDENCE silently; an unrecognized one is a policy
     typo and falls back the same way, but LOUDLY, so it never reads as warden quietly requiring
@@ -417,9 +417,9 @@ def _valid_host_verb_min_confidence(value: Any) -> str:
     if value is None:
         return DEFAULT_HOST_VERB_MIN_CONFIDENCE
     level = str(value).strip().lower()
-    if level in _CONFIDENCE_RANK:
+    if level in CONFIDENCE_RANK:
         return level
-    print(f"triage: policy hostVerbMinConfidence {value!r} is not one of {sorted(_CONFIDENCE_RANK)} — "
+    print(f"triage: policy hostVerbMinConfidence {value!r} is not one of {sorted(CONFIDENCE_RANK)} — "
           f"falling back to {DEFAULT_HOST_VERB_MIN_CONFIDENCE!r}", file=sys.stderr)
     return DEFAULT_HOST_VERB_MIN_CONFIDENCE
 
@@ -461,7 +461,7 @@ def load_policy() -> dict[str, Any]:
         "quietResolveHours": float(data.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS),
         "chronicRecurrences": int(data.get("chronicRecurrences") or DEFAULT_CHRONIC_RECURRENCES),
         "chronicWindowDays": float(data.get("chronicWindowDays") or DEFAULT_CHRONIC_WINDOW_DAYS),
-        # Routing rules: a signature glob -> repo, the deterministic label tier (see _label_route()).
+        # Routing rules: a signature glob -> repo, the deterministic label tier (see label_route()).
         # Validated here, at load, like hostVerbs.
         "rules": [r for r in (data.get("rules") or []) if _valid_rule(r)],
         # `ignore` entries are a bare pattern string or an object with a `match` string; only `match` is used for fnmatch.
@@ -487,7 +487,7 @@ def load_policy() -> dict[str, Any]:
     }
 
 
-def _card_channel(policy: dict[str, Any]) -> str:
+def card_channel(policy: dict[str, Any]) -> str:
     return policy["cardChannel"]
 
 
@@ -498,7 +498,7 @@ _FINGERPRINTED_SOURCES = ("slack_alert", "slack_update", "hermes_log")
 _BATCH_SUFFIX_RE = re.compile(r"\s*\(×\d+ in batch\)$")
 
 
-def _match_targets(event_row: sqlite3.Row) -> list[str]:
+def match_targets(event_row: sqlite3.Row) -> list[str]:
     """Two candidate strings a policy rule can match against, in order: the raw
     `source:external_id` (works for grouped/self-describing sources), and `source:<normalized
     title>` (works for a state source like `uk`, whose external_id is an opaque, unglobbable monitor
@@ -520,11 +520,11 @@ def _match_targets(event_row: sqlite3.Row) -> list[str]:
     return targets
 
 
-def _fnmatch_any(targets: list[str], patterns: list[str]) -> bool:
+def fnmatch_any(targets: list[str], patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(t, p) for t in targets for p in patterns)
 
 
-def _match_rule(targets: list[str], rules: list[dict[str, Any]]) -> dict[str, Any] | None:
+def match_rule(targets: list[str], rules: list[dict[str, Any]]) -> dict[str, Any] | None:
     """First rule (already validated by _valid_rule()/_valid_host_verb_rule()) whose `match`
     fnmatches any target."""
     for rule in rules:
@@ -539,15 +539,15 @@ def _match_rule(targets: list[str], rules: list[dict[str, Any]]) -> dict[str, An
 _BOT_ALERT_PREFIXES = ("[", "\U0001F6A8", "✅", "⚠️", "*⚠️")
 
 
-def _looks_like_bot_alert(title: str) -> bool:
+def looks_like_bot_alert(title: str) -> bool:
     return (title or "").lstrip().startswith(_BOT_ALERT_PREFIXES)
 
 
-def _now_iso(now: dt.datetime) -> str:
+def now_iso(now: dt.datetime) -> str:
     return now.isoformat()
 
 
-def _safe_json(raw: str | None) -> dict[str, Any]:
+def safe_json(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
     try:
@@ -557,7 +557,7 @@ def _safe_json(raw: str | None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _parse_ts(value: str | None) -> dt.datetime | None:
+def parse_ts(value: str | None) -> dt.datetime | None:
     if not value:
         return None
     try:
@@ -569,34 +569,34 @@ def _parse_ts(value: str | None) -> dt.datetime | None:
     return parsed
 
 
-def _fmt_ts(value: str | None) -> str:
-    parsed = _parse_ts(value)
+def fmt_ts(value: str | None) -> str:
+    parsed = parse_ts(value)
     if parsed is None:
         return value or "?"
     return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _age_minutes(first_seen: str | None, now: dt.datetime) -> float:
-    parsed = _parse_ts(first_seen)
+def age_minutes(first_seen: str | None, now: dt.datetime) -> float:
+    parsed = parse_ts(first_seen)
     if parsed is None:
         return 0.0
     return (now - parsed).total_seconds() / 60.0
 
 
-def _signature(event_row: sqlite3.Row) -> str:
+def signature(event_row: sqlite3.Row) -> str:
     return f"{event_row['source']}:{event_row['external_id']}"
 
 
-def _get_event(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+def get_event(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
 
 
-def _get_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+def get_item(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
 
 
 # Lives in lifecycle/items.py so the CLI's own transitions stamp it the same way.
-_occurrence_mark = _items.occurrence_mark
+occurrence_mark = _items.occurrence_mark
 
 
 # Every column a state transition may write alongside `state`. A closed allowlist: these names
@@ -615,36 +615,36 @@ _SET_STATE_COLUMNS = (
 )
 
 # The merge train's position, meaningful only while the item is `merging`: leaving it clears
-# them (_set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha` and
+# them (set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha` and
 # `train_evidence` are not among them; see advance_merge_trains().
 _TRAIN_POSITION = ("train_stage", "train_sha", "train_job", "train_pushed_at")
 
 # An item entering `verifying` starts with no verification history: no deploy yet
 # (`verify_started_at` NULL), no baseline, no failures. `deploy_expect_json` is the host verb's
 # monitor record; nothing else writes it. `merged_sha` is what a failed verification reverts: an
-# entry from a merge sets it over this reset (_merged_entry()), together with how it merged
+# entry from a merge sets it over this reset (merged_entry()), together with how it merged
 # (`merge_method`); every other entry (a host verb) has nothing to revert. `fixed_by_pr` marks an
 # item a fixed-by sweep put in `verifying` (signal-only); any other entry starts without it.
-_VERIFY_RESET: dict[str, Any] = {
+VERIFY_RESET: dict[str, Any] = {
     "verify_started_at": None, "verify_mark": None, "verify_failures": 0, "verify_result": None,
     "deploy_expect_json": None, "merged_sha": None, "merge_method": None, "fixed_by_pr": None,
 }
 
 
-def _merged_entry(item: sqlite3.Row, sha: str | None, method: str | None) -> dict[str, Any]:
+def merged_entry(item: sqlite3.Row, sha: str | None, method: str | None) -> dict[str, Any]:
     """The columns of `item` entering `verifying` from a merge that landed as `sha` by `method`
-    (`unknown` when nothing on record says). A fix's merge (not a revert's: _is_revert()) also
+    (`unknown` when nothing on record says). A fix's merge (not a revert's: is_revert()) also
     queues the fixed-by sweep of its pull request (advance_fixed_by_sweeps()), whatever becomes of
     this item afterwards."""
-    entry = {**_VERIFY_RESET, "merged_sha": sha, "merge_method": method or "unknown"}
-    if item["pr_url"] and not _is_revert(item):
+    entry = {**VERIFY_RESET, "merged_sha": sha, "merge_method": method or "unknown"}
+    if item["pr_url"] and not is_revert(item):
         entry.update(sweep_pr=item["pr_url"], sweep_job=None, sweep_job_at=None, sweep_attempts=0,
                      sweep_candidates=None)
     return entry
 
 
-class _Coalesce(NamedTuple):
-    """`_set_state(..., artifact_url=_Coalesce(url))` writes `artifact_url=COALESCE(?, artifact_url)`:
+class Coalesce(NamedTuple):
+    """`set_state(..., artifact_url=Coalesce(url))` writes `artifact_url=COALESCE(?, artifact_url)`:
     keep the existing value when the new one is NULL. One call site needs it (fold_dispatch_verdict(),
     where a verdict with no artifact must not erase the pull request an earlier fold recorded), and
     it is a sentinel rather than a second helper so that site is not a raw UPDATE."""
@@ -652,7 +652,7 @@ class _Coalesce(NamedTuple):
     value: Any
 
 
-def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datetime, *,
+def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datetime, *,
                 expect_state: str | None = None, expect_null: tuple[str, ...] = (),
                 expect_eq: dict[str, Any] | None = None, **columns: Any) -> int:
     """The ONLY place triage_items.state is written. Returns rowcount.
@@ -668,7 +668,7 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     The strike counter is owned here too: an item that advances to `merging`, `verifying` or `fixed`
     (a step SUCCEEDED; claiming `working` is not progress, the episode may still fail), or that
     leaves an end state (needs_decision, failed, terminal) by any route, gets `strikes=0,
-    retry_at=NULL` unless the caller passed `strikes` itself (_strike() does), so "three strikes"
+    retry_at=NULL` unless the caller passed `strikes` itself (strike() does), so "three strikes"
     always means three consecutive failures of one step. A retry (which moves an item BACKWARD, or
     leaves it where it is) never resets its own counter; a caller whose success does not change
     state (a verdict folded onto a `working` row) resets it explicitly.
@@ -680,13 +680,13 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
     `note` is capped to one short line (lifecycle/items.py `cap_note()`): whitespace collapsed, at
     most 200 characters, the last of them an ellipsis when cut.
 
-    Also writes `occurrence_mark` (see _occurrence_mark()) on EVERY transition, computed here from
+    Also writes `occurrence_mark` (see occurrence_mark()) on EVERY transition, computed here from
     the event row and not caller-settable: a closed list of "states that need a mark" is one more
     list to forget to update. reopen_if_needed() is the only reader: it compares the stored mark
     against the event's CURRENT mark to tell a closed row that is still quiet from one a fresh
     occurrence reopened underneath.
 
-    See `_record_created_transition()` for the one exception: the two `INSERT INTO triage_items`
+    See `record_created_transition()` for the one exception: the two `INSERT INTO triage_items`
     creation sites, which start a row at `new` without calling this function.
 
     Also appends exactly one `item_transitions` row on a REAL state change (rowcount>0 AND the prior
@@ -728,10 +728,10 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
 
     if "note" in columns:
         note_column = columns["note"]
-        columns["note"] = (_Coalesce(_items.cap_note(note_column.value)) if isinstance(note_column, _Coalesce)
+        columns["note"] = (Coalesce(_items.cap_note(note_column.value)) if isinstance(note_column, Coalesce)
                            else _items.cap_note(note_column))
 
-    mark = _occurrence_mark(_get_event(conn, event_id))
+    mark = occurrence_mark(get_event(conn, event_id))
 
     # The row's state BEFORE this write: the only way to tell a real transition from a column-only write below.
     prev_row = conn.execute("SELECT state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
@@ -746,7 +746,7 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
             columns["retry_at"] = None
 
     sql = "UPDATE triage_items SET state=?, occurrence_mark=?, updated_at=?"
-    params: list[Any] = [state, mark, _now_iso(now)]
+    params: list[Any] = [state, mark, now_iso(now)]
     if "card_hash" not in columns:
         # card_hash is the state a Slack line was posted for (notify_cluster()): leaving that state
         # clears it, so re-entering it later posts again. The CASE reads the row's state from BEFORE this
@@ -754,7 +754,7 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
         sql += ", card_hash=CASE WHEN state=? THEN card_hash END"
         params.append(state)
     for col, value in columns.items():
-        if isinstance(value, _Coalesce):
+        if isinstance(value, Coalesce):
             sql += f", {col}=COALESCE(?, {col})"
             params.append(value.value)
         else:
@@ -777,23 +777,23 @@ def _set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.date
 
     if rowcount > 0 and prev_state != state:
         note_value = columns.get("note")
-        if isinstance(note_value, _Coalesce):
+        if isinstance(note_value, Coalesce):
             note_value = note_value.value
         conn.execute(
             "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
-            (event_id, prev_state, state, _now_iso(now), note_value),
+            (event_id, prev_state, state, now_iso(now), note_value),
         )
     return rowcount
 
 
-def _retry_ready_sql(now: dt.datetime, alias: str = "") -> tuple[str, list[str]]:
+def retry_ready_sql(now: dt.datetime, alias: str = "") -> tuple[str, list[str]]:
     """The predicate every poller that SUBMITS adds to its candidate query: a row waiting out a
     strike's backoff is skipped until `retry_at` passes."""
     col = f"{alias}retry_at"
-    return f"({col} IS NULL OR {col} <= ?)", [_now_iso(now)]
+    return f"({col} IS NULL OR {col} <= ?)", [now_iso(now)]
 
 
-def _strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,
+def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,
             retry_state: str, expect_state: str | None = None, expect_eq: dict[str, Any] | None = None,
             **retry_columns: Any) -> str:
     """The one retry rule. An infrastructure failure of the step the item is on increments `strikes`;
@@ -806,27 +806,27 @@ def _strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: s
     first) and nothing was written, the state it is actually in, logged to stderr.
 
     A SUBMIT REFUSED by sideclaw (4xx) is not an infrastructure failure and never comes through
-    here; see _end_on_refusal()."""
-    row = _get_item(conn, event_id)
+    here; see end_on_refusal()."""
+    row = get_item(conn, event_id)
     if row is None:
         raise LookupError(f"strike on event {event_id}: no such triage item")
     strikes = row["strikes"] + 1
     if strikes >= STRIKE_LIMIT:
         landed = STATE_FAILED
-        written = _set_state(conn, event_id, STATE_FAILED, now, expect_state=expect_state,
+        written = set_state(conn, event_id, STATE_FAILED, now, expect_state=expect_state,
                              expect_eq=expect_eq, note=reason, strikes=strikes, retry_at=None)
     else:
         landed = retry_state
         backoff = STRIKE_BACKOFF_MINUTES[min(strikes, len(STRIKE_BACKOFF_MINUTES)) - 1]
-        retry_at = _now_iso(now + dt.timedelta(minutes=backoff))
-        written = _set_state(conn, event_id, retry_state, now, expect_state=expect_state,
+        retry_at = now_iso(now + dt.timedelta(minutes=backoff))
+        written = set_state(conn, event_id, retry_state, now, expect_state=expect_state,
                              expect_eq=expect_eq, note=f"{reason} — retry {strikes}/{STRIKE_LIMIT - 1} after {backoff} min",
                              strikes=strikes, retry_at=retry_at, **retry_columns)
     if written:
         return landed
     # The compare-and-set lost: another pass moved the item first, so nothing here landed and what
     # is reported must be where the item really is.
-    current = _get_item(conn, event_id)
+    current = get_item(conn, event_id)
     if current is None:
         raise LookupError(f"strike on event {event_id}: no such triage item")
     actual = current["state"]
@@ -835,9 +835,9 @@ def _strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: s
     return actual
 
 
-def _record_created_transition(conn: sqlite3.Connection, event_id: int, state: str, at: str) -> None:
+def record_created_transition(conn: sqlite3.Connection, event_id: int, state: str, at: str) -> None:
     """Write the one `item_transitions` row a creation site owes: a raw `INSERT INTO triage_items`
-    (unlike every later move) never goes through `_set_state()`, so without this call a brand-new
+    (unlike every later move) never goes through `set_state()`, so without this call a brand-new
     item has no row in its own history. `from_state` is NULL (there was no prior state) and `at` is
     the item's own `created_at`, not `now()`."""
     conn.execute(
@@ -846,7 +846,7 @@ def _record_created_transition(conn: sqlite3.Connection, event_id: int, state: s
     )
 
 
-def _wp_module() -> Any | None:
+def wp_module() -> Any | None:
     """The sibling watchdog-poll.py module, if it loaded (see the try/except above `normalize_title`),
     for callers that need its resolve_secret()/poll_slack_messages() rather than a reimplementation.
     None (never raises) if that load failed, so a broken import degrades one caller, not the
@@ -854,7 +854,7 @@ def _wp_module() -> Any | None:
     return globals().get("_watchdog_poll")
 
 
-def _is_revert(item: sqlite3.Row) -> bool:
+def is_revert(item: sqlite3.Row) -> bool:
     """The item's change in flight is warden's revert of a merged fix, not a fix. True from the
     verify failure until the revert passed `make verify`; in particular when the revert merges,
     which is the predicate a fixed-by sweep after a fix's merge must skip on."""

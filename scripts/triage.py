@@ -55,9 +55,9 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     work.advance_implement_chain(conn, policy, now, dry_run=dry_run)
     verify.maybe_verify(conn, policy, now, dry_run=dry_run)
 
-    for _key, members in work._cluster_groups(conn).items():
+    for _key, members in work.cluster_groups(conn).items():
         members = sorted(members, key=lambda r: r["event_id"])
-        event_rows = [core._get_event(conn, m["event_id"]) for m in members]
+        event_rows = [core.get_event(conn, m["event_id"]) for m in members]
         if any(er is None for er in event_rows):
             continue
         notify.notify_cluster(conn, members, event_rows, policy, dry_run=dry_run)
@@ -93,7 +93,7 @@ def record_heartbeat(conn: sqlite3.Connection, *, dry_run: bool) -> None:
             "SELECT state, COUNT(*) AS n FROM triage_items GROUP BY state"
         )
     }
-    open_clusters = work._count_open_investigation_clusters(conn)
+    open_clusters = work.count_open_investigation_clusters(conn)
     value = json.dumps({"states": census, "open_clusters": open_clusters}, sort_keys=True)
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
@@ -102,14 +102,14 @@ def record_heartbeat(conn: sqlite3.Connection, *, dry_run: bool) -> None:
         # hold the pass's START time, while `updated_at` must mean "when the pass COMPLETED" (api.py
         # checks it against 3x the StartInterval). Without the parameter the wrong stamp cannot be
         # expressed.
-        (HEARTBEAT_CURSOR_KEY, value, core._now_iso(dt.datetime.now(dt.timezone.utc))),
+        (HEARTBEAT_CURSOR_KEY, value, core.now_iso(dt.datetime.now(dt.timezone.utc))),
     )
     conn.commit()
 
 
 def _items_for_signature(conn: sqlite3.Connection, signature: str) -> list[sqlite3.Row]:
     """The CLI verbs address a SIGNATURE, not an event: resolve it to rows, then transition each
-    through _set_state(), the one writer of `state`."""
+    through set_state(), the one writer of `state`."""
     return conn.execute("SELECT event_id FROM triage_items WHERE signature=?", (signature,)).fetchall()
 
 
@@ -127,7 +127,7 @@ def cmd_ignore(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
         return 2
     rows = _items_for_signature(conn, signature)
     for row in rows:
-        core._set_state(conn, row["event_id"], core.STATE_CLOSED, now, close_reason=core.CLOSE_IGNORED)
+        core.set_state(conn, row["event_id"], core.STATE_CLOSED, now, close_reason=core.CLOSE_IGNORED)
     conn.commit()
     if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
@@ -143,7 +143,7 @@ def cmd_reopen(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> i
         return 2
     rows = _items_for_signature(conn, signature)
     for row in rows:
-        core._set_state(conn, row["event_id"], core.STATE_NEW, now)
+        core.set_state(conn, row["event_id"], core.STATE_NEW, now)
     conn.commit()
     if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
@@ -165,7 +165,7 @@ def cmd_close(conn: sqlite3.Connection, argv: list[str], now: dt.datetime) -> in
         return 2
     rows = _items_for_signature(conn, signature)
     for row in rows:
-        core._set_state(conn, row["event_id"], core.STATE_CLOSED, now, note=reason.strip(), close_reason=core.CLOSE_RESOLVED)
+        core.set_state(conn, row["event_id"], core.STATE_CLOSED, now, note=reason.strip(), close_reason=core.CLOSE_RESOLVED)
     conn.commit()
     if not rows:
         print(f"triage: no triage item for signature {signature!r}", file=sys.stderr)
@@ -191,7 +191,7 @@ def cmd_list(conn: sqlite3.Connection) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
-    core._apply_db_override(argv)
+    core.apply_db_override(argv)
     now = dt.datetime.now(dt.timezone.utc)
     conn = core.db_connect()
     try:

@@ -702,7 +702,7 @@ def test_item_payload_full_shape():
     assert len(payload["operations"]) == 1, payload["operations"]
     assert payload["operations"][0]["op_id"] == "op1"
 
-    # The fixture item was inserted directly (no _record_created_transition()
+    # The fixture item was inserted directly (no record_created_transition()
     # row), so item_payload() prepends the synthetic `created` entry ahead of
     # the one real transition.
     assert len(payload["transitions"]) == 2, payload["transitions"]
@@ -743,7 +743,7 @@ def test_item_payload_raises_not_found():
 
 def test_item_payload_synthetic_created_entry_for_legacy_item():
     """A legacy item (inserted directly, like every fixture in this file, and
-    like every item created before _record_created_transition() existed) has
+    like every item created before record_created_transition() existed) has
     no `from_state IS NULL` row. item_payload() must fabricate one, reading
     the state it was created into off the first REAL transition's from_state
     — never off the item's current state, which would lie once the item has

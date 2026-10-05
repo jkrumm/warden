@@ -41,12 +41,12 @@ TRIAGE_JOB_STALE_MINUTES = 30
 TRIAGE_WAIT_GUARD_S = 1800
 
 
-def _is_triage_claim(value: str | None) -> bool:
+def is_triage_claim(value: str | None) -> bool:
     return bool(value) and value.startswith(TRIAGE_CLAIM_PREFIX)
 
 
 def _triage_candidates(item: sqlite3.Row, event: sqlite3.Row) -> list[str]:
-    label = intake._label_route(item, event)
+    label = intake.label_route(item, event)
     return [label] if label else _intake.known_repos()
 
 
@@ -59,27 +59,27 @@ def _submit_triage(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
     the item's, so it must not end the item on the first refusal. The strike is a compare-and-set
     on the claim."""
     event_id = item["event_id"]
-    event = core._get_event(conn, event_id)
+    event = core.get_event(conn, event_id)
     if event is None:
         return None
-    claim = f"{TRIAGE_CLAIM_PREFIX}{core._now_iso(now)}"
-    if not core._set_state(conn, event_id, core.STATE_NEW, now, expect_state=core.STATE_NEW, expect_null=("triage_job",),
-                           triage_job=claim, triage_job_at=core._now_iso(now)):
+    claim = f"{TRIAGE_CLAIM_PREFIX}{core.now_iso(now)}"
+    if not core.set_state(conn, event_id, core.STATE_NEW, now, expect_state=core.STATE_NEW, expect_null=("triage_job",),
+                           triage_job=claim, triage_job_at=core.now_iso(now)):
         return None
     conn.commit()
     claimed = {"triage_job": claim}
-    item = core._get_item(conn, event_id)
+    item = core.get_item(conn, event_id)
     prompt = _intake.build_triage_prompt(conn, item, event, _triage_candidates(item, event), now)
     try:
         job = _sideclaw.submit_triage(prompt=prompt, schema=_intake.TRIAGE_SCHEMA)
     except WardenError as e:
         print(f"triage: triage submit failed for {item['signature']}: {e}", file=sys.stderr)
-        core._strike(conn, event_id, now, f"triage submit failed: {e}", retry_state=core.STATE_NEW,
+        core.strike(conn, event_id, now, f"triage submit failed: {e}", retry_state=core.STATE_NEW,
                      expect_state=core.STATE_NEW, expect_eq=claimed, triage_job=None)
         conn.commit()
         return None
-    recorded = core._set_state(conn, event_id, core.STATE_NEW, now, expect_state=core.STATE_NEW, expect_eq=claimed,
-                               triage_job=job["id"], triage_job_at=core._now_iso(now))
+    recorded = core.set_state(conn, event_id, core.STATE_NEW, now, expect_state=core.STATE_NEW, expect_eq=claimed,
+                               triage_job=job["id"], triage_job_at=core.now_iso(now))
     conn.commit()
     if not recorded:
         print(f"triage: triage job {job['id']} for {item['signature']} lost its claim (released as stale "
@@ -111,19 +111,19 @@ def _fold_triage_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: 
     triage job only when the MODEL ignored it, which is what reopen_if_needed() reads to tell a
     model's ignore (revisited after the cooldown) from an owner's dismiss or `--ignore` (never
     reopened)."""
-    item = core._get_item(conn, event_id)
-    event = core._get_event(conn, event_id)
+    item = core.get_item(conn, event_id)
+    event = core.get_event(conn, event_id)
     if item is None or event is None or item["state"] != core.STATE_NEW or item["triage_job"] != job_id:
         return None
     cas = {"expect_state": core.STATE_NEW, "expect_eq": {"triage_job": job_id}}
 
     def strike(reason: str) -> str:
-        core._strike(conn, event_id, now, reason, retry_state=core.STATE_NEW, triage_job=None, **cas)
+        core.strike(conn, event_id, now, reason, retry_state=core.STATE_NEW, triage_job=None, **cas)
         conn.commit()
         return f"retrying: {reason}"
 
     def close(close_reason: str, note: str, outcome: str, **columns: Any) -> str | None:
-        won = core._set_state(conn, event_id, core.STATE_CLOSED, now, close_reason=close_reason, note=note,
+        won = core.set_state(conn, event_id, core.STATE_CLOSED, now, close_reason=close_reason, note=note,
                               **cas, **columns)
         conn.commit()
         return outcome if won else None
@@ -139,18 +139,18 @@ def _fold_triage_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: 
     origin = item["origin"]
 
     if action == "attach" and origin != "human":
-        target = _open_item(conn, answer.get("item"), exclude=event_id)
+        target = open_item(conn, answer.get("item"), exclude=event_id)
         if target is not None:
             outcome = close(core.CLOSE_DUPLICATE, f"attached to #{target['event_id']}: {reason}",
                             f"attached to #{target['event_id']}", duplicate_of=target["event_id"],
                             triage_job=None)
             if outcome:
-                intake._bump_open_target(conn, target["event_id"], occurrences=item["occurrences"],
+                intake.bump_open_target(conn, target["event_id"], occurrences=item["occurrences"],
                                          last_seen=item["last_seen"])
                 conn.commit()
                 # An issue closed as a duplicate would otherwise vanish without a word to whoever
-                # filed it (the owner's own issues only — see _maybe_comment_back_on_issue()).
-                work._maybe_comment_back_on_issue(conn, item, event, {}, now, state="duplicate",
+                # filed it (the owner's own issues only — see maybe_comment_back_on_issue()).
+                work.maybe_comment_back_on_issue(conn, item, event, {}, now, state="duplicate",
                                                   note=f"tracked as #{target['event_id']}: {reason}", dry_run=False)
             return outcome
 
@@ -162,7 +162,7 @@ def _fold_triage_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: 
     if action == "ignore" and origin == "alert":
         return close(core.CLOSE_IGNORED, f"ignored: {reason}", "ignored")
 
-    label = intake._label_route(item, event)
+    label = intake.label_route(item, event)
     if origin != "alert":
         repo = item["repo"]
     elif label:
@@ -172,18 +172,18 @@ def _fold_triage_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: 
     if repo is None:
         return strike(f"triage job {job_id} named no candidate repo (answer: {action}, "
                       f"repo {answer.get('repo')!r})")
-    won = core._set_state(conn, event_id, core.STATE_TRIAGED, now, repo=repo, note=str(answer.get("title") or reason),
+    won = core.set_state(conn, event_id, core.STATE_TRIAGED, now, repo=repo, note=str(answer.get("title") or reason),
                           strikes=0, retry_at=None, triage_job=None, **cas)
     conn.commit()
     return f"triaged to {repo}" if won else None
 
 
-def _open_item(conn: sqlite3.Connection, event_id: Any, *, exclude: int) -> sqlite3.Row | None:
+def open_item(conn: sqlite3.Connection, event_id: Any, *, exclude: int) -> sqlite3.Row | None:
     """The item `event_id` names when it exists, is not `exclude`, and is still open."""
     if not isinstance(event_id, int) or isinstance(event_id, bool) or event_id == exclude:
         return None
-    target = core._get_item(conn, event_id)
-    return None if target is None or target["state"] in core._NOT_OPEN_STATES else target
+    target = core.get_item(conn, event_id)
+    return None if target is None or target["state"] in core.NOT_OPEN_STATES else target
 
 
 def _fixed_reference(conn: sqlite3.Connection, answer: dict[str, Any], *, exclude: int) -> str | None:
@@ -191,7 +191,7 @@ def _fixed_reference(conn: sqlite3.Connection, answer: dict[str, Any], *, exclud
     real: an item that is `fixed` or carries a PR, or a PR URL on some item's record."""
     target_id = answer.get("item")
     if isinstance(target_id, int) and not isinstance(target_id, bool) and target_id != exclude:
-        target = core._get_item(conn, target_id)
+        target = core.get_item(conn, target_id)
         if target is not None and (target["state"] == core.STATE_FIXED or target["pr_url"]):
             return f"#{target_id}" + (f" ({target['pr_url']})" if target["pr_url"] else "")
     pr = answer.get("pr")
@@ -217,10 +217,10 @@ def poll_triage_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: boo
     ).fetchall()
     for row in rows:
         event_id, job_id = row["event_id"], row["triage_job"]
-        if _is_triage_claim(job_id):
-            claimed_at = core._parse_ts(job_id[len(TRIAGE_CLAIM_PREFIX):])
+        if is_triage_claim(job_id):
+            claimed_at = core.parse_ts(job_id[len(TRIAGE_CLAIM_PREFIX):])
             if claimed_at is None or claimed_at < stale_before:
-                released = core._set_state(conn, event_id, core.STATE_NEW, now, expect_state=core.STATE_NEW,
+                released = core.set_state(conn, event_id, core.STATE_NEW, now, expect_state=core.STATE_NEW,
                                            expect_eq={"triage_job": job_id}, triage_job=None)
                 conn.commit()
                 if released:
@@ -234,20 +234,20 @@ def poll_triage_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: boo
                   file=sys.stderr)
             continue
         if job is None:
-            core._strike(conn, event_id, now, f"sideclaw has no record of triage job {job_id} (pruned or lost)",
+            core.strike(conn, event_id, now, f"sideclaw has no record of triage job {job_id} (pruned or lost)",
                          retry_state=core.STATE_NEW, expect_state=core.STATE_NEW, expect_eq={"triage_job": job_id},
                          triage_job=None)
             conn.commit()
             continue
         if job.get("status") not in _sideclaw.TERMINAL:
-            submitted_at = core._parse_ts(row["triage_job_at"])
+            submitted_at = core.parse_ts(row["triage_job_at"])
             if submitted_at is None or now - submitted_at < dt.timedelta(minutes=TRIAGE_JOB_STALE_MINUTES):
                 continue
             try:
                 _sideclaw.cancel(job_id)
             except WardenError as e:
                 print(f"triage: could not cancel stuck triage job {job_id}: {e}", file=sys.stderr)
-            core._strike(conn, event_id, now, f"triage job {job_id} still {job.get('status')} after "
+            core.strike(conn, event_id, now, f"triage job {job_id} still {job.get('status')} after "
                          f"{TRIAGE_JOB_STALE_MINUTES} min — cancelled", retry_state=core.STATE_NEW,
                          expect_state=core.STATE_NEW, expect_eq={"triage_job": job_id}, triage_job=None)
             conn.commit()
@@ -258,11 +258,11 @@ def poll_triage_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: boo
 def submit_triage_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                        *, dry_run: bool) -> list[str]:
     """Open a triage job for every ready `new` item without one: `warden run` and issues first,
-    then alerts that passed the debounce (_is_escalation_eligible()) and the cooldown
-    (_cooldown_ok()), at most MAX_TRIAGE_SUBMITS_PER_RUN per run. A job that is already finished
+    then alerts that passed the debounce (is_escalation_eligible()) and the cooldown
+    (cooldown_ok()), at most MAX_TRIAGE_SUBMITS_PER_RUN per run. A job that is already finished
     when the submit returns is folded on the spot; the rest fold in poll_triage_jobs(). Returns the
     ids of the jobs submitted by THIS call that are still running (what settle_triage_jobs() waits on)."""
-    ready_sql, ready_params = core._retry_ready_sql(now)
+    ready_sql, ready_params = core.retry_ready_sql(now)
     rows = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND triage_job IS NULL AND {ready_sql} "
         f"ORDER BY origin = 'alert', event_id",
@@ -271,9 +271,9 @@ def submit_triage_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt
     ready = []
     for item in rows:
         if item["origin"] == "alert":
-            if not work._is_escalation_eligible(item, policy, now):
+            if not work.is_escalation_eligible(item, policy, now):
                 continue
-            if not work._cooldown_ok(conn, item, policy, now):
+            if not work.cooldown_ok(conn, item, policy, now):
                 print(f"triage: {item['signature']} recurred inside cooldownHours, not re-triaging yet",
                       file=sys.stderr)
                 continue
@@ -320,7 +320,7 @@ def triage_item_now(conn: sqlite3.Connection, event_id: int, now: dt.datetime) -
     """Triage one item synchronously — `warden run`'s intake: submit, wait for the job, fold it.
     Returns the outcome (see _fold_triage_job()), or None when the item was not triaged here (not
     `new`, already has a job, or sideclaw could not be reached — the loop retries those)."""
-    item = core._get_item(conn, event_id)
+    item = core.get_item(conn, event_id)
     if item is None or item["state"] != core.STATE_NEW or item["triage_job"] is not None:
         return None
     job = _submit_triage(conn, item, now, core.load_policy())

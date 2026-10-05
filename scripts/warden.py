@@ -670,7 +670,7 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     # item, its train's `update_pr` while one runs, else its review.
     implement_job = row["implement_job"]
     if row["state"] == core.STATE_WORKING:
-        job_id = implement_job if implement_job and not core._is_claim(implement_job) else row["dispatch_job"]
+        job_id = implement_job if implement_job and not core.is_claim(implement_job) else row["dispatch_job"]
     elif row["state"] == core.STATE_MERGING:
         train_job = row["train_job"]
         job_id = train_job if train_job and train_job != train.TRAIN_CLAIM else row["validation_job"]

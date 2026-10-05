@@ -301,7 +301,7 @@ def _metric_median_needs_decision_to_decision(
 
     Pairs each transition INTO needs_decision with the very next transition for
     that same event_id (item_transitions is per-event chronological, and
-    _set_state() only ever appends on a REAL state change — see triage.py's
+    set_state() only ever appends on a REAL state change — see triage.py's
     own docstring — so "the next row" IS "the exit from needs_decision"). Nothing
     expires a needs_decision item, so every exit is somebody deciding."""
     window_start = now - dt.timedelta(days=WINDOW_DAYS)
@@ -800,7 +800,7 @@ def _bounded_history(
 
 
 def _synthetic_created_transition(item: dict[str, Any], transitions: list[dict[str, Any]]) -> dict[str, Any]:
-    """A legacy item — created before `_record_created_transition()` existed
+    """A legacy item — created before `record_created_transition()` existed
     — has no `from_state IS NULL` row at all. Rather than leave its earliest
     real transition looking like the item's whole history started mid-flight,
     fabricate the row it should have had: `to_state` is whatever state the

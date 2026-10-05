@@ -195,18 +195,16 @@ def _clip(text: str | None, limit: int) -> str:
     return " ".join((text or "").split())[:limit]
 
 
-def _is_private(repo: str | None) -> bool:
+def is_private(repo: str | None) -> bool:
     return bool(repo) and repo.endswith(PRIVATE_SUFFIX)
 
-
-is_private = _is_private
 
 
 def _open_items(conn: sqlite3.Connection, repos: list[str], exclude: int) -> list[str]:
     """Open items of the candidate repos, newest CREATED first (`updated_at` is rewritten by every
     ingest tick, so it orders by recency of the signal, not of the item). A `-private` repo
     contributes no item lines: its titles, notes and root causes must never reach an external model."""
-    repos = [r for r in repos if not _is_private(r)]
+    repos = [r for r in repos if not is_private(r)]
     if not repos:
         return []
     marks = ",".join("?" * len(repos))
@@ -234,7 +232,7 @@ def _fixed_items(conn: sqlite3.Connection, repos: list[str], exclude: int, now: 
     for a row with no such transition. `updated_at` is rewritten by every ingest tick while an
     alert keeps firing, so it would keep a fixed item inside the window forever. A `-private` repo
     contributes no item lines (see _open_items())."""
-    repos = [r for r in repos if not _is_private(r)]
+    repos = [r for r in repos if not is_private(r)]
     if not repos:
         return []
     marks = ",".join("?" * len(repos))
@@ -274,7 +272,7 @@ def build_triage_prompt(conn: sqlite3.Connection, item: sqlite3.Row, event: sqli
     is fenced between UNTRUSTED markers with one line saying it is data. When the item is in a
     `-private` repo (its own, or the one repo its label routes it to) that text is withheld
     entirely: the prompt goes to an external model."""
-    private = _is_private(item["repo"]) or (len(candidates) == 1 and _is_private(candidates[0]))
+    private = is_private(item["repo"]) or (len(candidates) == 1 and is_private(candidates[0]))
     if private:
         content = WITHHELD
     else:

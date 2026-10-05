@@ -58,7 +58,7 @@ def _notify_claim_live(card_hash: str | None, state: str, now: dt.datetime) -> b
     prefix = f"{core.NOTIFY_CLAIM_PREFIX}{state}:"
     if not card_hash or not card_hash.startswith(prefix):
         return False
-    claimed_at = core._parse_ts(card_hash[len(prefix):])
+    claimed_at = core.parse_ts(card_hash[len(prefix):])
     return claimed_at is not None and (now - claimed_at).total_seconds() < core.NOTIFY_CLAIM_STALE_S
 
 
@@ -67,7 +67,7 @@ def notify_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], event_r
     """Post ONE plain line to Slack for each NOTIFY_STATES state (and NOTIFY_ANSWERED) `members`
     has entered and not yet announced; everything else is silent (it lives in Argo). A cluster
     (several members, one state) posts once, for its first member. Dedupe is `card_hash` = the
-    state posted for, copied onto every member of that state: _set_state() clears it when an item
+    state posted for, copied onto every member of that state: set_state() clears it when an item
     leaves the state, so a re-entry posts again and a re-run of the same pass never posts twice.
     Only Slack's own `ok: true` stamps it; a failed post is retried on the next pass.
 
@@ -86,7 +86,7 @@ def notify_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], event_r
         if not pairs:
             continue
         primary, event_row = pairs[0]
-        channel = primary["origin_channel"] or core._card_channel(policy)
+        channel = primary["origin_channel"] or core.card_channel(policy)
         thread_ts = primary["origin_thread_ts"] if primary["origin_channel"] else None
         if dry_run:
             print(f"[dry-run] would post to {channel}: {format_notification(state, primary, event_row, len(pairs))}")
@@ -95,7 +95,7 @@ def notify_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], event_r
         if not token:
             print(f"triage: no Slack token, cannot post for {[m['signature'] for m, _ in pairs]}", file=sys.stderr)
             continue
-        claim = f"{core.NOTIFY_CLAIM_PREFIX}{state}:{core._now_iso(now)}"
+        claim = f"{core.NOTIFY_CLAIM_PREFIX}{state}:{core.now_iso(now)}"
         won = [(m, e) for m, e in pairs
                if conn.execute("UPDATE triage_items SET card_hash=? WHERE event_id=? AND state=? AND card_hash IS ?",
                                (claim, m["event_id"], m["state"], m["card_hash"])).rowcount]
@@ -130,7 +130,7 @@ def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], no
         return
 
     text = f":x: {failed} failed — {argo_link()}"
-    channel = core._card_channel(policy)
+    channel = core.card_channel(policy)
     if dry_run:
         print(f"[dry-run] would post to {channel}: {text}")
         return
@@ -144,7 +144,7 @@ def maybe_post_daily_digest(conn: sqlite3.Connection, policy: dict[str, Any], no
     conn.execute(
         "INSERT INTO cursors(key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (core.DAILY_DIGEST_CURSOR_KEY, today, core._now_iso(now)),
+        (core.DAILY_DIGEST_CURSOR_KEY, today, core.now_iso(now)),
     )
     conn.commit()
 
@@ -193,7 +193,7 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
     # refusing on that column would make retrying from Argo impossible for exactly the item the action
     # exists to unstick. Overwritten below on success. The owner's attempt replaces whatever automatic
     # revert the item was on (maybe_submit_reverts()).
-    claimed = core._set_state(conn, event_id, core.STATE_WORKING, now, expect_state=item["state"],
+    claimed = core.set_state(conn, event_id, core.STATE_WORKING, now, expect_state=item["state"],
                               implement_job=core.IMPLEMENT_CLAIM, validation_job=None, pr_url=None,
                               reverting_sha=None, revert_json=None)
     conn.commit()
@@ -204,8 +204,8 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
         d = conn.execute(
             "SELECT verdict_json FROM dispatches WHERE job_id=?", (item["dispatch_job"],)
         ).fetchone()
-        verdict = core._safe_json(d["verdict_json"]) if d else {}
-        context = work._verdict_as_context(item["dispatch_job"], verdict)
+        verdict = core.safe_json(d["verdict_json"]) if d else {}
+        context = work.verdict_as_context(item["dispatch_job"], verdict)
         brief = (
             "The owner reviewed this item in Argo and asked for it to be implemented directly. "
             "Re-read the prior investigation's own verdict and evidence yourself (it ran against "
@@ -218,7 +218,7 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
         brief = "The owner asked, via Argo, for this to be implemented directly. " + (item["brief"] or "")
 
     def _hand_back(note: str) -> None:
-        core._set_state(conn, event_id, item["state"], now, expect_state=core.STATE_WORKING, note=note,
+        core.set_state(conn, event_id, item["state"], now, expect_state=core.STATE_WORKING, note=note,
                         implement_job=item["implement_job"], validation_job=item["validation_job"],
                         pr_url=item["pr_url"], reverting_sha=item["reverting_sha"], revert_json=item["revert_json"])
         conn.commit()
@@ -230,12 +230,12 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
             origin=_dispatch.Origin(event_id=event_id), authorized_by="owner:argo",
         )
     except SubmitRefused as exc:
-        work._end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=core.load_policy(),
+        work.end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=core.load_policy(),
                              implement_job=None)
         return "failed", None, str(exc)
     except RemoteError as exc:
         if exc.maybe_mutated:
-            work._hold_ambiguous_submit(item, exc)
+            work.hold_ambiguous_submit(item, exc)
             return "applied", {"note": "implement submit may have reached sideclaw, outcome ambiguous — "
                                        "left for reconcile_operations()"}, None
         _hand_back(f"deferred: {exc}")
@@ -246,7 +246,7 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
 
     conn.execute(
         "UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
-        (opened.job_id, core._now_iso(now), event_id),
+        (opened.job_id, core.now_iso(now), event_id),
     )
     conn.commit()
     return "applied", {"jobId": opened.job_id}, None
@@ -255,7 +255,7 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
 def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                        now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
     """The owner's one-click merge, accepted from `failed` and from `needs_decision` carrying a PR.
-    Goes through _merge_and_rollout() with `authorized_by="owner:argo"` and the same gate (PR open,
+    Goes through merge_and_rollout() with `authorized_by="owner:argo"` and the same gate (PR open,
     checks green on the head, review confirmed, GitHub allows), so an owner merge deploys and
     verifies like an automatic one. Outside `merging` there is no train SHA: the merge pins the head
     a review confirmed (`reviewed_sha`), since `dispatches.validation_status` only says that a
@@ -273,7 +273,7 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
         # The item joins its repo's merge train (advance_merge_trains()), which brings it up to date,
         # reviews it unless `reviewed_sha` is already its head, and lands it once the checks settle.
         # Parked here it would never be asked again.
-        moved = core._set_state(conn, event_id, core.STATE_MERGING, now, expect_state=item["state"],
+        moved = core.set_state(conn, event_id, core.STATE_MERGING, now, expect_state=item["state"],
                                 train_stage=train.TRAIN_UPDATE, train_sha=None, train_job=None, validation_job=None)
         conn.commit()
         if not moved:
@@ -284,9 +284,9 @@ def _apply_argo_merge(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int
     if not reviewed:
         return _rejoin_train("no review of this PR's head on record — review the current head first; "
                              "the item rejoins the merge train")
-    outcome = train._merge_and_rollout(conn, core.load_policy(), item, now, expected_sha=reviewed,
+    outcome = train.merge_and_rollout(conn, core.load_policy(), item, now, expected_sha=reviewed,
                                        authorized_by="owner:argo", why="owner approved via Argo")
-    fresh = core._get_item(conn, event_id)
+    fresh = core.get_item(conn, event_id)
     if outcome == "merged":
         return "applied", {"merged": True, "state": fresh["state"] if fresh else None}, None
     if outcome == "pending":
@@ -308,7 +308,7 @@ def _apply_argo_dismiss(conn: sqlite3.Connection, item: sqlite3.Row, event_id: i
     reason = str(payload.get("reason") or "").strip()
     if not reason:
         return "rejected", None, "dismiss requires a reason"
-    rowcount = core._set_state(conn, event_id, core.STATE_CLOSED, now, expect_state=item["state"], note=reason,
+    rowcount = core.set_state(conn, event_id, core.STATE_CLOSED, now, expect_state=item["state"], note=reason,
                                close_reason=core.CLOSE_IGNORED)
     conn.commit()
     if rowcount == 0:
@@ -324,7 +324,7 @@ def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event
     against the re-run just asked for."""
     if item["state"] not in _ARGO_REINVESTIGATE_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, reinvestigate not allowed"
-    rowcount = core._set_state(conn, event_id, core.STATE_TRIAGED, now, expect_state=item["state"],
+    rowcount = core.set_state(conn, event_id, core.STATE_TRIAGED, now, expect_state=item["state"],
                                note="re-investigation requested by the owner via Argo",
                                dispatch_job=None, implement_job=None, validation_job=None)
     conn.commit()
@@ -347,10 +347,10 @@ def _apply_argo_note(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
     tag = f"[owner note via Argo #{action_id}, {now.strftime('%Y-%m-%d')}]"
     if item["note"] and tag in item["note"]:
         return "applied", None, None
-    # The tag must survive the note cap (items.py NOTE_MAX, applied again by _set_state): appended after
+    # The tag must survive the note cap (items.py NOTE_MAX, applied again by set_state): appended after
     # a long note it would be cut off, the check above would miss it, and a redelivery would append twice.
     merged = _items.append_to_note(item["note"], f"{tag}: {text}")
-    rowcount = core._set_state(conn, event_id, item["state"], now, expect_state=item["state"], note=merged)
+    rowcount = core.set_state(conn, event_id, item["state"], now, expect_state=item["state"], note=merged)
     conn.commit()
     if rowcount == 0:
         return "rejected", None, "item state changed before this action could be applied — retry from Argo"
@@ -381,7 +381,7 @@ def _apply_one_argo_action(conn: sqlite3.Connection, action: dict[str, Any], now
     if verb not in ARGO_ACTION_VERBS:
         status, result, error = "rejected", None, f"unknown verb: {verb!r}"
     else:
-        item = core._get_item(conn, event_id)
+        item = core.get_item(conn, event_id)
         if item is None:
             status, result, error = "rejected", None, f"no triage_items row for event_id {event_id}"
         elif verb == "implement":
@@ -428,10 +428,10 @@ def build_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
     re-deriving them, so a second definition of "what /board counts" cannot drift. `items` carries
     full detail for only the first `ARGO_SNAPSHOT_ITEMS_CAP` board items (already ORDER BY
     updated_at DESC), keyed by event_id as a string (JSON object keys are strings)."""
-    board = core._api.board_payload(conn)
+    board = core.api.board_payload(conn)
     board_items = board["items"][:ARGO_SNAPSHOT_ITEMS_CAP]
     items = {
-        str(item["event_id"]): core._api.item_payload(
+        str(item["event_id"]): core.api.item_payload(
             conn, item["event_id"], history_limit=ARGO_SNAPSHOT_HISTORY_LIMIT
         )
         for item in board_items
@@ -439,9 +439,9 @@ def build_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
 
     return {
         "machine": os.environ.get("WARDEN_MACHINE", "mini"),
-        "generatedAt": core._now_iso(now),
-        "health": core._api.health_payload(conn),
-        "metrics": core._api.metrics_payload(conn),
+        "generatedAt": core.now_iso(now),
+        "health": core.api.health_payload(conn),
+        "metrics": core.api.metrics_payload(conn),
         "board": board,
         "items": items,
         "itemsTruncated": len(board["items"]) > ARGO_SNAPSHOT_ITEMS_CAP,

@@ -580,7 +580,7 @@ def main() -> int:
 
     # --- review-tier rows: never treated as a Slack-deliverable verdict -------
     #
-    # `_open_validation_dispatch()`'s step-7 `review` job (Wave 6.2) opens
+    # `open_validation_dispatch()`'s step-7 `review` job (Wave 6.2) opens
     # with `Origin(event_id=...)` only — no origin_channel. Pins that such a
     # row rides the exact same "no origin_channel -> sentinel, nothing
     # posted" path every other originless dispatch already takes, rather

@@ -405,7 +405,7 @@ def test_snapshot_copies_rows_and_refuses_to_overwrite():
 # --- runner ------------------------------------------------------------------
 
 def test_migration_3_adds_occurrence_mark():
-    """See _MIGRATION_3 / loop/core.py's _occurrence_mark() and loop/intake.py's reopen_if_needed()
+    """See _MIGRATION_3 / loop/core.py's occurrence_mark() and loop/intake.py's reopen_if_needed()
     — the column that stops a quiet-resolved grouped item from being reopened
     and re-resolved every ten minutes."""
     conn = ledger.connect(_tmp_path(), migrate=True)

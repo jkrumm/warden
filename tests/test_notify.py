@@ -3,7 +3,7 @@
 
 The `[owner note via Argo #<id>, <date>]` tag is the only dedup a note action has, and
 the note it lives in is capped to one short line (lifecycle/items.py NOTE_MAX) by
-`core._set_state()`. A tag appended after a long note used to be cut off by that cap, so a
+`core.set_state()`. A tag appended after a long note used to be cut off by that cap, so a
 redelivered action found no tag and appended the text twice.
 
 Run: .venv/bin/python3 tests/test_notify.py  (or: make test, from warden/)
@@ -36,41 +36,41 @@ def _item_with_note(note: str):
         "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, last_seen, "
         "created_at, updated_at) VALUES (?, 's:e1', 'demo', ?, 1, 'now', 'now', 'now', 'now')",
         (eid, core.STATE_NEEDS_DECISION))
-    core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note=note)
+    core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note=note)
     conn.commit()
     return conn, eid
 
 
 def _apply(conn, eid: int, action_id, text: str):
-    item = core._get_item(conn, eid)
+    item = core.get_item(conn, eid)
     return notify._apply_argo_note(conn, item, eid, NOW, {"text": text}, action_id)
 
 
 def test_redelivered_note_is_not_appended_twice_after_a_long_note():
     conn, eid = _item_with_note("x" * 190)
     assert _apply(conn, eid, 7, "owner adds context")[0] == "applied"
-    first = core._get_item(conn, eid)["note"]
+    first = core.get_item(conn, eid)["note"]
     assert "[owner note via Argo #7, 2030-01-02]" in first, f"the cap cut the idempotency tag: {first!r}"
     assert "owner adds context" in first, first
     assert len(first) <= _items.NOTE_MAX, len(first)
 
     assert _apply(conn, eid, 7, "owner adds context")[0] == "applied"   # the redelivery
-    assert core._get_item(conn, eid)["note"] == first, "a redelivered note action changed the note"
+    assert core.get_item(conn, eid)["note"] == first, "a redelivered note action changed the note"
 
 
 def test_a_long_owner_text_keeps_the_tag_and_still_dedupes():
     conn, eid = _item_with_note("short original")
     assert _apply(conn, eid, 8, "y" * 500)[0] == "applied"
-    first = core._get_item(conn, eid)["note"]
+    first = core.get_item(conn, eid)["note"]
     assert "[owner note via Argo #8, 2030-01-02]" in first and len(first) <= _items.NOTE_MAX, first
     _apply(conn, eid, 8, "y" * 500)
-    assert core._get_item(conn, eid)["note"] == first
+    assert core.get_item(conn, eid)["note"] == first
 
 
 def test_a_short_note_still_reads_original_then_owner_text():
     conn, eid = _item_with_note("original note")
     _apply(conn, eid, 9, "owner adds context")
-    note = core._get_item(conn, eid)["note"]
+    note = core.get_item(conn, eid)["note"]
     assert note == "original note [owner note via Argo #9, 2030-01-02]: owner adds context", note
 
 

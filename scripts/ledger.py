@@ -222,7 +222,7 @@ _MIGRATION_3 = "ALTER TABLE triage_items ADD COLUMN occurrence_mark TEXT;"
 # needs_human -> decision, verified unattended fixes per week, reopen-after-
 # `fixed`) are not derivable from the ledger without it: `triage_items.
 # updated_at` cannot serve — ingest() rewrites it on every open row on every
-# pass regardless of state (see loop/core.py's _set_state() docstring), so it
+# pass regardless of state (see loop/core.py's set_state() docstring), so it
 # cannot answer "when did this item enter/leave a state" at all.
 #
 # The literal 'resolved' below, not a symbolic constant: STATE_RESOLVED no
@@ -469,7 +469,7 @@ _MIGRATION_10 = """ALTER TABLE dispatches ADD COLUMN error TEXT;"""
 #   triage_items.revision_count      how many times maybe_revise_blocked() sent
 #     a blocked implementation back to a fresh implement episode with the
 #     reviewer's findings. 0 on every existing row: no revision ever ran.
-#   triage_items.parked_mark          the event's _occurrence_mark() when the
+#   triage_items.parked_mark          the event's occurrence_mark() when the
 #     item was last seen parked (needs_human / merge_blocked) — the baseline
 #     track_parked_recurrences() compares against. NULL until first seen parked.
 #   triage_items.parked_recurrences   occurrences observed while parked. A
@@ -766,7 +766,7 @@ def _now_iso() -> str:
 # Public alias — scripts/lifecycle/operations.py used to carry a
 # byte-identical zero-arg copy of this; it now calls this one instead of
 # hand-mirroring it. (scripts/lifecycle/items.py's and
-# scripts/loop/core.py's own `_now_iso(now)` take an argument and are
+# scripts/loop/core.py's own `now_iso(now)` take an argument and are
 # deliberately NOT this function — see the one-line comment on each.)
 now_iso = _now_iso
 

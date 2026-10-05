@@ -21,7 +21,7 @@ from lifecycle import dispatch as _dispatch, items as _items, operations as _ope
 from loop import core, intake, train, verify, notify
 
 
-def _cluster_groups(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
+def cluster_groups(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
     """Every triage_items row in a NOTIFY_STATES state, grouped by `dispatch_job`, the derived
     cluster key. A row with no dispatch_job is its own singleton group keyed by its event_id."""
     placeholders = ",".join("?" * len(core.NOTIFY_STATES))
@@ -47,7 +47,7 @@ _INVESTIGATING_SQL = (
 )
 
 
-def _count_open_investigation_clusters(conn: sqlite3.Connection) -> int:
+def count_open_investigation_clusters(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         f"SELECT count(DISTINCT dispatch_job) c FROM triage_items WHERE {_INVESTIGATING_SQL}",
         (core.STATE_WORKING,),
@@ -76,7 +76,7 @@ def _recent_raw_texts(event_row: sqlite3.Row) -> list[str]:
     title = (event_row["title"] or "").strip()
     if title:
         out.append(title)
-    payload = core._safe_json(event_row["payload_json"])
+    payload = core.safe_json(event_row["payload_json"])
     for key in ("first_text", "first_line"):
         val = payload.get(key)
         val = val.strip() if isinstance(val, str) else ""
@@ -91,7 +91,7 @@ def _cap_brief(text: str) -> str:
     return text[: core.MAX_BRIEF_CHARS - 1].rstrip() + "…"
 
 
-def _run_bounded(fn: Any, *args: Any, timeout: int = core.EVIDENCE_TIMEOUT) -> tuple[bool, str]:
+def run_bounded(fn: Any, *args: Any, timeout: int = core.EVIDENCE_TIMEOUT) -> tuple[bool, str]:
     """Runs fn(*args) with a hard wall-clock timeout. Every liveness gatherer is read-only and
     side-effect-free, so this is the in-process equivalent of the `timeout=` subprocess.run() gives
     HOST_VERB_ALLOWLIST commands: a hang (a stuck network mount, a slow API call) cannot stall a
@@ -146,10 +146,10 @@ def _parse_kuma_heartbeat_rows(rows_text: str) -> list[tuple[dt.datetime, int]]:
     return beats
 
 
-def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
+def gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     """The generic own-monitor probe (maybe_verify()): true only if the push-heartbeat Uptime Kuma
     monitor named in `expected` recorded an UP heartbeat AFTER `since`, the start of the item's
-    verify window. Used for an item whose own signal is a monitor (`_kuma_monitor_title()`) and for a
+    verify window. Used for an item whose own signal is a monitor (`kuma_monitor_title()`) and for a
     host-verb remediation, whose verb names its monitor in code (HOST_VERB_LIVENESS_MONITOR).
 
     Reads Uptime Kuma's heartbeat table through hermes-ops.sh (tier A, read-only) rather than
@@ -170,13 +170,13 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     since = expected[0].get("since")
     if not monitor_title or not since:
         return False, "expected liveness record carried no monitor title/since timestamp"
-    since_parsed = core._parse_ts(since)
+    since_parsed = core.parse_ts(since)
     if since_parsed is None:
         # Fail CLOSED, not open: an unparsable `since` must never read as "no lower bound, any push
         # confirms it", which would let a malformed record confirm liveness off a push unrelated to THIS
         # verify window.
         return False, f"unparsable since timestamp {since!r} — cannot confirm liveness against it"
-    monitors_result = _run_verb([str(core._HERMES_OPS_BIN), "monitors", "--json"], timeout=core.EVIDENCE_TIMEOUT)
+    monitors_result = _run_verb([str(core.HERMES_OPS_BIN), "monitors", "--json"], timeout=core.EVIDENCE_TIMEOUT)
     if "_error" in monitors_result:
         return False, f"hermes-ops.sh monitors --json failed: {monitors_result['_error']}"
     monitor_id = next(
@@ -187,7 +187,7 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     if monitor_id is None:
         return False, f"no UptimeKuma monitor named {monitor_title!r} in hermes-ops.sh monitors --json"
     heartbeats_result = _run_verb(
-        [str(core._HERMES_OPS_BIN), "kuma-db", "heartbeats", str(monitor_id), "--json"], timeout=core.EVIDENCE_TIMEOUT
+        [str(core.HERMES_OPS_BIN), "kuma-db", "heartbeats", str(monitor_id), "--json"], timeout=core.EVIDENCE_TIMEOUT
     )
     if "_error" in heartbeats_result:
         return False, f"hermes-ops.sh kuma-db heartbeats {monitor_id} --json failed: {heartbeats_result['_error']}"
@@ -198,14 +198,14 @@ def _gather_kuma_push_fresh(expected: list[dict[str, Any]]) -> tuple[bool, str]:
     up = [when for when, status in fresh if status == 1]
     if up:
         latest = max(up)
-        return True, f"{monitor_title} heartbeat OK at {core._fmt_ts(latest.isoformat())} (> since {core._fmt_ts(since)})"
-    return False, f"{len(fresh)} heartbeats since {core._fmt_ts(since)}, none up"
+        return True, f"{monitor_title} heartbeat OK at {core.fmt_ts(latest.isoformat())} (> since {core.fmt_ts(since)})"
+    return False, f"{len(fresh)} heartbeats since {core.fmt_ts(since)}, none up"
 
 
-def _kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
+def kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
     """The Uptime Kuma monitor an item's own signal came from, or None: a `uk` event's title IS the
     monitor name; a Kuma message in #alerts carries it as its leading `[Name]`. What the own-monitor
-    probe (_gather_kuma_push_fresh) confirms after a monitor or watchdog fix deploys: the item's own
+    probe (gather_kuma_push_fresh) confirms after a monitor or watchdog fix deploys: the item's own
     monitor reporting UP again."""
     if event_row is None:
         return None
@@ -229,8 +229,8 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
         lines.append(f"{len(members)} alert signatures fired together and MAY share one root cause:")
     for m in members:
         er = event_rows_by_id[m["event_id"]]
-        lines.append(f"- `{m['signature']}` — {m['occurrences']}x since {core._fmt_ts(m['first_seen'])} "
-                      f"(last {core._fmt_ts(m['last_seen'])}) — {er['title']}")
+        lines.append(f"- `{m['signature']}` — {m['occurrences']}x since {core.fmt_ts(m['first_seen'])} "
+                      f"(last {core.fmt_ts(m['last_seen'])}) — {er['title']}")
         for t in _recent_raw_texts(er)[:2]:
             lines.append(f"    raw: {t}")
         if m["event_id"] in chronic:
@@ -273,13 +273,13 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
     return _cap_brief("\n".join(lines + closing_lines))
 
 
-def _is_escalation_eligible(item: sqlite3.Row, policy: dict[str, Any], now: dt.datetime) -> bool:
+def is_escalation_eligible(item: sqlite3.Row, policy: dict[str, Any], now: dt.datetime) -> bool:
     if item["occurrences"] >= policy["minOccurrences"]:
         return True
-    return core._age_minutes(item["first_seen"], now) >= policy["minOpenMinutes"]
+    return core.age_minutes(item["first_seen"], now) >= policy["minOpenMinutes"]
 
 
-def _cooldown_ok(conn: sqlite3.Connection, item: sqlite3.Row, policy: dict[str, Any],
+def cooldown_ok(conn: sqlite3.Connection, item: sqlite3.Row, policy: dict[str, Any],
                   now: dt.datetime) -> bool:
     """No prior dispatch for this signature -> always ok. Otherwise wait out cooldownHours from the
     PRIOR dispatch's created_at before re-escalating a signature that recurred: a flapping alert
@@ -287,7 +287,7 @@ def _cooldown_ok(conn: sqlite3.Connection, item: sqlite3.Row, policy: dict[str, 
     if not item["dispatch_job"]:
         return True
     row = conn.execute("SELECT created_at FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone()
-    created = core._parse_ts(row["created_at"]) if row else None
+    created = core.parse_ts(row["created_at"]) if row else None
     if created is None:
         return True
     return (now - created).total_seconds() >= policy["cooldownHours"] * 3600
@@ -295,7 +295,7 @@ def _cooldown_ok(conn: sqlite3.Connection, item: sqlite3.Row, policy: dict[str, 
 
 def _host_verb_cooldown_ok(conn: sqlite3.Connection, verb_key: str, policy: dict[str, Any],
                             now: dt.datetime) -> bool:
-    """Same shape as _cooldown_ok(), against the `operations` ledger instead of `dispatches`, but
+    """Same shape as cooldown_ok(), against the `operations` ledger instead of `dispatches`, but
     keyed by VERB, not by item: several items can name the same restart, and a per-item cooldown
     would let all of them pass in one pass and restart the same process repeatedly. No PRIOR
     `kind='host'` operation for THIS VERB (matched on `note`, which record_operation() is always
@@ -307,7 +307,7 @@ def _host_verb_cooldown_ok(conn: sqlite3.Connection, verb_key: str, policy: dict
     ).fetchone()
     if row is None:
         return True
-    started = core._parse_ts(row["started_at"])
+    started = core.parse_ts(row["started_at"])
     if started is None:
         return True
     return (now - started).total_seconds() >= policy["hostVerbCooldownHours"] * 3600
@@ -328,15 +328,15 @@ def _host_verb_attempts(conn: sqlite3.Connection, verb_key: str, policy: dict[st
     ).fetchall()
 
 
-def _end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: SubmitRefused, *,
+def end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: SubmitRefused, *,
                     tier: str, now: dt.datetime, policy: dict[str, Any], **columns: Any) -> None:
     """sideclaw answered the submit with a 4xx, a refusal (repo outside its allowlist, tier above the
     repo's ceiling, bad params). The same submit is refused again, so every item the dispatch was
     for ends `failed`, carrying sideclaw's own message, and is never retried. A 5xx or a connection
-    failure is not this: it is an infrastructure failure and strikes (see _strike())."""
+    failure is not this: it is an infrastructure failure and strikes (see strike())."""
     note = _cap_brief(f"{tier} episode not started — {exc}")
     for m in members:
-        core._set_state(conn, m["event_id"], core.STATE_FAILED, now, note=note, **columns)
+        core.set_state(conn, m["event_id"], core.STATE_FAILED, now, note=note, **columns)
     conn.commit()
     print(f"triage: {tier} dispatch refused by sideclaw, ending {[m['signature'] for m in members]}: {exc}",
           file=sys.stderr)
@@ -349,7 +349,7 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
     `escalate_origin_items()` (a `human`/`github_issue` item, always a cluster of exactly one):
     dispatch ONE investigate episode against `repo` with `brief`, flip every row in `members` to
     `STATE_WORKING` sharing that `dispatch_job`, and retro-fill `events.dispatch_id`. Returns the
-    opened job id, or None on a failed submit (every member strikes, see _strike()) or under
+    opened job id, or None on a failed submit (every member strikes, see strike()) or under
     `dry_run`."""
     sigs = [m["signature"] for m in members]
     if dry_run:
@@ -357,7 +357,7 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
         return None
 
     primary = members[0]
-    channel = core._card_channel(policy)
+    channel = core.card_channel(policy)
     # A human (or Hermes, on a human's behalf) that opened this item with its own thread is answered
     # THERE (notify_cluster()). Only `human`-origin items carry these; every alert-cluster `primary`
     # has both NULL.
@@ -371,18 +371,18 @@ def _dispatch_investigate_and_advance(conn: sqlite3.Connection, *, repo: str, br
             authorized_by=None,
         )
     except SubmitRefused as e:
-        _end_on_refusal(conn, members, e, tier="investigate", now=now, policy=policy)
+        end_on_refusal(conn, members, e, tier="investigate", now=now, policy=policy)
         return None
     except WardenError as e:
         print(f"triage: dispatch failed for {repo}: {e}", file=sys.stderr)
         for m in members:
-            core._strike(conn, m["event_id"], now, f"investigate dispatch failed: {e}", retry_state=core.STATE_TRIAGED,
+            core.strike(conn, m["event_id"], now, f"investigate dispatch failed: {e}", retry_state=core.STATE_TRIAGED,
                          dispatch_job=None)
         conn.commit()
         return None
     job_id = opened.job_id
     for m in members:
-        core._set_state(conn, m["event_id"], core.STATE_WORKING, now, dispatch_job=job_id)
+        core.set_state(conn, m["event_id"], core.STATE_WORKING, now, dispatch_job=job_id)
     dispatch_row = conn.execute("SELECT id FROM dispatches WHERE job_id=?", (job_id,)).fetchone()
     if dispatch_row is not None:
         for m in members:
@@ -400,11 +400,11 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
         return _dispatch_investigate_and_advance(conn, repo=repo, brief="", members=members, now=now,
                                                   policy=policy, dry_run=True)
 
-    event_rows_by_id = {m["event_id"]: core._get_event(conn, m["event_id"]) for m in members}
+    event_rows_by_id = {m["event_id"]: core.get_event(conn, m["event_id"]) for m in members}
     exclude_ids = [m["event_id"] for m in members]
     sibling_events = _sibling_open_items(conn, repo, exclude_ids)
-    window, _threshold = intake._chronic_policy(policy)
-    recurrences = {m["event_id"]: intake._chronic_recurrences(conn, m["event_id"], m["repo"], policy, now)
+    window, _threshold = intake.chronic_policy(policy)
+    recurrences = {m["event_id"]: intake.chronic_recurrences(conn, m["event_id"], m["repo"], policy, now)
                    for m in members}
     chronic = {eid: n for eid, n in recurrences.items() if n}
     brief = _build_cluster_brief(repo=repo, members=members, event_rows_by_id=event_rows_by_id,
@@ -418,7 +418,7 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     """Groups every eligible `triaged` alert item BY REPO and opens at most one sideclaw dispatch per
     repo per run (a cluster), capped at MAX_CLUSTER_SIGNATURES members per brief. `triaged` is the
     triage step's output (submit_triage_jobs()/_fold_triage_job()), so every candidate already has
-    its repo; the checks here are retry_at, _is_escalation_eligible() and _cooldown_ok().
+    its repo; the checks here are retry_at, is_escalation_eligible() and cooldown_ok().
 
     A `triaged` item that already carries a `dispatch_job` (a dissolved cluster member, whose pointer
     is kept as the cooldown anchor) escalates as a SINGLETON, never grouped with another item:
@@ -435,9 +435,9 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
 
     Concurrency is checked once per run, decremented as clusters are opened, so later repos in the
     same run see an exhausted cap."""
-    open_investigations = _count_open_investigation_clusters(conn)
+    open_investigations = count_open_investigation_clusters(conn)
 
-    ready_sql, ready_params = core._retry_ready_sql(now)
+    ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND origin='alert' AND repo IS NOT NULL AND {ready_sql} "
         f"ORDER BY event_id",
@@ -447,9 +447,9 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     clustered_by_repo: dict[str, list[sqlite3.Row]] = {}
     for item in candidates:
         repo = item["repo"]
-        if not _is_escalation_eligible(item, policy, now):
+        if not is_escalation_eligible(item, policy, now):
             continue
-        if not _cooldown_ok(conn, item, policy, now):
+        if not cooldown_ok(conn, item, policy, now):
             print(f"triage: {item['signature']} recurred inside cooldownHours, not re-escalating yet",
                   file=sys.stderr)
             continue
@@ -522,7 +522,7 @@ ISSUE_CLOSING_INSTRUCTION = ("When you open a pull request that closes this issu
                              "'Closes #<issue number>' in its body.")
 
 
-def _issue_closing_instruction(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
+def issue_closing_instruction(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     """`ISSUE_CLOSING_INSTRUCTION` for a revision of a trusted-issue item, else "".
 
     `_origin_item_brief()` puts that line in the *origin* brief only, so a revision brief, the one
@@ -538,7 +538,7 @@ def _issue_closing_instruction(conn: sqlite3.Connection, item: sqlite3.Row) -> s
     event = conn.execute("SELECT * FROM events WHERE id=?", (item["event_id"],)).fetchone()
     if event is None:
         return ""
-    if core._safe_json(event["payload_json"]).get("author") != _github.GH_OWNER:
+    if core.safe_json(event["payload_json"]).get("author") != _github.GH_OWNER:
         return ""
     return ISSUE_CLOSING_INSTRUCTION + "\n\n"
 
@@ -561,7 +561,7 @@ def _origin_item_brief(item: sqlite3.Row, event_row: sqlite3.Row) -> str:
     if item["origin"] != "github_issue":
         return _cap_brief(raw)
 
-    payload = core._safe_json(event_row["payload_json"])
+    payload = core.safe_json(event_row["payload_json"])
     author = payload.get("author")
     url = event_row["url"] or ""
     trusted = author == _github.GH_OWNER
@@ -617,7 +617,7 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
 
     Called by both the loop tick (`run()`) and `warden run`, so a human running `warden run` against
     an item the same tick is about to pick up races it for that `triaged` row. The claim below
-    (`triaged -> working`, CAS'd through `_set_state()`'s `expect_state=`, the shape
+    (`triaged -> working`, CAS'd through `set_state()`'s `expect_state=`, the shape
     `maybe_auto_implement()` uses) makes only one caller dispatch: a caller that loses the CAS
     (rowcount 0) skips the item rather than racing the winner into a second episode. The
     orphan-reclaim pass at the top is the claim's crash-recovery counterpart (claimed `working`, but
@@ -625,25 +625,25 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
     ORIGIN_CLAIM_STALE_MINUTES: a younger one is another caller still mid-dispatch, and reclaiming
     it would open the investigation twice."""
     policy = core.load_policy()
-    open_investigations = _count_open_investigation_clusters(conn)
+    open_investigations = count_open_investigation_clusters(conn)
     if not dry_run:
         # Only a STALE claim is an orphan: `updated_at` is when the claim was written, and a claim
         # younger than ORIGIN_CLAIM_STALE_MINUTES belongs to a caller (the loop or `warden run`) still
         # opening its episode.
-        stale_before = core._now_iso(now - dt.timedelta(minutes=ORIGIN_CLAIM_STALE_MINUTES))
+        stale_before = core.now_iso(now - dt.timedelta(minutes=ORIGIN_CLAIM_STALE_MINUTES))
         orphans = conn.execute(
             "SELECT * FROM triage_items WHERE state=? AND origin != 'alert' AND dispatch_job IS NULL "
             "AND implement_job IS NULL AND revert_json IS NULL AND updated_at < ?",
             (core.STATE_WORKING, stale_before),
         ).fetchall()
         for orphan in orphans:
-            core._set_state(conn, orphan["event_id"], core.STATE_TRIAGED, now, expect_state=core.STATE_WORKING,
+            core.set_state(conn, orphan["event_id"], core.STATE_TRIAGED, now, expect_state=core.STATE_WORKING,
                             note="reclaimed: the loop stopped between claiming this item and dispatching it")
             conn.commit()
             print(f"triage: reclaimed {orphan['signature']} (event {orphan['event_id']}) — working "
                   f"with no dispatch job", file=sys.stderr)
 
-    ready_sql, ready_params = core._retry_ready_sql(now)
+    ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND origin != 'alert' AND {ready_sql} "
         f"ORDER BY event_id",
@@ -657,11 +657,11 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
             note = f"queued: at MAX_OPEN_INVESTIGATIONS={core.MAX_OPEN_INVESTIGATIONS}, waiting for a free slot"
             print(f"triage: {note} ({item['signature']})", file=sys.stderr)
             if not dry_run:
-                core._set_state(conn, item["event_id"], core.STATE_TRIAGED, now, note=note)
+                core.set_state(conn, item["event_id"], core.STATE_TRIAGED, now, note=note)
                 conn.commit()
             continue
 
-        event_row = core._get_event(conn, item["event_id"])
+        event_row = core.get_event(conn, item["event_id"])
         if event_row is None:
             continue
         brief = _origin_item_brief(item, event_row)
@@ -675,13 +675,13 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
 
         # Claim before dispatch, not after (see the docstring). A caller that loses this CAS skips the
         # row rather than racing.
-        claimed = core._set_state(conn, item["event_id"], core.STATE_WORKING, now,
+        claimed = core.set_state(conn, item["event_id"], core.STATE_WORKING, now,
                                   expect_state=item["state"], expect_null=("dispatch_job",))
         conn.commit()
         if not claimed:
             continue
 
-        fresh_item = core._get_item(conn, item["event_id"])
+        fresh_item = core.get_item(conn, item["event_id"])
         if fresh_item is None:
             continue
         job_id = _dispatch_investigate_and_advance(conn, repo=item["repo"], brief=brief, members=[fresh_item],
@@ -703,7 +703,7 @@ def _comment_back_body(state: str, note: str | None, result: dict[str, Any]) -> 
     return "\n".join(lines)
 
 
-def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, event_row: sqlite3.Row,
+def maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, event_row: sqlite3.Row,
                                    result: dict[str, Any], now: dt.datetime, *, state: str, note: str | None,
                                    dry_run: bool) -> None:
     """Comment-back for a `github_issue` item whose verdict just landed (called from
@@ -719,7 +719,7 @@ def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, ev
     `dry_run` never touches GitHub: a preview line instead of a POST."""
     if item["origin"] != "github_issue":
         return
-    payload = core._safe_json(event_row["payload_json"])
+    payload = core.safe_json(event_row["payload_json"])
     if payload.get("author") != _github.GH_OWNER:
         return
     if payload.get("commented_at"):
@@ -741,7 +741,7 @@ def _maybe_comment_back_on_issue(conn: sqlite3.Connection, item: sqlite3.Row, ev
     claimed = conn.execute(
         "UPDATE events SET payload_json=json_set(COALESCE(payload_json, '{}'), '$.commented_at', ?) "
         "WHERE id=? AND json_extract(COALESCE(payload_json, '{}'), '$.commented_at') IS NULL",
-        (core._now_iso(now), event_row["id"]),
+        (core.now_iso(now), event_row["id"]),
     ).rowcount
     conn.commit()
     if not claimed:
@@ -794,9 +794,9 @@ def _run_host_verb(argv: list[str], *, timeout: int) -> dict[str, Any]:
 def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now: dt.datetime,
                        verdict_text: str, *, dry_run: bool) -> None:
     """Move every member to `triaged` so each is re-evaluated individually. `dispatch_job` is
-    deliberately LEFT SET: a `triaged` row is never grouped by `_cluster_groups()` (NOTIFY_STATES
+    deliberately LEFT SET: a `triaged` row is never grouped by `cluster_groups()` (NOTIFY_STATES
     plus the NOTIFY_ANSWERED clause; `triaged` is in neither), so the cluster is gone for
-    notification/escalation, but the pointer lets `_cooldown_ok()` find the dissolved dispatch's
+    notification/escalation, but the pointer lets `cooldown_ok()` find the dissolved dispatch's
     created_at and enforce a real cooldownHours wait. Without it the same `run()` that dissolves a
     cluster would see both members eligible with no cooldown and re-fuse them in the escalate() call
     that follows. Tradeoff: a dissolved pair COULD re-cluster after cooldownHours if both are still
@@ -816,7 +816,7 @@ def _dissolve_cluster(conn: sqlite3.Connection, members: list[sqlite3.Row], now:
     print(f"{'[dry-run] would dissolve' if dry_run else 'triage: dissolving'} cluster {job_id}: {sigs}")
     note = f"{core.SPLIT_VERDICT_NOTE_PREFIX}{_cap_brief(verdict_text)}" if verdict_text.strip() else None
     for m in members:
-        core._set_state(conn, m["event_id"], core.STATE_TRIAGED, now, note=note)
+        core.set_state(conn, m["event_id"], core.STATE_TRIAGED, now, note=note)
     conn.commit()
 
 
@@ -837,7 +837,7 @@ def maybe_dissolve_clusters(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
         d = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?", (job_id,)).fetchone()
         if d is None:
             continue
-        result = core._safe_json(d["verdict_json"])
+        result = core.safe_json(d["verdict_json"])
         text_blob = " ".join(str(result.get(k) or "") for k in ("summary", "verdict", "recommendation"))
         if core.DISSOLVE_MARKER not in text_blob:
             continue
@@ -889,21 +889,21 @@ def apply_root_cause(conn: sqlite3.Connection, members: list[sqlite3.Row], resul
     for m in members:
         conn.execute("UPDATE triage_items SET root_cause=? WHERE event_id=?", (root_cause, m["event_id"]))
     conn.commit()
-    placeholders = ",".join("?" * len(core._NOT_OPEN_STATES))
+    placeholders = ",".join("?" * len(core.NOT_OPEN_STATES))
     for member in members:
-        m = core._get_item(conn, member["event_id"])
-        if m is None or m["state"] in core._NOT_OPEN_STATES or m["repo"] is None or m["origin"] != "alert":
+        m = core.get_item(conn, member["event_id"])
+        if m is None or m["state"] in core.NOT_OPEN_STATES or m["repo"] is None or m["origin"] != "alert":
             continue
         others = conn.execute(
             f"SELECT event_id FROM triage_items WHERE repo=? AND root_cause=? AND event_id != ? "
             f"AND origin='alert' AND dispatch_job IS NOT ? AND state NOT IN ({placeholders}) "
             f"ORDER BY created_at, event_id",
-            (m["repo"], root_cause, m["event_id"], m["dispatch_job"], *core._NOT_OPEN_STATES),
+            (m["repo"], root_cause, m["event_id"], m["dispatch_job"], *core.NOT_OPEN_STATES),
         ).fetchall()
         for row in others:
-            m, other = core._get_item(conn, member["event_id"]), core._get_item(conn, row["event_id"])
-            if (m is None or other is None or m["state"] in core._NOT_OPEN_STATES
-                    or other["state"] in core._NOT_OPEN_STATES):
+            m, other = core.get_item(conn, member["event_id"]), core.get_item(conn, row["event_id"])
+            if (m is None or other is None or m["state"] in core.NOT_OPEN_STATES
+                    or other["state"] in core.NOT_OPEN_STATES):
                 continue
             keep, drop = sorted((m, other), key=lambda r: (r["created_at"], r["event_id"]))
             if _has_operation_in_flight(drop):
@@ -911,7 +911,7 @@ def apply_root_cause(conn: sqlite3.Connection, members: list[sqlite3.Row], resul
                       f"#{keep['event_id']} — #{drop['event_id']} has an operation in flight "
                       f"({drop['state']})", file=sys.stderr)
                 continue
-            won = core._set_state(
+            won = core.set_state(
                 conn, drop["event_id"], core.STATE_CLOSED, now, expect_state=drop["state"],
                 expect_null=("implement_job", "validation_job"), close_reason=core.CLOSE_DUPLICATE,
                 duplicate_of=keep["event_id"], note=f"duplicate of #{keep['event_id']} ({root_cause})")
@@ -943,14 +943,14 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
       origin human/github_issue capped at
         max_tier=investigate (not `human`)    -> closed(resolved), note = the answer
       terminal with NO verdict                -> infrastructure failure: strike, retry
-                                                 the investigation (see _strike())
+                                                 the investigation (see strike())
 
     A multi-member cluster whose verdict carries DISSOLVE_MARKER stays `working` for
     maybe_dissolve_clusters() to split.
 
-    Each member's state transition is its own compare-and-set (`_set_state`'s `expect_state=`, read
+    Each member's state transition is its own compare-and-set (`set_state`'s `expect_state=`, read
     fresh off THIS row right before the write) committed IMMEDIATELY, and the GitHub comment-back
-    only runs AFTER that commit lands and only when the CAS won. `_maybe_comment_back_on_issue()`'s
+    only runs AFTER that commit lands and only when the CAS won. `maybe_comment_back_on_issue()`'s
     `payload_json.commented_at` marker is the independent defence against a repeat post (a
     `working` -> `working` fold records no state change, so the marker is what makes the comment
     once)."""
@@ -972,7 +972,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     members = [m for m in all_members if m["state"] == core.STATE_WORKING and m["implement_job"] is None]
     if not members:
         return
-    result = core._safe_json(d["verdict_json"]) if d["verdict_json"] else {}
+    result = core.safe_json(d["verdict_json"]) if d["verdict_json"] else {}
     next_action = (result.get("nextAction") or "").strip().lower()
     text_blob = " ".join(str(result.get(k) or "") for k in ("summary", "verdict", "recommendation"))
     answer = (result.get("summary") or result.get("recommendation") or "").strip() or None
@@ -1007,10 +1007,10 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         if no_verdict:
             return
         for m in members:
-            event_row = core._get_event(conn, m["event_id"])
+            event_row = core.get_event(conn, m["event_id"])
             if event_row is not None:
                 outcome_state, outcome_note, _reason = _member_outcome(m)
-                _maybe_comment_back_on_issue(conn, m, event_row, result, now, state=outcome_state,
+                maybe_comment_back_on_issue(conn, m, event_row, result, now, state=outcome_state,
                                              note=outcome_note, dry_run=True)
         return
 
@@ -1019,7 +1019,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         if no_verdict:
             reason = (d["error"] or "").strip() or "sideclaw recorded no reason"
             reason = _cap_brief(f"{d['tier']} episode {d['status']} with no verdict: {reason}")
-            core._strike(conn, m["event_id"], now, reason, retry_state=core.STATE_TRIAGED, expect_state=prior_state,
+            core.strike(conn, m["event_id"], now, reason, retry_state=core.STATE_TRIAGED, expect_state=prior_state,
                          dispatch_job=None)
             conn.commit()
             continue
@@ -1030,20 +1030,20 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         # Atomic compare-and-set, committed IMMEDIATELY (see the docstring). `expect_state` is read
         # fresh off `m` here, so the UPDATE's own `WHERE state=?` decides who wins a race against another
         # connection folding the same row, not a stale Python variable.
-        rowcount = core._set_state(conn, m["event_id"], member_state, now, expect_state=prior_state,
-                                   artifact_url=core._Coalesce(d["artifact_url"]), **columns)
+        rowcount = core.set_state(conn, m["event_id"], member_state, now, expect_state=prior_state,
+                                   artifact_url=core.Coalesce(d["artifact_url"]), **columns)
         conn.commit()
         if rowcount:
-            event_row = core._get_event(conn, m["event_id"])
+            event_row = core.get_event(conn, m["event_id"])
             if event_row is not None:
-                _maybe_comment_back_on_issue(conn, m, event_row, result, now, state=member_state,
+                maybe_comment_back_on_issue(conn, m, event_row, result, now, state=member_state,
                                              note=member_note, dry_run=False)
 
     if not no_verdict:
         apply_root_cause(conn, members, result, now)
 
-    fresh_members = [r for r in (core._get_item(conn, m["event_id"]) for m in members) if r is not None]
-    fresh_events = [e for e in (core._get_event(conn, m["event_id"]) for m in fresh_members) if e is not None]
+    fresh_members = [r for r in (core.get_item(conn, m["event_id"]) for m in members) if r is not None]
+    fresh_events = [e for e in (core.get_event(conn, m["event_id"]) for m in fresh_members) if e is not None]
     if fresh_members and len(fresh_members) == len(fresh_events):
         notify.notify_cluster(conn, fresh_members, fresh_events, core.load_policy(), dry_run=False)
 
@@ -1134,7 +1134,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     the row itself carries, never the item's current state, which is what might be stale.
 
     `outcome`, once resolved, is always one of `_OPERATION_OUTCOMES`. An operation that resolves to
-    `unknown` is an infrastructure failure of the step it covered: its item strikes (see _strike())
+    `unknown` is an infrastructure failure of the step it covered: its item strikes (see strike())
     and the step's poller re-submits it, the third strike landing `failed` with the reason."""
     if dry_run:
         # Every branch below reaches out (sideclaw, `gh pr view`), and the dry-run contract is "never
@@ -1143,7 +1143,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         return
     rows = conn.execute("SELECT * FROM operations WHERE outcome IS NULL ORDER BY op_id").fetchall()
     for row in rows:
-        receipt = core._safe_json(row["receipt_json"])
+        receipt = core.safe_json(row["receipt_json"])
         new_receipt: dict[str, Any] | None = None
         note: str | None = None
         strike_reason: str | None = None
@@ -1157,7 +1157,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 # ask about. Give a started episode time to open its PR (the row stays open, no write, no strike,
                 # and it keeps the repo's in-flight lock), then resolve it `unknown` and strike: the duplicate risk
                 # is accepted, bounded by the strike limit and sideclaw's per-repo lease.
-                started = core._parse_ts(row["started_at"])
+                started = core.parse_ts(row["started_at"])
                 if started is not None and (now - started) < AMBIGUOUS_SUBMIT_GRACE:
                     continue
                 outcome = "unknown"
@@ -1219,7 +1219,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                     # read. Stamp it here so a reconciled merge counts like a live one.
                     conn.execute(
                         "UPDATE dispatches SET merged_at=? WHERE job_id=? AND merged_at IS NULL",
-                        (core._now_iso(now), d["job_id"]),
+                        (core.now_iso(now), d["job_id"]),
                     )
                     new_receipt = {"pullRequest": pr, "mergeCommit": sha, "reconciled": True,
                                    "mergeMethod": receipt.get("mergeMethod")}
@@ -1246,7 +1246,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             outcome = "unknown"
             note = f"reconcile_operations: unrecognized operation kind {row['kind']!r}"
 
-        # `note` above is used TWICE: for the triage_items note written below (via _set_state(), human-
+        # `note` above is used TWICE: for the triage_items note written below (via set_state(), human-
         # facing text) and, by default, as `operations.note` through complete_operation()'s `note=`
         # COALESCE. For `kind='host'` those two must diverge (see the branch above), so `complete_note`
         # overrides to None (a no-op COALESCE, preserving `verb=<key>`) for that kind only. `deploy` keeps
@@ -1255,7 +1255,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         complete_operation(conn, row["op_id"], outcome=outcome,
                             receipt=json.dumps(new_receipt) if new_receipt is not None else None,
                             note=complete_note)
-        conn.execute("UPDATE operations SET reconciled_at=? WHERE op_id=?", (core._now_iso(now), row["op_id"]))
+        conn.execute("UPDATE operations SET reconciled_at=? WHERE op_id=?", (core.now_iso(now), row["op_id"]))
         conn.commit()
 
         if row["event_id"] is None:
@@ -1263,12 +1263,12 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
         if outcome == "unknown":
             # A lost in-flight operation is an infrastructure failure: strike it and let the step's poller
-            # re-submit (see _strike()). A `deploy` is re-run by the verify pass with no strike (see its branch
+            # re-submit (see strike()). A `deploy` is re-run by the verify pass with no strike (see its branch
             # above), so it only records the outcome.
             retry = _RECONCILE_RETRY.get(row["kind"])
             if retry is not None:
                 retry_state, retry_columns = retry
-                core._strike(conn, row["event_id"], now,
+                core.strike(conn, row["event_id"], now,
                              strike_reason or f"operation {row['op_id']} ({row['kind']}) could not be reconciled: {note}",
                              retry_state=retry_state, expect_state=retry_state, **retry_columns)
                 conn.commit()
@@ -1288,15 +1288,15 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # GitHub is authoritative and says it did not merge (closed, or open and untouched by whatever
             # the crash interrupted): the merge step failed, so it strikes and is re-attempted.
             detail = note or f"see operation {row['op_id']}"
-            core._strike(conn, row["event_id"], now,
+            core.strike(conn, row["event_id"], now,
                          f"reconciled from GitHub: the pull request is not merged ({detail})",
                          retry_state=core.STATE_MERGING, expect_state=core.STATE_MERGING)
             conn.commit()
             continue
         sha = (new_receipt or {}).get("mergeCommit")
-        merged = core._get_item(conn, row["event_id"])
-        core._set_state(conn, row["event_id"], core.STATE_VERIFYING, now,
-                        **core._merged_entry(merged, sha, (new_receipt or {}).get("mergeMethod")),
+        merged = core.get_item(conn, row["event_id"])
+        core.set_state(conn, row["event_id"], core.STATE_VERIFYING, now,
+                        **core.merged_entry(merged, sha, (new_receipt or {}).get("mergeMethod")),
                         note=f"reconciled from GitHub: merged as {sha}; deploy and verification next")
         conn.commit()
 
@@ -1310,7 +1310,7 @@ _RECONCILE_RETRY: dict[str, tuple[str, dict[str, Any]]] = {
 }
 
 
-def _verdict_as_context(job_id: str, verdict: dict[str, Any]) -> str:
+def verdict_as_context(job_id: str, verdict: dict[str, Any]) -> str:
     """The investigate verdict, handed to the implement episode as its `context`. The brief tells the
     episode to re-read "that investigation's own verdict", but the episode runs in a fresh worktree
     with nothing but the brief and this, so without it the instruction points at nothing. Capped at
@@ -1355,9 +1355,9 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
          its record_operation() call is a narrower window this check cannot see; the orphan reclaim
          in poll_implement_jobs() is the backstop.)
       3. the item's signature matches a `hostVerbs` policy rule (same two match targets, first
-         match wins; see _match_targets()/_match_rule()).
+         match wins; see match_targets()/match_rule()).
       4. the folded verdict's confidence RANKS AT OR ABOVE `policy["hostVerbMinConfidence"]`
-         (DEFAULT_HOST_VERB_MIN_CONFIDENCE = `medium`, see _CONFIDENCE_RANK) AND `nextAction in
+         (DEFAULT_HOST_VERB_MIN_CONFIDENCE = `medium`, see CONFIDENCE_RANK) AND `nextAction in
          ("human", "implement")`. `high` is deliberately NOT the default floor: a restart from
          HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE liveness probe before the item is marked done, and
          capped at `hostVerbMaxAttempts`, so a wrong guess costs one restart and a `needs_decision`
@@ -1374,7 +1374,7 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
          leaving its items to be retried forever is the silent-stuck-item failure.
 
     Every item in a verb's group is claimed with the SAME compare-and-set maybe_auto_implement()
-    uses (`_set_state(..., STATE_WORKING, expect_state=item["state"],
+    uses (`set_state(..., STATE_WORKING, expect_state=item["state"],
     expect_null=("implement_job",))`); an item whose OWN claim loses (a concurrent run, or a state
     that moved between phases) is excluded from `claimed`, never restarted on its own.
     `_run_host_verb()` (NOT `_run_verb()`) then runs synchronously ONCE (bounded by
@@ -1382,12 +1382,12 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     FIRST claimed item, receipt carrying `"items": [<every claimed event_id>]` so the group is
     reconstructable from the row alone. Every claimed item releases its claim before this function
     returns, together, with the SAME note: STATE_VERIFYING on `exitCode == 0`, an infrastructure
-    strike (back to `working`, see _strike()) otherwise. There is no async poll step: a host verb's
+    strike (back to `working`, see strike()) otherwise. There is no async poll step: a host verb's
     subprocess IS the whole operation."""
     host_verbs = policy.get("hostVerbs") or []
     if not host_verbs:
         return
-    ready_sql, ready_params = core._retry_ready_sql(now)
+    ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state IN (?, ?) AND dispatch_job IS NOT NULL "
         f"AND implement_job IS NULL AND revert_json IS NULL AND {ready_sql} ORDER BY event_id",
@@ -1405,10 +1405,10 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if open_host_op:
             continue  # genuinely in flight this pass — reconcile_operations() owns a crashed one
 
-        event_row = core._get_event(conn, item["event_id"])
+        event_row = core.get_event(conn, item["event_id"])
         if event_row is None:
             continue
-        rule = core._match_rule(core._match_targets(event_row), host_verbs)
+        rule = core.match_rule(core.match_targets(event_row), host_verbs)
         if rule is None:
             continue
         verb_key = rule["verb"]
@@ -1419,10 +1419,10 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         d = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone()
         if d is None:
             continue
-        verdict = core._safe_json(d["verdict_json"])
+        verdict = core.safe_json(d["verdict_json"])
         verdict_confidence = (verdict.get("confidence") or "").strip().lower()
-        min_rank = core._CONFIDENCE_RANK.get(policy["hostVerbMinConfidence"], core._CONFIDENCE_RANK["high"])
-        if core._CONFIDENCE_RANK.get(verdict_confidence, -1) < min_rank:
+        min_rank = core.CONFIDENCE_RANK.get(policy["hostVerbMinConfidence"], core.CONFIDENCE_RANK["high"])
+        if core.CONFIDENCE_RANK.get(verdict_confidence, -1) < min_rank:
             continue
         if (verdict.get("nextAction") or "").strip().lower() not in ("human", "implement"):
             continue
@@ -1442,13 +1442,13 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         prior_ops = _host_verb_attempts(conn, verb_key, policy, now)
         if len(prior_ops) >= policy["hostVerbMaxAttempts"]:
             attempts = "; ".join(
-                f"attempt {i + 1}: exit {core._safe_json(op['receipt_json']).get('exitCode', '?')}"
+                f"attempt {i + 1}: exit {core.safe_json(op['receipt_json']).get('exitCode', '?')}"
                 for i, op in enumerate(prior_ops)
             )
             note = (f"host verb {verb_key!r} hit hostVerbMaxAttempts="
                     f"{policy['hostVerbMaxAttempts']} ({attempts})")
             for item in items:
-                core._set_state(conn, item["event_id"], core.STATE_FAILED, now, note=note)
+                core.set_state(conn, item["event_id"], core.STATE_FAILED, now, note=note)
             conn.commit()
             continue
 
@@ -1459,7 +1459,7 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         claim = f"{core.HOST_VERB_CLAIM_PREFIX}{verb_key}"
         claimed = [
             item for item in items
-            if core._set_state(conn, item["event_id"], core.STATE_WORKING, now,
+            if core.set_state(conn, item["event_id"], core.STATE_WORKING, now,
                                expect_state=item["state"], expect_null=("implement_job",),
                                implement_job=claim, note=f"restarting via {verb_key}")
         ]
@@ -1480,27 +1480,27 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             complete_operation(conn, op_id, outcome="done", receipt=receipt)
             monitor_title = core.HOST_VERB_LIVENESS_MONITOR.get(verb_key)
             deploy_expect = (
-                json.dumps([{"monitorTitle": monitor_title, "since": core._now_iso(now)}]) if monitor_title else "[]"
+                json.dumps([{"monitorTitle": monitor_title, "since": core.now_iso(now)}]) if monitor_title else "[]"
             )
             note = f"restarted via {verb_key}; verifying"
             for item in claimed:
                 # The restart IS the deploy: the verify window opens now, on the verb's own monitor
                 # (`deploy_expect_json`); no baseline mark, since the restart may itself blip the item's own
                 # signal.
-                core._set_state(conn, item["event_id"], core.STATE_VERIFYING, now, implement_job=None, note=note,
-                                **{**core._VERIFY_RESET, "verify_started_at": core._now_iso(now),
+                core.set_state(conn, item["event_id"], core.STATE_VERIFYING, now, implement_job=None, note=note,
+                                **{**core.VERIFY_RESET, "verify_started_at": core.now_iso(now),
                                    "deploy_expect_json": deploy_expect})
         else:
             complete_operation(conn, op_id, outcome="failed", receipt=receipt)
             note = (f"host verb {verb_key!r} failed (exit {result['exitCode']}): "
                     f"{result['output'][:500] or '(no output)'}")
             for item in claimed:
-                core._strike(conn, item["event_id"], now, note, retry_state=core.STATE_WORKING,
+                core.strike(conn, item["event_id"], now, note, retry_state=core.STATE_WORKING,
                              expect_state=core.STATE_WORKING, implement_job=None)
         conn.commit()
 
 
-def _hold_ambiguous_submit(item: sqlite3.Row, exc: RemoteError) -> None:
+def hold_ambiguous_submit(item: sqlite3.Row, exc: RemoteError) -> None:
     """An implement submit that MAY have reached sideclaw (a timeout): the item keeps its claim and
     its implement operation stays open. Clearing either would let the next tick submit the same work
     again while the first episode runs. reconcile_operations() resolves it: sideclaw handed back no
@@ -1530,13 +1530,13 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     prefixed `deferred: ` (DESIGN.md § What must not be lost), and the card is synced immediately. A
     deferral is not a strike: nothing failed.
 
-    A submit that fails definitively (5xx, connection refused) strikes (see _strike()); a sideclaw
+    A submit that fails definitively (5xx, connection refused) strikes (see strike()); a sideclaw
     4xx ends the item `failed` and is never retried (an attempt that carried an escalation model is
-    first resubmitted once without it, _open_implement_episode()). A submit that MAY have reached
+    first resubmitted once without it, open_implement_episode()). A submit that MAY have reached
     sideclaw (a timeout) is never retried blind: the claim and the open operation stay put for
-    reconcile_operations() (_hold_ambiguous_submit()), which strikes the item back to `working` once
+    reconcile_operations() (hold_ambiguous_submit()), which strikes the item back to `working` once
     the grace window has passed."""
-    ready_sql, ready_params = core._retry_ready_sql(now)
+    ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND dispatch_job IS NOT NULL AND implement_job IS NULL "
         f"AND max_tier = 'implement' AND revert_json IS NULL AND {ready_sql} ORDER BY event_id",
@@ -1548,7 +1548,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         d = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone()
         if d is None:
             continue
-        verdict = core._safe_json(d["verdict_json"])
+        verdict = core.safe_json(d["verdict_json"])
         if (verdict.get("nextAction") or "").strip().lower() not in ("implement", "issue"):
             continue
         if dry_run:
@@ -1560,7 +1560,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _policy.require_auto_from_item(conn, event_id=item["event_id"], repo=item["repo"], tier="implement")
             _policy.check_repo_not_in_flight(conn, repo=item["repo"])
         except (PolicyError, PreconditionError, UsageError) as e:
-            core._set_state(conn, item["event_id"], core.STATE_WORKING, now, note=f"deferred: {e}")
+            core.set_state(conn, item["event_id"], core.STATE_WORKING, now, note=f"deferred: {e}")
             conn.commit()
             continue
 
@@ -1579,7 +1579,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         # opens for the same verdict (duplicate branches and draft PRs). The conditional UPDATE is the
         # claim: `expect_null=("implement_job",)` makes it a compare-and-set, so a concurrent run that
         # already claimed the item changes 0 rows and this one skips.
-        claimed = core._set_state(conn, item["event_id"], core.STATE_WORKING, now,
+        claimed = core.set_state(conn, item["event_id"], core.STATE_WORKING, now,
                                   expect_state=core.STATE_WORKING, expect_null=("implement_job",),
                                   implement_job=core.IMPLEMENT_CLAIM)
         conn.commit()
@@ -1587,39 +1587,39 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
 
         try:
-            opened = _open_implement_episode(
+            opened = open_implement_episode(
                 conn, repo=item["repo"], tier="implement", brief=brief,
-                context=_verdict_as_context(item["dispatch_job"], verdict),
+                context=verdict_as_context(item["dispatch_job"], verdict),
                 why="triage auto-implement: investigation concluded nextAction=implement",
                 origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
-                model=_implement_model(item["revision_count"] + 1),
+                model=implement_model(item["revision_count"] + 1),
             )
         except SubmitRefused as exc:
             # open_episode() already completed the operation `failed`. A refusal is final: end the item,
             # never hand the claim back for the next tick to submit the same thing again.
-            _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy,
+            end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy,
                             implement_job=None)
             continue
         except RemoteError as exc:
             if exc.maybe_mutated:
-                _hold_ambiguous_submit(item, exc)
+                hold_ambiguous_submit(item, exc)
                 continue
             # sideclaw 5xx or unreachable-before-send: definitively not sent, an infrastructure failure, so
             # the claim is handed back as a strike (open_episode() already completed the operation `failed`).
-            core._strike(conn, item["event_id"], now, f"implement dispatch failed: {exc}",
+            core.strike(conn, item["event_id"], now, f"implement dispatch failed: {exc}",
                          retry_state=core.STATE_WORKING, expect_state=core.STATE_WORKING, implement_job=None)
             conn.commit()
             continue
         except (PolicyError, PreconditionError, UsageError) as e:
-            core._set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
+            core.set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
                             implement_job=None, note=f"deferred: {e}")
             conn.commit()
             continue
 
         conn.execute(
             "UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
-            (opened.job_id, core._now_iso(now), item["event_id"]),
+            (opened.job_id, core.now_iso(now), item["event_id"]),
         )
         conn.commit()
 
@@ -1636,7 +1636,7 @@ VALIDATION_GATE_QUESTIONS = (
 )
 
 
-def _validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
+def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     """What the reviewer needs to judge the PR against its goal: the gate questions and the
     investigation's own conclusion. Without it "does it do what it should" is unanswerable and the
     gate is only a code read."""
@@ -1644,7 +1644,7 @@ def _validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     if item["dispatch_job"]:
         inv = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
                            (item["dispatch_job"],)).fetchone()
-        verdict = core._safe_json(inv["verdict_json"] if inv else None)
+        verdict = core.safe_json(inv["verdict_json"] if inv else None)
         goal = verdict.get("recommendation") or verdict.get("summary")
         if goal:
             parts.append(f"Goal (from the investigation that led to this PR): {goal}")
@@ -1653,7 +1653,7 @@ def _validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     return "\n\n".join(parts)[: _dispatch.MAX_CONTEXT_CHARS]
 
 
-def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: int,
+def open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: int,
                                implement_job: str, pr_url: str,
                                context: str | None = None) -> tuple[str | None, str | None]:
     """Step 7: sideclaw's own `review` job against the pull request itself, reading its actual diff
@@ -1670,7 +1670,7 @@ def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: 
     parsed out of `pr_url`, or the review dispatch raised a WardenError (logged either way). A
     sideclaw refusal (`SubmitRefused`, a 4xx) is NOT folded into that tuple: it propagates so the
     caller ends the item instead of parking it for a retry that is refused the same way."""
-    match = core._PR_NUMBER_RE.search(pr_url)
+    match = core.PR_NUMBER_RE.search(pr_url)
     if not match:
         return None, "could not parse the PR number"
     pr_number = int(match.group(1))
@@ -1689,8 +1689,8 @@ def _open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: 
     return opened.job_id, None
 
 
-def _notify_item(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int) -> None:
-    fresh_item, fresh_event = core._get_item(conn, event_id), core._get_event(conn, event_id)
+def notify_item(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int) -> None:
+    fresh_item, fresh_event = core.get_item(conn, event_id), core.get_event(conn, event_id)
     if fresh_item is not None and fresh_event is not None:
         notify.notify_cluster(conn, [fresh_item], [fresh_event], policy, dry_run=False)
 
@@ -1705,31 +1705,31 @@ _IMPLEMENT_RETRY_COLUMNS: dict[str, Any] = {"implement_job": None, "validation_j
 REVIEW_CLAIM_MINUTES = 5
 
 
-def _review_claim_until(now: dt.datetime) -> str:
-    return core._now_iso(now + dt.timedelta(minutes=REVIEW_CLAIM_MINUTES))
+def review_claim_until(now: dt.datetime) -> str:
+    return core.now_iso(now + dt.timedelta(minutes=REVIEW_CLAIM_MINUTES))
 
 
-def _revisions_left(item: sqlite3.Row) -> bool:
+def revisions_left(item: sqlite3.Row) -> bool:
     """Another implement attempt may follow the one on record: `revision_count` counts the attempts
     after the first, so MAX_IMPLEMENT_ATTEMPTS - 1 of them are allowed."""
     return item["max_tier"] == "implement" and item["revision_count"] + 1 < core.MAX_IMPLEMENT_ATTEMPTS
 
 
-def _revisable(item: sqlite3.Row) -> bool:
+def revisable(item: sqlite3.Row) -> bool:
     """A revision may follow the attempt on record: attempts are left and it is not a revert. A
     revert that cannot land as it is (blocked, failing checks, conflicting) is a question for the
     owner, never another episode spinning on a mechanical change."""
-    return _revisions_left(item) and not core._is_revert(item)
+    return revisions_left(item) and not core.is_revert(item)
 
 
-def _implement_model(attempt: int) -> str | None:
+def implement_model(attempt: int) -> str | None:
     """The `model` an implement attempt is submitted with. Attempts 1 and 2 send none (sideclaw's
     default); attempt ESCALATION_ATTEMPT and later send the escalation model sideclaw's registry
     names, or none when it names no such route. Warden never carries a model id of its own."""
     return _sideclaw.escalation_model() if attempt >= core.ESCALATION_ATTEMPT else None
 
 
-def _open_implement_episode(conn: sqlite3.Connection, *, model: str | None, **kwargs: Any) -> Any:
+def open_implement_episode(conn: sqlite3.Connection, *, model: str | None, **kwargs: Any) -> Any:
     """`open_episode()` for an implement attempt. A refusal (sideclaw 4xx) of an attempt that carried
     an escalation `model` is retried ONCE without it, on sideclaw's default: a registry that names a
     model the allowlist then refuses must not fail the item. A refusal with no model to drop is
@@ -1790,7 +1790,7 @@ def _attempt_rewind_columns(conn: sqlite3.Connection, item: sqlite3.Row, job_id:
             "revision_count": max(item["revision_count"] - 1, 0)}
 
 
-def _lease_retry(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, what: str,
+def lease_retry(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, what: str,
                  expect_eq: dict[str, Any], **columns: Any) -> None:
     """sideclaw's per-repo implement lease refused this item's job (an implement episode, or the
     merge train's `update_pr`; both take the lease): the work is fine, the slot was taken. The item
@@ -1803,11 +1803,11 @@ def _lease_retry(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, 
 
     The write is a compare-and-set (`expect_eq` on the refused job), so two passes cannot both hand
     it back."""
-    won = core._set_state(
+    won = core.set_state(
         conn, item["event_id"], item["state"], now, expect_state=item["state"], expect_eq=expect_eq,
         note=f"sideclaw's implement lease for {item['repo']} is held by another episode — "
              f"{what} retries after {core.LEASE_RETRY_MINUTES} min",
-        retry_at=core._now_iso(now + dt.timedelta(minutes=core.LEASE_RETRY_MINUTES)), **columns)
+        retry_at=core.now_iso(now + dt.timedelta(minutes=core.LEASE_RETRY_MINUTES)), **columns)
     conn.commit()
     if won:
         print(f"triage: {item['signature']} (event {item['event_id']}): implement lease held in {item['repo']} — "
@@ -1816,13 +1816,13 @@ def _lease_retry(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, 
 
 def _retry_after_lease_refusal(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> None:
     """An implement episode refused by the lease: the attempt is submitted again from where it was
-    (_attempt_rewind_columns()). See _lease_retry()."""
+    (_attempt_rewind_columns()). See lease_retry()."""
     job_id = item["implement_job"]
-    _lease_retry(conn, item, now, what="the implement attempt", expect_eq={"implement_job": job_id},
+    lease_retry(conn, item, now, what="the implement attempt", expect_eq={"implement_job": job_id},
                  **_attempt_rewind_columns(conn, item, job_id))
 
 
-def _hand_back_for_revision(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *,
+def hand_back_for_revision(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *,
                             outcome: str, note: str, expect_eq: dict[str, Any] | None = None,
                             **columns: Any) -> bool:
     """An attempt that cannot land as it is (its own checks failed or its rebase conflicted: the
@@ -1833,19 +1833,19 @@ def _hand_back_for_revision(conn: sqlite3.Connection, item: sqlite3.Row, now: dt
 
     Attempts spent: the PR on record is left open deliberately, since it holds the work for the
     owner to take over, and the note, capped at 200 characters, says so with its URL. A revert
-    (_is_revert()) is never revised: it is `failed` at once, its PR left open the same way.
+    (is_revert()) is never revised: it is `failed` at once, its PR left open the same way.
 
     A compare-and-set on the item's state as read (plus `expect_eq`); returns whether it won, and
     marks the dispatch row only then."""
-    if _revisable(item):
-        won = core._set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=item["state"],
+    if revisable(item):
+        won = core.set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=item["state"],
                               expect_eq=expect_eq, note=f"{note} — revision pending", **columns)
     else:
         suffix = f" — PR left open: {item['pr_url']}" if item["pr_url"] else ""
-        if core._is_revert(item):
+        if core.is_revert(item):
             note = f"revert of {item['reverting_sha'][:12]}, not revised: {note}"
         head = " ".join(note.split())[: _items.NOTE_MAX - len(suffix)]
-        won = core._set_state(conn, item["event_id"], core.STATE_FAILED, now, expect_state=item["state"],
+        won = core.set_state(conn, item["event_id"], core.STATE_FAILED, now, expect_state=item["state"],
                               expect_eq=expect_eq, note=head + suffix, **columns)
     if won:
         conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?", (outcome, item["implement_job"]))
@@ -1898,7 +1898,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         ).fetchone()
         if open_ops is not None:
             continue
-        released = core._set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
+        released = core.set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
                                    expect_eq={"implement_job": item["implement_job"]}, implement_job=None,
                                    note="reclaimed: the loop stopped between claiming this item and dispatching it")
         conn.commit()
@@ -1915,7 +1915,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         event_id, job_id = item["event_id"], item["implement_job"]
 
         def _strike_attempt(reason: str) -> None:
-            core._strike(conn, event_id, now, reason, retry_state=core.STATE_WORKING, expect_state=core.STATE_WORKING,
+            core.strike(conn, event_id, now, reason, retry_state=core.STATE_WORKING, expect_state=core.STATE_WORKING,
                          **_attempt_rewind_columns(conn, item, job_id))
             conn.commit()
 
@@ -1967,18 +1967,18 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         apply_root_cause(conn, [item], result, now)
 
         if result.get("nextAction") == "human":
-            core._set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, note=_decision_note(result))
+            core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, note=_decision_note(result))
         elif outcome in ("pr_opened", "pr_updated") and artifact_url:
             # The pull request joins its repo's merge train at `update` (advance_merge_trains()). A
             # compare-and-set on the `working` item this pass read (same implement job, no review yet): the
             # loop and the sweep both reach this handoff, and the loser skips. A new attempt's head has never
             # been reviewed, so `reviewed_sha` starts over. The revert record stays with a revert and is spent
             # once the attempt after it has a PR.
-            claimed = core._set_state(conn, event_id, core.STATE_MERGING, now, expect_state=core.STATE_WORKING,
+            claimed = core.set_state(conn, event_id, core.STATE_MERGING, now, expect_state=core.STATE_WORKING,
                                       expect_eq={"implement_job": job_id, "validation_job": None},
                                       pr_url=artifact_url, strikes=0, retry_at=None,
-                                      **{**train._TRAIN_START, "train_pushed_at": core._now_iso(now)},
-                                      revert_json=item["revert_json"] if core._is_revert(item) else None,
+                                      **{**train.TRAIN_START, "train_pushed_at": core.now_iso(now)},
+                                      revert_json=item["revert_json"] if core.is_revert(item) else None,
                                       note=f"{outcome}: {artifact_url} joins the merge train")
             conn.commit()
             if not claimed:
@@ -1997,7 +1997,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                     f"(branch {branch}): {summary[:300]}" if outcome == "checks_failed" else
                     f"implement {job_id}: the base moved and the rebase conflicted, nothing was "
                     f"pushed: {summary[:300]}")
-            _hand_back_for_revision(conn, item, now, outcome=outcome, note=note)
+            hand_back_for_revision(conn, item, now, outcome=outcome, note=note)
         else:
             # no_changes, diff_refused, branch_no_pr, pr_failed, withheld, salvaged, a wrong tier's outcome,
             # or one this switch does not know: the episode ended without a pull request.
@@ -2005,10 +2005,10 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             _strike_attempt(f"implement {job_id}: {outcome or 'missing outcome'} — {summary}")
             continue
         conn.commit()
-        _notify_item(conn, policy, event_id)
+        notify_item(conn, policy, event_id)
 
 
-def _already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
+def already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
     row = conn.execute("SELECT merged_at FROM dispatches WHERE job_id=?", (implement_job,)).fetchone()
     return bool(row and row["merged_at"])
 
@@ -2016,7 +2016,7 @@ def _already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
 UNREVIEWED_MERGE_NOTE = "merged outside the train, unreviewed — verifying by signal only"
 
 
-def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
+def land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                               now: dt.datetime, *, github_sha: str | None = None,
                               head_sha: str | None = None) -> bool:
     """An item whose pull request is already merged though the item never moved on:
@@ -2041,23 +2041,23 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
     gated merges."""
     ops = conn.execute("SELECT outcome, receipt_json FROM operations WHERE event_id=? AND kind='merge' "
                        "ORDER BY rowid DESC", (item["event_id"],)).fetchall()
-    receipts = [(op["outcome"], core._safe_json(op["receipt_json"])) for op in ops]
+    receipts = [(op["outcome"], core.safe_json(op["receipt_json"])) for op in ops]
     sha = github_sha or next((r.get("mergeCommit") for outcome, r in receipts if outcome == "done"), None)
     method = receipts[0][1].get("mergeMethod") if receipts else None   # this merge's: the latest op
     if github_sha:
         conn.execute("UPDATE dispatches SET merged_at=? WHERE job_id=? AND merged_at IS NULL",
-                     (core._now_iso(now), item["implement_job"]))
+                     (core.now_iso(now), item["implement_job"]))
     source = "GitHub" if github_sha else "the merge receipt"
-    entry = core._merged_entry(item, sha, method)
+    entry = core.merged_entry(item, sha, method)
     note = f"already merged; state derived from {source}, merge not repeated"
     if github_sha and (not head_sha or item["reviewed_sha"] != head_sha):
-        event = core._get_event(conn, item["event_id"])
-        mark = core._occurrence_mark(event) if item["origin"] == "alert" and event is not None else None
+        event = core.get_event(conn, item["event_id"])
+        mark = core.occurrence_mark(event) if item["origin"] == "alert" and event is not None else None
         # Not a sweep's own: an unreviewed merge must not queue other items as fixed by it.
         entry = {k: v for k, v in entry.items() if not k.startswith("sweep_")}
-        entry.update(verify_started_at=core._now_iso(now), verify_mark=mark, fixed_by_pr=item["pr_url"])
+        entry.update(verify_started_at=core.now_iso(now), verify_mark=mark, fixed_by_pr=item["pr_url"])
         note = UNREVIEWED_MERGE_NOTE
-    moved = core._set_state(conn, item["event_id"], core.STATE_VERIFYING, now, expect_state=item["state"],
+    moved = core.set_state(conn, item["event_id"], core.STATE_VERIFYING, now, expect_state=item["state"],
                             **entry, note=note)
     conn.commit()
     if moved:
@@ -2066,7 +2066,7 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
     return bool(moved)
 
 
-def _format_blocking_findings(blocking: list[dict[str, Any]]) -> str:
+def format_blocking_findings(blocking: list[dict[str, Any]]) -> str:
     """The first three `review` blocking findings as `file:line — message`, joined and capped at 600
     chars: the note text a `blocked` validation lands on the item, since a deferral must be visible
     (DESIGN.md): a human reading the card must see WHAT blocked the merge, not just that it did."""
@@ -2101,7 +2101,7 @@ _PROCESS_FINDING_INSTRUCTION_RE = re.compile(
 )
 
 
-def _is_process_only_finding(finding: dict[str, Any]) -> bool:
+def is_process_only_finding(finding: dict[str, Any]) -> bool:
     """True when a step-7 blocking finding is about the PR wrapper, not the diff.
 
     All three phrases must be present (the closing/auto-close subject, the wrapper it belongs to,
@@ -2118,7 +2118,7 @@ def _is_process_only_finding(finding: dict[str, Any]) -> bool:
     )
 
 
-def _safe_json_list(raw: str | None) -> list[dict[str, Any]]:
+def safe_json_list(raw: str | None) -> list[dict[str, Any]]:
     try:
         val = json.loads(raw) if raw else []
     except ValueError:
@@ -2133,10 +2133,10 @@ REVISION_WHY_PREFIX = "triage revision "
 def _review_findings_text(verdict: dict[str, Any]) -> str | None:
     """The blocking findings of one review verdict as the bullet list a revision brief carries, or
     None when none are left. A wrapper-only round is a human's one-line edit, not a revision (see
-    `_is_process_only_finding()`). Filtering here as well as in the folding switch keeps an item
+    `is_process_only_finding()`). Filtering here as well as in the folding switch keeps an item
     parked `blocked` by an older round from spending its remaining attempt on text no episode can
     write."""
-    blocking = [f for f in (verdict.get("blocking") or []) if not _is_process_only_finding(f)]
+    blocking = [f for f in (verdict.get("blocking") or []) if not is_process_only_finding(f)]
     if not blocking:
         return None
     lines = []
@@ -2163,7 +2163,7 @@ def _earlier_blocked_review_findings(conn: sqlite3.Connection, item: sqlite3.Row
         return None
     rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
                        (blocked["validation_job_id"],)).fetchone()
-    return _review_findings_text(core._safe_json(rev["verdict_json"] if rev else None))
+    return _review_findings_text(core.safe_json(rev["verdict_json"] if rev else None))
 
 
 def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | None:
@@ -2182,11 +2182,11 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
     if impl["validation_status"] == "blocked" and item["validation_job"]:
         rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
                            (item["validation_job"],)).fetchone()
-        text = _review_findings_text(core._safe_json(rev["verdict_json"] if rev else None))
+        text = _review_findings_text(core.safe_json(rev["verdict_json"] if rev else None))
         if text is None:
             return None
         return "The independent review BLOCKED the previous attempt:\n" + text
-    result = core._safe_json(impl["verdict_json"])
+    result = core.safe_json(impl["verdict_json"])
     if impl["validation_status"] in ("checks_failed", "conflict") and result.get("outcome") in ("pr_opened",
                                                                                               "pr_updated"):
         # The merge train ended this attempt: its evidence is on the row (`train_evidence`).
@@ -2262,9 +2262,9 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     attempt's verdict and its git bundle (or, when the merge train's `update_pr` could not rebase
     the PR, a pointer to its branch), without `revisionOf`; the PR on record is closed when its
     replacement opens (poll_implement_jobs()). Attempt ESCALATION_ATTEMPT and later run on the
-    escalation model (_implement_model()); a sideclaw refusal of that model is retried once without
-    it (_open_implement_episode())."""
-    ready_sql, ready_params = core._retry_ready_sql(now)
+    escalation model (implement_model()); a sideclaw refusal of that model is retried once without
+    it (open_implement_episode())."""
+    ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND implement_job IS NOT NULL AND implement_job != ? "
         f"AND implement_job NOT LIKE ? AND max_tier='implement' AND revision_count + 1 < ? AND {ready_sql} "
@@ -2290,7 +2290,7 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
         prior = conn.execute("SELECT verdict_json, validation_status FROM dispatches WHERE job_id=?",
                              (item["implement_job"],)).fetchone()
-        prior_result = core._safe_json(prior["verdict_json"] if prior else None)
+        prior_result = core.safe_json(prior["verdict_json"] if prior else None)
         prior_pr = item["pr_url"] or prior_result.get("artifactUrl")
         prior_branch = prior_result.get("branch")
         train_conflict = (prior is not None and prior["validation_status"] == "conflict"
@@ -2314,7 +2314,7 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         brief = (
             f"Attempt {attempt} of {core.MAX_IMPLEMENT_ATTEMPTS} of a fix the alert triage loop already implemented"
             f"{f' as {prior_pr}' if prior_pr else ''}. {start}\n\n{findings}\n\n"
-            f"{_issue_closing_instruction(conn, item)}"
+            f"{issue_closing_instruction(conn, item)}"
             "Address every finding. Keep what the previous attempt got right and do not widen scope. "
             "If a finding is wrong, keep the code and explain why in your verdict — the same "
             "independent review reads your PR next. If the finding cannot be fixed inside this repo, "
@@ -2322,14 +2322,14 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         )
         inv = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
                            (item["dispatch_job"],)).fetchone() if item["dispatch_job"] else None
-        context = (_verdict_as_context(item["dispatch_job"], core._safe_json(inv["verdict_json"]))
+        context = (verdict_as_context(item["dispatch_job"], core.safe_json(inv["verdict_json"]))
                    if inv is not None else None)
         if conflicted:
             previous = (_train_conflict_context(prior_pr, prior_branch, item["train_evidence"]) if train_conflict
                         else _conflict_context(item["implement_job"], prior_result))
             context = "\n\n".join(filter(None, (previous, context)))[: _dispatch.MAX_CONTEXT_CHARS]
 
-        claimed = core._set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
+        claimed = core.set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
                                   expect_eq={"implement_job": item["implement_job"],
                                              "revision_count": item["revision_count"]},
                                   note=f"{REVISION_NOTE_PREFIX}{attempt}/{core.MAX_IMPLEMENT_ATTEMPTS}: {findings[:300]}",
@@ -2340,34 +2340,34 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
 
         try:
-            opened = _open_implement_episode(
+            opened = open_implement_episode(
                 conn, repo=item["repo"], tier="implement", brief=brief, context=context,
                 why=f"{REVISION_WHY_PREFIX}{attempt}: the previous attempt could not land",
                 origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
-                model=_implement_model(attempt), revision_of=revision_of,
+                model=implement_model(attempt), revision_of=revision_of,
             )
         except SubmitRefused as exc:
             # Refused for good: end the item.
-            _end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy,
+            end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy,
                             implement_job=item["implement_job"], validation_job=item["validation_job"],
                             pr_url=item["pr_url"])
             continue
         except RemoteError as exc:
             if exc.maybe_mutated:
-                _hold_ambiguous_submit(item, exc)
+                hold_ambiguous_submit(item, exc)
                 continue
             # A definite infrastructure failure: hand the attempt back (the prior job is restored, so the
             # findings are still on the row) and strike.
-            core._set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
+            core.set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
                             implement_job=item["implement_job"], validation_job=item["validation_job"],
                             revision_count=item["revision_count"])
-            core._strike(conn, item["event_id"], now, f"revision {attempt} could not start: {exc}",
+            core.strike(conn, item["event_id"], now, f"revision {attempt} could not start: {exc}",
                          retry_state=core.STATE_WORKING, expect_state=core.STATE_WORKING)
             conn.commit()
             continue
         except (PolicyError, PreconditionError, UsageError) as e:
-            core._set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
+            core.set_state(conn, item["event_id"], core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
                             note=f"revision {attempt} could not start: {e}",
                             implement_job=item["implement_job"], validation_job=item["validation_job"],
                             revision_count=item["revision_count"])
@@ -2375,7 +2375,7 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
 
         conn.execute("UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
-                     (opened.job_id, core._now_iso(now), item["event_id"]))
+                     (opened.job_id, core.now_iso(now), item["event_id"]))
         conn.commit()
 
 

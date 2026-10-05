@@ -214,7 +214,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         "resolve_slack_token": core.resolve_slack_token,
         "post_line": core.post_line,
         "MAX_OPEN_INVESTIGATIONS": core.MAX_OPEN_INVESTIGATIONS,
-        "_HERMES_OPS_BIN": core._HERMES_OPS_BIN,
+        "HERMES_OPS_BIN": core.HERMES_OPS_BIN,
         "HOST_VERB_ALLOWLIST": dict(core.HOST_VERB_ALLOWLIST),
         "_watchdog_poll": core._watchdog_poll,
         "TRIAGE_REPO_DIR": core.TRIAGE_REPO_DIR,
@@ -425,7 +425,7 @@ def _fake_submit(calls: list[dict[str, Any]], *, ok: bool = True):
 
 def _fake_submit_review(calls: list[dict[str, Any]], *, ok: bool = True):
     """The `submit_review` counterpart to `_fake_submit()` above, for the
-    step-7 `review` dispatch `_open_validation_dispatch()` opens (Wave 6.2 —
+    step-7 `review` dispatch `open_validation_dispatch()` opens (Wave 6.2 —
     replaced the second `investigate` episode on a different model)."""
     counter = {"n": 0}
 
@@ -502,7 +502,7 @@ VERY_OLD = NOW - dt.timedelta(days=10)
 
 def _insert_dispatch_row(conn: sqlite3.Connection, job_id: str, created_at: dt.datetime, *,
                           repo: str = "demo-repo") -> None:
-    """A bare `dispatches` row with nothing but the columns `_cooldown_ok()`
+    """A bare `dispatches` row with nothing but the columns `cooldown_ok()`
     reads (job_id, created_at) — for tests that need a `split`/carried
     `dispatch_job` to resolve against a real cooldown anchor without running
     a whole escalate_cluster() cycle to produce one."""
@@ -551,7 +551,7 @@ def test_repeated_signature_one_investigation_and_no_slack_post():
         assert len(calls) == 1, f"expected exactly one dispatch, got {len(calls)}"
         assert ctx.posted == [], f"`working` is not a notify state, got {ctx.posted}"
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING
         assert item["dispatch_job"] == "job-000001"
 
@@ -596,7 +596,7 @@ def test_both_missing_edges_are_written():
         _sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
 
-        event_row = core._get_event(conn, eid)
+        event_row = core.get_event(conn, eid)
         assert event_row["dispatch_id"] is not None, "events.dispatch_id was never written"
 
         d = conn.execute(
@@ -615,7 +615,7 @@ def test_min_occurrences_withholds():
         _sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == [], "should not have escalated below minOccurrences and inside minOpenMinutes"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEW
 
 
@@ -702,7 +702,7 @@ def test_mapped_row_survives_a_second_classify_pass():
         intake.classify(conn, policy, NOW)
         intake.classify(conn, policy, NOW)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEW, (
             "a row mapped on an earlier pass must stay `new` for the escalation pass, "
             f"not be routed by the prose filter — got state={item['state']!r}")
@@ -772,7 +772,7 @@ def test_sideclaw_5xx_on_an_investigate_dispatch_retries_with_backoff_and_fails_
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls, ok=False)
         triage.run(conn, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert len(calls) == 1
         assert item["state"] == core.STATE_TRIAGED and item["strikes"] == 1, dict(item)
         assert item["dispatch_job"] is None and item["retry_at"]
@@ -782,13 +782,13 @@ def test_sideclaw_5xx_on_an_investigate_dispatch_retries_with_backoff_and_fails_
 
         t1 = dt.datetime.fromisoformat(item["retry_at"]) + dt.timedelta(seconds=1)
         work.escalate(conn, DEFAULT_POLICY, t1, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert len(calls) == 2 and item["strikes"] == 2 and item["state"] == core.STATE_TRIAGED
         assert dt.datetime.fromisoformat(item["retry_at"]) == t1 + dt.timedelta(minutes=30), item["retry_at"]
 
         t2 = dt.datetime.fromisoformat(item["retry_at"]) + dt.timedelta(seconds=1)
         work.escalate(conn, DEFAULT_POLICY, t2, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert len(calls) == 3
         assert item["state"] == core.STATE_FAILED and item["strikes"] == 3, dict(item)
         assert "investigate dispatch failed" in item["note"], item["note"]
@@ -842,10 +842,10 @@ def test_cluster_same_repo_one_dispatch_both_edges():
         assert "sig-cluster-a" in brief and "sig-cluster-b" in brief, "both signatures must be in the brief"
 
         for eid in (e1, e2):
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_WORKING
             assert item["dispatch_job"] == "job-000001"
-            event_row = core._get_event(conn, eid)
+            event_row = core.get_event(conn, eid)
             assert event_row["dispatch_id"] is not None, f"events.dispatch_id not written for member {eid}"
 
 
@@ -868,7 +868,7 @@ def test_cluster_dissolves_on_unrelated_verdict():
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
-        job_id = core._get_item(conn, e1)["dispatch_job"]
+        job_id = core.get_item(conn, e1)["dispatch_job"]
         assert job_id is not None
 
         conn.execute(
@@ -878,7 +878,7 @@ def test_cluster_dissolves_on_unrelated_verdict():
         )
         conn.commit()
         work.fold_dispatch_verdict(conn, origin_event_id=e1, job_id=job_id, now=NOW, dry_run=False)
-        assert core._get_item(conn, e1)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, e1)["state"] == core.STATE_WORKING
 
         # A direct call, not triage.run(): run() would immediately try to
         # re-escalate the freshly-dissolved (now cooldown-unprotected-by-
@@ -888,7 +888,7 @@ def test_cluster_dissolves_on_unrelated_verdict():
         # asserts, not the following escalation.
         work.maybe_dissolve_clusters(conn, NOW, dry_run=False)
         for eid in (e1, e2):
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_TRIAGED, f"member {eid} should have been dissolved to split"
             # dispatch_job is deliberately RETAINED as a cooldown anchor —
             # see _dissolve_cluster()'s docstring — not cleared.
@@ -913,7 +913,7 @@ def test_dissolve_cluster_dry_run_performs_state_change_without_slack_call():
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
-        job_id = core._get_item(conn, e1)["dispatch_job"]
+        job_id = core.get_item(conn, e1)["dispatch_job"]
         assert job_id is not None
 
         conn.execute(
@@ -929,7 +929,7 @@ def test_dissolve_cluster_dry_run_performs_state_change_without_slack_call():
         assert ctx.total_calls() == calls_before, "--dry-run must never call Slack"
 
         for eid in (e1, e2):
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_TRIAGED, (
                 f"dissolve bookkeeping must run for real under --dry-run, got {item['state']}"
             )
@@ -949,7 +949,7 @@ def test_split_state_survives_apply_resolutions_state_43_regression():
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
-        job_id = core._get_item(conn, e1)["dispatch_job"]
+        job_id = core.get_item(conn, e1)["dispatch_job"]
 
         conn.execute(
             "UPDATE dispatches SET status=?, verdict_json=? WHERE job_id=?",
@@ -960,7 +960,7 @@ def test_split_state_survives_apply_resolutions_state_43_regression():
         work.fold_dispatch_verdict(conn, origin_event_id=e1, job_id=job_id, now=NOW, dry_run=False)
         work.maybe_dissolve_clusters(conn, NOW, dry_run=False)
         for eid in (e1, e2):
-            assert core._get_item(conn, eid)["state"] == core.STATE_TRIAGED
+            assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
 
         # The exact §43 mechanism: the underlying signal disappears
         # (events.resolved_at set — disappearance from observation, never a
@@ -971,7 +971,7 @@ def test_split_state_survives_apply_resolutions_state_43_regression():
         intake.apply_resolutions(conn, NOW)
 
         for eid in (e1, e2):
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_TRIAGED, (
                 f"a split row's verdict must survive silence — got {item['state']} (this is the exact "
                 f"state-log.md §43 defect: the verdict reached nobody)"
@@ -998,8 +998,8 @@ def test_escalate_singleton_splits_never_group():
             f"one dispatch per repo per run must hold across two split items too, got {len(calls)}"
         )
         dispatched = [eid for eid in (e1, e2)
-                      if core._get_item(conn, eid)["state"] == core.STATE_WORKING]
-        waiting = [eid for eid in (e1, e2) if core._get_item(conn, eid)["state"] == core.STATE_TRIAGED]
+                      if core.get_item(conn, eid)["state"] == core.STATE_WORKING]
+        waiting = [eid for eid in (e1, e2) if core.get_item(conn, eid)["state"] == core.STATE_TRIAGED]
         assert len(dispatched) == 1 and len(waiting) == 1, f"{dispatched=} {waiting=}"
         # The dispatch's own primary event_id is the proof of singleton-ness —
         # NOT "the other signature's text is absent from the brief": the
@@ -1050,8 +1050,8 @@ def test_escalate_prefers_singleton_over_cluster_in_same_repo_and_defers_cluster
         assert origin_event_id == split_eid, (
             f"expected the split item to win this run's slot, got origin_event_id={origin_event_id!r}"
         )
-        assert core._get_item(conn, split_eid)["state"] == core.STATE_WORKING
-        assert core._get_item(conn, new_eid)["state"] == core.STATE_TRIAGED, (
+        assert core.get_item(conn, split_eid)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, new_eid)["state"] == core.STATE_TRIAGED, (
             "the clustered item must wait for the next run, not be dropped"
         )
         assert "wait for next run" in err.getvalue(), (
@@ -1096,8 +1096,8 @@ def test_a_capped_attempt_does_not_claim_to_have_deferred_anyone():
             assert "wait for next run" not in err.getvalue(), (
                 f"nothing was dispatched, so nothing was deferred BY a dispatch — the cap message is "
                 f"the whole story here: {err.getvalue()}")
-            assert core._get_item(conn, split_eid)["state"] == core.STATE_TRIAGED
-            assert core._get_item(conn, new_eid)["state"] == core.STATE_NEW
+            assert core.get_item(conn, split_eid)["state"] == core.STATE_TRIAGED
+            assert core.get_item(conn, new_eid)["state"] == core.STATE_NEW
     finally:
         # Restored by hand: _triage_env()'s own save/restore captures this
         # global on ENTRY, and the cap tests in this file set it before
@@ -1118,7 +1118,7 @@ def test_cooldown_holds_back_split_member_inside_cooldown_hours():
         _sideclaw.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "inside cooldownHours, a split item must not re-escalate"
-        assert core._get_item(conn, eid)["state"] == core.STATE_TRIAGED
+        assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
 
 
 def test_dispatch_brief_on_stdin_and_capped():
@@ -1151,7 +1151,7 @@ def test_dispatch_brief_on_stdin_and_capped():
             f"routes the tier itself — got {calls[0]['model']!r}"
         )
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING
         assert item["dispatch_job"] is not None
 
@@ -1169,7 +1169,7 @@ def test_quiet_resolution_never_posts():
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
         conn.commit()
         triage.run(conn, dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_QUIET
+        assert core.get_item(conn, eid)["state"] == core.STATE_QUIET
         triage.run(conn, dry_run=False)
         assert ctx.posted == [], ctx.posted
 
@@ -1235,10 +1235,10 @@ def test_open_origin_item_inserts_event_and_item_and_dedups():
             external_id="human:fixed-1", title="a human ask", now=NOW,
         )
         assert eid1 is not None
-        item = core._get_item(conn, eid1)
+        item = core.get_item(conn, eid1)
         assert item["origin"] == "human" and item["max_tier"] == "implement"
         assert item["brief"] == "do the thing" and item["state"] == core.STATE_NEW
-        event = core._get_event(conn, eid1)
+        event = core.get_event(conn, eid1)
         assert event["source"] == "human" and event["external_id"] == "human:fixed-1"
 
         eid2 = intake.open_origin_item(
@@ -1249,12 +1249,12 @@ def test_open_origin_item_inserts_event_and_item_and_dedups():
         assert conn.execute("SELECT COUNT(*) FROM triage_items").fetchone()[0] == 1
         # The second call's brief must never have overwritten the first — no
         # re-INSERT and no UPDATE happened.
-        assert core._get_item(conn, eid1)["brief"] == "do the thing"
+        assert core.get_item(conn, eid1)["brief"] == "do the thing"
 
 
 def test_open_origin_item_records_created_transition():
     """The raw `INSERT INTO triage_items` in open_origin_item() never goes
-    through _set_state(), so without _record_created_transition() a
+    through set_state(), so without record_created_transition() a
     human-origin item would have zero rows in its own item_transitions —
     invisible history from the very moment it started."""
     with _triage_env() as (conn, ctx):
@@ -1293,7 +1293,7 @@ def test_open_origin_item_terminal_item_returns_none_and_inserts_nothing():
             conn, origin="human", repo="demo-repo", brief="do the thing", max_tier="implement",
             external_id="human:closed-1", title="a human ask", now=NOW,
         )
-        core._set_state(conn, eid, core.STATE_CLOSED, NOW, note="done by hand", close_reason=core.CLOSE_RESOLVED)
+        core.set_state(conn, eid, core.STATE_CLOSED, NOW, note="done by hand", close_reason=core.CLOSE_RESOLVED)
 
         again = intake.open_origin_item(
             conn, origin="human", repo="demo-repo", brief="a stale re-ask", max_tier="implement",
@@ -1317,7 +1317,7 @@ def test_human_item_escalates_as_a_cluster_of_one_with_its_own_brief():
         assert len(calls) == 1, f"expected exactly one dispatch, got {len(calls)}"
         assert calls[0]["tier"] == "investigate"
         assert calls[0]["brief"] == "investigate the flaky test"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING
         assert item["dispatch_job"] == "job-000001"
 
@@ -1333,7 +1333,7 @@ def test_human_item_with_its_own_origin_thread_routes_the_dispatch_there():
             external_id="human:origin-thread-1", title="fix it", now=NOW,
             origin_channel="C0ORIGIN0001", origin_thread_ts="1111.000001",
         )
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["origin_channel"] == "C0ORIGIN0001" and item["origin_thread_ts"] == "1111.000001"
 
         _sideclaw.submit = _fake_submit([])
@@ -1356,7 +1356,7 @@ def test_human_item_without_its_own_origin_thread_falls_back_to_the_card_channel
             conn, origin="human", repo="demo-repo", brief="fix it", max_tier="implement",
             external_id="human:origin-thread-2", title="fix it", now=NOW,
         )
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["origin_channel"] is None and item["origin_thread_ts"] is None
 
         _sideclaw.submit = _fake_submit([])
@@ -1385,7 +1385,7 @@ def test_escalate_origin_items_overflow_waits_in_triaged_with_note():
             work.escalate_origin_items(conn, NOW)
 
             assert calls == [], "at the cap, nothing may dispatch"
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_TRIAGED, "overflow waits in `triaged`, never drops"
             assert item["note"] and "MAX_OPEN_INVESTIGATIONS" in item["note"]
     finally:
@@ -1405,19 +1405,19 @@ def test_escalate_origin_items_cas_claim_loses_to_a_concurrent_claim():
         )
         conn2 = core._ledger.connect(core.DB_PATH)
         try:
-            won = core._set_state(conn, eid, core.STATE_WORKING, NOW,
+            won = core.set_state(conn, eid, core.STATE_WORKING, NOW,
                                    expect_state=core.STATE_NEW, expect_null=("dispatch_job",))
             conn.commit()
             assert won == 1, "the first claim must succeed"
 
-            lost = core._set_state(conn2, eid, core.STATE_WORKING, NOW,
+            lost = core.set_state(conn2, eid, core.STATE_WORKING, NOW,
                                     expect_state=core.STATE_NEW, expect_null=("dispatch_job",))
             conn2.commit()
             assert lost == 0, "a second claim against an already-claimed row must affect 0 rows"
         finally:
             conn2.close()
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING
 
 
@@ -1434,7 +1434,7 @@ def test_escalate_origin_items_reclaims_investigating_orphan_with_no_dispatch_jo
             external_id="human:orphan-inv-1", title="ask", now=NOW,
         )
         # claimed long enough ago that no live caller can still be mid-dispatch
-        core._set_state(conn, eid, core.STATE_WORKING, NOW - dt.timedelta(minutes=10),
+        core.set_state(conn, eid, core.STATE_WORKING, NOW - dt.timedelta(minutes=10),
                         expect_state=core.STATE_NEW)
         conn.commit()
 
@@ -1442,7 +1442,7 @@ def test_escalate_origin_items_reclaims_investigating_orphan_with_no_dispatch_jo
         _sideclaw.submit = _fake_submit(calls)
         work.escalate_origin_items(conn, NOW)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["note"] and "reclaimed" in item["note"], item["note"]
         assert item["state"] == core.STATE_WORKING, item["state"]
         assert item["dispatch_job"] is not None
@@ -1458,13 +1458,13 @@ def test_escalate_origin_items_leaves_a_live_claim_alone_and_a_lost_cas_skips():
             conn, origin="human", repo="demo-repo", brief="do the thing", max_tier="implement",
             external_id="human:live-claim", title="ask", now=NOW,
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW - dt.timedelta(minutes=1),
+        core.set_state(conn, eid, core.STATE_WORKING, NOW - dt.timedelta(minutes=1),
                         expect_state=core.STATE_NEW)   # the other caller's claim, mid-dispatch
         conn.commit()
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         work.escalate_origin_items(conn, NOW)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert calls == [] and item["state"] == core.STATE_WORKING and item["dispatch_job"] is None, dict(item)
         assert "reclaimed" not in (item["note"] or ""), item["note"]
 
@@ -1481,12 +1481,12 @@ def test_escalate_origin_items_leaves_a_live_claim_alone_and_a_lost_cas_skips():
                 conn_.commit()
             return real_get_event(conn_, event_id)
 
-        real_get_event = core._get_event
-        core._get_event = _racing_get_event
+        real_get_event = core.get_event
+        core.get_event = _racing_get_event
         try:
             work.escalate_origin_items(conn, NOW)
         finally:
-            core._get_event = real_get_event
+            core.get_event = real_get_event
         assert calls == [], "a lost claim must not dispatch"
 
 
@@ -1503,7 +1503,7 @@ def test_maybe_auto_implement_blocked_by_investigate_ceiling():
              json.dumps({"nextAction": "implement", "confidence": "high", "summary": "do it"}),
              NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job="job-ceiling-1")
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job="job-ceiling-1")
         conn.commit()
 
         calls: list[dict[str, Any]] = []
@@ -1511,7 +1511,7 @@ def test_maybe_auto_implement_blocked_by_investigate_ceiling():
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert calls == [], "max_tier='investigate' must never reach an implement dispatch"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["implement_job"] is None
 
 
@@ -1528,11 +1528,11 @@ def test_fold_dispatch_verdict_lands_closed_for_investigate_ceiling_origin_item(
             (job_id, "investigate", "demo-repo", "b", eid, "done",
              json.dumps({"summary": "it is fine, no action needed", "nextAction": "none"}), NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED, dict(item)
         assert item["note"] == "it is fine, no action needed", item["note"]
 
@@ -1554,11 +1554,11 @@ def test_fold_dispatch_verdict_third_party_github_issue_closes_resolved_with_the
             (job_id, "investigate", "demo-repo", "b", eid, "done",
              json.dumps({"summary": "confirmed, low priority", "nextAction": "none"}), NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED, dict(item)
         assert item["note"] == "confirmed, low priority", item["note"]
 
@@ -1575,10 +1575,10 @@ def _fold_alert_verdict(conn, ext: str, *, status: str = "done", verdict: dict[s
         (job_id, tier, "demo-repo", "b", eid, status, json.dumps(verdict) if verdict is not None else None,
          artifact_url, error, NOW.isoformat()),
     )
-    core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+    core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
     conn.commit()
     work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
-    return core._get_item(conn, eid)
+    return core.get_item(conn, eid)
 
 
 def test_fold_dispatch_verdict_next_action_to_state_table():
@@ -1683,11 +1683,11 @@ def test_fold_dispatch_verdict_interrupted_with_real_verdict_folds_normally():
              json.dumps({"summary": "found the root cause", "nextAction": "implement"}),
              "cancelled by operator", NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]
 
 
@@ -1708,11 +1708,11 @@ def test_fold_dispatch_verdict_failed_human_origin_is_a_strike_never_closed_as_a
             (job_id, "investigate", "demo-repo", "b", eid, "failed", None,
              "Session timed out after 480000ms", NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED and item["strikes"] == 1, dict(item)
         assert item["state"] != core.STATE_CLOSED
         assert item["note"] and "Session timed out after 480000ms" in item["note"], item["note"]
@@ -1760,18 +1760,18 @@ def test_ingest_github_issues_issue_disappears_from_poll_while_new_resolves_by_s
         intake.ingest_github_issues(conn, NOW)
         row = conn.execute("SELECT event_id FROM triage_items WHERE origin='github_issue'").fetchone()
         eid = row["event_id"]
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEW
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEW
 
         # The issue (closed, or `warden:skip` applied) is gone on the next poll,
         # AND a direct per-issue check confirms it is actually closed.
         _github.search_issues = lambda *, owner, skip_label: []
         _github.read_issue = lambda owner, repo, number: {"state": "closed"}
         intake.ingest_github_issues(conn, NOW)
-        event = core._get_event(conn, eid)
+        event = core.get_event(conn, eid)
         assert event["resolved_at"] is not None, "an issue confirmed closed must be resolved"
 
         intake.apply_resolutions(conn, NOW)
-        assert core._get_item(conn, eid)["state"] == core.STATE_QUIET, (
+        assert core.get_item(conn, eid)["state"] == core.STATE_QUIET, (
             "a still-`new` item must close through the existing silence-resolve path"
         )
 
@@ -1797,7 +1797,7 @@ def test_ingest_github_issues_missing_from_search_but_still_open_is_not_resolved
         _github.search_issues = lambda *, owner, skip_label: []
         _github.read_issue = lambda owner, repo, number: {"state": "open"}
         intake.ingest_github_issues(conn, NOW)
-        assert core._get_event(conn, eid)["resolved_at"] is None, (
+        assert core.get_event(conn, eid)["resolved_at"] is None, (
             "an issue the search omitted but is still open must not be resolved"
         )
 
@@ -1822,7 +1822,7 @@ def test_ingest_github_issues_disappearance_check_error_leaves_event_open():
         _github.search_issues = lambda *, owner, skip_label: []
         _github.read_issue = _boom
         intake.ingest_github_issues(conn, NOW)
-        assert core._get_event(conn, eid)["resolved_at"] is None, (
+        assert core.get_event(conn, eid)["resolved_at"] is None, (
             "an error confirming closure must leave the event open, not resolve it"
         )
 
@@ -1851,7 +1851,7 @@ def test_comment_back_happens_for_own_issue():
              json.dumps({"summary": "fixed the root cause", "recommendation": "merge it",
                          "nextAction": "implement"}), NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         comments: list[dict[str, Any]] = []
@@ -1881,7 +1881,7 @@ def test_comment_back_never_happens_for_third_party_issue():
             (job_id, "investigate", "argo", "b", eid, "done",
              json.dumps({"summary": "looked into it", "nextAction": "none"}), NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         def _must_not_be_called(repo_full, number, body):
@@ -1889,7 +1889,7 @@ def test_comment_back_never_happens_for_third_party_issue():
         _github.create_issue_comment = _must_not_be_called
 
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         # The property THIS test exists to guard: no comment is ever posted back
         # to a stranger's issue, whatever state its answer lands in.
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED, item["state"]
@@ -1912,7 +1912,7 @@ def test_fold_dispatch_verdict_repeat_call_never_reposts_comment():
             (job_id, "investigate", "argo", "b", eid, "done",
              json.dumps({"summary": "fixed the root cause", "nextAction": "implement"}), NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         comments: list[dict[str, Any]] = []
@@ -1928,7 +1928,7 @@ def test_fold_dispatch_verdict_repeat_call_never_reposts_comment():
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
         assert len(comments) == 1, "a repeat fold must never repost the same comment"
 
-        event = core._get_event(conn, eid)
+        event = core.get_event(conn, eid)
         payload = json.loads(event["payload_json"])
         assert payload.get("commented_at"), "the durable marker must be written after a successful post"
 
@@ -1951,7 +1951,7 @@ def test_fold_dispatch_verdict_cas_loss_never_double_posts():
             (job_id, "investigate", "argo", "b", eid, "done",
              json.dumps({"summary": "fixed the root cause", "nextAction": "implement"}), NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         comments: list[dict[str, Any]] = []
@@ -1991,7 +1991,7 @@ def test_fold_dispatch_verdict_cas_loss_never_double_posts():
 
         assert not errors, errors
         assert len(comments) == 1, f"exactly one racing fold must post the comment, got {len(comments)}"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]
 
 
@@ -2009,7 +2009,7 @@ def test_fold_dispatch_verdict_dry_run_previews_comment_without_posting():
             (job_id, "investigate", "argo", "b", eid, "done",
              json.dumps({"summary": "fixed the root cause", "nextAction": "implement"}), NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
 
         def _must_not_be_called(repo_full, number, body):
@@ -2021,9 +2021,9 @@ def test_fold_dispatch_verdict_dry_run_previews_comment_without_posting():
             work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=True)
 
         assert "[dry-run] would comment on jkrumm/argo#22" in buf.getvalue(), buf.getvalue()
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, "dry-run must never write state"
-        event = core._get_event(conn, eid)
+        event = core.get_event(conn, eid)
         payload = json.loads(event["payload_json"])
         assert not payload.get("commented_at"), "dry-run must never write the commented_at marker"
 
@@ -2059,8 +2059,8 @@ def test_origin_item_brief_truncates_long_third_party_body_before_the_fence():
             url="https://github.com/jkrumm/demo-repo/issues/14",
             payload={"repo": "demo-repo", "number": 14, "author": "some-stranger"}, now=NOW,
         )
-        item = core._get_item(conn, eid)
-        event_row = core._get_event(conn, eid)
+        item = core.get_item(conn, eid)
+        event_row = core.get_event(conn, eid)
         brief = work._origin_item_brief(item, event_row)
 
         assert len(brief) <= core.MAX_BRIEF_CHARS, len(brief)
@@ -2103,17 +2103,17 @@ def test_reopen_after_resolve_preserves_artifact_url():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-recur", title="Recurring", first_seen=OLD)
         intake.ingest(conn, NOW)
-        core._set_state(conn, eid, core.STATE_QUIET, NOW,
+        core.set_state(conn, eid, core.STATE_QUIET, NOW,
                          artifact_url="https://github.com/jkrumm/demo-repo/pull/1")
 
         # A fresh occurrence — the cooldown-suppressed-recurrence shape (see
-        # _occurrence_mark()): only payload_json.ts_last moves.
+        # occurrence_mark()): only payload_json.ts_last moves.
         conn.execute("UPDATE events SET payload_json=? WHERE id=?",
                      (json.dumps({"ts_last": "1788850795.862159"}), eid))
         conn.commit()
 
         intake.reopen_if_needed(conn, NOW)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEW
         assert item["artifact_url"] == "https://github.com/jkrumm/demo-repo/pull/1"
 
@@ -2141,7 +2141,7 @@ def test_fold_dispatch_verdict_artifact_closes_resolved_without_a_post():
         conn.commit()
 
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED
         assert item["artifact_url"] == "https://github.com/jkrumm/demo-repo/issues/2"
         assert ctx.posted == [], "closed(resolved) is not a notify state"
@@ -2154,7 +2154,7 @@ def test_fold_dispatch_verdict_updates_every_cluster_member():
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
-        job_id = core._get_item(conn, e1)["dispatch_job"]
+        job_id = core.get_item(conn, e1)["dispatch_job"]
 
         conn.execute(
             "UPDATE dispatches SET status=?, verdict_json=?, artifact_url=? WHERE job_id=?",
@@ -2165,7 +2165,7 @@ def test_fold_dispatch_verdict_updates_every_cluster_member():
         conn.commit()
         work.fold_dispatch_verdict(conn, origin_event_id=e1, job_id=job_id, now=NOW, dry_run=False)
         for eid in (e1, e2):
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED
             assert item["artifact_url"] == "https://github.com/jkrumm/demo-repo/pull/3"
 
@@ -2180,7 +2180,7 @@ def test_op_refs_sources_are_ingested():
         eid = _insert_event(conn, source="op_refs_homelab", external_id="raw:some-error",
                              title="1Password refs unresolved on homelab", first_seen=OLD)
         intake.ingest(conn, NOW)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item is not None, "op_refs_homelab must produce a triage_items row"
 
 
@@ -2224,7 +2224,7 @@ def _slack_msg(ts: str, text: str) -> dict[str, Any]:
 
 
 def test_run_bounded_hang_does_not_block_past_its_timeout():
-    """_run_bounded() must RETURN at its timeout, not merely report one.
+    """run_bounded() must RETURN at its timeout, not merely report one.
 
     Regression test for a real bug: the executor was used as a context manager,
     whose __exit__ calls shutdown(wait=True) and blocks until the worker thread
@@ -2235,11 +2235,11 @@ def test_run_bounded_hang_does_not_block_past_its_timeout():
     the `with` block immediately either way — only an actual hang exposes it.
     Asserts wall-clock, which is the only thing that would have caught it."""
     started = time.monotonic()
-    ok, result = work._run_bounded(lambda: time.sleep(20), timeout=1)
+    ok, result = work.run_bounded(lambda: time.sleep(20), timeout=1)
     elapsed = time.monotonic() - started
     assert ok is False, ok
     assert "timed out" in result, result
-    assert elapsed < 5, f"_run_bounded blocked {elapsed:.1f}s past a 1s timeout"
+    assert elapsed < 5, f"run_bounded blocked {elapsed:.1f}s past a 1s timeout"
 
 
 def test_run_bounded_logs_the_traceback_of_a_raising_probe_and_keeps_the_return_shape():
@@ -2248,7 +2248,7 @@ def test_run_bounded_logs_the_traceback_of_a_raising_probe_and_keeps_the_return_
 
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
-        ok, result = work._run_bounded(_boom, timeout=5)
+        ok, result = work.run_bounded(_boom, timeout=5)
     assert ok is False and result == "ValueError: probe exploded", (ok, result)
     assert "Traceback" in err.getvalue() and "probe exploded" in err.getvalue(), err.getvalue()
 
@@ -2333,7 +2333,7 @@ def test_quiet_grouped_resolves_after_window_without_a_post():
         conn.commit()
 
         triage.run(conn, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_QUIET
         assert item["note"].startswith(core.QUIET_RESOLVE_NOTE_PREFIX)
         assert "fixed" not in item["note"].lower()
@@ -2352,10 +2352,10 @@ def test_quiet_grouped_resolves_after_window_without_a_post():
         # a full round trip leaves state looking identical while still
         # rewriting note/occurrence_mark underneath. (updated_at is NOT part of
         # this assertion: ingest() legitimately rewrites it on every open row
-        # every pass regardless of state — see _set_state()'s own docstring for
+        # every pass regardless of state — see set_state()'s own docstring for
         # why that is exactly why occurrence_mark, not updated_at, has to be
         # the anchor here.)
-        item_after = core._get_item(conn, eid)
+        item_after = core.get_item(conn, eid)
         assert item_after["state"] == core.STATE_QUIET
         assert item_after["occurrence_mark"] == first_mark, "quiet-resolved grouped item churned"
         assert item_after["note"] == first_note, "quiet-resolved grouped item churned"
@@ -2376,7 +2376,7 @@ def test_new_to_resolved_with_no_card_is_silent():
         eid = _insert_event(conn, source="slack_alert", external_id="sig-never-carded",
                              title="Never carded", first_seen=OLD)
         triage.run(conn, dry_run=False)  # ingest + classify only — the event is still open
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEW and item["card_ts"] is None
         assert ctx.total_calls() == 0, "an unescalated `new` item must never get a card"
 
@@ -2384,7 +2384,7 @@ def test_new_to_resolved_with_no_card_is_silent():
         conn.commit()
         triage.run(conn, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_QUIET
         assert item["card_ts"] is None
         assert ctx.total_calls() == 0, "new -> resolved with no prior card must make zero Slack calls"
@@ -2420,7 +2420,7 @@ def test_investigating_is_not_discharged_by_its_signal_disappearing():
         conn.commit()
         triage.run(conn, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, (
             f"an in-flight investigation must survive its signal disappearing, got {item['state']}"
         )
@@ -2451,7 +2451,7 @@ def test_quiet_grouped_does_not_resolve_while_investigating():
         )
         conn.commit()
         intake.resolve_quiet_grouped(conn, policy, NOW)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, "must not resolve out from under an open dispatch"
 
 
@@ -2475,7 +2475,7 @@ def test_recovery_paired_resolves_immediately_without_waiting_for_quiet():
         core._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", recovery_text)])
 
         triage.run(conn, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_QUIET
         assert item["note"].startswith(core.RECOVERY_PAIRED_NOTE_PREFIX)
         assert recovery_text in item["note"]
@@ -2507,7 +2507,7 @@ def test_recovery_paired_never_discharges_needs_decision():
             [_slack_msg("999.000001", "✅ research-gateway job.reaped >= 1 (15m)")])
 
         triage.run(conn, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, (
             f"a pending human decision must survive its alert recovering, got {item['state']}"
         )
@@ -2540,7 +2540,7 @@ def test_quiet_timer_never_discharges_needs_decision():
         conn.commit()
 
         intake.resolve_quiet_grouped(conn, policy, NOW)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, (
             f"a 3h-quiet signal must not close a pending human decision, got {item['state']}"
         )
@@ -2569,7 +2569,7 @@ def test_event_resolution_never_discharges_needs_decision():
         conn.commit()
 
         intake.apply_resolutions(conn, NOW)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, (
             f"a disappeared signal must not close a pending human decision, got {item['state']}"
         )
@@ -2633,9 +2633,9 @@ def test_no_chain_state_is_silence_resolvable():
         conn.commit()
         intake.apply_resolutions(conn, NOW)
 
-        leaked = {state: core._get_item(conn, eid)["state"]
+        leaked = {state: core.get_item(conn, eid)["state"]
                    for state, eid in ids.items()
-                   if core._get_item(conn, eid)["state"] != state}
+                   if core.get_item(conn, eid)["state"] != state}
         assert not leaked, (
             f"silence-resolved a state carrying an obligation: {leaked} "
             f"(each entry is seeded-state -> state after the three silence paths)"
@@ -2747,7 +2747,7 @@ def test_auto_implement_fires_at_any_confidence_with_no_wait():
         assert all(c["model"] is None for c in calls), (
             "auto-implement must send no model override by default, so sideclaw routes the implement tier itself")
         for conf, eid in eids.items():
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_WORKING, f"{conf}: {item['state']}"
             assert item["implement_job"] is not None, f"{conf}-confidence item was never implemented"
 
@@ -2762,7 +2762,7 @@ def test_auto_implement_ignores_a_verdict_that_does_not_say_implement():
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], f"only nextAction=implement may auto-implement, got {calls}"
         for eid in eids:
-            assert core._get_item(conn, eid)["state"] == core.STATE_WORKING
+            assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
 
 
 def test_auto_implement_claims_the_item_before_dispatching():
@@ -2790,14 +2790,14 @@ def test_auto_implement_claims_the_item_before_dispatching():
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert observed == [[core.IMPLEMENT_CLAIM]], (
             f"item must already be claimed while the dispatch runs, saw {observed}")
-        assert core._get_item(conn, eid)["implement_job"] == "implement-job-claim"
+        assert core.get_item(conn, eid)["implement_job"] == "implement-job-claim"
 
         # A refused (definitely-failed, not merely ambiguous) dispatch hands the claim back.
         eid2 = _seed_verdict_item(conn, external_id="sig-claim-fail", confidence="high", repo="other-repo",
                                   investigate_job="investigate-claim-fail")
         _sideclaw.submit = _fake_submit([], ok=False)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        back = core._get_item(conn, eid2)
+        back = core.get_item(conn, eid2)
         assert back["state"] == core.STATE_WORKING and back["strikes"] == 1, dict(back)
         assert back["implement_job"] is None, back["implement_job"]
 
@@ -2827,7 +2827,7 @@ def test_auto_implement_in_flight_lock_defers_with_a_visible_note():
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert submit_calls == [], "an in-flight repo must never open a second implement episode"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, "a deferral must never look like a claim+rollback"
         assert item["note"] is not None and item["note"].startswith("deferred: "), item["note"]
 
@@ -2847,7 +2847,7 @@ def test_auto_implement_refused_by_sideclaw_ends_the_item_and_is_never_retried()
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert len(calls) == 1, f"a refused implement must never be resubmitted, got {len(calls)}"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, item["state"]
         assert "exceeds the ceiling 'investigate'" in (item["note"] or ""), item["note"]
         assert item["implement_job"] is None
@@ -2879,7 +2879,7 @@ def test_implement_success_joins_the_merge_train_at_update():
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert validation_calls == [], "the review waits for the train's update and checks"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING
         assert item["train_stage"] == train.TRAIN_UPDATE and item["train_sha"] is None, dict(item)
         assert item["train_job"] is None and item["validation_job"] is None and item["retry_at"] is None, dict(item)
@@ -2937,7 +2937,7 @@ def test_poll_reads_artifact_and_verdict_from_the_nested_result():
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_UPDATE, (
             "a nested artifactUrl must put the PR on its merge train, not block the merge")
         assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/99", item["pr_url"]
@@ -2992,7 +2992,7 @@ def test_implement_failure_is_a_strike_without_opening_validation():
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert validation_calls == []
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], "the attempt starts over after the backoff"
         assert "failed" in item["note"] and "budget exhausted" in item["note"], item["note"]
@@ -3017,7 +3017,7 @@ def test_cancelled_implement_job_is_a_strike_without_opening_validation():
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert validation_calls == []
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert "cancelled" in item["note"], item["note"]
 
@@ -3063,7 +3063,7 @@ def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_no
             "result": _dispatch_result("checks_failed", branch="dispatch/x-1", summary="lint failed"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["implement_job"] == "impl-checks-failed", dict(item)
         assert item["strikes"] == 0, "a red check is a finding for the implementer, not an infrastructure failure"
         assert "checks failed" in item["note"] and "dispatch/x-1" in item["note"], item["note"]
@@ -3076,7 +3076,7 @@ def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_no
                      (core.MAX_IMPLEMENT_ATTEMPTS - 1, eid2))
         conn.commit()
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item2 = core._get_item(conn, eid2)
+        item2 = core.get_item(conn, eid2)
         assert item2["state"] == core.STATE_FAILED, dict(item2)
         assert "checks failed" in item2["note"] and "lint failed" in item2["note"], item2["note"]
 
@@ -3088,7 +3088,7 @@ def test_implement_outcome_no_changes_is_a_strike():
             "status": "done", "result": _dispatch_result("no_changes", summary="nothing to do"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert 'no_changes' in item["note"], item["note"]
@@ -3102,7 +3102,7 @@ def test_implement_outcome_diff_refused_is_a_strike():
             "status": "done", "result": _dispatch_result("diff_refused", summary="diff too large"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert 'diff_refused' in item["note"], item["note"]
@@ -3115,7 +3115,7 @@ def test_implement_outcome_branch_no_pr_is_a_strike():
             "status": "done", "result": _dispatch_result("branch_no_pr", summary="no PR text"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert 'branch_no_pr' in item["note"], item["note"]
@@ -3128,7 +3128,7 @@ def test_implement_outcome_pr_failed_is_a_strike():
             "status": "done", "result": _dispatch_result("pr_failed", summary="opening the PR threw"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert 'pr_failed' in item["note"], item["note"]
@@ -3141,7 +3141,7 @@ def test_implement_outcome_withheld_is_a_strike():
             "status": "done", "result": _dispatch_result("withheld", summary="secret scanner matched"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert 'withheld' in item["note"], item["note"]
@@ -3154,7 +3154,7 @@ def test_implement_outcome_salvaged_is_a_strike():
             "status": "done", "result": _dispatch_result("salvaged", summary="degraded verdict"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert 'salvaged' in item["note"], item["note"]
@@ -3172,7 +3172,7 @@ def test_implement_outcome_unexpected_for_implement_tier_is_a_strike():
                 "status": "done", "result": _dispatch_result(outcome),
             }
             work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, (outcome, dict(item))
             assert outcome in item["note"], (outcome, item["note"])
 
@@ -3185,7 +3185,7 @@ def test_implement_outcome_missing_is_a_strike_never_guessed():
             "result": {"summary": "s", "schemaVersion": _sideclaw.DISPATCH_SCHEMA_VERSION},
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         # assert_outcome() (clients/sideclaw.py) catches a missing outcome
@@ -3200,7 +3200,7 @@ def test_implement_outcome_unrecognized_is_a_strike_never_guessed():
             "status": "done", "result": _dispatch_result("a_future_outcome_this_warden_does_not_know"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         # assert_outcome() (clients/sideclaw.py) catches a value outside
@@ -3227,7 +3227,7 @@ def test_implement_next_action_human_overrides_pr_opened():
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert validation_calls == [], "nextAction=human must never open a validation episode"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, item["state"]
         assert "needs a human to decide" in item["note"], item["note"]
 
@@ -3241,7 +3241,7 @@ def test_implement_result_schema_mismatch_is_a_loud_strike():
                                         schema_version=_sideclaw.DISPATCH_SCHEMA_VERSION - 1),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert 'schemaVersion' in item["note"], item["note"]
@@ -3257,7 +3257,7 @@ def test_implement_pr_opened_with_unparseable_pr_url_strikes_the_merge_train():
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         # The PR exists, only its train cannot address it: the item moves on to `merging` and
         # the update stage strikes.
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
@@ -3301,7 +3301,7 @@ def test_blocking_validation_blocks_the_merge_and_sends_the_findings_back_for_a_
             train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
             assert merge_calls == [], "a blocking validation must never call merge"
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == want, (revision_count, dict(item))
             assert "scripts/x.py:12" in item["note"] and "does not match the PR body" in item["note"], item["note"]
             d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
@@ -3335,7 +3335,7 @@ def test_cancelled_validation_job_never_merges_and_strikes_the_review():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == [], "a cancelled validation must never call merge"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert item["validation_job"] is None and item["retry_at"], dict(item)
 
@@ -3407,7 +3407,7 @@ def test_failed_review_is_resubmitted_after_the_backoff_and_the_third_failure_fa
         _merge.plan_or_land = _unexpected_merge
 
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert calls == [], "the resubmission waits out the backoff"
         assert item["state"] == core.STATE_MERGING and item["validation_job"] is None, dict(item)
         assert item["strikes"] == 1 and item["retry_at"] == (NOW + dt.timedelta(minutes=10)).isoformat()
@@ -3420,21 +3420,21 @@ def test_failed_review_is_resubmitted_after_the_backoff_and_the_third_failure_fa
 
         t1 = NOW + dt.timedelta(minutes=11)
         train.advance_merge_trains(conn, DEFAULT_POLICY, t1, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert len(calls) == 1 and calls[0]["pr"] == 10, calls
         assert item["validation_job"] == "review-job-000001" and item["state"] == core.STATE_MERGING
         d = conn.execute("SELECT validation_job_id FROM dispatches WHERE job_id='impl-rv-infra'").fetchone()
         assert d["validation_job_id"] == "review-job-000001"
 
         train.advance_merge_trains(conn, DEFAULT_POLICY, t1, dry_run=False)   # that review fails too
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["strikes"] == 2 and item["retry_at"] == (t1 + dt.timedelta(minutes=30)).isoformat(), dict(item)
 
         t2 = t1 + dt.timedelta(minutes=31)
         train.advance_merge_trains(conn, DEFAULT_POLICY, t2, dry_run=False)   # resubmit
         assert len(calls) == 2
         train.advance_merge_trains(conn, DEFAULT_POLICY, t2, dry_run=False)   # third failure
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert len(calls) == 2, "the third strike must not submit a third review"
         assert item["state"] == core.STATE_FAILED and item["strikes"] == 3, dict(item)
         assert "could not serialize" in item["note"], item["note"]
@@ -3448,7 +3448,7 @@ def test_done_review_with_no_result_is_an_infra_failure_too():
         calls: list[dict[str, Any]] = []
         _sideclaw.submit_review = _fake_submit_review(calls)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1 and item["validation_job"] is None, dict(item)
 
 
@@ -3468,7 +3468,7 @@ def test_a_review_with_a_verdict_resets_the_strike_count():
 
         _merge.plan_or_land = _flaky_merge
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert item["validation_job"] == "review-job-now", "the confirmed review is kept; only the merge retries"
 
@@ -3489,7 +3489,7 @@ def test_review_resubmit_refused_by_sideclaw_ends_the_item_without_retry():
         _sideclaw.submit_review = _refuse
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, item["state"]
         assert "nope" in (item["note"] or ""), item["note"]
         assert len(refusals) == 1, "a refused review is never submitted again"
@@ -3508,7 +3508,7 @@ def test_real_blocked_review_is_not_retried():
         _sideclaw.submit_review = _fake_submit_review(calls)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "a review that returned a verdict must never be re-submitted"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and "wrong comparator" in item["note"], dict(item)
         assert item["strikes"] == 0, "a real finding is not an infrastructure failure"
 
@@ -3539,7 +3539,7 @@ def test_validation_outcome_needs_decision_routes_to_needs_decision():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, item["state"]
         assert "the PR grants scope its body never mentions" in item["note"], item["note"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
@@ -3584,7 +3584,7 @@ def test_validation_needs_decision_with_blocking_goes_to_the_owner_and_is_never_
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, item["state"]
         assert "a human must rule on the check's exit semantics" in item["note"], item["note"]
         assert "scripts/check.sh:808" in item["note"], item["note"]
@@ -3596,8 +3596,8 @@ def test_validation_needs_decision_with_blocking_goes_to_the_owner_and_is_never_
         _sideclaw.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         assert calls == [], "a needs-human review is never a revisable finding"
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
-        assert core._get_item(conn, eid)["revision_count"] == 0
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
+        assert core.get_item(conn, eid)["revision_count"] == 0
 
 
 def test_validation_actionable_with_empty_blocking_confirms():
@@ -3694,7 +3694,7 @@ def test_blocking_validation_on_an_executor_repo_still_blocks():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]   # a revision attempt is pending
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
                          ("implement-job-gated-block",)).fetchone()
@@ -3733,7 +3733,7 @@ def test_validation_unknown_outcome_is_a_strike_never_merged():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == [], "an unrecognised review outcome must never call merge"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert "a_future_outcome_this_warden_does_not_know" in item["note"], item["note"]
         assert "refusing to parse" in item["note"], item["note"]
@@ -3767,7 +3767,7 @@ def test_validation_missing_outcome_never_reaches_confirmed():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == [], "a missing review outcome must never call merge"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
 
 
@@ -3797,7 +3797,7 @@ def test_validation_result_schema_mismatch_is_a_loud_strike():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert "schemaVersion" in item["note"] and "refusing to parse" in item["note"], item["note"]
 
@@ -3825,7 +3825,7 @@ def test_confirmed_validation_merge_policy_error_fails_the_item():
 
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED
         assert "merge gate refused" in item["note"]
         assert item["strikes"] == 0, "a refusal that will not clear is not retried"
@@ -3855,7 +3855,7 @@ def test_confirmed_validation_merge_remote_error_maybe_mutated_leaves_validating
 
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING, (
             "an ambiguous merge outcome must stay unresolved for reconcile_operations(), "
             f"got {item['state']}")
@@ -3884,7 +3884,7 @@ def test_confirmed_validation_merge_remote_error_not_mutated_is_a_strike():
 
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert "could not reach GitHub" in item["note"] and item["retry_at"], dict(item)
 
@@ -3918,7 +3918,7 @@ def test_a_merge_waiting_on_pending_checks_stays_merging_without_a_strike():
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
             _merge.ChecksPending("demo-repo's CI is still running on the head commit: build."))
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
         assert item["train_stage"] == train.TRAIN_CHECKS and item["reviewed_sha"] == TRAIN_SHA, dict(item)
         assert item["note"].startswith(train.MERGE_PENDING_NOTE_PREFIX), item["note"]
@@ -3931,7 +3931,7 @@ def test_a_merge_waiting_on_pending_checks_stays_merging_without_a_strike():
             AssertionError("the SHA a review confirmed is not reviewed again"))
         with _patched(_merge, plan_or_land=lambda *a, **kw: merges.append(kw) or fake_merged):
             train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
-        assert len(merges) == 1 and core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+        assert len(merges) == 1 and core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
         assert merges[0]["expected_sha"] == TRAIN_SHA, merges
 
 
@@ -3941,9 +3941,9 @@ def test_a_merge_another_process_is_already_landing_changes_nothing():
         _on_train(conn, eid, "merge", reviewed=TRAIN_SHA)
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
             _merge.MergeInFlight("a merge for job x is already in flight"))
-        before = dict(core._get_item(conn, eid))
+        before = dict(core.get_item(conn, eid))
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        after = core._get_item(conn, eid)
+        after = core.get_item(conn, eid)
         assert after["state"] == core.STATE_MERGING and after["note"] == before["note"], dict(after)
 
 
@@ -3987,7 +3987,7 @@ def test_confirmed_validation_merges_real_path_no_deploy():
             ):
                 train.advance_merge_trains(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING, item["state"]
         assert item["verify_started_at"] is None, "the deploy has not run yet"
         assert conn.execute("SELECT COUNT(*) FROM operations WHERE kind='deploy'").fetchone()[0] == 0
@@ -4027,7 +4027,7 @@ def test_poll_implement_syncs_its_own_dispatch_row_before_moving_to_validating()
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING, item["state"]
         d = conn.execute("SELECT status, artifact_url, finished_at, reported_at FROM dispatches "
                           "WHERE job_id=?", ("impl-sync-001",)).fetchone()
@@ -4039,7 +4039,7 @@ def test_poll_implement_syncs_its_own_dispatch_row_before_moving_to_validating()
 
 
 def test_poll_validation_syncs_the_review_jobs_own_dispatch_row():
-    """The REVIEW job opened by `_open_validation_dispatch()` gets its own
+    """The REVIEW job opened by `open_validation_dispatch()` gets its own
     `dispatches` row (job_id=validation_job, separate from the implement
     job's row) — this pins that poll_validation_jobs() folds the review job
     onto THAT row too, not just the `validation_status` column it already
@@ -4066,7 +4066,7 @@ def test_poll_validation_syncs_the_review_jobs_own_dispatch_row():
 
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, item["state"]
         d = conn.execute("SELECT status, finished_at, reported_at FROM dispatches WHERE job_id=?",
                           ("review-sync-001",)).fetchone()
@@ -4149,7 +4149,7 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
             ):
                 train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] != core.STATE_VERIFYING, (
             "the head commit's CI failed — a real merge must not land")
         assert item["note"] is not None
@@ -4188,7 +4188,7 @@ def _seed_verifying(conn, external_id: str, *, started: dt.datetime | None = Non
     eid = _seed_item(conn, external_id=external_id, state=core.STATE_VERIFYING,
                       pr_url="https://github.com/jkrumm/demo-repo/pull/9", **columns)
     if started is not None:
-        baseline = core._occurrence_mark(core._get_event(conn, eid)) if mark else None
+        baseline = core.occurrence_mark(core.get_event(conn, eid)) if mark else None
         conn.execute("UPDATE triage_items SET verify_started_at=?, verify_mark=? WHERE event_id=?",
                      (started.isoformat(), baseline, eid))
         conn.commit()
@@ -4204,10 +4204,10 @@ def test_no_deploy_target_goes_straight_to_verify_with_the_mark_as_baseline():
         eid = _seed_verifying(conn, "sig-no-deploy-target")
         ran = _fake_rollout(targets=())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert ran == [] and item["state"] == core.STATE_VERIFYING
         assert item["verify_started_at"] == NOW.isoformat() and item["verify_failures"] == 0
-        assert item["verify_mark"] == core._occurrence_mark(core._get_event(conn, eid)), dict(item)
+        assert item["verify_mark"] == core.occurrence_mark(core.get_event(conn, eid)), dict(item)
         assert conn.execute("SELECT COUNT(*) FROM operations WHERE kind='deploy'").fetchone()[0] == 0
 
 
@@ -4216,7 +4216,7 @@ def test_a_deploy_runs_once_records_its_operation_and_opens_the_window():
         eid = _seed_verifying(conn, "sig-deploy-ok")
         ran = _fake_rollout(targets=("deploy",), deploy=_ran(tail="deployed"))
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert ran == [("deploy", "demo-repo")], ran
         assert item["verify_started_at"] is not None and item["strikes"] == 0, dict(item)
         op = conn.execute("SELECT * FROM operations WHERE kind='deploy'").fetchone()
@@ -4233,7 +4233,7 @@ def test_a_dirty_checkout_defers_the_deploy_as_a_strike_with_backoff():
         syncs: list[str] = []
         _rollout.sync_checkout = lambda cwd, **kw: syncs.append(cwd.name) or _rollout.Deferred(reason)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING and item["strikes"] == 1, dict(item)
         assert reason in item["note"] and item["retry_at"] and item["verify_started_at"] is None, dict(item)
         assert ran == [], "neither make deploy nor make verify runs on a checkout that could not be synced"
@@ -4248,7 +4248,7 @@ def test_a_failing_deploy_strikes_and_the_third_strike_fails_the_item_with_the_o
         ran = _fake_rollout(targets=("deploy",), deploy=_ran(False, 2, "step one ok\nstep two: connection refused"))
         for n, minutes in enumerate((0, 11, 42), start=1):
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=minutes), dry_run=False)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["strikes"] == n, (n, dict(item))
         assert len(ran) == 3
         assert item["state"] == core.STATE_FAILED, dict(item)
@@ -4261,13 +4261,13 @@ def test_verify_passes_and_the_signal_stays_quiet_for_the_window_fixes_the_item(
         eid = _seed_verifying(conn, "sig-verify-ok", started=NOW - dt.timedelta(hours=1))
         ran = _fake_rollout(targets=("verify",), verify=_ran())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING and "window open" in item["verify_result"], dict(item)
         assert ctx.total_calls() == 0
 
         later = NOW + dt.timedelta(hours=core.VERIFY_WINDOW_HOURS)
         verify.maybe_verify(conn, DEFAULT_POLICY, later, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FIXED, dict(item)
         assert item["note"].startswith(verify.VERIFIED_NOTE_PREFIX) and "make verify passed" in item["note"]
         assert len(ctx.posted) == 1 and ctx.posted[0]["text"].startswith(":white_check_mark: "), ctx.posted
@@ -4279,10 +4279,10 @@ def test_no_signal_item_is_fixed_the_moment_verify_passes_and_waits_while_it_fai
         eid = _seed_verifying(conn, "sig-issue-item", started=NOW, origin="github_issue")
         _fake_rollout(targets=("verify",), verify=[_ran(False, 1, "boom"), _ran()])
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == 1, dict(item)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FIXED, "no window for an item with no signal"
         assert "make verify passed" in item["note"]
 
@@ -4292,7 +4292,7 @@ def test_a_repo_with_no_verify_target_and_no_signal_is_fixed_after_the_deploy():
         eid = _seed_verifying(conn, "sig-nothing-to-verify", origin="human")
         _fake_rollout(targets=())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FIXED and "no make verify target" in item["note"], dict(item)
 
 
@@ -4301,7 +4301,7 @@ def test_a_signal_item_without_a_verify_target_verifies_by_signal_alone():
         eid = _seed_verifying(conn, "sig-signal-only", started=NOW - dt.timedelta(hours=3))
         ran = _fake_rollout(targets=())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert ran == [] and item["state"] == core.STATE_FIXED, dict(item)
         assert "own signal quiet" in item["note"]
 
@@ -4328,7 +4328,7 @@ def test_a_signal_recurrence_during_verification_goes_through_the_failure_seam()
             verify._on_verify_failure = real_seam
         assert len(seen) == 1 and "recurred" in seen[0][1], seen
         assert ran == [], "no point verifying a change whose signal is already back"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED and verify.VERIFY_FAILED_NOTE_PREFIX in item["note"], dict(item)
         assert item["verify_started_at"] is None and item["verify_mark"] is None and item["verify_failures"] == 0
 
@@ -4341,11 +4341,11 @@ def test_three_consecutive_failing_verifications_go_through_the_failure_seam():
                                                    _ran(False, 1, "final tail")])
         for n, expected in enumerate((1, 0, 1, 2), start=0):
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10 * n), dry_run=False)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == expected, (n, dict(item))
         assert "make verify failed (exit 1)" in item["verify_result"]
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=40), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED, dict(item)
         assert "3 consecutive failing passes" in item["note"] and "final tail" in item["note"], item["note"]
 
@@ -4362,21 +4362,21 @@ def test_the_items_own_kuma_monitor_must_be_up_since_the_window_opened():
         conn.commit()
         _fake_rollout(targets=())
         probes: list[Any] = []
-        saved = work._gather_kuma_push_fresh
+        saved = work.gather_kuma_push_fresh
         try:
-            work._gather_kuma_push_fresh = lambda expected: probes.append(expected) or (False, "0 heartbeats")
+            work.gather_kuma_push_fresh = lambda expected: probes.append(expected) or (False, "0 heartbeats")
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == 1, dict(item)
             assert "own monitor not UP" in item["verify_result"], item["verify_result"]
             assert probes[0][0]["monitorTitle"] == "Brain Sync - Push"
             assert probes[0][0]["since"] == (NOW - dt.timedelta(hours=3)).isoformat()
 
-            work._gather_kuma_push_fresh = lambda expected: (True, "heartbeat OK")
+            work.gather_kuma_push_fresh = lambda expected: (True, "heartbeat OK")
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
         finally:
-            work._gather_kuma_push_fresh = saved
-        assert core._get_item(conn, eid)["state"] == core.STATE_FIXED
+            work.gather_kuma_push_fresh = saved
+        assert core.get_item(conn, eid)["state"] == core.STATE_FIXED
 
 
 def test_a_state_source_event_still_open_at_the_end_of_the_window_is_not_quiet():
@@ -4391,12 +4391,12 @@ def test_a_state_source_event_still_open_at_the_end_of_the_window_is_not_quiet()
         conn.commit()
         _fake_rollout(targets=())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING and "still firing" in item["verify_result"], dict(item)
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
         conn.commit()
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_FIXED
+        assert core.get_item(conn, eid)["state"] == core.STATE_FIXED
 
 
 def test_verify_dry_run_prints_and_runs_nothing():
@@ -4407,7 +4407,7 @@ def test_verify_dry_run_prints_and_runs_nothing():
         with contextlib.redirect_stdout(buf):
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=True)
         assert "[dry-run] would run make deploy, then make verify" in buf.getvalue(), buf.getvalue()
-        assert ran == [] and core._get_item(conn, eid)["verify_started_at"] is None
+        assert ran == [] and core.get_item(conn, eid)["verify_started_at"] is None
 
 
 def test_an_open_deploy_operation_after_a_crash_resolves_unknown_without_a_strike_and_runs_again():
@@ -4418,12 +4418,12 @@ def test_an_open_deploy_operation_after_a_crash_resolves_unknown_without_a_strik
         work.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
         row = conn.execute("SELECT outcome, receipt_json FROM operations WHERE op_id=?", (op,)).fetchone()
         assert row["outcome"] == "unknown" and "interrupted" in row["receipt_json"], dict(row)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING and item["strikes"] == 0 and item["verify_started_at"] is None
         ran = _fake_rollout(targets=("deploy",), deploy=_ran())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert ran == [("deploy", "demo-repo")]
-        assert core._get_item(conn, eid)["verify_started_at"] is not None
+        assert core.get_item(conn, eid)["verify_started_at"] is not None
 
 
 # --- Argo actions — owner-pulled implement/merge/dismiss/reinvestigate/note ---
@@ -4463,7 +4463,7 @@ def test_apply_argo_actions_unknown_verb_is_rejected_and_acked():
 def test_apply_argo_implement_on_needs_decision_item_opens_episode_and_sets_implement_job():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-implement")
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="ship it?")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="ship it?")
         conn.commit()
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
@@ -4473,7 +4473,7 @@ def test_apply_argo_implement_on_needs_decision_item_opens_episode_and_sets_impl
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
         assert len(calls) == 1, "implement must open exactly one sideclaw episode"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]
         assert item["implement_job"], "implement_job must be recorded"
 
@@ -4488,7 +4488,7 @@ def test_apply_argo_implement_on_wrong_state_item_is_rejected():
         eid = _insert_event(conn, source="slack_alert", external_id="sig-argo-implement-new",
                              title="New item", first_seen=OLD)
         intake.ingest(conn, NOW)
-        item_before = core._get_item(conn, eid)
+        item_before = core.get_item(conn, eid)
         assert item_before["state"] == core.STATE_NEW
 
         calls: list[dict[str, Any]] = []
@@ -4499,7 +4499,7 @@ def test_apply_argo_implement_on_wrong_state_item_is_rejected():
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
         assert calls == [], "an item not in needs_decision/failed must never dispatch"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEW, item["state"]
 
         assert len(ctx.argo_acks) == 1, ctx.argo_acks
@@ -4511,7 +4511,7 @@ def test_apply_argo_implement_on_wrong_state_item_is_rejected():
 def test_apply_argo_dismiss_with_no_reason_is_rejected():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-dismiss-empty")
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="waiting on a human")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="waiting on a human")
         conn.commit()
 
         _argo.fetch_actions = lambda machine, **kw: (
@@ -4519,7 +4519,7 @@ def test_apply_argo_dismiss_with_no_reason_is_rejected():
         )
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, item["state"]
         assert len(ctx.argo_acks) == 1, ctx.argo_acks
         ack = ctx.argo_acks[0]
@@ -4530,7 +4530,7 @@ def test_apply_argo_dismiss_with_no_reason_is_rejected():
 def test_apply_argo_dismiss_with_reason_on_needs_decision_closes_ignored():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-dismiss-ok")
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="waiting on a human")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="waiting on a human")
         conn.commit()
 
         _argo.fetch_actions = lambda machine, **kw: (
@@ -4538,7 +4538,7 @@ def test_apply_argo_dismiss_with_reason_on_needs_decision_closes_ignored():
         )
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_IGNORED, dict(item)
         assert item["note"] == "not worth doing", item["note"]
         assert len(ctx.argo_acks) == 1, ctx.argo_acks
@@ -4557,7 +4557,7 @@ def test_apply_argo_merge_on_an_item_that_is_neither_needs_decision_nor_failed_i
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
         assert merge_calls == []
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]
         assert len(ctx.argo_acks) == 1, ctx.argo_acks
         ack = ctx.argo_acks[0]
@@ -4568,7 +4568,7 @@ def test_apply_argo_merge_on_an_item_that_is_neither_needs_decision_nor_failed_i
 def test_apply_argo_note_appends_rather_than_overwrites():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-note")
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="original note")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="original note")
         conn.commit()
 
         _argo.fetch_actions = lambda machine, **kw: (
@@ -4576,7 +4576,7 @@ def test_apply_argo_note_appends_rather_than_overwrites():
         )
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, item["state"]
         assert item["note"].startswith("original note "), item["note"]
         assert "owner adds context" in item["note"], item["note"]
@@ -4590,7 +4590,7 @@ def test_apply_argo_implement_on_needs_decision_with_stale_implement_job_still_a
     # Argo must not be permanently blocked by that stale column.
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-implement-stale")
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="prior attempt needs a human")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="prior attempt needs a human")
         conn.execute("UPDATE triage_items SET implement_job=? WHERE event_id=?", ("stale-job-1", eid))
         conn.commit()
 
@@ -4602,7 +4602,7 @@ def test_apply_argo_implement_on_needs_decision_with_stale_implement_job_still_a
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
         assert len(calls) == 1, "a stale implement_job must not block a re-implement from Argo"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]
         assert item["implement_job"] != "stale-job-1", "the stale job id must be overwritten"
         assert len(ctx.argo_acks) == 1 and ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
@@ -4611,7 +4611,7 @@ def test_apply_argo_implement_on_needs_decision_with_stale_implement_job_still_a
 def test_apply_argo_note_redelivery_is_idempotent_not_duplicated():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-note-redelivery")
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="original note")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="original note")
         conn.commit()
 
         _argo.fetch_actions = lambda machine, **kw: (
@@ -4620,7 +4620,7 @@ def test_apply_argo_note_redelivery_is_idempotent_not_duplicated():
         notify.apply_argo_actions(conn, NOW, dry_run=False)
         notify.apply_argo_actions(conn, NOW, dry_run=False)  # simulates a redelivered action a1
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["note"].count("owner adds context") == 1, (
             f"a redelivered note action must not duplicate the text: {item['note']!r}")
         assert len(ctx.argo_acks) == 2
@@ -4632,14 +4632,14 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
         eid = _seed_verdict_item(conn, external_id="sig-argo-reinvestigate")
         conn.execute("UPDATE triage_items SET implement_job=?, validation_job=?, strikes=3 WHERE event_id=?",
                      ("stale-impl", "stale-val", eid))
-        core._set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3)
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3)
         conn.commit()
         _argo.fetch_actions = lambda machine, **kw: (
             "ok", [_argo_action("a1", eid, "reinvestigate"), _argo_action("a2", eid, "reinvestigate")]
         )
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
         assert item["dispatch_job"] is None and item["implement_job"] is None and item["validation_job"] is None
         assert [a["status"] for a in ctx.argo_acks] == ["applied", "rejected"], ctx.argo_acks
@@ -4648,7 +4648,7 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
         _sideclaw.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1, "the next escalation pass opens the fresh investigation"
-        assert core._get_item(conn, eid)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
 
 
 def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
@@ -4656,17 +4656,17 @@ def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
         eid1 = _seed_verdict_item(conn, external_id="sig-argo-raise", investigate_job="investigate-job-raise")
         eid2 = _seed_verdict_item(conn, external_id="sig-argo-after-raise",
                                    investigate_job="investigate-job-after-raise")
-        core._set_state(conn, eid2, core.STATE_NEEDS_DECISION, NOW, note="waiting")
+        core.set_state(conn, eid2, core.STATE_NEEDS_DECISION, NOW, note="waiting")
         conn.commit()
 
-        real_get_item = core._get_item
+        real_get_item = core.get_item
 
         def _flaky_get_item(conn_, event_id):
             if event_id == eid1:
                 raise RuntimeError("boom")
             return real_get_item(conn_, event_id)
 
-        core._get_item = _flaky_get_item
+        core.get_item = _flaky_get_item
         try:
             _argo.fetch_actions = lambda machine, **kw: (
                 "ok", [_argo_action("a1", eid1, "dismiss", {"reason": "x"}),
@@ -4674,9 +4674,9 @@ def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
             )
             notify.apply_argo_actions(conn, NOW, dry_run=False)
         finally:
-            core._get_item = real_get_item
+            core.get_item = real_get_item
 
-        item2 = core._get_item(conn, eid2)
+        item2 = core.get_item(conn, eid2)
         assert item2["state"] == core.STATE_CLOSED, (
             "a raising action must not stop the rest of the batch from being applied")
 
@@ -4735,8 +4735,8 @@ def test_build_argo_snapshot_bounds_embedded_history():
                              first_seen=VERY_OLD)
         intake.ingest(conn, NOW)
         for i in range(6):
-            core._set_state(conn, eid, core.STATE_WORKING, NOW + dt.timedelta(minutes=2 * i))
-            core._set_state(conn, eid, core.STATE_NEW, NOW + dt.timedelta(minutes=2 * i + 1))
+            core.set_state(conn, eid, core.STATE_WORKING, NOW + dt.timedelta(minutes=2 * i))
+            core.set_state(conn, eid, core.STATE_NEW, NOW + dt.timedelta(minutes=2 * i + 1))
         real_total = conn.execute(
             "SELECT COUNT(*) FROM item_transitions WHERE event_id=?", (eid,)
         ).fetchone()[0]
@@ -4873,7 +4873,7 @@ def test_heartbeat_skipped_under_dry_run():
 def _seed_item(conn, *, external_id: str, state: str, **columns) -> int:
     """One triage_items row parked in `state`, written directly: these cases are
     about what a poller does with a given row, so the test owns every column
-    instead of inheriting whatever _set_state() would compute."""
+    instead of inheriting whatever set_state() would compute."""
     eid = _insert_event(conn, source="slack_alert", external_id=external_id,
                          title=f"Seeded {external_id}", first_seen=OLD)
     cols = {
@@ -4911,17 +4911,17 @@ def test_state_vocabulary_is_the_spec_s_ten_states_and_matches_the_ledger_mirror
 
 
 def test_no_raw_state_transition_remains():
-    """Every transition goes through _set_state(), and this is what keeps it
+    """Every transition goes through set_state(), and this is what keeps it
     true: it is the one place that owns `close_reason` and the strike counter,
     so a raw `UPDATE triage_items SET state=` would skip both."""
     source = "\n".join(p.read_text() for p in [TRIAGE_PATH, *sorted((REPO_ROOT / "scripts" / "loop").glob("*.py"))])
     marker = "UPDATE triage_items SET state="
-    start = source.index("def _set_state(")
+    start = source.index("def set_state(")
     end = source.index("\ndef ", start)
     inside = source[start:end].count(marker)
     outside = source.count(marker) - inside
-    assert inside == 1, f"_set_state() should hold exactly one such statement, found {inside}"
-    assert outside == 0, f"{outside} raw state transition(s) outside _set_state()"
+    assert inside == 1, f"set_state() should hold exactly one such statement, found {inside}"
+    assert outside == 0, f"{outside} raw state transition(s) outside set_state()"
 
 
 def test_closed_always_carries_a_reason_and_every_other_state_clears_it():
@@ -4929,18 +4929,18 @@ def test_closed_always_carries_a_reason_and_every_other_state_clears_it():
         eid = _seed_item(conn, external_id="sig-closed-reason", state=core.STATE_NEEDS_DECISION)
         for bad in ({}, {"close_reason": None}, {"close_reason": "because"}):
             try:
-                core._set_state(conn, eid, core.STATE_CLOSED, NOW, **bad)
+                core.set_state(conn, eid, core.STATE_CLOSED, NOW, **bad)
             except ValueError:
                 pass
             else:
                 raise AssertionError(f"a closed transition with {bad!r} must raise")
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
 
         for reason in core.CLOSE_REASONS:
-            core._set_state(conn, eid, core.STATE_CLOSED, NOW, close_reason=reason, note="done")
-            assert core._get_item(conn, eid)["close_reason"] == reason
-        core._set_state(conn, eid, core.STATE_NEW, NOW)
-        assert core._get_item(conn, eid)["close_reason"] is None, (
+            core.set_state(conn, eid, core.STATE_CLOSED, NOW, close_reason=reason, note="done")
+            assert core.get_item(conn, eid)["close_reason"] == reason
+        core.set_state(conn, eid, core.STATE_NEW, NOW)
+        assert core.get_item(conn, eid)["close_reason"] is None, (
             "a reopened item must not keep the reason it was closed with")
 
 
@@ -4949,7 +4949,7 @@ def test_unknown_state_cannot_transition():
         eid = _seed_item(conn, external_id="sig-unknown-state", state=core.STATE_NEW)
         for bad in ("deploying", "dismissed", "verdict"):
             try:
-                core._set_state(conn, eid, bad, NOW)
+                core.set_state(conn, eid, bad, NOW)
             except ValueError as e:
                 assert "not a state of this machine" in str(e), str(e)
             else:
@@ -4960,23 +4960,23 @@ def test_strike_retries_with_backoff_then_the_third_strike_fails_with_the_reason
     with _triage_env() as (conn, _ctx):
         eid = _seed_item(conn, external_id="sig-strikes", state=core.STATE_WORKING,
                           implement_job="job-lost")
-        landed = core._strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING,
+        landed = core.strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING,
                               implement_job=None)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert landed == core.STATE_WORKING and item["state"] == core.STATE_WORKING
         assert item["strikes"] == 1 and item["implement_job"] is None
         assert item["retry_at"] == (NOW + dt.timedelta(minutes=10)).isoformat(), item["retry_at"]
         assert "sideclaw 503" in item["note"], item["note"]
 
         later = NOW + dt.timedelta(minutes=11)
-        core._strike(conn, eid, later, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
-        item = core._get_item(conn, eid)
+        core.strike(conn, eid, later, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
+        item = core.get_item(conn, eid)
         assert item["strikes"] == 2
         assert item["retry_at"] == (later + dt.timedelta(minutes=30)).isoformat(), item["retry_at"]
 
-        landed = core._strike(conn, eid, later, "sideclaw 503 again", retry_state=core.STATE_WORKING,
+        landed = core.strike(conn, eid, later, "sideclaw 503 again", retry_state=core.STATE_WORKING,
                               implement_job=None)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert landed == core.STATE_FAILED and item["state"] == core.STATE_FAILED
         assert item["note"] == "sideclaw 503 again", item["note"]
         assert item["strikes"] == 3 and item["retry_at"] is None
@@ -4989,8 +4989,8 @@ def test_strikes_reset_when_the_item_advances_to_merging():
     with _triage_env() as (conn, _ctx):
         eid = _seed_item(conn, external_id="sig-strike-reset", state=core.STATE_WORKING,
                           strikes=2, retry_at=NOW.isoformat())
-        core._set_state(conn, eid, core.STATE_MERGING, NOW, pr_url="https://github.com/o/r/pull/1")
-        item = core._get_item(conn, eid)
+        core.set_state(conn, eid, core.STATE_MERGING, NOW, pr_url="https://github.com/o/r/pull/1")
+        item = core.get_item(conn, eid)
         assert item["strikes"] == 0 and item["retry_at"] is None, dict(item)
 
 
@@ -5021,7 +5021,7 @@ def test_needs_decision_and_failed_never_expire_and_are_never_silence_resolved()
         assert calls == [], "neither state is ever re-dispatched"
         for eid, state, note in ((decide, core.STATE_NEEDS_DECISION, "ship it or not?"),
                                  (failed, core.STATE_FAILED, "retries exhausted")):
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == state and item["note"] == note, dict(item)
             rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=?", (eid,)).fetchall()
             assert rows == [], "no transition was ever recorded for either"
@@ -5036,7 +5036,7 @@ def test_a_pruned_implement_job_is_a_strike_not_a_stranded_item():
                           implement_job="impl-pruned", dispatch_job="inv-1")
         _sideclaw.get = lambda job_id: None
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None, "the lost handle is cleared so a fresh attempt starts"
         assert "impl-pruned" in item["note"] and item["retry_at"], dict(item)
@@ -5050,11 +5050,11 @@ def test_a_row_waiting_out_its_backoff_is_not_resubmitted_until_retry_at():
         _sideclaw.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "inside its backoff the row is skipped"
-        assert core._get_item(conn, eid)["state"] == core.STATE_TRIAGED
+        assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
 
         work.escalate(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=11), dry_run=False)
         assert len(calls) == 1, "past retry_at the row is submitted again"
-        assert core._get_item(conn, eid)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
 
 
 def test_a_closed_signature_that_recurs_comes_back_except_closed_ignored():
@@ -5077,7 +5077,7 @@ def test_a_closed_signature_that_recurs_comes_back_except_closed_ignored():
             reopening[ext] = eid
         intake.reopen_if_needed(conn, NOW)
         for ext, eid in reopening.items():
-            now_state = core._get_item(conn, eid)["state"]
+            now_state = core.get_item(conn, eid)["state"]
             want = core.STATE_CLOSED if ext == "sig-recur-ignored" else core.STATE_NEW
             assert now_state == want, f"{ext}: {now_state}"
 
@@ -5096,12 +5096,12 @@ def test_quiet_resolved_grouped_item_does_not_churn_with_no_new_occurrence():
                              title="🚨 quiet", first_seen=OLD,
                              payload={"ts_last": "1700000000.000001"})
         intake.ingest(conn, NOW)
-        core._set_state(conn, eid, core.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
-        stamped = core._get_item(conn, eid)
-        assert stamped["occurrence_mark"] is not None, "a fresh _set_state() call must stamp a mark"
+        core.set_state(conn, eid, core.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
+        stamped = core.get_item(conn, eid)
+        assert stamped["occurrence_mark"] is not None, "a fresh set_state() call must stamp a mark"
 
         intake.reopen_if_needed(conn, NOW)
-        after = core._get_item(conn, eid)
+        after = core.get_item(conn, eid)
         assert after["state"] == core.STATE_QUIET, "a quiet row with no new occurrence must not reopen"
         assert after["occurrence_mark"] == stamped["occurrence_mark"], "quiet row's mark must not move"
         assert after["note"] == stamped["note"], "quiet row's note must not be overwritten"
@@ -5116,14 +5116,14 @@ def test_new_ts_last_alone_reopens_a_quiet_resolved_grouped_item():
                              title="🚨 quiet", first_seen=OLD,
                              payload={"ts_last": "1700000000.000001"})
         intake.ingest(conn, NOW)
-        core._set_state(conn, eid, core.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
+        core.set_state(conn, eid, core.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
 
         conn.execute("UPDATE events SET payload_json=? WHERE id=?",
                      (json.dumps({"ts_last": "1700000500.000002"}), eid))
         conn.commit()
 
         intake.reopen_if_needed(conn, NOW)
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEW, (
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEW, (
             "a new ts_last alone must reopen a quiet-resolved grouped item")
 
 
@@ -5131,12 +5131,12 @@ def test_new_last_reminder_at_alone_reopens_a_quiet_resolved_item():
     """Case 3 — the emit-path shape: upsert_grouped() re-stamps
     last_reminder_at/reminder_count only when it actually emits. That alone
     must also reopen the row (neither family alone is sufficient, per
-    _occurrence_mark()'s docstring — this and the previous test cover both)."""
+    occurrence_mark()'s docstring — this and the previous test cover both)."""
     with _triage_env() as (conn, _ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-emit-recur",
                              title="🚨 quiet", first_seen=OLD)
         intake.ingest(conn, NOW)
-        core._set_state(conn, eid, core.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
+        core.set_state(conn, eid, core.STATE_QUIET, NOW, note="signal quiet since 2026-09-01")
 
         conn.execute(
             "UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
@@ -5145,7 +5145,7 @@ def test_new_last_reminder_at_alone_reopens_a_quiet_resolved_item():
         conn.commit()
 
         intake.reopen_if_needed(conn, NOW)
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEW, (
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEW, (
             "a new last_reminder_at/reminder_count alone must reopen a quiet-resolved item"
         )
 
@@ -5160,7 +5160,7 @@ def test_state_source_reopen_via_resolved_at_reset_still_reopens():
         eid = _insert_event(conn, source="uk", external_id="uk-monitor-1",
                              title="[X] [:red_circle: Down] uk monitor", first_seen=OLD)
         intake.ingest(conn, NOW)
-        core._set_state(conn, eid, core.STATE_QUIET, NOW, note=None)
+        core.set_state(conn, eid, core.STATE_QUIET, NOW, note=None)
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (OLD.isoformat(), eid))
         conn.commit()
 
@@ -5173,7 +5173,7 @@ def test_state_source_reopen_via_resolved_at_reset_still_reopens():
         conn.commit()
 
         intake.reopen_if_needed(conn, NOW)
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEW, (
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEW, (
             "a state-source reopen (the resolved_at/first_seen/... reset) must still reopen the item")
 
 
@@ -5195,16 +5195,16 @@ def test_adoption_null_occurrence_mark_does_not_reopen_but_gets_stamped():
              NOW.isoformat(), NOW.isoformat()),
         )
         conn.commit()
-        assert core._get_item(conn, eid)["occurrence_mark"] is None
+        assert core.get_item(conn, eid)["occurrence_mark"] is None
 
         intake.reopen_if_needed(conn, NOW)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_QUIET, "adoption of a NULL mark must not reopen the row"
         assert item["occurrence_mark"] is not None, "adoption must stamp a baseline mark"
 
 
 def test_occurrence_mark_keeps_the_two_clocks_separate():
-    """Case 7 — what fails if someone later 'simplifies' _occurrence_mark()
+    """Case 7 — what fails if someone later 'simplifies' occurrence_mark()
     to a single MAX() across ts_last and the ISO columns: ts_last is a Slack
     `ts` float-string ("1788850795.862159"), the other four slots are
     ISO-8601. A lexical MAX()/`>` across them compares "1788…" to "2026…" and
@@ -5217,12 +5217,12 @@ def test_occurrence_mark_keeps_the_two_clocks_separate():
         "first_seen": "2026-08-01T00:00:00+00:00",
         "reminder_count": 3,
     }
-    mark_a = core._occurrence_mark(base)
+    mark_a = core.occurrence_mark(base)
 
     # Changing ts_last alone must change the mark (case 2's invariant, proven
     # directly against the function rather than through reopen_if_needed()).
     bumped = dict(base, payload_json=json.dumps({"ts_last": "1788850900.000000"}))
-    mark_b = core._occurrence_mark(bumped)
+    mark_b = core.occurrence_mark(bumped)
     assert mark_a != mark_b, "changing ts_last alone must change the mark"
 
     # The ISO slots must survive INTACT in the string when ts_last is also
@@ -5231,7 +5231,7 @@ def test_occurrence_mark_keeps_the_two_clocks_separate():
     for slot in (base["last_reminder_at"], base["notified_at"], base["first_seen"]):
         assert slot in mark_a, f"{slot!r} missing from the mark — an ISO clock got merged with ts_last"
 
-    assert core._occurrence_mark(None) is None
+    assert core.occurrence_mark(None) is None
 
 
 # --- the `resolved` -> fixed/quiet/closed split ------------------------------
@@ -5258,7 +5258,7 @@ def test_recovery_paired_never_produces_fixed():
 
         intake.resolve_recovery_paired(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] != core.STATE_FIXED, (
             "DESIGN.md § What must not be lost, item 4: recovery-pairing is a positive OBSERVATION, "
             "never a confirmed fix — the service recovering does not tell us whether we caused it"
@@ -5267,7 +5267,7 @@ def test_recovery_paired_never_produces_fixed():
 
 
 def test_set_state_records_transitions_only_on_real_change():
-    """_set_state() is the only writer of item_transitions, appending exactly
+    """set_state() is the only writer of item_transitions, appending exactly
     one row per REAL state change and nothing for a column-only write with the
     state unchanged (column-only writers such as dispatch_job) — recording those would fill the table with noise
     and corrupt every duration /metrics computes from it."""
@@ -5277,14 +5277,14 @@ def test_set_state_records_transitions_only_on_real_change():
         intake.ingest(conn, NOW)
 
         # ingest()'s own INSERT already recorded one `created` row (from_state
-        # NULL, to_state=new) via _record_created_transition() — not this
+        # NULL, to_state=new) via record_created_transition() — not this
         # function's concern, but it is the baseline every count below starts from.
         rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)).fetchall()
         assert len(rows) == 1, rows
         assert rows[0]["from_state"] is None
         assert rows[0]["to_state"] == core.STATE_NEW
 
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job="job-t1")
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job="job-t1")
         rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)).fetchall()
         assert len(rows) == 2, rows
         assert rows[1]["from_state"] == core.STATE_NEW
@@ -5292,11 +5292,11 @@ def test_set_state_records_transitions_only_on_real_change():
         assert rows[1]["note"] is None
 
         # Column-only write, state unchanged — must NOT be recorded.
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job="job-t1")
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job="job-t1")
         rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=?", (eid,)).fetchall()
         assert len(rows) == 2, "a column-only write with the state unchanged must not be recorded"
 
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="deadline expired: test")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="deadline expired: test")
         rows = conn.execute("SELECT * FROM item_transitions WHERE event_id=? ORDER BY id", (eid,)).fetchall()
         assert len(rows) == 3, rows
         assert rows[2]["from_state"] == core.STATE_WORKING
@@ -5312,7 +5312,7 @@ def test_cmd_close_closes_with_reason_and_refuses_empty_reason_or_unknown_signat
         rc = triage.cmd_close(
             conn, ["--close", "slack_alert:sig-close-me", "--reason", "manual fix, verified by eye"], NOW)
         assert rc == 0
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED
         assert item["note"] == "manual fix, verified by eye"
 
@@ -5329,11 +5329,11 @@ def test_cmd_ignore_closes_ignored_and_cmd_reopen_returns_the_item_to_new():
         intake.ingest(conn, NOW)
 
         assert triage.cmd_ignore(conn, ["--ignore", "slack_alert:sig-ign-reopen"], NOW) == 0
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_IGNORED
 
         assert triage.cmd_reopen(conn, ["--reopen", "slack_alert:sig-ign-reopen"], NOW) == 0
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEW and item["close_reason"] is None
         assert triage.cmd_ignore(conn, ["--ignore", "slack_alert:nope"], NOW) != 0
 
@@ -5427,7 +5427,7 @@ def test_auto_implement_maps_each_failure_mode():
 
         _sideclaw.submit = _timing_out_submit
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item1 = core._get_item(conn, eid1)
+        item1 = core.get_item(conn, eid1)
         assert item1["state"] == core.STATE_WORKING and item1["strikes"] == 0, (
             f"a maybe-mutated failure must NOT strike or roll back — got {dict(item1)}")
         assert item1["implement_job"] == core.IMPLEMENT_CLAIM, "the claim stays"
@@ -5438,7 +5438,7 @@ def test_auto_implement_maps_each_failure_mode():
         later = NOW + dt.timedelta(hours=1)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, later, dry_run=False)
         work.poll_implement_jobs(conn, DEFAULT_POLICY, later, dry_run=False)
-        assert len(submits) == 1 and core._get_item(conn, eid1)["implement_job"] == core.IMPLEMENT_CLAIM
+        assert len(submits) == 1 and core.get_item(conn, eid1)["implement_job"] == core.IMPLEMENT_CLAIM
         # reconcile_operations() has no job id to poll: inside the 30 min grace it leaves the
         # operation and the claim alone; after it, the operation resolves `unknown` and the item
         # strikes back to `working` for a fresh attempt.
@@ -5446,11 +5446,11 @@ def test_auto_implement_maps_each_failure_mode():
         conn.execute("UPDATE operations SET started_at=? WHERE event_id=?", (NOW.isoformat(), eid1))
         conn.commit()
         work.reconcile_operations(conn, DEFAULT_POLICY, inside, dry_run=False)
-        item1 = core._get_item(conn, eid1)
+        item1 = core.get_item(conn, eid1)
         assert item1["implement_job"] == core.IMPLEMENT_CLAIM and item1["strikes"] == 0, dict(item1)
         assert conn.execute("SELECT outcome FROM operations WHERE event_id=?", (eid1,)).fetchone()["outcome"] is None
         work.reconcile_operations(conn, DEFAULT_POLICY, later, dry_run=False)
-        item1 = core._get_item(conn, eid1)
+        item1 = core.get_item(conn, eid1)
         assert item1["state"] == core.STATE_WORKING and item1["implement_job"] is None, dict(item1)
         assert item1["strikes"] == 1 and item1["note"].startswith(
             "ambiguous implement submit — retried after 30 min grace"), dict(item1)
@@ -5464,7 +5464,7 @@ def test_auto_implement_maps_each_failure_mode():
         _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(
             RemoteError("sideclaw refused the submission"))
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item2 = core._get_item(conn, eid2)
+        item2 = core.get_item(conn, eid2)
         assert item2["state"] == core.STATE_WORKING, "a definite failure must hand the claim back"
         assert item2["implement_job"] is None
         op2 = conn.execute("SELECT outcome FROM operations WHERE event_id=? AND kind='implement'",
@@ -5476,7 +5476,7 @@ def test_auto_implement_maps_each_failure_mode():
         with _patched(_dispatch, open_episode=lambda *a, **kw: (_ for _ in ()).throw(
                 PolicyError("test: refused at open_episode"))):
             work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item3 = core._get_item(conn, eid3)
+        item3 = core.get_item(conn, eid3)
         assert item3["state"] == core.STATE_WORKING, item3["state"]
         assert (item3["note"] or "").startswith("deferred: "), item3["note"]
 
@@ -5484,7 +5484,7 @@ def test_auto_implement_maps_each_failure_mode():
                                    investigate_job="investigate-map-success", repo="argo")
         _sideclaw.submit = _fake_submit([])
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item4 = core._get_item(conn, eid4)
+        item4 = core.get_item(conn, eid4)
         assert item4["state"] == core.STATE_WORKING
         assert item4["implement_job"] is not None
         op4 = conn.execute("SELECT outcome FROM operations WHERE event_id=? AND kind='implement'",
@@ -5521,7 +5521,7 @@ def test_reconcile_implement_sideclaw_404_becomes_unknown_not_failed_and_strikes
         assert op["outcome"] == "unknown", op["outcome"]
         assert op["reconciled_at"] is not None, "every row reconcile_operations() touches must be stamped"
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
 
@@ -5565,7 +5565,7 @@ def test_reconcile_merge_github_reports_merged_becomes_done_with_merge_commit_no
         assert receipt["pullRequest"] == 8
         assert "deploy" not in receipt, "the deploy is the verify pass's, not the merge receipt's"
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] != core.STATE_FAILED, (
             "a PR GitHub reports merged must never be recorded failed")
         # And it must not be left in `validating` either — see
@@ -5603,7 +5603,7 @@ def test_reconcile_merged_operation_advances_the_item_instead_of_leaving_it_to_e
 
         work.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING, (
             f"a reconciled merge must advance the item, not leave it in `validating` to expire "
             f"into failed — got {item['state']!r}")
@@ -5645,7 +5645,7 @@ def test_reconcile_operations_runs_before_anything_that_could_retry():
 
         assert implement_calls == [], (
             "maybe_auto_implement() must never fire while this item's operation is unreconciled")
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["strikes"] == 0 and item["state"] == core.STATE_WORKING, (
             f"an operation with no job id stays open through its grace window: {dict(item)}")
 
@@ -5656,7 +5656,7 @@ def test_reconcile_operations_runs_before_anything_that_could_retry():
         conn.commit()
         triage.run(conn, dry_run=False)
         assert implement_calls == [], "the strike's backoff keeps the resubmission waiting"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1 and item["retry_at"], (
             "reconcile_operations() must have already struck the item this same pass: "
             f"{dict(item)}")
@@ -5706,7 +5706,7 @@ def _argo_url(url: str = "https://argo.example.test/api"):
 
 
 def _notify(conn, eid, *, dry_run=False):
-    notify.notify_cluster(conn, [core._get_item(conn, eid)], [core._get_event(conn, eid)],
+    notify.notify_cluster(conn, [core.get_item(conn, eid)], [core.get_event(conn, eid)],
                           DEFAULT_POLICY, dry_run=dry_run)
 
 
@@ -5760,13 +5760,13 @@ def test_notify_posts_once_per_entry_and_again_on_reentry():
         triage.run(conn, dry_run=False)
         triage.run(conn, dry_run=False)
         assert len(ctx.posted) == 1, ctx.posted
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["card_hash"] == core.STATE_NEEDS_DECISION and item["card_ts"] == ctx.posted[0]["ts"]
 
         # Leaving the state clears the dedupe marker; entering it again is a new entry.
-        core._set_state(conn, eid, core.STATE_WORKING, NOW)
-        assert core._get_item(conn, eid)["card_hash"] is None
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="which one now?")
+        core.set_state(conn, eid, core.STATE_WORKING, NOW)
+        assert core.get_item(conn, eid)["card_hash"] is None
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="which one now?")
         conn.commit()
         triage.run(conn, dry_run=False)
         triage.run(conn, dry_run=False)
@@ -5779,7 +5779,7 @@ def test_notify_a_failed_post_is_retried_on_the_next_pass():
         real = core.post_line
         core.post_line = lambda channel, text, token, *, thread_ts=None: (False, None)
         _notify(conn, eid)
-        assert core._get_item(conn, eid)["card_hash"] is None
+        assert core.get_item(conn, eid)["card_hash"] is None
         core.post_line = real
         _notify(conn, eid)
         assert len(ctx.posted) == 1
@@ -5795,7 +5795,7 @@ def test_notify_cluster_posts_one_line_for_the_primary_member():
         triage.run(conn, dry_run=False)
         assert len(ctx.posted) == 1, ctx.posted
         assert ctx.posted[0]["text"].startswith(":raising_hand: demo-repo: q? — needs_decision"), ctx.posted
-        assert {core._get_item(conn, e)["card_hash"] for e in (e1, e2)} == {core.STATE_NEEDS_DECISION}
+        assert {core.get_item(conn, e)["card_hash"] for e in (e1, e2)} == {core.STATE_NEEDS_DECISION}
 
 
 def test_notify_answers_in_the_origin_thread_when_the_item_has_one():
@@ -5813,7 +5813,7 @@ def test_notify_dry_run_never_posts():
         _notify(conn, eid, dry_run=True)
         triage.run(conn, dry_run=True)
         assert ctx.posted == []
-        assert core._get_item(conn, eid)["card_hash"] is None
+        assert core.get_item(conn, eid)["card_hash"] is None
 
 
 def test_failed_entry_never_posts_but_the_daily_digest_counts_failed_items():
@@ -5858,21 +5858,21 @@ def test_set_state_caps_the_note_to_one_short_line():
     with _triage_env() as (conn, _ctx):
         eid = _seed_item(conn, external_id="sig-note-cap", state=core.STATE_WORKING)
         long_note = "first line\n\n  second   line\t" + "x" * 500
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note=long_note)
-        note = core._get_item(conn, eid)["note"]
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note=long_note)
+        note = core.get_item(conn, eid)["note"]
         assert len(note) == 200 and note.endswith("…") and "\n" not in note, note
         assert note.startswith("first line second line xxx"), note
         transition = conn.execute("SELECT note FROM item_transitions WHERE event_id=? ORDER BY id DESC",
                                   (eid,)).fetchone()
         assert transition["note"] == note, "history carries the capped note too"
 
-        core._set_state(conn, eid, core.STATE_FAILED, NOW, note=core._Coalesce("y" * 300))
-        assert len(core._get_item(conn, eid)["note"]) == 200
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note=core.Coalesce("y" * 300))
+        assert len(core.get_item(conn, eid)["note"]) == 200
 
-        core._set_state(conn, eid, core.STATE_FAILED, NOW, note="short\nnote")
-        assert core._get_item(conn, eid)["note"] == "short note"
-        core._set_state(conn, eid, core.STATE_FAILED, NOW, note=None)
-        assert core._get_item(conn, eid)["note"] is None
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="short\nnote")
+        assert core.get_item(conn, eid)["note"] == "short note"
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note=None)
+        assert core.get_item(conn, eid)["note"] is None
 
 
 def test_cli_transition_caps_the_note_too():
@@ -5880,7 +5880,7 @@ def test_cli_transition_caps_the_note_too():
         eid = _seed_item(conn, external_id="sig-note-cap-cli", state=core.STATE_WORKING)
         _items.transition(conn, eid, to_state=core.STATE_CLOSED, now=NOW, note="aborted: " + "z\n" * 300,
                           extra={"close_reason": core.CLOSE_IGNORED})
-        note = core._get_item(conn, eid)["note"]
+        note = core.get_item(conn, eid)["note"]
         assert len(note) == 200 and "\n" not in note, note
 
 
@@ -5901,7 +5901,7 @@ def test_comment_back_is_at_most_three_lines():
                          "evidence": [{"file": "x.py", "detail": "y"}] * 5,
                          "artifactUrl": "https://github.com/jkrumm/argo/pull/31"}), NOW.isoformat()),
         )
-        core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
         comments: list[str] = []
         _github.create_issue_comment = lambda repo_full, number, body: comments.append(body) or {"id": 1}
@@ -5955,7 +5955,7 @@ def _fold(conn, eid: int, answer: dict[str, Any] | None, *, job_id: str = "triag
 
 
 def _rows(conn, eid: int) -> sqlite3.Row:
-    return core._get_item(conn, eid)
+    return core.get_item(conn, eid)
 
 
 # -- label routing --
@@ -5967,7 +5967,7 @@ def test_label_route_issue_and_human_carry_their_own_repo():
         human = intake.open_origin_item(conn, origin="human", repo="not-a-checkout", brief="b",
                                          max_tier="investigate", external_id="human:1", title="ask", now=NOW)
         for eid, repo in ((issue, "argo"), (human, "not-a-checkout")):
-            assert _intake.route_by_label(_rows(conn, eid), core._get_event(conn, eid)) == repo
+            assert _intake.route_by_label(_rows(conn, eid), core.get_event(conn, eid)) == repo
 
 
 def test_label_route_kuma_tag_equal_to_a_known_repo():
@@ -5983,7 +5983,7 @@ def test_label_route_kuma_tag_equal_to_a_known_repo():
         for i, (tags, expected) in enumerate(cases):
             eid = _seed_row(conn, external_id=f"{i}", title=f"Monitor {i}", source="uk",
                             payload={"type": "http", "status": 0, "tags": tags})
-            got = _intake.route_by_label(_rows(conn, eid), core._get_event(conn, eid))
+            got = _intake.route_by_label(_rows(conn, eid), core.get_event(conn, eid))
             assert got == expected, (tags, got)
 
 
@@ -5996,7 +5996,7 @@ def test_label_route_docker_container_name_equal_to_a_known_repo():
                             source="docker_homelab")
         other = _seed_row(conn, external_id="unhealthy:redis", title="redis unhealthy (vps)", source="docker_vps")
         for eid, expected in ((known, "weatherorb"), (restart, "weatherorb"), (other, None)):
-            assert _intake.route_by_label(_rows(conn, eid), core._get_event(conn, eid)) == expected
+            assert _intake.route_by_label(_rows(conn, eid), core.get_event(conn, eid)) == expected
 
 
 def test_label_route_otel_service_name_in_an_alert_text():
@@ -6011,11 +6011,11 @@ def test_label_route_otel_service_name_in_an_alert_text():
         ]
         for i, (title, expected) in enumerate(cases):
             eid = _seed_row(conn, external_id=f"otel-{i}", title=title)
-            assert _intake.route_by_label(_rows(conn, eid), core._get_event(conn, eid)) == expected, title
+            assert _intake.route_by_label(_rows(conn, eid), core.get_event(conn, eid)) == expected, title
         # The label can sit in the payload text instead of the title.
         eid = _seed_row(conn, external_id="otel-payload", title="🚨 alert",
                         payload={"first_text": "🚨 alert (service.name: audio-gateway)"})
-        assert _intake.route_by_label(_rows(conn, eid), core._get_event(conn, eid)) == "audio-gateway"
+        assert _intake.route_by_label(_rows(conn, eid), core.get_event(conn, eid)) == "audio-gateway"
 
 
 def test_known_repos_need_an_agents_md_and_skip_worktrees():
@@ -6034,7 +6034,7 @@ def test_known_repos_need_an_agents_md_and_skip_worktrees():
 # -- the prompt --
 
 def _prompt_for(conn, eid: int, candidates: list[str]) -> str:
-    return _intake.build_triage_prompt(conn, _rows(conn, eid), core._get_event(conn, eid), candidates, NOW)
+    return _intake.build_triage_prompt(conn, _rows(conn, eid), core.get_event(conn, eid), candidates, NOW)
 
 
 def test_prompt_carries_the_verify_and_monitor_section_only():
@@ -6386,7 +6386,7 @@ def test_a_fold_loses_to_a_pass_that_moved_the_item_first():
         eid = _seed_row(conn, external_id="race", title="Race")
         conn.execute("UPDATE triage_items SET triage_job='t-race' WHERE event_id=?", (eid,))
         conn.commit()
-        core._set_state(conn, eid, core.STATE_QUIET, NOW)   # silence-resolve got there first
+        core.set_state(conn, eid, core.STATE_QUIET, NOW)   # silence-resolve got there first
         assert triaging._fold_triage_job(conn, eid, "t-race", _triage_job(
             {"action": "new", "repo": "demo-repo", "reason": "r"}, job_id="t-race"), NOW) is None
         assert _rows(conn, eid)["state"] == core.STATE_QUIET
@@ -6646,7 +6646,7 @@ def test_a_recurring_duplicate_bumps_its_open_target_instead_of_reopening():
         intake.ingest(conn, NOW)
         target = _seed_row(conn, external_id="o/r#32", title="Target", repo="demo-repo", state=core.STATE_WORKING,
                            occurrences=2, origin="github_issue", source="github_go")
-        core._set_state(conn, eid, core.STATE_CLOSED, NOW, close_reason=core.CLOSE_DUPLICATE,
+        core.set_state(conn, eid, core.STATE_CLOSED, NOW, close_reason=core.CLOSE_DUPLICATE,
                         duplicate_of=target)
         _recur_ts(conn, eid, "1788850795.862159")
         intake.reopen_if_needed(conn, NOW)
@@ -6667,7 +6667,7 @@ def test_a_recurring_duplicate_reopens_when_its_target_is_done():
             eid = _insert_event(conn, source="slack_alert", external_id=f"dup-{i}", title="Dup", first_seen=OLD)
             intake.ingest(conn, NOW)
             conn.execute("UPDATE triage_items SET triage_job='t-old' WHERE event_id=?", (eid,))
-            core._set_state(conn, eid, core.STATE_CLOSED, NOW, close_reason=core.CLOSE_DUPLICATE,
+            core.set_state(conn, eid, core.STATE_CLOSED, NOW, close_reason=core.CLOSE_DUPLICATE,
                             duplicate_of=target)
             _recur_ts(conn, eid, "1788850795.862159")
             intake.reopen_if_needed(conn, NOW)
@@ -6779,7 +6779,7 @@ def test_a_reopened_item_is_triaged_again():
         intake.ingest(conn, NOW)
         _triage_pass(conn)
         assert _rows(conn, eid)["state"] == core.STATE_TRIAGED
-        core._set_state(conn, eid, core.STATE_QUIET, NOW)
+        core.set_state(conn, eid, core.STATE_QUIET, NOW)
         _recur_ts(conn, eid, "1788850795.862159")
         intake.reopen_if_needed(conn, NOW)
         item = _rows(conn, eid)
@@ -6802,7 +6802,7 @@ def test_uk_rule_routes_via_the_title_not_the_external_id():
     policy = dict(DEFAULT_POLICY, rules=[{"match": "uk:macmini-dev-host-push", "repo": "dotfiles"}])
     with _triage_env(policy=policy) as (conn, ctx):
         eid = _seed_row(conn, external_id="204", title="MacMini Dev Host - Push", source="uk")
-        assert intake._label_route(_rows(conn, eid), core._get_event(conn, eid)) == "dotfiles"
+        assert intake.label_route(_rows(conn, eid), core.get_event(conn, eid)) == "dotfiles"
 
 
 def test_the_shipped_policy_routes_argo_infra_signals_to_vps():
@@ -6820,7 +6820,7 @@ def test_the_shipped_policy_routes_argo_infra_signals_to_vps():
         ("slack_alert:dashboard-http-red-circle-down-connect-econnrefused-100-97-220-54-443-channel", "vps"),
     ]
     for target, expected_repo in cases:
-        matched = core._match_rule([target], rules)
+        matched = core.match_rule([target], rules)
         assert matched is not None, f"{target!r} matched no rule in the shipped policy"
         assert matched["repo"] == expected_repo, (target, matched)
     assert not any(r["repo"] == "argo" for r in rules), "no rule may point at `argo` — the deploy target is `vps`"
@@ -6865,7 +6865,7 @@ def test_a_native_label_wins_over_a_rule():
                            source="docker_vps")
         ruled = _seed_row(conn, external_id="unhealthy:redis", title="redis unhealthy (vps)", source="docker_vps")
         for eid, expected in ((native, "weatherorb"), (ruled, "vps")):
-            assert intake._label_route(_rows(conn, eid), core._get_event(conn, eid)) == expected
+            assert intake.label_route(_rows(conn, eid), core.get_event(conn, eid)) == expected
 
 
 def test_a_corrected_rule_applies_at_the_next_triage_of_a_recurring_alert():
@@ -6874,10 +6874,10 @@ def test_a_corrected_rule_applies_at_the_next_triage_of_a_recurring_alert():
     with _triage_env(policy=dict(DEFAULT_POLICY, rules=[{"match": "uk:226", "repo": "demo-repo"}])) as (conn, ctx):
         _add_repo(ctx, "homelab")
         eid = _seed_row(conn, external_id="226", title="MyAnonamouse Session - Push", source="uk")
-        ev = core._get_event(conn, eid)
-        assert intake._label_route(_rows(conn, eid), ev) == "demo-repo"
+        ev = core.get_event(conn, eid)
+        assert intake.label_route(_rows(conn, eid), ev) == "demo-repo"
         _write_json(core.POLICY_PATH, dict(DEFAULT_POLICY, rules=[{"match": "uk:226", "repo": "homelab"}]))
-        assert intake._label_route(_rows(conn, eid), ev) == "homelab"
+        assert intake.label_route(_rows(conn, eid), ev) == "homelab"
 
 
 def test_rule_routing_runs_before_the_prose_filter():
@@ -6923,7 +6923,7 @@ def _model_ignored(conn, ext: str, *, closed_at: dt.datetime) -> int:
     intake.ingest(conn, NOW)
     conn.execute("UPDATE triage_items SET triage_job='t-ign' WHERE event_id=?", (eid,))
     conn.commit()
-    core._set_state(conn, eid, core.STATE_CLOSED, closed_at, close_reason=core.CLOSE_IGNORED,
+    core.set_state(conn, eid, core.STATE_CLOSED, closed_at, close_reason=core.CLOSE_IGNORED,
                     note="ignored: noise")
     conn.commit()
     return eid
@@ -6953,7 +6953,7 @@ def test_a_human_ignored_alert_never_reopens():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="hi-1", title="Hand ignored", first_seen=OLD)
         intake.ingest(conn, NOW)
-        core._set_state(conn, eid, core.STATE_CLOSED, NOW - dt.timedelta(days=3), close_reason=core.CLOSE_IGNORED)
+        core.set_state(conn, eid, core.STATE_CLOSED, NOW - dt.timedelta(days=3), close_reason=core.CLOSE_IGNORED)
         conn.commit()
         _recur_ts(conn, eid, "1788850795.862159")
         intake.reopen_if_needed(conn, NOW, DEFAULT_POLICY)
@@ -6993,7 +6993,7 @@ def test_a_recurring_duplicate_does_not_count_on_an_alert_target():
         intake.ingest(conn, NOW)
         target = _seed_row(conn, external_id="rt-a", title="Target", repo="demo-repo", state=core.STATE_WORKING,
                            occurrences=2)
-        core._set_state(conn, eid, core.STATE_CLOSED, NOW, close_reason=core.CLOSE_DUPLICATE,
+        core.set_state(conn, eid, core.STATE_CLOSED, NOW, close_reason=core.CLOSE_DUPLICATE,
                         duplicate_of=target)
         _recur_ts(conn, eid, "1788850795.862159")
         intake.reopen_if_needed(conn, NOW)
@@ -7074,11 +7074,11 @@ def test_a_claim_with_no_job_and_no_operation_is_released_for_a_fresh_dispatch()
                               authorized_by="auto-from-item")
         _sideclaw.get = lambda job_id: None
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["implement_job"] is None, dict(item)
         assert (item["note"] or "").startswith("reclaimed: "), item["note"]
-        assert core._get_item(conn, eid3)["implement_job"] is None, "a host-verb claim is released the same way"
-        item2 = core._get_item(conn, eid2)
+        assert core.get_item(conn, eid3)["implement_job"] is None, "a host-verb claim is released the same way"
+        item2 = core.get_item(conn, eid2)
         assert item2["implement_job"] == core.IMPLEMENT_CLAIM, "an open operation means reconcile owns it"
 
 
@@ -7109,7 +7109,7 @@ def test_merging_item_already_merged_lands_from_the_receipt_without_a_second_mer
         with _patched(_merge, plan_or_land=lambda *a, **kw: merges.append(kw) or None):
             train.advance_merge_trains(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
         assert merges == [], "merge must not be called for a dispatch that already carries merged_at"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING, item["state"]
         assert item["verify_started_at"] is None, "the deploy has not run yet"
 
@@ -7142,7 +7142,7 @@ def test_reconcile_open_pr_after_a_crash_before_the_put_is_a_merge_strike():
         op = conn.execute("SELECT outcome, receipt_json FROM operations WHERE op_id=?", (op_id,)).fetchone()
         assert op["outcome"] == "failed" and json.loads(op["receipt_json"]).get("state") == "OPEN", dict(op)
         assert "untouched" not in (op["receipt_json"] or "")
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert "the pull request is not merged" in (item["note"] or ""), item["note"]
 
@@ -7156,7 +7156,7 @@ def test_reconcile_closed_pr_is_a_merge_strike_too():
             pr_url="https://github.com/jkrumm/vps/pull/22")
         work._run_gh_pr_view = lambda owner, repo, pr: {"state": "CLOSED", "mergeCommit": None}
         work.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         op = conn.execute("SELECT outcome, receipt_json FROM operations WHERE op_id=?", (op_id,)).fetchone()
         assert op["outcome"] == "failed" and "untouched" not in (op["receipt_json"] or "")
@@ -7192,7 +7192,7 @@ def _seed_host_verb_item(conn, *, external_id="175", title="Hermes Agent", repo=
                           state=None, confidence="high", next_action="human",
                           investigate_job="investigate-host") -> int:
     """A `uk`-sourced item whose TITLE-derived match target (`uk:hermes-agent`
-    — see _match_targets()) matches HOST_VERB_POLICY's own seeded `hostVerbs`
+    — see match_targets()) matches HOST_VERB_POLICY's own seeded `hostVerbs`
     rule. Same shape _seed_verdict_item() uses for the implement chain above,
     keyed by title rather than the bare numeric monitor id because that IS
     the target maybe_auto_remediate() actually matches against."""
@@ -7252,7 +7252,7 @@ def test_every_host_verb_has_a_liveness_monitor():
     """Enforced at import time too (see the AssertionError right after
     HOST_VERB_LIVENESS_MONITOR's own definition) — a verb with no monitor
     would still run, but its item's `deploy_expect_json` would carry no
-    `monitorTitle`, and _gather_kuma_push_fresh() unconditionally refuses an
+    `monitorTitle`, and gather_kuma_push_fresh() unconditionally refuses an
     empty `expected`, so the item would cycle verifying -> new
     forever, never confirmed and never escalated to a human either. This
     test is the regression: it fails LOUDLY here, at test time, if the two
@@ -7277,7 +7277,7 @@ def test_auto_remediate_fires_at_the_default_medium_floor_not_below_it():
                                         investigate_job="investigate-low")
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
 
-        item_med = core._get_item(conn, eid_med)
+        item_med = core.get_item(conn, eid_med)
         assert item_med["state"] == core.STATE_VERIFYING, item_med["state"]
         op = conn.execute("SELECT kind, outcome, repo, receipt_json FROM operations WHERE event_id=?",
                            (eid_med,)).fetchone()
@@ -7286,7 +7286,7 @@ def test_auto_remediate_fires_at_the_default_medium_floor_not_below_it():
         assert receipt == {"verb": "restart-hermes-gateway", "exitCode": 0, "output": "restarted",
                             "items": [eid_med]}
 
-        item_low = core._get_item(conn, eid_low)
+        item_low = core.get_item(conn, eid_low)
         assert item_low["state"] == core.STATE_WORKING, (
             "a low-confidence verdict must still never auto-remediate at the default floor")
         assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
@@ -7304,7 +7304,7 @@ def test_auto_remediate_high_floor_refuses_a_medium_verdict():
         eid = _seed_host_verb_item(conn, external_id="175", state=core.STATE_WORKING,
                                     confidence="medium", investigate_job="investigate-raised-floor")
         work.maybe_auto_remediate(conn, policy, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]
         assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
                              (eid,)).fetchone()["n"] == 0
@@ -7351,7 +7351,7 @@ def test_auto_remediate_no_matching_rule_untouched():
                                     state=core.STATE_WORKING, confidence="high",
                                     investigate_job="investigate-unmatched")
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]
         assert conn.execute("SELECT COUNT(*) AS n FROM operations").fetchone()["n"] == 0
 
@@ -7367,15 +7367,15 @@ def test_auto_remediate_cooldown_blocks_a_second_run_of_the_same_verb():
         eid = _seed_host_verb_item(conn, external_id="175", confidence="high",
                                     investigate_job="investigate-cooldown")
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+        assert core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
 
         # The SAME item flaps back to needs_decision moments later — inside
         # hostVerbCooldownHours, a second restart of THIS VERB must be
         # deferred, not run again.
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW + dt.timedelta(minutes=1))
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW + dt.timedelta(minutes=1))
         conn.commit()
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, "cooldown must block a second run on the same item"
         assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
                              (eid,)).fetchone()["n"] == 1, "only the first attempt's operation must exist"
@@ -7392,14 +7392,14 @@ def test_auto_remediate_cooldown_is_keyed_by_verb_not_by_item():
         eid_a = _seed_host_verb_item(conn, external_id="175", confidence="high",
                                       investigate_job="investigate-verb-a")
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
-        assert core._get_item(conn, eid_a)["state"] == core.STATE_VERIFYING
+        assert core.get_item(conn, eid_a)["state"] == core.STATE_VERIFYING
 
         # A SECOND, previously-untouched item, mapping to the SAME verb,
         # appears 10 minutes later — well inside hostVerbCooldownHours=6.
         eid_b = _seed_host_verb_item(conn, external_id="185", title="Hermes Watchdog - Push",
                                       confidence="high", investigate_job="investigate-verb-b")
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
-        item_b = core._get_item(conn, eid_b)
+        item_b = core.get_item(conn, eid_b)
         assert item_b["state"] == core.STATE_NEEDS_DECISION, (
             "a fresh item on a verb someone else just ran must be deferred by the same cooldown")
         assert conn.execute("SELECT COUNT(*) AS n FROM operations").fetchone()["n"] == 1, (
@@ -7454,7 +7454,7 @@ def test_auto_remediate_groups_every_item_sharing_a_verb_into_one_run():
         assert sorted(receipt["items"]) == sorted([eid1, eid2, eid3]), receipt["items"]
 
         for eid in (eid1, eid2, eid3):
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_VERIFYING, (eid, item["state"])
             assert item["note"] == "restarted via restart-hermes-gateway; verifying"
             assert item["verify_started_at"] == NOW.isoformat() and item["verify_mark"] is None, dict(item)
@@ -7495,12 +7495,12 @@ def test_auto_remediate_attempt_cap_lands_failed_with_attempts_noted():
                                     investigate_job="investigate-cap")
 
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
-        first = core._get_item(conn, eid)
+        first = core.get_item(conn, eid)
         assert first["state"] == core.STATE_WORKING and first["strikes"] == 1, dict(first)
         _backdate_latest_host_op(conn, "restart-hermes-gateway", NOW)
 
         # Re-open it and try again exactly hostVerbCooldownHours=6h later.
-        core._set_state(conn, eid, core.STATE_WORKING, NOW + dt.timedelta(hours=6))
+        core.set_state(conn, eid, core.STATE_WORKING, NOW + dt.timedelta(hours=6))
         conn.commit()
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(hours=6), dry_run=False)
         assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
@@ -7510,10 +7510,10 @@ def test_auto_remediate_attempt_cap_lands_failed_with_attempts_noted():
         # A third pass, another 6h later (t=12h) — cooldown clears again, but
         # the cap fires BEFORE a third attempt: both priors (t=0h, t=6h) are
         # still (just) inside the 12h bounded window at t=12h.
-        core._set_state(conn, eid, core.STATE_WORKING, NOW + dt.timedelta(hours=12))
+        core.set_state(conn, eid, core.STATE_WORKING, NOW + dt.timedelta(hours=12))
         conn.commit()
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(hours=12), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, item["state"]
         assert "hostVerbMaxAttempts=2" in (item["note"] or ""), item["note"]
         assert "attempt 1: exit 1" in item["note"] and "attempt 2: exit 1" in item["note"], item["note"]
@@ -7528,7 +7528,7 @@ def test_auto_remediate_nonzero_exit_is_a_strike_and_the_operation_failed():
         eid = _seed_host_verb_item(conn, external_id="175", confidence="high",
                                     investigate_job="investigate-fail")
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None, "the host-verb claim is released"
         assert "exit 1" in item["note"] and "boom" in item["note"], item["note"]
@@ -7548,7 +7548,7 @@ def test_auto_remediate_dry_run_prints_and_does_nothing():
         with contextlib.redirect_stdout(buf):
             work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=True)
         assert "[dry-run] would run host verb restart-hermes-gateway for ['uk:175']" in buf.getvalue(), buf.getvalue()
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, "dry-run must never write state"
         assert conn.execute("SELECT COUNT(*) AS n FROM operations").fetchone()["n"] == 0
 
@@ -7569,7 +7569,7 @@ def _seed_verifying_host_item(conn, *, external_id="175", monitor_title="Hermes 
     already open (the restart IS the deploy), the verb's monitor on `deploy_expect_json`."""
     eid = _seed_host_verb_item(conn, external_id=external_id, confidence="high", state=core.STATE_WORKING,
                                 investigate_job=f"investigate-live-{external_id}")
-    core._set_state(conn, eid, core.STATE_VERIFYING, since,
+    core.set_state(conn, eid, core.STATE_VERIFYING, since,
                     verify_started_at=since.isoformat(), verify_mark=None, verify_failures=0,
                     deploy_expect_json=json.dumps([{"monitorTitle": monitor_title, "since": since.isoformat()}]))
     conn.commit()
@@ -7579,8 +7579,8 @@ def _seed_verifying_host_item(conn, *, external_id="175", monitor_title="Hermes 
 def _write_kuma_stub(tmp_dir: Path, *, monitors: list[dict[str, Any]] | None = None,
                       monitors_exit: int = 0, heartbeat_rows: str = "", heartbeats_exit: int = 0) -> Path:
     """A stub standing in for hermes-ops.sh's `monitors --json` AND `kuma-db
-    heartbeats <id> --json` — the two calls _gather_kuma_push_fresh() makes,
-    both against the SAME binary (`_HERMES_OPS_BIN`) — so one stub dispatches
+    heartbeats <id> --json` — the two calls gather_kuma_push_fresh() makes,
+    both against the SAME binary (`HERMES_OPS_BIN`) — so one stub dispatches
     on `sys.argv[1]` rather than needing two allowlist entries the real
     function never goes through (it builds its argv directly, not via
     HOST_VERB_ALLOWLIST, since it needs a monitor id only the FIRST call
@@ -7631,18 +7631,18 @@ def test_a_host_verb_restart_is_fixed_once_its_monitor_is_up_and_the_window_has_
         window_end = since + dt.timedelta(hours=core.VERIFY_WINDOW_HOURS)
 
         # No push yet, still inside the window — stays verifying.
-        core._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
+        core.HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
         verify.maybe_verify(conn, HOST_VERB_POLICY, since + dt.timedelta(minutes=5), dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+        assert core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
 
         # An UP heartbeat AFTER `since`, the item's own event gone quiet, window over -> `fixed`.
         push_dt = since + dt.timedelta(minutes=10)
         rows = _kuma_rows((push_dt.strftime("%Y-%m-%d %H:%M:%S.000"), 1))
-        core._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
+        core.HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (window_end.isoformat(), eid))
         conn.commit()
         verify.maybe_verify(conn, HOST_VERB_POLICY, window_end, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FIXED, item["state"]
         assert verify.VERIFIED_NOTE_PREFIX in (item["note"] or ""), item["note"]
 
@@ -7652,12 +7652,12 @@ def test_a_host_verb_monitor_that_never_comes_up_fails_verification_after_three_
         _fake_rollout(targets=())
         since = NOW
         eid = _seed_verifying_host_item(conn, since=since)
-        core._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
+        core.HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows="")
         window_end = since + dt.timedelta(hours=core.VERIFY_WINDOW_HOURS)
         for n in range(3):
-            assert core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+            assert core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
             verify.maybe_verify(conn, HOST_VERB_POLICY, window_end + dt.timedelta(minutes=10 * n), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED, item["state"]
         assert "own monitor not UP" in item["note"], item["note"]
 
@@ -7667,7 +7667,7 @@ def test_gather_kuma_push_fresh_unparsable_since_fails_closed():
     confirms it" — that would let a corrupted deploy_expect_json confirm
     liveness off a heartbeat unrelated to the restart it is supposed to
     verify. Refused before hermes-ops.sh is even invoked."""
-    ok, detail = work._gather_kuma_push_fresh(
+    ok, detail = work.gather_kuma_push_fresh(
         [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": "not-a-timestamp"}])
     assert ok is False, detail
     assert "unparsable" in detail.lower(), detail
@@ -7680,8 +7680,8 @@ def test_gather_kuma_push_fresh_rows_before_since_fail():
         since = NOW
         older = since - dt.timedelta(minutes=5)
         rows = _kuma_rows((older.strftime("%Y-%m-%d %H:%M:%S.000"), 1))
-        core._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
-        ok, detail = work._gather_kuma_push_fresh(
+        core.HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
+        ok, detail = work.gather_kuma_push_fresh(
             [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": since.isoformat()}])
         assert ok is False, detail
 
@@ -7693,8 +7693,8 @@ def test_gather_kuma_push_fresh_status_zero_only_fails():
         since = NOW
         fresh = since + dt.timedelta(minutes=5)
         rows = _kuma_rows((fresh.strftime("%Y-%m-%d %H:%M:%S.000"), 0))
-        core._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
-        ok, detail = work._gather_kuma_push_fresh(
+        core.HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, heartbeat_rows=rows)
+        ok, detail = work.gather_kuma_push_fresh(
             [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": since.isoformat()}])
         assert ok is False, detail
         assert "none up" in detail, detail
@@ -7704,8 +7704,8 @@ def test_gather_kuma_push_fresh_title_not_in_monitors_fails():
     """`monitors --json` not carrying the expected title (a rename, a
     monitor deleted in UptimeKuma) must fail closed, never guess an id."""
     with _triage_env() as (conn, ctx):
-        core._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=[{"id": "1", "name": "Something Else"}])
-        ok, detail = work._gather_kuma_push_fresh(
+        core.HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=[{"id": "1", "name": "Something Else"}])
+        ok, detail = work.gather_kuma_push_fresh(
             [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": NOW.isoformat()}])
         assert ok is False, detail
         assert "no UptimeKuma monitor named" in detail, detail
@@ -7716,8 +7716,8 @@ def test_gather_kuma_push_fresh_hermes_ops_nonzero_exit_fails():
     docker-exec refusal — must read as no evidence, never raise and never
     read as confirmed."""
     with _triage_env() as (conn, ctx):
-        core._HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, monitors_exit=1)
-        ok, detail = work._gather_kuma_push_fresh(
+        core.HERMES_OPS_BIN = _write_kuma_stub(ctx.tmp_dir, monitors=_KUMA_MONITORS, monitors_exit=1)
+        ok, detail = work.gather_kuma_push_fresh(
             [{"monitorTitle": _KUMA_MONITOR_TITLE, "since": NOW.isoformat()}])
         assert ok is False, detail
         assert "monitors --json failed" in detail, detail
@@ -7746,7 +7746,7 @@ def test_reconcile_crashed_host_operation_is_a_strike():
         op_id = work.record_operation(conn, event_id=eid, kind="host", repo="hermes-agent",
                                        authorized_by="auto-remediate", note="verb=restart-hermes-gateway")
         work.reconcile_operations(conn, HOST_VERB_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None, "the host-verb claim is released"
         op = conn.execute("SELECT outcome, note FROM operations WHERE op_id=?", (op_id,)).fetchone()
@@ -7762,7 +7762,7 @@ def test_reconcile_crashed_host_operation_is_a_strike():
         work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW + dt.timedelta(minutes=11), dry_run=False)
         assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE note='verb=restart-hermes-gateway'"
                              ).fetchone()["n"] == 1, "the cooldown must have refused a second host op"
-        assert core._get_item(conn, eid)["state"] == core.STATE_WORKING, (
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING, (
             "a cooldown-refused pass must leave the item exactly where it was")
 
 
@@ -7804,7 +7804,7 @@ def test_chronic_signature_escalates_instead_of_recovery_resolving():
 
         triage.run(conn, dry_run=False)
 
-        assert core._get_item(conn, eid)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
         assert len(calls) == 1, calls
         assert "CHRONIC: cleared on its own and came back 3 times" in calls[0]["brief"]
         assert "The recurrence is the defect" in calls[0]["brief"]
@@ -7816,7 +7816,7 @@ def test_below_chronic_threshold_still_recovery_resolves():
         _seed_reopens(conn, eid, 2)
         core._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", "✅ sig-twice")])
         triage.run(conn, dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_QUIET
+        assert core.get_item(conn, eid)["state"] == core.STATE_QUIET
 
 
 def test_reopens_outside_the_chronic_window_do_not_count():
@@ -7825,7 +7825,7 @@ def test_reopens_outside_the_chronic_window_do_not_count():
         _seed_reopens(conn, eid, 5, days_ago=core.DEFAULT_CHRONIC_WINDOW_DAYS + 1)
         core._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", "✅ sig-old-flaps")])
         triage.run(conn, dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_QUIET
+        assert core.get_item(conn, eid)["state"] == core.STATE_QUIET
 
 
 def test_unmapped_chronic_signature_still_goes_quiet():
@@ -7854,9 +7854,9 @@ def test_chronic_state_source_is_not_disappearance_resolved():
         conn.commit()
         _seed_reopens(conn, eid, 3)
         intake.apply_resolutions(conn, NOW, core.load_policy())
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEW
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEW
         intake.apply_resolutions(conn, NOW)  # no policy: defaults apply, still chronic
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEW
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEW
 
 
 def test_quiet_timer_reads_a_suppressed_occurrences_ts_last():
@@ -7879,13 +7879,13 @@ def test_quiet_timer_reads_a_suppressed_occurrences_ts_last():
         )
         conn.commit()
         intake.resolve_quiet_grouped(conn, core.load_policy(), NOW)
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEW
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEW
 
         later = NOW + dt.timedelta(hours=3)
         intake.resolve_quiet_grouped(conn, core.load_policy(), later)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_QUIET
-        assert core._fmt_ts(stale.isoformat()) not in item["note"], item["note"]
+        assert core.fmt_ts(stale.isoformat()) not in item["note"], item["note"]
 
 
 def test_chronic_signature_investigated_once_per_window():
@@ -7904,7 +7904,7 @@ def test_chronic_signature_investigated_once_per_window():
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_QUIET
+        assert core.get_item(conn, eid)["state"] == core.STATE_QUIET
         assert calls == []
 
 
@@ -7950,7 +7950,7 @@ def test_blocked_implementation_goes_back_to_the_implementer_with_findings():
 
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING
         assert item["revision_count"] == 1
         assert item["implement_job"] and item["implement_job"] != "impl-sig-revise"
@@ -7973,7 +7973,7 @@ def test_revision_stops_at_the_attempt_cap():
         _sideclaw.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         assert calls == [], "no revision is dispatched past the cap (the pollers fail the item instead)"
-        assert core._get_item(conn, eid)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
 
 
 def test_non_finding_blocks_are_not_revised():
@@ -7988,7 +7988,7 @@ def test_non_finding_blocks_are_not_revised():
         _sideclaw.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         assert calls == []
-        assert core._get_item(conn, eid)["revision_count"] == 0
+        assert core.get_item(conn, eid)["revision_count"] == 0
 
 
 def test_checks_failed_before_push_is_revised():
@@ -8002,7 +8002,7 @@ def test_checks_failed_before_push_is_revised():
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
         assert "bun test: 2 failing" in calls[0]["brief"]
 
 
@@ -8011,7 +8011,7 @@ def test_revision_that_cannot_start_hands_the_item_back_as_a_strike():
         eid = _seed_blocked_item(conn, external_id="sig-refused")
         _sideclaw.submit = _fake_submit([], ok=False)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["revision_count"] == 0
         assert item["implement_job"] == "impl-sig-refused" and item["pr_url"]
@@ -8032,7 +8032,7 @@ def test_revision_refused_by_sideclaw_ends_the_item_and_is_never_retried():
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
 
         assert len(calls) == 1, f"a refused revision must never be resubmitted, got {len(calls)}"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, item["state"]
         assert "dispatch refused: repo is not allowed" in (item["note"] or ""), item["note"]
         assert item["implement_job"] == "impl-sig-rev-refused" and item["pr_url"]
@@ -8062,7 +8062,7 @@ def test_update_pr_refused_by_sideclaw_ends_the_item_with_its_pr():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, item["state"]
         assert "update_pr" in item["note"] and "nope" in item["note"], item["note"]
         assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/9"
@@ -8072,7 +8072,7 @@ def test_update_pr_refused_by_sideclaw_ends_the_item_with_its_pr():
 def test_argo_implement_refused_by_sideclaw_ends_the_item_and_reports_failed():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-refused")
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="ship it?")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="ship it?")
         conn.commit()
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _refusing_submit(calls, message="dispatch refused: ceiling")
@@ -8080,7 +8080,7 @@ def test_argo_implement_refused_by_sideclaw_ends_the_item_and_reports_failed():
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
         assert len(calls) == 1
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "dispatch refused: ceiling" in item["note"], dict(item)
         assert ctx.argo_acks[0]["status"] == "failed", ctx.argo_acks
         assert "dispatch refused: ceiling" in (ctx.argo_acks[0]["error"] or ""), ctx.argo_acks
@@ -8107,7 +8107,7 @@ def test_pr_updated_hands_the_updated_pr_to_the_merge_train_without_closing_it()
         conn.execute("UPDATE triage_items SET reviewed_sha=? WHERE event_id=?", (TRAIN_SHA, eid))
         conn.commit()
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["pr_url"] == pr, dict(item)
         assert item["train_stage"] == train.TRAIN_UPDATE and review_calls == [], (dict(item), review_calls)
         assert item["reviewed_sha"] is None, "a revision's head was never reviewed"
@@ -8124,7 +8124,7 @@ def test_a_newer_pr_closes_the_one_it_supersedes():
         }
         _sideclaw.submit_review = _fake_submit_review([])
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["pr_url"].endswith("/pull/9"), dict(item)
         assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
 
@@ -8134,7 +8134,7 @@ def test_pr_updated_without_an_artifact_url_is_a_strike():
         eid = _outcome_item_with_pr(conn, external_id="sig-pr-updated-bare", job_id="impl-pr-updated-bare", pr=None)
         _sideclaw.get = lambda job_id: {"status": "done", "result": _dispatch_result("pr_updated")}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert "pr_updated outcome carried no artifactUrl" in item["note"], item["note"]
 
@@ -8156,7 +8156,7 @@ def test_conflict_is_an_attempt_that_redispatches_from_the_new_base_with_the_bun
                                     revision_count=1)
         _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 0, dict(item)
         assert item["implement_job"] == "impl-conflict" and "conflicted" in item["note"], dict(item)
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-conflict'").fetchone()
@@ -8166,7 +8166,7 @@ def test_conflict_is_an_attempt_that_redispatches_from_the_new_base_with_the_bun
         _sideclaw.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["revision_count"] == 2 and item["implement_job"] not in (None, "impl-conflict"), dict(item)
         assert len(calls) == 1 and calls[0]["revision_of"] is None, calls
         assert "Attempt 3 of 4" in calls[0]["brief"], calls[0]["brief"]
@@ -8182,7 +8182,7 @@ def test_conflict_is_an_attempt_that_redispatches_from_the_new_base_with_the_bun
         }
         _sideclaw.submit_review = _fake_submit_review([])
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_MERGING
+        assert core.get_item(conn, eid)["state"] == core.STATE_MERGING
         assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
 
 
@@ -8197,7 +8197,7 @@ def test_conflict_without_a_bundle_still_redispatches():
         _sideclaw.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and "git bundle" not in calls[0]["context"], calls
-        assert core._get_item(conn, eid)["revision_count"] == 1
+        assert core.get_item(conn, eid)["revision_count"] == 1
 
 
 def test_conflict_with_no_attempts_left_fails_the_item_with_the_note():
@@ -8206,7 +8206,7 @@ def test_conflict_with_no_attempts_left_fails_the_item_with_the_note():
                                     revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
         _sideclaw.get = lambda job_id: {"status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "conflicted" in item["note"], dict(item)
 
 
@@ -8218,7 +8218,7 @@ def test_lease_refusal_of_a_first_attempt_retries_later_without_a_strike_or_an_a
             "error": "dispatch refused: an implement episode is already running in this repo (job x)",
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 0, dict(item)
         assert item["implement_job"] is None and item["revision_count"] == 0, dict(item)
         retry_at = dt.datetime.fromisoformat(item["retry_at"])
@@ -8245,7 +8245,7 @@ def test_lease_refusal_of_a_revision_puts_the_previous_attempt_back_and_keeps_th
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         revision_job = item["implement_job"]
         assert item["revision_count"] == 1 and revision_job != "impl-sig-lease-rev", dict(item)
 
@@ -8254,7 +8254,7 @@ def test_lease_refusal_of_a_revision_puts_the_previous_attempt_back_and_keeps_th
             "error": "update_pr refused: an implement episode is already running in this repo",
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 0, dict(item)
         assert item["implement_job"] == "impl-sig-lease-rev" and item["validation_job"] == "val-sig-lease-rev", dict(item)
         assert item["revision_count"] == 0 and item["retry_at"], dict(item)
@@ -8263,7 +8263,7 @@ def test_lease_refusal_of_a_revision_puts_the_previous_attempt_back_and_keeps_th
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, later, dry_run=False)
         assert len(calls) == 2 and calls[1]["revision_of"] == "dispatch/prior-branch", calls
         assert "scripts/check.sh:808" in calls[1]["brief"]
-        assert core._get_item(conn, eid)["revision_count"] == 1
+        assert core.get_item(conn, eid)["revision_count"] == 1
 
 
 def test_a_failed_job_that_is_not_the_lease_still_strikes():
@@ -8271,7 +8271,7 @@ def test_a_failed_job_that_is_not_the_lease_still_strikes():
         eid = _outcome_item_with_pr(conn, external_id="sig-notlease", job_id="impl-notlease", pr=None)
         _sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert core._get_item(conn, eid)["strikes"] == 1
+        assert core.get_item(conn, eid)["strikes"] == 1
 
 
 def test_attempt_three_escalates_the_model_when_sideclaw_routes_one_and_sends_none_when_it_does_not():
@@ -8318,7 +8318,7 @@ def test_four_attempts_in_total_then_the_pollers_fail_the_item():
         _sideclaw.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and "Attempt 4 of 4" in calls[0]["brief"], calls
-        assert core._get_item(conn, eid)["revision_count"] == core.MAX_IMPLEMENT_ATTEMPTS - 1
+        assert core.get_item(conn, eid)["revision_count"] == core.MAX_IMPLEMENT_ATTEMPTS - 1
         assert not _loop_defines("DEFAULT_REVISION_MAX_ATTEMPTS")
         assert "revisionMaxAttempts" not in core.load_policy()
 
@@ -8340,14 +8340,14 @@ def _folded_with_root_cause(conn, ext: str, root_cause: str | None, *, created: 
         "VALUES(?,?,?,?,?,?,?,?)",
         (job_id, "investigate", repo, "b", eid, "done", json.dumps(verdict), NOW.isoformat()),
     )
-    core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+    core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
     conn.execute("UPDATE triage_items SET repo=? WHERE event_id=?", (repo, eid))
     if created is not None:
         conn.execute("UPDATE triage_items SET created_at=? WHERE event_id=?", (created, eid))
     conn.commit()
     if fold:
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
-    return core._get_item(conn, eid)
+    return core.get_item(conn, eid)
 
 
 def test_root_cause_is_stored_on_the_folded_item():
@@ -8361,7 +8361,7 @@ def test_a_matching_root_cause_closes_the_newer_item_as_a_duplicate_of_the_older
     with _triage_env() as (conn, ctx):
         older = _folded_with_root_cause(conn, "sig-rc-old", "shared-cause", created="2026-10-01T00:00:00+00:00")
         newer = _folded_with_root_cause(conn, "sig-rc-new", "shared-cause")
-        old_now, new_now = core._get_item(conn, older["event_id"]), core._get_item(conn, newer["event_id"])
+        old_now, new_now = core.get_item(conn, older["event_id"]), core.get_item(conn, newer["event_id"])
         assert old_now["state"] == core.STATE_WORKING and old_now["duplicate_of"] is None, dict(old_now)
         assert new_now["state"] == core.STATE_CLOSED and new_now["close_reason"] == core.CLOSE_DUPLICATE, dict(new_now)
         assert new_now["duplicate_of"] == older["event_id"], dict(new_now)
@@ -8374,8 +8374,8 @@ def test_the_older_item_is_kept_even_when_the_newer_verdict_folds_first():
     with _triage_env() as (conn, ctx):
         newer = _folded_with_root_cause(conn, "sig-rc-first", "shared-cause-2")
         older = _folded_with_root_cause(conn, "sig-rc-second", "shared-cause-2", created="2026-10-01T00:00:00+00:00")
-        assert core._get_item(conn, older["event_id"])["state"] == core.STATE_WORKING
-        closed = core._get_item(conn, newer["event_id"])
+        assert core.get_item(conn, older["event_id"])["state"] == core.STATE_WORKING
+        closed = core.get_item(conn, newer["event_id"])
         assert closed["state"] == core.STATE_CLOSED and closed["duplicate_of"] == older["event_id"], dict(closed)
 
 
@@ -8384,21 +8384,21 @@ def test_a_different_repo_or_root_cause_or_state_is_never_merged():
         a = _folded_with_root_cause(conn, "sig-rc-a", "cause-a")
         b = _folded_with_root_cause(conn, "sig-rc-b", "cause-b")
         c = _folded_with_root_cause(conn, "sig-rc-c", None)
-        assert [core._get_item(conn, r["event_id"])["state"] for r in (a, b, c)] == [core.STATE_WORKING] * 3
+        assert [core.get_item(conn, r["event_id"])["state"] for r in (a, b, c)] == [core.STATE_WORKING] * 3
 
         # same key, but the older item already ended (failed): not open, so no merge
         d = _folded_with_root_cause(conn, "sig-rc-d", "cause-d", created="2026-10-01T00:00:00+00:00")
-        core._set_state(conn, d["event_id"], core.STATE_FAILED, NOW, note="x")
+        core.set_state(conn, d["event_id"], core.STATE_FAILED, NOW, note="x")
         conn.commit()
         e = _folded_with_root_cause(conn, "sig-rc-e", "cause-d")
-        assert core._get_item(conn, e["event_id"])["state"] == core.STATE_WORKING
+        assert core.get_item(conn, e["event_id"])["state"] == core.STATE_WORKING
 
         # same key in another repo
         f = _folded_with_root_cause(conn, "sig-rc-f", "cause-f", created="2026-10-01T00:00:00+00:00")
         conn.execute("UPDATE triage_items SET repo='other-repo' WHERE event_id=?", (f["event_id"],))
         conn.commit()
         g = _folded_with_root_cause(conn, "sig-rc-g", "cause-f")
-        assert core._get_item(conn, g["event_id"])["state"] == core.STATE_WORKING
+        assert core.get_item(conn, g["event_id"])["state"] == core.STATE_WORKING
 
 
 def test_an_item_with_an_operation_in_flight_is_never_merged_away():
@@ -8416,12 +8416,12 @@ def test_an_item_with_an_operation_in_flight_is_never_merged_away():
             conn.execute(f"UPDATE triage_items SET {sets}, root_cause=? WHERE event_id=?",
                          (*columns.values(), f"busy-{label}", newer["event_id"]))
             conn.commit()
-            work.apply_root_cause(conn, [core._get_item(conn, older["event_id"])],
+            work.apply_root_cause(conn, [core.get_item(conn, older["event_id"])],
                                   {"rootCause": f"busy-{label}"}, NOW)
-            busy = core._get_item(conn, newer["event_id"])
+            busy = core.get_item(conn, newer["event_id"])
             assert busy["state"] == columns.get("state", core.STATE_WORKING), (label, dict(busy))
             assert busy["close_reason"] is None and busy["duplicate_of"] is None, (label, dict(busy))
-            assert core._get_item(conn, older["event_id"])["state"] == core.STATE_WORKING
+            assert core.get_item(conn, older["event_id"])["state"] == core.STATE_WORKING
 
 
 def test_items_of_the_same_cluster_are_not_merged_with_each_other():
@@ -8439,10 +8439,10 @@ def test_items_of_the_same_cluster_are_not_merged_with_each_other():
              json.dumps({"summary": "one cause", "nextAction": "implement", "rootCause": "cluster-cause"}),
              NOW.isoformat()))
         for eid in eids:
-            core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+            core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
         conn.commit()
         work.fold_dispatch_verdict(conn, origin_event_id=eids[0], job_id=job_id, now=NOW, dry_run=False)
-        items = [core._get_item(conn, eid) for eid in eids]
+        items = [core.get_item(conn, eid) for eid in eids]
         assert [i["state"] for i in items] == [core.STATE_WORKING] * 2, [dict(i) for i in items]
         assert [i["root_cause"] for i in items] == ["cluster-cause"] * 2
 
@@ -8458,8 +8458,8 @@ def test_the_implement_result_root_cause_merges_other_open_items():
         _sideclaw.get = lambda job_id: {"status": "done", "result": result}
         _sideclaw.submit_review = _fake_submit_review([])
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert core._get_item(conn, eid)["root_cause"] == "impl-cause"
-        merged = core._get_item(conn, other["event_id"])
+        assert core.get_item(conn, eid)["root_cause"] == "impl-cause"
+        merged = core.get_item(conn, other["event_id"])
         assert merged["state"] == core.STATE_CLOSED and merged["duplicate_of"] == eid, dict(merged)
 
 
@@ -8467,10 +8467,10 @@ def test_a_reopened_duplicate_forgets_what_it_was_a_duplicate_of():
     with _triage_env() as (conn, ctx):
         _folded_with_root_cause(conn, "sig-rc-r-old", "reopen-cause", created="2026-10-01T00:00:00+00:00")
         newer = _folded_with_root_cause(conn, "sig-rc-r-new", "reopen-cause")
-        assert core._get_item(conn, newer["event_id"])["duplicate_of"] is not None
-        core._set_state(conn, newer["event_id"], core.STATE_NEW, NOW)
+        assert core.get_item(conn, newer["event_id"])["duplicate_of"] is not None
+        core.set_state(conn, newer["event_id"], core.STATE_NEW, NOW)
         conn.commit()
-        item = core._get_item(conn, newer["event_id"])
+        item = core.get_item(conn, newer["event_id"])
         assert item["duplicate_of"] is None and item["close_reason"] is None, dict(item)
 
 
@@ -8526,7 +8526,7 @@ def test_a_process_only_blocking_finding_parks_for_a_human_instead_of_blocking()
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert merge_calls == []
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, item["state"]
         assert "process-only" in item["note"] and "Closes #20" in item["note"], item["note"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
@@ -8545,7 +8545,7 @@ def test_a_process_only_finding_is_never_spent_as_a_revision():
 
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert calls == []
         assert item["state"] == core.STATE_WORKING and item["revision_count"] == 0
 
@@ -8645,9 +8645,9 @@ def test_kuma_monitor_title_from_uk_and_slack_alert():
     uk = {"source": "uk", "title": "MacMini Dev Host - Push (×3 in batch)"}
     sa = {"source": "slack_alert", "title": "[Brain Sync - Push] [:red_circle: Down] No heartbeat"}
     other = {"source": "hermes_log", "title": "[x] y"}
-    assert work._kuma_monitor_title(uk) == "MacMini Dev Host - Push"
-    assert work._kuma_monitor_title(sa) == "Brain Sync - Push"
-    assert work._kuma_monitor_title(other) is None
+    assert work.kuma_monitor_title(uk) == "MacMini Dev Host - Push"
+    assert work.kuma_monitor_title(sa) == "Brain Sync - Push"
+    assert work.kuma_monitor_title(other) is None
 
 
 def test_validation_review_gets_the_goal_and_the_gate_questions():
@@ -8656,7 +8656,7 @@ def test_validation_review_gets_the_goal_and_the_gate_questions():
         conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id='investigate-job'",
                      (json.dumps({"summary": "s", "recommendation": "raise the push window to 10m"}),))
         conn.commit()
-        ctx_text = work._validation_context(conn, core._get_item(conn, eid))
+        ctx_text = work.validation_context(conn, core.get_item(conn, eid))
         assert "raise the push window to 10m" in ctx_text
         assert "Loosening detection without that evidence is a blocking finding" in ctx_text
 
@@ -8682,7 +8682,7 @@ def test_a_refused_merge_is_not_retried_by_the_loop():
             work.advance_implement_chain(conn, core.load_policy(), NOW, dry_run=False)
             work.advance_implement_chain(conn, core.load_policy(), NOW, dry_run=False)
         assert calls == [], "the loop must not re-attempt a refused merge on its own"
-        assert core._get_item(conn, eid)["state"] == core.STATE_FAILED
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED
 
 
 # --- what waits on the owner (§94) --------------------------------------------
@@ -8709,7 +8709,7 @@ def test_awaiting_owner_lists_parked_items():
         conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (?,?,?,?)",
                      (parked, "merging", "needs_decision", (NOW - dt.timedelta(days=2)).isoformat()))
         conn.commit()
-        rows = core._api.awaiting_owner(conn, NOW)
+        rows = core.api.awaiting_owner(conn, NOW)
         assert [r["kind"] for r in rows] == ["item"]
         assert rows[0]["age_days"] == 2.0
         assert rows[0]["reason"] == "approve the merge"
@@ -8736,7 +8736,7 @@ def test_argo_merge_of_a_needs_decision_item_with_a_pr_merges_and_routes_like_au
 
         assert seen and seen[0]["authorized_by"] == "owner:argo"
         assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
-        assert core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+        assert core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
 
 
 def test_argo_merge_that_may_have_reached_github_is_not_reported_refused():
@@ -8751,7 +8751,7 @@ def test_argo_merge_that_may_have_reached_github_is_not_reported_refused():
         notify.apply_argo_actions(conn, NOW, dry_run=False)
         assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
         assert "ambiguous" in ctx.argo_acks[0]["result"]["note"]
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
 
 
 def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
@@ -8759,24 +8759,24 @@ def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
     plan_or_land() refuses — and must not write failed over `merged`."""
     with _triage_env() as (conn, ctx):
         eid = _seed_pr_item(conn, external_id="sig-race", state=core.STATE_FAILED, pr=13)
-        item = core._get_item(conn, eid)
-        core._set_state(conn, eid, core.STATE_VERIFYING, NOW, note="landed by the other pass")
+        item = core.get_item(conn, eid)
+        core.set_state(conn, eid, core.STATE_VERIFYING, NOW, note="landed by the other pass")
         conn.commit()
 
         def _refuse(conn_, **kw):
             raise PolicyError("dispatch was already merged")
 
         with _patched(_merge, plan_or_land=_refuse):
-            outcome = train._merge_and_rollout(conn, core.load_policy(), item, NOW, expected_sha=None)
+            outcome = train.merge_and_rollout(conn, core.load_policy(), item, NOW, expected_sha=None)
         assert outcome == "refused"
-        fresh = core._get_item(conn, eid)
+        fresh = core.get_item(conn, eid)
         assert fresh["state"] == core.STATE_VERIFYING and fresh["note"] == "landed by the other pass"
 
 
 # --- the uk poller ----------------------------------------------------------------
 
 def test_the_uk_poller_keeps_a_monitors_tags_for_label_routing():
-    wp = core._wp_module()
+    wp = core.wp_module()
     saved = wp.http_get
     wp.http_get = lambda url, headers: [
         {"id": 11, "name": "Tagged", "type": "http", "status": 0, "tags": [{"name": "repo", "value": "weatherorb"}]},
@@ -8821,7 +8821,7 @@ def test_implement_handoff_that_lost_the_race_opens_no_second_review():
         _sideclaw.get = _get
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert review_calls == [], "the loser must not submit a review"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["validation_job"] == "review-from-the-other-cron" and item["state"] == core.STATE_MERGING
 
 
@@ -8838,7 +8838,7 @@ def test_update_pr_submit_claim_is_visible_and_released():
         seen: dict[str, Any] = {}
 
         def _submit(**kw):
-            mid = core._get_item(conn, eid)
+            mid = core.get_item(conn, eid)
             seen["mid"] = (mid["train_job"], mid["retry_at"])
             train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
             return inner(**kw)
@@ -8848,7 +8848,7 @@ def test_update_pr_submit_claim_is_visible_and_released():
         assert seen["mid"] == (train.TRAIN_CLAIM, (NOW + dt.timedelta(minutes=5)).isoformat()), seen
         assert len(calls) == 1, "the other cron's pass inside the claim window submitted a second update_pr"
         assert calls[0]["pr"] == 10 and calls[0]["cwd"].endswith("/demo-repo"), calls
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_job"] == "update-job-000001" and item["retry_at"] is None and item["strikes"] == 0
 
 
@@ -8866,7 +8866,7 @@ def test_a_crashed_handoff_claim_is_retaken_once_it_expires():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=1), dry_run=False)
         assert calls == [], "a live claim holds"
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=6), dry_run=False)
-        assert len(calls) == 1 and core._get_item(conn, eid)["validation_job"] == "review-job-000001"
+        assert len(calls) == 1 and core.get_item(conn, eid)["validation_job"] == "review-job-000001"
 
 
 def test_a_review_result_is_acted_on_once_when_two_passes_race():
@@ -8880,7 +8880,7 @@ def test_a_review_result_is_acted_on_once_when_two_passes_race():
 
         def _land(conn_, **kw):
             landed.append(1)
-            inside["retry_at"] = core._get_item(conn, eid)["retry_at"]
+            inside["retry_at"] = core.get_item(conn, eid)["retry_at"]
             train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
             raise _merge.ChecksPending("CI still running")
 
@@ -8889,7 +8889,7 @@ def test_a_review_result_is_acted_on_once_when_two_passes_race():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert landed == [1], "the other cron's pass inside the claim window must not act on the result"
         assert inside["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat(), inside
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["retry_at"] is None, dict(item)
         assert (item["note"] or "").startswith(train.MERGE_PENDING_NOTE_PREFIX), item["note"]
 
@@ -8911,7 +8911,7 @@ def test_a_review_result_claim_lost_to_another_pass_does_nothing():
         _merge.plan_or_land = lambda *a, **kw: landed.append(1)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert landed == [], "a lost claim must not merge"
-        assert core._get_item(conn, eid)["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat()
+        assert core.get_item(conn, eid)["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat()
 
 
 def test_reconcile_leaves_an_implement_operation_open_while_sideclaw_still_runs_it():
@@ -8927,7 +8927,7 @@ def test_reconcile_leaves_an_implement_operation_open_while_sideclaw_still_runs_
             work.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
             row = conn.execute("SELECT outcome, reconciled_at FROM operations WHERE op_id=?", (op,)).fetchone()
             assert row["outcome"] is None and row["reconciled_at"] is None, (status, dict(row))
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["strikes"] == 0 and item["implement_job"] == "impl-still-running", dict(item)
 
 
@@ -8936,41 +8936,41 @@ def test_strike_reports_the_state_the_item_is_really_in_when_its_write_lost():
         eid = _seed_item(conn, external_id="sig-strike-cas", state=core.STATE_VERIFYING, note="moved on")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            landed = core._strike(conn, eid, NOW, "boom", retry_state=core.STATE_WORKING,
+            landed = core.strike(conn, eid, NOW, "boom", retry_state=core.STATE_WORKING,
                                   expect_state=core.STATE_MERGING)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert landed == core.STATE_VERIFYING, "must report where the item is, not where the strike meant to put it"
         assert item["state"] == core.STATE_VERIFYING and item["strikes"] == 0 and item["note"] == "moved on"
         assert "lost its compare-and-set" in err.getvalue(), err.getvalue()
 
         eid2 = _seed_item(conn, external_id="sig-strike-ok", state=core.STATE_MERGING)
-        assert core._strike(conn, eid2, NOW, "boom", retry_state=core.STATE_MERGING,
+        assert core.strike(conn, eid2, NOW, "boom", retry_state=core.STATE_MERGING,
                             expect_state=core.STATE_MERGING) == core.STATE_MERGING
         eid3 = _seed_item(conn, external_id="sig-strike-failed", state=core.STATE_MERGING, strikes=2)
-        assert core._strike(conn, eid3, NOW, "boom", retry_state=core.STATE_MERGING,
+        assert core.strike(conn, eid3, NOW, "boom", retry_state=core.STATE_MERGING,
                             expect_state=core.STATE_MERGING) == core.STATE_FAILED
         eid4 = _seed_item(conn, external_id="sig-strike-failed-lost", state=core.STATE_FIXED, strikes=2)
         with contextlib.redirect_stderr(io.StringIO()):
-            assert core._strike(conn, eid4, NOW, "boom", retry_state=core.STATE_MERGING,
+            assert core.strike(conn, eid4, NOW, "boom", retry_state=core.STATE_MERGING,
                                 expect_state=core.STATE_MERGING) == core.STATE_FIXED
 
 
 def test_cli_close_stamps_the_occurrence_mark_so_a_recurrence_before_it_does_not_reopen_it():
     """A human `warden close` goes through items.transition(): it must record the occurrence it
-    closed against, as _set_state() does, or reopen_if_needed() reads the stale mark as new."""
+    closed against, as set_state() does, or reopen_if_needed() reads the stale mark as new."""
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-close-mark", title="x", first_seen=OLD)
         intake.ingest(conn, NOW)
-        core._set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="which?")
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="which?")
         conn.execute("UPDATE events SET last_reminder_at=?, reminder_count=reminder_count+1 WHERE id=?",
                      (NOW.isoformat(), eid))
         conn.commit()
         _items.transition(conn, eid, to_state=core.STATE_CLOSED, now=NOW, note="closed by hand",
                           extra={"close_reason": core.CLOSE_RESOLVED})
         conn.commit()
-        assert core._get_item(conn, eid)["occurrence_mark"] == core._occurrence_mark(core._get_event(conn, eid))
+        assert core.get_item(conn, eid)["occurrence_mark"] == core.occurrence_mark(core.get_event(conn, eid))
         intake.reopen_if_needed(conn, NOW)
-        assert core._get_item(conn, eid)["state"] == core.STATE_CLOSED, "the hand-close was undone"
+        assert core.get_item(conn, eid)["state"] == core.STATE_CLOSED, "the hand-close was undone"
 
 
 def test_cli_transition_refuses_a_close_reason_outside_the_ledger_vocabulary():
@@ -8983,7 +8983,7 @@ def test_cli_transition_refuses_a_close_reason_outside_the_ledger_vocabulary():
                 pass
             else:
                 raise AssertionError(f"expected ValueError for {extra}")
-        assert core._get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
 
 
 def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_poller():
@@ -9000,7 +9000,7 @@ def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_
         _merge.plan_or_land = _pending
         _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("m-pending", eid, "merge")])
         notify.apply_argo_actions(conn, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING, "parked in needs_decision nothing would ever ask again"
         assert item["train_stage"] == train.TRAIN_UPDATE and item["reviewed_sha"] == TRAIN_SHA, dict(item)
         assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
@@ -9021,7 +9021,7 @@ def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
         _sideclaw.get = lambda job_id: _update_pr_job("up_to_date", job_id=job_id)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=11), dry_run=False)
-        assert landed == [1] and core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+        assert landed == [1] and core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
 
 
 def test_argo_implement_and_merge_are_rejected_for_a_reverted_item():
@@ -9041,14 +9041,14 @@ def test_argo_implement_and_merge_are_rejected_for_a_reverted_item():
         assert [a["status"] for a in ctx.argo_acks] == ["rejected", "rejected"], ctx.argo_acks
         assert all("revert" in a["error"] for a in ctx.argo_acks), ctx.argo_acks
         assert submits == [] and landed == [], "nothing may be dispatched or merged"
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and item["implement_job"] == "impl-sig-argo-reverted", dict(item)
 
 
 def test_strike_on_a_missing_item_raises_instead_of_reporting_a_state():
     with _triage_env() as (conn, ctx):
         try:
-            core._strike(conn, 424242, NOW, "boom", retry_state=core.STATE_WORKING)
+            core.strike(conn, 424242, NOW, "boom", retry_state=core.STATE_WORKING)
         except LookupError:
             pass
         else:
@@ -9064,7 +9064,7 @@ def test_notify_claim_keeps_a_second_process_from_posting_the_same_line():
         inside: dict[str, Any] = {}
 
         def _racing_post(channel, text, token, *, thread_ts=None):
-            inside["card_hash"] = core._get_item(conn, eid)["card_hash"]
+            inside["card_hash"] = core.get_item(conn, eid)["card_hash"]
             _notify(conn, eid)              # the other cron, mid-post
             return real(channel, text, token, thread_ts=thread_ts)
 
@@ -9072,7 +9072,7 @@ def test_notify_claim_keeps_a_second_process_from_posting_the_same_line():
         _notify(conn, eid)
         assert len(ctx.posted) == 1, ctx.posted
         assert inside["card_hash"].startswith(f"{core.NOTIFY_CLAIM_PREFIX}{core.STATE_NEEDS_DECISION}:"), inside
-        assert core._get_item(conn, eid)["card_hash"] == core.STATE_NEEDS_DECISION
+        assert core.get_item(conn, eid)["card_hash"] == core.STATE_NEEDS_DECISION
 
 
 def test_notify_claim_is_handed_back_on_a_slack_failure_and_retaken_when_stale():
@@ -9081,7 +9081,7 @@ def test_notify_claim_is_handed_back_on_a_slack_failure_and_retaken_when_stale()
         real = core.post_line
         core.post_line = lambda channel, text, token, *, thread_ts=None: (False, None)
         _notify(conn, eid)
-        assert core._get_item(conn, eid)["card_hash"] is None, "a failed post hands the claim back"
+        assert core.get_item(conn, eid)["card_hash"] is None, "a failed post hands the claim back"
         core.post_line = real
 
         fresh = f"{core.NOTIFY_CLAIM_PREFIX}{core.STATE_FIXED}:{dt.datetime.now(dt.timezone.utc).isoformat()}"
@@ -9096,7 +9096,7 @@ def test_notify_claim_is_handed_back_on_a_slack_failure_and_retaken_when_stale()
         conn.commit()
         _notify(conn, eid)
         assert len(ctx.posted) == 1, "a crashed poster's stale claim is retaken"
-        assert core._get_item(conn, eid)["card_hash"] == core.STATE_FIXED
+        assert core.get_item(conn, eid)["card_hash"] == core.STATE_FIXED
 
 
 def test_a_resolved_answer_is_posted_once_into_its_own_origin_thread():
@@ -9111,7 +9111,7 @@ def test_a_resolved_answer_is_posted_once_into_its_own_origin_thread():
         post = ctx.posted[0]
         assert post["channel"] == "C0ORIGIN0001" and post["thread_ts"] == "1111.000001", post
         assert post["text"] == ":speech_balloon: demo-repo: It is the cron. — answered <https://argo.example.test/warden|Argo>", post
-        assert core._get_item(conn, eid)["card_hash"] == core.NOTIFY_ANSWERED
+        assert core.get_item(conn, eid)["card_hash"] == core.NOTIFY_ANSWERED
 
 
 def test_an_answer_with_no_origin_thread_or_no_answer_tier_stays_out_of_slack():
@@ -9142,7 +9142,7 @@ def test_an_answer_folded_from_an_investigation_reaches_its_origin_thread_and_a_
         real = core.post_line
         core.post_line = lambda channel, text, token, *, thread_ts=None: (False, None)
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id="job-ans-fold", now=NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED, dict(item)
         assert item["card_hash"] is None
         core.post_line = real
@@ -9175,7 +9175,7 @@ def _revision_in_flight(conn, ext: str, *, with_prior: bool = True) -> tuple[int
         conn.commit()
     _sideclaw.submit = _numbered_submit([], "rev-first")
     work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
-    item = core._get_item(conn, eid)
+    item = core.get_item(conn, eid)
     assert item["revision_count"] == 1 and item["implement_job"] != f"impl-{ext}", dict(item)
     return eid, item["implement_job"]
 
@@ -9189,7 +9189,7 @@ def test_a_struck_revision_is_handed_back_not_restarted_from_scratch():
         eid, _job = _revision_in_flight(conn, "sig-strike-rev")
         _sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] == "impl-sig-strike-rev" and item["validation_job"] == "val-sig-strike-rev", dict(item)
         assert item["revision_count"] == 0 and item["pr_url"] == pr, dict(item)
@@ -9202,7 +9202,7 @@ def test_a_struck_revision_is_handed_back_not_restarted_from_scratch():
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, later, dry_run=False)
         assert len(calls) == 1 and calls[0]["revision_of"] == "dispatch/prior-branch", calls
         assert "scripts/check.sh:808" in calls[0]["brief"], calls[0]["brief"]
-        assert core._get_item(conn, eid)["revision_count"] == 1
+        assert core.get_item(conn, eid)["revision_count"] == 1
         assert CLOSED_PRS == []
 
 
@@ -9212,14 +9212,14 @@ def test_a_struck_revision_with_no_previous_attempt_on_record_keeps_the_pr_to_su
         eid, _job = _revision_in_flight(conn, "sig-strike-noprior", with_prior=False)
         _sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["pr_url"] == pr, dict(item)
 
         # The from-scratch attempt that follows opens its own PR: the old one is closed as superseded.
         _sideclaw.submit = _numbered_submit([], "rev-scratch")
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=11), dry_run=False)
-        new_job = core._get_item(conn, eid)["implement_job"]
+        new_job = core.get_item(conn, eid)["implement_job"]
         assert new_job, "a fresh attempt was submitted"
         _sideclaw.get = lambda job_id: {
             "status": "done",
@@ -9235,7 +9235,7 @@ def test_a_struck_first_attempt_still_clears_its_handles():
         eid = _outcome_item_with_pr(conn, external_id="sig-strike-first", job_id="impl-strike-first", pr=None)
         _sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["implement_job"] is None and item["pr_url"] is None and item["strikes"] == 1, dict(item)
 
 
@@ -9262,7 +9262,7 @@ def test_a_refused_escalation_model_is_resubmitted_once_without_it_on_a_revision
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert [c["model"] for c in calls] == ["escalation-model-x", None], calls
         assert calls[1]["revision_of"] == "dispatch/prior-branch", calls
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["implement_job"].startswith("job-esc-"), dict(item)
         assert item["revision_count"] == 2
 
@@ -9277,7 +9277,7 @@ def test_a_refused_escalation_model_is_resubmitted_once_without_it_on_an_auto_im
         _sideclaw.submit = _escalation_refusing_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert [c["model"] for c in calls] == ["escalation-model-x", None], calls
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["implement_job"].startswith("job-esc-"), dict(item)
 
 
@@ -9289,14 +9289,14 @@ def test_a_refusal_without_a_model_still_ends_the_item_after_the_one_retry():
         _sideclaw.submit = _escalation_refusing_submit(calls, always=True)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert [c["model"] for c in calls] == ["escalation-model-x", None], calls
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "unknown model" in item["note"], dict(item)
 
 
 def _human_item(conn, ext: str, root_cause: str, *, max_tier: str = "investigate") -> int:
     eid = intake.open_origin_item(conn, origin="human", repo="demo-repo", brief=f"please look {ext}",
                                   max_tier=max_tier, external_id=ext, title=f"human {ext}", now=NOW)
-    core._set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=f"job-{ext}")
+    core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=f"job-{ext}")
     conn.execute("UPDATE triage_items SET root_cause=? WHERE event_id=?", (root_cause, eid))
     conn.commit()
     return eid
@@ -9312,21 +9312,21 @@ def test_root_cause_merge_never_touches_a_human_or_issue_item():
             conn.execute("UPDATE triage_items SET created_at=? WHERE event_id=?",
                          ("2026-10-01T00:00:00+00:00" if human_is_older else "2999-01-01T00:00:00+00:00", human))
             conn.commit()
-            work.apply_root_cause(conn, [core._get_item(conn, alert["event_id"])],
+            work.apply_root_cause(conn, [core.get_item(conn, alert["event_id"])],
                                   {"rootCause": "mixed-cause"}, NOW)
             for eid in (alert["event_id"], human):
-                item = core._get_item(conn, eid)
+                item = core.get_item(conn, eid)
                 assert item["state"] == core.STATE_WORKING, (human_is_older, dict(item))
-            assert core._get_item(conn, human)["duplicate_of"] is None
+            assert core.get_item(conn, human)["duplicate_of"] is None
 
 
 def test_root_cause_merge_never_starts_from_a_human_item_either():
     with _triage_env() as (conn, ctx):
         alert = _folded_with_root_cause(conn, "sig-rc-from-human", "from-human-cause")
         human = _human_item(conn, "rc-from-human", "from-human-cause")
-        work.apply_root_cause(conn, [core._get_item(conn, human)], {"rootCause": "from-human-cause"}, NOW)
-        assert core._get_item(conn, human)["state"] == core.STATE_WORKING
-        assert core._get_item(conn, alert["event_id"])["state"] == core.STATE_WORKING
+        work.apply_root_cause(conn, [core.get_item(conn, human)], {"rootCause": "from-human-cause"}, NOW)
+        assert core.get_item(conn, human)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, alert["event_id"])["state"] == core.STATE_WORKING
 
 
 def test_a_conflict_on_a_revision_keeps_the_original_review_findings():
@@ -9339,10 +9339,10 @@ def test_a_conflict_on_a_revision_keeps_the_original_review_findings():
         conn.commit()
         _sideclaw.submit = _numbered_submit([], "cf-first")
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        revision_job = core._get_item(conn, eid)["implement_job"]
+        revision_job = core.get_item(conn, eid)["implement_job"]
         _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["implement_job"] == revision_job and item["state"] == core.STATE_WORKING, dict(item)
 
         calls: list[dict[str, Any]] = []
@@ -9376,7 +9376,7 @@ def test_exhausted_attempts_on_checks_failed_or_conflict_leave_the_pr_open_and_s
                                         pr=pr, revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
             _sideclaw.get = lambda job_id, r=result: {"id": job_id, "status": "done", "result": r}
             work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_FAILED, dict(item)
             assert len(item["note"]) <= 200 and item["note"].endswith(f"PR left open: {pr}"), item["note"]
             assert CLOSED_PRS == [] and item["pr_url"] == pr, (CLOSED_PRS, dict(item))
@@ -9388,7 +9388,7 @@ def test_exhausted_attempts_without_a_pr_say_nothing_about_one():
                                     revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
         _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "PR left open" not in item["note"], dict(item)
 
 
@@ -9517,15 +9517,15 @@ def test_the_title_match_target_of_a_grouped_source_is_the_fingerprint_without_t
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="homelab-m-load-above-threshold",
                             title="HomeLab 5m Load above threshold (×12 in batch)", first_seen=OLD)
-        targets = core._match_targets(core._get_event(conn, eid))
+        targets = core.match_targets(core.get_event(conn, eid))
         assert targets == ["slack_alert:homelab-m-load-above-threshold"], targets
         # A key truncated before the ingest fingerprint can differ from the title's: both are tried.
         eid2 = _insert_event(conn, source="slack_alert", external_id="opaque-key",
                              title="Job 2026-09-08T06:53:12Z failed (×3 in batch)", first_seen=OLD)
-        assert core._match_targets(core._get_event(conn, eid2)) == [
+        assert core.match_targets(core.get_event(conn, eid2)) == [
             "slack_alert:opaque-key", "slack_alert:job-failed"]
         uk = _insert_event(conn, source="uk", external_id="95", title="Kuma 5m check", first_seen=OLD)
-        assert core._match_targets(core._get_event(conn, uk)) == ["uk:95", "uk:kuma-5m-check"], "state sources keep normalize_title()"
+        assert core.match_targets(core.get_event(conn, uk)) == ["uk:95", "uk:kuma-5m-check"], "state sources keep normalize_title()"
 
 
 def test_a_digit_pattern_policy_rule_now_routes_the_real_title():
@@ -9534,7 +9534,7 @@ def test_a_digit_pattern_policy_rule_now_routes_the_real_title():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id=core.fingerprint("research-gateway job error >= 1 (15m)"),
                             title="research-gateway job error >= 1 (15m) (×4 in batch)", first_seen=OLD)
-        rule = core._match_rule(core._match_targets(core._get_event(conn, eid)), _shipped_policy()["rules"])
+        rule = core.match_rule(core.match_targets(core.get_event(conn, eid)), _shipped_policy()["rules"])
         assert rule is not None and rule["repo"] == "research-gateway", rule
 
 
@@ -9557,7 +9557,7 @@ def test_private_repo_items_never_reach_the_triage_prompt():
         _seed_row(conn, external_id="d-open", title="Public open title", repo="demo-repo", state=core.STATE_WORKING)
         eid = _seed_row(conn, external_id="new-one", title="Fresh alert")
         prompt = _intake.build_triage_prompt(
-            conn, _rows(conn, eid), core._get_event(conn, eid), ["demo-repo", "homelab-private"], NOW)
+            conn, _rows(conn, eid), core.get_event(conn, eid), ["demo-repo", "homelab-private"], NOW)
         assert "Public open title" in prompt, "a public repo's items are still listed"
         assert "homelab-private" in prompt, "the repo name is listed"
         for secret in ("SECRET", "secret-root-cause", "secret open note", "homelab-private/pull/9"):
@@ -9591,7 +9591,7 @@ def test_a_public_item_still_carries_its_title_and_payload_in_the_prompt():
     with _triage_env() as (conn, ctx):
         eid = _seed_row(conn, external_id="pub", title="Public alert", payload={"first_text": "disk is full"})
         prompt = _intake.build_triage_prompt(
-            conn, _rows(conn, eid), core._get_event(conn, eid), ["demo-repo"], NOW)
+            conn, _rows(conn, eid), core.get_event(conn, eid), ["demo-repo"], NOW)
         assert "title: Public alert" in prompt and "disk is full" in prompt and _intake.WITHHELD not in prompt
 
 
@@ -9603,7 +9603,7 @@ def test_the_event_text_is_fenced_as_untrusted_data():
         eid = _seed_row(conn, external_id="evil", title="Evil issue", origin="github_issue",
                         source="github_go", repo="demo-repo", brief=evil)
         prompt = _intake.build_triage_prompt(
-            conn, _rows(conn, eid), core._get_event(conn, eid), ["demo-repo"], NOW)
+            conn, _rows(conn, eid), core.get_event(conn, eid), ["demo-repo"], NOW)
         begin, end = _intake.UNTRUSTED_BEGIN, _intake.UNTRUSTED_END
         assert prompt.count(begin) == 1 and prompt.count(end) == 1, prompt
         inside = prompt[prompt.index(begin):prompt.index(end)]
@@ -9820,18 +9820,18 @@ def test_train_happy_path_updates_checks_reviews_and_merges_the_pinned_sha():
             merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="d" * 40)
 
         work.advance_implement_chain(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
         assert updates == [{"cwd": updates[0]["cwd"], "pr": 10}] and reviews == [], (updates, reviews)
 
         _train_pass(conn, 1)   # up_to_date -> checks green -> review submitted
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_REVIEW and item["train_sha"] == TRAIN_SHA, dict(item)
         assert CHECK_RUNS["asked"] == [TRAIN_SHA] and len(reviews) == 1 and reviews[0]["pr"] == 10, reviews
         assert merges == []
 
         _train_pass(conn, 2)   # review confirmed -> merge
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING, dict(item)
         assert len(merges) == 1 and merges[0]["expected_sha"] == TRAIN_SHA, merges
         assert item["reviewed_sha"] == TRAIN_SHA and item["train_stage"] is None and item["train_sha"] is None
@@ -9850,13 +9850,13 @@ def test_train_updated_branch_waits_for_pending_checks_without_a_deadline():
         _train_pass(conn)
         for hours in (1, 24, 72):   # no deadline: still waiting, never a strike
             _train_pass(conn, hours * 60)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_CHECKS, dict(item)
             assert item["train_sha"] == REBASED_SHA and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
             assert item["note"].startswith(train.MERGE_PENDING_NOTE_PREFIX), item["note"]
         CHECK_RUNS["runs"] = [{"name": "ci", "status": "completed", "conclusion": "success"}]
         _train_pass(conn, 73 * 60)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_REVIEW and item["validation_job"] == "review-job-000001", dict(item)
         assert set(CHECK_RUNS["asked"]) == {REBASED_SHA}
 
@@ -9875,7 +9875,7 @@ def test_train_head_moved_during_review_goes_back_to_update():
         _sideclaw.submit_update_pr = _fake_update_pr(updates)
         PR_HEAD["sha"] = REBASED_SHA   # someone pushed while the review ran
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_UPDATE, dict(item)
         assert item["train_sha"] is None and item["validation_job"] is None and item["reviewed_sha"] is None
         assert item["strikes"] == 0 and "back to update" in item["note"], dict(item)
@@ -9889,7 +9889,7 @@ def test_train_head_moved_before_the_review_is_submitted_goes_back_to_update():
         _sideclaw.submit_update_pr = _fake_update_pr([])
         PR_HEAD["sha"] = REBASED_SHA
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
 
 
@@ -9905,7 +9905,7 @@ def test_train_skips_the_review_of_a_sha_a_review_already_confirmed():
             merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="d" * 40)
         _train_pass(conn)
         assert [m["expected_sha"] for m in merges] == [TRAIN_SHA], merges
-        assert core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+        assert core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
 
 
 def test_train_rebased_after_a_confirmed_review_is_reviewed_again_with_delta_context():
@@ -9926,7 +9926,7 @@ def test_train_rebased_after_a_confirmed_review_is_reviewed_again_with_delta_con
         assert work.VALIDATION_GATE_QUESTIONS in context, "the gate questions still lead"
         assert f"confirmed this pull request at {TRAIN_SHA}" in context and REBASED_SHA in context, context
         assert "Focus on what changed since that review" in context, context
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_REVIEW and item["reviewed_sha"] == TRAIN_SHA, dict(item)
 
     with _triage_env() as (conn, ctx):   # a first review carries no delta text
@@ -9946,7 +9946,7 @@ def test_train_conflict_goes_back_to_working_for_a_revision_from_the_new_base():
         _sideclaw.get = _jobs({"update-job-conflict": _update_pr_job(
             "conflict", note="rebase onto master failed: CONFLICT (content): Merge conflict in scripts/a.py")})
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["train_stage"] is None, dict(item)
         assert "no longer rebases" in item["note"] and item["strikes"] == 0, item["note"]
         assert "Merge conflict in scripts/a.py" in item["train_evidence"], item["train_evidence"]
@@ -9962,7 +9962,7 @@ def test_train_conflict_goes_back_to_working_for_a_revision_from_the_new_base():
         assert "could not be rebased onto it" in calls[0]["brief"], calls[0]["brief"]
         assert "Merge conflict in scripts/a.py" in calls[0]["brief"], calls[0]["brief"]
         assert "git fetch origin dispatch/demo-repo-10" in (calls[0]["context"] or ""), calls[0]["context"]
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["revision_count"] == 1 and item["pr_url"] == _TRAIN_PR, dict(item)
 
 
@@ -9972,7 +9972,7 @@ def test_train_conflict_with_no_attempt_left_fails_and_leaves_the_pr_open():
                           revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
         _sideclaw.get = _jobs({"update-job-spent": _update_pr_job("conflict", note="rebase failed")})
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, dict(item)
         assert item["note"].endswith(f"PR left open: {_TRAIN_PR}"), item["note"]
         assert CLOSED_PRS == []
@@ -9983,7 +9983,7 @@ def test_train_failed_checks_after_the_update_is_a_checks_failed_revision_of_the
         eid = _train_item(conn, "sig-train-red", job="update-job-red")
         _sideclaw.get = _jobs({"update-job-red": _update_pr_job("updated", head=REBASED_SHA, passed=False)})
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and "checks failed" in item["note"], dict(item)
         assert "tests/test_x.py::test_y failed" in item["train_evidence"], item["train_evidence"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-red'").fetchone()
@@ -10003,7 +10003,7 @@ def test_train_failed_ci_on_the_train_sha_is_a_checks_failed_revision():
         CHECK_RUNS["runs"] = [{"name": "build", "status": "completed", "conclusion": "success"},
                               {"name": "e2e", "status": "completed", "conclusion": "failure"}]
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and "CI failed" in item["note"], dict(item)
         assert "e2e" in item["train_evidence"] and TRAIN_SHA in item["train_evidence"], item["train_evidence"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-ci-red'").fetchone()
@@ -10022,7 +10022,7 @@ def test_train_checks_403_falls_back_to_actions_runs():
             {"name": "CI", "status": "completed", "conclusion": "success"}]
         _sideclaw.submit_review = _fake_submit_review([])
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
         assert item["train_stage"] == train.TRAIN_REVIEW, dict(item)
 
@@ -10039,7 +10039,7 @@ def test_train_checks_unreadable_never_pass():
         _github.workflow_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
             RemoteError("HTTP 403 reading Actions runs"))
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert item["train_stage"] == train.TRAIN_CHECKS, dict(item)
 
@@ -10050,7 +10050,7 @@ def test_train_checks_on_a_moved_head_go_back_to_update():
         _sideclaw.submit_update_pr = _fake_update_pr([])
         PR_HEAD["sha"] = REBASED_SHA
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_UPDATE and CHECK_RUNS["asked"] == [], dict(item)
 
 
@@ -10061,7 +10061,7 @@ def test_train_merge_refused_because_the_head_moved_goes_back_to_update_without_
             HeadMoved("GitHub refused the merge (409): the head moved"))
         _sideclaw.submit_update_pr = _fake_update_pr([])
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_UPDATE, dict(item)
         assert item["strikes"] == 0 and item["retry_at"] is None and item["reviewed_sha"] == TRAIN_SHA, dict(item)
 
@@ -10077,7 +10077,7 @@ def test_train_update_lease_refusal_retries_later_without_a_strike():
         updates: list[dict[str, Any]] = []
         _sideclaw.submit_update_pr = _fake_update_pr(updates)
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
         assert item["train_job"] is None and item["train_stage"] == train.TRAIN_UPDATE, dict(item)
         assert item["retry_at"] == (NOW + dt.timedelta(minutes=core.LEASE_RETRY_MINUTES)).isoformat()
@@ -10085,7 +10085,7 @@ def test_train_update_lease_refusal_retries_later_without_a_strike():
         _train_pass(conn, core.LEASE_RETRY_MINUTES - 1)
         assert updates == [], "the retry waits out LEASE_RETRY_MINUTES"
         _train_pass(conn, core.LEASE_RETRY_MINUTES)
-        assert len(updates) == 1 and core._get_item(conn, eid)["strikes"] == 0
+        assert len(updates) == 1 and core.get_item(conn, eid)["strikes"] == 0
 
 
 def test_train_update_infrastructure_failures_strike():
@@ -10099,7 +10099,7 @@ def test_train_update_infrastructure_failures_strike():
 
         _sideclaw.submit_update_pr = _down
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert item["train_job"] is None and item["retry_at"] == (NOW + dt.timedelta(minutes=10)).isoformat()
         assert "502" in item["note"], item["note"]
@@ -10109,13 +10109,13 @@ def test_train_update_infrastructure_failures_strike():
                                                       "error": "git push --force-with-lease rejected"}})
         _train_pass(conn, 11)   # submits
         _train_pass(conn, 11)   # folds the failure
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["strikes"] == 2 and "force-with-lease rejected" in item["note"], dict(item)
 
         _sideclaw.get = _default_fake_get   # the next job is pruned/lost
         _train_pass(conn, 42)
         _train_pass(conn, 42)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and item["strikes"] == 3, dict(item)
         assert "no record of update_pr job" in item["note"], item["note"]
 
@@ -10126,7 +10126,7 @@ def test_train_malformed_update_pr_result_is_a_loud_strike():
         bad = _update_pr_job("rebased")
         _sideclaw.get = _jobs({"update-job-bad": bad})
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["strikes"] == 1 and "refusing to parse" in item["note"], dict(item)
         assert item["train_stage"] == train.TRAIN_UPDATE and item["train_sha"] is None
 
@@ -10140,15 +10140,15 @@ def test_train_walks_only_the_oldest_merging_item_of_a_repo():
         _sideclaw.submit_update_pr = _fake_update_pr(updates)
         _train_pass(conn)
         assert len(updates) == 2, updates
-        assert core._get_item(conn, older)["train_job"] == "update-job-000001"
-        assert core._get_item(conn, newer)["train_job"] is None, "a newer item waits for its repo's train"
-        assert core._get_item(conn, other)["train_job"] == "update-job-000002"
+        assert core.get_item(conn, older)["train_job"] == "update-job-000001"
+        assert core.get_item(conn, newer)["train_job"] is None, "a newer item waits for its repo's train"
+        assert core.get_item(conn, other)["train_job"] == "update-job-000002"
         # The oldest waiting out a backoff still holds its repo's train.
         conn.execute("UPDATE triage_items SET retry_at=? WHERE event_id=?",
                      ((NOW + dt.timedelta(hours=1)).isoformat(), older))
         conn.commit()
         _train_pass(conn, 1)
-        assert core._get_item(conn, newer)["train_job"] is None and len(updates) == 2
+        assert core.get_item(conn, newer)["train_job"] is None and len(updates) == 2
 
 
 def test_train_update_job_folded_by_two_passes_is_acted_on_once():
@@ -10166,7 +10166,7 @@ def test_train_update_job_folded_by_two_passes_is_acted_on_once():
             return done
 
         _sideclaw.get = _get
-        real_set_state = core._set_state
+        real_set_state = core.set_state
         written: list[str] = []
 
         def _counting_set_state(conn_, event_id, state, now, **kw):
@@ -10175,9 +10175,9 @@ def test_train_update_job_folded_by_two_passes_is_acted_on_once():
                 written.append(state)
             return n
 
-        with _patched(core, _set_state=_counting_set_state):
+        with _patched(core, set_state=_counting_set_state):
             _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, dict(item)
         assert written == [core.STATE_WORKING], f"the conflict was acted on {len(written)} times"
 
@@ -10195,7 +10195,7 @@ def test_train_update_job_folded_by_two_passes_is_acted_on_once():
 
         _sideclaw.get = _get_ok
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_CHECKS and item["train_sha"] == TRAIN_SHA, dict(item)
         assert CHECK_RUNS["asked"] == [TRAIN_SHA], "only the winner reads the checks"
 
@@ -10207,7 +10207,7 @@ def test_a_merging_item_with_no_stage_starts_its_train_at_update():
         conn.commit()
         _sideclaw.submit_update_pr = _fake_update_pr([])
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
 
 
@@ -10215,9 +10215,9 @@ def test_leaving_merging_clears_the_train_position_but_keeps_the_reviewed_sha():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-leave", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA,
                           job=None)
-        core._set_state(conn, eid, core.STATE_FAILED, NOW, note="gave up")
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="gave up")
         conn.commit()
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert (item["train_stage"], item["train_sha"], item["train_job"]) == (None, None, None), dict(item)
         assert item["reviewed_sha"] == TRAIN_SHA
 
@@ -10267,7 +10267,7 @@ def test_a_verify_failure_reverts_the_merged_commit_through_an_implement_episode
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["reverting_sha"] == MERGED_SHA, dict(item)
         assert item["implement_job"] == "job-000001" and item["pr_url"] is None, dict(item)
         assert item["revision_count"] == 0 and item["strikes"] == 0, "a revert is not an attempt"
@@ -10295,7 +10295,7 @@ def test_a_host_verb_verify_failure_has_nothing_to_revert_and_goes_back_to_triag
         _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED and item["reverting_sha"] is None, dict(item)
 
 
@@ -10326,7 +10326,7 @@ def test_the_revert_rides_the_train_then_a_verified_revert_starts_a_fresh_attemp
             merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit=REVERT_SHA)
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["pr_url"] == _TRAIN_PR, dict(item)
         assert item["reverting_sha"] == MERGED_SHA and item["revert_json"], "the revert keeps its record"
         assert CLOSED_PRS == [], "the merged fix is not a superseded PR"
@@ -10336,9 +10336,9 @@ def test_the_revert_rides_the_train_then_a_verified_revert_starts_a_fresh_attemp
         context = reviews[0]["context"]
         assert "MECHANICAL REVERT" in context and MERGED_SHA in context and "recurred" in context, context
         _train_pass(conn, 2)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert len(merges) == 1 and item["state"] == core.STATE_VERIFYING, dict(item)
-        assert core._is_revert(item) and item["merged_sha"] == REVERT_SHA, "a revert merge is marked as one"
+        assert core.is_revert(item) and item["merged_sha"] == REVERT_SHA, "a revert merge is marked as one"
 
         ran = _fake_rollout(targets=("deploy", "verify"), deploy=_ran(), verify=_ran())
         _github.pr_files = lambda owner, repo, number: [
@@ -10346,7 +10346,7 @@ def test_the_revert_rides_the_train_then_a_verified_revert_starts_a_fresh_attemp
         _signal_fires_again(conn, eid)   # the signal is back after a revert, by design: no window
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=30), dry_run=False)
         assert ran == [("deploy", "demo-repo"), ("verify", "demo-repo")], ran
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["reverting_sha"] is None, dict(item)
         assert item["revision_count"] == 1 and item["implement_job"] == "job-000002", dict(item)
         assert item["pr_url"] is None and item["merged_sha"] is None, dict(item)
@@ -10361,9 +10361,9 @@ def test_the_revert_rides_the_train_then_a_verified_revert_starts_a_fresh_attemp
         assert "the watchdog threshold is too tight" in fresh["context"], "the investigation stays the goal"
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=40), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["revert_json"] is None, dict(item)
-        assert not core._is_revert(item)
+        assert not core.is_revert(item)
 
 
 def test_a_revert_whose_make_verify_fails_three_passes_fails_the_item():
@@ -10374,10 +10374,10 @@ def test_a_revert_whose_make_verify_fails_three_passes_fails_the_item():
         _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
         for n in (1, 2):
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10 * n), dry_run=False)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == n, dict(item)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=30), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, dict(item)
         assert "production unhealthy after revert" in item["note"] and "db down" in item["note"], item["note"]
 
@@ -10389,7 +10389,7 @@ def test_a_landed_revert_with_no_attempt_left_fails_with_the_evidence():
         _fake_rollout(targets=("verify",), verify=_ran())
         _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and item["reverting_sha"] is None, dict(item)
         assert "no implement attempt left" in item["note"] and "recurred" in item["note"], item["note"]
         assert item["revision_count"] == core.MAX_IMPLEMENT_ATTEMPTS - 1
@@ -10407,7 +10407,7 @@ def test_a_blocked_revert_review_fails_the_item_with_the_pr_left_open_and_no_rev
                                                                        "message": "more than a revert"}])}})
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, dict(item)
         assert "not revised" in item["note"] and _TRAIN_PR in item["note"], item["note"]
         assert CLOSED_PRS == []
@@ -10424,7 +10424,7 @@ def test_a_conflicting_revert_update_fails_instead_of_revising():
         conn.commit()
         _sideclaw.get = _jobs({"update-job-conflict": _update_pr_job("conflict", note="rebase failed")})
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "not revised" in item["note"], dict(item)
         assert item["note"].endswith(f"PR left open: {_TRAIN_PR}"), item["note"]
 
@@ -10435,11 +10435,11 @@ def test_a_lease_refused_revert_is_submitted_again_later_without_a_strike():
         calls: list[dict[str, Any]] = []
         _sideclaw.submit = _fake_submit(calls)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert len(calls) == 1 and core._get_item(conn, eid)["implement_job"] == "job-000001"
+        assert len(calls) == 1 and core.get_item(conn, eid)["implement_job"] == "job-000001"
         _sideclaw.get = _jobs({"job-000001": {"id": "job-000001", "status": "failed", "error": _LEASE_ERROR},
                                "job-000002": {"id": "job-000002", "status": "running"}})
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 0, dict(item)
         assert item["implement_job"] is None and item["reverting_sha"] == MERGED_SHA, dict(item)
         assert item["retry_at"] == (NOW + dt.timedelta(minutes=core.LEASE_RETRY_MINUTES)).isoformat()
@@ -10449,7 +10449,7 @@ def test_a_lease_refused_revert_is_submitted_again_later_without_a_strike():
         work.advance_implement_chain(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=core.LEASE_RETRY_MINUTES),
                                      dry_run=False)
         assert len(calls) == 2 and f"git revert --no-edit {MERGED_SHA}" in calls[1]["brief"], calls
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["strikes"] == 0 and item["revision_count"] == 0, dict(item)
 
 
@@ -10458,14 +10458,14 @@ def test_a_refused_revert_submit_fails_the_item_and_a_5xx_strikes():
         struck = _reverting(conn, "sig-revert-5xx", state=core.STATE_WORKING)
         _sideclaw.submit = _fake_submit([], ok=False)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, struck)
+        item = core.get_item(conn, struck)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
 
         refused = _reverting(conn, "sig-revert-4xx", state=core.STATE_WORKING)
         _sideclaw.submit = _refusing_submit([])
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert core._get_item(conn, refused)["state"] == core.STATE_FAILED
+        assert core.get_item(conn, refused)["state"] == core.STATE_FAILED
 
 
 def test_revert_dry_run_submits_nothing():
@@ -10476,7 +10476,7 @@ def test_revert_dry_run_submits_nothing():
         with contextlib.redirect_stdout(buf):
             work.advance_implement_chain(conn, DEFAULT_POLICY, NOW, dry_run=True)
         assert f"[dry-run] would submit the revert of {MERGED_SHA[:12]}" in buf.getvalue(), buf.getvalue()
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["implement_job"] is None and item["state"] == core.STATE_WORKING, dict(item)
 
 
@@ -10488,15 +10488,15 @@ def test_auto_implement_leaves_an_item_on_its_revert_alone():
         conn.commit()
         _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"auto-implemented: {kw}"))
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert core._get_item(conn, eid)["implement_job"] is None
+        assert core.get_item(conn, eid)["implement_job"] is None
 
 
 def test_an_item_back_before_its_investigation_forgets_its_revert():
     with _triage_env() as (conn, ctx):
         eid = _reverting(conn, "sig-revert-forgotten", state=core.STATE_FAILED)
-        core._set_state(conn, eid, core.STATE_TRIAGED, NOW, note="reinvestigate")
+        core.set_state(conn, eid, core.STATE_TRIAGED, NOW, note="reinvestigate")
         conn.commit()
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["reverting_sha"] is None and item["revert_json"] is None, dict(item)
 
 
@@ -10532,7 +10532,7 @@ def _sweep_pass(conn, minutes: float = 0) -> None:
 
 
 def _sweep_untouched(conn, eid: int) -> None:
-    item = core._get_item(conn, eid)
+    item = core.get_item(conn, eid)
     assert item["state"] == core.STATE_VERIFYING and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
     assert item["merged_sha"] == MERGED_SHA and item["fixed_by_pr"] is None, dict(item)
 
@@ -10544,7 +10544,7 @@ def test_a_fix_merge_queues_the_sweep_and_a_revert_merge_does_not():
             merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit=REVERT_SHA)
         fix = _train_item(conn, "sig-sweep-fix", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
         _train_pass(conn)
-        item = core._get_item(conn, fix)
+        item = core.get_item(conn, fix)
         assert item["state"] == core.STATE_VERIFYING, dict(item)
         assert item["sweep_pr"] == _TRAIN_PR and item["sweep_job"] is None and item["sweep_attempts"] == 0, dict(item)
 
@@ -10553,8 +10553,8 @@ def test_a_fix_merge_queues_the_sweep_and_a_revert_merge_does_not():
         conn.execute("UPDATE triage_items SET reverting_sha=?, revert_json='{}' WHERE event_id=?", (MERGED_SHA, revert))
         conn.commit()
         _train_pass(conn)
-        item = core._get_item(conn, revert)
-        assert item["state"] == core.STATE_VERIFYING and core._is_revert(item), dict(item)
+        item = core.get_item(conn, revert)
+        assert item["state"] == core.STATE_VERIFYING and core.is_revert(item), dict(item)
         assert item["sweep_pr"] is None, "a revert's merge is never swept"
         assert len(merges) == 2
 
@@ -10567,8 +10567,8 @@ def test_the_other_merge_paths_queue_the_sweep_too():
                      (core.STATE_MERGING, "implement-job-sw", "validation-job-sw",
                       "https://github.com/jkrumm/argo/pull/40", eid))
         conn.commit()
-        work._land_already_merged_item(conn, _MERGE_FIXTURE_POLICY, core._get_item(conn, eid), NOW)
-        assert core._get_item(conn, eid)["sweep_pr"] == "https://github.com/jkrumm/argo/pull/40"
+        work.land_already_merged_item(conn, _MERGE_FIXTURE_POLICY, core.get_item(conn, eid), NOW)
+        assert core.get_item(conn, eid)["sweep_pr"] == "https://github.com/jkrumm/argo/pull/40"
 
         # Reconcile: GitHub says a crashed merge did land.
         rec = _seed_verdict_item(conn, external_id="sig-sweep-reconcile", investigate_job="inv-sw-rec", repo="vps")
@@ -10582,7 +10582,7 @@ def test_the_other_merge_paths_queue_the_sweep_too():
         work.record_operation(conn, event_id=rec, kind="merge", repo="vps", authorized_by="auto-from-item")
         work._run_gh_pr_view = lambda owner, repo, pr: {"state": "MERGED", "mergeCommit": {"oid": "deadbeef"}}
         work.reconcile_operations(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, rec)
+        item = core.get_item(conn, rec)
         assert item["state"] == core.STATE_VERIFYING, dict(item)
         assert item["sweep_pr"] == "https://github.com/jkrumm/vps/pull/8", dict(item)
 
@@ -10611,7 +10611,7 @@ def test_a_queued_sweep_submits_one_job_with_the_diff_and_only_the_idle_candidat
             assert f"#{eid} " in prompt, (eid, prompt)
         for eid in (merged, busy, investigating, elsewhere, owners):
             assert f"#{eid} " not in prompt, (eid, prompt)
-        row = core._get_item(conn, merged)
+        row = core.get_item(conn, merged)
         assert row["sweep_job"] == SWEEP_JOB and row["sweep_pr"] == _TRAIN_PR, dict(row)
         assert json.loads(row["sweep_candidates"]) == {str(triaged): "triaged", str(idle): "working"}
         _sweep_untouched(conn, merged)
@@ -10642,7 +10642,7 @@ def test_a_finished_sweep_moves_only_the_valid_match_to_verifying_by_signal():
         _sweep_env()
         _sweep_pass(conn)
         # Between the submit and the fold: one item moved on, one got an episode, one an investigation.
-        core._set_state(conn, stale, core.STATE_NEEDS_DECISION, NOW, note="human please")
+        core.set_state(conn, stale, core.STATE_NEEDS_DECISION, NOW, note="human please")
         conn.execute("UPDATE triage_items SET implement_job='impl-late' WHERE event_id=?", (started,))
         conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) VALUES(?,?,?,?,?,?)",
                      ("inv-late", "investigate", "demo-repo", "b", "running", NOW.isoformat()))
@@ -10655,18 +10655,18 @@ def test_a_finished_sweep_moves_only_the_valid_match_to_verifying_by_signal():
             {"item": "x", "reason": "r"}, {"item": valid, "reason": "twice"}, "nonsense"]}, job_id=job_id)
         _sweep_pass(conn, 1)
 
-        item = core._get_item(conn, valid)
+        item = core.get_item(conn, valid)
         assert item["state"] == core.STATE_VERIFYING and item["fixed_by_pr"] == _TRAIN_PR, dict(item)
         assert item["note"].startswith(f"fixed by {_TRAIN_PR}: the threshold change") and len(item["note"]) <= 200
         assert item["verify_started_at"] == (NOW + dt.timedelta(minutes=1)).isoformat(), dict(item)
-        assert item["verify_mark"] == core._occurrence_mark(core._get_event(conn, valid)), dict(item)
+        assert item["verify_mark"] == core.occurrence_mark(core.get_event(conn, valid)), dict(item)
         assert item["merged_sha"] is None and item["verify_failures"] == 0, dict(item)
-        assert core._get_item(conn, working)["state"] == core.STATE_VERIFYING
+        assert core.get_item(conn, working)["state"] == core.STATE_VERIFYING
         for eid, state in ((stale, core.STATE_NEEDS_DECISION), (started, core.STATE_TRIAGED),
                            (investigating, core.STATE_WORKING), (foreign, core.STATE_TRIAGED)):
-            other = core._get_item(conn, eid)
+            other = core.get_item(conn, eid)
             assert other["state"] == state and other["fixed_by_pr"] is None, (eid, dict(other))
-        row = core._get_item(conn, merged)
+        row = core.get_item(conn, merged)
         assert row["sweep_pr"] is None and row["sweep_job"] is None and row["sweep_candidates"] is None, dict(row)
         _sweep_untouched(conn, merged)
 
@@ -10693,10 +10693,10 @@ def test_a_swept_item_quiet_for_the_window_closes_fixed_by_with_no_make_verify_a
                               note=f"fixed by {_TRAIN_PR}: same defect", repo="demo-repo")
         _rollout.verify = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("a swept item never runs make verify"))
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING, "the window is still open"
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(hours=core.VERIFY_WINDOW_HOURS), dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_FIXED_BY, dict(item)
         assert _TRAIN_PR in item["note"] and ctx.posted == [], (item["note"], ctx.posted)
         assert not conn.execute("SELECT 1 FROM operations WHERE kind='deploy'").fetchone()
@@ -10708,7 +10708,7 @@ def test_a_swept_item_whose_signal_recurs_goes_back_to_triaged_without_a_revert(
         _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"a revert was submitted: {kw}"))
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED and item["fixed_by_pr"] is None, dict(item)
         assert item["note"].startswith(verify.SWEPT_BACK_NOTE_PREFIX) and "recurred" in item["note"], item["note"]
         assert item["reverting_sha"] is None and item["verify_started_at"] is None, dict(item)
@@ -10722,10 +10722,10 @@ def test_a_swept_item_still_firing_at_the_window_end_goes_back_after_three_passe
         conn.commit()
         for n in (1, 2):
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=n), dry_run=False)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == n, dict(item)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=3), dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_TRIAGED
+        assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
 
 
 def test_a_swept_issue_closes_at_the_window_end_and_the_owner_is_told():
@@ -10734,15 +10734,15 @@ def test_a_swept_issue_closes_at_the_window_end_and_the_owner_is_told():
             conn, origin="github_issue", repo="demo-repo", brief="fix it", max_tier="implement",
             external_id="jkrumm/demo-repo#21", title="fix it", url="https://github.com/jkrumm/demo-repo/issues/21",
             payload={"repo": "demo-repo", "number": 21, "author": _github.GH_OWNER}, now=NOW)
-        core._set_state(conn, eid, core.STATE_VERIFYING, NOW - dt.timedelta(hours=3),
-                        **{**core._VERIFY_RESET, "verify_started_at": (NOW - dt.timedelta(hours=3)).isoformat(),
+        core.set_state(conn, eid, core.STATE_VERIFYING, NOW - dt.timedelta(hours=3),
+                        **{**core.VERIFY_RESET, "verify_started_at": (NOW - dt.timedelta(hours=3)).isoformat(),
                            "fixed_by_pr": _TRAIN_PR}, note=f"fixed by {_TRAIN_PR}: same defect")
         conn.commit()
         comments: list[dict[str, Any]] = []
         _github.create_issue_comment = lambda repo_full, number, body: comments.append(
             {"number": number, "body": body}) or {"id": 1}
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_FIXED_BY, dict(item)
         assert len(comments) == 1 and comments[0]["number"] == 21 and _TRAIN_PR in comments[0]["body"], comments
         assert comments[0]["body"].count("\n") <= 2 and ctx.posted == []
@@ -10755,7 +10755,7 @@ def test_a_private_repo_is_never_swept_and_nothing_is_submitted():
         submitted = _sweep_env()
         _sweep_pass(conn)
         assert submitted == []
-        row = core._get_item(conn, merged)
+        row = core.get_item(conn, merged)
         assert row["sweep_pr"] is None and row["sweep_job"] is None, dict(row)
         _sweep_untouched(conn, merged)
 
@@ -10765,7 +10765,7 @@ def test_no_candidate_means_no_job():
         merged = _merged_with_sweep(conn, "sig-sweep-alone")
         submitted = _sweep_env()
         _sweep_pass(conn)
-        assert submitted == [] and core._get_item(conn, merged)["sweep_pr"] is None
+        assert submitted == [] and core.get_item(conn, merged)["sweep_pr"] is None
 
 
 def test_sweep_dry_run_prints_what_it_would_submit_and_submits_nothing():
@@ -10778,7 +10778,7 @@ def test_sweep_dry_run_prints_what_it_would_submit_and_submits_nothing():
         with contextlib.redirect_stdout(buf):
             work.advance_implement_chain(conn, DEFAULT_POLICY, NOW, dry_run=True)
         assert f"[dry-run] would submit a fixed-by sweep for {_TRAIN_PR} (1 candidate item(s))" in buf.getvalue(), buf.getvalue()
-        row = core._get_item(conn, merged)
+        row = core.get_item(conn, merged)
         assert row["sweep_pr"] == _TRAIN_PR and row["sweep_job"] is None and row["sweep_attempts"] == 0, dict(row)
 
 
@@ -10790,14 +10790,14 @@ def test_a_failing_sweep_never_touches_the_merged_item_and_gives_up_after_the_li
         _sideclaw.submit_triage = lambda **kw: (_ for _ in ()).throw(RemoteError("sideclaw is down"))
         for n in range(1, verify.SWEEP_ATTEMPT_LIMIT):
             _sweep_pass(conn, n)
-            row = core._get_item(conn, merged)
+            row = core.get_item(conn, merged)
             assert row["sweep_pr"] == _TRAIN_PR and row["sweep_job"] is None and row["sweep_attempts"] == n, dict(row)
             _sweep_untouched(conn, merged)
         _sweep_pass(conn, 10)
-        row = core._get_item(conn, merged)
+        row = core.get_item(conn, merged)
         assert row["sweep_pr"] is None and row["sweep_attempts"] == 0, dict(row)
         _sweep_untouched(conn, merged)
-        assert core._get_item(conn, cand)["state"] == core.STATE_TRIAGED
+        assert core.get_item(conn, cand)["state"] == core.STATE_TRIAGED
 
 
 def test_a_failed_sweep_job_and_an_unusable_answer_are_failed_attempts_not_folds():
@@ -10807,13 +10807,13 @@ def test_a_failed_sweep_job_and_an_unusable_answer_are_failed_attempts_not_folds
         _sweep_env(job_status="failed")
         _sweep_pass(conn)
         _sweep_pass(conn, 1)   # the job is failed: attempt 1
-        row = core._get_item(conn, merged)
+        row = core.get_item(conn, merged)
         assert row["sweep_job"] is None and row["sweep_attempts"] == 1, dict(row)
         _sideclaw.get = lambda job_id: _triage_job({"matches": "not-a-list"}, job_id=job_id)
         _sweep_pass(conn, 2)   # resubmitted
         _sweep_pass(conn, 3)   # unusable answer: attempt 2
-        assert core._get_item(conn, merged)["sweep_attempts"] == 2
-        assert core._get_item(conn, cand)["state"] == core.STATE_TRIAGED
+        assert core.get_item(conn, merged)["sweep_attempts"] == 2
+        assert core.get_item(conn, cand)["state"] == core.STATE_TRIAGED
         _sweep_untouched(conn, merged)
 
 
@@ -10824,15 +10824,15 @@ def test_a_stale_sweep_claim_is_released_as_a_failed_attempt():
         conn.execute("UPDATE triage_items SET sweep_job=? WHERE event_id=?", (claim, merged))
         conn.commit()
         _sweep_pass(conn)
-        row = core._get_item(conn, merged)
+        row = core.get_item(conn, merged)
         assert row["sweep_job"] is None and row["sweep_attempts"] == 1, dict(row)
 
 
 def test_a_verifying_entry_that_is_not_a_sweep_starts_without_fixed_by_pr():
     with _triage_env() as (conn, ctx):
         eid = _seed_item(conn, external_id="sig-fixed-by-reset", state=core.STATE_VERIFYING, fixed_by_pr=_TRAIN_PR)
-        core._set_state(conn, eid, core.STATE_VERIFYING, NOW, **core._VERIFY_RESET)
-        assert core._get_item(conn, eid)["fixed_by_pr"] is None
+        core.set_state(conn, eid, core.STATE_VERIFYING, NOW, **core.VERIFY_RESET)
+        assert core.get_item(conn, eid)["fixed_by_pr"] is None
 
 
 
@@ -10869,7 +10869,7 @@ def test_a_repo_without_a_deploy_target_verifies_the_synced_tree_and_a_started_w
         _rollout.verify = lambda cwd, **kw: order.append("verify") or _ran()
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert order == ["sync", "has_target deploy", "has_target verify", "verify"], order
-        assert core._get_item(conn, eid)["state"] == core.STATE_FIXED
+        assert core.get_item(conn, eid)["state"] == core.STATE_FIXED
 
     with _triage_env() as (conn, ctx):
         _seed_verifying(conn, "sig-window-open", started=NOW - dt.timedelta(minutes=5))
@@ -10899,7 +10899,7 @@ def test_a_migrated_merging_row_never_folds_its_pre_train_review():
         PR_HEAD["sha"] = REBASED_SHA
         CHECK_RUNS["runs"] = _green_runs()
         _train_pass(conn, 5)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert "review-old" not in asked, asked
         assert item["train_stage"] == train.TRAIN_REVIEW and item["validation_job"] == "review-job-000001", dict(item)
         assert item["reviewed_sha"] is None and len(reviews) == 1, dict(item)
@@ -10916,7 +10916,7 @@ def test_a_revert_is_submitted_past_a_pr_waiting_on_its_train_but_waits_for_a_ru
         _sideclaw.submit = _fake_submit(calls)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and f"git revert --no-edit {MERGED_SHA}" in calls[0]["brief"], calls
-        assert core._get_item(conn, eid)["implement_job"] == "job-000001"
+        assert core.get_item(conn, eid)["implement_job"] == "job-000001"
 
     with _triage_env() as (conn, ctx):
         _train_item(conn, "sig-updating", stage="update", job="update-job-running")
@@ -10924,7 +10924,7 @@ def test_a_revert_is_submitted_past_a_pr_waiting_on_its_train_but_waits_for_a_ru
         calls = []
         _sideclaw.submit = _fake_submit(calls)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert calls == [] and item["implement_job"] is None and "deferred" in item["note"], dict(item)
 
     with _triage_env() as (conn, ctx):
@@ -10935,7 +10935,7 @@ def test_a_revert_is_submitted_past_a_pr_waiting_on_its_train_but_waits_for_a_ru
         calls = []
         _sideclaw.submit = _fake_submit(calls)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert calls == [] and core._get_item(conn, eid)["implement_job"] is None
+        assert calls == [] and core.get_item(conn, eid)["implement_job"] is None
 
 
 def test_a_revert_goes_first_on_its_repos_merge_train():
@@ -10950,8 +10950,8 @@ def test_a_revert_goes_first_on_its_repos_merge_train():
         _sideclaw.submit_review = _fake_submit_review([])
         CHECK_RUNS["runs"] = _green_runs()
         _train_pass(conn)
-        assert core._get_item(conn, revert)["train_stage"] == train.TRAIN_REVIEW
-        assert core._get_item(conn, older)["train_stage"] == train.TRAIN_CHECKS, "the older PR waits"
+        assert core.get_item(conn, revert)["train_stage"] == train.TRAIN_REVIEW
+        assert core.get_item(conn, older)["train_stage"] == train.TRAIN_CHECKS, "the older PR waits"
 
 
 def test_argo_merge_is_pinned_to_the_reviewed_head_and_rejoins_the_train_otherwise():
@@ -10967,7 +10967,7 @@ def test_argo_merge_is_pinned_to_the_reviewed_head_and_rejoins_the_train_otherwi
         ack = ctx.argo_acks[0]
         assert ack["status"] == "applied" and ack["result"]["merging"] is True, ack
         assert "review the current head first" in ack["result"]["note"], ack
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_UPDATE, dict(item)
 
     with _triage_env() as (conn, ctx):
@@ -10984,7 +10984,7 @@ def test_argo_merge_is_pinned_to_the_reviewed_head_and_rejoins_the_train_otherwi
         assert seen and seen[0]["expected_sha"] == TRAIN_SHA, seen
         ack = ctx.argo_acks[0]
         assert ack["status"] == "applied" and "review the current head first" in ack["result"]["note"], ack
-        assert core._get_item(conn, eid)["state"] == core.STATE_MERGING
+        assert core.get_item(conn, eid)["state"] == core.STATE_MERGING
 
 
 def test_a_verify_failure_of_a_merge_that_is_not_one_commit_fails_with_the_evidence_instead_of_reverting():
@@ -11001,7 +11001,7 @@ def test_a_verify_failure_of_a_merge_that_is_not_one_commit_fails_with_the_evide
             _sideclaw.submit = _fake_submit(calls)
             _signal_fires_again(conn, eid)
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-            item = core._get_item(conn, eid)
+            item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_FAILED and item["reverting_sha"] is None, (ext, dict(item))
             assert "cannot auto-revert" in item["note"] and why in item["note"], item["note"]
             assert "recurred" in item["verify_result"], dict(item)
@@ -11019,9 +11019,9 @@ def test_a_verify_failure_of_a_merge_commit_reverts_it_with_mainline_one():
         _sideclaw.submit = _fake_submit(calls)
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert core._get_item(conn, eid)["state"] == core.STATE_WORKING
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
         assert len(calls) == 1 and f"git revert --no-edit -m 1 {MERGED_SHA}" in calls[0]["brief"], calls
-        assert json.loads(core._get_item(conn, eid)["revert_json"])["method"] == "merge"
+        assert json.loads(core.get_item(conn, eid)["revert_json"])["method"] == "merge"
 
 
 def test_merge_landings_are_compare_and_set_and_a_loser_never_rewrites_verifying():
@@ -11029,17 +11029,17 @@ def test_merge_landings_are_compare_and_set_and_a_loser_never_rewrites_verifying
     window or re-queue its sweep."""
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-land-race", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
-        stale = core._get_item(conn, eid)
-        core._set_state(conn, eid, core.STATE_VERIFYING, NOW, note="landed by the winner",
+        stale = core.get_item(conn, eid)
+        core.set_state(conn, eid, core.STATE_VERIFYING, NOW, note="landed by the winner",
                         verify_started_at=NOW.isoformat(), verify_failures=1, merged_sha="d" * 40,
                         merge_method="squash")
         conn.commit()
-        assert work._land_already_merged_item(conn, DEFAULT_POLICY, stale, NOW) is False
+        assert work.land_already_merged_item(conn, DEFAULT_POLICY, stale, NOW) is False
         _sideclaw.get = _jobs({})
         _merge.plan_or_land = lambda conn_, **kw: types.SimpleNamespace(
             merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="e" * 40)
-        train._merge_and_rollout(conn, DEFAULT_POLICY, stale, NOW, expected_sha=TRAIN_SHA)
-        item = core._get_item(conn, eid)
+        train.merge_and_rollout(conn, DEFAULT_POLICY, stale, NOW, expected_sha=TRAIN_SHA)
+        item = core.get_item(conn, eid)
         assert item["note"] == "landed by the winner" and item["verify_started_at"] == NOW.isoformat(), dict(item)
         assert item["verify_failures"] == 1 and item["merged_sha"] == "d" * 40 and item["sweep_pr"] is None
 
@@ -11056,8 +11056,8 @@ def test_a_review_whose_pr_cannot_be_read_strikes_out_instead_of_resetting_its_s
         _github.read_pr = lambda owner, repo, number: (_ for _ in ()).throw(RemoteError("GitHub 502"))
         for n, minutes in enumerate((0, 11, 42), start=1):
             _train_pass(conn, minutes)
-            assert core._get_item(conn, eid)["strikes"] == n, (n, dict(core._get_item(conn, eid)))
-        item = core._get_item(conn, eid)
+            assert core.get_item(conn, eid)["strikes"] == n, (n, dict(core.get_item(conn, eid)))
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "GitHub 502" in item["note"], dict(item)
 
 
@@ -11072,9 +11072,9 @@ def test_a_train_whose_head_keeps_moving_is_bounded_by_strikes():
         PR_HEAD["sha"] = REBASED_SHA                                                        # ...never the head
         for hour in range(40):
             _train_pass(conn, hour * 60)
-            if core._get_item(conn, eid)["state"] != core.STATE_MERGING:
+            if core.get_item(conn, eid)["state"] != core.STATE_MERGING:
                 break
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, dict(item)
         assert "back to update" in item["note"] and item["strikes"] == core.STRIKE_LIMIT, item["note"]
         # Two plain rewinds each submit an update; from the third rewind on each one strikes, and every
@@ -11094,7 +11094,7 @@ def test_an_interrupted_deploy_of_the_same_commit_goes_to_verify_instead_of_depl
         work.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
         ran = _fake_rollout(targets=("deploy", "verify"), deploy=_ran(), verify=_ran())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert ran == [("verify", "demo-repo")], ran
         assert item["verify_started_at"] == NOW.isoformat() and "interrupted" in item["note"], dict(item)
 
@@ -11130,7 +11130,7 @@ def test_a_merge_whose_answer_was_lost_lands_the_item_when_github_says_merged():
 
         _merge.plan_or_land = _already
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING, dict(item)
         assert item["merged_sha"] == "f" * 40 and item["merge_method"] == "squash", dict(item)
         assert item["sweep_pr"] == _TRAIN_PR, "a fix's merge queues its fixed-by sweep"
@@ -11142,7 +11142,7 @@ def test_a_merge_whose_answer_was_lost_lands_the_item_when_github_says_merged():
 def _hand_merged(conn, ext: str, *, reviewed: str | None, head: str = TRAIN_SHA) -> tuple[int, str]:
     """An item on the train whose PR GitHub reports merged at `head` (a merge by hand, or a lost
     merge answer): `reviewed` is the last head a review confirmed, if any. Returns the item and
-    the outcome `_merge_and_rollout` reports."""
+    the outcome `merge_and_rollout` reports."""
     eid = _train_item(conn, ext, stage="merge", sha=TRAIN_SHA, reviewed=reviewed)
     _sideclaw.get = _jobs({})
 
@@ -11150,7 +11150,7 @@ def _hand_merged(conn, ext: str, *, reviewed: str | None, head: str = TRAIN_SHA)
         raise _merge.AlreadyMerged("jkrumm/demo-repo#10 is already merged.", merge_commit="f" * 40, head_sha=head)
 
     _merge.plan_or_land = _already
-    outcome = train._merge_and_rollout(conn, DEFAULT_POLICY, core._get_item(conn, eid), NOW, expected_sha=TRAIN_SHA)
+    outcome = train.merge_and_rollout(conn, DEFAULT_POLICY, core.get_item(conn, eid), NOW, expected_sha=TRAIN_SHA)
     return eid, outcome
 
 
@@ -11160,7 +11160,7 @@ def test_a_pr_merged_by_hand_with_no_review_of_its_head_verifies_by_signal_only(
     sweep's mode: no deploy, no `make verify`), says so in its note, and queues no sweep."""
     with _triage_env() as (conn, ctx):
         eid, outcome = _hand_merged(conn, "sig-hand-merged", reviewed=None)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert outcome == "merged" and item["state"] == core.STATE_VERIFYING, dict(item)
         assert item["note"] == work.UNREVIEWED_MERGE_NOTE and "signal only" in item["note"], dict(item)
         assert item["fixed_by_pr"] == _TRAIN_PR and item["verify_started_at"] == NOW.isoformat(), dict(item)
@@ -11168,13 +11168,13 @@ def test_a_pr_merged_by_hand_with_no_review_of_its_head_verifies_by_signal_only(
         ran = _fake_rollout(targets=("deploy", "verify"), deploy=_ran(), verify=_ran())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert ran == [], f"signal-only verification runs neither make deploy nor make verify: {ran}"
-        assert core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+        assert core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
 
 
 def test_a_pr_merged_at_a_head_other_than_the_reviewed_one_verifies_by_signal_only():
     with _triage_env() as (conn, ctx):
         eid, _ = _hand_merged(conn, "sig-hand-merged-other-head", reviewed=TRAIN_SHA, head=REBASED_SHA)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_VERIFYING and item["fixed_by_pr"] == _TRAIN_PR, dict(item)
         assert item["note"] == work.UNREVIEWED_MERGE_NOTE, dict(item)
 
@@ -11183,7 +11183,7 @@ def test_a_pr_merged_at_the_reviewed_head_is_landed_as_gated():
     """The counterpart: a review confirmed that very head, so the merge is warden's gated one."""
     with _triage_env() as (conn, ctx):
         eid, outcome = _hand_merged(conn, "sig-merged-reviewed", reviewed=TRAIN_SHA)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert outcome == "merged" and item["state"] == core.STATE_VERIFYING, dict(item)
         assert item["fixed_by_pr"] is None and item["verify_started_at"] is None, dict(item)
         assert item["sweep_pr"] == _TRAIN_PR and "signal only" not in (item["note"] or ""), dict(item)
@@ -11200,14 +11200,14 @@ def test_no_check_runs_right_after_update_pr_pushed_is_pending_not_green():
         reviews: list[dict[str, Any]] = []
         _sideclaw.submit_review = _fake_submit_review(reviews)
         _train_pass(conn)
-        item = core._get_item(conn, eid)
+        item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_CHECKS and item["train_pushed_at"] == NOW.isoformat(), dict(item)
         assert item["note"].startswith(train.MERGE_PENDING_NOTE_PREFIX) and "no check runs" in item["note"]
         _train_pass(conn, 1)
-        assert reviews == [] and core._get_item(conn, eid)["strikes"] == 0
+        assert reviews == [] and core.get_item(conn, eid)["strikes"] == 0
         _train_pass(conn, 3)
         assert len(reviews) == 1, "past the grace, no check runs means none exist"
-        assert core._get_item(conn, eid)["train_stage"] == train.TRAIN_REVIEW
+        assert core.get_item(conn, eid)["train_stage"] == train.TRAIN_REVIEW
 
 if __name__ == "__main__":
     sys.exit(main())

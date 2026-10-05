@@ -65,33 +65,33 @@ def _on_verify_failure(conn: sqlite3.Connection, item: sqlite3.Row, evidence: st
     is `failed` with the evidence and the reason, the change still deployed, for the owner."""
     event_id, sha, method = item["event_id"], item["merged_sha"], item["merge_method"]
     if method is None:
-        core._set_state(conn, event_id, core.STATE_TRIAGED, now, expect_state=core.STATE_VERIFYING,
-                        note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence}", **core._VERIFY_RESET)
+        core.set_state(conn, event_id, core.STATE_TRIAGED, now, expect_state=core.STATE_VERIFYING,
+                        note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence}", **core.VERIFY_RESET)
         conn.commit()
         return
     if not sha or method not in REVERTIBLE_MERGE_METHODS:
         why = ("its merge commit is not on record" if not sha else
                f"{sha[:12]} landed as a {method} merge, not one commit")
-        core._set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
+        core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
                         expect_eq={"merged_sha": sha} if sha else None, verify_result=evidence[:VERIFY_RESULT_MAX],
                         note=f"{VERIFY_FAILED_NOTE_PREFIX}cannot auto-revert ({why}): {evidence}")
         conn.commit()
         return
     record = {"sha": sha, "pr": item["pr_url"], "title": _merged_title(conn, event_id, sha), "evidence": evidence,
               "method": method}
-    core._set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_VERIFYING, expect_eq={"merged_sha": sha},
+    core.set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_VERIFYING, expect_eq={"merged_sha": sha},
                     note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence} — reverting {sha[:12]}",
                     reverting_sha=sha, revert_json=json.dumps(record), implement_job=None, validation_job=None,
-                    pr_url=None, reviewed_sha=None, strikes=0, retry_at=None, **core._VERIFY_RESET)
+                    pr_url=None, reviewed_sha=None, strikes=0, retry_at=None, **core.VERIFY_RESET)
     conn.commit()
 
 
 def _start_verify(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, note: str) -> None:
     """Open the verify window: stamp its start and, for an alert item, the event's occurrence
     mark every later occurrence is compared against."""
-    mark = core._occurrence_mark(core._get_event(conn, item["event_id"])) if item["origin"] == "alert" else None
-    core._set_state(conn, item["event_id"], core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING, note=note,
-                    verify_started_at=core._now_iso(now), verify_mark=mark, verify_failures=0, verify_result=None,
+    mark = core.occurrence_mark(core.get_event(conn, item["event_id"])) if item["origin"] == "alert" else None
+    core.set_state(conn, item["event_id"], core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING, note=note,
+                    verify_started_at=core.now_iso(now), verify_mark=mark, verify_failures=0, verify_result=None,
                     strikes=0, retry_at=None)
     conn.commit()
 
@@ -116,26 +116,26 @@ def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) 
     adds the first `deploy` target is deployed, and `make verify` (every later pass) runs on the
     merged tree, not the one before it. A checkout that cannot be synced strikes."""
     event_id = item["event_id"]
-    retry_at = core._parse_ts(item["retry_at"])
+    retry_at = core.parse_ts(item["retry_at"])
     if retry_at is not None and now < retry_at:
         return None
     cwd = _repo_checkout(item)
     if cwd is None:
         _start_verify(conn, item, now, note="no checkout to deploy; verifying")
-        return core._get_item(conn, event_id)
+        return core.get_item(conn, event_id)
     deferred = _rollout.sync_checkout(cwd)
     if deferred is not None:
-        core._strike(conn, event_id, now, f"deploy deferred: {deferred.reason}",
+        core.strike(conn, event_id, now, f"deploy deferred: {deferred.reason}",
                      retry_state=core.STATE_VERIFYING, expect_state=core.STATE_VERIFYING)
         conn.commit()
         return None
     if not _rollout.has_target(cwd, "deploy"):
         _start_verify(conn, item, now, note="no deploy target; verifying")
-        return core._get_item(conn, event_id)
+        return core.get_item(conn, event_id)
     if _interrupted_deploy(conn, item):
         _start_verify(conn, item, now, note=f"the deploy of {item['merged_sha'][:12]} was interrupted (it may "
                                             f"have restarted warden itself) — not run again; make verify judges")
-        return core._get_item(conn, event_id)
+        return core.get_item(conn, event_id)
 
     # Recorded before the deploy runs (DESIGN.md § Crash recovery), keyed to the merged commit:
     # a crash leaves it open, reconcile_operations() resolves it `unknown`, and the next pass
@@ -147,13 +147,13 @@ def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) 
     receipt = json.dumps({"exitCode": result.exit_code, "output": result.tail})
     if not result.ok:
         work.complete_operation(conn, op_id, outcome="failed", receipt=receipt)
-        core._strike(conn, event_id, now, f"deploy failed (exit {result.exit_code}): {_tail_for_note(result.tail)}",
+        core.strike(conn, event_id, now, f"deploy failed (exit {result.exit_code}): {_tail_for_note(result.tail)}",
                      retry_state=core.STATE_VERIFYING, expect_state=core.STATE_VERIFYING)
         conn.commit()
         return None
     work.complete_operation(conn, op_id, outcome="done", receipt=receipt)
     _start_verify(conn, item, now, note="deployed via make deploy; verifying")
-    return core._get_item(conn, event_id)
+    return core.get_item(conn, event_id)
 
 
 def _signal_not_quiet(item: sqlite3.Row, event: sqlite3.Row) -> list[str]:
@@ -161,10 +161,10 @@ def _signal_not_quiet(item: sqlite3.Row, event: sqlite3.Row) -> list[str]:
     problems: list[str] = []
     if event["source"] not in core.GROUPED_TRIAGE_SOURCES and event["resolved_at"] is None:
         problems.append(f"{event['title']} is still firing")
-    records = work._safe_json_list(item["deploy_expect_json"])
-    title = (records[0].get("monitorTitle") if records else None) or work._kuma_monitor_title(event)
+    records = work.safe_json_list(item["deploy_expect_json"])
+    title = (records[0].get("monitorTitle") if records else None) or work.kuma_monitor_title(event)
     if title:
-        ran_ok, result = work._run_bounded(work._gather_kuma_push_fresh,
+        ran_ok, result = work.run_bounded(work.gather_kuma_push_fresh,
                                            [{"monitorTitle": title, "since": item["verify_started_at"]}],
                                            timeout=core.EVIDENCE_TIMEOUT)
         live_ok, detail = result if ran_ok else (False, f"monitor probe error: {result}")
@@ -177,16 +177,16 @@ def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     if item["fixed_by_pr"]:
         _verify_swept(conn, item, now)
         return
-    if core._is_revert(item):
+    if core.is_revert(item):
         _verify_revert(conn, item, now)
         return
     event_id = item["event_id"]
-    event = core._get_event(conn, event_id)
+    event = core.get_event(conn, event_id)
     signal = item["origin"] == "alert" and event is not None
-    started = core._parse_ts(item["verify_started_at"]) or now
+    started = core.parse_ts(item["verify_started_at"]) or now
     window_over = now - started >= dt.timedelta(hours=core.VERIFY_WINDOW_HOURS)
 
-    if signal and item["verify_mark"] is not None and core._occurrence_mark(event) != item["verify_mark"]:
+    if signal and item["verify_mark"] is not None and core.occurrence_mark(event) != item["verify_mark"]:
         _on_verify_failure(conn, item, f"own signal recurred while verifying: {event['title']}", now)
         return
 
@@ -208,22 +208,22 @@ def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         if failures >= core.VERIFY_FAILURE_LIMIT:
             _on_verify_failure(conn, item, f"{failures} consecutive failing passes — {evidence}", now)
             return
-        core._set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING,
+        core.set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING,
                         verify_failures=failures, verify_result=evidence[:VERIFY_RESULT_MAX])
         conn.commit()
         return
     if signal and not window_over:
-        core._set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING, verify_failures=0,
+        core.set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING, verify_failures=0,
                         verify_result=f"{verify_note}; signal window open ({core.VERIFY_WINDOW_HOURS:g}h)")
         conn.commit()
         return
 
     note = f"{VERIFIED_NOTE_PREFIX}{verify_note}" + (f"; own signal quiet {core.VERIFY_WINDOW_HOURS:g}h" if signal else "")
-    moved = core._set_state(conn, event_id, core.STATE_FIXED, now, expect_state=core.STATE_VERIFYING, note=note,
+    moved = core.set_state(conn, event_id, core.STATE_FIXED, now, expect_state=core.STATE_VERIFYING, note=note,
                             verify_failures=0, verify_result=note)
     conn.commit()
     if moved:
-        work._notify_item(conn, policy, event_id)
+        work.notify_item(conn, policy, event_id)
 
 
 def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
@@ -247,7 +247,7 @@ def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datet
 
 
 # A merged fix may also fix other items waiting in its repo. When a fix's merge lands (a revert's
-# never does: _is_revert()) _merged_entry() queues the sweep on the merged item (`sweep_pr`), and
+# never does: is_revert()) merged_entry() queues the sweep on the merged item (`sweep_pr`), and
 # advance_fixed_by_sweeps(), in the implement chain so both crons run it, turns that into one
 # sideclaw `triage` job: the merged PR's title, body and diff against the repo's `triaged` items
 # and its `working` items with no episode in flight, answering `{matches: [{item, reason}]}`. It
@@ -320,7 +320,7 @@ def _sweep_candidates(conn: sqlite3.Connection, row: sqlite3.Row) -> list[dict[s
             f"SELECT event_id, state, root_cause, note FROM triage_items WHERE repo=? AND event_id != ? "
             f"AND origin != 'human' AND {_SWEEPABLE_SQL} ORDER BY created_at DESC, event_id DESC LIMIT ?",
             (row["repo"], row["event_id"], _intake.MAX_OPEN_ITEMS)):
-        event = core._get_event(conn, r["event_id"])
+        event = core.get_event(conn, r["event_id"])
         out.append({"id": r["event_id"], "state": r["state"], "title": event["title"] if event else "",
                     "root_cause": r["root_cause"], "note": r["note"]})
     return out
@@ -341,11 +341,11 @@ def _submit_sweep(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) 
     if not candidates:
         _sweep_drop(conn, row, None, "no item waiting in the repo")
         return None
-    claim = f"{triaging.TRIAGE_CLAIM_PREFIX}{core._now_iso(now)}"
-    if not _sweep_cas(conn, event_id, None, sweep_job=claim, sweep_job_at=core._now_iso(now),
+    claim = f"{triaging.TRIAGE_CLAIM_PREFIX}{core.now_iso(now)}"
+    if not _sweep_cas(conn, event_id, None, sweep_job=claim, sweep_job_at=core.now_iso(now),
                       sweep_candidates=json.dumps({str(c["id"]): c["state"] for c in candidates})):
         return None
-    row = core._get_item(conn, event_id)
+    row = core.get_item(conn, event_id)
     try:
         pr = _github.read_pr(*ref)
     except WardenError as e:
@@ -362,7 +362,7 @@ def _submit_sweep(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) 
     except WardenError as e:
         _sweep_failed(conn, row, claim, f"submit failed: {e}")
         return None
-    if not _sweep_cas(conn, event_id, claim, sweep_job=job["id"], sweep_job_at=core._now_iso(now)):
+    if not _sweep_cas(conn, event_id, claim, sweep_job=job["id"], sweep_job_at=core.now_iso(now)):
         print(f"triage: fixed-by sweep job {job['id']} for {pr_url} lost its claim (released as stale "
               f"while submitting) — its answer is dropped", file=sys.stderr)
         return None
@@ -375,7 +375,7 @@ def _fold_sweep_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: d
     id, so a second pass finding the same finished job does nothing; then every match is validated
     and applied on its own (see the block comment). Returns what happened in a few words, or None
     when another pass already folded it or the job failed (a failed attempt)."""
-    row = core._get_item(conn, event_id)
+    row = core.get_item(conn, event_id)
     if row is None or row["sweep_job"] != job_id:
         return None
     result = job.get("result")
@@ -386,7 +386,7 @@ def _fold_sweep_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: d
                       f"{job.get('error') or 'no usable answer'}")
         return None
     pr_url = row["sweep_pr"]
-    shown = core._safe_json(row["sweep_candidates"])
+    shown = core.safe_json(row["sweep_candidates"])
     if not _sweep_cas(conn, event_id, job_id, **_SWEEP_DONE):
         return None
     swept: list[int] = []
@@ -395,19 +395,19 @@ def _fold_sweep_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: d
         if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id in swept:
             continue
         shown_state = shown.get(str(target_id))
-        target = core._get_item(conn, target_id)
+        target = core.get_item(conn, target_id)
         if shown_state is None or target is None or target["repo"] != row["repo"] or target_id == event_id:
             continue
         if not conn.execute(f"SELECT 1 FROM triage_items WHERE event_id=? AND state=? AND {_SWEEPABLE_SQL}",
                             (target_id, shown_state)).fetchone():
             continue
-        event = core._get_event(conn, target_id)
+        event = core.get_event(conn, target_id)
         reason = " ".join(str(match.get("reason") or "").split())[:200] or "no reason given"
-        mark = core._occurrence_mark(event) if target["origin"] == "alert" and event is not None else None
-        moved = core._set_state(
+        mark = core.occurrence_mark(event) if target["origin"] == "alert" and event is not None else None
+        moved = core.set_state(
             conn, target_id, core.STATE_VERIFYING, now, expect_state=shown_state,
             expect_null=("implement_job", "validation_job"), note=f"fixed by {pr_url}: {reason}",
-            **{**core._VERIFY_RESET, "verify_started_at": core._now_iso(now), "verify_mark": mark, "fixed_by_pr": pr_url})
+            **{**core.VERIFY_RESET, "verify_started_at": core.now_iso(now), "verify_mark": mark, "fixed_by_pr": pr_url})
         conn.commit()
         if moved:
             swept.append(target_id)
@@ -423,18 +423,18 @@ def _verify_swept(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime)
     `closed(fixed_by)`, with no Slack line. An item with no signal (an issue) closes at the end of
     the window; an owner's issue is told, like any other issue verdict."""
     event_id, pr_url = item["event_id"], item["fixed_by_pr"]
-    event = core._get_event(conn, event_id)
+    event = core.get_event(conn, event_id)
     signal = item["origin"] == "alert" and event is not None
 
     def back(evidence: str) -> None:
-        core._set_state(conn, event_id, core.STATE_TRIAGED, now, expect_state=core.STATE_VERIFYING,
-                        expect_eq={"fixed_by_pr": pr_url}, note=f"{SWEPT_BACK_NOTE_PREFIX}{evidence}", **core._VERIFY_RESET)
+        core.set_state(conn, event_id, core.STATE_TRIAGED, now, expect_state=core.STATE_VERIFYING,
+                        expect_eq={"fixed_by_pr": pr_url}, note=f"{SWEPT_BACK_NOTE_PREFIX}{evidence}", **core.VERIFY_RESET)
         conn.commit()
 
-    if signal and item["verify_mark"] is not None and core._occurrence_mark(event) != item["verify_mark"]:
+    if signal and item["verify_mark"] is not None and core.occurrence_mark(event) != item["verify_mark"]:
         back(f"own signal recurred after {pr_url}: {event['title']}")
         return
-    started = core._parse_ts(item["verify_started_at"]) or now
+    started = core.parse_ts(item["verify_started_at"]) or now
     if now - started < dt.timedelta(hours=core.VERIFY_WINDOW_HOURS):
         return
     problems = _signal_not_quiet(item, event) if signal else []
@@ -444,17 +444,17 @@ def _verify_swept(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime)
         if failures >= core.VERIFY_FAILURE_LIMIT:
             back(f"{failures} consecutive failing passes after {pr_url} — {evidence}")
             return
-        core._set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING,
+        core.set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING,
                         verify_failures=failures, verify_result=evidence[:VERIFY_RESULT_MAX])
         conn.commit()
         return
     note = item["note"] or f"fixed by {pr_url}"
-    won = core._set_state(conn, event_id, core.STATE_CLOSED, now, expect_state=core.STATE_VERIFYING,
+    won = core.set_state(conn, event_id, core.STATE_CLOSED, now, expect_state=core.STATE_VERIFYING,
                           expect_eq={"fixed_by_pr": pr_url}, close_reason=core.CLOSE_FIXED_BY, note=note,
                           verify_failures=0, verify_result=f"quiet {core.VERIFY_WINDOW_HOURS:g}h")
     conn.commit()
     if won and event is not None:
-        work._maybe_comment_back_on_issue(conn, item, event, {}, now, state="fixed",
+        work.maybe_comment_back_on_issue(conn, item, event, {}, now, state="fixed",
                                           note=note.removeprefix("fixed by "), dry_run=False)
 
 
@@ -477,8 +477,8 @@ def advance_fixed_by_sweeps(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
             if job is not None and job.get("status") in _sideclaw.TERMINAL:
                 _fold_sweep_job(conn, row["event_id"], job["id"], job, now)
             continue
-        if triaging._is_triage_claim(job_id):
-            claimed_at = core._parse_ts(job_id[len(triaging.TRIAGE_CLAIM_PREFIX):])
+        if triaging.is_triage_claim(job_id):
+            claimed_at = core.parse_ts(job_id[len(triaging.TRIAGE_CLAIM_PREFIX):])
             if claimed_at is None or claimed_at < now - dt.timedelta(minutes=triaging.TRIAGE_CLAIM_STALE_MINUTES):
                 _sweep_failed(conn, row, job_id, "a stale claim (the submitter died)")
             continue
@@ -493,7 +493,7 @@ def advance_fixed_by_sweeps(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
         if job.get("status") in _sideclaw.TERMINAL:
             _fold_sweep_job(conn, row["event_id"], job_id, job, now)
             continue
-        submitted_at = core._parse_ts(row["sweep_job_at"])
+        submitted_at = core.parse_ts(row["sweep_job_at"])
         if submitted_at is None or now - submitted_at < dt.timedelta(minutes=triaging.TRIAGE_JOB_STALE_MINUTES):
             continue
         try:
@@ -510,9 +510,9 @@ def advance_fixed_by_sweeps(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
 #      and nothing else. It goes through the implement path unchanged: the lease, a refusal
 #      (`failed`), a strike, an ambiguous submit. Not an attempt: `revision_count` stays.
 #   3. Its PR is a `dispatch/*` PR: poll_implement_jobs() hands it to the merge train like any
-#      other, the review is told it is a mechanical revert (_revert_review_context()), and a
+#      other, the review is told it is a mechanical revert (revert_review_context()), and a
 #      block, failing checks or a conflict end it `failed` with the PR left open, never a
-#      revision (_revisable()). A revert merge keeps `reverting_sha`: that is _is_revert().
+#      revision (revisable()). A revert merge keeps `reverting_sha`: that is is_revert().
 #   4. Deploy as usual, then _verify_revert(): `make verify` only, no signal window. Passing
 #      clears `reverting_sha`, counts the next attempt (the failed fix was one) and sends the
 #      item to `working`, where maybe_submit_reverts() opens a fresh attempt from the latest
@@ -535,14 +535,14 @@ def _merged_title(conn: sqlite3.Connection, event_id: int, sha: str) -> str | No
     """The title of the pull request that merged as `sha`, from its merge operation's receipt."""
     for op in conn.execute("SELECT receipt_json FROM operations WHERE event_id=? AND kind='merge' "
                            "AND outcome='done' ORDER BY rowid DESC", (event_id,)):
-        receipt = core._safe_json(op["receipt_json"])
+        receipt = core.safe_json(op["receipt_json"])
         if receipt.get("mergeCommit") == sha:
             return receipt.get("title")
     return None
 
 
 def _revert_record(item: sqlite3.Row) -> dict[str, Any]:
-    record = core._safe_json(item["revert_json"])
+    record = core.safe_json(item["revert_json"])
     record["evidence"] = str(record.get("evidence") or "no evidence on record")[:REVERT_EVIDENCE_MAX]
     return record
 
@@ -568,7 +568,7 @@ def _revert_brief(record: dict[str, Any]) -> str:
     )
 
 
-def _revert_review_context(item: sqlite3.Row) -> str:
+def revert_review_context(item: sqlite3.Row) -> str:
     record = _revert_record(item)
     sha = record.get("sha") or item["reverting_sha"]
     title = f" ({record['title']})" if record.get("title") else ""
@@ -615,7 +615,7 @@ def _after_revert_episode(conn: sqlite3.Connection, item: sqlite3.Row, record: d
         f"verification failure and the reverted change: work out why it did not hold, then implement a fix "
         f"that does — do not re-apply the reverted change unchanged. If the evidence shows the problem "
         f"cannot be fixed from inside this repo, say so and stop.\n\n"
-        f"{work._issue_closing_instruction(conn, item)}"
+        f"{work.issue_closing_instruction(conn, item)}"
     )
     title = f" ({record['title']})" if record.get("title") else ""
     diff = _reverted_diff(record.get("pr"))
@@ -626,7 +626,7 @@ def _after_revert_episode(conn: sqlite3.Connection, item: sqlite3.Row, record: d
     if item["dispatch_job"]:
         inv = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone()
         if inv is not None:
-            parts.append(work._verdict_as_context(item["dispatch_job"], core._safe_json(inv["verdict_json"])))
+            parts.append(work.verdict_as_context(item["dispatch_job"], core.safe_json(inv["verdict_json"])))
     elif item["brief"]:
         parts.append(f"The owner's brief: {item['brief']}")
     return brief, "\n\n".join(parts)[: _dispatch.MAX_CONTEXT_CHARS]
@@ -645,7 +645,7 @@ def maybe_submit_reverts(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     "Busy" for the revert itself is a running episode only (an implement, or a train's
     `update_pr`): a PR merely waiting on its train never holds it back — the revert would starve
     behind a PR waiting on CI — and its own PR then goes first on the train (advance_merge_trains())."""
-    ready_sql, ready_params = core._retry_ready_sql(now)
+    ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND implement_job IS NULL AND revert_json IS NOT NULL "
         f"AND {ready_sql} ORDER BY event_id", (core.STATE_WORKING, *ready_params)).fetchall()
@@ -653,18 +653,18 @@ def maybe_submit_reverts(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if item["repo"] is None:
             continue
         event_id, record = item["event_id"], _revert_record(item)
-        if core._is_revert(item):
+        if core.is_revert(item):
             what, model, why = f"the revert of {item['reverting_sha'][:12]}", None, REVERT_WHY
             brief, context = _revert_brief(record), None
         else:
             attempt = item["revision_count"] + 1
-            what, model = f"attempt {attempt}/{core.MAX_IMPLEMENT_ATTEMPTS} after a revert", work._implement_model(attempt)
+            what, model = f"attempt {attempt}/{core.MAX_IMPLEMENT_ATTEMPTS} after a revert", work.implement_model(attempt)
             why = f"{AFTER_REVERT_WHY_PREFIX}{attempt}: the reverted change failed verification"
             brief = context = None
         if dry_run:
             print(f"[dry-run] would submit {what} for {item['signature']} in {item['repo']}")
             continue
-        claimed = core._set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
+        claimed = core.set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_WORKING,
                                   expect_null=("implement_job",), expect_eq={"reverting_sha": item["reverting_sha"]},
                                   implement_job=core.IMPLEMENT_CLAIM)
         conn.commit()
@@ -673,28 +673,28 @@ def maybe_submit_reverts(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if brief is None:
             brief, context = _after_revert_episode(conn, item, record, item["revision_count"] + 1)
         try:
-            opened = work._open_implement_episode(
+            opened = work.open_implement_episode(
                 conn, repo=item["repo"], tier="implement", brief=brief, context=context, why=why,
                 origin=_dispatch.Origin(event_id=event_id), authorized_by="auto-from-item", model=model,
-                count_merging=not core._is_revert(item))
+                count_merging=not core.is_revert(item))
         except SubmitRefused as exc:
-            work._end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy, implement_job=None)
+            work.end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy, implement_job=None)
             continue
         except RemoteError as exc:
             if exc.maybe_mutated:
-                work._hold_ambiguous_submit(item, exc)
+                work.hold_ambiguous_submit(item, exc)
                 continue
-            core._strike(conn, event_id, now, f"{what} could not be submitted: {exc}", retry_state=core.STATE_WORKING,
+            core.strike(conn, event_id, now, f"{what} could not be submitted: {exc}", retry_state=core.STATE_WORKING,
                          expect_state=core.STATE_WORKING, implement_job=None)
             conn.commit()
             continue
         except (PolicyError, PreconditionError, UsageError) as e:
-            core._set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_WORKING, implement_job=None,
+            core.set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_WORKING, implement_job=None,
                             note=f"deferred: {e}")
             conn.commit()
             continue
         conn.execute("UPDATE triage_items SET implement_job=?, updated_at=? WHERE event_id=?",
-                     (opened.job_id, core._now_iso(now), event_id))
+                     (opened.job_id, core.now_iso(now), event_id))
         conn.commit()
 
 
@@ -710,13 +710,13 @@ def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
             failures = item["verify_failures"] + 1
             evidence = f"make verify failed (exit {res.exit_code}): {_tail_for_note(res.tail)}"
             if failures >= core.VERIFY_FAILURE_LIMIT:
-                core._set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
+                core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
                                 expect_eq={"reverting_sha": sha}, verify_failures=failures,
                                 verify_result=evidence[:VERIFY_RESULT_MAX],
                                 note=f"production unhealthy after revert of {sha[:12]}: {failures} consecutive "
                                      f"failing passes — {evidence}")
             else:
-                core._set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING,
+                core.set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING,
                                 expect_eq={"reverting_sha": sha}, verify_failures=failures,
                                 verify_result=evidence[:VERIFY_RESULT_MAX])
             conn.commit()
@@ -724,16 +724,16 @@ def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
         verify_note = "make verify passed"
 
     record = _revert_record(item)
-    if not work._revisions_left(item):
-        core._set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
+    if not work.revisions_left(item):
+        core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
                         expect_eq={"reverting_sha": sha}, reverting_sha=None, verify_failures=0, verify_result=verify_note,
                         note=f"reverted {sha[:12]} ({verify_note}); no implement attempt left — "
                              f"verification failure: {record['evidence']}")
         conn.commit()
         return
     attempt = item["revision_count"] + 2
-    core._set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_VERIFYING, expect_eq={"reverting_sha": sha},
+    core.set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_VERIFYING, expect_eq={"reverting_sha": sha},
                     note=f"reverted {sha[:12]} ({verify_note}); attempt {attempt}/{core.MAX_IMPLEMENT_ATTEMPTS} next",
                     reverting_sha=None, revision_count=item["revision_count"] + 1, implement_job=None,
-                    validation_job=None, pr_url=None, reviewed_sha=None, strikes=0, retry_at=None, **core._VERIFY_RESET)
+                    validation_job=None, pr_url=None, reviewed_sha=None, strikes=0, retry_at=None, **core.VERIFY_RESET)
     conn.commit()

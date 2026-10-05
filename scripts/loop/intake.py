@@ -25,23 +25,23 @@ def ingest(conn: sqlite3.Connection, now: dt.datetime) -> None:
         f"SELECT * FROM events WHERE resolved_at IS NULL AND source IN ({placeholders})",
         core.INGEST_SOURCES,
     ).fetchall()
-    now_iso = core._now_iso(now)
+    now_iso = core.now_iso(now)
     for ev in rows:
         event_id = ev["id"]
-        payload = core._safe_json(ev["payload_json"])
+        payload = core.safe_json(ev["payload_json"])
         occurrences = payload.get("batch_count")
         if not isinstance(occurrences, int):
             occurrences = int(ev["reminder_count"] or 0) + 1
         last_seen = ev["last_reminder_at"] or ev["notified_at"] or ev["first_seen"] or now_iso
-        existing = core._get_item(conn, event_id)
+        existing = core.get_item(conn, event_id)
         if existing is None:
             conn.execute(
                 "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, "
                 "first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (event_id, core._signature(ev), None, core.STATE_NEW, occurrences,
+                (event_id, core.signature(ev), None, core.STATE_NEW, occurrences,
                  ev["first_seen"], last_seen, now_iso, now_iso),
             )
-            core._record_created_transition(conn, event_id, core.STATE_NEW, now_iso)
+            core.record_created_transition(conn, event_id, core.STATE_NEW, now_iso)
         else:
             conn.execute(
                 "UPDATE triage_items SET occurrences=?, last_seen=?, updated_at=? WHERE event_id=?",
@@ -83,7 +83,7 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
     `human` origin from `warden run`'s `--origin-channel`/`--origin-thread`); NULL for a GitHub
     issue, which has no thread."""
     now = now or dt.datetime.now(dt.timezone.utc)
-    now_iso = core._now_iso(now)
+    now_iso = core.now_iso(now)
     source = ORIGIN_EVENT_SOURCE[origin]
 
     event_row = conn.execute(
@@ -101,7 +101,7 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
         ).fetchone()
     event_id = event_row["id"]
 
-    existing_item = core._get_item(conn, event_id)
+    existing_item = core.get_item(conn, event_id)
     if existing_item is not None:
         if existing_item["state"] in core.TERMINAL_STATES:
             return None
@@ -111,10 +111,10 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
         "INSERT INTO triage_items(event_id, signature, repo, state, origin, max_tier, brief, "
         "origin_channel, origin_thread_ts, occurrences, first_seen, last_seen, created_at, updated_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (event_id, core._signature(event_row), repo, core.STATE_NEW, origin, max_tier, brief,
+        (event_id, core.signature(event_row), repo, core.STATE_NEW, origin, max_tier, brief,
          origin_channel or None, origin_thread_ts or None, 1, now_iso, now_iso, now_iso, now_iso),
     )
-    core._record_created_transition(conn, event_id, core.STATE_NEW, now_iso)
+    core.record_created_transition(conn, event_id, core.STATE_NEW, now_iso)
     conn.commit()
     return event_id
 
@@ -164,7 +164,7 @@ def ingest_github_issues(conn: sqlite3.Connection, now: dt.datetime) -> None:
             now=now,
         )
 
-    now_iso = core._now_iso(now)
+    now_iso = core.now_iso(now)
     for row in conn.execute(
         "SELECT id, external_id FROM events WHERE source='github_go' AND resolved_at IS NULL"
     ).fetchall():
@@ -193,27 +193,27 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
     artifact_url/dispatch_job) lets the next escalation's brief say "a PR already exists for this
     signature" instead of rediscovering it.
 
-    The predicate is "the event's _occurrence_mark() changed since this row's last transition", NOT
+    The predicate is "the event's occurrence_mark() changed since this row's last transition", NOT
     `events.resolved_at IS NULL`: for a GROUPED source (slack_alert, hermes_log) resolved_at stays
     NULL for up to 7 idle days by design (sweep_stale_grouped()), so it is true on every pass after
     a quiet-resolve and would reopen a row just re-closed, every 10 minutes, forever. Comparing
     marks ties reopening to an actual new occurrence, whichever of the two clocks produced it (see
-    _occurrence_mark()).
+    occurrence_mark()).
 
-    Per closed row, the event's CURRENT mark against the one `_set_state()` stamped at this row's
+    Per closed row, the event's CURRENT mark against the one `set_state()` stamped at this row's
     last transition:
 
-    - differs -> a genuine new occurrence since the row closed: reopen via _set_state().
+    - differs -> a genuine new occurrence since the row closed: reopen via set_state().
     - same -> still quiet: leave it alone.
     - stored mark IS NULL -> the row closed without a stamp. Do not reopen and do not guess a
       history it does not have: write the current mark as a baseline with a plain UPDATE (not
-      _set_state(): it writes no `state`) and leave the state. It reopens on the next genuine
+      set_state(): it writes no `state`) and leave the state. It reopens on the next genuine
       occurrence like any other row.
 
     A `closed(duplicate)` item whose event recurs does not reopen while the item it was attached to
-    is still open: the recurrence is counted on that target (_bump_open_target()). Once the target
+    is still open: the recurrence is counted on that target (bump_open_target()). Once the target
     is terminal or `failed`, it reopens like any other (back to `new`, `duplicate_of` cleared by
-    _set_state()).
+    set_state()).
 
     `closed(ignored)` reopens only when the triage MODEL ignored it (the row still carries the
     `triage_job` that decided it) and `cooldownHours` have passed since it closed: an LLM must never
@@ -232,7 +232,7 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
     ).fetchall()
     for row in rows:
         stored_mark = row["stored_mark"]
-        current_mark = core._occurrence_mark(row)
+        current_mark = core.occurrence_mark(row)
         if stored_mark is None:
             conn.execute(
                 "UPDATE triage_items SET occurrence_mark=? WHERE event_id=?",
@@ -246,12 +246,12 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
                 if not row["triage_job"] or not _ignored_for(conn, row["event_id"], now) >= cooldown:
                     continue
             if (row["item_state"] == core.STATE_CLOSED and row["close_reason"] == core.CLOSE_DUPLICATE
-                    and _bump_open_target(conn, row["duplicate_of"], occurrences=1,
-                                          last_seen=row["last_reminder_at"] or row["notified_at"] or core._now_iso(now))):
+                    and bump_open_target(conn, row["duplicate_of"], occurrences=1,
+                                          last_seen=row["last_reminder_at"] or row["notified_at"] or core.now_iso(now))):
                 conn.execute("UPDATE triage_items SET occurrence_mark=? WHERE event_id=?",
                              (current_mark, row["event_id"]))
                 continue
-            core._set_state(conn, row["event_id"], core.STATE_NEW, now)
+            core.set_state(conn, row["event_id"], core.STATE_NEW, now)
     conn.commit()
 
 
@@ -259,11 +259,11 @@ def _ignored_for(conn: sqlite3.Connection, event_id: int, now: dt.datetime) -> d
     """How long ago the item last entered `closed` (zero when there is no such transition)."""
     row = conn.execute("SELECT MAX(at) AS at FROM item_transitions WHERE event_id=? AND to_state=?",
                        (event_id, core.STATE_CLOSED)).fetchone()
-    closed_at = core._parse_ts(row["at"]) if row else None
+    closed_at = core.parse_ts(row["at"]) if row else None
     return now - closed_at if closed_at else dt.timedelta(0)
 
 
-def _bump_open_target(conn: sqlite3.Connection, target_id: int | None, *, occurrences: int,
+def bump_open_target(conn: sqlite3.Connection, target_id: int | None, *, occurrences: int,
                       last_seen: str | None) -> bool:
     """Count `occurrences` more sightings on an OPEN item (not terminal, not `failed`) and move
     its `last_seen` forward. Returns False, writing nothing, when the target is gone or no longer
@@ -273,7 +273,7 @@ def _bump_open_target(conn: sqlite3.Connection, target_id: int | None, *, occurr
     `occurrences`/`last_seen` from its own event on every run, so a bump would be overwritten, and
     its own event already counts what it sees. The counts are kept for issue and `warden run`
     targets, which ingest() never touches."""
-    target = triaging._open_item(conn, target_id, exclude=-1)
+    target = triaging.open_item(conn, target_id, exclude=-1)
     if target is None:
         return False
     if target["origin"] == "alert":
@@ -306,7 +306,7 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime,
         # worth keeping. Clearing it stops a stale QUIET_RESOLVE_NOTE_PREFIX/RECOVERY_PAIRED_NOTE_PREFIX
         # note from an earlier quiet-resolve surviving a reopen -> genuine fix -> resolve cycle as if it
         # were current.
-        core._set_state(conn, row["event_id"], core.STATE_QUIET, now, note=None)
+        core.set_state(conn, row["event_id"], core.STATE_QUIET, now, note=None)
     conn.commit()
 
 
@@ -327,12 +327,12 @@ def _recurrence_count(conn: sqlite3.Connection, event_id: int, now: dt.datetime,
     ).fetchone()[0]
 
 
-def _chronic_policy(policy: dict[str, Any]) -> tuple[float, int]:
+def chronic_policy(policy: dict[str, Any]) -> tuple[float, int]:
     return (float(policy.get("chronicWindowDays") or core.DEFAULT_CHRONIC_WINDOW_DAYS),
             int(policy.get("chronicRecurrences") or core.DEFAULT_CHRONIC_RECURRENCES))
 
 
-def _chronic_recurrences(conn: sqlite3.Connection, event_id: int, repo: str | None,
+def chronic_recurrences(conn: sqlite3.Connection, event_id: int, repo: str | None,
                          policy: dict[str, Any], now: dt.datetime) -> int:
     """The reopen count when this row is chronic, else 0 (see DEFAULT_CHRONIC_RECURRENCES). Unmapped
     rows are never chronic: nothing could escalate them, so holding them out of `quiet` would only
@@ -344,7 +344,7 @@ def _chronic_recurrences(conn: sqlite3.Connection, event_id: int, repo: str | No
     row silence-resolves as usual."""
     if repo is None:
         return 0
-    window, threshold = _chronic_policy(policy)
+    window, threshold = chronic_policy(policy)
     since = (now - dt.timedelta(days=window)).isoformat()
     investigated = conn.execute(
         "SELECT 1 FROM triage_items ti JOIN dispatches d ON d.job_id = ti.dispatch_job "
@@ -358,7 +358,7 @@ def _chronic_recurrences(conn: sqlite3.Connection, event_id: int, repo: str | No
 
 def _is_chronic(conn: sqlite3.Connection, event_id: int, repo: str | None,
                 policy: dict[str, Any], now: dt.datetime) -> bool:
-    return _chronic_recurrences(conn, event_id, repo, policy, now) > 0
+    return chronic_recurrences(conn, event_id, repo, policy, now) > 0
 
 
 def _slack_ts_to_dt(value: Any) -> dt.datetime | None:
@@ -374,12 +374,12 @@ def _quiet_anchor(row: sqlite3.Row) -> tuple[dt.datetime | None, str | None]:
     """The last time a grouped event was actually observed. The ISO clocks
     (`last_reminder_at`/`notified_at`/`first_seen`) move only when watchdog-poll.py's
     upsert_grouped() EMITS; a cooldown-suppressed occurrence moves `payload_json.ts_last` alone (see
-    _occurrence_mark()). Reading only the ISO clocks would reopen a row on the fresh ts_last and
+    occurrence_mark()). Reading only the ISO clocks would reopen a row on the fresh ts_last and
     quiet-resolve it again in the same pass against a days-old time. Returns (anchor, raw value for
     the note)."""
     candidates = [(t, r) for r in (row["last_reminder_at"], row["notified_at"], row["first_seen"])
-                  if r and (t := core._parse_ts(r)) is not None]
-    ts_last = _slack_ts_to_dt(core._safe_json(row["payload_json"]).get("ts_last"))
+                  if r and (t := core.parse_ts(r)) is not None]
+    ts_last = _slack_ts_to_dt(core.safe_json(row["payload_json"]).get("ts_last"))
     if ts_last is not None:
         candidates.append((ts_last, ts_last.isoformat()))
     if not candidates:
@@ -445,7 +445,7 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
                   f"#alerts for a ✅ recovery pairing (skipped under --dry-run)")
         return
 
-    wp = core._wp_module()
+    wp = core.wp_module()
     if wp is None:
         return
     token = wp.resolve_secret("HOMELAB_API_KEY")
@@ -483,7 +483,7 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
             continue
         note = f"{core.RECOVERY_PAIRED_NOTE_PREFIX}{text.strip()[:200]}"
         # STATE_QUIET, never STATE_FIXED: see the docstring.
-        core._set_state(conn, row["event_id"], core.STATE_QUIET, now, note=note)
+        core.set_state(conn, row["event_id"], core.STATE_QUIET, now, note=note)
     conn.commit()
 
 
@@ -527,14 +527,14 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
             continue
         if _is_chronic(conn, row["event_id"], row["repo"], policy, now):
             continue
-        note = (f"{core.QUIET_RESOLVE_NOTE_PREFIX}{core._fmt_ts(anchor_raw)} — no new occurrence for "
+        note = (f"{core.QUIET_RESOLVE_NOTE_PREFIX}{core.fmt_ts(anchor_raw)} — no new occurrence for "
                 f"{quiet_hours:g}h. This closes the item on silence alone; it is NOT a confirmed "
                 f"fix, and the signature reopens automatically the moment it recurs.")
-        core._set_state(conn, row["event_id"], core.STATE_QUIET, now, note=note)
+        core.set_state(conn, row["event_id"], core.STATE_QUIET, now, note=note)
     conn.commit()
 
 
-def _label_route(item: sqlite3.Row, event: sqlite3.Row, policy: dict[str, Any] | None = None) -> str | None:
+def label_route(item: sqlite3.Row, event: sqlite3.Row, policy: dict[str, Any] | None = None) -> str | None:
     """The repo the signal's own label names, or None. Native labels first (intake.route_by_label():
     the repo an issue or `warden run` carries, a Kuma tag, a container name, an OTel
     `service.name`), then the policy's `rules`: a rule match is exactly a label route, the
@@ -543,7 +543,7 @@ def _label_route(item: sqlite3.Row, event: sqlite3.Row, policy: dict[str, Any] |
     repo = _intake.route_by_label(item, event)
     if repo:
         return repo
-    rule = core._match_rule(core._match_targets(event), (policy or core.load_policy()).get("rules") or [])
+    rule = core.match_rule(core.match_targets(event), (policy or core.load_policy()).get("rules") or [])
     return rule["repo"] if rule else None
 
 
@@ -554,7 +554,7 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
     1. the explicit `ignore` list (genuine recoveries / known-benign patterns, matched against both
        match targets) -> `closed(ignored)`;
     2. with `ignoreUnstructuredSlackProse`, a `slack_alert` with no label route whose title does not
-       start with a recognized bot-alert shape (`_looks_like_bot_alert`) is chat prose that
+       start with a recognized bot-alert shape (`looks_like_bot_alert`) is chat prose that
        watchdog-poll.py ingested from #alerts, not an alert -> `closed(ignored)` with a note.
 
     **The prose filter runs after the label route, and that order is load-bearing.** It is a prefix
@@ -562,24 +562,24 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
     threshold`) fails it on every occurrence, however real the alert. A row that already carries a
     repo is never the filter's to close.
 
-    Routing itself is not decided here: _label_route() and the triage job do that (see
+    Routing itself is not decided here: label_route() and the triage job do that (see
     submit_triage_jobs())."""
     rows = conn.execute(
         "SELECT event_id, repo FROM triage_items WHERE state=? AND origin='alert' AND triage_job IS NULL",
         (core.STATE_NEW,),
     ).fetchall()
     for row in rows:
-        event_row = core._get_event(conn, row["event_id"])
-        item = core._get_item(conn, row["event_id"])
+        event_row = core.get_event(conn, row["event_id"])
+        item = core.get_item(conn, row["event_id"])
         if event_row is None or item is None:
             continue
-        if core._fnmatch_any(core._match_targets(event_row), policy.get("ignore") or []):
-            core._set_state(conn, row["event_id"], core.STATE_CLOSED, now, expect_state=core.STATE_NEW,
+        if core.fnmatch_any(core.match_targets(event_row), policy.get("ignore") or []):
+            core.set_state(conn, row["event_id"], core.STATE_CLOSED, now, expect_state=core.STATE_NEW,
                             close_reason=core.CLOSE_IGNORED, note="matched the policy ignore list")
             continue
         if (policy["ignoreUnstructuredSlackProse"] and row["repo"] is None
-                and event_row["source"] == "slack_alert" and not core._looks_like_bot_alert(event_row["title"])
-                and _label_route(item, event_row, policy) is None):
-            core._set_state(conn, row["event_id"], core.STATE_CLOSED, now, expect_state=core.STATE_NEW,
+                and event_row["source"] == "slack_alert" and not core.looks_like_bot_alert(event_row["title"])
+                and label_route(item, event_row, policy) is None):
+            core.set_state(conn, row["event_id"], core.STATE_CLOSED, now, expect_state=core.STATE_NEW,
                             close_reason=core.CLOSE_IGNORED, note="unstructured #alerts prose, not a bot alert")
     conn.commit()

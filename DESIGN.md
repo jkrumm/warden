@@ -34,7 +34,7 @@ quiet · closed(duplicate | fixed_by | ignored | resolved)      terminal
 `needs_decision` is the only human exit, reached only by a verdict with
 `nextAction=human` (its `decisionQuestion` is the Slack line). `needs_decision`
 and `failed` never expire. Every infrastructure failure strikes
-(`core._strike()`): 10 then 30 minutes of backoff, the third strike is `failed`
+(`core.strike()`): 10 then 30 minutes of backoff, the third strike is `failed`
 carrying the error. A sideclaw 4xx on submit is a refusal, not a strike: the item
 ends `failed` with sideclaw's message — except a refused escalation `model`
 (resubmitted once without it), a lease refusal (retry in 10 minutes, no strike)
@@ -55,7 +55,7 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
 2. **Triage** (`triaging.py`). Each `new` item gets one single-shot sideclaw
    `triage` job — alerts once debounced (≥`minOccurrences` or ≥`minOpenMinutes`
    open), issues and runs at once. Candidates come from the signal's own label
-   (`_label_route()`: Kuma tag, container name, OTel `service.name`, the issue's
+   (`label_route()`: Kuma tag, container name, OTel `service.name`, the issue's
    repo; then a policy `rules` match — a rule is a label, not a route). With no
    label every checkout under the repos root with an `AGENTS.md` is a candidate and
    the job reads their `## Verify & Monitor` sections. The answer is
