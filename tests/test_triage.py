@@ -179,6 +179,9 @@ TRAIN_SHA = "a" * 40
 REBASED_SHA = "b" * 40
 PR_HEAD: dict[str, Any] = {}
 CHECK_RUNS: dict[str, Any] = {}
+# sideclaw's `GET /api/dispatch-policy` as the fixture answers it: `body` is the JSON object, or None
+# for "unreachable" (a RemoteError). A policy re-drive test changes it between passes.
+DISPATCH_POLICY: dict[str, Any] = {}
 
 
 def _default_fake_read_pr(owner, repo, number):
@@ -196,6 +199,12 @@ def _default_fake_check_runs(owner, repo, sha):
 
 def _default_fake_submit_update_pr(*, cwd, pr):
     raise AssertionError(f"test: no fake submit_update_pr registered (PR #{pr})")
+
+
+def _default_fake_dispatch_policy():
+    if DISPATCH_POLICY["body"] is None:
+        raise RemoteError("test: sideclaw is unreachable")
+    return dict(DISPATCH_POLICY["body"])
 
 
 @contextlib.contextmanager
@@ -235,6 +244,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_sideclaw", "wait"): _sideclaw.wait,
         ("_sideclaw", "cancel"): _sideclaw.cancel,
         ("_sideclaw", "escalation_model"): _sideclaw.escalation_model,
+        ("_sideclaw", "dispatch_policy"): _sideclaw.dispatch_policy,
         ("_github", "search_issues"): _github.search_issues,
         ("_github", "create_issue_comment"): _github.create_issue_comment,
         ("_github", "close_pr"): _github.close_pr,
@@ -268,6 +278,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         _sideclaw.submit_update_pr = _default_fake_submit_update_pr
         _sideclaw.get = _default_fake_get
         _sideclaw.escalation_model = lambda: None
+        DISPATCH_POLICY.clear()
+        DISPATCH_POLICY.update(body={"rules": {}, "overrides": []})
+        _sideclaw.dispatch_policy = _default_fake_dispatch_policy
         _sideclaw.cancel = lambda job_id: (_ for _ in ()).throw(
             RemoteError(f"test: no fake cancel registered for {job_id}"))
         # ingest_github_issues() runs unconditionally on every run() pass
@@ -779,9 +792,10 @@ def test_sideclaw_refusal_of_an_investigate_dispatch_ends_the_item_and_is_never_
         _sideclaw.submit = _refusing_submit(calls, message="dispatch refused: repo is not allowed")
         triage.run(conn, dry_run=False)
         assert len(calls) == 1, calls
-        item = conn.execute("SELECT state, repo, note, dispatch_job FROM triage_items").fetchone()
+        item = conn.execute("SELECT state, repo, note, dispatch_job, failure_class FROM triage_items").fetchone()
         assert item["repo"] == "refused-repo" and item["dispatch_job"] is None
         assert item["state"] == core.STATE_FAILED, item["state"]
+        assert item["failure_class"] == core.FAILURE_POLICY, item["failure_class"]
         assert "HTTP 400" in item["note"] and "dispatch refused: repo is not allowed" in item["note"], item["note"]
         assert "investigate" in item["note"], item["note"]
 
@@ -3520,6 +3534,7 @@ def test_review_resubmit_refused_by_sideclaw_ends_the_item_without_retry():
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, item["state"]
+        assert item["failure_class"] == core.FAILURE_POLICY, item["failure_class"]
         assert "nope" in (item["note"] or ""), item["note"]
         assert len(refusals) == 1, "a refused review is never submitted again"
 
@@ -4286,6 +4301,8 @@ def test_a_failing_deploy_strikes_and_the_third_strike_fails_the_item_with_the_o
         assert len(ran) == 3
         assert item["state"] == core.STATE_FAILED, dict(item)
         assert "deploy failed (exit 2)" in item["note"] and "connection refused" in item["note"], item["note"]
+        assert item["failure_class"] == core.FAILURE_WORK, "the same merged commit would fail the same way"
+        assert core.redrive_target(item)[0] == "verifying", "the owner's retry re-runs the deploy"
         assert [r[0] for r in conn.execute("SELECT outcome FROM operations WHERE kind='deploy'")] == ["failed"] * 3
 
 
@@ -4665,7 +4682,8 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
         eid = _seed_verdict_item(conn, external_id="sig-argo-reinvestigate")
         conn.execute("UPDATE triage_items SET implement_job=?, validation_job=?, strikes=3 WHERE event_id=?",
                      ("stale-impl", "stale-val", eid))
-        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3)
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                        failure_class=core.FAILURE_WORK)
         conn.commit()
         _argo.fetch_actions = lambda machine, **kw: (
             "ok", [_argo_action("a1", eid, "reinvestigate"), _argo_action("a2", eid, "reinvestigate")]
@@ -5012,7 +5030,12 @@ def test_strike_retries_with_backoff_then_the_third_strike_fails_with_the_reason
         item = core.get_item(conn, eid)
         assert landed == core.STATE_FAILED and item["state"] == core.STATE_FAILED
         assert item["note"] == "sideclaw 503 again", item["note"]
-        assert item["strikes"] == 3 and item["retry_at"] is None
+        assert item["strikes"] == 3
+        # An infra failure is re-driven: the first backoff is out, the recipe re-enters the step.
+        assert item["retry_at"] == (later + dt.timedelta(minutes=60)).isoformat(), item["retry_at"]
+        assert item["failure_class"] == core.FAILURE_INFRA and item["redrives"] == 0
+        assert json.loads(item["redrive_json"]) == {"state": "working", "columns": {"implement_job": None},
+                                                    "policy_hash": None}
 
 
 def test_strikes_reset_when_the_item_advances_to_merging():
@@ -5899,12 +5922,13 @@ def test_set_state_caps_the_note_to_one_short_line():
                                   (eid,)).fetchone()
         assert transition["note"] == note, "history carries the capped note too"
 
-        core.set_state(conn, eid, core.STATE_FAILED, NOW, note=core.Coalesce("y" * 300))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note=core.Coalesce("y" * 300),
+                        failure_class=core.FAILURE_WORK)
         assert len(core.get_item(conn, eid)["note"]) == 200
 
-        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="short\nnote")
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="short\nnote", failure_class=core.FAILURE_WORK)
         assert core.get_item(conn, eid)["note"] == "short note"
-        core.set_state(conn, eid, core.STATE_FAILED, NOW, note=None)
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note=None, failure_class=core.FAILURE_WORK)
         assert core.get_item(conn, eid)["note"] is None
 
 
@@ -7034,6 +7058,432 @@ def test_a_recurring_duplicate_does_not_count_on_an_alert_target():
         assert _rows(conn, target)["occurrences"] == 2
 
 
+# --- failure classes and re-drive (Wave 7) -------------------------------------
+
+
+def _recipe(item) -> dict[str, Any]:
+    return json.loads(item["redrive_json"])
+
+
+def _fail_by_strikes(conn, *, external_id: str, now=NOW, state=core.STATE_WORKING, **columns) -> int:
+    """An item whose next strike is its third: lands `failed(infra)` re-entering `state`."""
+    eid = _seed_item(conn, external_id=external_id, state=state, strikes=2, **columns)
+    landed = core.strike(conn, eid, now, "sideclaw 503", retry_state=state, implement_job=None)
+    assert landed == core.STATE_FAILED, landed
+    return eid
+
+
+def test_set_state_failed_must_carry_a_class_and_every_other_state_clears_it():
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_item(conn, external_id="sig-fc-gate", state=core.STATE_WORKING)
+        for bad in ({}, {"failure_class": "bogus"}, {"failure_class": None}):
+            try:
+                core.set_state(conn, eid, core.STATE_FAILED, NOW, note="x", **bad)
+                raise AssertionError(f"a failed transition with {bad} must be refused")
+            except ValueError as e:
+                assert "failure_class" in str(e), e
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING, "a refused transition writes nothing"
+
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="x", failure_class=core.FAILURE_WORK)
+        item = core.get_item(conn, eid)
+        assert item["failure_class"] == "work" and item["retry_at"] is None and item["redrives"] == 0
+        assert _recipe(item) == {"state": "working", "columns": {}, "policy_hash": None}, dict(item)
+
+        # A failed item written again keeps its recipe: it is not a stage to come from.
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="again", failure_class=core.FAILURE_WORK)
+        assert _recipe(core.get_item(conn, eid))["state"] == "working"
+
+        core.set_state(conn, eid, core.STATE_TRIAGED, NOW, failure_class=core.FAILURE_INFRA)
+        item = core.get_item(conn, eid)
+        assert item["failure_class"] is None and item["redrive_json"] is None, "leaving failed clears both"
+
+        # needs_decision -> failed has no stage to re-enter.
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="q")
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="x", failure_class=core.FAILURE_WORK)
+        assert core.get_item(conn, eid)["redrive_json"] is None
+        assert core.redrive_target(core.get_item(conn, eid)) is None
+
+
+def test_failure_classes_are_the_ledgers_and_the_cli_transition_enforces_them_too():
+    assert core.FAILURE_CLASSES == core._ledger.FAILURE_CLASSES == ("infra", "policy", "work")
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_item(conn, external_id="sig-fc-cli", state=core.STATE_VERIFYING)
+        try:
+            _items.transition(conn, eid, to_state=core.STATE_FAILED, now=NOW, note="x")
+            raise AssertionError("a CLI failed transition without a class must be refused")
+        except ValueError:
+            pass
+        _items.transition(conn, eid, to_state=core.STATE_FAILED, now=NOW, note="x",
+                          extra={"failure_class": core.FAILURE_WORK})
+        item = core.get_item(conn, eid)
+        assert item["failure_class"] == "work" and item["redrive_json"] is None, dict(item)
+        _items.transition(conn, eid, to_state=core.STATE_CLOSED, now=NOW, note="done",
+                          extra={"close_reason": core.CLOSE_RESOLVED})
+        assert core.get_item(conn, eid)["failure_class"] is None, "closing a failed item clears its class"
+
+
+def test_strike_limit_lands_infra_with_a_recipe_and_a_backoff_and_a_caller_may_override_the_class():
+    with _triage_env() as (conn, _ctx):
+        eid = _fail_by_strikes(conn, external_id="sig-fc-strike", implement_job="job-lost")
+        item = core.get_item(conn, eid)
+        assert item["failure_class"] == core.FAILURE_INFRA and item["redrives"] == 0, dict(item)
+        assert item["retry_at"] == (NOW + dt.timedelta(minutes=60)).isoformat(), item["retry_at"]
+        assert _recipe(item) == {"state": "working", "columns": {"implement_job": None}, "policy_hash": None}
+        assert item["implement_job"] == "job-lost", "the failed attempt's handle stays as evidence"
+
+        other = _seed_item(conn, external_id="sig-fc-strike-work", state=core.STATE_MERGING, strikes=2)
+        core.strike(conn, other, NOW, "no PR number", retry_state=core.STATE_MERGING,
+                    failure_class=core.FAILURE_WORK)
+        item = core.get_item(conn, other)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == "work", dict(item)
+        assert item["retry_at"] is None, "a work failure has no re-drive due"
+
+
+def test_end_on_refusal_lands_policy_with_the_state_it_came_from_and_the_policy_hash():
+    with _triage_env() as (conn, _ctx):
+        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
+        expected = _sideclaw.policy_hash(DISPATCH_POLICY["body"])
+        eid = _seed_verdict_item(conn, external_id="sig-fc-refusal")
+        _sideclaw.submit = _refusing_submit([])
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_POLICY, dict(item)
+        assert item["retry_at"] is None
+        assert _recipe(item) == {"state": "working", "columns": {"implement_job": None}, "policy_hash": expected}
+
+        # The hash read failing never fails the transition: the recipe just carries none.
+        DISPATCH_POLICY["body"] = None
+        other = _seed_verdict_item(conn, external_id="sig-fc-refusal-blind", investigate_job="inv-blind")
+        with contextlib.redirect_stderr(io.StringIO()):
+            work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, other)
+        assert item["state"] == core.STATE_FAILED and _recipe(item)["policy_hash"] is None, dict(item)
+
+        # A refused investigate dispatch re-enters triaged, where it came from.
+        DISPATCH_POLICY["body"] = {"rules": {}, "overrides": []}
+        member = _seed_item(conn, external_id="sig-fc-refusal-inv", state=core.STATE_TRIAGED)
+        work.end_on_refusal(conn, [core.get_item(conn, member)], SubmitRefused("nope", status=400),
+                            tier="investigate", now=NOW, policy=DEFAULT_POLICY)
+        assert _recipe(core.get_item(conn, member))["state"] == "triaged"
+
+
+def test_work_sites_land_work():
+    with _triage_env() as (conn, _ctx):
+        # A PR that is no longer open: nothing to merge, a human's call.
+        eid = _train_item(conn, "sig-fc-pr-closed", stage="checks", sha=TRAIN_SHA)
+        PR_HEAD["state"] = "closed"
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_WORK, dict(item)
+        assert _recipe(item)["state"] == "merging", "the owner's retry re-enters the train"
+
+        # A blocked review with no revision left.
+        blocked = _seed_blocked_item(conn, external_id="sig-fc-no-revisions",
+                                     revision_count=core.MAX_IMPLEMENT_ATTEMPTS)
+        item = core.get_item(conn, blocked)
+        assert not work.revisable(item)
+        work.hand_back_for_revision(conn, item, NOW, outcome="blocked", note="findings")
+        item = core.get_item(conn, blocked)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_WORK, dict(item)
+
+        # An investigation verdict nobody can act on.
+        item = _fold_alert_verdict(conn, "sig-fc-odd-verdict", verdict={"summary": "s", "nextAction": "dance"})
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_WORK, dict(item)
+
+        # A merge-train rewind loop.
+        looping = _train_item(conn, "sig-fc-rewinds", stage="checks", sha=TRAIN_SHA)
+        PR_HEAD.update(sha=REBASED_SHA, state="open")
+        conn.execute("UPDATE triage_items SET train_rewinds=?, strikes=2 WHERE event_id=?",
+                     (train.TRAIN_REWIND_LIMIT - 1, looping))
+        conn.commit()
+        _train_pass(conn)
+        item = core.get_item(conn, looping)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_WORK, dict(item)
+        assert _recipe(item)["state"] == "merging" and item["train_rewinds"] == 0, dict(item)
+
+
+def test_an_unknown_review_outcome_lands_infra_and_unreadable_checks_land_policy_with_the_hash():
+    with _triage_env() as (conn, _ctx):
+        DISPATCH_POLICY["body"] = {"rules": {"x": 1}, "overrides": []}
+        # The outcome check in the client is the first line of defence; the switch's own `else` the second.
+        real_assert_outcome = _sideclaw.assert_outcome
+        _sideclaw.assert_outcome = lambda *a, **kw: None
+        try:
+            eid = _seed_validating_item(conn, external_id="sig-fc-unknown", implement_job="impl-fc-unknown",
+                                        review_job="val-fc-unknown")
+            _sideclaw.get = lambda job_id: {"status": "done", "result": _review_result("a_future_outcome")}
+            _train_pass(conn)
+        finally:
+            _sideclaw.assert_outcome = real_assert_outcome
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_INFRA, dict(item)
+        assert item["retry_at"] == (NOW + dt.timedelta(minutes=60)).isoformat()
+        assert _recipe(item) == {"state": "merging", "columns": {}, "policy_hash": None}
+
+        unreadable = _train_item(conn, "sig-fc-unreadable", stage="checks", sha=TRAIN_SHA)
+        _github.check_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
+            PolicyError("the token cannot read check runs"))
+        _train_pass(conn)
+        item = core.get_item(conn, unreadable)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_POLICY, dict(item)
+        assert _recipe(item)["policy_hash"] == _sideclaw.policy_hash(DISPATCH_POLICY["body"]), _recipe(item)
+
+
+def test_infra_failures_are_redriven_after_the_backoff_three_times_then_stay_failed():
+    with _triage_env() as (conn, ctx):
+        eid = _fail_by_strikes(conn, external_id="sig-fc-infra", implement_job="job-lost", pr_url="https://x/pull/1",
+                               revision_count=1)
+        due = [NOW + dt.timedelta(minutes=m) for m in (60, 60 + 180, 60 + 180 + 480)]
+
+        work.redrive_failed(conn, NOW + dt.timedelta(minutes=59), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED, "not due before the backoff"
+
+        t = due[0]
+        work.redrive_failed(conn, t, dry_run=True)
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED, "a dry run writes nothing"
+
+        for k, t in enumerate(due, start=1):
+            work.redrive_failed(conn, t, dry_run=False)
+            item = core.get_item(conn, eid)
+            assert item["state"] == core.STATE_WORKING and item["redrives"] == k, dict(item)
+            assert item["implement_job"] is None, "the recipe's columns are applied"
+            assert item["pr_url"] == "https://x/pull/1" and item["revision_count"] == 1, "everything else stays"
+            assert item["strikes"] == 0 and item["retry_at"] is None and item["failure_class"] is None
+            assert item["note"].startswith(f"re-drive {k}/3 after infra failure: sideclaw 503"), item["note"]
+            for _ in range(3):
+                core.strike(conn, eid, t, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
+            item = core.get_item(conn, eid)
+            assert item["state"] == core.STATE_FAILED and item["redrives"] == k, dict(item)
+        assert item["retry_at"] is None, "the budget is spent: nothing is due any more"
+
+        work.redrive_failed(conn, NOW + dt.timedelta(days=30), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED, "three re-drives, then it stays failed"
+        assert ctx.posted == [], "a re-drive posts nothing"
+
+
+def test_a_backfilled_infra_failure_with_no_retry_at_is_due_at_once():
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_item(conn, external_id="sig-fc-backfilled", state=core.STATE_FAILED, note="old",
+                         failure_class="infra",
+                         redrive_json='{"state":"triaged","columns":{"dispatch_job":null},"policy_hash":null}')
+        work.redrive_failed(conn, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and item["redrives"] == 1 and item["dispatch_job"] is None
+
+
+def test_policy_failures_are_redriven_when_the_policy_hash_changes_and_not_when_it_is_unreadable():
+    with _triage_env() as (conn, ctx):
+        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
+        eid = _seed_verdict_item(conn, external_id="sig-fc-policy")
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _refusing_submit(calls)
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert core.get_item(conn, eid)["failure_class"] == core.FAILURE_POLICY and len(calls) == 1
+
+        # Same policy: nothing to re-drive, however long it waits.
+        work.redrive_failed(conn, NOW + dt.timedelta(days=30), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED
+
+        # Policy unreadable: skipped this pass, even though the stored hash would differ.
+        DISPATCH_POLICY["body"] = None
+        with contextlib.redirect_stderr(io.StringIO()):
+            work.redrive_failed(conn, NOW + dt.timedelta(days=30), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED
+
+        # Policy changed: re-driven once, back where it came from, no infra limit or backoff involved.
+        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "implement"}}, "overrides": []}
+        work.redrive_failed(conn, NOW, dry_run=True)
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED, "a dry run writes nothing"
+        work.redrive_failed(conn, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["redrives"] == 0 and item["failure_class"] is None
+        assert item["note"].startswith("re-drive after the dispatch policy changed: "), item["note"]
+
+        # Refused again under the new policy: it stores the new hash and waits for the next change.
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED and len(calls) == 2, dict(item)
+        assert _recipe(item)["policy_hash"] == _sideclaw.policy_hash(DISPATCH_POLICY["body"])
+        work.redrive_failed(conn, NOW + dt.timedelta(days=30), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED and len(calls) == 2
+        DISPATCH_POLICY["body"] = {"rules": {}, "overrides": []}
+        work.redrive_failed(conn, NOW, dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING and core.get_item(conn, eid)["redrives"] == 0, \
+            "a policy re-drive does not spend the infra budget"
+        assert ctx.posted == [], "a re-drive posts nothing"
+
+
+def test_work_failures_are_never_redriven_and_a_row_without_a_stage_is_left_alone():
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_item(conn, external_id="sig-fc-work", state=core.STATE_WORKING)
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="x", failure_class=core.FAILURE_WORK)
+        stageless = _seed_item(conn, external_id="sig-fc-stageless", state=core.STATE_FAILED, note="x",
+                               failure_class="infra", redrive_json=None)
+        garbled = _seed_item(conn, external_id="sig-fc-garbled", state=core.STATE_FAILED, note="x",
+                             failure_class="infra", redrive_json='{"state":"fixed","columns":{}}')
+        DISPATCH_POLICY["body"] = {"changed": True}
+        work.redrive_failed(conn, NOW + dt.timedelta(days=365), dry_run=False)
+        for e in (eid, stageless, garbled):
+            assert core.get_item(conn, e)["state"] == core.STATE_FAILED, e
+
+
+def test_redriving_into_merging_restarts_the_train_at_update_and_run_calls_the_pass():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-fc-merging", stage="review", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
+        conn.execute("UPDATE triage_items SET strikes=2, train_rewinds=2 WHERE event_id=?", (eid,))
+        conn.commit()
+        core.strike(conn, eid, NOW, "GitHub 502", retry_state=core.STATE_MERGING)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED and item["train_stage"] is None, dict(item)
+        _sideclaw.submit_update_pr = _fake_update_pr([])
+        due = NOW + dt.timedelta(minutes=61)
+        work.redrive_failed(conn, due, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["train_stage"] is None and item["train_rewinds"] == 0
+        train.advance_merge_trains(conn, DEFAULT_POLICY, due, dry_run=False)
+        assert core.get_item(conn, eid)["train_stage"] == train.TRAIN_UPDATE, "a stage-less merging row starts at update"
+        assert ctx.posted == []
+
+
+def test_failed_and_redrive_transitions_post_nothing_to_slack():
+    with _triage_env() as (conn, ctx):
+        eid = _fail_by_strikes(conn, external_id="sig-fc-silent")
+        policy = core.load_policy()
+
+        def _notify_everything(now):
+            for _key, members in work.cluster_groups(conn).items():
+                events = [core.get_event(conn, m["event_id"]) for m in members]
+                notify.notify_cluster(conn, members, events, policy, dry_run=False)
+
+        _notify_everything(NOW)
+        assert ctx.posted == [], "`failed` only ever counts in the daily digest"
+        work.redrive_failed(conn, NOW + dt.timedelta(hours=2), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
+        _notify_everything(NOW + dt.timedelta(hours=2))
+        assert ctx.posted == [], ctx.posted
+
+
+def test_column_writes_on_a_failed_item_keep_its_class_and_recipe():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-fc-keeps")
+        core.strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None,
+                    failure_class=core.FAILURE_POLICY)
+        conn.execute("UPDATE triage_items SET strikes=2 WHERE event_id=?", (eid,))
+        core.strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None,
+                    failure_class=core.FAILURE_POLICY)
+        before = core.get_item(conn, eid)
+        assert before["state"] == core.STATE_FAILED, dict(before)
+
+        # An owner's note (a column-only write: the state does not change) is not a failed transition.
+        _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("n1", eid, "note", {"text": "looking"})])
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+        after = core.get_item(conn, eid)
+        assert [a["status"] for a in ctx.argo_acks] == ["applied"], ctx.argo_acks
+        assert "looking" in after["note"], after["note"]
+        assert after["failure_class"] == "policy" and after["redrive_json"] == before["redrive_json"], dict(after)
+
+        # An owner's implement that sideclaw cannot take right now hands the item back as it was.
+        ctx.argo_acks.clear()
+        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(RemoteError("sideclaw is down"))
+        _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("i1", eid, "implement")])
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+        assert [a["status"] for a in ctx.argo_acks] == ["failed"], ctx.argo_acks
+        again = core.get_item(conn, eid)
+        assert again["state"] == core.STATE_FAILED and again["failure_class"] == "policy", dict(again)
+        assert again["redrive_json"] == before["redrive_json"], dict(again)
+
+
+def test_a_deferred_deploy_that_runs_out_of_strikes_is_infra():
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verifying(conn, "sig-deploy-deferred-class")
+        _fake_rollout(targets=("deploy", "verify"), deploy=_ran())
+        _rollout.sync_checkout = lambda cwd, **kw: _rollout.Deferred("checkout not clean")
+        for minutes in (0, 11, 42):
+            verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=minutes), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_INFRA, dict(item)
+
+
+def test_a_reverted_item_is_never_redriven_or_retried_from_any_surface():
+    with _triage_env() as (conn, ctx):
+        eid = _fail_by_strikes(conn, external_id="sig-fc-reverted", implement_job="job-lost")
+        conn.execute("UPDATE triage_items SET revert_pr=7 WHERE event_id=?", (eid,))
+        conn.commit()
+        assert core.redrive_target(core.get_item(conn, eid)) is None
+        work.redrive_failed(conn, NOW + dt.timedelta(days=30), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED, "the loop pass skips it"
+        _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("rv1", eid, "retry")])
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+        assert [a["status"] for a in ctx.argo_acks] == ["rejected"], ctx.argo_acks
+        assert core.get_item(conn, eid)["state"] == core.STATE_FAILED, "the Argo action rejects it"
+        assert core.redrive(conn, core.get_item(conn, eid), NOW, redrives=0, note="x") == 0
+
+
+def test_redrives_is_the_infra_budget_policy_re_drives_do_not_spend_it_and_progress_resets_it():
+    with _triage_env() as (conn, ctx):
+        DISPATCH_POLICY["body"] = {"v": 0}
+        eid = _seed_verdict_item(conn, external_id="sig-fc-budget")
+        _sideclaw.submit = _refusing_submit([])
+        for v in (1, 2, 3):
+            work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            assert core.get_item(conn, eid)["failure_class"] == core.FAILURE_POLICY
+            DISPATCH_POLICY["body"] = {"v": v}
+            work.redrive_failed(conn, NOW, dry_run=False)
+            item = core.get_item(conn, eid)
+            assert item["state"] == core.STATE_WORKING and item["redrives"] == 0, dict(item)
+        # An infra failure afterwards still gets its three automatic re-drives.
+        conn.execute("UPDATE triage_items SET strikes=2 WHERE event_id=?", (eid,))
+        core.strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
+        t = NOW
+        for k in (1, 2, 3):
+            t += dt.timedelta(days=1)
+            work.redrive_failed(conn, t, dry_run=False)
+            item = core.get_item(conn, eid)
+            assert item["state"] == core.STATE_WORKING and item["redrives"] == k, dict(item)
+            conn.execute("UPDATE triage_items SET strikes=2 WHERE event_id=?", (eid,))
+            core.strike(conn, eid, t, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
+        assert core.get_item(conn, eid)["redrives"] == 3
+
+        # The spent budget does not follow the item into an unrelated later failure.
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, t, note="q")
+        core.set_state(conn, eid, core.STATE_WORKING, t)
+        assert core.get_item(conn, eid)["redrives"] == 3, "leaving an end state is not progress"
+        core.set_state(conn, eid, core.STATE_MERGING, t, pr_url="https://github.com/o/r/pull/1")
+        assert core.get_item(conn, eid)["redrives"] == 0, "advancing resets the infra budget"
+
+
+def test_owner_retry_through_argo_re_enters_any_class_with_a_fresh_budget():
+    with _triage_env() as (conn, ctx):
+        spent = _fail_by_strikes(conn, external_id="sig-fc-argo-spent", implement_job="job-lost")
+        conn.execute("UPDATE triage_items SET redrives=3 WHERE event_id=?", (spent,))
+        work_failed = _seed_item(conn, external_id="sig-fc-argo-work", state=core.STATE_MERGING)
+        core.set_state(conn, work_failed, core.STATE_FAILED, NOW, note="checks failed", failure_class=core.FAILURE_WORK)
+        stageless = _seed_item(conn, external_id="sig-fc-argo-none", state=core.STATE_FAILED, note="x",
+                               failure_class="work")
+        working = _seed_item(conn, external_id="sig-fc-argo-working", state=core.STATE_WORKING)
+        conn.commit()
+        assert "retry" in notify.ARGO_ACTION_VERBS
+        _argo.fetch_actions = lambda machine, **kw: ("ok", [
+            _argo_action("r1", spent, "retry", {"why": "sideclaw is back"}),
+            _argo_action("r2", work_failed, "retry"),
+            _argo_action("r3", stageless, "retry"),
+            _argo_action("r4", working, "retry"),
+            _argo_action("r5", spent, "retry"),
+        ])
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+        assert [a["status"] for a in ctx.argo_acks] == ["applied", "applied", "rejected", "rejected", "rejected"], \
+            ctx.argo_acks
+
+        item = core.get_item(conn, spent)
+        assert item["state"] == core.STATE_WORKING and item["redrives"] == 0 and item["implement_job"] is None
+        assert item["note"] == "retried by owner via Argo: sideclaw is back", item["note"]
+        item = core.get_item(conn, work_failed)
+        assert item["state"] == core.STATE_MERGING and item["note"] == "retried by owner via Argo: no reason given"
+        assert core.get_item(conn, stageless)["state"] == core.STATE_FAILED
+        assert core.get_item(conn, working)["state"] == core.STATE_WORKING
+        assert ctx.posted == []
+
+
 # --- runner ------------------------------------------------------------------
 
 def main() -> int:
@@ -7549,6 +7999,7 @@ def test_auto_remediate_attempt_cap_lands_failed_with_attempts_noted():
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, item["state"]
         assert "hostVerbMaxAttempts=2" in (item["note"] or ""), item["note"]
+        assert item["failure_class"] == core.FAILURE_WORK, item["failure_class"]
         assert "attempt 1: exit 1" in item["note"] and "attempt 2: exit 1" in item["note"], item["note"]
         assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE event_id=?",
                              (eid,)).fetchone()["n"] == 2, "the cap gate must not run a third attempt"
@@ -8421,7 +8872,7 @@ def test_a_different_repo_or_root_cause_or_state_is_never_merged():
 
         # same key, but the older item already ended (failed): not open, so no merge
         d = _folded_with_root_cause(conn, "sig-rc-d", "cause-d", created="2026-10-01T00:00:00+00:00")
-        core.set_state(conn, d["event_id"], core.STATE_FAILED, NOW, note="x")
+        core.set_state(conn, d["event_id"], core.STATE_FAILED, NOW, note="x", failure_class=core.FAILURE_WORK)
         conn.commit()
         e = _folded_with_root_cause(conn, "sig-rc-e", "cause-d")
         assert core.get_item(conn, e["event_id"])["state"] == core.STATE_WORKING
@@ -10248,7 +10699,7 @@ def test_leaving_merging_clears_the_train_position_but_keeps_the_reviewed_sha():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-leave", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA,
                           job=None)
-        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="gave up")
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="gave up", failure_class=core.FAILURE_WORK)
         conn.commit()
         item = core.get_item(conn, eid)
         assert (item["train_stage"], item["train_sha"], item["train_job"]) == (None, None, None), dict(item)

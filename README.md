@@ -31,6 +31,7 @@ triage → investigate → implement → merge train → deploy → verify, visi
 | `status` / `list` | `warden status <job-id> [--json]` · `warden list [open\|today\|all]` | see it |
 | `merge` | `warden merge <job-id> --why … --confirm` | lands a PR through the same merge gate |
 | `abort` / `revert` / `close` | `warden abort <event-id> --why …` · `warden revert <event-id> --pr <n> --why …` · `warden close <event-id> --why … [--reason resolved\|ignored]` | stop, record a revert, close by hand |
+| `retry` | `warden retry <event-id> [--why …]` | puts a `failed` item back where it failed, with a fresh re-drive budget |
 
 `warden help` has the exact flags.
 
@@ -39,4 +40,4 @@ triage → investigate → implement → merge train → deploy → verify, visi
 | Nothing seems to be running | `make status`, then `make logs` |
 | A poller might be dead | `GET http://127.0.0.1:7735/health` — each poller's heartbeat age |
 | An item won't move | `warden status <id>`'s `note`, or the item's Argo timeline |
-| An item is `failed` | its `note` carries the error; Argo offers reinvestigate/implement |
+| An item is `failed` | its `note` carries the error and `failure_class` says whether the loop re-drives it (`infra`, `policy`) or waits for you (`work`); `warden retry` or Argo's retry puts it back |

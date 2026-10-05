@@ -74,6 +74,7 @@ def _on_verify_failure(conn: sqlite3.Connection, item: sqlite3.Row, evidence: st
                f"{sha[:12]} landed as a {method} merge, not one commit")
         core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
                         expect_eq={"merged_sha": sha} if sha else None, verify_result=evidence[:VERIFY_RESULT_MAX],
+                        failure_class=core.FAILURE_WORK,
                         note=f"{VERIFY_FAILED_NOTE_PREFIX}cannot auto-revert ({why}): {evidence}")
         conn.commit()
         return
@@ -147,8 +148,10 @@ def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) 
     receipt = json.dumps({"exitCode": result.exit_code, "output": result.tail})
     if not result.ok:
         work.complete_operation(conn, op_id, outcome="failed", receipt=receipt)
+        # Not infra: the same merged commit's deploy would fail the same way.
         core.strike(conn, event_id, now, f"deploy failed (exit {result.exit_code}): {_tail_for_note(result.tail)}",
-                     retry_state=core.STATE_VERIFYING, expect_state=core.STATE_VERIFYING)
+                     retry_state=core.STATE_VERIFYING, expect_state=core.STATE_VERIFYING,
+                     failure_class=core.FAILURE_WORK)
         conn.commit()
         return None
     work.complete_operation(conn, op_id, outcome="done", receipt=receipt)
@@ -712,7 +715,7 @@ def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
             if failures >= core.VERIFY_FAILURE_LIMIT:
                 core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
                                 expect_eq={"reverting_sha": sha}, verify_failures=failures,
-                                verify_result=evidence[:VERIFY_RESULT_MAX],
+                                verify_result=evidence[:VERIFY_RESULT_MAX], failure_class=core.FAILURE_WORK,
                                 note=f"production unhealthy after revert of {sha[:12]}: {failures} consecutive "
                                      f"failing passes — {evidence}")
             else:
@@ -727,6 +730,7 @@ def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
     if not work.revisions_left(item):
         core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
                         expect_eq={"reverting_sha": sha}, reverting_sha=None, verify_failures=0, verify_result=verify_note,
+                        failure_class=core.FAILURE_WORK,
                         note=f"reverted {sha[:12]} ({verify_note}); no implement attempt left — "
                              f"verification failure: {record['evidence']}")
         conn.commit()

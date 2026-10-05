@@ -26,6 +26,10 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # operation (a crashed process, an ambiguous submit) is reconciled before anything else.
     work.reconcile_operations(conn, policy, now, dry_run=dry_run)
 
+    # `failed` items that were never the work's fault re-enter their stage here, so this pass's
+    # pollers pick them up.
+    work.redrive_failed(conn, now, dry_run=dry_run)
+
     intake.ingest(conn, now)
     intake.ingest_github_issues(conn, now)
     intake.reopen_if_needed(conn, now, policy)

@@ -20,6 +20,7 @@ VERBS
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
   revert <event-id>   record a revert PR against a merged item (--pr --why)
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
+  retry <event-id>    put a `failed` item back where it failed, with a fresh re-drive budget (--why)
   help
 
 Global flags, anywhere on the line, `--flag value` or `--flag=value`:
@@ -132,6 +133,10 @@ def _mode(verb: str | None, state: _State) -> str:
         return "aborted" if state.did_mutate else "refused"
     if verb == "revert":
         return "reverted" if state.did_mutate else "refused"
+    if verb == "retry":
+        if state.did_mutate:
+            return "retried"
+        return "dry-run" if state.dry_run else "refused"
     if verb == "close":
         if state.did_mutate:
             return "closed"
@@ -798,12 +803,54 @@ def cmd_revert(conn, flags: Flags, positional: list[str], state: _State) -> dict
     now = dt.datetime.now(dt.timezone.utc)
     items.transition(
         conn, event_id, to_state=ledger.STATE_FAILED, now=now,
-        note=f"reverted by PR #{pr_number}: {flags.why}", extra={"revert_pr": pr_number},
+        note=f"reverted by PR #{pr_number}: {flags.why}",
+        extra={"revert_pr": pr_number, "failure_class": core.FAILURE_WORK},
     )
     conn.commit()
     state.did_mutate = True
 
     return {"verb": "revert", "ok": True, "eventId": event_id, "pullRequest": pr_number, "state": ledger.STATE_FAILED}
+
+
+# --- retry ---------------------------------------------------------------------
+
+
+def cmd_retry(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
+    """Put a `failed` item back where it failed — whatever its class — with a fresh re-drive budget
+    (`redrives` back to 0): the owner's "try again". The same re-entry as the loop's automatic
+    re-drive (core.redrive()), so the stored recipe decides the state and the columns. An item with
+    no stage to re-enter (a revert recorded by hand, a failure that came from nowhere) is refused.
+    Local ledger only, like `close`: no GitHub or sideclaw call."""
+    if not positional:
+        raise UsageError('usage: warden retry <event-id> [--why "<reason>"] [--json]')
+    event_id = _parse_int(positional[0], "event-id")
+    state.target = str(event_id)
+
+    item = core.get_item(conn, event_id)
+    if item is None:
+        raise UsageError(f"no triage_items row for event_id {event_id}")
+    if item["state"] != core.STATE_FAILED:
+        raise PreconditionError(f"triage item {event_id} is in state '{item['state']}', not failed — nothing to retry")
+    target = core.redrive_target(item)
+    if target is None:
+        raise PreconditionError(f"triage item {event_id} is failed({item['failure_class']}) with no stage to "
+                                "re-enter — close it, or reinvestigate it from Argo")
+    stage = target[0]
+    note = f"retried by owner: {flags.why or 'no reason given'}"
+
+    if flags.dry_run:
+        state.dry_run = True
+        return {"verb": "retry", "ok": True, "dryRun": True, "eventId": event_id, "fromState": core.STATE_FAILED,
+                "state": stage, "note": "nothing written — no transition row, no state change"}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    if not core.redrive(conn, item, now, redrives=0, note=note):
+        conn.rollback()
+        raise PreconditionError(f"triage item {event_id} moved while this retry was applied — look again")
+    conn.commit()
+    state.did_mutate = True
+    return {"verb": "retry", "ok": True, "eventId": event_id, "fromState": core.STATE_FAILED, "state": stage,
+            "redrives": 0, "note": core.get_item(conn, event_id)["note"]}
 
 
 # --- close ---------------------------------------------------------------------
@@ -982,6 +1029,7 @@ VERBS
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
   revert <event-id>   record a revert PR against a merged item (--pr --why)
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
+  retry <event-id>    put a `failed` item back where it failed, with a fresh re-drive budget (--why)
   help
 
 Global flags, anywhere on the line, --flag value or --flag=value:
@@ -1054,6 +1102,8 @@ def main(argv: list[str]) -> int:
                 out = cmd_revert(conn, flags, rest, state)
             elif verb == "close":
                 out = cmd_close(conn, flags, rest, state)
+            elif verb == "retry":
+                out = cmd_retry(conn, flags, rest, state)
             else:
                 raise UsageError(
                     f"unknown verb: {verb}\n"
@@ -1066,6 +1116,7 @@ def main(argv: list[str]) -> int:
                     "  abort <event-id>  cancel an in-flight implement/validate episode (--why)\n"
                     "  revert <event-id> record a revert PR against a merged item (--pr --why)\n"
                     "  close <event-id>  resolve an open item by hand (--why required; --reason resolved|ignored)\n"
+                    "  retry <event-id>  put a failed item back where it failed (--why)\n"
                     "  help"
                 )
         finally:

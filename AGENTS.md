@@ -20,7 +20,7 @@ item moves.
 | `scripts/loop/` | the loop by stage: `core` (paths, states, `set_state`, strikes, policy), `intake`, `triaging`, `work`, `train`, `verify`, `notify` |
 | `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate (check runs, falling back to Actions workflow runs when the token cannot read checks), rollout (`make deploy`/`verify`), dispatch, operations |
 | `scripts/clients/` | the only HTTP/CLI boundaries: sideclaw, GitHub, Argo, Slack, secrets |
-| `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`) |
+| `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`) |
 | `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents |
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
 | `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns |
@@ -41,7 +41,7 @@ whether to touch production.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**467/467** — any other number is a finding to report, not a count to edit.
+**484/484** — any other number is a finding to report, not a count to edit.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary, so nothing reaches Slack, sideclaw, GitHub or Argo.
 Patch a name on the module that defines it (`loop.core.DB_PATH`, `loop.core.post_line`) —

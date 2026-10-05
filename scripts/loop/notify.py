@@ -162,10 +162,10 @@ ARGO_SNAPSHOT_HISTORY_LIMIT = 50
 # The closed set of verbs Argo's action queue may name, like HOST_VERB_ALLOWLIST: the string
 # reaches a dispatcher that branches on it, so an unrecognized value is a loud, acked rejection,
 # never a silent drop or a guess.
-ARGO_ACTION_VERBS = frozenset({"implement", "merge", "dismiss", "reinvestigate", "note"})
+ARGO_ACTION_VERBS = frozenset({"implement", "merge", "dismiss", "reinvestigate", "note", "retry"})
 
 # Owner actions are gated on the same state sets api.py's `availableActions` offers (mirrored
-# there by literal value, kept in sync by hand). An owner dismissal is the same terminal call as
+# there by state name, kept in sync by hand). An owner dismissal is the same terminal call as
 # a human `warden close`, so it may end anything that has not started work (`new`, `triaged`),
 # anything waiting on the owner (`needs_decision`, `failed`) and a `quiet` item.
 _ARGO_DISMISS_ALLOWED_STATES = (
@@ -176,6 +176,8 @@ _ARGO_DISMISS_ALLOWED_STATES = (
 _ARGO_REINVESTIGATE_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED, core.STATE_QUIET)
 _ARGO_IMPLEMENT_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED)
 _ARGO_MERGE_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED)
+# `retry` re-enters the stage a `failed` item stored (core.redrive()); api.py offers it only when one is.
+_ARGO_RETRY_ALLOWED_STATES = (core.STATE_FAILED,)
 # An item with `revert_pr` set was merged and rolled back by hand: implementing or merging it
 # again would redo the reverted change. api.py's `availableActions` offers neither.
 _ARGO_REVERTED_REFUSAL = "this item was reverted (revert_pr is set) — implement/merge would redo the reverted change"
@@ -220,7 +222,8 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
     def _hand_back(note: str) -> None:
         core.set_state(conn, event_id, item["state"], now, expect_state=core.STATE_WORKING, note=note,
                         implement_job=item["implement_job"], validation_job=item["validation_job"],
-                        pr_url=item["pr_url"], reverting_sha=item["reverting_sha"], revert_json=item["revert_json"])
+                        pr_url=item["pr_url"], reverting_sha=item["reverting_sha"], revert_json=item["revert_json"],
+                        failure_class=item["failure_class"], redrive_json=item["redrive_json"])
         conn.commit()
 
     try:
@@ -333,6 +336,22 @@ def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event
     return "applied", None, None
 
 
+def _apply_argo_retry(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int, now: dt.datetime,
+                      payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None, str | None]:
+    """The owner's "try again" on a `failed` item of any class: the same re-entry as the loop's
+    automatic re-drive and `warden retry`, with a fresh budget (`redrives` back to 0)."""
+    if item["state"] not in _ARGO_RETRY_ALLOWED_STATES:
+        return "rejected", None, f"item is in state {item['state']!r}, not failed"
+    if core.redrive_target(item) is None:
+        return "rejected", None, "this failed item has no stage to re-enter — reinvestigate or dismiss it"
+    why = str(payload.get("why") or payload.get("reason") or "").strip() or "no reason given"
+    rowcount = core.redrive(conn, item, now, redrives=0, note=f"retried by owner via Argo: {why}")
+    conn.commit()
+    if rowcount == 0:
+        return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+    return "applied", None, None
+
+
 def _apply_argo_note(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int, now: dt.datetime,
                       payload: dict[str, Any], action_id: str | int) -> tuple[str, dict[str, Any] | None, str | None]:
     if item["state"] in core.TERMINAL_STATES:
@@ -392,6 +411,8 @@ def _apply_one_argo_action(conn: sqlite3.Connection, action: dict[str, Any], now
             status, result, error = _apply_argo_dismiss(conn, item, event_id, now, payload)
         elif verb == "reinvestigate":
             status, result, error = _apply_argo_reinvestigate(conn, item, event_id, now)
+        elif verb == "retry":
+            status, result, error = _apply_argo_retry(conn, item, event_id, now, payload)
         else:
             status, result, error = _apply_argo_note(conn, item, event_id, now, payload, action_id)
 
@@ -403,7 +424,7 @@ def _apply_one_argo_action(conn: sqlite3.Connection, action: dict[str, Any], now
 
 def apply_argo_actions(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
     """Pulls the owner's queued actions off Argo (`implement`/`merge`/`dismiss`/`reinvestigate`/
-    `note`, see ARGO_ACTION_VERBS) and applies each one, immediately before this pass's
+    `note`/`retry`, see ARGO_ACTION_VERBS) and applies each one, immediately before this pass's
     push_argo_snapshot() reflects the outcome. Idempotency: see _apply_one_argo_action()."""
     if dry_run:
         print("[dry-run] would poll Argo for pending owner actions")

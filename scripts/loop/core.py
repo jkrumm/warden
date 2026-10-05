@@ -86,8 +86,9 @@ GROUPED_TRIAGE_SOURCES = ("slack_alert", "hermes_log")
 #            for the window (maybe_verify()). Nothing to verify -> `fixed` at once.
 # `needs_decision` a verdict carried a question only the owner can answer.
 # `failed`   three infrastructure strikes, a sideclaw refusal, a merge refusal that will not
-#            clear, or revisions exhausted. Never expires, never silence-resolved, never retried
-#            automatically.
+#            clear, or revisions exhausted. Never expires, never silence-resolved. Always carries a
+#            failure_class: `infra` and `policy` are re-driven automatically (redrive_failed()),
+#            `work` waits for the owner (`warden retry`).
 # `fixed`    verified. `quiet`  the signal went quiet before work started.
 # `closed`   done without a verified fix; close_reason says why.
 STATE_NEW = "new"
@@ -111,6 +112,24 @@ CLOSE_FIXED_BY = "fixed_by"
 CLOSE_IGNORED = "ignored"
 CLOSE_RESOLVED = "resolved"
 CLOSE_REASONS = (CLOSE_DUPLICATE, CLOSE_FIXED_BY, CLOSE_IGNORED, CLOSE_RESOLVED)
+
+# `failed` always carries one of these in triage_items.failure_class (scripts/ledger.py mirrors it):
+#   infra   sideclaw 5xx / timeout / unreachable / auth, a synthesis or serialization failure
+#   policy  sideclaw refused the submit (4xx), or its permissions could not be read
+#   work    anything a human must judge: checks failed, review blocked after the last attempt, a
+#           conflict loop, a revert that cannot be done mechanically
+FAILURE_INFRA = "infra"
+FAILURE_POLICY = "policy"
+FAILURE_WORK = "work"
+FAILURE_CLASSES = (FAILURE_INFRA, FAILURE_POLICY, FAILURE_WORK)
+
+# Automatic re-drives of a `failed` item (redrive_failed()): an `infra` failure waits
+# REDRIVE_BACKOFF_MINUTES[redrives] before its next re-drive, REDRIVE_LIMIT times (`redrives` counts
+# infra re-drives only); a `policy` failure is re-driven once per change of sideclaw's dispatch policy
+# and is not bound by the limit; `work` is never re-driven.
+REDRIVE_LIMIT = 3
+REDRIVE_BACKOFF_MINUTES = (60, 180, 480)   # indexed by `redrives`, so one wait per allowed re-drive
+assert len(REDRIVE_BACKOFF_MINUTES) == REDRIVE_LIMIT
 
 # Forward order of the pipeline. set_state() resets the strike counter when an
 # item advances to merging or beyond (or leaves an end state), so "three strikes"
@@ -613,7 +632,11 @@ _SET_STATE_COLUMNS = (
     "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
     "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
     "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
+    "failure_class", "redrive_json", "redrives",
 )
+
+# The states an item can be re-driven INTO: a stage of the pipeline that has a poller.
+_REDRIVE_STAGES = (STATE_NEW, STATE_TRIAGED, STATE_WORKING, STATE_MERGING, STATE_VERIFYING)
 
 # The merge train's position, meaningful only while the item is `merging`: leaving it clears
 # them (set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha` and
@@ -666,6 +689,13 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
     `revert_json`): an item back before its investigation starts over and must not reopen an old
     revert.
 
+    `failed` must carry its class: a `failure_class` in FAILURE_CLASSES is required (a column-only
+    write on an item that is already `failed` keeps the class and recipe it has), and every other
+    state clears it and `redrive_json` (the re-entry recipe, see redrive_spec()). Entering `failed`
+    without an explicit `redrive_json` stores the stage the item came from (no columns), or NULL when
+    that was not a stage (a `failed` item written again, `needs_decision`, a terminal state). An
+    `infra` failure also gets `retry_at`, the backoff of its next re-drive.
+
     The strike counter is owned here too: an item that advances to `merging`, `verifying` or `fixed`
     (a step SUCCEEDED; claiming `working` is not progress, the episode may still fail), or that
     leaves an end state (needs_decision, failed, terminal) by any route, gets `strikes=0,
@@ -706,6 +736,26 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
             raise ValueError(f"a `closed` transition must carry close_reason= one of {CLOSE_REASONS}")
     else:
         columns["close_reason"] = None
+    # The row's state BEFORE this write: the only way to tell a real transition from a column-only write below.
+    prev_row = conn.execute("SELECT state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
+    prev_state = prev_row["state"] if prev_row is not None else None
+
+    if state == STATE_FAILED:
+        # A column-only write on an item that is already `failed` (an owner's note, a pending-merge
+        # note) is not a transition: it keeps the class and the recipe it has.
+        if "failure_class" in columns or prev_state != STATE_FAILED:
+            if columns.get("failure_class") not in FAILURE_CLASSES:
+                raise ValueError(f"a `failed` transition must carry failure_class= one of {FAILURE_CLASSES}")
+            if prev_state != STATE_FAILED:
+                columns.setdefault("redrive_json", redrive_spec(prev_state) if prev_state in _REDRIVE_STAGES else None)
+            if columns["failure_class"] == FAILURE_INFRA:
+                spent = conn.execute("SELECT redrives FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
+                columns.setdefault("retry_at", redrive_due_at(now, spent["redrives"] if spent else 0))
+            else:
+                columns.setdefault("retry_at", None)
+    else:
+        columns["failure_class"] = None
+        columns["redrive_json"] = None
     if columns.get("close_reason") != CLOSE_DUPLICATE:
         columns.setdefault("duplicate_of", None)
     if state == STATE_NEW:
@@ -734,10 +784,6 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
 
     mark = occurrence_mark(get_event(conn, event_id))
 
-    # The row's state BEFORE this write: the only way to tell a real transition from a column-only write below.
-    prev_row = conn.execute("SELECT state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
-    prev_state = prev_row["state"] if prev_row is not None else None
-
     if "strikes" not in columns and prev_state is not None and prev_state != state:
         advanced = (state in _PIPELINE_RANK and prev_state in _PIPELINE_RANK
                     and _PIPELINE_RANK[state] >= _PIPELINE_RANK[STATE_MERGING]
@@ -745,6 +791,8 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
         if advanced or prev_state in _END_STATES:
             columns["strikes"] = 0
             columns["retry_at"] = None
+        if advanced:
+            columns.setdefault("redrives", 0)   # the infra budget is per stretch of trouble, not per item
 
     sql = "UPDATE triage_items SET state=?, occurrence_mark=?, updated_at=?"
     params: list[Any] = [state, mark, now_iso(now)]
@@ -794,15 +842,68 @@ def retry_ready_sql(now: dt.datetime, alias: str = "") -> tuple[str, list[str]]:
     return f"({col} IS NULL OR {col} <= ?)", [now_iso(now)]
 
 
+def redrive_spec(state: str | None, columns: dict[str, Any] | None = None, *,
+                 policy_hash: str | None = None) -> str | None:
+    """The `redrive_json` of a `failed` item: the state to re-enter, the columns to apply on the way
+    in (the failed step's handle cleared, so its poller starts a fresh attempt) and, for a `policy`
+    failure, the hash of sideclaw's dispatch policy it was refused under. NULL when there is no
+    stage to re-enter. A `Coalesce` is stored as its value."""
+    if state not in _REDRIVE_STAGES:
+        return None
+    plain = {col: (v.value if isinstance(v, Coalesce) else v) for col, v in (columns or {}).items()}
+    return json.dumps({"state": state, "columns": plain, "policy_hash": policy_hash},
+                      sort_keys=True, separators=(",", ":"))
+
+
+def redrive_target(item: sqlite3.Row) -> tuple[str, dict[str, Any], str | None] | None:
+    """(state, columns, policy_hash) a `failed` item re-enters, or None: not `failed`, no recipe, or
+    a recipe this code does not recognise (never guessed at). Never for an item with `revert_pr`: it
+    was rolled back by hand, and re-entering it would redo the reverted change."""
+    if item["state"] != STATE_FAILED or not item["redrive_json"] or item["revert_pr"] is not None:
+        return None
+    recipe = safe_json(item["redrive_json"])
+    state, columns = recipe.get("state"), recipe.get("columns")
+    if state not in _REDRIVE_STAGES or not isinstance(columns, dict):
+        return None
+    return state, columns, recipe.get("policy_hash")
+
+
+def redrive_due_at(now: dt.datetime, redrives: int) -> str | None:
+    """When the next automatic re-drive of an `infra` failure is due, or None once REDRIVE_LIMIT
+    re-drives are spent."""
+    if redrives >= REDRIVE_LIMIT:
+        return None
+    return now_iso(now + dt.timedelta(minutes=REDRIVE_BACKOFF_MINUTES[redrives]))
+
+
+def redrive(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, redrives: int, note: str) -> int:
+    """Put a `failed` item back where its `redrive_json` says. The one re-entry shared by the loop's
+    automatic re-drive, `warden retry` and the Argo `retry` action. A compare-and-set on `failed`;
+    returns the rowcount (0: no recipe, or another pass moved the item first). `pr_url`,
+    `revision_count` and every other column stay: only the stored columns change, the strike streak
+    starts over, and `redrives` is the caller's to set (the loop counts up, an owner resets it).
+    Entering `merging` restarts the train at `update` (a `merging` row on no stage does)."""
+    target = redrive_target(item)
+    if target is None:
+        return 0
+    stage, columns, _hash = target
+    columns = {**columns, "strikes": 0, "retry_at": None, "redrives": redrives, "note": note}
+    if stage == STATE_MERGING:
+        columns["train_rewinds"] = 0
+    return set_state(conn, item["event_id"], stage, now, expect_state=STATE_FAILED, **columns)
+
+
 def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,
-            retry_state: str, expect_state: str | None = None, expect_eq: dict[str, Any] | None = None,
+            retry_state: str, failure_class: str = FAILURE_INFRA, expect_state: str | None = None, expect_eq: dict[str, Any] | None = None,
             **retry_columns: Any) -> str:
     """The one retry rule. An infrastructure failure of the step the item is on increments `strikes`;
     below STRIKE_LIMIT the item goes to `retry_state` (the state whose poller re-submits the failed
     step: `triaged` for an investigation, `working` for an implement/host-verb episode, `merging` for
     a review or merge) with `retry_at` pushed out by the backoff, and `retry_columns` applied (the
     failed attempt's handle cleared, so the poller starts a fresh one). At STRIKE_LIMIT the item is
-    `failed`, `reason` is its note, and its columns are left alone as evidence. Returns the state the
+    `failed`, `reason` is its note, its columns are left alone as evidence, and it carries
+    `failure_class` (`infra` unless the caller knows better) plus the re-entry recipe: `retry_state`
+    with `retry_columns`, which is where its re-drive (redrive_failed()) puts it. Returns the state the
     item landed in, or, when `expect_state`/`expect_eq` no longer matched (another pass moved it
     first) and nothing was written, the state it is actually in, logged to stderr.
 
@@ -815,7 +916,8 @@ def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: st
     if strikes >= STRIKE_LIMIT:
         landed = STATE_FAILED
         written = set_state(conn, event_id, STATE_FAILED, now, expect_state=expect_state,
-                             expect_eq=expect_eq, note=reason, strikes=strikes, retry_at=None)
+                             expect_eq=expect_eq, note=reason, strikes=strikes, failure_class=failure_class,
+                             redrive_json=redrive_spec(retry_state, retry_columns))
     else:
         landed = retry_state
         backoff = STRIKE_BACKOFF_MINUTES[min(strikes, len(STRIKE_BACKOFF_MINUTES)) - 1]

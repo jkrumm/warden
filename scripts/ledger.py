@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 15
+LEDGER_SCHEMA_VERSION = 16
 
 
 class LedgerBehind(RuntimeError):
@@ -700,6 +700,54 @@ ALTER TABLE triage_items ADD COLUMN sweep_candidates TEXT;
 ALTER TABLE triage_items ADD COLUMN fixed_by_pr TEXT;
 """
 
+# Version 16 — `failed` is classified, and infra failures are re-driven (Wave 7). Three
+# columns on triage_items, set when an item lands `failed` and cleared when it leaves it:
+#
+#   failure_class  infra | policy | work. infra = sideclaw 5xx/timeouts/auth, a synthesis or
+#     serialization failure, sideclaw unreachable (re-driven on a backoff, three times);
+#     policy = sideclaw refused the submit with a 4xx or its permissions were unreadable
+#     (re-driven once whenever sideclaw's dispatch policy changes); work = anything a human must
+#     judge (checks failed, review blocked after the last attempt, conflict loops; never re-driven).
+#     NULL on every state but `failed`.
+#   redrive_json   {"state": <state to re-enter>, "columns": {<column>: <value>}, "policy_hash":
+#     <hash of sideclaw's dispatch policy at the refusal, or null>}: where `warden retry` and the
+#     automatic re-drive put the item. NULL on every state but `failed`, and NULL on a `failed`
+#     item with no stage to re-enter.
+#   redrives       automatic INFRA re-drives done on this item (a policy re-drive is not counted); an
+#     owner's `warden retry` and any forward progress of the item reset it. 0 on every existing row.
+#
+# Backfill of the existing `failed` rows, mapped from `note` (retry_at NULL on all of them, so
+# the first loop pass after the deploy re-drives the infra ones that are due and the policy ones
+# once, their stored policy_hash being NULL):
+#
+#   | note contains                                       | class  | re-enters                         |
+#   | investigate episode <status> with no verdict        | infra  | triaged, dispatch_job cleared     |
+#   | exceeds the ceiling / episode not started — sideclaw refused | policy | working (note starts with `implement`), merging (`review`/`update_pr`), else triaged |
+#   | is merge-approval gated (the deleted gate)          | policy | merging, the train restarts at update |
+#   | anything else                                       | work   | never automatically; `warden retry` re-enters merging (has a PR) or triaged; none when `revert_pr` is set |
+_MIGRATION_16 = """
+ALTER TABLE triage_items ADD COLUMN failure_class TEXT;
+ALTER TABLE triage_items ADD COLUMN redrive_json TEXT;
+ALTER TABLE triage_items ADD COLUMN redrives INTEGER NOT NULL DEFAULT 0;
+UPDATE triage_items SET failure_class = 'infra', retry_at = NULL,
+  redrive_json = '{"state":"triaged","columns":{"dispatch_job":null},"policy_hash":null}'
+  WHERE state = 'failed' AND failure_class IS NULL AND note LIKE '%investigate episode % with no verdict%';
+UPDATE triage_items SET failure_class = 'policy', retry_at = NULL,
+  redrive_json = '{"state":"' || CASE WHEN note LIKE 'implement%' THEN 'working'
+                                      WHEN note LIKE 'review%' OR note LIKE 'update_pr%' THEN 'merging'
+                                      ELSE 'triaged' END || '","columns":{},"policy_hash":null}'
+  WHERE state = 'failed' AND failure_class IS NULL
+    AND (note LIKE '%exceeds the ceiling%' OR note LIKE '%episode not started — sideclaw refused%');
+UPDATE triage_items SET failure_class = 'policy', retry_at = NULL,
+  redrive_json = '{"state":"merging","columns":{},"policy_hash":null}'
+  WHERE state = 'failed' AND failure_class IS NULL AND note LIKE '%is merge-approval gated%';
+UPDATE triage_items SET failure_class = 'work', retry_at = NULL,
+  redrive_json = CASE WHEN revert_pr IS NOT NULL THEN NULL
+                 ELSE '{"state":"' || CASE WHEN pr_url IS NOT NULL THEN 'merging' ELSE 'triaged' END
+                      || '","columns":{},"policy_hash":null}' END
+  WHERE state = 'failed' AND failure_class IS NULL;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -716,6 +764,7 @@ MIGRATIONS: dict[int, str] = {
     13: _MIGRATION_13,
     14: _MIGRATION_14,
     15: _MIGRATION_15,
+    16: _MIGRATION_16,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live
@@ -757,6 +806,9 @@ TERMINAL_STATES = (STATE_FIXED, STATE_QUIET, STATE_CLOSED)
 
 # `closed` always carries one of these in triage_items.close_reason.
 CLOSE_REASONS = ("duplicate", "fixed_by", "ignored", "resolved")
+
+# `failed` always carries one of these in triage_items.failure_class (loop/core.py mirrors it).
+FAILURE_CLASSES = ("infra", "policy", "work")
 
 
 def _now_iso() -> str:

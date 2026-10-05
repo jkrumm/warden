@@ -40,6 +40,18 @@ ends `failed` with sideclaw's message — except a refused escalation `model`
 (resubmitted once without it), a lease refusal (retry in 10 minutes, no strike)
 and a refused triage submit (strikes; never the item's fault).
 
+`failed` is classified where it happens (`failure_class`) and is not a graveyard for
+what was never the work's fault. `infra` (sideclaw 5xx/unreachable, a synthesis
+failure, the third strike) is re-driven after 60, 180, 480 minutes, three times;
+`policy` (a sideclaw 4xx refusal, unreadable permissions) once whenever sideclaw's
+dispatch policy hash differs from the one stored with the refusal, so a refusal
+under the new policy waits for the next change; `work` (checks failed, review
+blocked past the last attempt, a rewind loop, a revert by hand) never. A failed row
+carries `redrive_json` — the state to re-enter and the columns that clear the failed
+attempt's handle — and a re-drive (`redrive_failed()`, first in the pass) puts it
+back there silently, keeping the PR and the revision count. `warden retry` and
+Argo's `retry` do the same for any class with a fresh budget.
+
 ## The loop
 
 One pass of `triage.run()`; module per stage under `scripts/loop/`.
@@ -101,7 +113,7 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
 8. **Notify** (`notify.py`). Slack hears one line on `fixed` and
    `needs_decision` — `<icon> <repo>: <summary> — <state> <Argo link>` — plus a
    daily `failed` count. Argo `/warden` gets a snapshot every pass and is the
-   queue; owner actions (`implement`, `merge`, `dismiss`, `reinvestigate`, `note`)
+   queue; owner actions (`implement`, `merge`, `dismiss`, `reinvestigate`, `note`, `retry`)
    come back through `apply_argo_actions()` as `owner:argo`.
 
 `dispatch-sweep.py` folds finished episodes every 5 minutes and runs the

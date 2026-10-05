@@ -28,7 +28,7 @@ import ledger
 # `warden revert` needs, `close_reason` what every `closed` target carries; add to
 # this tuple only for a new verb that writes a specific column, never as a general
 # escape hatch.
-_EXTRA_COLUMNS = ("revert_pr", "close_reason")
+_EXTRA_COLUMNS = ("revert_pr", "close_reason", "failure_class")
 
 # An item `note` is one short line: it is what Slack and Argo show. Both writers of
 # the column (this module and loop/core.py's `set_state()`) cap it here.
@@ -150,6 +150,14 @@ def transition(
         extra = {**extra, "close_reason": None}
     # `duplicate_of` belongs to `closed(duplicate)` alone (only the loop writes that).
     extra = {**extra, "duplicate_of": None}
+    # `failed` always carries its class (and a CLI-written one has no stage to re-enter: it was a
+    # human's call); every other state clears both, so a closed item never keeps a failure's class.
+    if to_state == "failed":
+        if extra.get("failure_class") not in ledger.FAILURE_CLASSES:
+            raise ValueError(f"a `failed` transition must carry extra={{'failure_class': one of {ledger.FAILURE_CLASSES}}}")
+        extra = {**extra, "redrive_json": None, "retry_at": None}
+    else:
+        extra = {**extra, "failure_class": None, "redrive_json": None}
 
     prev_row = conn.execute("SELECT state FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
     prev_state = prev_row["state"] if prev_row is not None else None

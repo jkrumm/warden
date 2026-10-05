@@ -532,7 +532,8 @@ def test_board_counts_items_shape_ordering_and_terminal_24h():
 
     one = next(item for item in payload["items"] if item["event_id"] == 1)
     assert set(one.keys()) == {
-        "event_id", "origin", "repo", "state", "close_reason", "strikes", "retry_at", "max_tier", "title", "note",
+        "event_id", "origin", "repo", "state", "close_reason", "failure_class", "redrives", "strikes", "retry_at",
+        "max_tier", "title", "note",
         "pr_url", "dispatch_job", "implement_job", "validation_job", "occurrences",
         "revision_count", "train_stage", "created_at", "updated_at", "origin_channel", "origin_thread_ts",
         "availableActions", "issue",
@@ -614,6 +615,31 @@ def test_available_actions_follow_the_new_state_machine():
         assert a(in_flight, mergeable=True) == ["note"], in_flight
     for terminal in ("fixed", "closed"):
         assert a(terminal) == [], terminal
+
+
+def test_retry_is_offered_for_a_failed_item_with_a_stage_to_re_enter():
+    a = api._available_actions
+    assert "retry" in a("failed", retryable=True) and "retry" not in a("failed")
+    assert "retry" not in a("failed", retryable=True, reverted=True), "a reverted item is never retried"
+    for state in ("needs_decision", "working", "quiet", "new", "triaged", "fixed"):
+        assert "retry" not in a(state, retryable=True), state
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    for i, recipe in ((1, '{"state":"working","columns":{},"policy_hash":null}'), (2, None)):
+        _event(conn, i, now)
+        _item(conn, i, state="failed", now=now)
+        conn.execute("UPDATE triage_items SET failure_class='infra', redrives=2, redrive_json=? WHERE event_id=?",
+                     (recipe, i))
+        _transition(conn, i, "new", "failed", now)
+    conn.commit()
+    owner = {r["event_id"]: r for r in api.awaiting_owner(conn, now)}
+    assert "retry" in owner[1]["availableActions"] and "retry" not in owner[2]["availableActions"], owner
+    board = {i["event_id"]: i for i in api.board_payload(conn)["items"]}
+    assert "retry" in board[1]["availableActions"] and "retry" not in board[2]["availableActions"], board
+    assert board[1]["failure_class"] == "infra" and board[1]["redrives"] == 2, board[1]
+    item = api.item_payload(conn, 1)["item"]
+    assert item["failure_class"] == "infra" and item["redrives"] == 2, item
+    conn.close()
 
 
 def test_reverted_items_are_not_offered_implement_or_merge():

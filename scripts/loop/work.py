@@ -328,15 +328,76 @@ def _host_verb_attempts(conn: sqlite3.Connection, verb_key: str, policy: dict[st
     ).fetchall()
 
 
+def redrive_failed(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
+    """`failed` is not a graveyard for what was never the work's fault. Every `failed` item carries
+    its class and a recipe (core.redrive): this pass re-enters it, silently (nothing posts to Slack,
+    `failed` only ever counts in the daily digest), and never touches a `work` failure.
+
+      infra   after REDRIVE_BACKOFF_MINUTES[redrives], at most REDRIVE_LIMIT times (a row with no
+              `retry_at`, a backfilled one, is due at once)
+      policy  once whenever sideclaw's dispatch policy hash differs from the one the refusal was
+              stored under (none stored counts as different), however many re-drives it has had; a
+              refusal under the new policy stores the new hash and waits for the next change. The
+              policy is read once per pass; unreadable, every policy re-drive waits for the next one."""
+    rows = conn.execute(
+        "SELECT * FROM triage_items WHERE state=? AND redrive_json IS NOT NULL AND failure_class IN (?, ?) "
+        "ORDER BY event_id", (core.STATE_FAILED, core.FAILURE_INFRA, core.FAILURE_POLICY)).fetchall()
+    now_stamp = core.now_iso(now)
+    policy_hash: str | None = None
+    policy_read = False
+    for item in rows:
+        target = core.redrive_target(item)
+        if target is None:
+            continue
+        stage, _columns, stored_hash = target
+        if item["failure_class"] == core.FAILURE_INFRA:
+            if item["redrives"] >= core.REDRIVE_LIMIT or (item["retry_at"] or "") > now_stamp:
+                continue
+            why = f"re-drive {item['redrives'] + 1}/{core.REDRIVE_LIMIT} after infra failure"
+        else:
+            if not policy_read:
+                policy_hash, policy_read = current_policy_hash(), True
+            if policy_hash is None or stored_hash == policy_hash:
+                continue
+            why = "re-drive after the dispatch policy changed"
+        if dry_run:
+            print(f"[dry-run] would {why}: {item['signature'][:60]} (event {item['event_id']}) -> {stage}")
+            continue
+        # `redrives` is the infra budget: only an infra re-drive spends it.
+        spent = item["redrives"] + (item["failure_class"] == core.FAILURE_INFRA)
+        won = core.redrive(conn, item, now, redrives=spent, note=f"{why}: {item['note'] or 'no note'}")
+        conn.commit()
+        if won:
+            print(f"triage: {why}: {item['signature'][:60]} (event {item['event_id']}) -> {stage}", file=sys.stderr)
+
+
+def current_policy_hash() -> str | None:
+    """The hash of sideclaw's dispatch policy as it answers now, or None when it cannot be read:
+    a policy refusal's re-drive never depends on, and never fails because of, this call."""
+    try:
+        return _sideclaw.policy_hash(_sideclaw.dispatch_policy())
+    except WardenError as e:
+        print(f"triage: could not read sideclaw's dispatch policy: {e}", file=sys.stderr)
+        return None
+
+
 def end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: SubmitRefused, *,
                     tier: str, now: dt.datetime, policy: dict[str, Any], **columns: Any) -> None:
     """sideclaw answered the submit with a 4xx, a refusal (repo outside its allowlist, tier above the
     repo's ceiling, bad params). The same submit is refused again, so every item the dispatch was
-    for ends `failed`, carrying sideclaw's own message, and is never retried. A 5xx or a connection
-    failure is not this: it is an infrastructure failure and strikes (see strike())."""
+    for ends `failed(policy)`, carrying sideclaw's own message. It re-enters the state it came from
+    (with `columns`) once sideclaw's dispatch policy differs from the hash stored here
+    (redrive_failed()). A 5xx or a connection failure is not this: it is an infrastructure failure
+    and strikes (see strike())."""
     note = _cap_brief(f"{tier} episode not started — {exc}")
+    policy_hash = current_policy_hash()
+    recipe_columns = {col: v for col, v in columns.items() if col != "retry_at"}
     for m in members:
-        core.set_state(conn, m["event_id"], core.STATE_FAILED, now, note=note, **columns)
+        current = core.get_item(conn, m["event_id"])
+        redrive = core.redrive_spec(current["state"] if current is not None else None, recipe_columns,
+                                    policy_hash=policy_hash)
+        core.set_state(conn, m["event_id"], core.STATE_FAILED, now, note=note,
+                       failure_class=core.FAILURE_POLICY, redrive_json=redrive, **columns)
     conn.commit()
     print(f"triage: {tier} dispatch refused by sideclaw, ending {[m['signature'] for m in members]}: {exc}",
           file=sys.stderr)
@@ -1027,6 +1088,8 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         columns: dict[str, Any] = {"note": member_note, "strikes": 0, "retry_at": None}
         if close_reason:
             columns["close_reason"] = close_reason
+        if member_state == core.STATE_FAILED:
+            columns["failure_class"] = core.FAILURE_WORK   # a verdict nobody can act on: the owner's call
         # Atomic compare-and-set, committed IMMEDIATELY (see the docstring). `expect_state` is read
         # fresh off `m` here, so the UPDATE's own `WHERE state=?` decides who wins a race against another
         # connection folding the same row, not a stale Python variable.
@@ -1448,7 +1511,8 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             note = (f"host verb {verb_key!r} hit hostVerbMaxAttempts="
                     f"{policy['hostVerbMaxAttempts']} ({attempts})")
             for item in items:
-                core.set_state(conn, item["event_id"], core.STATE_FAILED, now, note=note)
+                core.set_state(conn, item["event_id"], core.STATE_FAILED, now, note=note,
+                               failure_class=core.FAILURE_WORK)
             conn.commit()
             continue
 
@@ -1846,7 +1910,7 @@ def hand_back_for_revision(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.
             note = f"revert of {item['reverting_sha'][:12]}, not revised: {note}"
         head = " ".join(note.split())[: _items.NOTE_MAX - len(suffix)]
         won = core.set_state(conn, item["event_id"], core.STATE_FAILED, now, expect_state=item["state"],
-                              expect_eq=expect_eq, note=head + suffix, **columns)
+                              expect_eq=expect_eq, note=head + suffix, failure_class=core.FAILURE_WORK, **columns)
     if won:
         conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?", (outcome, item["implement_job"]))
     conn.commit()

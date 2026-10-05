@@ -115,22 +115,24 @@ CHAIN_STATES = (
 #
 # Mirrors loop/notify.py's apply_argo_actions() per-verb allowed-state sets
 # (ARGO_ACTION_VERBS = {"implement", "merge", "dismiss", "reinvestigate",
-# "note"}). Must stay in sync by hand with apply_argo_actions()'s handlers if
+# "note", "retry"}). Must stay in sync by hand with apply_argo_actions()'s handlers if
 # either changes. implement and merge share one set: both act on an item that is
-# waiting on the owner.
+# waiting on the owner; retry acts on a `failed` item that has a stage to re-enter.
 _OWNER_STATES = (_ledger.STATE_NEEDS_DECISION, _ledger.STATE_FAILED)
 _DISMISS_STATES = (_ledger.STATE_NEW, _ledger.STATE_TRIAGED, *_OWNER_STATES, _ledger.STATE_QUIET)
 _REINVESTIGATE_STATES = (*_OWNER_STATES, _ledger.STATE_QUIET)
 
 
-def _available_actions(state: str, mergeable: bool = False, reverted: bool = False) -> list[str]:
-    """Zero or more of `implement`/`merge`/`dismiss`/`reinvestigate`/`note` —
+def _available_actions(state: str, mergeable: bool = False, reverted: bool = False,
+                       retryable: bool = False) -> list[str]:
+    """Zero or more of `implement`/`merge`/`dismiss`/`reinvestigate`/`retry`/`note` —
     what the owner could click for a card in `state`, from state alone. The
     real per-repo/per-tier gate runs server-side in loop/notify.py's
     apply_argo_actions() when an action is actually applied; this list is
     only what the UI offers. A `reverted` item (`revert_pr` set) already merged and was
     rolled back by hand: re-implementing or re-merging it would redo the very change
-    that was reverted, so neither is offered."""
+    that was reverted, so neither is offered. `retryable`: a `failed` item whose
+    `redrive_json` names the stage it re-enters (never offered once `revert_pr` is set)."""
     actions: list[str] = []
     if state in _OWNER_STATES and not reverted:
         actions.append("implement")
@@ -142,6 +144,8 @@ def _available_actions(state: str, mergeable: bool = False, reverted: bool = Fal
         actions.append("dismiss")
     if state in _REINVESTIGATE_STATES:
         actions.append("reinvestigate")
+    if retryable and state == _ledger.STATE_FAILED and not reverted:
+        actions.append("retry")
     if state not in _ledger.TERMINAL_STATES:
         actions.append("note")
     return actions
@@ -621,7 +625,7 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
     placeholders = ",".join("?" for _ in AWAITING_OWNER_STATES)
     out: list[dict[str, Any]] = []
     for row in conn.execute(
-        f"SELECT ti.event_id, ti.repo, ti.state, ti.note, ti.pr_url, ti.revision_count, ti.revert_pr, "
+        f"SELECT ti.event_id, ti.repo, ti.state, ti.note, ti.pr_url, ti.revision_count, ti.revert_pr, ti.redrive_json, "
         f"e.title, (SELECT d.validation_status FROM dispatches d WHERE d.job_id = ti.implement_job) "
         f"AS validation_status, (SELECT MAX(at) FROM item_transitions t WHERE t.event_id = ti.event_id "
         f"AND t.to_state = ti.state) AS entered_at FROM triage_items ti JOIN events e ON e.id = ti.event_id "
@@ -634,7 +638,7 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
             "reason": row["note"], "revision_count": row["revision_count"],
             "availableActions": _available_actions(
                 row["state"], bool(row["pr_url"]) and row["validation_status"] == "confirmed",
-                reverted=row["revert_pr"] is not None),
+                reverted=row["revert_pr"] is not None, retryable=bool(row["redrive_json"])),
         })
     out.sort(key=lambda x: (x["age_days"] is None, -(x["age_days"] or 0)))
     return out
@@ -676,6 +680,8 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "repo": row["repo"],
         "state": row["state"],
         "close_reason": row["close_reason"],
+        "failure_class": row["failure_class"],
+        "redrives": row["redrives"],
         "strikes": row["strikes"],
         "retry_at": row["retry_at"],
         "max_tier": row["max_tier"],
@@ -694,7 +700,7 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "origin_thread_ts": row["origin_thread_ts"],
         "availableActions": _available_actions(
             row["state"], bool(row["pr_url"]) and row["validation_status"] == "confirmed",
-            reverted=row["revert_pr"] is not None),
+            reverted=row["revert_pr"] is not None, retryable=bool(row["redrive_json"])),
         "issue": _board_item_issue(row),
     }
 

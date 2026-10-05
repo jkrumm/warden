@@ -66,12 +66,13 @@ Every non-terminal `triage_items` row plus counts.
 ```json
 {
   "generated_at": "...",
-  "schema_version": 15,
+  "schema_version": 16,
   "counts": {"new": 0, "triaged": 0, "working": 1, "merging": 0,
              "verifying": 0, "needs_decision": 2, "failed": 0},
   "items": [{
     "event_id": 42, "origin": "alert", "repo": "warden", "state": "needs_decision",
-    "close_reason": null, "strikes": 0, "retry_at": null, "max_tier": "implement",
+    "close_reason": null, "failure_class": null, "redrives": 0,
+    "strikes": 0, "retry_at": null, "max_tier": "implement",
     "title": "...", "note": null, "pr_url": null, "dispatch_job": "j-abc",
     "implement_job": null, "validation_job": null, "occurrences": 3,
     "revision_count": 0, "train_stage": null, "created_at": "...", "updated_at": "...",
@@ -103,7 +104,13 @@ Every non-terminal `triage_items` row plus counts.
   `needs_decision`, `failed`. `merge`: the same, plus a PR whose implement dispatch's
   `validation_status` is `confirmed`. Neither is offered once `revert_pr` is set. `dismiss`:
   `new`, `triaged`, `needs_decision`, `failed`, `quiet`. `reinvestigate`: `needs_decision`,
-  `failed`, `quiet`. `note`: any non-terminal state.
+  `failed`, `quiet`. `retry`: a `failed` item with a stage to re-enter. `note`: any
+  non-terminal state.
+- `failure_class` is `infra`, `policy` or `work` on a `failed` item and `null` on every other
+  state; `redrives` counts the automatic INFRA re-drives (3 at most, on a 60/180/480 minute
+  backoff after `retry_at`); a policy re-drive (once per change of sideclaw's dispatch policy) is
+  not counted, and `work` is never re-driven. An owner `retry` and any forward progress of the item
+  reset `redrives` to 0. `retry` is never offered once `revert_pr` is set.
 - `issue` is `null` except for `origin: "github_issue"`, where it is `{repo, number, url,
   author, trusted, labels}` from the event's stored payload (`trusted` = `author ==
   clients.github.GH_OWNER`); a missing or unparsable payload gives `null`, not a `500`.

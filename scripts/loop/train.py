@@ -82,10 +82,10 @@ def _train_hop(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, **
     return bool(won)
 
 
-def _train_strike(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, reason: str,
-                  **retry_columns: Any) -> None:
+def _train_strike(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, reason: str, *,
+                  failure_class: str = core.FAILURE_INFRA, **retry_columns: Any) -> None:
     core.strike(conn, item["event_id"], now, reason, retry_state=core.STATE_MERGING, expect_state=core.STATE_MERGING,
-                 expect_eq=_train_expect(item), **retry_columns)
+                 expect_eq=_train_expect(item), failure_class=failure_class, **retry_columns)
     conn.commit()
 
 
@@ -100,7 +100,7 @@ def _back_to_update(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetim
     if rewinds < TRAIN_REWIND_LIMIT:
         return _train_hop(conn, item, now, retry_at=None, note=f"back to update: {why}", **rewind)
     _train_strike(conn, item, now, f"back to update {rewinds} times since entering the merge train: {why}",
-                  **rewind)
+                  failure_class=core.FAILURE_WORK, **rewind)
     return False
 
 
@@ -121,7 +121,8 @@ def _open_pr_head(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime)
     open leaves nothing to merge and ends the item `failed`."""
     ref = _github.parse_pr_url(item["pr_url"] or "")
     if ref is None:
-        _train_strike(conn, item, now, f"could not parse the PR number from {item['pr_url']!r}")
+        _train_strike(conn, item, now, f"could not parse the PR number from {item['pr_url']!r}",
+                      failure_class=core.FAILURE_WORK)
         return None
     owner, name, number = ref
     try:
@@ -132,7 +133,7 @@ def _open_pr_head(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime)
     if pr.get("merged") or pr.get("state") != "open":
         state = "merged" if pr.get("merged") else pr.get("state")
         core.set_state(conn, item["event_id"], core.STATE_FAILED, now, expect_state=core.STATE_MERGING,
-                        expect_eq=_train_expect(item),
+                        expect_eq=_train_expect(item), failure_class=core.FAILURE_WORK,
                         note=f"{MERGE_REFUSED_NOTE_PREFIX}{owner}/{name}#{number} is {state}, not open")
         conn.commit()
         return None
@@ -150,7 +151,8 @@ def _submit_update_pr(conn: sqlite3.Connection, policy: dict[str, Any], item: sq
     item; any other submit failure strikes."""
     ref = _github.parse_pr_url(item["pr_url"] or "")
     if ref is None:
-        _train_strike(conn, item, now, f"could not parse the PR number from {item['pr_url']!r}", train_job=None)
+        _train_strike(conn, item, now, f"could not parse the PR number from {item['pr_url']!r}",
+                      failure_class=core.FAILURE_WORK, train_job=None)
         return
     if not _train_hop(conn, item, now, train_job=TRAIN_CLAIM, retry_at=work.review_claim_until(now)):
         return
@@ -246,9 +248,13 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
                                      note=f"CI failed on {sha[:12]}: {e}")
         return False
     except (PolicyError, PreconditionError) as e:
-        # Unreadable check runs: an unknown CI state never passes, and waiting does not fix a token.
+        # Unreadable check runs: an unknown CI state never passes, and waiting does not fix a token. A
+        # `policy` failure like a refused submit: it carries the dispatch-policy hash it failed under,
+        # so it is re-driven when that changes and not on every pass.
         core.set_state(conn, item["event_id"], core.STATE_FAILED, now, expect_state=core.STATE_MERGING,
-                        expect_eq=_train_expect(item), note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}")
+                        expect_eq=_train_expect(item), failure_class=core.FAILURE_POLICY,
+                        redrive_json=core.redrive_spec(core.STATE_MERGING, policy_hash=work.current_policy_hash()),
+                        note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}")
         conn.commit()
         return False
     except RemoteError as e:
@@ -452,7 +458,7 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         return _train_hop(conn, item, now, train_stage=TRAIN_MERGE, reviewed_sha=sha, retry_at=None,
                           note=f"review confirmed {sha[:12]}", **_stage_success(item))
     if validation_status == "unknown":
-        core.set_state(conn, event_id, core.STATE_FAILED, now, strikes=0,
+        core.set_state(conn, event_id, core.STATE_FAILED, now, strikes=0, failure_class=core.FAILURE_INFRA,
                         note=f"step-7 validation: {unknown_outcome_note}")
     elif validation_status == "needs_decision":
         detail = process_only_note or summary
@@ -466,7 +472,8 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         if core.is_revert(item):
             note = f"revert of {item['reverting_sha'][:12]} blocked, not revised — PR left open: {item['pr_url']}; {note}"
         # The findings go back to a fresh implement episode — see maybe_revise_blocked().
-        core.set_state(conn, event_id, core.STATE_WORKING if work.revisable(item) else core.STATE_FAILED, now, strikes=0, note=note)
+        core.set_state(conn, event_id, core.STATE_WORKING if work.revisable(item) else core.STATE_FAILED, now, strikes=0,
+                        failure_class=core.FAILURE_WORK, note=note)
     conn.commit()
     _release_review_claim(conn, event_id, claim_until)
     return False
@@ -606,7 +613,7 @@ def merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: sq
         return "pending"
     except (PolicyError, PreconditionError) as e:
         core.set_state(conn, item["event_id"], core.STATE_FAILED, now, note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}",
-                        expect_state=item["state"])
+                        expect_state=item["state"], failure_class=core.FAILURE_WORK)
         conn.commit()
         return "refused"
     except RemoteError as e:

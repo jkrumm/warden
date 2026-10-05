@@ -12,6 +12,7 @@ it.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -306,6 +307,31 @@ def escalation_model() -> str | None:
         return None
     _escalation_cache["model"] = model
     return model
+
+
+def dispatch_policy() -> dict[str, Any]:
+    """sideclaw's dispatch policy (`GET /api/dispatch-policy`: the repo roots, each repo's tier
+    ceiling, the overrides) as it answers now. A refusal that the policy caused (a tier above a
+    repo's ceiling) can only clear when this changes; see policy_hash(). Raises RemoteError when
+    sideclaw is unreachable or answers anything but a JSON object."""
+    try:
+        status, text = _request("GET", "/api/dispatch-policy", None)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise RemoteError("sideclaw dispatch-policy read failed (is the LaunchAgent up?)")
+    if status != 200:
+        raise RemoteError(f"sideclaw returned HTTP {status} for its dispatch policy")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise RemoteError(f"sideclaw's dispatch policy is not JSON: {text[:300]}")
+    if not isinstance(parsed, dict):
+        raise RemoteError("sideclaw's dispatch policy is not a JSON object")
+    return parsed
+
+
+def policy_hash(policy: dict[str, Any]) -> str:
+    """sha256 of the canonical JSON of a dispatch policy: equal policies, equal hash."""
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def get(job_id: str) -> dict[str, Any] | None:

@@ -15,6 +15,7 @@ Run: .venv/bin/python3 tests/test_ledger.py
 
 import datetime as dt
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
@@ -294,6 +295,7 @@ def test_migrate_adopts_pre_versioned_database():
         "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
         "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
         "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
+        "failure_class", "redrive_json", "redrives",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -1055,7 +1057,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     conn = ledger.connect(path, migrate=True)
     after = dt.datetime.now(dt.timezone.utc)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 15 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 16 == ledger.LEDGER_SCHEMA_VERSION
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
     assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
@@ -1086,6 +1088,71 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
         assert rows[note]["train_stage"] is None, note
     fresh = ledger.connect(_tmp_path(), migrate=True)
     assert _table_columns(fresh, "triage_items") == cols, "a v14-upgraded schema diverges from a fresh one"
+    fresh.close()
+    conn.close()
+
+
+def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_re_drive_columns():
+    path = _tmp_path()
+    _v14_database(path)
+    conn = sqlite3.connect(path)
+    for version in (15,):
+        conn.executescript(ledger.MIGRATIONS[version])
+    conn.execute("UPDATE schema_version SET version = 15")
+    conn.execute("DELETE FROM triage_items")
+    notes = {
+        1: ("failed", "investigate episode failed with no verdict: opencode error: Service Unavailable"),
+        2: ("failed", "implement episode not started — sideclaw refused the job (HTTP 400): tier 'implement' exceeds the ceiling"),
+        3: ("failed", "investigate episode not started — sideclaw refused the job (HTTP 400): repo is not allowed"),
+        4: ("failed", "step-7 review confirmed https://x/pull/6; warden is merge-approval gated (never merges)"),
+        5: ("failed", "step-7 validation (needs-human): 2 items to address"),
+        6: ("failed", "review episode not started — sideclaw refused the job (HTTP 400): nope"),
+        7: ("working", "implement episode not started — sideclaw refused the job"),
+        8: ("failed", None),
+    }
+    for event_id, (state, note) in notes.items():
+        conn.execute("INSERT OR IGNORE INTO events(id, source, external_id, title, first_seen) "
+                     "VALUES (?, 's', ?, 't', 'now')", (event_id, f"e{event_id}"))
+        conn.execute("INSERT INTO triage_items(event_id, signature, state, note, retry_at, created_at, updated_at) "
+                     "VALUES (?, ?, ?, ?, '2030-01-01T00:00:00+00:00', 'now', 'now')",
+                     (event_id, f"s:e{event_id}", state, note))
+    conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (9, 's', 'e9', 't', 'now')")
+    conn.execute("INSERT INTO triage_items(event_id, signature, state, note, pr_url, created_at, updated_at) "
+                 "VALUES (9, 's:e9', 'failed', 'step-7 validation (needs-human): blocked', 'https://x/pull/9', 'now', 'now')")
+    conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (11, 's', 'e11', 't', 'now')")
+    conn.execute("INSERT INTO triage_items(event_id, signature, state, note, created_at, updated_at) VALUES "
+                 "(11, 's:e11', 'failed', 'investigate episode interrupted with no verdict: no reason', 'now', 'now')")
+    conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (12, 's', 'e12', 't', 'now')")
+    conn.execute("INSERT INTO triage_items(event_id, signature, state, note, pr_url, revert_pr, created_at, updated_at) "
+                 "VALUES (12, 's:e12', 'failed', 'reverted by PR #7: regressed', 'https://x/pull/12', 7, 'now', 'now')")
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path, migrate=True)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 16 == ledger.LEDGER_SCHEMA_VERSION
+    assert {"failure_class", "redrive_json", "redrives"} <= _table_columns(conn, "triage_items")
+    rows = {r["event_id"]: r for r in conn.execute("SELECT * FROM triage_items")}
+
+    def recipe(event_id):
+        return json.loads(rows[event_id]["redrive_json"])
+
+    assert rows[1]["failure_class"] == "infra"
+    assert recipe(1) == {"state": "triaged", "columns": {"dispatch_job": None}, "policy_hash": None}
+    assert rows[2]["failure_class"] == "policy" and recipe(2) == {"state": "working", "columns": {}, "policy_hash": None}
+    assert rows[3]["failure_class"] == "policy" and recipe(3)["state"] == "triaged"
+    assert rows[4]["failure_class"] == "policy" and recipe(4)["state"] == "merging", "the deleted merge-approval gate"
+    assert rows[5]["failure_class"] == "work" and recipe(5)["state"] == "triaged", "no PR: an owner retry re-investigates"
+    assert rows[9]["failure_class"] == "work" and recipe(9)["state"] == "merging", "a PR: an owner retry re-enters the train"
+    assert rows[6]["failure_class"] == "policy" and recipe(6)["state"] == "merging"
+    assert rows[7]["failure_class"] is None and rows[7]["redrive_json"] is None, "only `failed` rows are classified"
+    assert rows[8]["failure_class"] == "work", "a failed row without a note is a work failure"
+    assert rows[11]["failure_class"] == "infra" and recipe(11)["state"] == "triaged", "any terminal status counts"
+    assert rows[12]["failure_class"] == "work" and rows[12]["redrive_json"] is None, "a reverted item has no stage"
+    for event_id in (1, 2, 3, 4, 5, 6, 8, 9, 11, 12):
+        assert rows[event_id]["retry_at"] is None and rows[event_id]["redrives"] == 0, event_id
+    assert rows[7]["retry_at"] == "2030-01-01T00:00:00+00:00", "a row that is not failed keeps its retry_at"
+    fresh = ledger.connect(_tmp_path(), migrate=True)
+    assert _table_columns(fresh, "triage_items") == _table_columns(conn, "triage_items")
     fresh.close()
     conn.close()
 

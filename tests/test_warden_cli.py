@@ -1117,8 +1117,10 @@ def test_revert_records_the_pr_and_leaves_the_item_failed():
     out = _json_or_fail(proc)
     assert proc.returncode == 0 and out["state"] == "failed" and out["pullRequest"] == 11, out
     conn, _ = _connect(db)
-    row = _row(conn, "SELECT state, revert_pr, note, close_reason FROM triage_items WHERE event_id=7")
+    row = _row(conn, "SELECT state, revert_pr, note, close_reason, failure_class, redrive_json "
+                     "FROM triage_items WHERE event_id=7")
     assert row["state"] == "failed" and row["revert_pr"] == 11, dict(row)
+    assert row["failure_class"] == "work" and row["redrive_json"] is None, "a human's revert is never re-driven"
     assert row["note"] == "reverted by PR #11: regressed" and row["close_reason"] is None, dict(row)
     conn.close()
 
@@ -1145,6 +1147,88 @@ def test_revert_wrong_state_is_policy_error():
     proc = h.run(["revert", "9", "--pr", "1", "--why", "x", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
     assert proc.returncode == 4, out
+
+
+# --- retry ---------------------------------------------------------------------
+
+
+def _fail(db: Path, event_id: int, *, failure_class: str = "infra", recipe: str | None = None, redrives: int = 3,
+          note: str = "sideclaw 503") -> None:
+    conn, _ = _connect(db)
+    conn.execute(
+        "UPDATE triage_items SET failure_class=?, redrive_json=?, redrives=?, note=?, strikes=3, "
+        "implement_job='job-lost' WHERE event_id=?",
+        (failure_class, recipe, redrives, note, event_id))
+    conn.commit()
+    conn.close()
+
+
+_WORKING_RECIPE = '{"state":"working","columns":{"implement_job":null},"policy_hash":null}'
+
+
+def test_retry_puts_a_failed_item_back_with_a_fresh_budget_whatever_its_class():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 40, state="failed", repo="gamma")
+    _seed_item(db, 41, state="failed", repo="gamma")
+    _fail(db, 40, failure_class="work", recipe=_WORKING_RECIPE)
+    _fail(db, 41, failure_class="infra", recipe=_WORKING_RECIPE)
+    proc = h.run(["retry", "40", "--why", "fixed the token", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["verb"] == "retry" and out["ok"] is True, out
+    assert out["eventId"] == 40 and out["fromState"] == "failed" and out["state"] == "working", out
+    proc = h.run(["retry", "41", "--json"], env=h.base_env(db=db))
+    assert proc.returncode == 0, _json_or_fail(proc)
+    conn, _ = _connect(db)
+    for event_id, note in ((40, "retried by owner: fixed the token"), (41, "retried by owner: no reason given")):
+        row = _row(conn, "SELECT * FROM triage_items WHERE event_id=?", (event_id,))
+        assert row["state"] == "working" and row["note"] == note, dict(row)
+        assert row["redrives"] == 0 and row["strikes"] == 0 and row["retry_at"] is None, dict(row)
+        assert row["failure_class"] is None and row["redrive_json"] is None, dict(row)
+        assert row["implement_job"] is None, "the recipe's columns are applied"
+    trans = _row(conn, "SELECT from_state, to_state FROM item_transitions WHERE event_id=40 ORDER BY id DESC LIMIT 1")
+    assert trans["from_state"] == "failed" and trans["to_state"] == "working", dict(trans)
+    conn.close()
+
+
+def test_retry_dry_run_writes_nothing():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 42, state="failed", repo="gamma")
+    _fail(db, 42, recipe=_WORKING_RECIPE)
+    proc = h.run(["retry", "42", "--dry-run", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["dryRun"] is True and out["state"] == "working", out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, redrives FROM triage_items WHERE event_id=42")
+    assert row["state"] == "failed" and row["redrives"] == 3, dict(row)
+    conn.close()
+
+
+def test_retry_refuses_anything_but_a_failed_item_with_a_stage():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 43, state="working", repo="gamma")
+    _seed_item(db, 44, state="failed", repo="gamma")
+    _fail(db, 44, failure_class="work", recipe=None)
+    for event_id in (43, 44):
+        proc = h.run(["retry", str(event_id), "--json"], env=h.base_env(db=db))
+        out = _json_or_fail(proc)
+        assert proc.returncode == 2 and out["ok"] is False, (event_id, out)
+    _seed_item(db, 45, state="failed", repo="gamma")
+    _fail(db, 45, recipe=_WORKING_RECIPE)
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET revert_pr=9 WHERE event_id=45")
+    conn.commit()
+    conn.close()
+    proc = h.run(["retry", "45", "--json"], env=h.base_env(db=db))
+    assert proc.returncode == 2, "a reverted item would redo the reverted change"
+    assert h.run(["retry", "999", "--json"], env=h.base_env(db=db)).returncode == 64
+    assert h.run(["retry", "--json"], env=h.base_env(db=db)).returncode == 64
+    conn, _ = _connect(db)
+    assert _row(conn, "SELECT state FROM triage_items WHERE event_id=43")["state"] == "working"
+    assert _row(conn, "SELECT state FROM triage_items WHERE event_id=44")["state"] == "failed"
+    conn.close()
 
 
 # --- close ---------------------------------------------------------------------
