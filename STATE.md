@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§121).
+build log (§1–§122).
 
 | | |
 |-|-|
-| Last updated | 2026-10-05 (§121 — agent-platform Wave 6: review fixes) |
+| Last updated | 2026-10-05 (§122 — a bold-wrapped bot alert `*🚨 …` is no longer closed as unstructured prose) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 15 |
