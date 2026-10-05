@@ -73,11 +73,16 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    the old diff as context. Confident host restarts run through
    `HOST_VERB_ALLOWLIST` and verify on `HOST_VERB_LIVENESS_MONITOR`.
 4. **Merge train** (`train.py`). One per repo, oldest item first, single-flight:
-   sideclaw `update_pr` onto the latest base → GitHub checks green (or none) on
-   that SHA → review `confirmed` on that SHA → squash merge pinned to it. A head
+   sideclaw `update_pr` onto the latest base → GitHub checks green (or none — only
+   a readable check-runs API may say so; unreadable, the gate reads Actions runs
+   and none there is still pending) on that SHA → review `confirmed` on that SHA → squash merge pinned to it. A head
    that moves goes back to `update`. The gate is exactly those four facts plus
    GitHub's own rules (`lifecycle.merge`); `warden merge --confirm` uses the same
-   gate.
+   gate and additionally requires a reviewed pin — the train's SHA while merging,
+   else the item's last review-confirmed head — and refuses without one (intended).
+   A PR found already merged is landed from the ledger only when its head is the
+   pinned one and a review confirmed that head; merged by hand otherwise, the item
+   verifies by signal only (no deploy, no `make verify`).
 5. **Deploy + verify** (`verify.py`, `lifecycle/rollout.py`). A merged item waits
    in `verifying`. If the checkout is clean, on the default branch and ends at
    origin, it is fast-forwarded and `make deploy` runs (else a strike); then

@@ -48,6 +48,9 @@ _RULESETS_UNAVAILABLE_RE = re.compile(r"Upgrade to GitHub Pro or make this repos
 # not exist (404) or a repository-level refusal.
 _TOKEN_CANNOT_READ_RE = re.compile(r"Resource not accessible by personal access token")
 
+# A ceiling on pages followed for one listing (100 runs a page at most): loud, never a silent cut.
+_MAX_PAGES = 20
+
 _token_cache: str | None = None
 
 
@@ -151,25 +154,47 @@ def check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     loud refusal."""
     if not _SHA_RE.match(sha):
         raise PreconditionError(f"{sha!r} is not a 40-hex commit sha — refusing before the request")
-    status, body = api("GET", f"/repos/{owner}/{repo}/commits/{sha}/check-runs")
+    path = f"/repos/{owner}/{repo}/commits/{sha}/check-runs"
+    status, body = api("GET", path)
     if status == 403 and isinstance(body, dict) and _TOKEN_CANNOT_READ_RE.search(body.get("message") or ""):
         raise CheckRunsUnreadable(
             f"GitHub returned HTTP 403 reading check-runs for {owner}/{repo}@{sha} — the token may "
             f"not read checks (Checks: read): {body.get('message')}"
         )
-    if status != 200:
-        raise RemoteError(f"GitHub returned HTTP {status} reading check-runs for {owner}/{repo}@{sha}")
-    if not isinstance(body, dict):
-        raise RemoteError(f"GitHub returned a non-object body reading check-runs for {owner}/{repo}@{sha}")
-    return body["check_runs"]
+    return _all_pages(status, body, path, "check_runs", f"check-runs for {owner}/{repo}@{sha}")
 
 
-def _workflow_run_recency(run: dict[str, Any]) -> tuple[int, str]:
-    """Latest attempt of one workflow run wins: `run_attempt` first (a re-run
-    increments it on the same run), then `created_at` for two distinct runs of
-    one workflow on the same commit."""
-    attempt = run.get("run_attempt")
-    return (attempt if isinstance(attempt, int) else 0, str(run.get("created_at") or ""))
+def _all_pages(status: int, body: Any, path: str, key: str, what: str) -> list[dict[str, Any]]:
+    """`body[key]` of the first page, then every further page until `total_count` is covered.
+    The first request is the caller's `path` untouched; later ones add `page=N` with the same
+    page size, so a CI set larger than one page is read whole — a dropped page could hide the
+    one failing run behind a green gate. Any page that fails or is unusable refuses, and a
+    server that stops delivering before `total_count` is refused rather than trusted."""
+    items: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        if status != 200:
+            raise RemoteError(f"GitHub returned HTTP {status} reading {what}")
+        if not isinstance(body, dict) or not isinstance(body.get(key), list):
+            raise RemoteError(f"GitHub returned an unusable body reading {what}")
+        items.extend(body[key])
+        total = body.get("total_count")
+        if not isinstance(total, int) or len(items) >= total:
+            return items
+        if not body[key] or page >= _MAX_PAGES:
+            raise RemoteError(f"GitHub listed {len(items)} of {total} {what} before pages ran out")
+        page += 1
+        status, body = api("GET", f"{path}{'&' if '?' in path else '?'}page={page}")
+
+
+def _workflow_run_recency(run: dict[str, Any]) -> tuple[int, str, int]:
+    """Newest run of one workflow wins: run id (monotonic), then `created_at`. `run_attempt` only
+    breaks a tie within one run (a re-run increments it on the SAME run id) — an old run re-run to
+    attempt 2 must never outrank a newer run of the same workflow, which may still be pending or
+    failed."""
+    run_id, attempt = run.get("id"), run.get("run_attempt")
+    return (run_id if isinstance(run_id, int) else 0, str(run.get("created_at") or ""),
+            attempt if isinstance(attempt, int) else 0)
 
 
 def workflow_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
@@ -184,13 +209,11 @@ def workflow_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     check-runs to fall back to, an unreadable CI state still refuses."""
     if not _SHA_RE.match(sha):
         raise PreconditionError(f"{sha!r} is not a 40-hex commit sha — refusing before the request")
-    status, body = api("GET", f"/repos/{owner}/{repo}/actions/runs?head_sha={sha}&per_page=100")
-    if status != 200:
-        raise RemoteError(f"GitHub returned HTTP {status} reading Actions runs for {owner}/{repo}@{sha}")
-    if not isinstance(body, dict) or not isinstance(body.get("workflow_runs"), list):
-        raise RemoteError(f"GitHub returned an unusable body reading Actions runs for {owner}/{repo}@{sha}")
+    path = f"/repos/{owner}/{repo}/actions/runs?head_sha={sha}&per_page=100"
+    status, body = api("GET", path)
+    all_runs = _all_pages(status, body, path, "workflow_runs", f"Actions runs for {owner}/{repo}@{sha}")
     latest: dict[Any, dict[str, Any]] = {}
-    for run in body["workflow_runs"]:
+    for run in all_runs:
         if not isinstance(run, dict):
             continue
         key = run.get("workflow_id")

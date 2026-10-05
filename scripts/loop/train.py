@@ -595,9 +595,10 @@ def _merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: s
     except HeadMoved:
         return "head_moved"
     except _merge.AlreadyMerged as e:
-        # The item's own PR merged without the ledger hearing of it (a lost merge answer): land it.
-        return "merged" if work._land_already_merged_item(conn, policy, item, now, github_sha=e.merge_commit) \
-            else "ambiguous"
+        # The item's own PR merged without the ledger hearing of it (a lost merge answer, or a hand merge): land it.
+        # Not gated by warden unless a review confirmed that very head: else it verifies by signal only.
+        return "merged" if work._land_already_merged_item(conn, policy, item, now, github_sha=e.merge_commit,
+                                                          head_sha=e.head_sha) else "ambiguous"
     except _merge.ChecksPending as e:
         core._set_state(conn, item["event_id"], item["state"], now, note=f"{MERGE_PENDING_NOTE_PREFIX}{e}",
                         expect_state=item["state"])

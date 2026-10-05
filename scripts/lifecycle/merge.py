@@ -26,7 +26,7 @@ from clients import github, sideclaw
 from clients.errors import (
     CheckRunsUnreadable, HeadMoved, PolicyError, PreconditionError, RemoteError, UsageError,
 )
-from lifecycle import operations, policy
+from lifecycle import operations
 
 
 class ChecksPending(PolicyError):
@@ -47,11 +47,13 @@ class MergeInFlight(PolicyError):
 class AlreadyMerged(PolicyError):
     """GitHub says the dispatch's own pull request is merged while the ledger never recorded
     it (a merge call whose answer was lost, or a merge by hand): the change landed. The merge
-    train lands its item from here instead of failing it; `merge_commit` is GitHub's."""
+    train lands its item from here instead of failing it; `merge_commit` is GitHub's and
+    `head_sha` is the PR head that merged — the caller asks whether a review confirmed THAT head."""
 
-    def __init__(self, message: str, *, merge_commit: str | None):
+    def __init__(self, message: str, *, merge_commit: str | None, head_sha: str | None = None):
         super().__init__(message)
         self.merge_commit = merge_commit
+        self.head_sha = head_sha
 
 def _nested(d: dict[str, Any], path: str) -> Any:
     cur: Any = d
@@ -161,7 +163,9 @@ def read_check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     `weatherorb`) falls back to the commit's GitHub Actions workflow runs, mapped to
     the same shape — the same credential can often read those. Unreadable is still not
     "none exist": if the fallback is unreadable too, the unknown CI state refuses with
-    the fallback's own `RemoteError`, never passes the green-or-none gate."""
+    the fallback's own `RemoteError`, and an EMPTY fallback is `ChecksPending` — only a
+    readable check-runs API may conclude that no CI exists, so the green-or-none gate is
+    never passed on an unknown state (workflows may simply not have registered yet)."""
     try:
         return github.check_runs(owner, repo, sha)
     except CheckRunsUnreadable as e:
@@ -171,6 +175,11 @@ def read_check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
             f"{len(runs)} GitHub Actions workflow run(s) instead",
             file=sys.stderr,
         )
+        if not runs:
+            raise ChecksPending(
+                f"check runs on {owner}/{repo}@{sha[:12]} are unreadable and the commit has no GitHub "
+                f"Actions runs to gate on — the CI state is unknown, not absent."
+            )
         return runs
 
 
@@ -320,12 +329,9 @@ def plan_or_land(
     # to the merge call, reported as-is — never pre-empted here (§97).
     rules = github.branch_rules(owner, repo, default_branch)
 
-    if pr_merged:
-        sha = pr.get("merge_commit_sha")
-        raise AlreadyMerged(f"{owner}/{repo}#{pr_number} is already merged.",
-                            merge_commit=sha if isinstance(sha, str) and sha else None)
-    if pr_state != "open":
-        raise PolicyError(f"{owner}/{repo}#{pr_number} is '{pr_state}', not open.")
+    # The guards that say whether this is the pull request this bridge inspected come BEFORE the
+    # merged check: a merged PR that is retargeted, from a fork or off a non-dispatch branch is not
+    # the dispatch's own, and "already merged" must never vouch for it.
     if pr_base != default_branch:
         raise PolicyError(
             f"{owner}/{repo}#{pr_number} targets '{pr_base}', not the default branch "
@@ -342,6 +348,21 @@ def plan_or_land(
             f"{owner}/{repo}#{pr_number} is from '{pr_head_repo}', a fork. A fork branch "
             f"was never inspected by the episode and is never merged here."
         )
+    if pr_merged:
+        # The change landed — but "landed" is only the caller's to accept when it is the head the
+        # caller pinned (checked, reviewed): a PR merged at any other head is not what was inspected.
+        if expected_sha is not None and pr_head_sha != expected_sha:
+            raise PolicyError(
+                f"{owner}/{repo}#{pr_number} is already merged, at head {pr_head_sha[:12]} — not the "
+                f"{expected_sha[:12]} that was checked and reviewed. It was merged outside this "
+                f"bridge, so the ledger does not take it as the reviewed change."
+            )
+        sha = pr.get("merge_commit_sha")
+        raise AlreadyMerged(f"{owner}/{repo}#{pr_number} is already merged.",
+                            merge_commit=sha if isinstance(sha, str) and sha else None,
+                            head_sha=pr_head_sha)
+    if pr_state != "open":
+        raise PolicyError(f"{owner}/{repo}#{pr_number} is '{pr_state}', not open.")
     if expected_sha is not None and pr_head_sha != expected_sha:
         raise HeadMoved(
             f"{owner}/{repo}#{pr_number}'s head is {pr_head_sha[:12]}, not the {expected_sha[:12]} "

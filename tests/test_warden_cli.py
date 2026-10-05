@@ -213,6 +213,13 @@ def test_bare_invocation_prints_help_and_exits_zero():
         ln for ln in proc.stdout.splitlines() if "close <event-id>" in ln][0], "the close verb line names --reason"
 
 
+def test_help_says_merge_confirm_needs_a_reviewed_head_to_pin():
+    h = Harness()
+    proc = h.run([])
+    assert proc.returncode == 0, proc
+    assert "--confirm needs a reviewed head to pin" in proc.stdout, proc.stdout
+
+
 # --- argument bounding ---------------------------------------------------------
 
 

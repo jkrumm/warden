@@ -211,9 +211,11 @@ def fakes(**overrides):
             setattr(m, n, orig)
 
 
-def _land(conn, *, job_id=JOB_ID, why="test", confirm=True, dry_run=False, authorized_by="U123"):
+def _land(conn, *, job_id=JOB_ID, why="test", confirm=True, dry_run=False, authorized_by="U123",
+          expected_sha=None):
     return merge.plan_or_land(conn, job_id=job_id, why=why, confirm=confirm, dry_run=dry_run,
-                               authorized_by=authorized_by, now=_NOW, sleep=_no_sleep)
+                               authorized_by=authorized_by, now=_NOW, sleep=_no_sleep,
+                               expected_sha=expected_sha)
 
 
 def _assert_refuses(*, exc_type, msg, job_id=JOB_ID, seed=None, fake=None):
@@ -360,10 +362,10 @@ def test_fallback_actions_run_failed_refuses():
         conn.close()
 
 
-def test_fallback_zero_actions_runs_passes():
-    """A 403 with no Actions runs to gate on is not a refusal: green-or-none still
-    means an empty set passes. (This is the same vacuous-clean case the check-runs
-    gate already had.)"""
+def test_fallback_zero_actions_runs_is_pending_never_none():
+    """A 403 with no Actions runs to gate on is an UNKNOWN CI state, not an absent one: only a
+    readable check-runs API may conclude none exist. The gate waits (`ChecksPending`, nothing
+    failed) rather than passing or refusing."""
     conn = _fresh_ledger()
     try:
         _seed_pr_dispatch(conn, validation_status="confirmed")
@@ -371,9 +373,28 @@ def test_fallback_zero_actions_runs_passes():
             check_runs_error=github.CheckRunsUnreadable("HTTP 403"),
             workflow_runs=[],
         ) as fx:
+            try:
+                _land(conn)
+            except merge.ChecksPending as e:
+                assert "unknown" in str(e), e
+            else:
+                raise AssertionError("expected ChecksPending")
+            assert fx.calls.get("workflow_runs")
+        assert "merge_pr" not in fx.calls
+    finally:
+        conn.close()
+
+
+def test_readable_empty_check_runs_still_means_none_exist_and_passes():
+    """The counterpart: an EMPTY but readable check-runs answer is the one place 'none exist'
+    is concluded."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn, validation_status="confirmed")
+        with fakes(check_runs=[]) as fx:
             result = _land(conn)
         assert result.merged is True
-        assert fx.calls.get("workflow_runs")
+        assert "workflow_runs" not in fx.calls
     finally:
         conn.close()
 
@@ -1014,6 +1035,181 @@ def test_merge_result_to_json_shape():
     assert "deploy" not in data
     assert "verb" not in data and "ok" not in data
     assert "op-1" not in json.dumps(data)
+
+
+# --- the Actions fallback reader: pagination and per-workflow recency ------------------------
+
+@contextmanager
+def _github_api(responses):
+    """`github.api` answering from {path: (status, body)}; every requested path is recorded and an
+    unscripted one is a 404."""
+    requested: list[str] = []
+
+    def _api(method, path, body=None):
+        requested.append(path)
+        return responses.get(path, (404, {"message": "Not Found"}))
+
+    orig = github.api
+    github.api = _api
+    try:
+        yield requested
+    finally:
+        github.api = orig
+
+
+_SHA = "a" * 40
+_RUNS_PATH = f"/repos/jkrumm/gamma/actions/runs?head_sha={_SHA}&per_page=100"
+
+
+def test_workflow_runs_follow_total_count_beyond_the_first_page():
+    """A commit with more runs than one page: a failing run on page 2 must not be dropped."""
+    page1 = [{"id": i, "workflow_id": i, "name": f"wf{i}", "status": "completed", "conclusion": "success",
+              "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z"} for i in range(1, 4)]
+    page2 = [{"id": 9, "workflow_id": 9, "name": "late", "status": "completed", "conclusion": "failure",
+              "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z"}]
+    with _github_api({
+        _RUNS_PATH: (200, {"total_count": 4, "workflow_runs": page1}),
+        _RUNS_PATH + "&page=2": (200, {"total_count": 4, "workflow_runs": page2}),
+    }) as requested:
+        runs = github.workflow_runs("jkrumm", "gamma", _SHA)
+    assert requested == [_RUNS_PATH, _RUNS_PATH + "&page=2"], requested
+    assert {"name": "late", "status": "completed", "conclusion": "failure"} in runs, runs
+    assert len(runs) == 4, runs
+
+
+def test_workflow_runs_a_page_that_runs_dry_before_total_count_refuses():
+    with _github_api({
+        _RUNS_PATH: (200, {"total_count": 5, "workflow_runs": [{"id": 1, "workflow_id": 1, "name": "a"}]}),
+        _RUNS_PATH + "&page=2": (200, {"total_count": 5, "workflow_runs": []}),
+    }):
+        try:
+            github.workflow_runs("jkrumm", "gamma", _SHA)
+        except RemoteError as e:
+            assert "1 of 5" in str(e), e
+        else:
+            raise AssertionError("an incomplete listing must refuse, not be gated on")
+
+
+def test_workflow_runs_a_failing_later_page_refuses():
+    with _github_api({
+        _RUNS_PATH: (200, {"total_count": 2, "workflow_runs": [{"id": 1, "workflow_id": 1, "name": "a"}]}),
+    }):
+        try:
+            github.workflow_runs("jkrumm", "gamma", _SHA)
+        except RemoteError as e:
+            assert "404" in str(e), e
+        else:
+            raise AssertionError("a failed page must refuse")
+
+
+def test_workflow_runs_newest_run_beats_an_old_run_rerun_to_a_higher_attempt():
+    """Old run 100 was re-run to attempt 2 (green); the newer run 200 of the same workflow is
+    still pending. `run_attempt` only breaks ties inside one run id, so the pending run wins."""
+    with _github_api({_RUNS_PATH: (200, {"total_count": 3, "workflow_runs": [
+        {"id": 100, "workflow_id": 1, "name": "CI", "status": "completed", "conclusion": "success",
+         "run_attempt": 2, "created_at": "2026-01-01T00:00:00Z"},
+        {"id": 200, "workflow_id": 1, "name": "CI", "status": "in_progress", "conclusion": None,
+         "run_attempt": 1, "created_at": "2026-01-01T01:00:00Z"},
+        {"id": 150, "workflow_id": 1, "name": "CI", "status": "completed", "conclusion": "failure",
+         "run_attempt": 3, "created_at": "2026-01-01T00:30:00Z"},
+    ]})}):
+        runs = github.workflow_runs("jkrumm", "gamma", _SHA)
+    assert runs == [{"name": "CI", "status": "in_progress", "conclusion": None}], runs
+
+
+def test_workflow_runs_attempt_breaks_ties_within_the_same_run():
+    with _github_api({_RUNS_PATH: (200, {"total_count": 2, "workflow_runs": [
+        {"id": 100, "workflow_id": 1, "name": "CI", "status": "completed", "conclusion": "failure",
+         "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z"},
+        {"id": 100, "workflow_id": 1, "name": "CI", "status": "completed", "conclusion": "success",
+         "run_attempt": 2, "created_at": "2026-01-01T00:00:00Z"},
+    ]})}):
+        runs = github.workflow_runs("jkrumm", "gamma", _SHA)
+    assert runs == [{"name": "CI", "status": "completed", "conclusion": "success"}], runs
+
+
+def test_check_runs_follow_total_count_beyond_the_first_page():
+    path = f"/repos/jkrumm/gamma/commits/{_SHA}/check-runs"
+    ok = {"name": "a", "status": "completed", "conclusion": "success"}
+    bad = {"name": "b", "status": "completed", "conclusion": "failure"}
+    with _github_api({
+        path: (200, {"total_count": 2, "check_runs": [ok]}),
+        path + "?page=2": (200, {"total_count": 2, "check_runs": [bad]}),
+    }) as requested:
+        runs = github.check_runs("jkrumm", "gamma", _SHA)
+    assert runs == [ok, bad], runs
+    assert requested == [path, path + "?page=2"], requested
+
+
+# --- guards run before the merged check; a pinned head must match -----------------------------
+
+def _assert_merged_pr_refuses_not_already_merged(pr, *, msg, expected_sha=None):
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        with fakes(pr={**_DEFAULT_PR, "merged": True, "state": "closed",
+                       "merge_commit_sha": "f00d" * 10, **pr}) as fx:
+            try:
+                _land(conn, expected_sha=expected_sha)
+            except merge.AlreadyMerged:
+                raise AssertionError("a guard must refuse before 'already merged' is concluded")
+            except PolicyError as e:
+                assert msg in str(e), f"{msg!r} not in {e!r}"
+            else:
+                raise AssertionError("expected a refusal")
+            assert "merge_pr" not in fx.calls
+    finally:
+        conn.close()
+
+
+def test_merged_pr_on_a_retargeted_base_is_a_refusal_not_already_merged():
+    _assert_merged_pr_refuses_not_already_merged({"base": {"ref": "release"}}, msg="targets 'release'")
+
+
+def test_merged_pr_from_a_fork_is_a_refusal_not_already_merged():
+    _assert_merged_pr_refuses_not_already_merged(
+        {"head": {**_DEFAULT_PR["head"], "repo": {"full_name": "someone/gamma"}}}, msg="a fork")
+
+
+def test_merged_pr_off_a_non_dispatch_branch_is_a_refusal_not_already_merged():
+    _assert_merged_pr_refuses_not_already_merged(
+        {"head": {**_DEFAULT_PR["head"], "ref": "feature/by-hand"}}, msg="not a dispatch/")
+
+
+def test_merged_pr_at_another_head_than_the_pinned_one_is_a_refusal():
+    """Pinned to the reviewed head, but GitHub merged a different one: not AlreadyMerged (and not
+    HeadMoved, which a caller reads as 'rebase and try again') — a plain refusal."""
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        with fakes(pr={**_DEFAULT_PR, "merged": True, "state": "closed"}) as fx:
+            try:
+                _land(conn, expected_sha="c" * 40)
+            except (merge.AlreadyMerged, HeadMoved):
+                raise AssertionError("a merge at the wrong head must be a plain refusal")
+            except PolicyError as e:
+                assert "merged outside this bridge" in str(e) and "cccccccccccc" in str(e), e
+            else:
+                raise AssertionError("expected a refusal")
+            assert "merge_pr" not in fx.calls
+    finally:
+        conn.close()
+
+
+def test_merged_pr_at_the_pinned_head_is_already_merged_and_names_the_head():
+    conn = _fresh_ledger()
+    try:
+        _seed_pr_dispatch(conn)
+        pinned = _DEFAULT_PR["head"]["sha"]
+        with fakes(pr={**_DEFAULT_PR, "merged": True, "state": "closed", "merge_commit_sha": "f00d" * 10}):
+            try:
+                _land(conn, expected_sha=pinned)
+            except merge.AlreadyMerged as e:
+                assert e.head_sha == pinned and e.merge_commit == "f00d" * 10, e
+            else:
+                raise AssertionError("expected AlreadyMerged")
+    finally:
+        conn.close()
 
 
 # --- runner --------------------------------------------------------------------------------

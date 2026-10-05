@@ -12,6 +12,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import traceback
 from typing import Any
 
 from clients import github as _github, sideclaw as _sideclaw
@@ -95,7 +96,8 @@ def _run_bounded(fn: Any, *args: Any, timeout: int = core.EVIDENCE_TIMEOUT) -> t
     side-effect-free, so this is the in-process equivalent of the `timeout=` subprocess.run() gives
     HOST_VERB_ALLOWLIST commands: a hang (a stuck network mount, a slow API call) cannot stall a
     10-minute cron. A timeout or ANY exception folds into a returned error string rather than
-    raising: a failing probe must never abort the run."""
+    raising: a failing probe must never abort the run. The traceback goes to stderr, so a probe that
+    raises is a log line to read, not just a one-line note."""
     # NOT `with ThreadPoolExecutor(...)`: its __exit__ calls shutdown(wait=True), which blocks until
     # the worker finishes, so a hung gatherer would sail past `timeout` and stall the loop anyway.
     # shutdown(wait=False) lets a stuck thread keep running (it is read-only and side-effect-free, and
@@ -108,6 +110,7 @@ def _run_bounded(fn: Any, *args: Any, timeout: int = core.EVIDENCE_TIMEOUT) -> t
         except concurrent.futures.TimeoutError:
             return False, f"timed out after {timeout}s"
         except Exception as e:  # noqa: BLE001 - must never raise into the caller
+            print(f"triage: {getattr(fn, '__name__', fn)} raised:\n{traceback.format_exc()}", file=sys.stderr)
             return False, f"{type(e).__name__}: {e}"
     finally:
         ex.shutdown(wait=False)
@@ -1354,9 +1357,9 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
       3. the item's signature matches a `hostVerbs` policy rule (same two match targets, first
          match wins; see _match_targets()/_match_rule()).
       4. the folded verdict's confidence RANKS AT OR ABOVE `policy["hostVerbMinConfidence"]`
-         (DEFAULT_HOST_VERB_MIN_CONFIDENCE, see _CONFIDENCE_RANK) AND `nextAction in ("human",
-         "implement")`. `high` is deliberately NOT the floor: a restart from HOST_VERB_ALLOWLIST is
-         idempotent, confirmed by a POSITIVE liveness probe before the item is marked done, and
+         (DEFAULT_HOST_VERB_MIN_CONFIDENCE = `medium`, see _CONFIDENCE_RANK) AND `nextAction in
+         ("human", "implement")`. `high` is deliberately NOT the default floor: a restart from
+         HOST_VERB_ALLOWLIST is idempotent, confirmed by a POSITIVE liveness probe before the item is marked done, and
          capped at `hostVerbMaxAttempts`, so a wrong guess costs one restart and a `needs_decision`
          card carrying the receipt, cheaper than a human running the same restart.
          (maybe_auto_implement() has no confidence bar: its gate is the step-7 review.)
@@ -2010,8 +2013,12 @@ def _already_merged(conn: sqlite3.Connection, implement_job: str) -> bool:
     return bool(row and row["merged_at"])
 
 
+UNREVIEWED_MERGE_NOTE = "merged outside the train, unreviewed — verifying by signal only"
+
+
 def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
-                              now: dt.datetime, *, github_sha: str | None = None) -> bool:
+                              now: dt.datetime, *, github_sha: str | None = None,
+                              head_sha: str | None = None) -> bool:
     """An item whose pull request is already merged though the item never moved on:
 
       - its implement dispatch already carries `merged_at`: the loop died after `plan_or_land()`
@@ -2024,7 +2031,14 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
     branch does, the merge commit read back from the merge operation's receipt (or GitHub's), its
     method from the operation. A compare-and-set on the state the caller found: a concurrent pass
     that already landed it is never rewritten (its verify window, its sweep). Returns whether this
-    pass moved it."""
+    pass moved it.
+
+    GitHub's word alone (`github_sha`) is not warden's gate: when `head_sha`, the head that merged, is
+    not one a step-7 review confirmed (`reviewed_sha`), the PR was merged by hand and never went through
+    the merge gate. The item still verifies, but on its signal only — the fixed-by sweep's mode
+    (`fixed_by_pr`, verify._verify_swept(): no deploy, no `make verify` gating claim) — and its note
+    says so. The paths that read the merge off the ledger (receipt, `merged_at`) are warden's own
+    gated merges."""
     ops = conn.execute("SELECT outcome, receipt_json FROM operations WHERE event_id=? AND kind='merge' "
                        "ORDER BY rowid DESC", (item["event_id"],)).fetchall()
     receipts = [(op["outcome"], core._safe_json(op["receipt_json"])) for op in ops]
@@ -2034,9 +2048,17 @@ def _land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], 
         conn.execute("UPDATE dispatches SET merged_at=? WHERE job_id=? AND merged_at IS NULL",
                      (core._now_iso(now), item["implement_job"]))
     source = "GitHub" if github_sha else "the merge receipt"
+    entry = core._merged_entry(item, sha, method)
+    note = f"already merged; state derived from {source}, merge not repeated"
+    if github_sha and (not head_sha or item["reviewed_sha"] != head_sha):
+        event = core._get_event(conn, item["event_id"])
+        mark = core._occurrence_mark(event) if item["origin"] == "alert" and event is not None else None
+        # Not a sweep's own: an unreviewed merge must not queue other items as fixed by it.
+        entry = {k: v for k, v in entry.items() if not k.startswith("sweep_")}
+        entry.update(verify_started_at=core._now_iso(now), verify_mark=mark, fixed_by_pr=item["pr_url"])
+        note = UNREVIEWED_MERGE_NOTE
     moved = core._set_state(conn, item["event_id"], core.STATE_VERIFYING, now, expect_state=item["state"],
-                            **core._merged_entry(item, sha, method),
-                            note=f"already merged; state derived from {source}, merge not repeated")
+                            **entry, note=note)
     conn.commit()
     if moved:
         print(f"triage: {item['signature']} was already merged (event {item['event_id']}) — state derived "
@@ -2378,9 +2400,24 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
 
     `maybe_verify()` is deliberately NOT part of this chain: its window is hours
     (VERIFY_WINDOW_HOURS), not seconds, so the 600s tick covers it with room to spare."""
-    verify.maybe_submit_reverts(conn, policy, now, dry_run=dry_run)
-    maybe_revise_blocked(conn, policy, now, dry_run=dry_run)
-    maybe_auto_implement(conn, policy, now, dry_run=dry_run)
-    poll_implement_jobs(conn, policy, now, dry_run=dry_run)
-    train.advance_merge_trains(conn, policy, now, dry_run=dry_run)
-    verify.advance_fixed_by_sweeps(conn, now, dry_run=dry_run)
+    steps = (
+        lambda: verify.maybe_submit_reverts(conn, policy, now, dry_run=dry_run),
+        lambda: maybe_revise_blocked(conn, policy, now, dry_run=dry_run),
+        lambda: maybe_auto_implement(conn, policy, now, dry_run=dry_run),
+        lambda: poll_implement_jobs(conn, policy, now, dry_run=dry_run),
+        lambda: train.advance_merge_trains(conn, policy, now, dry_run=dry_run),
+        lambda: verify.advance_fixed_by_sweeps(conn, now, dry_run=dry_run),
+    )
+    # Each step is isolated: one raising must not starve the steps after it. Its uncommitted writes
+    # are rolled back so the next step's commit cannot land them half-done; the first error is
+    # re-raised once every step ran, so the caller still counts and logs the failure.
+    first_error: Exception | None = None
+    for step in steps:
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001 - re-raised below
+            conn.rollback()
+            print(f"triage: advance_implement_chain step raised:\n{traceback.format_exc()}", file=sys.stderr)
+            first_error = first_error or e
+    if first_error is not None:
+        raise first_error

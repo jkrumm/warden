@@ -2242,6 +2242,62 @@ def test_run_bounded_hang_does_not_block_past_its_timeout():
     assert elapsed < 5, f"_run_bounded blocked {elapsed:.1f}s past a 1s timeout"
 
 
+def test_run_bounded_logs_the_traceback_of_a_raising_probe_and_keeps_the_return_shape():
+    def _boom():
+        raise ValueError("probe exploded")
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        ok, result = work._run_bounded(_boom, timeout=5)
+    assert ok is False and result == "ValueError: probe exploded", (ok, result)
+    assert "Traceback" in err.getvalue() and "probe exploded" in err.getvalue(), err.getvalue()
+
+
+def test_advance_implement_chain_isolates_a_raising_step_and_reraises_after_the_rest():
+    """One raising step must not starve the steps after it; its uncommitted writes are rolled
+    back, and the first error still reaches the caller once every step ran."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (x INTEGER)")
+    conn.commit()
+    ran: list[str] = []
+
+    def _rec(name: str, *, write: bool = False, boom: bool = False):
+        def _step(*_a: Any, **_k: Any) -> None:
+            ran.append(name)
+            if write:
+                conn.execute("INSERT INTO t VALUES (1)")
+            if boom:
+                raise RuntimeError(f"{name} exploded")
+        return _step
+
+    patches = {
+        (work.verify, "maybe_submit_reverts"): _rec("reverts"),
+        (work, "maybe_revise_blocked"): _rec("revise", write=True, boom=True),
+        (work, "maybe_auto_implement"): _rec("implement"),
+        (work, "poll_implement_jobs"): _rec("poll", boom=True),
+        (work.train, "advance_merge_trains"): _rec("train"),
+        (work.verify, "advance_fixed_by_sweeps"): _rec("sweeps"),
+    }
+    saved = {k: getattr(*k) for k in patches}
+    try:
+        for (mod, name), fn in patches.items():
+            setattr(mod, name, fn)
+        err = io.StringIO()
+        raised: Exception | None = None
+        with contextlib.redirect_stderr(err):
+            try:
+                work.advance_implement_chain(conn, {}, dt.datetime.now(dt.timezone.utc), dry_run=False)
+            except RuntimeError as e:
+                raised = e
+    finally:
+        for (mod, name), fn in saved.items():
+            setattr(mod, name, fn)
+    assert ran == ["reverts", "revise", "implement", "poll", "train", "sweeps"], ran
+    assert raised is not None and str(raised) == "revise exploded", raised
+    assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0, "the raising step's write survived"
+    assert err.getvalue().count("Traceback") == 2, err.getvalue()
+
+
 # --- grouped-source resolution (quiet timer + recovery pairing) --------------
 
 def test_quiet_grouped_resolves_after_window_without_a_post():
@@ -11069,7 +11125,8 @@ def test_a_merge_whose_answer_was_lost_lands_the_item_when_github_says_merged():
         _sideclaw.get = _jobs({})
 
         def _already(conn_, **kw):
-            raise _merge.AlreadyMerged("jkrumm/demo-repo#10 is already merged.", merge_commit="f" * 40)
+            raise _merge.AlreadyMerged("jkrumm/demo-repo#10 is already merged.", merge_commit="f" * 40,
+                                       head_sha=TRAIN_SHA)
 
         _merge.plan_or_land = _already
         _train_pass(conn)
@@ -11079,6 +11136,57 @@ def test_a_merge_whose_answer_was_lost_lands_the_item_when_github_says_merged():
         assert item["sweep_pr"] == _TRAIN_PR, "a fix's merge queues its fixed-by sweep"
         d = conn.execute("SELECT merged_at FROM dispatches WHERE job_id='impl-sig-lost-answer'").fetchone()
         assert d["merged_at"] is not None, "the merge is on the dispatch record now"
+
+
+
+def _hand_merged(conn, ext: str, *, reviewed: str | None, head: str = TRAIN_SHA) -> tuple[int, str]:
+    """An item on the train whose PR GitHub reports merged at `head` (a merge by hand, or a lost
+    merge answer): `reviewed` is the last head a review confirmed, if any. Returns the item and
+    the outcome `_merge_and_rollout` reports."""
+    eid = _train_item(conn, ext, stage="merge", sha=TRAIN_SHA, reviewed=reviewed)
+    _sideclaw.get = _jobs({})
+
+    def _already(conn_, **kw):
+        raise _merge.AlreadyMerged("jkrumm/demo-repo#10 is already merged.", merge_commit="f" * 40, head_sha=head)
+
+    _merge.plan_or_land = _already
+    outcome = train._merge_and_rollout(conn, DEFAULT_POLICY, core._get_item(conn, eid), NOW, expected_sha=TRAIN_SHA)
+    return eid, outcome
+
+
+def test_a_pr_merged_by_hand_with_no_review_of_its_head_verifies_by_signal_only():
+    """A PR found merged whose head no step-7 review confirmed never went through the merge gate:
+    the item must not enter `verifying` as if gated. It verifies on its signal only (the fixed-by
+    sweep's mode: no deploy, no `make verify`), says so in its note, and queues no sweep."""
+    with _triage_env() as (conn, ctx):
+        eid, outcome = _hand_merged(conn, "sig-hand-merged", reviewed=None)
+        item = core._get_item(conn, eid)
+        assert outcome == "merged" and item["state"] == core.STATE_VERIFYING, dict(item)
+        assert item["note"] == work.UNREVIEWED_MERGE_NOTE and "signal only" in item["note"], dict(item)
+        assert item["fixed_by_pr"] == _TRAIN_PR and item["verify_started_at"] == NOW.isoformat(), dict(item)
+        assert item["merged_sha"] == "f" * 40 and item["sweep_pr"] is None, dict(item)
+        ran = _fake_rollout(targets=("deploy", "verify"), deploy=_ran(), verify=_ran())
+        verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert ran == [], f"signal-only verification runs neither make deploy nor make verify: {ran}"
+        assert core._get_item(conn, eid)["state"] == core.STATE_VERIFYING
+
+
+def test_a_pr_merged_at_a_head_other_than_the_reviewed_one_verifies_by_signal_only():
+    with _triage_env() as (conn, ctx):
+        eid, _ = _hand_merged(conn, "sig-hand-merged-other-head", reviewed=TRAIN_SHA, head=REBASED_SHA)
+        item = core._get_item(conn, eid)
+        assert item["state"] == core.STATE_VERIFYING and item["fixed_by_pr"] == _TRAIN_PR, dict(item)
+        assert item["note"] == work.UNREVIEWED_MERGE_NOTE, dict(item)
+
+
+def test_a_pr_merged_at_the_reviewed_head_is_landed_as_gated():
+    """The counterpart: a review confirmed that very head, so the merge is warden's gated one."""
+    with _triage_env() as (conn, ctx):
+        eid, outcome = _hand_merged(conn, "sig-merged-reviewed", reviewed=TRAIN_SHA)
+        item = core._get_item(conn, eid)
+        assert outcome == "merged" and item["state"] == core.STATE_VERIFYING, dict(item)
+        assert item["fixed_by_pr"] is None and item["verify_started_at"] is None, dict(item)
+        assert item["sweep_pr"] == _TRAIN_PR and "signal only" not in (item["note"] or ""), dict(item)
 
 
 def test_no_check_runs_right_after_update_pr_pushed_is_pending_not_green():

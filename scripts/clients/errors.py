@@ -56,9 +56,9 @@ class CheckRunsUnreadable(RemoteError):
     `weatherorb`).
 
     Its own class because this is a fact about the token, not about the commit,
-    and the *caller* owns the answer: `lifecycle/merge.py` reads it as "no
-    checks to gate on" and records the skip in the merge receipt — GitHub's own
-    required checks still decide at the merge call."""
+    and the *caller* owns the answer: `lifecycle/merge.py` falls back to the
+    commit's GitHub Actions workflow runs, and an empty fallback is pending,
+    never "no checks to gate on"."""
 
 
 class SubmitRefused(RemoteError):

@@ -16,6 +16,7 @@ VERBS
   status <job-id>    poll one
   list [scope]        open | today | all
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
+                     --confirm needs a reviewed head to pin; with none on record it refuses
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
   revert <event-id>   record a revert PR against a merged item (--pr --why)
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
@@ -977,6 +978,7 @@ VERBS
   status <job-id>    poll one
   list [scope]        open | today | all
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
+                     --confirm needs a reviewed head to pin; with none on record it refuses
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
   revert <event-id>   record a revert PR against a merged item (--pr --why)
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
