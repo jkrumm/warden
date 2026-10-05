@@ -347,7 +347,9 @@ def _apply_argo_note(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
     tag = f"[owner note via Argo #{action_id}, {now.strftime('%Y-%m-%d')}]"
     if item["note"] and tag in item["note"]:
         return "applied", None, None
-    merged = (item["note"] + "\n\n" if item["note"] else "") + f"{tag}: {text}"
+    # The tag must survive the note cap (items.py NOTE_MAX, applied again by _set_state): appended after
+    # a long note it would be cut off, the check above would miss it, and a redelivery would append twice.
+    merged = _items.append_to_note(item["note"], f"{tag}: {text}")
     rowcount = core._set_state(conn, event_id, item["state"], now, expect_state=item["state"], note=merged)
     conn.commit()
     if rowcount == 0:

@@ -46,6 +46,24 @@ def cap_note(note: str | None) -> str | None:
     return text[: NOTE_MAX - 1] + "…"
 
 
+def append_to_note(head: str | None, tail: str) -> str:
+    """`head` then `tail` as one capped note, with the TAIL kept whole: when the pair is too long
+    the head gives way (ellipsis, or dropped), and a tail longer than NOTE_MAX is itself cut from
+    its end. For a tail that carries an idempotency marker at its front (notify.py's
+    `[owner note via Argo #<id>, <date>]`): `cap_note()` on `head + tail` would cut from the end
+    and could take the marker with it, so a redelivered action would find no tag and append twice."""
+    tail = " ".join(tail.split())
+    if len(tail) >= NOTE_MAX:
+        return cap_note(tail)
+    head = " ".join((head or "").split())
+    if not head:
+        return tail
+    room = NOTE_MAX - len(tail) - 1
+    if len(head) > room:
+        head = head[: room - 1] + "…" if room >= 2 else ""
+    return f"{head} {tail}" if head else tail
+
+
 def _payload(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
