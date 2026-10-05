@@ -99,12 +99,16 @@ test:
 	[ $$ran -gt 0 ] || { echo "  no tests found"; exit 1; }; \
 	exit $$fail
 
-.PHONY: check
-check:
+# `test` is a prerequisite, not a `$(MAKE) test` recipe line: GNU make runs any recipe
+# line naming $(MAKE) even under -n, and the loop probes this target with `make -n check`.
+.PHONY: compile
+compile:
 	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
 	@"$(PY)" -m compileall -q "$(WARDEN_REPO)/scripts" "$(WARDEN_REPO)/tests" >/dev/null
 	@echo "  ✓ compileall"
-	@$(MAKE) --no-print-directory test
+
+.PHONY: check
+check: compile test
 
 # ---------------------------------------------------------------------------
 # Deploy / verify / logs — the repo contract

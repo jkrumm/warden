@@ -134,6 +134,7 @@ import json
 import os
 import sqlite3
 import sys
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -862,9 +863,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     try:
-        rows = conn.execute(
-            "SELECT * FROM dispatches WHERE reported_at IS NULL ORDER BY id"
-        ).fetchall()
+        # Each stage below is its own try: one failing must not starve the other.
+        rows: list[sqlite3.Row] = []
+        try:
+            rows = conn.execute(
+                "SELECT * FROM dispatches WHERE reported_at IS NULL ORDER BY id"
+            ).fetchall()
+        except Exception:  # the fold stage is lost; the advance chain still runs
+            errors += 1
+            print(f"dispatch-sweep: reading unreported dispatches raised:\n{traceback.format_exc()}",
+                  file=sys.stderr)
         for row in rows:
             try:
                 process_dispatch(conn, row, dry_run=dry_run)
@@ -872,7 +880,7 @@ def main(argv: list[str] | None = None) -> int:
                 errors += 1
                 print(
                     f"dispatch-sweep: row job_id={row['job_id']!r} (repo {row['repo']!r}) "
-                    f"raised: {e} — skipping, next sweep retries",
+                    f"raised: {e} — skipping, next sweep retries\n{traceback.format_exc()}",
                     file=sys.stderr,
                 )
 
@@ -893,7 +901,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # this chain must never take the sweep itself down
             errors += 1
             print(f"dispatch-sweep: advance_implement_chain raised: {e} — the loop's own "
-                  f"600s tick still covers it", file=sys.stderr)
+                  f"600s tick still covers it\n{traceback.format_exc()}", file=sys.stderr)
 
         if not dry_run:
             record_heartbeat(conn, considered=len(rows), errors=errors)

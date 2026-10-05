@@ -26,8 +26,11 @@ Run: .venv/bin/python3 tests/test_dispatch_sweep_pipeline.py
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import importlib.util
+import io
+import sqlite3
 import sys
 import tempfile
 import traceback
@@ -184,6 +187,81 @@ def test_advance_implement_chain_failure_does_not_crash_the_sweep():
         rc = dispatch_sweep.main(["--db", str(db_path)])
 
     assert rc == 0, "one bad pipeline pass must not take the whole sweep down"
+
+
+def _run_main_capturing_stderr(db_path: Path) -> tuple[int, str]:
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        rc = dispatch_sweep.main(["--db", str(db_path)])
+    return rc, buf.getvalue()
+
+
+def test_a_failing_chain_logs_its_traceback_and_the_heartbeat_counts_the_error():
+    db_path = _fresh_db()
+
+    def _raise(conn, policy, now, *, dry_run):
+        raise RuntimeError("boom")
+
+    with _patch(dispatch_sweep.work, "advance_implement_chain", _raise):
+        rc, err = _run_main_capturing_stderr(db_path)
+
+    assert rc == 0
+    assert "Traceback (most recent call last)" in err and "RuntimeError: boom" in err, err
+    conn = _ledger.connect(db_path)
+    try:
+        value = conn.execute("SELECT value FROM cursors WHERE key=?",
+                             (dispatch_sweep.HEARTBEAT_CURSOR_KEY,)).fetchone()["value"]
+    finally:
+        conn.close()
+    assert '"errors": 1' in value, value
+
+
+def test_a_failing_row_stage_does_not_starve_the_chain_and_logs_its_traceback():
+    db_path = _fresh_db()
+    conn = _ledger.connect(db_path)
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) VALUES('j1','investigate','r','b','running',?)",
+        (_now().isoformat(),))
+    conn.commit()
+    conn.close()
+    calls: list[bool] = []
+
+    def _raise_row(conn, row, *, dry_run):
+        raise ValueError("bad row")
+
+    with _patch(dispatch_sweep, "process_dispatch", _raise_row), \
+         _patch(dispatch_sweep.work, "advance_implement_chain",
+                lambda conn, policy, now, *, dry_run: calls.append(dry_run)):
+        rc, err = _run_main_capturing_stderr(db_path)
+
+    assert rc == 0 and calls == [False], (rc, calls)
+    assert "ValueError: bad row" in err and "Traceback (most recent call last)" in err, err
+
+
+def test_a_failing_dispatch_read_does_not_starve_the_chain():
+    db_path = _fresh_db()
+    real_connect = dispatch_sweep.db_connect
+    calls: list[bool] = []
+
+    class _Conn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *args):
+            if "FROM dispatches" in sql:
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._inner.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    with _patch(dispatch_sweep, "db_connect", lambda: _Conn(real_connect())), \
+         _patch(dispatch_sweep.work, "advance_implement_chain",
+                lambda conn, policy, now, *, dry_run: calls.append(dry_run)):
+        rc, err = _run_main_capturing_stderr(db_path)
+
+    assert rc == 0 and calls == [False], (rc, calls)
+    assert "disk I/O error" in err and "Traceback (most recent call last)" in err, err
 
 
 def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
