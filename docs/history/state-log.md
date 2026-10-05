@@ -9648,3 +9648,47 @@ closing.
 
 `make check` green, test_triage 466 → 467.
 
+
+## 123. Agent-platform Wave 7 — re-drive failed work (2026-10-05)
+
+After the program Argo's "needs you" held 21 `failed` items, nearly all infra (expired
+Max OAuth killed review synthesis, OpenCode/IU 503s, the deleted merge-approval gate, a
+sideclaw tier cap). `failed` was a graveyard for work that only failed because infra was
+down.
+
+- **Classified at the moment of failure.** `set_state()` refuses a `failed` transition
+  without `failure_class` ∈ `infra | policy | work` and stores a re-entry recipe
+  (`redrive_json`: state, columns, policy hash). `strike()` at its limit is infra with
+  its own retry state + columns; `end_on_refusal()` is policy with sideclaw's
+  dispatch-policy hash; checks/merge refusals, exhausted revisions, rewind loops, a
+  failed `make deploy`, unreadable check runs and every verify dead end are work. A
+  work failure out of `working` re-enters `merging` (PR) or `triaged`, never a judged
+  implement attempt.
+- **Re-drive pass** (`work.redrive_failed()`, right after `reconcile_operations`):
+  infra after 60/180/480 min, ≤3 (`redrives` is the infra budget; reset on a real
+  advance to merging+, not on the `working` claim — that would loop); policy once per
+  hash change of `GET /api/dispatch-policy` (unreadable → skip); work never. Per-row
+  isolation; unknown recipe columns skip the row. Nothing posts.
+- **`warden retry <id> [--why]`** and Argo's `retry` action share `core.redrive()`;
+  owner retry resets the budget. `revert_pr` set → never re-driven, never offered.
+- **Migration 16** adds the three columns and backfills `failed` rows from notes (no-
+  verdict investigate/review → infra; ceiling/refusal/merge-approval → policy;
+  anything else → work with a manual-only stage). Verified on a ledger copy.
+- **Backlog pass.** Closed as superseded: 1300 (mapping proposer, PR warden#6 + issue
+  #4 closed), 1392–1396 (self-audit, PR warden#7 closed), 1298 (fixed by 8f33137, PR
+  warden#5 + issue #2 closed), 543 (signal quiet, rides 1389), 1397 (transient
+  Requesty billing). Re-driven: 1398, 1400 (infra), 1370 + hermes 1114/1420–1424
+  (policy), 1389/1390 by `warden retry`. Left: 1302 (owner call).
+- **Also:** `deploy.sh`'s live checkout is `WARDEN_LIVE_REPO`-overridable and every
+  test sandbox sets it — the refusal test used to run a real deploy from the live
+  checkout. The daily-digest test was wall-clock dependent (failed after 21:00 UTC);
+  pinned to early in a UTC day.
+- Argo `warden-w7` (d3b72d9, bc1a983): `retry` verb, failure-class badge + re-drive
+  count, Retry button; `failure_class` is an open string so a new class never 422s.
+
+`make check` green, test_triage 467 → 488. sideclaw `/review` two rounds: round 1 — 4
+blocking (retry could redo a hand revert; deploy failure as infra re-runs a bad deploy;
+policy and infra shared one budget; backfill LIKE missed non-`failed` episode
+statuses); round 2 — 3 accepted (budget reset skipped on the real handoff; work
+recipes re-entering a stuck `working`; Argo hand-back reset the backoff), 1 rejected
+(reset on `triaged → working`: every re-drive would get a fresh budget).

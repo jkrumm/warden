@@ -6,10 +6,10 @@ build log (§1–§122).
 
 | | |
 |-|-|
-| Last updated | 2026-10-05 (§122 — a bold-wrapped bot alert `*🚨 …` is no longer closed as unstructured prose) |
+| Last updated | 2026-10-05 (§123 — agent-platform Wave 7: `failed` is classified and re-driven) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 15 |
+| Ledger | `~/.warden/warden.db`, schema 16 |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
 
 ## What is live
@@ -35,7 +35,14 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   without a review at its head verifies by signal only.
 - **Ledger:** every pending migration first writes
   `~/.warden/backups/pre-migration-v<from>-to-<to>-<stamp>-<pid>.db` (never pruned).
-- **Board at close-out of W5:** 1 `needs_decision`, 21 `failed`, nothing in flight.
+- **`failed` is classified.** Every `failed` row carries `failure_class` (`infra` |
+  `policy` | `work`) and a re-entry recipe (`redrive_json`). The loop re-drives infra
+  after 60/180/480 min (≤3, `redrives` is that budget; it resets once the item reaches
+  merging+), policy once per change of sideclaw's `GET /api/dispatch-policy` hash; work
+  waits for `warden retry <id> [--why]` or Argo's Retry button. A hand-reverted item is
+  never re-driven. `failed` still never posts; the daily count does.
+- **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
+  superseded/fixed), 2 `needs_decision`.
 
 ## Open — owner actions
 
@@ -48,8 +55,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   the affected apps, forwarded to the VPS; `homelab` master has `check`/`verify` and
   the contract sections, 9bc1b5d.)
 - sideclaw serves `dispatch_implement_escalation`; attempt 3+ escalates to it.
-- The 21 `failed` items are pre-train history; triage them in Argo (reinvestigate
-  or dismiss).
+- hermes-agent's sideclaw ceiling is `investigate`: its 6 policy-failed items
+  (1114, 1420–1424) re-drive once after the deploy, are refused again, and wait for
+  the ceiling to change. Lift it in sideclaw or close them.
+- sideclaw#10 (item 1302) is an owner call (keep matching `op://` pointers in the diff
+  secret-scan or not) — left `failed(work)`.
 
 ## Carried debt
 
@@ -80,7 +90,7 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 
 ## Next action
 
-Agent-platform waves are complete (W6 closed the review fixes). Run `make deploy`
-once on the W6 code (new lock and rollback path, renamed modules). Then watch the first warden PR that rides the train
-end to end (merge → fast-forward → `make deploy` → `make verify`) and the first
-revert in the field; then the carried debt above, concurrency first.
+Watch the first live re-drives after the W7 deploy: 1398/1400 (infra → re-investigate),
+1370 (dotfiles PR #12 → merge train), 1389/1390 (owner-retried into the train). Then
+the first warden PR that rides the train end to end and the first revert in the field;
+then the carried debt above, concurrency first.
