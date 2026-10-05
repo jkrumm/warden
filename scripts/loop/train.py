@@ -249,11 +249,9 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         return False
     except (PolicyError, PreconditionError) as e:
         # Unreadable check runs: an unknown CI state never passes, and waiting does not fix a token. A
-        # `policy` failure like a refused submit: it carries the dispatch-policy hash it failed under,
-        # so it is re-driven when that changes and not on every pass.
+        # GitHub problem, not sideclaw's policy, so `work` like merge_and_rollout()'s same exception pair.
         core.set_state(conn, item["event_id"], core.STATE_FAILED, now, expect_state=core.STATE_MERGING,
-                        expect_eq=_train_expect(item), failure_class=core.FAILURE_POLICY,
-                        redrive_json=core.redrive_spec(core.STATE_MERGING, policy_hash=work.current_policy_hash()),
+                        expect_eq=_train_expect(item), failure_class=core.FAILURE_WORK,
                         note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}")
         conn.commit()
         return False

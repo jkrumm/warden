@@ -43,7 +43,7 @@ and a refused triage submit (strikes; never the item's fault).
 `failed` is classified where it happens (`failure_class`) and is not a graveyard for
 what was never the work's fault. `infra` (sideclaw 5xx/unreachable, a synthesis
 failure, the third strike) is re-driven after 60, 180, 480 minutes, three times;
-`policy` (a sideclaw 4xx refusal, unreadable permissions) once whenever sideclaw's
+`policy` (a sideclaw 4xx refusal) once whenever sideclaw's
 dispatch policy hash differs from the one stored with the refusal, so a refusal
 under the new policy waits for the next change; `work` (checks failed, review
 blocked past the last attempt, a rewind loop, a revert by hand) never. A failed row

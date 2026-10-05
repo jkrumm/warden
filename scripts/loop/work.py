@@ -364,9 +364,14 @@ def redrive_failed(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool)
             print(f"[dry-run] would {why}: {item['signature'][:60]} (event {item['event_id']}) -> {stage}")
             continue
         # `redrives` is the infra budget: only an infra re-drive spends it.
-        spent = item["redrives"] + (item["failure_class"] == core.FAILURE_INFRA)
-        won = core.redrive(conn, item, now, redrives=spent, note=f"{why}: {item['note'] or 'no note'}")
-        conn.commit()
+        spent = item["redrives"] + 1 if item["failure_class"] == core.FAILURE_INFRA else item["redrives"]
+        try:
+            won = core.redrive(conn, item, now, redrives=spent, note=f"{why}: {item['note'] or 'no note'}")
+            conn.commit()
+        except Exception:  # noqa: BLE001 — one bad row must not stop the rest of the pass
+            conn.rollback()
+            print(f"triage: re-drive of event {item['event_id']} raised:\n{traceback.format_exc()}", file=sys.stderr)
+            continue
         if won:
             print(f"triage: {why}: {item['signature'][:60]} (event {item['event_id']}) -> {stage}", file=sys.stderr)
 

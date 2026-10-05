@@ -746,11 +746,21 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
         if "failure_class" in columns or prev_state != STATE_FAILED:
             if columns.get("failure_class") not in FAILURE_CLASSES:
                 raise ValueError(f"a `failed` transition must carry failure_class= one of {FAILURE_CLASSES}")
+            row = conn.execute("SELECT redrives, pr_url, revert_pr FROM triage_items WHERE event_id=?",
+                               (event_id,)).fetchone()
             if prev_state != STATE_FAILED:
-                columns.setdefault("redrive_json", redrive_spec(prev_state) if prev_state in _REDRIVE_STAGES else None)
+                stage = prev_state if prev_state in _REDRIVE_STAGES else None
+                if columns["failure_class"] == FAILURE_WORK and prev_state == STATE_WORKING:
+                    # A `work` failure is the owner's call, and `working` is no place to re-enter: an
+                    # implement attempt already judged stays stuck there. The owner's retry goes back to
+                    # the train when there is a PR, else to a fresh investigation.
+                    pr_url = columns["pr_url"] if "pr_url" in columns else (row["pr_url"] if row else None)
+                    stage = STATE_MERGING if pr_url else STATE_TRIAGED
+                if row is not None and row["revert_pr"] is not None:
+                    stage = None
+                columns.setdefault("redrive_json", redrive_spec(stage))
             if columns["failure_class"] == FAILURE_INFRA:
-                spent = conn.execute("SELECT redrives FROM triage_items WHERE event_id=?", (event_id,)).fetchone()
-                columns.setdefault("retry_at", redrive_due_at(now, spent["redrives"] if spent else 0))
+                columns.setdefault("retry_at", redrive_due_at(now, row["redrives"] if row else 0))
             else:
                 columns.setdefault("retry_at", None)
     else:
@@ -784,15 +794,19 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
 
     mark = occurrence_mark(get_event(conn, event_id))
 
-    if "strikes" not in columns and prev_state is not None and prev_state != state:
+    if prev_state is not None and prev_state != state:
         advanced = (state in _PIPELINE_RANK and prev_state in _PIPELINE_RANK
                     and _PIPELINE_RANK[state] >= _PIPELINE_RANK[STATE_MERGING]
                     and _PIPELINE_RANK[state] > _PIPELINE_RANK[prev_state])
-        if advanced or prev_state in _END_STATES:
+        if advanced:
+            # The infra re-drive budget is per stretch of trouble, not per item, so a step that SUCCEEDED
+            # gives it back. Only merging/verifying/fixed count (the rank threshold above): resetting on
+            # the `working` claim would hand every re-drive into `triaged` a fresh budget, an endless loop.
+            # Independent of the `strikes` guard: the production handoff to `merging` passes strikes=0.
+            columns.setdefault("redrives", 0)
+        if "strikes" not in columns and (advanced or prev_state in _END_STATES):
             columns["strikes"] = 0
             columns["retry_at"] = None
-        if advanced:
-            columns.setdefault("redrives", 0)   # the infra budget is per stretch of trouble, not per item
 
     sql = "UPDATE triage_items SET state=?, occurrence_mark=?, updated_at=?"
     params: list[Any] = [state, mark, now_iso(now)]
@@ -864,6 +878,11 @@ def redrive_target(item: sqlite3.Row) -> tuple[str, dict[str, Any], str | None] 
     recipe = safe_json(item["redrive_json"])
     state, columns = recipe.get("state"), recipe.get("columns")
     if state not in _REDRIVE_STAGES or not isinstance(columns, dict):
+        return None
+    unknown = [c for c in columns if c not in _SET_STATE_COLUMNS]
+    if unknown:
+        print(f"triage: event {item['event_id']}: redrive_json names columns this code does not know "
+              f"{unknown} — not re-driven", file=sys.stderr)
         return None
     return state, columns, recipe.get("policy_hash")
 

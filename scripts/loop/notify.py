@@ -223,7 +223,8 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
         core.set_state(conn, event_id, item["state"], now, expect_state=core.STATE_WORKING, note=note,
                         implement_job=item["implement_job"], validation_job=item["validation_job"],
                         pr_url=item["pr_url"], reverting_sha=item["reverting_sha"], revert_json=item["revert_json"],
-                        failure_class=item["failure_class"], redrive_json=item["redrive_json"])
+                        failure_class=item["failure_class"], redrive_json=item["redrive_json"],
+                        retry_at=item["retry_at"])
         conn.commit()
 
     try:

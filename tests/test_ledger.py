@@ -1122,6 +1122,12 @@ def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_r
     conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (11, 's', 'e11', 't', 'now')")
     conn.execute("INSERT INTO triage_items(event_id, signature, state, note, created_at, updated_at) VALUES "
                  "(11, 's:e11', 'failed', 'investigate episode interrupted with no verdict: no reason', 'now', 'now')")
+    for event_id, note in ((13, "step-7 review ended with no verdict: review job failed"),
+                           (14, "step-7 validation: unknown review outcome 'x'")):
+        conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (?, 's', ?, 't', 'now')",
+                     (event_id, f"e{event_id}"))
+        conn.execute("INSERT INTO triage_items(event_id, signature, state, note, created_at, updated_at) "
+                     "VALUES (?, ?, 'failed', ?, 'now', 'now')", (event_id, f"s:e{event_id}", note))
     conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (12, 's', 'e12', 't', 'now')")
     conn.execute("INSERT INTO triage_items(event_id, signature, state, note, pr_url, revert_pr, created_at, updated_at) "
                  "VALUES (12, 's:e12', 'failed', 'reverted by PR #7: regressed', 'https://x/pull/12', 7, 'now', 'now')")
@@ -1148,7 +1154,9 @@ def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_r
     assert rows[8]["failure_class"] == "work", "a failed row without a note is a work failure"
     assert rows[11]["failure_class"] == "infra" and recipe(11)["state"] == "triaged", "any terminal status counts"
     assert rows[12]["failure_class"] == "work" and rows[12]["redrive_json"] is None, "a reverted item has no stage"
-    for event_id in (1, 2, 3, 4, 5, 6, 8, 9, 11, 12):
+    for event_id in (13, 14):
+        assert rows[event_id]["failure_class"] == "infra" and recipe(event_id)["state"] == "merging", event_id
+    for event_id in (1, 2, 3, 4, 5, 6, 8, 9, 11, 12, 13, 14):
         assert rows[event_id]["retry_at"] is None and rows[event_id]["redrives"] == 0, event_id
     assert rows[7]["retry_at"] == "2030-01-01T00:00:00+00:00", "a row that is not failed keeps its retry_at"
     fresh = ledger.connect(_tmp_path(), migrate=True)

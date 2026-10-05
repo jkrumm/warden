@@ -705,7 +705,7 @@ ALTER TABLE triage_items ADD COLUMN fixed_by_pr TEXT;
 #
 #   failure_class  infra | policy | work. infra = sideclaw 5xx/timeouts/auth, a synthesis or
 #     serialization failure, sideclaw unreachable (re-driven on a backoff, three times);
-#     policy = sideclaw refused the submit with a 4xx or its permissions were unreadable
+#     policy = sideclaw refused the submit with a 4xx
 #     (re-driven once whenever sideclaw's dispatch policy changes); work = anything a human must
 #     judge (checks failed, review blocked after the last attempt, conflict loops; never re-driven).
 #     NULL on every state but `failed`.
@@ -722,6 +722,7 @@ ALTER TABLE triage_items ADD COLUMN fixed_by_pr TEXT;
 #
 #   | note contains                                       | class  | re-enters                         |
 #   | investigate episode <status> with no verdict        | infra  | triaged, dispatch_job cleared     |
+#   | step-7 review ended with no verdict / unknown review outcome | infra | merging, the train restarts at update |
 #   | exceeds the ceiling / episode not started — sideclaw refused | policy | working (note starts with `implement`), merging (`review`/`update_pr`), else triaged |
 #   | is merge-approval gated (the deleted gate)          | policy | merging, the train restarts at update |
 #   | anything else                                       | work   | never automatically; `warden retry` re-enters merging (has a PR) or triaged; none when `revert_pr` is set |
@@ -732,6 +733,10 @@ ALTER TABLE triage_items ADD COLUMN redrives INTEGER NOT NULL DEFAULT 0;
 UPDATE triage_items SET failure_class = 'infra', retry_at = NULL,
   redrive_json = '{"state":"triaged","columns":{"dispatch_job":null},"policy_hash":null}'
   WHERE state = 'failed' AND failure_class IS NULL AND note LIKE '%investigate episode % with no verdict%';
+UPDATE triage_items SET failure_class = 'infra', retry_at = NULL,
+  redrive_json = '{"state":"merging","columns":{},"policy_hash":null}'
+  WHERE state = 'failed' AND failure_class IS NULL
+    AND (note LIKE '%step-7 review ended with no verdict%' OR note LIKE '%unknown review outcome%');
 UPDATE triage_items SET failure_class = 'policy', retry_at = NULL,
   redrive_json = '{"state":"' || CASE WHEN note LIKE 'implement%' THEN 'working'
                                       WHEN note LIKE 'review%' OR note LIKE 'update_pr%' THEN 'merging'
