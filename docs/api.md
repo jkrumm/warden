@@ -159,7 +159,7 @@ The full detail behind one item.
 Argo (the dashboard on the VPS) cannot reach this loopback socket, so the loop pushes its own
 projection. `triage.py`'s `run()` ends every 10-minute pass (after `record_heartbeat()` and
 `apply_argo_actions()`) with `push_argo_snapshot()`, which POSTs `build_argo_snapshot()` via
-`clients.argo.push_snapshot()`:
+`clients.argo.push_snapshot()`. The snapshot/push helpers live in `scripts/loop/notify.py`:
 
 `machine` (`WARDEN_MACHINE`, default `mini`), `generatedAt`, `health`, `metrics`, `board`
 (this module's payloads verbatim), `items` (`item_payload()` for the first

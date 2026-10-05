@@ -43,11 +43,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `Actions: Read`) on private repos: weatherorb's check runs read 403, so the train
   refuses its merges (`failed`). It also lacks `Issues: Read` on `dispatch-scratch`
   and `Issues: Write` repo-wide (issue comment-back 403s).
-- Repo contract gaps the train hits: `vps`'s `make deploy` needs `APP=` (a merged
-  vps fix strikes to `failed` at deploy); `homelab` has no `make verify` (signal
-  only); `free-planning-poker`, `homelab-private`, `basalt-ui` have no `make deploy`.
-- sideclaw has no `dispatch_implement_escalation` route, so attempt 3+ uses the
-  default implement model.
+- Repo contract gaps the train hits: `free-planning-poker`, `homelab-private`,
+  `basalt-ui` have no `make deploy`. (`vps`'s `make deploy` without `APP=` deploys
+  the affected apps, forwarded to the VPS; `homelab` master has `check`/`verify` and
+  the contract sections, 9bc1b5d.)
+- sideclaw serves `dispatch_implement_escalation`; attempt 3+ escalates to it.
 - The 21 `failed` items are pre-train history; triage them in Argo (reinvestigate
   or dismiss).
 
