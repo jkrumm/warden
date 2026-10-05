@@ -221,6 +221,103 @@ def test_a_timeout_kills_the_whole_process_group_not_just_its_leader():
             raise AssertionError(f"the recipe's child {child} outlived the timeout")
 
 
+def test_a_timeout_does_not_hang_on_a_descendant_that_left_the_group_holding_the_pipes():
+    # A grandchild in its own session survives killpg and keeps stdout open: the post-kill drain
+    # must be bounded, and the run still reads as a timeout.
+    with tempfile.TemporaryDirectory() as tmp:
+        pidfile = Path(tmp) / "escaped.pid"
+        script = ("import os, subprocess, time\n"
+                  f"p = subprocess.Popen(['sleep', '30'], start_new_session=True)\n"
+                  f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+                  "time.sleep(30)\n")
+        original = rollout.KILL_DRAIN_S
+        rollout.KILL_DRAIN_S = 0.5
+        started = time.monotonic()
+        try:
+            res = rollout._run([sys.executable, "-c", script], rollout._run_in_group, 1)
+        finally:
+            rollout.KILL_DRAIN_S = original
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), 9)
+                except ProcessLookupError:
+                    pass
+        assert time.monotonic() - started < 10, "the drain after killpg must be bounded"
+        assert res == rollout.Ran(False, 124, "timed out after 1s"), res
+
+
+class _EnvLock:
+    """Point the deploy lock at a temp file and make warden's checkout CWD for one `with`."""
+
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = (os.environ.get("WARDEN_DEPLOY_LOCK"), rollout.WARDEN_CHECKOUT)
+        os.environ["WARDEN_DEPLOY_LOCK"] = str(Path(self.tmp.name) / "deploy.lock")
+        rollout.WARDEN_CHECKOUT = CWD.resolve()
+        return self
+
+    def __exit__(self, *exc):
+        old, rollout.WARDEN_CHECKOUT = self.saved
+        if old is None:
+            os.environ.pop("WARDEN_DEPLOY_LOCK", None)
+        else:
+            os.environ["WARDEN_DEPLOY_LOCK"] = old
+        self.tmp.cleanup()
+
+
+def test_the_deploy_lock_is_exclusive_and_released_on_exit():
+    with _EnvLock():
+        with rollout.deploy_lock(wait_s=0):
+            try:
+                with rollout.deploy_lock(wait_s=0.2):
+                    raise AssertionError("a second holder got the lock")
+            except rollout.LockBusy:
+                pass
+        with rollout.deploy_lock(wait_s=0):
+            pass
+
+
+def test_syncing_warden_own_checkout_is_deferred_while_a_deploy_holds_the_lock():
+    with _EnvLock():
+        run = Script(_CLEAN_ON_MAIN)
+        with rollout.deploy_lock(wait_s=0):
+            original = rollout.LOCK_WAIT_S
+            rollout.LOCK_WAIT_S = 0.2
+            try:
+                result = rollout.sync_checkout(CWD, runner=run)
+            finally:
+                rollout.LOCK_WAIT_S = original
+        assert isinstance(result, rollout.Deferred) and "busy" in result.reason, result
+        assert run.argvs == [], "nothing may touch git while the deploy holds the lock"
+        assert rollout.sync_checkout(CWD, runner=run) is None
+
+
+def test_syncing_another_repo_never_takes_the_deploy_lock():
+    with _EnvLock():
+        with rollout.deploy_lock(wait_s=0):
+            assert rollout.sync_checkout(Path("/repos/other"), runner=Script(_CLEAN_ON_MAIN)) is None
+
+
+def test_deploy_hands_the_pre_merge_sha_to_make_as_the_rollback_target_once():
+    answers = {**_CLEAN_ON_MAIN, "rev-parse HEAD origin/": (0, "bbbb\nbbbb\n", ""),
+               "rev-parse HEAD": (0, "aaaa\n", "")}
+    sync_run = Script(answers)
+    assert rollout.sync_checkout(CWD, runner=sync_run) is None
+    run = Script({})
+    rollout.deploy(CWD, runner=run)
+    assert run.kwargs[-1]["env"]["WARDEN_DEPLOY_PREV"] == "aaaa", run.kwargs[-1]["env"]
+    rollout.deploy(CWD, runner=run)
+    assert run.kwargs[-1]["env"].get("WARDEN_DEPLOY_PREV") != "aaaa", "a SHA must not outlive its deploy"
+
+
+def test_a_no_op_sync_clears_the_rollback_target():
+    rollout._pre_merge_head[str(CWD)] = "stale"
+    assert rollout.sync_checkout(CWD, runner=Script(_CLEAN_ON_MAIN)) is None  # HEAD == origin, nothing merged
+    run = Script({})
+    rollout.deploy(CWD, runner=run)
+    assert run.kwargs[-1]["env"].get("WARDEN_DEPLOY_PREV") != "stale"
+
+
 def test_the_default_runner_returns_like_subprocess_run():
     res = rollout._run(["sh", "-c", "echo out; echo err >&2; exit 3"], rollout._run_in_group, 10)
     assert res.ok is False and res.exit_code == 3 and "out" in res.tail and "err" in res.tail, res

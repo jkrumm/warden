@@ -25,6 +25,11 @@ Three questions live here and nowhere else:
   deploy()      `make deploy`.
   verify()      `make verify`.
 
+One lock, `deploy_lock()` (~/.warden/deploy.lock, override WARDEN_DEPLOY_LOCK), serialises
+scripts/deploy.sh's deploy/verify (which re-execs itself under `exec_locked`) with
+sync_checkout() on warden's own checkout: a fast-forward must not land mid-deploy or
+mid-rollback. It is an fcntl.flock — macOS has no flock(1) — so a crash releases it.
+
 Every subprocess goes through an injectable `runner` (tests) and is bounded by a
 timeout; the default runner starts it in its own process group and kills the whole
 group on timeout (a `make` recipe's children must not outlive it). Output is returned
@@ -34,12 +39,16 @@ never calls into this module.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import signal
 import subprocess
+import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable, Iterator, NamedTuple
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -47,6 +56,10 @@ DEPLOY_TIMEOUT_S = int(os.environ.get("WARDEN_DEPLOY_TIMEOUT", "900"))
 VERIFY_TIMEOUT_S = int(os.environ.get("WARDEN_VERIFY_TIMEOUT", "600"))
 PROBE_TIMEOUT_S = 60
 GIT_TIMEOUT_S = 120
+KILL_DRAIN_S = 5      # after killpg, how long the pipes get to close before the run is given up on
+LOCK_WAIT_S = float(os.environ.get("WARDEN_DEPLOY_LOCK_WAIT", "120"))
+LOCK_BUSY_EXIT = 75   # EX_TEMPFAIL
+WARDEN_CHECKOUT = Path(__file__).resolve().parents[2]
 OUTPUT_TAIL_CHARS = 2000
 
 _NO_MAKEFILE_RE = re.compile(r"No targets specified and no makefile found")
@@ -63,6 +76,51 @@ class Ran(NamedTuple):
 class Deferred(NamedTuple):
     """The checkout is not in a state a deploy may start from — nothing ran."""
     reason: str
+
+
+class LockBusy(Exception):
+    """The deploy lock stayed held past the wait."""
+
+
+def deploy_lock_path() -> Path:
+    return Path(os.environ.get("WARDEN_DEPLOY_LOCK") or Path.home() / ".warden" / "deploy.lock")
+
+
+def _acquire_lock(wait_s: float) -> int:
+    path = deploy_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise LockBusy(f"deploy lock {path} busy after {wait_s:g}s") from None
+            time.sleep(0.1)
+
+
+@contextmanager
+def deploy_lock(wait_s: float | None = None) -> Iterator[None]:
+    fd = _acquire_lock(LOCK_WAIT_S if wait_s is None else wait_s)
+    try:
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the flock
+
+
+def exec_locked(argv: list[str]) -> None:
+    """Take the deploy lock, then replace this process with `argv`. The lock's descriptor is
+    inherited across the exec, so it is held exactly as long as the command runs."""
+    try:
+        fd = _acquire_lock(LOCK_WAIT_S)
+    except LockBusy as exc:
+        print(f"warden: {exc}", file=sys.stderr)
+        sys.exit(LOCK_BUSY_EXIT)
+    os.set_inheritable(fd, True)
+    os.execvpe(argv[0], argv, {**os.environ, "WARDEN_DEPLOY_LOCKED": "1"})
 
 
 def _tail(text: str) -> str:
@@ -83,14 +141,17 @@ def _run_in_group(argv: list[str], *, capture_output: bool, text: bool, timeout:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            proc.communicate()
+            try:
+                proc.communicate(timeout=KILL_DRAIN_S)
+            except subprocess.TimeoutExpired:
+                pass  # a descendant that left the group still holds the pipes: give up, don't hang
             raise
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
-def _run(argv: list[str], runner: Runner, timeout_s: int) -> Ran:
+def _run(argv: list[str], runner: Runner, timeout_s: int, extra_env: dict[str, str] | None = None) -> Ran:
     # LC_ALL=C: has_target() matches make's own English message.
-    env = {**os.environ, "LC_ALL": "C"}
+    env = {**os.environ, "LC_ALL": "C", **(extra_env or {})}
     try:
         proc = runner(argv, capture_output=True, text=True, timeout=timeout_s, env=env)
     except subprocess.TimeoutExpired:
@@ -128,11 +189,28 @@ def _default_branch(cwd: Path, runner: Runner) -> str | None:
     return None
 
 
+# cwd -> the SHA HEAD was at before the last sync_checkout() fast-forwarded it. deploy() hands
+# it to scripts/deploy.sh as WARDEN_DEPLOY_PREV, its rollback target (HEAD@{1} is only a guess).
+_pre_merge_head: dict[str, str] = {}
+
+
 def sync_checkout(cwd: Path, *, runner: Runner = _run_in_group) -> Deferred | None:
     """Fast-forward `cwd` to `origin/<default>`; a `Deferred` says why it is not there.
+    Warden's own checkout is synced under the deploy lock — see the module docstring.
     Untracked files do not count as dirty — git itself refuses a merge they would collide with.
     `merge --ff-only` also succeeds on a checkout AHEAD of origin ("Already up to date"), so
     the result is checked: HEAD must be origin/<default> exactly."""
+    if cwd.resolve() != WARDEN_CHECKOUT:
+        return _sync_checkout(cwd, runner)
+    try:
+        with deploy_lock():
+            return _sync_checkout(cwd, runner)
+    except LockBusy as exc:
+        return Deferred(f"{exc} — a deploy is running in {cwd.name}")
+
+
+def _sync_checkout(cwd: Path, runner: Runner) -> Deferred | None:
+    _pre_merge_head.pop(str(cwd), None)
     fetched = _git(cwd, runner, "fetch", "--quiet", "origin")
     if not fetched.ok:
         return Deferred(f"git fetch failed in {cwd.name}: {fetched.tail.strip()[-200:]}")
@@ -145,6 +223,7 @@ def sync_checkout(cwd: Path, *, runner: Runner = _run_in_group) -> Deferred | No
     dirty = _git(cwd, runner, "status", "--porcelain", "--untracked-files=no")
     if not dirty.ok or dirty.tail.strip():
         return Deferred(f"checkout not clean/on {default}: {cwd.name} has uncommitted changes")
+    before = _git(cwd, runner, "rev-parse", "HEAD").tail.strip()
     merged = _git(cwd, runner, "merge", "--ff-only", f"origin/{default}")
     if not merged.ok:
         return Deferred(f"cannot fast-forward {cwd.name} to origin/{default}: {merged.tail.strip()[-200:]}")
@@ -153,12 +232,16 @@ def sync_checkout(cwd: Path, *, runner: Runner = _run_in_group) -> Deferred | No
     if not heads.ok or len(shas) != 2 or shas[0] != shas[1]:
         return Deferred(f"checkout not at origin/{default}: {cwd.name} has commits origin does not "
                         f"({' vs '.join(s[:12] for s in shas) or 'unreadable'})")
+    if before and before != shas[0]:
+        _pre_merge_head[str(cwd)] = before
     return None
 
 
 def deploy(cwd: Path, *, runner: Runner = _run_in_group, timeout_s: int | None = None) -> Ran:
     """`make deploy` — the caller synced the checkout first (sync_checkout())."""
-    return _run(["make", "-C", str(cwd), "deploy"], runner, timeout_s or DEPLOY_TIMEOUT_S)
+    prev = _pre_merge_head.pop(str(cwd), None)
+    return _run(["make", "-C", str(cwd), "deploy"], runner, timeout_s or DEPLOY_TIMEOUT_S,
+                {"WARDEN_DEPLOY_PREV": prev} if prev else None)
 
 
 def verify(cwd: Path, *, runner: Runner = _run_in_group, timeout_s: int | None = None) -> Ran:
