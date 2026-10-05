@@ -2,7 +2,7 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§122).
+build log (§1–§123).
 
 | | |
 |-|-|
