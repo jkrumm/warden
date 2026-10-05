@@ -825,7 +825,7 @@ def _merge_stub() -> stubs.StubServer:
         ("GET", "/repos/jkrumm/gamma"): (200, {"default_branch": "master", "allow_squash_merge": True}),
         ("GET", "/repos/jkrumm/gamma/rules/branches/master"): (200, []),
         ("GET", "/repos/jkrumm/gamma/pulls/9/files?per_page=100"): (200, [{"filename": "a.py"}]),
-        ("GET", f"/repos/jkrumm/gamma/commits/{'deadbeef' * 5}/check-runs"): (200, {"check_runs": []}),
+        ("GET", f"/repos/jkrumm/gamma/commits/{'deadbeef' * 5}/check-runs?per_page=100"): (200, {"total_count": 0, "check_runs": []}),
         ("POST", "/graphql"): (200, {"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}}}),
         ("PUT", "/repos/jkrumm/gamma/pulls/9/merge"): (200, {"sha": "merged-sha", "merged": True}),
         ("DELETE", "/repos/jkrumm/gamma/git/refs/heads/dispatch/x"): (204, None),

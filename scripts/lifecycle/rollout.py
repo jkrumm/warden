@@ -78,6 +78,13 @@ class Deferred(NamedTuple):
     reason: str
 
 
+class Synced(NamedTuple):
+    """The checkout sits at origin's default branch. `before` is where HEAD was when the sync
+    began (== `head` when nothing merged), `head` where it is now: the hand-off to deploy()."""
+    before: str
+    head: str
+
+
 class LockBusy(Exception):
     """The deploy lock stayed held past the wait."""
 
@@ -189,13 +196,9 @@ def _default_branch(cwd: Path, runner: Runner) -> str | None:
     return None
 
 
-# cwd -> the SHA HEAD was at before the last sync_checkout() fast-forwarded it. deploy() hands
-# it to scripts/deploy.sh as WARDEN_DEPLOY_PREV, its rollback target (HEAD@{1} is only a guess).
-_pre_merge_head: dict[str, str] = {}
-
-
-def sync_checkout(cwd: Path, *, runner: Runner = _run_in_group) -> Deferred | None:
-    """Fast-forward `cwd` to `origin/<default>`; a `Deferred` says why it is not there.
+def sync_checkout(cwd: Path, *, runner: Runner = _run_in_group) -> Synced | Deferred:
+    """Fast-forward `cwd` to `origin/<default>`; a `Deferred` says why it is not there, a
+    `Synced` carries the SHAs before and after for deploy().
     Warden's own checkout is synced under the deploy lock — see the module docstring.
     Untracked files do not count as dirty — git itself refuses a merge they would collide with.
     `merge --ff-only` also succeeds on a checkout AHEAD of origin ("Already up to date"), so
@@ -209,8 +212,7 @@ def sync_checkout(cwd: Path, *, runner: Runner = _run_in_group) -> Deferred | No
         return Deferred(f"{exc} — a deploy is running in {cwd.name}")
 
 
-def _sync_checkout(cwd: Path, runner: Runner) -> Deferred | None:
-    _pre_merge_head.pop(str(cwd), None)
+def _sync_checkout(cwd: Path, runner: Runner) -> Synced | Deferred:
     fetched = _git(cwd, runner, "fetch", "--quiet", "origin")
     if not fetched.ok:
         return Deferred(f"git fetch failed in {cwd.name}: {fetched.tail.strip()[-200:]}")
@@ -232,16 +234,17 @@ def _sync_checkout(cwd: Path, runner: Runner) -> Deferred | None:
     if not heads.ok or len(shas) != 2 or shas[0] != shas[1]:
         return Deferred(f"checkout not at origin/{default}: {cwd.name} has commits origin does not "
                         f"({' vs '.join(s[:12] for s in shas) or 'unreadable'})")
-    if before and before != shas[0]:
-        _pre_merge_head[str(cwd)] = before
-    return None
+    return Synced(before or shas[0], shas[0])
 
 
-def deploy(cwd: Path, *, runner: Runner = _run_in_group, timeout_s: int | None = None) -> Ran:
-    """`make deploy` — the caller synced the checkout first (sync_checkout())."""
-    prev = _pre_merge_head.pop(str(cwd), None)
-    return _run(["make", "-C", str(cwd), "deploy"], runner, timeout_s or DEPLOY_TIMEOUT_S,
-                {"WARDEN_DEPLOY_PREV": prev} if prev else None)
+def deploy(cwd: Path, *, prev_sha: str | None = None, head_sha: str | None = None,
+           runner: Runner = _run_in_group, timeout_s: int | None = None) -> Ran:
+    """`make deploy` — the caller synced the checkout first (sync_checkout()) and passes its
+    `Synced` SHAs on: `prev_sha` is scripts/deploy.sh's rollback target (WARDEN_DEPLOY_PREV),
+    `head_sha` the commit it is meant to deploy (WARDEN_DEPLOY_HEAD) — the lock is released
+    between sync and deploy, so deploy.sh refuses to roll back when HEAD is no longer it."""
+    extra = {name: sha for name, sha in (("WARDEN_DEPLOY_PREV", prev_sha), ("WARDEN_DEPLOY_HEAD", head_sha)) if sha}
+    return _run(["make", "-C", str(cwd), "deploy"], runner, timeout_s or DEPLOY_TIMEOUT_S, extra or None)
 
 
 def verify(cwd: Path, *, runner: Runner = _run_in_group, timeout_s: int | None = None) -> Ran:

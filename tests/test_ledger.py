@@ -15,6 +15,7 @@ Run: .venv/bin/python3 tests/test_ledger.py
 
 import datetime as dt
 import importlib.util
+import os
 import sqlite3
 import sys
 import tempfile
@@ -1100,6 +1101,7 @@ def test_pending_migration_takes_a_snapshot_beside_the_database_first():
     snaps = _snapshots(path)
     assert len(snaps) == 1, snaps
     assert snaps[0].name.startswith(f"pre-migration-v14-to-{ledger.LEDGER_SCHEMA_VERSION}-"), snaps[0].name
+    assert snaps[0].name.endswith(f"-{os.getpid()}.db"), "the pid keeps two overlapping boots apart"
     # The snapshot is the pre-migration ledger: still v14, rows intact.
     snap = sqlite3.connect(snaps[0])
     assert snap.execute("SELECT version FROM schema_version").fetchone()[0] == 14

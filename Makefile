@@ -110,6 +110,11 @@ compile:
 .PHONY: check
 check: compile test
 
+# `check` runs its prerequisites in order even under `make -j`: `compile` is the gate that
+# says the scripts import before the suites start. (GNU make 4.4+ scopes this to `check`'s
+# prerequisites; make 3.81, the macOS default, applies it to the whole run.)
+.NOTPARALLEL: check
+
 # ---------------------------------------------------------------------------
 # Deploy / verify / logs — the repo contract
 # ---------------------------------------------------------------------------

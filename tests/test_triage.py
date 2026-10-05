@@ -167,6 +167,7 @@ def _default_fake_submit_review(*, cwd, pr, context=None, model=None):
 # Default fakes: the repo has neither a `deploy` nor a `verify` target, so a verifying item
 # goes straight through; a test that wants a target registers its own fake.
 ROLLOUT_CALLS: list[tuple[str, str]] = []
+_SYNCED = _rollout.Synced("a" * 40, "b" * 40)  # what the default sync_checkout fake reports
 
 # Every PR a test's revision closed — reset per _triage_env().
 CLOSED_PRS: list[tuple[str, str, int, str | None]] = []
@@ -285,7 +286,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ROLLOUT_CALLS.clear()
         _rollout.has_target = lambda cwd, target, **kw: ROLLOUT_CALLS.append(("has_target", target)) or False
         # The checkout sync before the deploy stage: synced, unless a test says otherwise.
-        _rollout.sync_checkout = lambda cwd, **kw: ROLLOUT_CALLS.append(("sync_checkout", cwd.name)) and None
+        _rollout.sync_checkout = lambda cwd, **kw: ROLLOUT_CALLS.append(("sync_checkout", cwd.name)) or _SYNCED
         _rollout.deploy = lambda cwd, **kw: (_ for _ in ()).throw(
             AssertionError("test: no fake rollout.deploy registered"))
         _rollout.verify = lambda cwd, **kw: (_ for _ in ()).throw(
@@ -4215,9 +4216,13 @@ def test_a_deploy_runs_once_records_its_operation_and_opens_the_window():
     with _triage_env() as (conn, ctx):
         eid = _seed_verifying(conn, "sig-deploy-ok")
         ran = _fake_rollout(targets=("deploy",), deploy=_ran(tail="deployed"))
+        deploy_kw: list[dict] = []
+        fake_deploy = _rollout.deploy
+        _rollout.deploy = lambda cwd, **kw: deploy_kw.append(kw) or fake_deploy(cwd, **kw)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert ran == [("deploy", "demo-repo")], ran
+        assert deploy_kw == [{"prev_sha": _SYNCED.before, "head_sha": _SYNCED.head}], "the sync's SHAs reach deploy()"
         assert item["verify_started_at"] is not None and item["strikes"] == 0, dict(item)
         op = conn.execute("SELECT * FROM operations WHERE kind='deploy'").fetchone()
         assert op["outcome"] == "done" and op["event_id"] == eid and "deployed" in op["receipt_json"]
@@ -10849,7 +10854,7 @@ def test_the_checkout_is_synced_before_the_makefile_is_read_so_a_merged_first_de
         _seed_verifying(conn, "sig-sync-first")
         order: list[str] = []
         synced = {"done": False}
-        _rollout.sync_checkout = lambda cwd, **kw: order.append("sync") or synced.update(done=True)
+        _rollout.sync_checkout = lambda cwd, **kw: order.append("sync") or synced.update(done=True) or _SYNCED
         _rollout.has_target = lambda cwd, target, **kw: order.append(f"has_target {target}") or synced["done"]
         _rollout.deploy = lambda cwd, **kw: order.append("deploy") or _ran()
         _rollout.verify = lambda cwd, **kw: order.append("verify") or _ran()
@@ -10864,7 +10869,7 @@ def test_a_repo_without_a_deploy_target_verifies_the_synced_tree_and_a_started_w
     with _triage_env() as (conn, ctx):
         eid = _seed_verifying(conn, "sig-sync-verify", origin="github_issue")
         order: list[str] = []
-        _rollout.sync_checkout = lambda cwd, **kw: order.append("sync")
+        _rollout.sync_checkout = lambda cwd, **kw: order.append("sync") or _SYNCED
         _rollout.has_target = lambda cwd, target, **kw: order.append(f"has_target {target}") or target == "verify"
         _rollout.verify = lambda cwd, **kw: order.append("verify") or _ran()
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -10874,7 +10879,7 @@ def test_a_repo_without_a_deploy_target_verifies_the_synced_tree_and_a_started_w
     with _triage_env() as (conn, ctx):
         _seed_verifying(conn, "sig-window-open", started=NOW - dt.timedelta(minutes=5))
         syncs: list[str] = []
-        _rollout.sync_checkout = lambda cwd, **kw: syncs.append(cwd.name)
+        _rollout.sync_checkout = lambda cwd, **kw: syncs.append(cwd.name) or _SYNCED
         _fake_rollout(targets=("verify",), verify=_ran())
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert syncs == [], "only the deploy stage syncs"

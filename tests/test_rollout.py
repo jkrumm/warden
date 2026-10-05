@@ -105,7 +105,7 @@ def test_has_target_refuses_a_target_that_is_not_deploy_or_verify():
 
 def test_sync_fast_forwards_to_origin_and_checks_it_landed_there():
     run = Script(_CLEAN_ON_MAIN)
-    assert rollout.sync_checkout(CWD, runner=run) is None
+    assert rollout.sync_checkout(CWD, runner=run) == rollout.Synced("c0ffee", "c0ffee")  # nothing merged
     cmds = [" ".join(a) for a in run.argvs]
     assert cmds[0] == f"git -C {CWD} fetch --quiet origin"
     assert cmds[-2] == f"git -C {CWD} merge --ff-only origin/main"
@@ -161,7 +161,7 @@ def test_the_default_branch_falls_back_to_master_when_origin_head_is_unset():
     run = Script({**_CLEAN_ON_MAIN, "symbolic-ref": (128, "", "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref"),
                   "refs/remotes/origin/main": (1, "", ""),
                   "rev-parse --abbrev-ref HEAD": (0, "master\n", "")})
-    assert rollout.sync_checkout(CWD, runner=run) is None
+    assert isinstance(rollout.sync_checkout(CWD, runner=run), rollout.Synced)
     assert run.ran("merge --ff-only origin/master") and run.ran("rev-parse HEAD origin/master")
 
 
@@ -289,33 +289,39 @@ def test_syncing_warden_own_checkout_is_deferred_while_a_deploy_holds_the_lock()
                 rollout.LOCK_WAIT_S = original
         assert isinstance(result, rollout.Deferred) and "busy" in result.reason, result
         assert run.argvs == [], "nothing may touch git while the deploy holds the lock"
-        assert rollout.sync_checkout(CWD, runner=run) is None
+        assert isinstance(rollout.sync_checkout(CWD, runner=run), rollout.Synced)
 
 
 def test_syncing_another_repo_never_takes_the_deploy_lock():
     with _EnvLock():
         with rollout.deploy_lock(wait_s=0):
-            assert rollout.sync_checkout(Path("/repos/other"), runner=Script(_CLEAN_ON_MAIN)) is None
+            assert isinstance(rollout.sync_checkout(Path("/repos/other"), runner=Script(_CLEAN_ON_MAIN)), rollout.Synced)
 
 
-def test_deploy_hands_the_pre_merge_sha_to_make_as_the_rollback_target_once():
+def test_sync_reports_the_shas_before_and_after_a_fast_forward():
     answers = {**_CLEAN_ON_MAIN, "rev-parse HEAD origin/": (0, "bbbb\nbbbb\n", ""),
                "rev-parse HEAD": (0, "aaaa\n", "")}
-    sync_run = Script(answers)
-    assert rollout.sync_checkout(CWD, runner=sync_run) is None
-    run = Script({})
-    rollout.deploy(CWD, runner=run)
-    assert run.kwargs[-1]["env"]["WARDEN_DEPLOY_PREV"] == "aaaa", run.kwargs[-1]["env"]
-    rollout.deploy(CWD, runner=run)
-    assert run.kwargs[-1]["env"].get("WARDEN_DEPLOY_PREV") != "aaaa", "a SHA must not outlive its deploy"
+    assert rollout.sync_checkout(CWD, runner=Script(answers)) == rollout.Synced("aaaa", "bbbb")
 
 
-def test_a_no_op_sync_clears_the_rollback_target():
-    rollout._pre_merge_head[str(CWD)] = "stale"
-    assert rollout.sync_checkout(CWD, runner=Script(_CLEAN_ON_MAIN)) is None  # HEAD == origin, nothing merged
+def test_deploy_hands_the_synced_shas_to_make_as_rollback_target_and_expected_head():
     run = Script({})
-    rollout.deploy(CWD, runner=run)
-    assert run.kwargs[-1]["env"].get("WARDEN_DEPLOY_PREV") != "stale"
+    rollout.deploy(CWD, prev_sha="aaaa", head_sha="bbbb", runner=run)
+    env = run.kwargs[-1]["env"]
+    assert env["WARDEN_DEPLOY_PREV"] == "aaaa" and env["WARDEN_DEPLOY_HEAD"] == "bbbb", env
+
+
+def test_deploy_without_shas_sets_neither_variable():
+    # Nothing is remembered between calls: a SHA reaches make only when the caller passes it.
+    run = Script({})
+    prior = {k: os.environ.pop(k, None) for k in ("WARDEN_DEPLOY_PREV", "WARDEN_DEPLOY_HEAD")}
+    try:
+        rollout.deploy(CWD, runner=run)
+    finally:
+        os.environ.update({k: v for k, v in prior.items() if v is not None})
+    env = run.kwargs[-1]["env"]
+    assert "WARDEN_DEPLOY_PREV" not in env and "WARDEN_DEPLOY_HEAD" not in env, env
+    assert not hasattr(rollout, "_pre_merge_head")
 
 
 def test_the_default_runner_returns_like_subprocess_run():

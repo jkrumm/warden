@@ -48,7 +48,7 @@ _RULESETS_UNAVAILABLE_RE = re.compile(r"Upgrade to GitHub Pro or make this repos
 # not exist (404) or a repository-level refusal.
 _TOKEN_CANNOT_READ_RE = re.compile(r"Resource not accessible by personal access token")
 
-# A ceiling on pages followed for one listing (100 runs a page at most): loud, never a silent cut.
+# A ceiling on pages followed for one listing (both request per_page=100): loud, never a silent cut.
 _MAX_PAGES = 20
 
 _token_cache: str | None = None
@@ -154,7 +154,7 @@ def check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     loud refusal."""
     if not _SHA_RE.match(sha):
         raise PreconditionError(f"{sha!r} is not a 40-hex commit sha — refusing before the request")
-    path = f"/repos/{owner}/{repo}/commits/{sha}/check-runs"
+    path = f"/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100"
     status, body = api("GET", path)
     if status == 403 and isinstance(body, dict) and _TOKEN_CANNOT_READ_RE.search(body.get("message") or ""):
         raise CheckRunsUnreadable(
@@ -165,7 +165,8 @@ def check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
 
 
 def _all_pages(status: int, body: Any, path: str, key: str, what: str) -> list[dict[str, Any]]:
-    """`body[key]` of the first page, then every further page until `total_count` is covered.
+    """`body[key]` of the first page, then every further page until `total_count` is covered
+    (GitHub always sends it for both listings; a body without it is unusable, not a single page).
     The first request is the caller's `path` untouched; later ones add `page=N` with the same
     page size, so a CI set larger than one page is read whole — a dropped page could hide the
     one failing run behind a green gate. Any page that fails or is unusable refuses, and a
@@ -179,7 +180,9 @@ def _all_pages(status: int, body: Any, path: str, key: str, what: str) -> list[d
             raise RemoteError(f"GitHub returned an unusable body reading {what}")
         items.extend(body[key])
         total = body.get("total_count")
-        if not isinstance(total, int) or len(items) >= total:
+        if not isinstance(total, int):
+            raise RemoteError(f"GitHub returned an unusable body reading {what}: no total_count")
+        if len(items) >= total:
             return items
         if not body[key] or page >= _MAX_PAGES:
             raise RemoteError(f"GitHub listed {len(items)} of {total} {what} before pages ran out")

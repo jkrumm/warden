@@ -10,7 +10,10 @@
 # `make agents`, never reloaded here. Rollback goes to the commit before the
 # fast-forward — WARDEN_DEPLOY_PREV (the loop's sync_checkout passes the pre-merge SHA),
 # else HEAD@{1} — only when it is a strict ancestor of HEAD, via `git reset --keep`,
-# which refuses rather than discard local changes.
+# which refuses rather than discard local changes. WARDEN_DEPLOY_HEAD is the commit the
+# sync landed on: the lock is released between sync and deploy, so when HEAD is no longer
+# it the checkout moved on its own, and a rollback would reset past commits this deploy
+# never saw — the health check still runs, but a failure is reported, never reset.
 #
 # Deploy and verify run under one flock (deploy.lock, shared with rollout.sync_checkout,
 # which fast-forwards this very checkout): macOS has no flock(1), so the script re-execs
@@ -45,8 +48,9 @@ schema_migratable() {
   printf '%s' "$1" | "$PY" -c '
 import json, re, sys
 try:
-    m = re.search(r"schema_version=(\d+).*LEDGER_SCHEMA_VERSION=(\d+)", json.load(sys.stdin)["error"], re.S)
-    sys.exit(0 if m and int(m[1]) < int(m[2]) else 1)
+    error = json.load(sys.stdin)["error"]
+    ledger, code = (re.search(rf"\b{key}=(\d+)", error) for key in ("schema_version", "LEDGER_SCHEMA_VERSION"))
+    sys.exit(0 if ledger and code and int(ledger[1]) < int(code[1]) else 1)
 except Exception:
     sys.exit(1)'
 }
@@ -98,9 +102,15 @@ rollback_target() {
 deploy() {
   [ "$REPO" = "$LIVE_REPO" ] || { echo "warden: deploy runs only in $LIVE_REPO, the checkout the agents run"; return 1; }
   [ -x "$PY" ] || { echo "warden: no venv — run 'make venv'"; return 1; }
-  local prev
+  local prev moved=0
   prev=$(rollback_target || true)
+  if [ -n "${WARDEN_DEPLOY_HEAD:-}" ] && [ "$WARDEN_DEPLOY_HEAD" != "$(git -C "$REPO" rev-parse HEAD)" ]; then
+    moved=1
+  fi
   health && { echo "  ✓ deployed $(git -C "$REPO" rev-parse --short HEAD)"; return 0; }
+  if [ "$moved" = 1 ]; then
+    echo "  ✗ deploy failed — checkout moved since sync, not rolling back"; return 1
+  fi
   if [ -z "$prev" ]; then
     echo "  ✗ deploy failed, no valid previous commit to roll back to"; return 1
   fi

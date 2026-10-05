@@ -750,13 +750,36 @@ _FULL_SHA = "d" * 40
 
 
 def test_check_runs_ok():
-    srv = _StubServer({("GET", f"/repos/jkrumm/gamma/commits/{_FULL_SHA}/check-runs"): (200, {"check_runs": [{"conclusion": "success"}]})})
+    srv = _StubServer({("GET", f"/repos/jkrumm/gamma/commits/{_FULL_SHA}/check-runs?per_page=100"): (
+        200, {"total_count": 1, "check_runs": [{"conclusion": "success"}]})})
     _gh_env(srv)
     try:
         assert github.check_runs("jkrumm", "gamma", _FULL_SHA) == [{"conclusion": "success"}]
     finally:
         srv.stop()
         _gh_cleanup()
+
+
+def test_a_listing_without_total_count_is_an_unusable_body_not_one_page():
+    """GitHub always sends `total_count` for check-runs and workflow runs; without it there is no
+    way to know the first page was everything, so it refuses rather than gating on a cut list."""
+    runs_path = f"/repos/jkrumm/gamma/actions/runs?head_sha={_FULL_SHA}&per_page=100"
+    checks_path = f"/repos/jkrumm/gamma/commits/{_FULL_SHA}/check-runs?per_page=100"
+    for call, path, key in ((github.check_runs, checks_path, "check_runs"),
+                            (github.workflow_runs, runs_path, "workflow_runs")):
+        for body in ({key: []}, {"total_count": "3", key: []}):
+            srv = _StubServer({("GET", path): (200, body)})
+            _gh_env(srv)
+            try:
+                try:
+                    call("jkrumm", "gamma", _FULL_SHA)
+                except RemoteError as e:
+                    assert "total_count" in str(e), e
+                else:
+                    raise AssertionError(f"expected RemoteError for {key} {body}")
+            finally:
+                srv.stop()
+                _gh_cleanup()
 
 
 def test_check_runs_invalid_sha_raises_precondition_error_before_any_request():
@@ -781,7 +804,7 @@ def test_workflow_runs_maps_to_check_run_shape_keeping_the_latest_per_workflow()
     re-run cannot mask the run that matters."""
     srv = _StubServer({("GET", f"/repos/jkrumm/gamma/actions/runs?head_sha={_FULL_SHA}&per_page=100"): (
         200,
-        {"workflow_runs": [
+        {"total_count": 3, "workflow_runs": [
             {"workflow_id": 1, "name": "CI", "status": "completed", "conclusion": "failure",
              "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z"},
             {"workflow_id": 1, "name": "CI", "status": "completed", "conclusion": "success",

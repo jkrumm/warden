@@ -1129,16 +1129,16 @@ def test_workflow_runs_attempt_breaks_ties_within_the_same_run():
 
 
 def test_check_runs_follow_total_count_beyond_the_first_page():
-    path = f"/repos/jkrumm/gamma/commits/{_SHA}/check-runs"
+    path = f"/repos/jkrumm/gamma/commits/{_SHA}/check-runs?per_page=100"
     ok = {"name": "a", "status": "completed", "conclusion": "success"}
     bad = {"name": "b", "status": "completed", "conclusion": "failure"}
     with _github_api({
         path: (200, {"total_count": 2, "check_runs": [ok]}),
-        path + "?page=2": (200, {"total_count": 2, "check_runs": [bad]}),
+        path + "&page=2": (200, {"total_count": 2, "check_runs": [bad]}),
     }) as requested:
         runs = github.check_runs("jkrumm", "gamma", _SHA)
     assert runs == [ok, bad], runs
-    assert requested == [path, path + "?page=2"], requested
+    assert requested == [path, path + "&page=2"], requested
 
 
 # --- guards run before the merged check; a pinned head must match -----------------------------

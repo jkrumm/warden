@@ -59,6 +59,7 @@ class Sandbox:
                     "WARDEN_DEPLOY_LOCK": str(self.dir / "deploy.lock"), "WARDEN_DEPLOY_LOCK_WAIT": "0.3"}
         self.env.pop("WARDEN_DEPLOY_LOCKED", None)
         self.env.pop("WARDEN_DEPLOY_PREV", None)
+        self.env.pop("WARDEN_DEPLOY_HEAD", None)
         return self
 
     def __exit__(self, *exc):
@@ -108,6 +109,15 @@ def test_schema_migratable_accepts_only_a_ledger_older_than_the_code():
                  (_schema_body(None, 5), 1), ('{"error": "ledger unreachable at /x: unable to open"}', 1),
                  ("not json", 1), ("", 1), ('["schema_version=1 LEDGER_SCHEMA_VERSION=2"]', 1)]
         for body, want in cases:
+            res = sb.bash('schema_migratable "$BODY"', BODY=body)
+            assert res.returncode == want, (body, res.returncode, res.stderr)
+
+
+def test_schema_migratable_reads_the_two_numbers_independently_of_their_order():
+    with Sandbox() as sb:
+        for ledger, code, want in ((3, 5, 0), (5, 5, 1), (6, 5, 1)):
+            body = json.dumps({"error": f"warden expects LEDGER_SCHEMA_VERSION={code}, "
+                                        f"the ledger at /x/warden.db is at schema_version={ledger}."})
             res = sb.bash('schema_migratable "$BODY"', BODY=body)
             assert res.returncode == want, (body, res.returncode, res.stderr)
 
@@ -182,6 +192,32 @@ def test_a_failed_deploy_rolls_back_to_the_validated_target():
         res = _deploy_with_health(sb, repo, WARDEN_DEPLOY_PREV=sha["B"])
         assert "rolled back" in res.stdout and res.stdout.strip().endswith("rc=1"), (res.stdout, res.stderr)
         assert sb.git(repo, "rev-parse", "HEAD") == sha["B"]
+
+
+def test_a_failed_deploy_rolls_back_when_head_is_the_commit_the_sync_landed_on():
+    with Sandbox() as sb:
+        repo, sha = sb.make_repo()
+        res = _deploy_with_health(sb, repo, WARDEN_DEPLOY_PREV=sha["B"], WARDEN_DEPLOY_HEAD=sha["C"])
+        assert "rolled back" in res.stdout and res.stdout.strip().endswith("rc=1"), (res.stdout, res.stderr)
+        assert sb.git(repo, "rev-parse", "HEAD") == sha["B"]
+
+
+def test_a_failed_deploy_does_not_roll_back_when_the_checkout_moved_since_the_sync():
+    # A -> B was synced, then something moved the checkout on to C: resetting to B would discard C.
+    with Sandbox() as sb:
+        repo, sha = sb.make_repo()
+        res = _deploy_with_health(sb, repo, WARDEN_DEPLOY_PREV=sha["A"], WARDEN_DEPLOY_HEAD=sha["B"])
+        assert "checkout moved since sync, not rolling back" in res.stdout, (res.stdout, res.stderr)
+        assert res.stdout.strip().endswith("rc=1") and "rolled back" not in res.stdout, res.stdout
+        assert sb.git(repo, "rev-parse", "HEAD") == sha["C"], "HEAD must not move"
+
+
+def test_a_moved_checkout_that_still_passes_health_is_a_successful_deploy():
+    with Sandbox() as sb:
+        repo, sha = sb.make_repo()
+        res = sb.bash(_point_at(repo) + "health() { return 0; }\ndeploy; echo rc=$?",
+                      WARDEN_DEPLOY_PREV=sha["A"], WARDEN_DEPLOY_HEAD=sha["B"])
+        assert "deployed" in res.stdout and res.stdout.strip().endswith("rc=0"), (res.stdout, res.stderr)
 
 
 def test_a_failed_deploy_refuses_to_roll_back_to_an_invalid_target():

@@ -123,9 +123,9 @@ def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) 
     if cwd is None:
         _start_verify(conn, item, now, note="no checkout to deploy; verifying")
         return core.get_item(conn, event_id)
-    deferred = _rollout.sync_checkout(cwd)
-    if deferred is not None:
-        core.strike(conn, event_id, now, f"deploy deferred: {deferred.reason}",
+    synced = _rollout.sync_checkout(cwd)
+    if isinstance(synced, _rollout.Deferred):
+        core.strike(conn, event_id, now, f"deploy deferred: {synced.reason}",
                      retry_state=core.STATE_VERIFYING, expect_state=core.STATE_VERIFYING)
         conn.commit()
         return None
@@ -143,7 +143,7 @@ def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) 
     op_id = work.record_operation(conn, event_id=event_id, kind="deploy", repo=item["repo"],
                                    authorized_by="auto-verify",
                                    note=f"sha:{item['merged_sha']}" if item["merged_sha"] else None)
-    result = _rollout.deploy(cwd)
+    result = _rollout.deploy(cwd, prev_sha=synced.before, head_sha=synced.head)
     receipt = json.dumps({"exitCode": result.exit_code, "output": result.tail})
     if not result.ok:
         work.complete_operation(conn, op_id, outcome="failed", receipt=receipt)

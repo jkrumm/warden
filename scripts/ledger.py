@@ -805,7 +805,7 @@ def _tables_exist(conn: sqlite3.Connection, names: tuple[str, ...]) -> bool:
 
 
 def _snapshot_before_migrating(conn: sqlite3.Connection, current: int) -> None:
-    """`VACUUM INTO` <db dir>/backups/pre-migration-v<from>-to-<to>-<UTC stamp>.db,
+    """`VACUUM INTO` <db dir>/backups/pre-migration-v<from>-to-<to>-<UTC stamp>-<pid>.db,
     but only when a migration is actually pending AND there is a ledger to lose
     (a file-backed database that already carries its four tables — a fresh or
     in-memory one has nothing to back up). One implementation: `snapshot()`.
@@ -821,7 +821,7 @@ def _snapshot_before_migrating(conn: sqlite3.Connection, current: int) -> None:
     if not db_file:
         return
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    dest = Path(db_file).parent / "backups" / f"pre-migration-v{current}-to-{LEDGER_SCHEMA_VERSION}-{stamp}.db"
+    dest = Path(db_file).parent / "backups" / f"pre-migration-v{current}-to-{LEDGER_SCHEMA_VERSION}-{stamp}-{os.getpid()}.db"
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         snapshot(conn, dest)
