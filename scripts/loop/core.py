@@ -215,8 +215,8 @@ DEFAULT_HOST_VERB_MAX_ATTEMPTS = 2
 # A host verb keeps a confidence bar that auto-implement does not have (review is its gate): a
 # restart from HOST_VERB_ALLOWLIST is idempotent, followed by a positive liveness probe before the
 # item is marked done, and capped at `hostVerbMaxAttempts`, so a wrong guess costs one restart and
-# a `failed` card with the receipt, cheaper than a human running the same restart. `high` is the
-# default; a policy may only choose a LOWER bar from this closed vocabulary.
+# a `failed` card with the receipt, cheaper than a human running the same restart. The default is
+# `medium`; a policy may choose another bar from this closed vocabulary.
 _CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 DEFAULT_HOST_VERB_MIN_CONFIDENCE = "medium"
 
@@ -360,8 +360,13 @@ try:
     _wp_spec.loader.exec_module(_watchdog_poll)
     normalize_title = _watchdog_poll.normalize_title
     fingerprint = _watchdog_poll.fingerprint
-except Exception:  # pragma: no cover - defensive: keep this module independently runnable
+except Exception as _wp_exc:  # pragma: no cover - defensive: keep this module independently runnable
     import re as _re
+
+    # Once per import, stderr only: the mirror below can drift from watchdog-poll.py, so the
+    # fallback must never be taken silently (fingerprints would diverge from the poller's).
+    print(f"warden: watchdog-poll.py failed to load ({_wp_exc!r}) — using the hand-mirrored "
+          "normalize_title()/fingerprint() fallback", file=sys.stderr)
 
     _DEDUP_NORMALIZE = _re.compile(r"[^a-z0-9]+")
 

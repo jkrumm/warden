@@ -165,6 +165,31 @@ def submit(
     return job
 
 
+def _submit_job(tool: str, params: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/jobs {"tool": tool, "params": params}` and return the `{"job": {...}}` envelope's
+    job: the shared transport and error handling of `submit_review`, `submit_triage` and
+    `submit_update_pr`. A 4xx is `SubmitRefused`, anything else a `RemoteError`."""
+    try:
+        status, text = _request("POST", "/api/jobs", {"tool": tool, "params": params})
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise RemoteError(
+            f"sideclaw {tool} submit failed (is the LaunchAgent up? curl {_base()}/health)",
+            maybe_mutated=True,
+        )
+
+    _raise_for_submit_status(status, text)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
+
+    job = parsed.get("job") if isinstance(parsed, dict) else None
+    if not isinstance(job, dict) or "id" not in job:
+        raise RemoteError(f"sideclaw accepted the {tool} job but returned no id")
+    return job
+
+
 def submit_review(*, cwd: Path, pr: int, context: str | None = None, model: str | None = None) -> dict[str, Any]:
     """The `review` counterpart to `submit()` — same transport, error
     handling and `{"job": {...}}` envelope, different tool/params shape
@@ -174,27 +199,7 @@ def submit_review(*, cwd: Path, pr: int, context: str | None = None, model: str 
         params["context"] = context
     if model:
         params["model"] = model
-    body = {"tool": "review", "params": params}
-
-    try:
-        status, text = _request("POST", "/api/jobs", body)
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise RemoteError(
-            f"sideclaw review submit failed (is the LaunchAgent up? curl {_base()}/health)",
-            maybe_mutated=True,
-        )
-
-    _raise_for_submit_status(status, text)
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
-
-    job = parsed.get("job") if isinstance(parsed, dict) else None
-    if not isinstance(job, dict) or "id" not in job:
-        raise RemoteError("sideclaw accepted the review job but returned no id")
-    return job
+    return _submit_job("review", params)
 
 
 def submit_triage(*, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -202,27 +207,7 @@ def submit_triage(*, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     sideclaw validates the model's answer against `schema` and, on a `done` job, returns it at
     `job.result.result`. No `model` param — sideclaw routes the tool itself. Same transport and
     error handling as `submit_review()`: a 4xx is `SubmitRefused`, anything else a `RemoteError`."""
-    body = {"tool": "triage", "params": {"prompt": prompt, "schema": schema}}
-
-    try:
-        status, text = _request("POST", "/api/jobs", body)
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise RemoteError(
-            f"sideclaw triage submit failed (is the LaunchAgent up? curl {_base()}/health)",
-            maybe_mutated=True,
-        )
-
-    _raise_for_submit_status(status, text)
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
-
-    job = parsed.get("job") if isinstance(parsed, dict) else None
-    if not isinstance(job, dict) or "id" not in job:
-        raise RemoteError("sideclaw accepted the triage job but returned no id")
-    return job
+    return _submit_job("triage", {"prompt": prompt, "schema": schema})
 
 
 def submit_update_pr(*, cwd: str | Path, pr: int) -> dict[str, Any]:
@@ -231,27 +216,7 @@ def submit_update_pr(*, cwd: str | Path, pr: int) -> dict[str, Any]:
     force-with-lease push. Same transport and error handling as `submit_review()`: a 4xx is
     `SubmitRefused`, anything else a `RemoteError`. The result is read with
     `update_pr_result()`."""
-    body = {"tool": "update_pr", "params": {"cwd": str(cwd), "pr": pr}}
-
-    try:
-        status, text = _request("POST", "/api/jobs", body)
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise RemoteError(
-            f"sideclaw update_pr submit failed (is the LaunchAgent up? curl {_base()}/health)",
-            maybe_mutated=True,
-        )
-
-    _raise_for_submit_status(status, text)
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
-
-    job = parsed.get("job") if isinstance(parsed, dict) else None
-    if not isinstance(job, dict) or "id" not in job:
-        raise RemoteError("sideclaw accepted the update_pr job but returned no id")
-    return job
+    return _submit_job("update_pr", {"cwd": str(cwd), "pr": pr})
 
 
 def update_pr_result(job: dict[str, Any]) -> dict[str, Any]:
