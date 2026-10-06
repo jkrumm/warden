@@ -638,6 +638,13 @@ _SET_STATE_COLUMNS = (
 # The states an item can be re-driven INTO: a stage of the pipeline that has a poller.
 _REDRIVE_STAGES = (STATE_NEW, STATE_TRIAGED, STATE_WORKING, STATE_MERGING, STATE_VERIFYING)
 
+# The states a fresh investigation can be requested from: past the first investigation (there is
+# something to re-investigate), waiting on a person, or gone quiet. `new`/`triaged` are excluded —
+# escalate()/escalate_origin_items() already pick those up. Shared by notify's Argo reinvestigate
+# handler and `warden reinvestigate`; scripts/api.py's `_REINVESTIGATE_STATES` mirrors it by hand
+# for `/board`'s `availableActions`.
+REINVESTIGATE_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED, STATE_QUIET)
+
 # The merge train's position, meaningful only while the item is `merging`: leaving it clears
 # them (set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha` and
 # `train_evidence` are not among them; see advance_merge_trains().
@@ -910,6 +917,19 @@ def redrive(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, re
     if stage == STATE_MERGING:
         columns["train_rewinds"] = 0
     return set_state(conn, item["event_id"], stage, now, expect_state=STATE_FAILED, **columns)
+
+
+def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
+                  expect_state: str, note: str) -> int:
+    """Send an item back to `triaged`, whose pollers (escalate()/escalate_origin_items()) open the
+    fresh investigation. The old investigation, review and PR handles are cleared so the new
+    `working` phase starts clean, `dispatch_job` included: it would otherwise hold the cooldown
+    anchor against the re-run just asked for. A compare-and-set on `expect_state`; returns the
+    rowcount (0: another pass moved the item first). Shared by Argo's reinvestigate handler and
+    `warden reinvestigate`; the allowed-state precondition (REINVESTIGATE_ALLOWED_STATES) is the
+    caller's."""
+    return set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
+                     dispatch_job=None, implement_job=None, validation_job=None)
 
 
 def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,

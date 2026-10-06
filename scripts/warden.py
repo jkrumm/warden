@@ -21,6 +21,7 @@ VERBS
   revert <event-id>   record a revert PR against a merged item (--pr --why)
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
   retry <event-id>    put a `failed` item back where it failed, with a fresh re-drive budget (--why)
+  reinvestigate <event-id>  send an item back for a fresh investigation (--why required)
   help
 
 Global flags, anywhere on the line, `--flag value` or `--flag=value`:
@@ -136,6 +137,10 @@ def _mode(verb: str | None, state: _State) -> str:
     if verb == "retry":
         if state.did_mutate:
             return "retried"
+        return "dry-run" if state.dry_run else "refused"
+    if verb == "reinvestigate":
+        if state.did_mutate:
+            return "reinvestigated"
         return "dry-run" if state.dry_run else "refused"
     if verb == "close":
         if state.did_mutate:
@@ -857,6 +862,53 @@ def cmd_retry(conn, flags: Flags, positional: list[str], state: _State) -> dict[
             "redrives": 0, "note": core.get_item(conn, event_id)["note"]}
 
 
+# --- reinvestigate ---------------------------------------------------------------
+
+
+def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
+    """Send an item the owner decided to re-open back to `triaged` for a fresh investigation — the
+    CLI counterpart to Argo's reinvestigate action, through the same shared core.reinvestigate().
+    Accepts the states owner actions act on (needs_decision/failed/quiet). Local ledger only, like
+    `close`/`retry`: no GitHub or sideclaw call."""
+    # No require_backend(): reinvestigate only writes triage_items/item_transitions in the local
+    # ledger — no GitHub or sideclaw call to authenticate for.
+    if not positional:
+        raise UsageError('usage: warden reinvestigate <event-id> --why "<reason>" [--json]')
+    event_id = _parse_int(positional[0], "event-id")
+    if not flags.why:
+        raise UsageError(
+            'reinvestigate requires --why "<reason>" (it lands in the audit log and becomes the item\'s note)'
+        )
+    state.target = str(event_id)
+
+    item = core.get_item(conn, event_id)
+    if item is None:
+        raise UsageError(f"no triage_items row for event_id {event_id}")
+    if item["state"] not in core.REINVESTIGATE_ALLOWED_STATES:
+        raise PreconditionError(
+            f"triage item {event_id} is in state '{item['state']}', not one of "
+            f"{'/'.join(core.REINVESTIGATE_ALLOWED_STATES)} — nothing to re-investigate"
+        )
+    note = f"re-investigation requested via CLI: {flags.why}"
+
+    if flags.dry_run:
+        state.dry_run = True
+        return {"verb": "reinvestigate", "ok": True, "dryRun": True, "eventId": event_id,
+                "fromState": item["state"], "state": core.STATE_TRIAGED,
+                "note": "nothing written — no transition row, no state change"}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    if not core.reinvestigate(conn, event_id, now, expect_state=item["state"], note=note):
+        conn.rollback()
+        raise PreconditionError(
+            f"triage item {event_id} moved while this reinvestigate was applied — look again"
+        )
+    conn.commit()
+    state.did_mutate = True
+    return {"verb": "reinvestigate", "ok": True, "eventId": event_id, "fromState": item["state"],
+            "state": core.STATE_TRIAGED, "note": core.get_item(conn, event_id)["note"]}
+
+
 # --- close ---------------------------------------------------------------------
 
 # States a human can resolve by hand: no episode or operation is in flight,
@@ -1034,6 +1086,7 @@ VERBS
   revert <event-id>   record a revert PR against a merged item (--pr --why)
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
   retry <event-id>    put a `failed` item back where it failed, with a fresh re-drive budget (--why)
+  reinvestigate <event-id>  send an item back for a fresh investigation (--why required)
   help
 
 Global flags, anywhere on the line, --flag value or --flag=value:
@@ -1108,6 +1161,8 @@ def main(argv: list[str]) -> int:
                 out = cmd_close(conn, flags, rest, state)
             elif verb == "retry":
                 out = cmd_retry(conn, flags, rest, state)
+            elif verb == "reinvestigate":
+                out = cmd_reinvestigate(conn, flags, rest, state)
             else:
                 raise UsageError(
                     f"unknown verb: {verb}\n"
@@ -1121,6 +1176,7 @@ def main(argv: list[str]) -> int:
                     "  revert <event-id> record a revert PR against a merged item (--pr --why)\n"
                     "  close <event-id>  resolve an open item by hand (--why required; --reason resolved|ignored)\n"
                     "  retry <event-id>  put a failed item back where it failed (--why)\n"
+                    "  reinvestigate <event-id>  send an item back for a fresh investigation (--why)\n"
                     "  help"
                 )
         finally:

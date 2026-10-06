@@ -1248,6 +1248,65 @@ def test_retry_refuses_anything_but_a_failed_item_with_a_stage():
     conn.close()
 
 
+# --- reinvestigate -------------------------------------------------------------
+
+
+def test_reinvestigate_sends_an_owner_flagged_item_back_to_triaged_for_a_fresh_investigation():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 50, state="needs_decision", repo="gamma",
+               dispatch_job="old-investigate", implement_job="old-implement", validation_job="old-validation")
+    _seed_item(db, 54, state="quiet", repo="gamma", dispatch_job="old-investigate")
+    proc = h.run(["reinvestigate", "50", "--why", "reopen after a fix landed", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["verb"] == "reinvestigate" and out["ok"] is True, out
+    assert out["eventId"] == 50 and out["fromState"] == "needs_decision" and out["state"] == "triaged", out
+    assert out["note"] == "re-investigation requested via CLI: reopen after a fix landed", out
+    assert h.run(["reinvestigate", "54", "--why", "signal returned", "--json"], env=h.base_env(db=db)).returncode == 0
+    conn, _ = _connect(db)
+    for event_id in (50, 54):
+        row = _row(conn, "SELECT * FROM triage_items WHERE event_id=?", (event_id,))
+        assert row["state"] == "triaged", dict(row)
+        assert row["dispatch_job"] is None and row["implement_job"] is None and row["validation_job"] is None, dict(row)
+    trans = _row(conn, "SELECT from_state, to_state FROM item_transitions WHERE event_id=50 ORDER BY id DESC LIMIT 1")
+    assert trans["from_state"] == "needs_decision" and trans["to_state"] == "triaged", dict(trans)
+    conn.close()
+
+
+def test_reinvestigate_dry_run_writes_nothing():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 51, state="failed", repo="gamma", implement_job="job-lost")
+    proc = h.run(["reinvestigate", "51", "--why", "x", "--dry-run", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["dryRun"] is True and out["state"] == "triaged", out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, implement_job FROM triage_items WHERE event_id=51")
+    assert row["state"] == "failed" and row["implement_job"] == "job-lost", dict(row)
+    count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id=51")["n"]
+    assert count == 0, count
+    conn.close()
+
+
+def test_reinvestigate_refuses_states_outside_the_allowlist_and_requires_why():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 52, state="working", repo="gamma", implement_job="job-x")
+    _seed_item(db, 53, state="needs_decision", repo="gamma")
+    proc = h.run(["reinvestigate", "52", "--why", "x", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 2 and out["ok"] is False, out
+    assert h.run(["reinvestigate", "53", "--json"], env=h.base_env(db=db)).returncode == 64, "why is required"
+    assert h.run(["reinvestigate", "999", "--why", "x", "--json"], env=h.base_env(db=db)).returncode == 64
+    assert h.run(["reinvestigate", "--json"], env=h.base_env(db=db)).returncode == 64
+    conn, _ = _connect(db)
+    assert _row(conn, "SELECT state FROM triage_items WHERE event_id=52")["state"] == "working"
+    assert _row(conn, "SELECT state FROM triage_items WHERE event_id=53")["state"] == "needs_decision"
+    count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id IN (52,53)")["n"]
+    assert count == 0, count
+    conn.close()
+
+
 # --- close ---------------------------------------------------------------------
 
 

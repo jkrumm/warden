@@ -171,9 +171,8 @@ ARGO_ACTION_VERBS = frozenset({"implement", "merge", "dismiss", "reinvestigate",
 _ARGO_DISMISS_ALLOWED_STATES = (
     core.STATE_NEW, core.STATE_TRIAGED, core.STATE_NEEDS_DECISION, core.STATE_FAILED, core.STATE_QUIET,
 )
-# The same without `new`/`triaged`: an item not yet investigated has nothing to re-investigate;
-# escalate()/escalate_origin_items() pick it up on their own.
-_ARGO_REINVESTIGATE_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED, core.STATE_QUIET)
+# `reinvestigate`'s allowed states live in core (REINVESTIGATE_ALLOWED_STATES), shared with the
+# `warden reinvestigate` CLI verb.
 _ARGO_IMPLEMENT_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED)
 _ARGO_MERGE_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED)
 # `retry` re-enters the stage a `failed` item stored (core.redrive()); api.py offers it only when one is.
@@ -323,14 +322,12 @@ def _apply_argo_dismiss(conn: sqlite3.Connection, item: sqlite3.Row, event_id: i
 def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                                now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
     """Back to `triaged`, whose pollers (escalate()/escalate_origin_items()) open the fresh
-    investigation. The old investigation, review and PR handles are cleared so the new `working`
-    phase starts clean, `dispatch_job` included: it would otherwise hold the cooldown anchor
-    against the re-run just asked for."""
-    if item["state"] not in _ARGO_REINVESTIGATE_ALLOWED_STATES:
+    investigation. The transition itself is core.reinvestigate(), shared with the
+    `warden reinvestigate` CLI verb."""
+    if item["state"] not in core.REINVESTIGATE_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, reinvestigate not allowed"
-    rowcount = core.set_state(conn, event_id, core.STATE_TRIAGED, now, expect_state=item["state"],
-                               note="re-investigation requested by the owner via Argo",
-                               dispatch_job=None, implement_job=None, validation_job=None)
+    rowcount = core.reinvestigate(conn, event_id, now, expect_state=item["state"],
+                                  note="re-investigation requested by the owner via Argo")
     conn.commit()
     if rowcount == 0:
         return "rejected", None, "item state changed before this action could be applied — retry from Argo"

@@ -32,6 +32,7 @@ triage → investigate → implement → merge train → deploy → verify, visi
 | `merge` | `warden merge <job-id> --why … --confirm` | lands a PR through the same merge gate |
 | `abort` / `revert` / `close` | `warden abort <event-id> --why …` · `warden revert <event-id> --pr <n> --why …` · `warden close <event-id> --why … [--reason resolved\|ignored]` | stop, record a revert, close by hand |
 | `retry` | `warden retry <event-id> [--why …]` | puts a `failed` item back where it failed, with a fresh re-drive budget |
+| `reinvestigate` | `warden reinvestigate <event-id> --why …` | sends an item back to `triaged` for a fresh investigation |
 
 `warden help` has the exact flags.
 

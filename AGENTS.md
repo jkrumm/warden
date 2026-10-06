@@ -20,7 +20,7 @@ item moves.
 | `scripts/loop/` | the loop by stage: `core` (paths, states, `set_state`, strikes, policy), `intake`, `triaging`, `work`, `train`, `verify`, `notify` |
 | `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate (check runs, falling back to Actions workflow runs when the token cannot read checks), rollout (`make deploy`/`verify`), dispatch, operations |
 | `scripts/clients/` | the only HTTP/CLI boundaries: sideclaw, GitHub, Argo, Slack, secrets |
-| `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`) |
+| `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`, `reinvestigate`) |
 | `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents |
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
 | `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns |
