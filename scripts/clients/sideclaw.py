@@ -49,8 +49,8 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 # answers with v4. DISPATCH_SCHEMA_VERSIONS is what assert_result_schema()
 # enforces; a version outside the window is refused as loudly as ever. Review
 # has a single live version.
-DISPATCH_SCHEMA_VERSION = 5
 DISPATCH_SCHEMA_VERSIONS: frozenset[int] = frozenset({4, 5})
+DISPATCH_SCHEMA_VERSION = max(DISPATCH_SCHEMA_VERSIONS)  # the current version, derived so the two cannot drift
 REVIEW_SCHEMA_VERSION = 1
 
 # server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES. `pr_updated` (a `revisionOf`

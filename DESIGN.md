@@ -39,6 +39,9 @@ carrying the error. A sideclaw 4xx on submit is a refusal, not a strike: the ite
 ends `failed` with sideclaw's message — except a refused escalation `model`
 (resubmitted once without it), a lease refusal (retry in 10 minutes, no strike)
 and a refused triage submit (strikes; never the item's fault).
+An implement whose repo check TOOL failed to run (sideclaw's `checks_tool_failed`,
+dispatch schema v5) is an infrastructure failure too: it strikes and never spends a
+revision — only a red suite (`checks_failed`) goes back to the implementer.
 
 `failed` is classified where it happens (`failure_class`) and is not a graveyard for
 what was never the work's fault. `infra` (sideclaw 5xx/unreachable, a synthesis

@@ -9735,3 +9735,25 @@ Item 1470, PR #12. Its revision's repo check died on sideclaw's `check` route (t
 claude-harness `DeepSeek-V4-Flash` id is rejected by IU, `unrecognized_model`) and parked
 the item; landed by hand. `make check` green — `test_triage.py` 488/488,
 `test_warden_cli.py` 83/83 (+3).
+
+
+## 126. A check-tool failure is an infrastructure strike, not a revision (2026-10-07)
+
+An implement episode whose repo check TOOL crashed or was idle-killed reported
+`checks_failed` + `human`, identical to a red suite except in prose, so the item parked in
+`needs_decision` (1470, 1472, 1400 on 2026-10-06, each landed or re-driven by hand).
+sideclaw will report it as its own outcome, `checks_tool_failed`, at dispatch schema v5.
+
+warden goes first: `clients/sideclaw.py` accepts a dispatch schema WINDOW
+(`DISPATCH_SCHEMA_VERSIONS = {4, 5}`, the scalar derived as its max so the two cannot
+drift) — a sideclaw not yet restarted still answers v4 — and anything outside it is
+refused as loudly as before; review stays pinned at 1. `poll_implement_jobs()` strikes on
+`checks_tool_failed` (backoff, third strike `failed` infra) and never calls
+`hand_back_for_revision()`: no `revision_count` spent, no `validation_status`.
+
+Item 1473, PR #14. Its review was partial (the api-contract angle idle-killed) with one
+blocking finding — "investigate polling still pins the v5 scalar" — rejected on reading:
+`work.py`'s implement poll is the only dispatch `assert_result_schema()` call site. Taken
+from the improvements: the derived scalar, and the new test now asserts the branch's own
+message ("the check tool itself failed"); verified it fails with the branch disabled.
+`make check` green — `test_triage.py` 491/491 (+3), `test_warden_cli.py` 83/83.

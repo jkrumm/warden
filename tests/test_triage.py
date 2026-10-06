@@ -3141,7 +3141,7 @@ def test_implement_outcome_checks_tool_failed_is_an_infra_strike_never_a_revisio
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert item["revision_count"] == 0, "a tool failure must never spend a revision"
-        assert "checks_tool_failed" in item["note"], item["note"]
+        assert "the check tool itself failed" in item["note"], item["note"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-checks-tool-failed'").fetchone()
         assert d["validation_status"] is None, "a tool failure is not a checks_failed revision"
 
