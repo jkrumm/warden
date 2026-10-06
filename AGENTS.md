@@ -80,6 +80,7 @@ is reported, not reloaded. Schema migrations run on the loop's next boot.
   loop itself has no Kuma monitor — its staleness shows on `/health`.
 - OTel `service.name`: none — warden does not export telemetry.
 - The queue: Argo `/warden`. Slack #agents: one line per `fixed` / `needs_decision`.
+- Continuous improvement: a herdr tab `improve` in this workspace runs `/loop` on `docs/improve/LOOP.md`; one line per iteration in `docs/improve/JOURNAL.md`. Steer it with `rd say`.
 
 ## Gotchas
 
