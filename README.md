@@ -26,7 +26,7 @@ triage → investigate → implement → merge train → deploy → verify, visi
 
 | Verb | Syntax | Does |
 |-|-|-|
-| `run` | `warden run <repo> [--tier investigate\|implement] [--wait] [--json] <<'BRIEF' … BRIEF` | opens an item |
+| `run` | `warden run <repo> [--tier investigate\|implement] [--wait] [--json] <<'BRIEF' … BRIEF` | opens an item; implements when the verdict says so, `--tier investigate` = answer only |
 | `dispatch` | `warden dispatch <repo> [--tier …] [--model …] <<'BRIEF' … BRIEF` | one bare episode, a verdict, no item |
 | `status` / `list` | `warden status <job-id> [--json]` · `warden list [open\|today\|all]` | see it |
 | `merge` | `warden merge <job-id> --why … --confirm` | lands a PR through the same merge gate |
