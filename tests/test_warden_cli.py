@@ -510,9 +510,25 @@ def test_run_record_round_trip():
     out = _json_or_fail(proc)
     assert proc.returncode == 0, out
     assert out["verb"] == "run" and out["origin"] == "human" and out["repo"] == "alpha"
-    assert out["maxTier"] == "investigate" and out["queued"] is False
+    assert out["maxTier"] == "implement" and out["queued"] is False
     assert out["jobId"] == "job-run-rt" and out["state"] == "working"
     assert out["eventId"] is not None
+
+
+def test_run_tier_investigate_caps_the_item_at_investigate():
+    """An explicit `--tier investigate` is the answer-only ceiling: the item is opened with
+    `max_tier='investigate'`, so a verdict that says implement is closed with its answer instead
+    of auto-implementing. Only the explicit flag caps it — no flag defaults to `implement`."""
+    h = Harness()
+    srv = stubs.StubServer(_run_routes({"id": "job-run-inv", "status": "running"}))
+    try:
+        proc = h.run(["run", "alpha", "--tier", "investigate", "--json"],
+                     env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+    finally:
+        srv.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0, out
+    assert out["maxTier"] == "investigate" and out["state"] == "working", out
 
 
 def test_run_triages_first_then_dispatches_on_new():
@@ -679,7 +695,8 @@ def test_run_wait_folds_the_verdict_before_returning():
     db = h.new_db()
     srv = stubs.StubServer(_run_routes({"id": "job-run-fold", "status": "running"}, extra={
         ("GET", "/api/jobs/job-run-fold"): (200, {"job": {"id": "job-run-fold", "status": "done",
-                                                           "result": {"summary": "all good, no fix needed"}}}),
+                                                           "result": {"summary": "all good, no fix needed",
+                                                                      "nextAction": "none"}}}),
     }))
     try:
         proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(db=db, sideclaw=srv.base),

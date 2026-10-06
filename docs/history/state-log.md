@@ -9692,3 +9692,25 @@ policy and infra shared one budget; backfill LIKE missed non-`failed` episode
 statuses); round 2 — 3 accepted (budget reset skipped on the real handoff; work
 recipes re-entering a stuck `working`; Argo hand-back reset the backoff), 1 rejected
 (reset on `triaged → working`: every re-drive would get a fresh budget).
+
+
+## 124. `warden run` without `--tier` defaults to an implement ceiling (2026-10-06)
+
+`warden run <repo>` with no `--tier` opened its item at `max_tier='investigate'`: `cmd_run`
+derived the ceiling from the RESOLVED start tier (`tier = flags.tier or "investigate"`), so
+only an explicit `--tier implement` raised it. `fold_dispatch_verdict()` closes every item
+whose `max_tier` is `investigate` with its answer regardless of the verdict's `nextAction`
+(`work.py`'s fold table), so an investigation that concluded `implement` was folded
+`closed(resolved)` and never reached `maybe_auto_implement()` — the silently-dropped in-flight
+fixes 1457/1459/1460 and the owner-ask 1461 (`docs/improve/JOURNAL.md`, 2026-10-06).
+
+The ceiling is now derived from the FLAG, not the start tier: an explicit `--tier investigate`
+stays answer-only, while the default (like `--tier implement`) lets a verdict that says
+implement reach one. The first episode is always `investigate` (`escalate_origin_items()`), so
+`--tier` was only ever the ceiling. `test_warden_cli.py`'s no-flag round-trip now expects
+`maxTier='implement'`; a new `test_run_tier_investigate_caps_the_item_at_investigate` pins the
+explicit cap; and the `--wait` fold stub carries a well-formed `nextAction: none` (under an
+implement ceiling a verdict missing `nextAction` is correctly a `failed`, not an answered
+close, so the old stub would have failed).
+
+`make check` green, test_triage 488 → 488.

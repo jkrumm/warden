@@ -485,7 +485,11 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
     policy.valid_origin(channel=flags.origin_channel, thread_ts=flags.origin_thread)
 
     brief = dispatch.normalize_brief(_read_brief(flags))
-    max_tier = "implement" if tier == "implement" else "investigate"
+    # `--tier` is this item's CEILING, not the tier of its first episode: that is always
+    # `investigate`, dispatched by escalate_origin_items(). An explicit `--tier investigate`
+    # asks for an answer only, while the default (`tier` above) — like `--tier implement` —
+    # lets a verdict that says implement still reach one.
+    max_tier = "investigate" if flags.tier == "investigate" else "implement"
 
     state.target = f"{name}:{tier}"
     now = dt.datetime.now(dt.timezone.utc)
