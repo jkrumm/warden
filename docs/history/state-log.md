@@ -9714,3 +9714,24 @@ implement ceiling a verdict missing `nextAction` is correctly a `failed`, not an
 close, so the old stub would have failed).
 
 `make check` green, test_triage 488 → 488.
+
+
+## 125. `warden reinvestigate` — the CLI twin of Argo's reinvestigate (2026-10-06)
+
+Re-running an item's investigation was an Argo button only, so neither the improvement loop
+nor Hermes could re-drive a `needs_decision` item whose question predates sideclaw's
+tightened escalation rules (sideclaw 9baee68). `warden reinvestigate <event-id> --why` now
+does it through `core.reinvestigate()`, the one transition both the CLI and Argo's handler
+call; the allowed states moved to `core.REINVESTIGATE_ALLOWED_STATES`
+(`needs_decision`/`failed`/`quiet`, still mirrored by hand in `api.py` for `/board`).
+
+**Behaviour change, both doors:** the transition now also clears `pr_url` and
+`reviewed_sha`, not only the three job handles. The step-7 review of the first attempt
+caught it: `set_state()`'s `work`-failure recipe routes back to `merging` whenever `pr_url`
+is set, so a stale URL would mis-route a later failure of the fresh run. The Argo handler's
+existing test now seeds and asserts both columns.
+
+Item 1470, PR #12. Its revision's repo check died on sideclaw's `check` route (the
+claude-harness `DeepSeek-V4-Flash` id is rejected by IU, `unrecognized_model`) and parked
+the item; landed by hand. `make check` green — `test_triage.py` 488/488,
+`test_warden_cli.py` 83/83 (+3).
