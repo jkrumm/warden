@@ -101,8 +101,9 @@ Every non-terminal `triage_items` row plus counts.
   `reason` is the item's `note`.
 - `availableActions` is what the UI offers, from the item's state, its PR and its revert
   status; `apply_argo_actions()` re-validates when an action is applied. `implement`:
-  `needs_decision`, `failed`. `merge`: the same, plus a PR whose implement dispatch's
-  `validation_status` is `confirmed`. Neither is offered once `revert_pr` is set. `dismiss`:
+  `needs_decision`, `failed`. `merge`: the same, plus a PR on the item — the handler lands
+  it when a review confirmed the head, else rejoins the merge train, so a prior review is
+  not required to offer it. Neither is offered once `revert_pr` is set. `dismiss`:
   `new`, `triaged`, `needs_decision`, `failed`, `quiet`. `reinvestigate`: `needs_decision`,
   `failed`, `quiet`. `retry`: a `failed` item with a stage to re-enter. `note`: any
   non-terminal state.

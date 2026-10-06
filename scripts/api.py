@@ -136,8 +136,9 @@ def _available_actions(state: str, mergeable: bool = False, reverted: bool = Fal
     actions: list[str] = []
     if state in _OWNER_STATES and not reverted:
         actions.append("implement")
-    # `mergeable`: a PR whose step-7 review confirmed — the one shape an owner
-    # merge can land.
+    # `mergeable`: the item carries a PR. The owner's merge lands it when a review
+    # confirmed the head, else rejoins the merge train (notify.py's _apply_argo_merge),
+    # so a review is not a prerequisite for the UI to offer the verb.
     if mergeable and state in _OWNER_STATES and not reverted:
         actions.append("merge")
     if state in _DISMISS_STATES:
@@ -573,7 +574,6 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
 
     rows = conn.execute(
         f"SELECT ti.*, e.title AS event_title, e.url AS event_url, "
-        f"(SELECT d.validation_status FROM dispatches d WHERE d.job_id = ti.implement_job) AS validation_status, "
         f"e.payload_json AS event_payload_json FROM triage_items ti "
         f"JOIN events e ON e.id = ti.event_id "
         f"WHERE ti.state NOT IN ({terminal_placeholders}) "
@@ -626,8 +626,7 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
     out: list[dict[str, Any]] = []
     for row in conn.execute(
         f"SELECT ti.event_id, ti.repo, ti.state, ti.note, ti.pr_url, ti.revision_count, ti.revert_pr, ti.redrive_json, "
-        f"e.title, (SELECT d.validation_status FROM dispatches d WHERE d.job_id = ti.implement_job) "
-        f"AS validation_status, (SELECT MAX(at) FROM item_transitions t WHERE t.event_id = ti.event_id "
+        f"e.title, (SELECT MAX(at) FROM item_transitions t WHERE t.event_id = ti.event_id "
         f"AND t.to_state = ti.state) AS entered_at FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         f"WHERE ti.state IN ({placeholders})",
         AWAITING_OWNER_STATES,
@@ -637,7 +636,7 @@ def awaiting_owner(conn: sqlite3.Connection, now: dt.datetime) -> list[dict[str,
             "state": row["state"], "pr_url": row["pr_url"], "age_days": _age_days(row["entered_at"], now),
             "reason": row["note"], "revision_count": row["revision_count"],
             "availableActions": _available_actions(
-                row["state"], bool(row["pr_url"]) and row["validation_status"] == "confirmed",
+                row["state"], bool(row["pr_url"]),
                 reverted=row["revert_pr"] is not None, retryable=bool(row["redrive_json"])),
         })
     out.sort(key=lambda x: (x["age_days"] is None, -(x["age_days"] or 0)))
@@ -699,7 +698,7 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "origin_channel": row["origin_channel"],
         "origin_thread_ts": row["origin_thread_ts"],
         "availableActions": _available_actions(
-            row["state"], bool(row["pr_url"]) and row["validation_status"] == "confirmed",
+            row["state"], bool(row["pr_url"]),
             reverted=row["revert_pr"] is not None, retryable=bool(row["redrive_json"])),
         "issue": _board_item_issue(row),
     }

@@ -604,7 +604,7 @@ def test_board_item_available_actions_and_issue_shape():
 
 def test_available_actions_follow_the_new_state_machine():
     """The owner's verbs per state — needs_decision and failed are the two states an
-    owner acts on; merge is offered only for a PR whose review confirmed."""
+    owner acts on; merge is offered for an owner-state item carrying a PR."""
     a = api._available_actions
     assert set(a("needs_decision")) == {"implement", "dismiss", "reinvestigate", "note"}
     assert set(a("needs_decision", mergeable=True)) == {"implement", "merge", "dismiss", "reinvestigate", "note"}
@@ -615,6 +615,27 @@ def test_available_actions_follow_the_new_state_machine():
         assert a(in_flight, mergeable=True) == ["note"], in_flight
     for terminal in ("fixed", "closed"):
         assert a(terminal) == [], terminal
+
+
+def test_merge_is_offered_for_a_parked_pr_never_reviewed():
+    """A parked item whose PR never entered the merge train carries a NULL
+    `validation_status`; the UI must still offer `merge`, since the handler rejoins
+    the train when no review of the head is on record."""
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    _event(conn, 1, now)
+    _item(conn, 1, state="needs_decision",
+          pr_url="https://github.com/jkrumm/x/pull/9", implement_job="j1", now=now)
+    conn.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at) "
+                 "VALUES ('j1','implement','x','b','done',?)", (_iso(now),))
+    _transition(conn, 1, "merging", "needs_decision", now)
+    conn.commit()
+
+    owner = api.awaiting_owner(conn, now)
+    assert owner and "merge" in owner[0]["availableActions"], owner
+    board = api.board_payload(conn)["items"]
+    assert board and "merge" in board[0]["availableActions"], board
+    conn.close()
 
 
 def test_retry_is_offered_for_a_failed_item_with_a_stage_to_re_enter():
@@ -661,8 +682,8 @@ def test_reverted_items_are_not_offered_implement_or_merge():
     row = api.awaiting_owner(conn, now)[0]
     assert "implement" not in row["availableActions"] and "merge" not in row["availableActions"], row
     board_row = conn.execute(
-        "SELECT ti.*, e.title AS event_title, e.url AS event_url, 'confirmed' AS validation_status, "
-        "e.payload_json AS event_payload_json FROM triage_items ti JOIN events e ON e.id = ti.event_id").fetchone()
+        "SELECT ti.*, e.title AS event_title, e.url AS event_url, e.payload_json AS event_payload_json "
+        "FROM triage_items ti JOIN events e ON e.id = ti.event_id").fetchone()
     assert "merge" not in api._board_item(board_row)["availableActions"]
     conn.close()
 
