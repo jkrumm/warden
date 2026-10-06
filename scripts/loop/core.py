@@ -922,14 +922,19 @@ def redrive(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, re
 def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
                   expect_state: str, note: str) -> int:
     """Send an item back to `triaged`, whose pollers (escalate()/escalate_origin_items()) open the
-    fresh investigation. The old investigation, review and PR handles are cleared so the new
-    `working` phase starts clean, `dispatch_job` included: it would otherwise hold the cooldown
-    anchor against the re-run just asked for. A compare-and-set on `expect_state`; returns the
-    rowcount (0: another pass moved the item first). Shared by Argo's reinvestigate handler and
-    `warden reinvestigate`; the allowed-state precondition (REINVESTIGATE_ALLOWED_STATES) is the
-    caller's."""
+    fresh investigation. Every handle the old run left is cleared so the new `working` phase starts
+    clean: `dispatch_job` (the investigation, which would otherwise hold the cooldown anchor against
+    the re-run just asked for), `implement_job` and `validation_job` (the implement and step-7
+    review dispatches), and `pr_url` with `reviewed_sha` (the PR and the head a review confirmed for
+    it). The PR is cleared deliberately: `set_state()`'s `work`-failure recipe routes back to
+    `merging` whenever `pr_url` is set, so a stale URL would mis-route a later failure of the fresh
+    re-run, and a review of that stale head means nothing. A compare-and-set on `expect_state`;
+    returns the rowcount (0: another pass moved the item first). Shared by Argo's reinvestigate
+    handler and `warden reinvestigate`; the allowed-state precondition (REINVESTIGATE_ALLOWED_STATES)
+    is the caller's."""
     return set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
-                     dispatch_job=None, implement_job=None, validation_job=None)
+                     dispatch_job=None, implement_job=None, validation_job=None,
+                     pr_url=None, reviewed_sha=None)
 
 
 def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,

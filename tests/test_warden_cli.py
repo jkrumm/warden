@@ -1257,6 +1257,11 @@ def test_reinvestigate_sends_an_owner_flagged_item_back_to_triaged_for_a_fresh_i
     _seed_item(db, 50, state="needs_decision", repo="gamma",
                dispatch_job="old-investigate", implement_job="old-implement", validation_job="old-validation")
     _seed_item(db, 54, state="quiet", repo="gamma", dispatch_job="old-investigate")
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET pr_url=?, reviewed_sha=? WHERE event_id=50",
+                 ("https://github.com/o/r/pull/1", "a" * 40))
+    conn.commit()
+    conn.close()
     proc = h.run(["reinvestigate", "50", "--why", "reopen after a fix landed", "--json"], env=h.base_env(db=db))
     out = _json_or_fail(proc)
     assert proc.returncode == 0 and out["verb"] == "reinvestigate" and out["ok"] is True, out
@@ -1268,6 +1273,7 @@ def test_reinvestigate_sends_an_owner_flagged_item_back_to_triaged_for_a_fresh_i
         row = _row(conn, "SELECT * FROM triage_items WHERE event_id=?", (event_id,))
         assert row["state"] == "triaged", dict(row)
         assert row["dispatch_job"] is None and row["implement_job"] is None and row["validation_job"] is None, dict(row)
+        assert row["pr_url"] is None and row["reviewed_sha"] is None, dict(row)
     trans = _row(conn, "SELECT from_state, to_state FROM item_transitions WHERE event_id=50 ORDER BY id DESC LIMIT 1")
     assert trans["from_state"] == "needs_decision" and trans["to_state"] == "triaged", dict(trans)
     conn.close()
