@@ -3124,6 +3124,28 @@ def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_no
         assert "checks failed" in item2["note"] and "lint failed" in item2["note"], item2["note"]
 
 
+def test_implement_outcome_checks_tool_failed_is_an_infra_strike_never_a_revision():
+    """sideclaw's v5 `checks_tool_failed` — the check TOOL itself crashed — is an
+    infrastructure failure: it strikes for a fresh attempt and never spends a
+    revision or marks the dispatch as a code finding."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-outcome-checks-tool-failed",
+                                       job_id="impl-checks-tool-failed")
+        _sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _dispatch_result("checks_tool_failed", branch="dispatch/x-1",
+                                        summary="the check harness was idle-killed"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
+        assert item["implement_job"] is None and item["retry_at"], dict(item)
+        assert item["revision_count"] == 0, "a tool failure must never spend a revision"
+        assert "checks_tool_failed" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-checks-tool-failed'").fetchone()
+        assert d["validation_status"] is None, "a tool failure is not a checks_failed revision"
+
+
 def test_implement_outcome_no_changes_is_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-no-changes", job_id="impl-no-changes")
@@ -3281,7 +3303,7 @@ def test_implement_result_schema_mismatch_is_a_loud_strike():
         _sideclaw.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/51",
-                                        schema_version=_sideclaw.DISPATCH_SCHEMA_VERSION - 1),
+                                        schema_version=_sideclaw.DISPATCH_SCHEMA_VERSION - 2),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
@@ -3289,6 +3311,39 @@ def test_implement_result_schema_mismatch_is_a_loud_strike():
         assert item["implement_job"] is None and item["retry_at"], dict(item)
         assert 'schemaVersion' in item["note"], item["note"]
         assert 'refusing to parse' in item["note"], item["note"]
+
+
+def test_implement_v4_result_is_still_parsed():
+    """A sideclaw not yet restarted still answers with v4, and the window keeps it
+    parseable rather than striking every in-flight episode."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-schema-v4", job_id="impl-schema-v4")
+        _sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/53",
+                                        schema_version=_sideclaw.DISPATCH_SCHEMA_VERSION - 1),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
+        assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/53", dict(item)
+
+
+def test_implement_future_schema_version_is_a_loud_strike():
+    """A schemaVersion above the window (sideclaw moved again) is refused exactly
+    as before — never guessed at."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-schema-future", job_id="impl-schema-future")
+        _sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/54",
+                                        schema_version=_sideclaw.DISPATCH_SCHEMA_VERSION + 1),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
+        assert item["implement_job"] is None and item["retry_at"], dict(item)
+        assert 'schemaVersion' in item["note"] and 'refusing to parse' in item["note"], item["note"]
 
 
 def test_implement_pr_opened_with_unparseable_pr_url_strikes_the_merge_train():

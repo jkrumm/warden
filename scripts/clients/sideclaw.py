@@ -20,6 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,19 +35,30 @@ TERMINAL = frozenset({"done", "failed", "interrupted", "cancelled"})
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 
-# The two verdict schemas warden consumes — published by sideclaw
+# The verdict schemas warden consumes — published by sideclaw
 # (server/jobs/handlers/{dispatch,review}.ts) at GET /api/dispatch-schema and
 # GET /api/review-schema, pinned here rather than copied by hand so drift is
 # a loud refusal (assert_result_schema()) instead of a silently-ignored
 # verdict. Bump these ONLY after re-reading the source constants they mirror
 # — never guess a version or an outcome list.
-DISPATCH_SCHEMA_VERSION = 4
+#
+# Dispatch keeps a small ACCEPTANCE WINDOW instead of one version, so a
+# rolling sideclaw restart cannot strike every in-flight episode: v5 adds the
+# `checks_tool_failed` outcome (a check-tool infrastructure failure, distinct
+# from the repo's own red suite), while a sideclaw not yet restarted still
+# answers with v4. DISPATCH_SCHEMA_VERSIONS is what assert_result_schema()
+# enforces; a version outside the window is refused as loudly as ever. Review
+# has a single live version.
+DISPATCH_SCHEMA_VERSION = 5
+DISPATCH_SCHEMA_VERSIONS: frozenset[int] = frozenset({4, 5})
 REVIEW_SCHEMA_VERSION = 1
 
 # server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES. `pr_updated` (a `revisionOf`
 # episode pushed to the same branch and updated the existing PR) and `conflict`
 # (the rebase onto the latest default branch failed; nothing pushed) arrive with
-# schema version 4.
+# schema version 4. `checks_tool_failed` (the check TOOL itself crashed — an
+# infrastructure failure, never a finding about the code) arrives with schema
+# version 5.
 DISPATCH_OUTCOMES: tuple[str, ...] = (
     "verdict_only",
     "issue_declined",
@@ -55,6 +67,7 @@ DISPATCH_OUTCOMES: tuple[str, ...] = (
     "no_changes",
     "diff_refused",
     "checks_failed",
+    "checks_tool_failed",
     "branch_no_pr",
     "pr_failed",
     "pr_opened",
@@ -406,24 +419,30 @@ def cancel(job_id: str) -> dict[str, Any]:
     return job
 
 
-def assert_result_schema(job: dict[str, Any], expected: int, tool: str) -> None:
+def assert_result_schema(job: dict[str, Any], expected: int | Collection[int], tool: str) -> None:
     """Raise a LOUD refusal when a terminal `done` job's `result.schemaVersion`
-    does not match `expected` — the failure this exists to design out is a
+    is not one of `expected` — the failure this exists to design out is a
     consumer (this file's own callers in triage.py) silently parsing a verdict
     whose shape moved under it. Every loop poll that reads a `result` off an
     `investigate`/`implement`/`review` job calls this first; the caller is
     expected to treat it as an infrastructure failure (a strike) carrying the exact
     message this raises, per DESIGN.md's "deferral must be visible".
 
-    Only checked on `status == "done"`: a failed/interrupted/cancelled job
-    carries no `result` worth pinning a shape to."""
+    `expected` is a single version (review, `REVIEW_SCHEMA_VERSION`) or a
+    collection of them (dispatch, `DISPATCH_SCHEMA_VERSIONS` — the acceptance
+    window that spans a rolling sideclaw restart). Only checked on
+    `status == "done"`: a failed/interrupted/cancelled job carries no `result`
+    worth pinning a shape to."""
     if job.get("status") != "done":
         return
     result = job.get("result")
     version = result.get("schemaVersion") if isinstance(result, dict) else None
-    if version != expected:
+    versions = {expected} if isinstance(expected, int) else set(expected)
+    if version not in versions:
+        expected_text = (str(expected) if isinstance(expected, int)
+                         else "one of " + ", ".join(str(v) for v in sorted(versions)))
         raise RemoteError(
-            f"sideclaw {tool} result schemaVersion {version}, warden expects {expected} — refusing to parse"
+            f"sideclaw {tool} result schemaVersion {version}, warden expects {expected_text} — refusing to parse"
         )
 
 

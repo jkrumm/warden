@@ -1934,6 +1934,9 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
       checks_failed | conflict                 -> a revision attempt (stays working) while any
                                                   are left, else failed; the PR on record is left
                                                   open, its URL in the note
+      checks_tool_failed                       -> a strike and a fresh attempt: the check tool
+                                                  itself crashed (sideclaw's infrastructure), so it
+                                                  is never a revision and never spends revision_count
       a failed job refused by sideclaw's
         per-repo implement lease               -> retry later (retry_at), no strike, no attempt
       result.nextAction == "human"             -> needs_decision (decisionQuestion, else summary)
@@ -2019,7 +2022,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             continue
 
         try:
-            _sideclaw.assert_result_schema(resp, _sideclaw.DISPATCH_SCHEMA_VERSION, "implement")
+            _sideclaw.assert_result_schema(resp, _sideclaw.DISPATCH_SCHEMA_VERSIONS, "implement")
             _sideclaw.assert_outcome(resp, _sideclaw.DISPATCH_OUTCOMES, "implement")
         except RemoteError as e:
             _strike_attempt(str(e))
@@ -2059,6 +2062,16 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         elif outcome in ("pr_opened", "pr_updated"):
             conn.commit()
             _strike_attempt(f"implement {job_id}: {outcome} outcome carried no artifactUrl")
+            continue
+        elif outcome == "checks_tool_failed":
+            # The check TOOL crashed (sideclaw's own infrastructure), not the repo's
+            # suite: an infrastructure failure, never a finding to revise. Strike so a
+            # fresh attempt retries, and never hand_back_for_revision() — that would
+            # spend revision_count and re-brief the implementer about a red suite that
+            # never ran.
+            conn.commit()
+            _strike_attempt(f"implement {job_id}: checks_tool_failed — the check tool itself failed "
+                            f"(infrastructure, not a red suite): {summary}")
             continue
         elif outcome in ("checks_failed", "conflict"):
             branch = result.get("branch") or "?"
