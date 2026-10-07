@@ -9436,11 +9436,14 @@ def test_validation_review_gets_the_goal_and_the_gate_questions():
 def test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change():
     """The gate must define a blocking finding as a concrete defect in the goal and say an
     out-of-goal improvement is a note — the scope drift items 1478/1480 burned every revision on
-    (§132/§136)."""
+    (§132/§136). The calibration scopes out-of-goal enhancements only: Safety and Detection still
+    block, and a reachable edge case this diff introduces or leaves is still a defect."""
     gate = work.VALIDATION_GATE_QUESTIONS
     assert "A blocking finding is a concrete defect in the goal in front of you" in gate
     assert "Scope beyond the request is never blocking" in gate
     assert "A revision is not re-litigated" in gate
+    assert "which still block on their own terms" in gate
+    assert "a reachable path this diff introduces or leaves" in gate
 
 
 def test_validation_review_gets_the_owners_brief_and_the_investigation_goal():
