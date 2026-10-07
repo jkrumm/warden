@@ -1701,7 +1701,12 @@ VALIDATION_GATE_QUESTIONS = (
     "3. Detection — if it touches a monitor, alert, threshold, health check or watchdog: does it fix "
     "a miscalibration with evidence that the old setting misfired, rather than silencing a real "
     "fault? Loosening detection without that evidence is a blocking finding.\n"
-    "Style and nits are improvements, never blocking."
+    "Style and nits are improvements, never blocking. A blocking finding is a concrete defect in "
+    "the goal in front of you, and nothing else is:\n"
+    "- Scope beyond the request is never blocking, however good the wider change would be.\n"
+    "- A missing test, an edge case or machinery the goal did not ask for is a note, never a block.\n"
+    "- A revision is not re-litigated: judge the diff against the goal it answers, and do not add "
+    "new blocking scope round after round."
 )
 
 
