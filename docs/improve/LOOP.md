@@ -17,7 +17,8 @@ line. Spec it serves: `~/SourceRoot/dotfiles/docs/agent-platform.md`.
    - Hermes: replies in #agents / #hermes since the last entry and their length
      (`~/.hermes/state.db`, read-only); any reply over 3 lines is friction.
    - Argo `/warden`: every few iterations, have `@verifier` screenshot it and confirm
-     the "needs you" list equals warden's `needs_decision` items and nothing else.
+     the "needs you" list equals warden's `needs_decision` and `failed` items (`awaiting_owner`
+     in `scripts/api.py`: only an owner action moves either) and nothing else.
 2. **Pick one** friction, ranked by: owner was paged without a real question >
    work stuck or lost > duplicate work > wasted cost > noise. If nothing ranks,
    write "quiet" and schedule the next wakeup long.
