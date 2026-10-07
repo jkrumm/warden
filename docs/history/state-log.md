@@ -9908,3 +9908,15 @@ exempting every out-of-goal edge case. Step-7's context carries no round number,
 bullet is phrased as a rule that holds on a first review too.
 `test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change`;
 `test_triage.py` 506/506 → 507/507 (+1).
+
+## 138. The concrete-failure criterion covers every blocking question (2026-10-07)
+
+Independent review of §137's calibration found the concrete-defect requirement was still scoped to
+"beyond the three questions above, which still block on their own terms", so a reviewer could block
+under Goal/Safety/Detection with a hypothetical that names no reachable input or state and no wrong
+result. The lead sentence now applies the concrete-reachable-failure criterion to every blocking
+finding — Goal, Safety and Detection alike — and keeps Detection's evidence rule as the one block
+that does not need a reachable path: loosening detection without evidence the old setting misfired
+stays a blocking finding on its own. The bullets that scope out-of-goal enhancements are unchanged;
+`test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change` pins the new criterion.
+`test_triage.py` stays 507/507.
