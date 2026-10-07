@@ -4954,6 +4954,69 @@ def test_reinvestigate_holds_off_fresh_dispatch_until_the_close_resolves():
         assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
 
 
+def test_reinvestigate_retries_a_failed_close_after_the_grace_lapses():
+    # A close that failed (or never ran — the process died between reinvestigate()'s commit and the
+    # caller's close_reinvestigated_pr() call) must not silently leave the superseded PR open while
+    # the fresh investigation dispatches beside it (items 1390/1400). Once the retry_at grace lapses,
+    # the poller retries the close before dispatching: another failure re-arms the grace and holds
+    # the dispatch off for the next pass.
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-retry")
+        pr = "https://github.com/demo/repo/pull/7"
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?", (pr, eid))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+
+        note = "re-investigation requested by the owner via Argo"
+        rowcount, old_pr = core.reinvestigate(conn, eid, NOW, expect_state=core.STATE_FAILED, note=note)
+        conn.commit()
+        assert rowcount == 1 and old_pr == pr, (rowcount, old_pr)
+
+        def _refuse(owner, repo, number, *, comment=None):
+            raise RemoteError("test: GitHub refused the close")
+
+        _github.close_pr = _refuse
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _fake_submit(calls)
+        later = NOW + dt.timedelta(minutes=6)
+        work.escalate(conn, DEFAULT_POLICY, later, dry_run=False)
+
+        assert len(calls) == 0, "a still-unresolved close must keep holding the fresh dispatch off"
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED, dict(item)
+        assert item["retry_at"] is not None, "the grace must be re-armed for another retry"
+        assert f"closing superseded PR {pr}" in item["note"], item["note"]
+
+
+def test_reinvestigate_dispatches_once_the_retried_close_succeeds():
+    # The counterpart: when the grace lapses with the note still `closing`, the poller retries the
+    # close and, once it succeeds, clears the grace and lets the fresh investigation dispatch — the
+    # superseded PR is actually closed first, so there is only ever one open PR.
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-retry-succeeds")
+        pr = "https://github.com/demo/repo/pull/7"
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?", (pr, eid))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+
+        note = "re-investigation requested by the owner via Argo"
+        rowcount, old_pr = core.reinvestigate(conn, eid, NOW, expect_state=core.STATE_FAILED, note=note)
+        conn.commit()
+        assert rowcount == 1 and old_pr == pr, (rowcount, old_pr)
+        # The initial close is never confirmed (close_reinvestigated_pr() is not called): the note
+        # still says `closing` when the poller reaches it after the grace.
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _fake_submit(calls)
+        work.escalate(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=6), dry_run=False)
+
+        assert len(calls) == 1, "the retried close succeeded — the fresh investigation must dispatch"
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING, dict(item)
+        assert [c[:3] for c in CLOSED_PRS] == [("demo", "repo", 7)], CLOSED_PRS
+
+
 def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
     with _triage_env() as (conn, ctx):
         eid1 = _seed_verdict_item(conn, external_id="sig-argo-raise", investigate_job="investigate-job-raise")

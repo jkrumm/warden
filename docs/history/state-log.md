@@ -9913,3 +9913,21 @@ close or a crash mid-close leaves the grace to lapse, the crash-safety net, so t
 rather than blocked. New `test_reinvestigate_holds_off_fresh_dispatch_until_the_close_resolves`
 asserts `escalate()` skips the item while `retry_at` is set and dispatches once the close clears it.
 `test_triage.py` 506/506 → 507/507 (+1).
+
+## 138. A failed superseded-PR close is retried, never silently dropped (2026-10-07)
+
+Review follow-up on §137. The close was one-shot: when it failed (GitHub down, rate-limited, revoked
+token — `close_pr_best_effort()` logs and returns False) or the process died between
+`reinvestigate()`'s commit and the caller's `close_reinvestigated_pr()` call, nothing retried it,
+and once the `retry_at` grace lapsed `retry_ready_sql()` (which checks only `retry_at` vs now, not
+the close outcome) let `escalate()`/`escalate_origin_items()` dispatch the fresh investigation while
+the superseded PR stayed open — recreating the two-open-PRs condition (1390/1400) with the note stuck
+at `closing` forever. `core.resolve_pending_superseded_close()` now runs first in both pollers'
+candidate loops: an item whose note still says `closing superseded PR <url>` has its close retried
+before dispatch — success rewrites the note to `closed` and clears the grace, failure re-arms the
+grace for another `CLOSE_SUPERSEDED_GRACE_MINUTES` and holds the dispatch off. The note markers are
+named constants (`SUPERSEDED_CLOSE_PENDING`/`RESOLVED`), shared with `reinvestigate()` and
+`close_reinvestigated_pr()` so the detect/rewrite pair cannot drift. New
+`test_reinvestigate_retries_a_failed_close_after_the_grace_lapses` (retry fails → dispatch still
+held off, grace re-armed) and `test_reinvestigate_dispatches_once_the_retried_close_succeeds` (retry
+succeeds → dispatch proceeds, PR closed). `test_triage.py` 507/507 → 509/509 (+2).

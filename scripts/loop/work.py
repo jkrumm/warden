@@ -512,6 +512,8 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     singleton_by_repo: dict[str, list[sqlite3.Row]] = {}
     clustered_by_repo: dict[str, list[sqlite3.Row]] = {}
     for item in candidates:
+        if not dry_run and not core.resolve_pending_superseded_close(conn, item, now):
+            continue
         repo = item["repo"]
         if not is_escalation_eligible(item, policy, now):
             continue
@@ -716,6 +718,8 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
         (core.STATE_TRIAGED, *ready_params),
     ).fetchall()
     for item in candidates:
+        if not dry_run and not core.resolve_pending_superseded_close(conn, item, now):
+            continue
         if item["repo"] is None:
             continue
 

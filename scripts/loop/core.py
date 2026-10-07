@@ -928,6 +928,18 @@ def redrive(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, re
 # a fresh PR beside the superseded one still open (items 1390/1400).
 CLOSE_SUPERSEDED_GRACE_MINUTES = 5
 
+# The note markers that carry a superseded PR's URL across reinvestigate() — `pr_url` is cleared in
+# the same write, so the note is the URL's only record. `PENDING` until close_reinvestigated_pr()
+# confirms the close went through, `RESOLVED` once it did; resolve_pending_superseded_close() reads
+# the former to retry a close that failed or never ran (the process died between reinvestigate()'s
+# commit and the close call, or GitHub was down).
+SUPERSEDED_CLOSE_PENDING = "closing superseded PR "
+SUPERSEDED_CLOSE_RESOLVED = "closed superseded PR "
+
+# What a superseded pull request is told when it is closed (once, best-effort).
+SUPERSEDED_CLOSE_COMMENT = ("Superseded: the owner asked for a fresh investigation, so this pull "
+                            "request is closed rather than reused.")
+
 
 def close_pr_best_effort(pr_url: str, comment: str) -> bool:
     """Close the pull request `pr_url` names, saying `comment` first. Returns whether the close
@@ -960,8 +972,7 @@ def close_reinvestigated_pr(conn: sqlite3.Connection, event_id: int, old_pr: str
     was cleared, or the compare-and-set lost) closes nothing."""
     if not old_pr:
         return
-    if not close_pr_best_effort(old_pr, "Superseded: the owner asked for a fresh investigation, so "
-                                        "this pull request is closed rather than reused."):
+    if not close_pr_best_effort(old_pr, SUPERSEDED_CLOSE_COMMENT):
         return
     # A compare-and-set: if a poller already picked the item up (the CLI runs in its own process, the
     # loop may have dispatched the fresh investigation mid-close) the item has moved on, and its state
@@ -970,8 +981,38 @@ def close_reinvestigated_pr(conn: sqlite3.Connection, event_id: int, old_pr: str
     # attempt is resolved.
     set_state(conn, event_id, STATE_TRIAGED, dt.datetime.now(dt.timezone.utc),
               expect_state=STATE_TRIAGED, retry_at=None,
-              note=_items.append_to_note(note, f"closed superseded PR {old_pr}"))
+              note=_items.append_to_note(note, f"{SUPERSEDED_CLOSE_RESOLVED}{old_pr}"))
     conn.commit()
+
+
+def resolve_pending_superseded_close(conn: sqlite3.Connection, item: sqlite3.Row,
+                                     now: dt.datetime) -> bool:
+    """Retry the close a `triaged` item is still waiting on, and gate its fresh dispatch on the
+    outcome. A candidate whose note still says `closing superseded PR <url>` had its close fail (down,
+    rate-limited, revoked token) or never run (the process died between reinvestigate()'s commit and
+    the caller's close_reinvestigated_pr() call), so escalate()/escalate_origin_items() call this
+    before dispatching — the `retry_at` grace alone cannot catch it, since retry_ready_sql() checks
+    only `retry_at` vs now, not the close outcome. Success rewrites the note to `closed` and clears
+    the grace; failure re-arms the grace for another CLOSE_SUPERSEDED_GRACE_MINUTES, so the close is
+    retried on a later pass rather than the fresh investigation proceeding beside the superseded PR
+    still open (items 1390/1400). Returns True when the item may dispatch now (no pending close, or
+    the retry just closed the PR), False when it must wait another grace period."""
+    note = item["note"] or ""
+    i = note.rfind(SUPERSEDED_CLOSE_PENDING)
+    if i < 0:
+        return True
+    url = note[i + len(SUPERSEDED_CLOSE_PENDING):].strip()
+    if not url:
+        return True
+    if close_pr_best_effort(url, SUPERSEDED_CLOSE_COMMENT):
+        set_state(conn, item["event_id"], STATE_TRIAGED, now, expect_state=STATE_TRIAGED,
+                  retry_at=None, note=_items.cap_note(note[:i] + SUPERSEDED_CLOSE_RESOLVED + url))
+        conn.commit()
+        return True
+    set_state(conn, item["event_id"], STATE_TRIAGED, now, expect_state=STATE_TRIAGED,
+              retry_at=now_iso(now + dt.timedelta(minutes=CLOSE_SUPERSEDED_GRACE_MINUTES)))
+    conn.commit()
+    return False
 
 
 def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
@@ -992,7 +1033,8 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
     claim it, and only once the close succeeded. Because the transition lands `triaged` before that
     close, the item is pollable while the superseded PR is still open: a `retry_at` grace
     (CLOSE_SUPERSEDED_GRACE_MINUTES) is written alongside so the pollers hold off the fresh dispatch
-    until close_reinvestigated_pr() clears it (or the grace lapses, the crash-safety net).
+    until close_reinvestigated_pr() clears it — and resolve_pending_superseded_close() retries the
+    close on a later pass when the grace lapses still `closing` (the crash-safety net).
 
     Returns `(rowcount, old_pr)`: `old_pr` is the pull request this transition cleared, which the
     caller passes to close_reinvestigated_pr() once it has committed (None on a lost compare-and-set,
@@ -1004,7 +1046,7 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
     columns = {"dispatch_job": None, "implement_job": None, "validation_job": None,
                "pr_url": None, "reviewed_sha": None, "revision_count": 0}
     if old_pr:
-        note = _items.append_to_note(note, f"closing superseded PR {old_pr}")
+        note = _items.append_to_note(note, f"{SUPERSEDED_CLOSE_PENDING}{old_pr}")
         # The transition commits `triaged` before the close is attempted (a network call must not
         # hold the write lock), so the item is pollable while the superseded PR is still open: hold
         # the fresh dispatch off until the close resolves. `strikes=0` keeps set_state()'s end-state
