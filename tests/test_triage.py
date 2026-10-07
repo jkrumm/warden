@@ -3181,7 +3181,29 @@ def test_implement_outcome_no_changes_on_a_revision_goes_to_needs_decision():
         assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
         assert item["strikes"] == 0, dict(item)
         assert "the finding does not apply" in item["note"], item["note"]
+        assert "https://github.com/jkrumm/demo-repo/pull/7" in item["note"], \
+            "the owner's single Slack line must name the open PR"
         assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/7", "the open PR stays on record"
+
+
+def test_implement_outcome_no_changes_with_a_pr_on_record_goes_to_needs_decision():
+    """A no_changes attempt with a pull request already on record must not be closed resolved even
+    with revision_count still 0: that would silently discard an open PR and its finding. The PR on
+    record is what makes it the owner's call, so it routes to needs_decision with the PR named."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-no-changes-pr", job_id="impl-no-changes-pr")
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?",
+                     ("https://github.com/jkrumm/demo-repo/pull/11", eid))
+        conn.commit()
+        _sideclaw.get = lambda job_id: {
+            "status": "done", "result": _dispatch_result("no_changes", summary="the finding does not apply"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["close_reason"] is None, dict(item)
+        assert "https://github.com/jkrumm/demo-repo/pull/11" in item["note"], item["note"]
+        assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/11", "the open PR stays on record"
 
 
 def test_implement_no_changes_next_action_human_wins_over_the_close():

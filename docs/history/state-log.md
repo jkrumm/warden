@@ -9846,3 +9846,16 @@ goes to `needs_decision`. `nextAction=human` still wins, judged before the outco
 `test_implement_outcome_no_changes_on_a_revision_goes_to_needs_decision` and
 `test_implement_no_changes_next_action_human_wins_over_the_close` replace the old strike assertion.
 `test_triage.py` 498/498 → 500/500 (+2).
+
+## 134. `no_changes` routes on a PR on record too, and names it (2026-10-07)
+
+§133 keyed the `no_changes` branch's `needs_decision` path on `revision_count > 0` alone. Independent
+review found that an item with `pr_url` set and `revision_count == 0` — an open pull request that
+must not be silently closed — was routed to `closed(resolved)` instead, discarding the PR and its
+finding. The condition is now `revision_count > 0 or item['pr_url']`: either fact makes it the
+owner's call. The note also names the PR: `_decision_note(result)` alone never carried `pr_url`, so
+the one Slack `needs_decision` line could not show which PR was in question. It now appends
+`— PR: {pr_url}`, with the suffix kept whole (room reserved before it) as `hand_back_for_revision()`
+does, so the URL survives the 200-char `cap_note()`. New
+`test_implement_outcome_no_changes_with_a_pr_on_record_goes_to_needs_decision` and the revision
+test's note assertion. `test_triage.py` 500/500 → 501/501 (+1).

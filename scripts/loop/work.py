@@ -1983,11 +1983,12 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
       no_changes                               -> a terminal answer, not an infrastructure failure:
                                                   the episode looked and found nothing to change,
                                                   and re-running it cannot make it act differently.
-                                                  A FIRST attempt closes `closed(resolved)` with
-                                                  the summary; a REVISION (revision_count>0) declines
-                                                  to touch the pull request already on record, which
-                                                  only the owner can decide about, so it goes to
-                                                  needs_decision
+                                                  An attempt with nothing on record closes
+                                                  `closed(resolved)` with the summary; a REVISION
+                                                  (revision_count>0) or a PR already on record
+                                                  declines to touch it, which only the owner can
+                                                  decide about, so it goes to needs_decision with
+                                                  the PR named in the note
       everything else: diff_refused, branch_no_pr, pr_failed, withheld,
         salvaged, a wrong tier's outcome, a missing/unrecognized outcome, a failed/
         interrupted/cancelled job, a job sideclaw no longer knows, a schemaVersion
@@ -2137,9 +2138,17 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             # (poll_implement_jobs()) or block maybe_auto_implement() entirely. A REVISION that comes
             # back no_changes declines to address the finding on a pull request that is already open;
             # only the owner can decide what happens to it, so it goes to needs_decision rather than
-            # striking and spinning the episode again.
-            if item["revision_count"] > 0:
-                core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, note=_decision_note(result))
+            # striking and spinning the episode again. An attempt with a PR on record but no revision
+            # yet is the same case: whatever is open must not be silently closed, so either fact
+            # (revision_count>0 OR a pr_url) routes to needs_decision. The note names the open PR
+            # (the suffix kept whole, as hand_back_for_revision() does) so the owner's one Slack line
+            # shows what is in question.
+            if item["revision_count"] > 0 or item["pr_url"]:
+                note = _decision_note(result)
+                if item["pr_url"]:
+                    suffix = f" — PR: {item['pr_url']}"
+                    note = note[: _items.NOTE_MAX - len(suffix)] + suffix
+                core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, note=note)
             else:
                 core.set_state(conn, event_id, core.STATE_CLOSED, now, close_reason=core.CLOSE_RESOLVED,
                                note=summary, implement_job=None, validation_job=None)

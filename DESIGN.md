@@ -43,9 +43,10 @@ An implement whose repo check TOOL failed to run (sideclaw's `checks_tool_failed
 dispatch schema v5) is an infrastructure failure too: it strikes and never spends a
 revision — only a red suite (`checks_failed`) goes back to the implementer.
 An implement that found nothing to change (`no_changes`) is the opposite: a terminal
-answer, not infrastructure. A first attempt closes `closed(resolved)` with its summary;
-a revision, which would have to touch the pull request already open, goes to
-`needs_decision` instead — never a strike and another episode.
+answer, not infrastructure. An attempt with nothing on record closes `closed(resolved)`
+with its summary; a revision, or an attempt with a pull request already on record (which
+would have to touch it), goes to `needs_decision` instead, its note naming the open PR —
+never a strike and another episode.
 
 `failed` is classified where it happens (`failure_class`) and is not a graveyard for
 what was never the work's fault. `infra` (sideclaw 5xx/unreachable, a synthesis
