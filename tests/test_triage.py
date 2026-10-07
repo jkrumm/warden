@@ -4837,7 +4837,7 @@ def test_reinvestigate_closes_the_pr_it_clears_and_keeps_it_in_the_note():
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED and item["pr_url"] is None, dict(item)
         assert [c[:3] for c in CLOSED_PRS] == [("demo", "repo", 7)], CLOSED_PRS
-        assert f"closed superseded PR {pr}" in item["note"], item["note"]
+        assert f"superseded PR {pr}" in item["note"], item["note"]
 
 
 def test_reinvestigate_without_a_pr_closes_nothing_and_leaves_the_note_unchanged():
@@ -4872,7 +4872,7 @@ def test_reinvestigate_logs_a_failed_close_and_still_moves_the_item():
 
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED and item["pr_url"] is None, dict(item)
-        assert f"closed superseded PR {pr}" in item["note"], item["note"]
+        assert f"superseded PR {pr}" in item["note"], item["note"]
 
 
 def test_reinvestigate_caps_the_note_and_keeps_the_closed_pr_tail_whole():
@@ -4890,8 +4890,30 @@ def test_reinvestigate_caps_the_note_and_keeps_the_closed_pr_tail_whole():
 
         assert rowcount == 1 and old_pr == pr, (rowcount, old_pr)
         note = core.get_item(conn, eid)["note"]
-        assert len(note) <= 200 and note.endswith(f"closed superseded PR {pr}"), note
+        assert len(note) <= 200 and note.endswith(f"superseded PR {pr}"), note
         assert [c[:3] for c in CLOSED_PRS] == [("demo", "repo", 7)], CLOSED_PRS
+
+
+def test_reinvestigate_lost_compare_and_set_closes_nothing():
+    """A caller whose expect_state no longer matches (another pass moved the item first) wrote
+    nothing, so it hands back no PR to close and leaves the ledger alone."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-lost-cas")
+        pr = "https://github.com/demo/repo/pull/7"
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?", (pr, eid))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+        rowcount, old_pr = core.reinvestigate(
+            conn, eid, NOW, expect_state=core.STATE_NEEDS_DECISION, note="stale reinvestigate")
+        conn.commit()
+        core.close_reinvestigated_pr(old_pr)
+
+        assert rowcount == 0 and old_pr is None, (rowcount, old_pr)
+        assert CLOSED_PRS == [], CLOSED_PRS
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED, dict(item)
+        assert item["pr_url"] == pr and item["note"] == "retries exhausted", dict(item)
 
 
 def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():

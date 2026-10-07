@@ -1277,7 +1277,7 @@ def test_reinvestigate_sends_an_owner_flagged_item_back_to_triaged_for_a_fresh_i
     assert proc.returncode == 0 and out["verb"] == "reinvestigate" and out["ok"] is True, out
     assert out["eventId"] == 50 and out["fromState"] == "needs_decision" and out["state"] == "triaged", out
     assert out["note"] == ("re-investigation requested via CLI: reopen after a fix landed "
-                           "closed superseded PR https://github.com/o/r/pull/1"), out
+                           "superseded PR https://github.com/o/r/pull/1"), out
     # The PR it cleared is closed for real: a comment saying why, then the PATCH. Event 54 had none.
     assert [r["method"] for r in gh.requests] == ["POST", "PATCH"], gh.requests
     assert gh.requests[0]["path"] == "/repos/o/r/issues/1/comments", gh.requests

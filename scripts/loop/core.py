@@ -968,7 +968,7 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
     item = get_item(conn, event_id)
     old_pr = item["pr_url"] if item is not None else None
     if old_pr:
-        note = _items.append_to_note(note, f"closed superseded PR {old_pr}")
+        note = _items.append_to_note(note, f"superseded PR {old_pr}")
     rowcount = set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
                          dispatch_job=None, implement_job=None, validation_job=None,
                          pr_url=None, reviewed_sha=None, revision_count=0)

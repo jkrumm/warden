@@ -9867,7 +9867,7 @@ run's own PR became a second one beside it (1390 #17 vs #21, 1400 #50 vs #56) an
 to choose between two PRs a reinvestigate had already made redundant. `work._close_superseded_pr()`
 only reached a stale PR when the item still carried `pr_url`, which reinvestigate had just nulled.
 `reinvestigate()` now reads `pr_url` before the compare-and-set and keeps its URL in the note as
-`closed superseded PR <url>` via `append_to_note()` — the tail is kept whole, so the 200-char cap drops
+`superseded PR <url>` via `append_to_note()` — the tail is kept whole, so the 200-char cap drops
 the head first — and returns `(rowcount, old_pr)` so each caller closes it AFTER its own `conn.commit()`
 (`core.close_reinvestigated_pr()`), never holding the ledger's write lock across the network call, the
 ordering notify's other Argo handlers already use. The close goes through a new shared
@@ -9880,3 +9880,16 @@ purely local verb: the close is a best-effort GitHub call, and the CLI comment s
 `test_reinvestigate_caps_the_note_and_keeps_the_closed_pr_tail_whole`; the CLI reinvestigate test
 asserts the comment POST and the PATCH (`tests/stubs.py` grew `do_PATCH`). `test_triage.py` 501/501 →
 505/505 (+4).
+
+## 136. Item 1480 landed at its first attempt, not its fourth (2026-10-07)
+
+Item 1480 spent all four revisions and failed. Round 1 asked for the missing lost-compare-and-set
+test; round 2 objected that the note said `closed` before the close had happened; round 3 asked to
+hold the fresh dispatch until the close resolved, which grew a grace period, pending/resolved note
+markers and a retry gating escalate() on GitHub; round 4 then blocked that, correctly, as contrary
+to the brief ("a failed close is logged only … never blocks the reinvestigate"). The improve loop
+landed §135's first attempt instead, with the two valid findings fixed: the note says
+`superseded PR <url>` (a fact either way, not a claim the close succeeded — the log carries a failed
+close) and `test_reinvestigate_lost_compare_and_set_closes_nothing` covers the lost compare-and-set.
+The race round 3 worried about (a fresh investigation dispatched before the close lands) is a
+sub-second window against a one-call close; not worth machinery. `test_triage.py` 505/505 → 506/506 (+1).
