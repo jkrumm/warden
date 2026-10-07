@@ -1750,16 +1750,15 @@ def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     # The gate questions and the goal are the parts never lost: the goal is reserved before the
     # brief and, when it alone cannot fit after the gate questions, is cut with its own marker —
     # never an unmarked trailing slice. The brief is the lowest priority and is dropped when the
-    # goal leaves it no room at all.
+    # goal leaves no room for more than its marker — a cut brief is always marked, never a bare head.
     if goal_part and len(goal_part) > cap - len(head) - len(sep):
         goal_part = _truncate_with_marker(goal_part, VALIDATION_GOAL_TRUNCATED, cap - len(head) - len(sep))
     if brief:
         seps = 2 if goal_part else 1
         room = cap - len(head) - len(goal_part) - seps * len(sep)
-        if room <= 0:
-            brief = ""
-        elif len(brief) > room:
-            brief = _truncate_with_marker(brief, VALIDATION_BRIEF_TRUNCATED, room)
+        if len(brief) > room:
+            fits = room > len(VALIDATION_BRIEF_TRUNCATED)
+            brief = _truncate_with_marker(brief, VALIDATION_BRIEF_TRUNCATED, room) if fits else ""
     return sep.join(p for p in (head, brief, goal_part) if p)
 
 

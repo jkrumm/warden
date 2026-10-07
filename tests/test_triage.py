@@ -9369,6 +9369,25 @@ def test_a_long_goal_on_a_briefless_item_is_marked_not_silently_cut():
         assert work.VALIDATION_BRIEF_TRUNCATED not in ctx_text
 
 
+def test_a_brief_with_no_room_for_its_marker_is_dropped_not_cut_bare():
+    """When the goal leaves the brief fewer chars than its truncation marker, a cut brief would be
+    an unmarked head; it is dropped instead, so every brief in the context is whole or marked."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-brief-no-marker-room")
+        prefix = "Goal (from the investigation that led to this PR): "
+        room = 10
+        goal = "g" * (_dispatch.MAX_CONTEXT_CHARS - len(work.VALIDATION_GATE_QUESTIONS) - 4 - room - len(prefix))
+        conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?", ("x" * 100, eid))
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id='investigate-job'",
+                     (json.dumps({"summary": "s", "recommendation": goal}),))
+        conn.commit()
+        ctx_text = work.validation_context(conn, core.get_item(conn, eid))
+        assert len(ctx_text) <= _dispatch.MAX_CONTEXT_CHARS
+        assert prefix + goal in ctx_text
+        assert "The owner's request" not in ctx_text
+        assert "x" not in ctx_text.replace(work.VALIDATION_GATE_QUESTIONS, "")
+
+
 def test_a_refused_merge_is_not_retried_by_the_loop():
     """No policy-mtime retry: a confirmed PR the merge gate (or GitHub) refused
     stays parked in `failed` with the refusal on its note. Only a person

@@ -9821,3 +9821,12 @@ its own `[investigation goal truncated]` marker (`_truncate_with_marker`); the b
 priority and is dropped when the goal leaves it no room. `test_an_oversized_goal_is_truncated_with_its_own_marker_not_a_blind_slice`
 and `test_a_long_goal_on_a_briefless_item_is_marked_not_silently_cut` cover both paths.
 `test_triage.py` 496/496 → 497/497 (+1).
+
+## 132. A brief with no room for its marker is dropped, not cut bare (2026-10-07)
+
+Item 1478's fourth review blocked on `_truncate_with_marker` keeping a bare head when
+`budget <= len(marker)`. The goal's budget can never get there (cap 16000, gate questions ~650), but
+the brief's room can, when the goal fills the cap to within the marker's length. `validation_context`
+now drops the brief whenever its room cannot hold more than the marker, so a brief in the context is
+always whole or marked. Landed by the improve loop after the item spent its revisions.
+`test_a_brief_with_no_room_for_its_marker_is_dropped_not_cut_bare`; `test_triage.py` 497/497 → 498/498 (+1).
