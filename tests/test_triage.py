@@ -3146,7 +3146,10 @@ def test_implement_outcome_checks_tool_failed_is_an_infra_strike_never_a_revisio
         assert d["validation_status"] is None, "a tool failure is not a checks_failed revision"
 
 
-def test_implement_outcome_no_changes_is_a_strike():
+def test_implement_outcome_no_changes_closes_resolved():
+    """A first attempt whose episode found nothing to change is a terminal answer, not an
+    infrastructure failure: it closes resolved with the summary, spends no strike, and leaves
+    no implement job behind for a recurrence to re-poll or block a fresh implement on."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-no-changes", job_id="impl-no-changes")
         _sideclaw.get = lambda job_id: {
@@ -3154,10 +3157,48 @@ def test_implement_outcome_no_changes_is_a_strike():
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
-        assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
-        assert item["implement_job"] is None and item["retry_at"], dict(item)
-        assert 'no_changes' in item["note"], item["note"]
-        assert 'nothing to do' in item["note"], item["note"]
+        assert item["state"] == core.STATE_CLOSED, dict(item)
+        assert item["close_reason"] == core.CLOSE_RESOLVED, dict(item)
+        assert item["strikes"] == 0 and item["retry_at"] is None, dict(item)
+        assert item["implement_job"] is None and item["validation_job"] is None, dict(item)
+        assert "nothing to do" in item["note"], item["note"]
+
+
+def test_implement_outcome_no_changes_on_a_revision_goes_to_needs_decision():
+    """A REVISION that comes back no_changes declines to touch the pull request already on
+    record; only the owner can decide what happens to it, so it goes to needs_decision — never
+    closed(resolved), never struck back into another episode."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-no-changes-revision", job_id="impl-no-changes-rev")
+        conn.execute("UPDATE triage_items SET revision_count=1, pr_url=? WHERE event_id=?",
+                     ("https://github.com/jkrumm/demo-repo/pull/7", eid))
+        conn.commit()
+        _sideclaw.get = lambda job_id: {
+            "status": "done", "result": _dispatch_result("no_changes", summary="the finding does not apply"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["strikes"] == 0, dict(item)
+        assert "the finding does not apply" in item["note"], item["note"]
+        assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/7", "the open PR stays on record"
+
+
+def test_implement_no_changes_next_action_human_wins_over_the_close():
+    """`nextAction=human` is judged before the outcome branches, so a no_changes episode that
+    asks for a decision goes to needs_decision, never closed(resolved), even on a first attempt."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-no-changes-human", job_id="impl-no-changes-human")
+        _sideclaw.get = lambda job_id: {
+            "status": "done",
+            "result": _dispatch_result("no_changes", next_action="human",
+                                        summary="two ways to fix this, the owner must pick"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["close_reason"] is None, dict(item)
+        assert "two ways to fix this" in item["note"], item["note"]
 
 
 def test_implement_outcome_diff_refused_is_a_strike():

@@ -6,7 +6,7 @@ build log (§1–§132).
 
 | | |
 |-|-|
-| Last updated | 2026-10-07 (§132 — the step-7 review sees the owner's brief; a cut brief is always marked) |
+| Last updated | 2026-10-07 (§133 — an implement `no_changes` closes resolved, never an infra re-drive) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 16 |

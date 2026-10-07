@@ -9830,3 +9830,19 @@ the brief's room can, when the goal fills the cap to within the marker's length.
 now drops the brief whenever its room cannot hold more than the marker, so a brief in the context is
 always whole or marked. Landed by the improve loop after the item spent its revisions.
 `test_a_brief_with_no_room_for_its_marker_is_dropped_not_cut_bare`; `test_triage.py` 497/497 → 498/498 (+1).
+
+## 133. An implement episode's `no_changes` is an answer, not infrastructure (2026-10-07)
+
+`poll_implement_jobs()` routed outcome `no_changes` into the generic "ended without a pull request"
+branch, so it struck the item and `maybe_auto_implement()` re-drove it up to three times (item 1424
+ran implement 3×, each concluding the fix was upstream, before landing `failed(infra)`). A
+`no_changes` episode is a terminal verdict — re-running cannot make it act — so it now has its own
+branch. A FIRST attempt closes `closed(resolved)` with the summary and clears `implement_job`/
+`validation_job` (a recurrence reopens to `new` and must start a fresh investigation, not re-poll the
+done episode or block `maybe_auto_implement()` on a stale handle). A REVISION (revision_count>0)
+declines to touch the pull request already on record, which only the owner can decide about, so it
+goes to `needs_decision`. `nextAction=human` still wins, judged before the outcome branches.
+`test_implement_outcome_no_changes_closes_resolved`,
+`test_implement_outcome_no_changes_on_a_revision_goes_to_needs_decision` and
+`test_implement_no_changes_next_action_human_wins_over_the_close` replace the old strike assertion.
+`test_triage.py` 498/498 → 500/500 (+2).
