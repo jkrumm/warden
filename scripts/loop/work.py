@@ -1980,7 +1980,15 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
       a failed job refused by sideclaw's
         per-repo implement lease               -> retry later (retry_at), no strike, no attempt
       result.nextAction == "human"             -> needs_decision (decisionQuestion, else summary)
-      everything else: no_changes, diff_refused, branch_no_pr, pr_failed, withheld,
+      no_changes                               -> a terminal answer, not an infrastructure failure:
+                                                  the episode looked and found nothing to change,
+                                                  and re-running it cannot make it act differently.
+                                                  A FIRST attempt closes `closed(resolved)` with
+                                                  the summary; a REVISION (revision_count>0) declines
+                                                  to touch the pull request already on record, which
+                                                  only the owner can decide about, so it goes to
+                                                  needs_decision
+      everything else: diff_refused, branch_no_pr, pr_failed, withheld,
         salvaged, a wrong tier's outcome, a missing/unrecognized outcome, a failed/
         interrupted/cancelled job, a job sideclaw no longer knows, a schemaVersion
         mismatch                               -> an episode that ended without a pull request:
@@ -2120,8 +2128,23 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                     f"implement {job_id}: the base moved and the rebase conflicted, nothing was "
                     f"pushed: {summary[:300]}")
             hand_back_for_revision(conn, item, now, outcome=outcome, note=note)
+        elif outcome == "no_changes":
+            # The implement episode's own verdict: it looked and found nothing to change. For a
+            # FIRST attempt that is an answer, not an infrastructure failure — re-driving cannot
+            # make the episode act differently — so the item closes resolved with the summary. The
+            # job handles are cleared: a recurrence reopens to `new` and must start a fresh
+            # investigation, and a stale `implement_job` on a re-opened item would be polled again
+            # (poll_implement_jobs()) or block maybe_auto_implement() entirely. A REVISION that comes
+            # back no_changes declines to address the finding on a pull request that is already open;
+            # only the owner can decide what happens to it, so it goes to needs_decision rather than
+            # striking and spinning the episode again.
+            if item["revision_count"] > 0:
+                core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, note=_decision_note(result))
+            else:
+                core.set_state(conn, event_id, core.STATE_CLOSED, now, close_reason=core.CLOSE_RESOLVED,
+                               note=summary, implement_job=None, validation_job=None)
         else:
-            # no_changes, diff_refused, branch_no_pr, pr_failed, withheld, salvaged, a wrong tier's outcome,
+            # diff_refused, branch_no_pr, pr_failed, withheld, salvaged, a wrong tier's outcome,
             # or one this switch does not know: the episode ended without a pull request.
             conn.commit()
             _strike_attempt(f"implement {job_id}: {outcome or 'missing outcome'} — {summary}")
