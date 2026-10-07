@@ -107,7 +107,11 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    in `verifying`. If the checkout is clean, on the default branch and ends at
    origin, it is fast-forwarded and `make deploy` runs (else a strike); then
    `make verify` if defined; then, for an alert, its own signal quiet for
-   `VERIFY_WINDOW_HOURS`. No signal → `fixed` once `make verify` passes.
+   `VERIFY_WINDOW_HOURS`. No signal → `fixed` once `make verify` passes. Every
+   `make`/`git` call runs under a PATH widened with the host tool dirs
+   (`rollout.HOST_TOOL_DIRS`), so a repo's recipe can reach `op`, `brew` or a
+   `~/.local/bin` tool under launchd's minimal environment; a caller's own PATH
+   in `extra_env` still wins.
 6. **Revert.** Signal recurrence or three failing verify passes revert the merged
    commit through an implement episode (`git revert --no-edit <sha>`, nothing
    else) whose PR rides the same train with no revisions. A passing revert gives
