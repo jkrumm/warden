@@ -868,10 +868,11 @@ def cmd_retry(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
     """Send an item the owner decided to re-open back to `triaged` for a fresh investigation — the
     CLI counterpart to Argo's reinvestigate action, through the same shared core.reinvestigate().
-    Accepts the states owner actions act on (needs_decision/failed/quiet). Local ledger only, like
-    `close`/`retry`: no GitHub or sideclaw call."""
-    # No require_backend(): reinvestigate only writes triage_items/item_transitions in the local
-    # ledger — no GitHub or sideclaw call to authenticate for.
+    Accepts the states owner actions act on (needs_decision/failed/quiet). Writes the local ledger;
+    the pull request on record is closed as a best-effort GitHub call (core.close_pr_best_effort()),
+    and sideclaw is never reached."""
+    # No require_backend(): the transition is local and the PR close is best-effort — a token that
+    # cannot be resolved is logged by close_pr_best_effort(), and must not block the owner's command.
     if not positional:
         raise UsageError('usage: warden reinvestigate <event-id> --why "<reason>" [--json]')
     event_id = _parse_int(positional[0], "event-id")
@@ -898,12 +899,14 @@ def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) 
                 "note": "nothing written — no transition row, no state change"}
 
     now = dt.datetime.now(dt.timezone.utc)
-    if not core.reinvestigate(conn, event_id, now, expect_state=item["state"], note=note):
+    rowcount, old_pr = core.reinvestigate(conn, event_id, now, expect_state=item["state"], note=note)
+    if not rowcount:
         conn.rollback()
         raise PreconditionError(
             f"triage item {event_id} moved while this reinvestigate was applied — look again"
         )
     conn.commit()
+    core.close_reinvestigated_pr(conn, event_id, old_pr, note)
     state.did_mutate = True
     return {"verb": "reinvestigate", "ok": True, "eventId": event_id, "fromState": item["state"],
             "state": core.STATE_TRIAGED, "note": core.get_item(conn, event_id)["note"]}

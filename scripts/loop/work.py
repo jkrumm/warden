@@ -512,6 +512,8 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     singleton_by_repo: dict[str, list[sqlite3.Row]] = {}
     clustered_by_repo: dict[str, list[sqlite3.Row]] = {}
     for item in candidates:
+        if not dry_run and not core.resolve_pending_superseded_close(conn, item, now):
+            continue
         repo = item["repo"]
         if not is_escalation_eligible(item, policy, now):
             continue
@@ -716,6 +718,8 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
         (core.STATE_TRIAGED, *ready_params),
     ).fetchall()
     for item in candidates:
+        if not dry_run and not core.resolve_pending_superseded_close(conn, item, now):
+            continue
         if item["repo"] is None:
             continue
 
@@ -1855,17 +1859,10 @@ def open_implement_episode(conn: sqlite3.Connection, *, model: str | None, **kwa
 
 def _close_superseded_pr(old_pr: str, new_pr: str) -> None:
     """A newer attempt opened its own pull request (a conflicting revision re-derived from the new
-    base): the older one is stale. Closed with a pointer; a failed close is logged only, the item's
-    own path does not depend on it."""
-    parsed = _github.parse_pr_url(old_pr)
-    if parsed is None:
-        return
-    owner, repo_name, number = parsed
-    try:
-        _github.close_pr(owner, repo_name, number, comment=f"Superseded by {new_pr}: the base moved under this "
-                         f"branch, so warden re-derived the fix from the latest base.")
-    except RemoteError as e:
-        print(f"triage: could not close superseded {old_pr}: {e}", file=sys.stderr)
+    base): the older one is stale. Closed with a pointer via the shared best-effort helper; a failed
+    close is logged only, the item's own path does not depend on it."""
+    core.close_pr_best_effort(old_pr, f"Superseded by {new_pr}: the base moved under this "
+                                      f"branch, so warden re-derived the fix from the latest base.")
 
 
 def _attempt_rewind_columns(conn: sqlite3.Connection, item: sqlite3.Row, job_id: str) -> dict[str, Any]:

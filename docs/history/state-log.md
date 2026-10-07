@@ -9859,3 +9859,75 @@ the one Slack `needs_decision` line could not show which PR was in question. It 
 does, so the URL survives the 200-char `cap_note()`. New
 `test_implement_outcome_no_changes_with_a_pr_on_record_goes_to_needs_decision` and the revision
 test's note assertion. `test_triage.py` 500/500 → 501/501 (+1).
+
+## 135. `reinvestigate()` closes the pull request it clears (2026-10-07)
+
+Item 1480. `core.reinvestigate()` cleared `pr_url` but left the GitHub pull request open, so the fresh
+run's own PR became a second one beside it (1390 #17 vs #21, 1400 #50 vs #56) and the owner was paged
+to choose between two PRs a reinvestigate had already made redundant. `work._close_superseded_pr()`
+only reached a stale PR when the item still carried `pr_url`, which reinvestigate had just nulled.
+`reinvestigate()` now reads `pr_url` before the compare-and-set and keeps its URL in the note as
+`closed superseded PR <url>` via `append_to_note()` — the tail is kept whole, so the 200-char cap drops
+the head first — and returns `(rowcount, old_pr)` so each caller closes it AFTER its own `conn.commit()`
+(`core.close_reinvestigated_pr()`), never holding the ledger's write lock across the network call, the
+ordering notify's other Argo handlers already use. The close goes through a new shared
+`core.close_pr_best_effort()`, the same best-effort close `work._close_superseded_pr()` now uses, so a
+failed close or an unresolvable token is logged, never fatal. `warden reinvestigate` is no longer a
+purely local verb: the close is a best-effort GitHub call, and the CLI comment says so. New
+`test_reinvestigate_closes_the_pr_it_clears_and_keeps_it_in_the_note`,
+`test_reinvestigate_without_a_pr_closes_nothing_and_leaves_the_note_unchanged`,
+`test_reinvestigate_logs_a_failed_close_and_still_moves_the_item`,
+`test_reinvestigate_caps_the_note_and_keeps_the_closed_pr_tail_whole`; the CLI reinvestigate test
+asserts the comment POST and the PATCH (`tests/stubs.py` grew `do_PATCH`). `test_triage.py` 501/501 →
+505/505 (+4).
+
+## 136. Reinvestigate records `closing`, confirms `closed` only after the close succeeds (2026-10-07)
+
+Review follow-up on §135. Two findings from the independent review, both addressed. (1) The
+transition claimed the old PR was `closed superseded PR <url>` in the SAME commit that cleared
+`pr_url` — before the GitHub close was ever attempted. The close runs post-commit and is one-shot
+best-effort, so GitHub being down, a revoked token or a crash between `conn.commit()` and the close
+left the PR open on GitHub while the ledger falsely said closed, recreating the two-competing-PRs
+failure with a misleading audit trail. `reinvestigate()` now writes `closing superseded PR <url>`
+pre-commit; only `close_reinvestigated_pr(conn, event_id, old_pr, note)`, after
+`close_pr_best_effort()` reports the close actually went through, rewrites the note to `closed
+superseded PR <url>`. A failed close leaves `closing` and the URL on record. `close_pr_best_effort()`
+now returns a bool. (2) The regression the prior attempt's tests missed: a reinvestigate whose
+`set_state()` returns rowcount 0 must close nothing. New
+`test_reinvestigate_lost_compare_and_set_closes_nothing` calls `core.reinvestigate()` with a stale
+`expect_state`, asserts `rowcount == 0`, `old_pr is None`, `CLOSED_PRS == []` and the ledger
+untouched. `test_reinvestigate_logs_a_failed_close_and_still_moves_the_item` now asserts the note
+says `closing`, not `closed`. `test_triage.py` 505/505 → 506/506 (+1).
+
+## 137. Reinvestigate holds off the fresh dispatch until the PR close resolves (2026-10-07)
+
+Review follow-up on §136. The transition still committed `triaged` — pollable by
+`escalate()`/`escalate_origin_items()` — before the GitHub close was attempted, so a concurrent
+pass (the CLI runs in its own process) could open the fresh investigation's PR while the superseded
+PR was still open, recreating the exact two-PR condition (1390/1400) the feature exists to prevent.
+The close stays post-commit (a network call must not hold the write lock) but `reinvestigate()` now
+writes a `retry_at` grace (`CLOSE_SUPERSEDED_GRACE_MINUTES = 5`, one sweep interval, far longer
+than the GitHub call it covers) alongside the `triaged` transition, so the pollers hold off the
+fresh dispatch until `close_reinvestigated_pr()` clears `retry_at` once the close resolves. A failed
+close or a crash mid-close leaves the grace to lapse, the crash-safety net, so the item is delayed
+rather than blocked. New `test_reinvestigate_holds_off_fresh_dispatch_until_the_close_resolves`
+asserts `escalate()` skips the item while `retry_at` is set and dispatches once the close clears it.
+`test_triage.py` 506/506 → 507/507 (+1).
+
+## 138. A failed superseded-PR close is retried, never silently dropped (2026-10-07)
+
+Review follow-up on §137. The close was one-shot: when it failed (GitHub down, rate-limited, revoked
+token — `close_pr_best_effort()` logs and returns False) or the process died between
+`reinvestigate()`'s commit and the caller's `close_reinvestigated_pr()` call, nothing retried it,
+and once the `retry_at` grace lapsed `retry_ready_sql()` (which checks only `retry_at` vs now, not
+the close outcome) let `escalate()`/`escalate_origin_items()` dispatch the fresh investigation while
+the superseded PR stayed open — recreating the two-open-PRs condition (1390/1400) with the note stuck
+at `closing` forever. `core.resolve_pending_superseded_close()` now runs first in both pollers'
+candidate loops: an item whose note still says `closing superseded PR <url>` has its close retried
+before dispatch — success rewrites the note to `closed` and clears the grace, failure re-arms the
+grace for another `CLOSE_SUPERSEDED_GRACE_MINUTES` and holds the dispatch off. The note markers are
+named constants (`SUPERSEDED_CLOSE_PENDING`/`RESOLVED`), shared with `reinvestigate()` and
+`close_reinvestigated_pr()` so the detect/rewrite pair cannot drift. New
+`test_reinvestigate_retries_a_failed_close_after_the_grace_lapses` (retry fails → dispatch still
+held off, grace re-armed) and `test_reinvestigate_dispatches_once_the_retried_close_succeeds` (retry
+succeeds → dispatch proceeds, PR closed). `test_triage.py` 507/507 → 509/509 (+2).

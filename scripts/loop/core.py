@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from clients import github as _github
+from clients.errors import WardenError
 from lifecycle import items as _items
 
 
@@ -919,8 +921,102 @@ def redrive(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, re
     return set_state(conn, item["event_id"], stage, now, expect_state=STATE_FAILED, **columns)
 
 
+# How long a fresh investigation's dispatch is held off while the superseded PR's close is in
+# flight: one sweep interval, far longer than the GitHub close call it covers. reinvestigate()
+# writes it as `retry_at` (escalate()/escalate_origin_items() skip a row until `retry_at` passes)
+# and close_reinvestigated_pr() clears it once the close resolves, so a concurrent pass cannot open
+# a fresh PR beside the superseded one still open (items 1390/1400).
+CLOSE_SUPERSEDED_GRACE_MINUTES = 5
+
+# The note markers that carry a superseded PR's URL across reinvestigate() — `pr_url` is cleared in
+# the same write, so the note is the URL's only record. `PENDING` until close_reinvestigated_pr()
+# confirms the close went through, `RESOLVED` once it did; resolve_pending_superseded_close() reads
+# the former to retry a close that failed or never ran (the process died between reinvestigate()'s
+# commit and the close call, or GitHub was down).
+SUPERSEDED_CLOSE_PENDING = "closing superseded PR "
+SUPERSEDED_CLOSE_RESOLVED = "closed superseded PR "
+
+# What a superseded pull request is told when it is closed (once, best-effort).
+SUPERSEDED_CLOSE_COMMENT = ("Superseded: the owner asked for a fresh investigation, so this pull "
+                            "request is closed rather than reused.")
+
+
+def close_pr_best_effort(pr_url: str, comment: str) -> bool:
+    """Close the pull request `pr_url` names, saying `comment` first. Returns whether the close
+    went through. Best-effort: a URL this code cannot parse, a close that fails, or a credential
+    that cannot be resolved (close_pr()'s own token read raises PreconditionError) is logged and
+    answered False — the caller's own path never depends on GitHub. Shared by
+    close_reinvestigated_pr() and work._close_superseded_pr()."""
+    parsed = _github.parse_pr_url(pr_url)
+    if parsed is None:
+        return False
+    owner, repo_name, number = parsed
+    try:
+        _github.close_pr(owner, repo_name, number, comment=comment)
+    except WardenError as e:
+        print(f"triage: could not close superseded {pr_url}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
+def close_reinvestigated_pr(conn: sqlite3.Connection, event_id: int, old_pr: str | None,
+                            note: str) -> None:
+    """Confirm the pull request `reinvestigate()` started closing, AFTER the caller committed the
+    transition: the transition's write lock must not be held across a network call, the same
+    ordering notify's other Argo handlers use. `reinvestigate()` writes the note as `closing
+    superseded PR <url>` and holds the fresh dispatch off with `retry_at`; this rewrites the note to
+    `closed superseded PR <url>` and clears `retry_at` once the close actually went through, so a
+    GitHub failure (down, rate-limited, revoked token) leaves the ledger saying `closing` and the URL
+    on record rather than falsely claiming the PR is closed, and the item's fresh dispatch waits out
+    the grace either way. `note` is the same base note `reinvestigate()` was given. `None` (nothing
+    was cleared, or the compare-and-set lost) closes nothing."""
+    if not old_pr:
+        return
+    if not close_pr_best_effort(old_pr, SUPERSEDED_CLOSE_COMMENT):
+        return
+    # A compare-and-set: if a poller already picked the item up (the CLI runs in its own process, the
+    # loop may have dispatched the fresh investigation mid-close) the item has moved on, and its state
+    # must not be dragged back. Losing only costs the `closed` wording; the URL is already on record.
+    # Clearing `retry_at` here releases the dispatch grace `reinvestigate()` set, now that the close
+    # attempt is resolved.
+    set_state(conn, event_id, STATE_TRIAGED, dt.datetime.now(dt.timezone.utc),
+              expect_state=STATE_TRIAGED, retry_at=None,
+              note=_items.append_to_note(note, f"{SUPERSEDED_CLOSE_RESOLVED}{old_pr}"))
+    conn.commit()
+
+
+def resolve_pending_superseded_close(conn: sqlite3.Connection, item: sqlite3.Row,
+                                     now: dt.datetime) -> bool:
+    """Retry the close a `triaged` item is still waiting on, and gate its fresh dispatch on the
+    outcome. A candidate whose note still says `closing superseded PR <url>` had its close fail (down,
+    rate-limited, revoked token) or never run (the process died between reinvestigate()'s commit and
+    the caller's close_reinvestigated_pr() call), so escalate()/escalate_origin_items() call this
+    before dispatching — the `retry_at` grace alone cannot catch it, since retry_ready_sql() checks
+    only `retry_at` vs now, not the close outcome. Success rewrites the note to `closed` and clears
+    the grace; failure re-arms the grace for another CLOSE_SUPERSEDED_GRACE_MINUTES, so the close is
+    retried on a later pass rather than the fresh investigation proceeding beside the superseded PR
+    still open (items 1390/1400). Returns True when the item may dispatch now (no pending close, or
+    the retry just closed the PR), False when it must wait another grace period."""
+    note = item["note"] or ""
+    i = note.rfind(SUPERSEDED_CLOSE_PENDING)
+    if i < 0:
+        return True
+    url = note[i + len(SUPERSEDED_CLOSE_PENDING):].strip()
+    if not url:
+        return True
+    if close_pr_best_effort(url, SUPERSEDED_CLOSE_COMMENT):
+        set_state(conn, item["event_id"], STATE_TRIAGED, now, expect_state=STATE_TRIAGED,
+                  retry_at=None, note=_items.cap_note(note[:i] + SUPERSEDED_CLOSE_RESOLVED + url))
+        conn.commit()
+        return True
+    set_state(conn, item["event_id"], STATE_TRIAGED, now, expect_state=STATE_TRIAGED,
+              retry_at=now_iso(now + dt.timedelta(minutes=CLOSE_SUPERSEDED_GRACE_MINUTES)))
+    conn.commit()
+    return False
+
+
 def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
-                  expect_state: str, note: str) -> int:
+                  expect_state: str, note: str) -> tuple[int, str | None]:
     """Send an item back to `triaged`, whose pollers (escalate()/escalate_origin_items()) open the
     fresh investigation. Every handle the old run left is cleared so the new `working` phase starts
     clean: `dispatch_job` (the investigation, which would otherwise hold the cooldown anchor against
@@ -929,13 +1025,37 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
     it), and `revision_count` — the attempts it counted were against that cleared PR, so a fresh
     run that inherited them could fail "revisions exhausted" after a single review (item 1390). The PR is cleared deliberately: `set_state()`'s `work`-failure recipe routes back to
     `merging` whenever `pr_url` is set, so a stale URL would mis-route a later failure of the fresh
-    re-run, and a review of that stale head means nothing. A compare-and-set on `expect_state`;
-    returns the rowcount (0: another pass moved the item first). Shared by Argo's reinvestigate
-    handler and `warden reinvestigate`; the allowed-state precondition (REINVESTIGATE_ALLOWED_STATES)
-    is the caller's."""
-    return set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
-                     dispatch_job=None, implement_job=None, validation_job=None,
-                     pr_url=None, reviewed_sha=None, revision_count=0)
+    re-run, and a review of that stale head means nothing. The cleared PR is worth CLOSING, and its
+    URL is kept in the note: leaving it open would make the fresh run's own PR a second one beside
+    it, and only the fresh attempt's own supersede-close could otherwise reach it (item 1480). The
+    note says `closing superseded PR <url>` here, never `closed`: the close happens AFTER this
+    transaction (a network call must not hold the write lock), so only close_reinvestigated_pr() may
+    claim it, and only once the close succeeded. Because the transition lands `triaged` before that
+    close, the item is pollable while the superseded PR is still open: a `retry_at` grace
+    (CLOSE_SUPERSEDED_GRACE_MINUTES) is written alongside so the pollers hold off the fresh dispatch
+    until close_reinvestigated_pr() clears it — and resolve_pending_superseded_close() retries the
+    close on a later pass when the grace lapses still `closing` (the crash-safety net).
+
+    Returns `(rowcount, old_pr)`: `old_pr` is the pull request this transition cleared, which the
+    caller passes to close_reinvestigated_pr() once it has committed (None on a lost compare-and-set,
+    where nothing was written and nothing must be closed). Shared by Argo's reinvestigate handler
+    and `warden reinvestigate`; the allowed-state precondition (REINVESTIGATE_ALLOWED_STATES) is the
+    caller's."""
+    item = get_item(conn, event_id)
+    old_pr = item["pr_url"] if item is not None else None
+    columns = {"dispatch_job": None, "implement_job": None, "validation_job": None,
+               "pr_url": None, "reviewed_sha": None, "revision_count": 0}
+    if old_pr:
+        note = _items.append_to_note(note, f"{SUPERSEDED_CLOSE_PENDING}{old_pr}")
+        # The transition commits `triaged` before the close is attempted (a network call must not
+        # hold the write lock), so the item is pollable while the superseded PR is still open: hold
+        # the fresh dispatch off until the close resolves. `strikes=0` keeps set_state()'s end-state
+        # reset from wiping the `retry_at` this write carries.
+        columns["retry_at"] = now_iso(now + dt.timedelta(minutes=CLOSE_SUPERSEDED_GRACE_MINUTES))
+        columns["strikes"] = 0
+    rowcount = set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
+                         **columns)
+    return rowcount, (old_pr if rowcount else None)
 
 
 def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,

@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§134).
+build log (§1–§138).
 
 | | |
 |-|-|
-| Last updated | 2026-10-07 (§134 — a `no_changes` with a PR on record goes to the owner, not closed) |
+| Last updated | 2026-10-07 (§138 — a failed superseded-PR close is retried, never silently dropped) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 16 |
@@ -41,6 +41,13 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   merging+), policy once per change of sideclaw's `GET /api/dispatch-policy` hash; work
   waits for `warden retry <id> [--why]` or Argo's Retry button. A hand-reverted item is
   never re-driven. `failed` still never posts; the daily count does.
+- **Reinvestigate** (`warden reinvestigate` / Argo) sends an item back to `triaged` for a fresh
+  investigation and closes the pull request it clears (best-effort GitHub call). The transition
+  records it as `closing superseded PR <url>` and holds the fresh dispatch off with a `retry_at`
+  grace; only a successful close rewrites that to `closed superseded PR <url>` and clears the grace.
+  A close that failed (or never ran) is retried by the pollers before dispatch — still `closing`
+  after the grace re-arms it and holds the fresh investigation off, so the superseded PR is never
+  left open beside the fresh run's own PR.
 - **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
   superseded/fixed), 2 `needs_decision`.
 
