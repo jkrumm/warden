@@ -329,6 +329,56 @@ def test_the_default_runner_returns_like_subprocess_run():
     assert res.ok is False and res.exit_code == 3 and "out" in res.tail and "err" in res.tail, res
 
 
+def test_the_runner_env_prepends_the_existing_host_tool_dirs_to_path():
+    # launchd's minimal PATH does not include Homebrew or /usr/local/bin, so a repo's
+    # `make deploy` would not find `op` or `brew` without this widening.
+    with tempfile.TemporaryDirectory() as tmp:
+        present = Path(tmp) / "homebrew" / "bin"
+        present.mkdir(parents=True)
+        absent = Path(tmp) / "nope" / "bin"
+        saved = rollout.HOST_TOOL_DIRS
+        rollout.HOST_TOOL_DIRS = (str(present), str(absent))
+        try:
+            run = Script({})
+            rollout.deploy(CWD, runner=run)
+        finally:
+            rollout.HOST_TOOL_DIRS = saved
+        env_path = run.kwargs[-1]["env"]["PATH"]
+        entries = env_path.split(os.pathsep)
+        assert entries[0] == str(present), entries
+        assert str(absent) not in entries, "a dir not on this host must not be added"
+
+
+def test_a_host_tool_dir_already_on_the_inherited_path_is_not_duplicated():
+    with tempfile.TemporaryDirectory() as tmp:
+        present = Path(tmp) / "bin"
+        present.mkdir()
+        saved = rollout.HOST_TOOL_DIRS
+        rollout.HOST_TOOL_DIRS = (str(present),)
+        try:
+            entries = rollout.host_path(base=f"/usr/bin:{present}:/bin").split(os.pathsep)
+        finally:
+            rollout.HOST_TOOL_DIRS = saved
+        assert entries[0] == str(present), entries
+        assert entries.count(str(present)) == 1, entries
+        assert entries[1:] == ["/usr/bin", "/bin"], entries
+
+
+def test_host_path_keeps_the_inherited_path_when_no_host_tool_dir_exists():
+    saved = rollout.HOST_TOOL_DIRS
+    rollout.HOST_TOOL_DIRS = ("/nonexistent/warden-test-dir",)
+    try:
+        assert rollout.host_path(base="/usr/bin:/bin") == "/usr/bin:/bin"
+    finally:
+        rollout.HOST_TOOL_DIRS = saved
+
+
+def test_a_caller_supplied_path_in_extra_env_still_wins():
+    run = Script({})
+    rollout._run(["make", "-C", str(CWD), "deploy"], run, 5, extra_env={"PATH": "/custom/bin:/bin"})
+    assert run.kwargs[-1]["env"]["PATH"] == "/custom/bin:/bin", run.kwargs[-1]["env"]["PATH"]
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

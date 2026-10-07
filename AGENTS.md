@@ -66,7 +66,10 @@ make unload    # stop the agents
 The loop calls `make deploy` itself after merging a warden PR (from inside
 `warden-loop`), so deploy never boots out a periodic agent — they read the new code
 on their next tick; only the long-running `warden-api` is restarted. A changed plist
-is reported, not reloaded. Schema migrations run on the loop's next boot.
+is reported, not reloaded. Schema migrations run on the loop's next boot. A repo's
+`make deploy` runs under a PATH widened with the host tool dirs
+(`rollout.HOST_TOOL_DIRS`), so a recipe can reach `op`, `brew` or a `~/.local/bin`
+tool even though launchd hands the loop a minimal PATH.
 
 ## Verify & Monitor
 

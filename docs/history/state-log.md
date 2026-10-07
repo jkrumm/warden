@@ -9911,3 +9911,17 @@ the one block that needs no reachable path. Step-7's context carries no round nu
 revision bullet is phrased as a rule that holds on a first review too.
 `test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change`;
 `test_triage.py` 506/506 → 507/507 (+1).
+
+## 138. A repo's `make deploy` now sees Homebrew and /usr/local/bin (2026-10-07)
+
+`rollout._run()` built its subprocess env as `{**os.environ, "LC_ALL": "C", **(extra_env or {})}`
+and never widened PATH. The loop runs inside `com.jkrumm.warden-loop`, whose launchd env is
+`PATH=/usr/bin:/bin`, so a repo's `make deploy` could not find `/usr/local/bin/op` or Homebrew's
+`brew` — the same launchd-minimal-PATH blindness `watchdog-poll.py`'s `GH_BIN` and
+`clients/secrets.py` already work around per caller, never centrally. `HOST_TOOL_DIRS`
+(`/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`, `~/.local/bin`, `~/.bun/bin`) and
+`host_path()` now prepend the dirs that exist on this host to PATH, de-duplicated against the
+inherited PATH. `_run()` sets `PATH` from `host_path()` before `extra_env`, so a caller that passes
+its own PATH still wins. Four tests in `tests/test_rollout.py` cover the prepend, the de-dup, the
+missing-dir drop and the caller override; `DESIGN.md` §5 and `AGENTS.md` §Deploy record the
+contract. `make check` green; `test_triage.py` 507/507.

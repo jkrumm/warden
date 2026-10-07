@@ -34,8 +34,10 @@ mid-rollback. It is an fcntl.flock — macOS has no flock(1) — so a crash rele
 Every subprocess goes through an injectable `runner` (tests) and is bounded by a
 timeout; the default runner starts it in its own process group and kills the whole
 group on timeout (a `make` recipe's children must not outlive it). Output is returned
-as a bounded tail. Dry-run is the caller's contract: it prints what it would do and
-never calls into this module.
+as a bounded tail. PATH is widened for launchd's minimal environment (HOST_TOOL_DIRS) so
+a repo's `make deploy` can reach `op`, `brew` or a `~/.local/bin` tool; a caller's own
+PATH in extra_env still wins. Dry-run is the caller's contract: it prints what it would
+do and never calls into this module.
 """
 
 from __future__ import annotations
@@ -62,6 +64,19 @@ LOCK_WAIT_S = float(os.environ.get("WARDEN_DEPLOY_LOCK_WAIT", "120"))
 LOCK_BUSY_EXIT = 75   # EX_TEMPFAIL
 WARDEN_CHECKOUT = Path(__file__).resolve().parents[2]
 OUTPUT_TAIL_CHARS = 2000
+
+# launchd hands a LaunchAgent a minimal PATH (/usr/bin:/bin), so a repo's `make deploy`
+# cannot see a tool installed by Homebrew or into /usr/local/bin — `op`, `brew`, a
+# `~/.local/bin` shim. Every _run call widens PATH with these existing host tool dirs
+# first; extra_env is applied after, so a caller that needs its own PATH still wins.
+HOST_TOOL_DIRS = (
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    str(Path.home() / ".local" / "bin"),
+    str(Path.home() / ".bun" / "bin"),
+)
+PATH_FALLBACK = "/usr/bin:/bin"
 
 _NO_MAKEFILE_RE = re.compile(r"No targets specified and no makefile found")
 _FALLBACK_DEFAULT_BRANCHES = ("main", "master")
@@ -157,9 +172,30 @@ def _run_in_group(argv: list[str], *, capture_output: bool, text: bool, timeout:
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
+def host_path(base: str | None = None) -> str:
+    """`base` (default the inherited PATH) with every existing HOST_TOOL_DIRS entry moved
+    to the front and de-duplicated — a repo's `make deploy` runs under launchd's minimal
+    PATH and must still find `/usr/local/bin/op` or Homebrew's `brew`. A dir that is not
+    on this host is left out rather than shadowing nothing."""
+    seen: set[str] = set()
+    entries: list[str] = []
+    for d in HOST_TOOL_DIRS:
+        if os.path.isdir(d) and d not in seen:
+            entries.append(d)
+            seen.add(d)
+    raw = (os.environ.get("PATH", "") if base is None else base) or PATH_FALLBACK
+    for d in raw.split(os.pathsep):
+        if d and d not in seen:
+            entries.append(d)
+            seen.add(d)
+    return os.pathsep.join(entries)
+
+
 def _run(argv: list[str], runner: Runner, timeout_s: int, extra_env: dict[str, str] | None = None) -> Ran:
     # LC_ALL=C: has_target() matches make's own English message.
-    env = {**os.environ, "LC_ALL": "C", **(extra_env or {})}
+    # PATH: widened for launchd's minimal env (host_path); extra_env last, so a caller's
+    # own PATH still wins.
+    env = {**os.environ, "PATH": host_path(), "LC_ALL": "C", **(extra_env or {})}
     try:
         proc = runner(argv, capture_output=True, text=True, timeout=timeout_s, env=env)
     except subprocess.TimeoutExpired:
