@@ -82,6 +82,9 @@ class _RecordingHandler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         self._handle()
 
+    def do_PATCH(self):
+        self._handle()
+
     def do_DELETE(self):
         self._handle()
 

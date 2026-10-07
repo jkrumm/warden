@@ -1262,12 +1262,26 @@ def test_reinvestigate_sends_an_owner_flagged_item_back_to_triaged_for_a_fresh_i
                  ("https://github.com/o/r/pull/1", "a" * 40))
     conn.commit()
     conn.close()
-    proc = h.run(["reinvestigate", "50", "--why", "reopen after a fix landed", "--json"], env=h.base_env(db=db))
+    gh = stubs.StubServer({
+        ("POST", "/repos/o/r/issues/1/comments"): (201, {"id": 1}),
+        ("PATCH", "/repos/o/r/pulls/1"): (200, {"state": "closed"}),
+    })
+    try:
+        proc = h.run(["reinvestigate", "50", "--why", "reopen after a fix landed", "--json"],
+                     env=h.base_env(db=db, gh=gh.base))
+        assert h.run(["reinvestigate", "54", "--why", "signal returned", "--json"],
+                     env=h.base_env(db=db, gh=gh.base)).returncode == 0
+    finally:
+        gh.stop()
     out = _json_or_fail(proc)
     assert proc.returncode == 0 and out["verb"] == "reinvestigate" and out["ok"] is True, out
     assert out["eventId"] == 50 and out["fromState"] == "needs_decision" and out["state"] == "triaged", out
-    assert out["note"] == "re-investigation requested via CLI: reopen after a fix landed", out
-    assert h.run(["reinvestigate", "54", "--why", "signal returned", "--json"], env=h.base_env(db=db)).returncode == 0
+    assert out["note"] == ("re-investigation requested via CLI: reopen after a fix landed "
+                           "closed superseded PR https://github.com/o/r/pull/1"), out
+    # The PR it cleared is closed for real: a comment saying why, then the PATCH. Event 54 had none.
+    assert [r["method"] for r in gh.requests] == ["POST", "PATCH"], gh.requests
+    assert gh.requests[0]["path"] == "/repos/o/r/issues/1/comments", gh.requests
+    assert gh.requests[1]["path"] == "/repos/o/r/pulls/1" and gh.requests[1]["body"] == {"state": "closed"}, gh.requests
     conn, _ = _connect(db)
     for event_id in (50, 54):
         row = _row(conn, "SELECT * FROM triage_items WHERE event_id=?", (event_id,))

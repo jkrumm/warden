@@ -326,11 +326,12 @@ def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event
     `warden reinvestigate` CLI verb."""
     if item["state"] not in core.REINVESTIGATE_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, reinvestigate not allowed"
-    rowcount = core.reinvestigate(conn, event_id, now, expect_state=item["state"],
-                                  note="re-investigation requested by the owner via Argo")
+    rowcount, old_pr = core.reinvestigate(conn, event_id, now, expect_state=item["state"],
+                                          note="re-investigation requested by the owner via Argo")
     conn.commit()
     if rowcount == 0:
         return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+    core.close_reinvestigated_pr(old_pr)
     return "applied", None, None
 
 

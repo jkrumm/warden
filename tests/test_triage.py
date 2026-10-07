@@ -4823,6 +4823,77 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
         assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
 
 
+def test_reinvestigate_closes_the_pr_it_clears_and_keeps_it_in_the_note():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-closes-pr")
+        pr = "https://github.com/demo/repo/pull/7"
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?", (pr, eid))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+        _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("a1", eid, "reinvestigate")])
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and item["pr_url"] is None, dict(item)
+        assert [c[:3] for c in CLOSED_PRS] == [("demo", "repo", 7)], CLOSED_PRS
+        assert f"closed superseded PR {pr}" in item["note"], item["note"]
+
+
+def test_reinvestigate_without_a_pr_closes_nothing_and_leaves_the_note_unchanged():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-no-pr")
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+        _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("a1", eid, "reinvestigate")])
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and CLOSED_PRS == [], (dict(item), CLOSED_PRS)
+        assert item["note"] == "re-investigation requested by the owner via Argo", item["note"]
+
+
+def test_reinvestigate_logs_a_failed_close_and_still_moves_the_item():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-close-fails")
+        pr = "https://github.com/demo/repo/pull/7"
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?", (pr, eid))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+
+        def _refuse(owner, repo, number, *, comment=None):
+            raise RemoteError("test: GitHub refused the close")
+
+        _github.close_pr = _refuse
+        _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("a1", eid, "reinvestigate")])
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and item["pr_url"] is None, dict(item)
+        assert f"closed superseded PR {pr}" in item["note"], item["note"]
+
+
+def test_reinvestigate_caps_the_note_and_keeps_the_closed_pr_tail_whole():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-long-note")
+        pr = "https://github.com/demo/repo/pull/7"
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?", (pr, eid))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+        long_note = "re-investigation requested: " + "the owner asked for a fresh look " * 10
+        rowcount, old_pr = core.reinvestigate(conn, eid, NOW, expect_state=core.STATE_FAILED, note=long_note)
+        conn.commit()
+        core.close_reinvestigated_pr(old_pr)
+
+        assert rowcount == 1 and old_pr == pr, (rowcount, old_pr)
+        note = core.get_item(conn, eid)["note"]
+        assert len(note) <= 200 and note.endswith(f"closed superseded PR {pr}"), note
+        assert [c[:3] for c in CLOSED_PRS] == [("demo", "repo", 7)], CLOSED_PRS
+
+
 def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
     with _triage_env() as (conn, ctx):
         eid1 = _seed_verdict_item(conn, external_id="sig-argo-raise", investigate_job="investigate-job-raise")
