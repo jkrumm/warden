@@ -9917,7 +9917,8 @@ revision bullet is phrased as a rule that holds on a first review too.
 `rollout._run()` built its subprocess env as `{**os.environ, "LC_ALL": "C", **(extra_env or {})}`
 and never widened PATH. The loop runs inside `com.jkrumm.warden-loop`, whose launchd env is
 `PATH=/usr/bin:/bin`, so a repo's `make deploy` could not find `/usr/local/bin/op` or Homebrew's
-`brew` — the same launchd-minimal-PATH blindness `watchdog-poll.py`'s `GH_BIN` and
+`brew` — the failure item 1477 hit when dotfiles' `make deploy` ran headless and `op` was
+invisible. That same launchd-minimal-PATH blindness is what `watchdog-poll.py`'s `GH_BIN` and
 `clients/secrets.py` already work around per caller, never centrally. `HOST_TOOL_DIRS`
 (`/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`, `~/.local/bin`, `~/.bun/bin`) and
 `host_path()` now prepend the dirs that exist on this host to PATH, de-duplicated against the
