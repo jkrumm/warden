@@ -41,7 +41,7 @@ whether to touch production.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**494/494** — any other number is a finding to report, not a count to edit.
+**495/495** — any other number is a finding to report, not a count to edit.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary, so nothing reaches Slack, sideclaw, GitHub or Argo.
 Patch a name on the module that defines it (`loop.core.DB_PATH`, `loop.core.post_line`) —

@@ -9783,3 +9783,14 @@ marker rather than letting it push the gate questions or the goal past `MAX_CONT
 `test_triage.py` 491/491 → 494/494 (+3). The same `elif` shape remains in
 `verify._after_revert_episode()`'s post-revert context — left alone here, it is a separate path and
 was outside this change's scope.
+
+
+## 129. The brief-only review context is truncation-marked too (2026-10-07)
+
+§128's truncation ran only when `brief and goal_part` were both present, so a brief with no
+investigation goal — exactly the un-investigated GitHub-issue item §128 set out to serve, whose raw
+body is stored uncapped in `triage_items.brief` — fell through to the trailing
+`[: MAX_CONTEXT_CHARS]` slice and was hard-cut with no `[owner's brief truncated]` marker. `room`
+is now computed whenever the brief is non-empty, with the separator count `2 if goal_part else 1`,
+so the marker survives in the one-part case too. `test_a_long_owners_brief_with_no_investigation_goal_is_marked_as_truncated`
+covers it. `test_triage.py` 494/494 → 495/495 (+1).

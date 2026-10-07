@@ -1705,9 +1705,9 @@ VALIDATION_GATE_QUESTIONS = (
 )
 
 
-# The owner's brief of a `warden run`/GitHub-issue item is unbounded prose. When it and the
-# investigation's goal cannot both fit the context cap, the brief is cut and this stands in for
-# its tail, so the gate questions and the goal are the parts never lost.
+# The owner's brief of a `warden run`/GitHub-issue item is unbounded prose. When it — alone or
+# alongside the investigation's goal — cannot fit the context cap, the brief is cut and this stands
+# in for its tail, so the gate questions and the goal are the parts never lost.
 VALIDATION_BRIEF_TRUNCATED = "\n\n[owner's brief truncated]"
 
 
@@ -1731,8 +1731,9 @@ def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
         goal = verdict.get("recommendation") or verdict.get("summary") or ""
     goal_part = f"Goal (from the investigation that led to this PR): {goal}" if goal else ""
 
-    if brief and goal_part:
-        room = _dispatch.MAX_CONTEXT_CHARS - len(head) - len(goal_part) - 2 * len(sep)
+    if brief:
+        seps = 2 if goal_part else 1
+        room = _dispatch.MAX_CONTEXT_CHARS - len(head) - len(goal_part) - seps * len(sep)
         if len(brief) > room:
             brief = brief[: room - len(VALIDATION_BRIEF_TRUNCATED)] + VALIDATION_BRIEF_TRUNCATED \
                 if room > len(VALIDATION_BRIEF_TRUNCATED) else ""

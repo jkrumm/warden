@@ -9320,6 +9320,21 @@ def test_a_long_owners_brief_cannot_crowd_out_the_gate_questions_or_the_goal():
         assert "Goal (from the investigation that led to this PR): the investigation goal" in ctx_text
 
 
+def test_a_long_owners_brief_with_no_investigation_goal_is_marked_as_truncated():
+    """The brief-only case: an un-investigated item's brief is also unbounded prose, so it is
+    truncated and marked — not silently hard-cut by the trailing context slice with no signal
+    that content is missing."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-long-brief-only")
+        conn.execute("UPDATE triage_items SET brief=?, dispatch_job=NULL WHERE event_id=?",
+                     ("x" * (_dispatch.MAX_CONTEXT_CHARS * 2), eid))
+        conn.commit()
+        ctx_text = work.validation_context(conn, core.get_item(conn, eid))
+        assert len(ctx_text) <= _dispatch.MAX_CONTEXT_CHARS
+        assert ctx_text.startswith(work.VALIDATION_GATE_QUESTIONS)
+        assert work.VALIDATION_BRIEF_TRUNCATED in ctx_text
+
+
 def test_a_refused_merge_is_not_retried_by_the_loop():
     """No policy-mtime retry: a confirmed PR the merge gate (or GitHub) refused
     stays parked in `failed` with the refusal on its note. Only a person
