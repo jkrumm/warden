@@ -4923,6 +4923,37 @@ def test_reinvestigate_lost_compare_and_set_closes_nothing():
         assert item["pr_url"] == pr and item["note"] == "retries exhausted", dict(item)
 
 
+def test_reinvestigate_holds_off_fresh_dispatch_until_the_close_resolves():
+    # The item lands `triaged` before the PR close is attempted (a network call must not hold the
+    # write lock), which would let a concurrent pass open a fresh PR beside the superseded one still
+    # open (items 1390/1400). The `retry_at` grace gates that: escalate() skips the item while the
+    # close is in flight, and dispatches once close_reinvestigated_pr() clears it.
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-grace")
+        pr = "https://github.com/demo/repo/pull/7"
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?", (pr, eid))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+
+        note = "re-investigation requested by the owner via Argo"
+        rowcount, old_pr = core.reinvestigate(conn, eid, NOW, expect_state=core.STATE_FAILED, note=note)
+        conn.commit()
+        assert rowcount == 1 and old_pr == pr, (rowcount, old_pr)
+
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _fake_submit(calls)
+        work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 0, "the close is still in flight — fresh dispatch must be held off"
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and item["retry_at"] is not None, dict(item)
+
+        core.close_reinvestigated_pr(conn, eid, old_pr, note)
+        work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1, "once the close resolves, the fresh investigation dispatches"
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
+
+
 def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
     with _triage_env() as (conn, ctx):
         eid1 = _seed_verdict_item(conn, external_id="sig-argo-raise", investigate_job="investigate-job-raise")

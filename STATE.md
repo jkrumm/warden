@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§136).
+build log (§1–§137).
 
 | | |
 |-|-|
-| Last updated | 2026-10-07 (§136 — reinvestigate records `closing`, confirms `closed` only after the close succeeds) |
+| Last updated | 2026-10-07 (§137 — reinvestigate holds off the fresh dispatch until the PR close resolves) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 16 |
@@ -43,8 +43,10 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   never re-driven. `failed` still never posts; the daily count does.
 - **Reinvestigate** (`warden reinvestigate` / Argo) sends an item back to `triaged` for a fresh
   investigation and closes the pull request it clears (best-effort GitHub call). The transition
-  records it as `closing superseded PR <url>`; only a successful close rewrites that to
-  `closed superseded PR <url>`, so a failed close never leaves the ledger claiming a PR is closed.
+  records it as `closing superseded PR <url>` and holds the fresh dispatch off with a `retry_at`
+  grace; only a successful close rewrites that to `closed superseded PR <url>` and clears the grace,
+  so a failed close never leaves the ledger claiming a PR is closed, and a concurrent pass cannot
+  open a fresh PR beside the superseded one still open.
 - **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
   superseded/fixed), 2 `needs_decision`.
 

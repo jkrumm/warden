@@ -9898,3 +9898,18 @@ now returns a bool. (2) The regression the prior attempt's tests missed: a reinv
 `expect_state`, asserts `rowcount == 0`, `old_pr is None`, `CLOSED_PRS == []` and the ledger
 untouched. `test_reinvestigate_logs_a_failed_close_and_still_moves_the_item` now asserts the note
 says `closing`, not `closed`. `test_triage.py` 505/505 → 506/506 (+1).
+
+## 137. Reinvestigate holds off the fresh dispatch until the PR close resolves (2026-10-07)
+
+Review follow-up on §136. The transition still committed `triaged` — pollable by
+`escalate()`/`escalate_origin_items()` — before the GitHub close was attempted, so a concurrent
+pass (the CLI runs in its own process) could open the fresh investigation's PR while the superseded
+PR was still open, recreating the exact two-PR condition (1390/1400) the feature exists to prevent.
+The close stays post-commit (a network call must not hold the write lock) but `reinvestigate()` now
+writes a `retry_at` grace (`CLOSE_SUPERSEDED_GRACE_MINUTES = 5`, one sweep interval, far longer
+than the GitHub call it covers) alongside the `triaged` transition, so the pollers hold off the
+fresh dispatch until `close_reinvestigated_pr()` clears `retry_at` once the close resolves. A failed
+close or a crash mid-close leaves the grace to lapse, the crash-safety net, so the item is delayed
+rather than blocked. New `test_reinvestigate_holds_off_fresh_dispatch_until_the_close_resolves`
+asserts `escalate()` skips the item while `retry_at` is set and dispatches once the close clears it.
+`test_triage.py` 506/506 → 507/507 (+1).
