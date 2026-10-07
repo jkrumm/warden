@@ -9880,3 +9880,21 @@ purely local verb: the close is a best-effort GitHub call, and the CLI comment s
 `test_reinvestigate_caps_the_note_and_keeps_the_closed_pr_tail_whole`; the CLI reinvestigate test
 asserts the comment POST and the PATCH (`tests/stubs.py` grew `do_PATCH`). `test_triage.py` 501/501 →
 505/505 (+4).
+
+## 136. Reinvestigate records `closing`, confirms `closed` only after the close succeeds (2026-10-07)
+
+Review follow-up on §135. Two findings from the independent review, both addressed. (1) The
+transition claimed the old PR was `closed superseded PR <url>` in the SAME commit that cleared
+`pr_url` — before the GitHub close was ever attempted. The close runs post-commit and is one-shot
+best-effort, so GitHub being down, a revoked token or a crash between `conn.commit()` and the close
+left the PR open on GitHub while the ledger falsely said closed, recreating the two-competing-PRs
+failure with a misleading audit trail. `reinvestigate()` now writes `closing superseded PR <url>`
+pre-commit; only `close_reinvestigated_pr(conn, event_id, old_pr, note)`, after
+`close_pr_best_effort()` reports the close actually went through, rewrites the note to `closed
+superseded PR <url>`. A failed close leaves `closing` and the URL on record. `close_pr_best_effort()`
+now returns a bool. (2) The regression the prior attempt's tests missed: a reinvestigate whose
+`set_state()` returns rowcount 0 must close nothing. New
+`test_reinvestigate_lost_compare_and_set_closes_nothing` calls `core.reinvestigate()` with a stale
+`expect_state`, asserts `rowcount == 0`, `old_pr is None`, `CLOSED_PRS == []` and the ledger
+untouched. `test_reinvestigate_logs_a_failed_close_and_still_moves_the_item` now asserts the note
+says `closing`, not `closed`. `test_triage.py` 505/505 → 506/506 (+1).

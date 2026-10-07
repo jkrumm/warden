@@ -921,29 +921,46 @@ def redrive(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, re
     return set_state(conn, item["event_id"], stage, now, expect_state=STATE_FAILED, **columns)
 
 
-def close_pr_best_effort(pr_url: str, comment: str) -> None:
-    """Close the pull request `pr_url` names, saying `comment` first. Best-effort: a URL this code
-    cannot parse, a close that fails, or a credential that cannot be resolved (close_pr()'s own
-    token read raises PreconditionError) is logged and ignored — the caller's own path never depends
-    on GitHub. Shared by close_reinvestigated_pr() and work._close_superseded_pr()."""
+def close_pr_best_effort(pr_url: str, comment: str) -> bool:
+    """Close the pull request `pr_url` names, saying `comment` first. Returns whether the close
+    went through. Best-effort: a URL this code cannot parse, a close that fails, or a credential
+    that cannot be resolved (close_pr()'s own token read raises PreconditionError) is logged and
+    answered False — the caller's own path never depends on GitHub. Shared by
+    close_reinvestigated_pr() and work._close_superseded_pr()."""
     parsed = _github.parse_pr_url(pr_url)
     if parsed is None:
-        return
+        return False
     owner, repo_name, number = parsed
     try:
         _github.close_pr(owner, repo_name, number, comment=comment)
     except WardenError as e:
         print(f"triage: could not close superseded {pr_url}: {e}", file=sys.stderr)
+        return False
+    return True
 
 
-def close_reinvestigated_pr(old_pr: str | None) -> None:
-    """Close the pull request `reinvestigate()` cleared, with the standard pointer. The caller runs
-    this AFTER its own `conn.commit()`: the transition's write lock must not be held across a network
-    call, the same ordering notify's other Argo handlers use. `None` (nothing was cleared, or the
+def close_reinvestigated_pr(conn: sqlite3.Connection, event_id: int, old_pr: str | None,
+                            note: str) -> None:
+    """Confirm the pull request `reinvestigate()` started closing, AFTER the caller committed the
+    transition: the transition's write lock must not be held across a network call, the same
+    ordering notify's other Argo handlers use. `reinvestigate()` writes the note as `closing
+    superseded PR <url>`; this rewrites it to `closed superseded PR <url>` only once the close
+    actually went through, so a GitHub failure (down, rate-limited, revoked token) leaves the ledger
+    saying `closing` and the URL on record rather than falsely claiming the PR is closed. `note` is
+    the same base note `reinvestigate()` was given. `None` (nothing was cleared, or the
     compare-and-set lost) closes nothing."""
-    if old_pr:
-        close_pr_best_effort(old_pr, "Superseded: the owner asked for a fresh investigation, so "
-                                     "this pull request is closed rather than reused.")
+    if not old_pr:
+        return
+    if not close_pr_best_effort(old_pr, "Superseded: the owner asked for a fresh investigation, so "
+                                        "this pull request is closed rather than reused."):
+        return
+    # A compare-and-set: if a poller already picked the item up (the CLI runs in its own process, the
+    # loop may have dispatched the fresh investigation mid-close) the item has moved on, and its state
+    # must not be dragged back. Losing only costs the `closed` wording; the URL is already on record.
+    set_state(conn, event_id, STATE_TRIAGED, dt.datetime.now(dt.timezone.utc),
+              expect_state=STATE_TRIAGED,
+              note=_items.append_to_note(note, f"closed superseded PR {old_pr}"))
+    conn.commit()
 
 
 def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
@@ -958,17 +975,20 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
     `merging` whenever `pr_url` is set, so a stale URL would mis-route a later failure of the fresh
     re-run, and a review of that stale head means nothing. The cleared PR is worth CLOSING, and its
     URL is kept in the note: leaving it open would make the fresh run's own PR a second one beside
-    it, and only the fresh attempt's own supersede-close could otherwise reach it (item 1480).
+    it, and only the fresh attempt's own supersede-close could otherwise reach it (item 1480). The
+    note says `closing superseded PR <url>` here, never `closed`: the close happens AFTER this
+    transaction (a network call must not hold the write lock), so only close_reinvestigated_pr() may
+    claim it, and only once the close succeeded.
 
     Returns `(rowcount, old_pr)`: `old_pr` is the pull request this transition cleared, which the
-    caller closes with close_reinvestigated_pr() once it has committed (None on a lost
-    compare-and-set, where nothing was written and nothing must be closed). Shared by Argo's
-    reinvestigate handler and `warden reinvestigate`; the allowed-state precondition
-    (REINVESTIGATE_ALLOWED_STATES) is the caller's."""
+    caller passes to close_reinvestigated_pr() once it has committed (None on a lost compare-and-set,
+    where nothing was written and nothing must be closed). Shared by Argo's reinvestigate handler
+    and `warden reinvestigate`; the allowed-state precondition (REINVESTIGATE_ALLOWED_STATES) is the
+    caller's."""
     item = get_item(conn, event_id)
     old_pr = item["pr_url"] if item is not None else None
     if old_pr:
-        note = _items.append_to_note(note, f"closed superseded PR {old_pr}")
+        note = _items.append_to_note(note, f"closing superseded PR {old_pr}")
     rowcount = set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
                          dispatch_job=None, implement_job=None, validation_job=None,
                          pr_url=None, reviewed_sha=None, revision_count=0)

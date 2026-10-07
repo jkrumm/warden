@@ -328,7 +328,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
             RemoteError("test: no fake workflow_runs registered"))
         CLOSED_PRS.clear()
         _github.close_pr = lambda owner, repo, number, *, comment=None: CLOSED_PRS.append(
-            (owner, repo, number, comment))
+            (owner, repo, number, comment)) or True
 
         posted: list[dict[str, Any]] = []
         _ts_counter = {"n": 0}
@@ -4872,10 +4872,12 @@ def test_reinvestigate_logs_a_failed_close_and_still_moves_the_item():
 
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_TRIAGED and item["pr_url"] is None, dict(item)
-        assert f"closed superseded PR {pr}" in item["note"], item["note"]
+        # A failed close must never be recorded as done: the URL stays on record as `closing`.
+        assert f"closing superseded PR {pr}" in item["note"], item["note"]
+        assert "closed superseded PR" not in item["note"], item["note"]
 
 
-def test_reinvestigate_caps_the_note_and_keeps_the_closed_pr_tail_whole():
+def test_reinvestigate_caps_the_note_and_keeps_the_closing_pr_tail_whole():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-long-note")
         pr = "https://github.com/demo/repo/pull/7"
@@ -4886,12 +4888,39 @@ def test_reinvestigate_caps_the_note_and_keeps_the_closed_pr_tail_whole():
         long_note = "re-investigation requested: " + "the owner asked for a fresh look " * 10
         rowcount, old_pr = core.reinvestigate(conn, eid, NOW, expect_state=core.STATE_FAILED, note=long_note)
         conn.commit()
-        core.close_reinvestigated_pr(old_pr)
-
         assert rowcount == 1 and old_pr == pr, (rowcount, old_pr)
+        closing = core.get_item(conn, eid)["note"]
+        assert len(closing) <= 200 and closing.endswith(f"closing superseded PR {pr}"), closing
+        core.close_reinvestigated_pr(conn, eid, old_pr, long_note)
+
         note = core.get_item(conn, eid)["note"]
         assert len(note) <= 200 and note.endswith(f"closed superseded PR {pr}"), note
         assert [c[:3] for c in CLOSED_PRS] == [("demo", "repo", 7)], CLOSED_PRS
+
+
+def test_reinvestigate_lost_compare_and_set_closes_nothing():
+    # The exact branch `return rowcount, (old_pr if rowcount else None)` guards: a caller whose
+    # expect_state no longer matches (another pass moved the item first) wrote nothing, so it must
+    # hand back no PR to close and must not touch the ledger.
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-reinvestigate-lost-cas")
+        pr = "https://github.com/demo/repo/pull/7"
+        conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?", (pr, eid))
+        core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
+                       failure_class=core.FAILURE_WORK)
+        conn.commit()
+        # The item is `failed`, but the caller's precondition says `needs_decision`: the
+        # compare-and-set loses.
+        rowcount, old_pr = core.reinvestigate(
+            conn, eid, NOW, expect_state=core.STATE_NEEDS_DECISION, note="stale reinvestigate")
+        conn.commit()
+        core.close_reinvestigated_pr(conn, eid, old_pr, "stale reinvestigate")
+
+        assert rowcount == 0 and old_pr is None, (rowcount, old_pr)
+        assert CLOSED_PRS == [], CLOSED_PRS
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED, dict(item)
+        assert item["pr_url"] == pr and item["note"] == "retries exhausted", dict(item)
 
 
 def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():

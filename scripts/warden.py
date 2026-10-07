@@ -906,7 +906,7 @@ def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) 
             f"triage item {event_id} moved while this reinvestigate was applied — look again"
         )
     conn.commit()
-    core.close_reinvestigated_pr(old_pr)
+    core.close_reinvestigated_pr(conn, event_id, old_pr, note)
     state.did_mutate = True
     return {"verb": "reinvestigate", "ok": True, "eventId": event_id, "fromState": item["state"],
             "state": core.STATE_TRIAGED, "note": core.get_item(conn, event_id)["note"]}
