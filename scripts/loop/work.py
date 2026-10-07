@@ -1735,8 +1735,7 @@ def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
         seps = 2 if goal_part else 1
         room = _dispatch.MAX_CONTEXT_CHARS - len(head) - len(goal_part) - seps * len(sep)
         if len(brief) > room:
-            brief = brief[: room - len(VALIDATION_BRIEF_TRUNCATED)] + VALIDATION_BRIEF_TRUNCATED \
-                if room > len(VALIDATION_BRIEF_TRUNCATED) else ""
+            brief = brief[: max(0, room - len(VALIDATION_BRIEF_TRUNCATED))] + VALIDATION_BRIEF_TRUNCATED
     return sep.join(p for p in (head, brief, goal_part) if p)[: _dispatch.MAX_CONTEXT_CHARS]
 
 

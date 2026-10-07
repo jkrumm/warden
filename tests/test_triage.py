@@ -9335,6 +9335,23 @@ def test_a_long_owners_brief_with_no_investigation_goal_is_marked_as_truncated()
         assert work.VALIDATION_BRIEF_TRUNCATED in ctx_text
 
 
+def test_a_long_investigation_goal_cannot_squeeze_out_the_truncation_marker():
+    """When the investigation's recommendation is itself near the context cap, `room` can fall
+    below the marker's own length; the brief is truncated to just the marker rather than dropped,
+    and the trailing slice trims the goal's tail, never the marker."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-huge-goal")
+        conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?",
+                     ("x" * (_dispatch.MAX_CONTEXT_CHARS * 2), eid))
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id='investigate-job'",
+                     (json.dumps({"summary": "s", "recommendation": "y" * (_dispatch.MAX_CONTEXT_CHARS * 2)}),))
+        conn.commit()
+        ctx_text = work.validation_context(conn, core.get_item(conn, eid))
+        assert len(ctx_text) <= _dispatch.MAX_CONTEXT_CHARS
+        assert ctx_text.startswith(work.VALIDATION_GATE_QUESTIONS)
+        assert work.VALIDATION_BRIEF_TRUNCATED in ctx_text
+
+
 def test_a_refused_merge_is_not_retried_by_the_loop():
     """No policy-mtime retry: a confirmed PR the merge gate (or GitHub) refused
     stays parked in `failed` with the refusal on its note. Only a person

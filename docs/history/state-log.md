@@ -9794,3 +9794,17 @@ body is stored uncapped in `triage_items.brief` — fell through to the trailing
 is now computed whenever the brief is non-empty, with the separator count `2 if goal_part else 1`,
 so the marker survives in the one-part case too. `test_a_long_owners_brief_with_no_investigation_goal_is_marked_as_truncated`
 covers it. `test_triage.py` 494/494 → 495/495 (+1).
+
+
+## 130. The truncation marker survives a goal that outgrows the cap (2026-10-07)
+
+§128's truncation boundary was off by one at the marker-only edge: `room` is the space left for
+the brief after the gate questions, the goal and the separators, and the marker was only appended
+when `room > len(marker)` — so when `room` equalled the marker's own length (a long investigation
+`recommendation`/`summary` can land here exactly) the brief was dropped with no marker at all,
+reintroducing the silent truncation §128 removed. The branch is now
+`brief[: max(0, room - len(marker))] + marker`: at `room == len(marker)` it emits the marker alone,
+and below that (a goal so large it pushes `room` under the marker's length) it still emits the
+marker and lets the trailing `[: MAX_CONTEXT_CHARS]` slice trim the goal's tail — the marker
+precedes the goal, so it can never be squeezed out. `test_a_long_investigation_goal_cannot_squeeze_out_the_truncation_marker`
+covers it. `test_triage.py` 495/495 → 496/496 (+1).
