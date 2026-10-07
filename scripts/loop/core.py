@@ -925,8 +925,9 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
     fresh investigation. Every handle the old run left is cleared so the new `working` phase starts
     clean: `dispatch_job` (the investigation, which would otherwise hold the cooldown anchor against
     the re-run just asked for), `implement_job` and `validation_job` (the implement and step-7
-    review dispatches), and `pr_url` with `reviewed_sha` (the PR and the head a review confirmed for
-    it). The PR is cleared deliberately: `set_state()`'s `work`-failure recipe routes back to
+    review dispatches), `pr_url` with `reviewed_sha` (the PR and the head a review confirmed for
+    it), and `revision_count` — the attempts it counted were against that cleared PR, so a fresh
+    run that inherited them could fail "revisions exhausted" after a single review (item 1390). The PR is cleared deliberately: `set_state()`'s `work`-failure recipe routes back to
     `merging` whenever `pr_url` is set, so a stale URL would mis-route a later failure of the fresh
     re-run, and a review of that stale head means nothing. A compare-and-set on `expect_state`;
     returns the rowcount (0: another pass moved the item first). Shared by Argo's reinvestigate
@@ -934,7 +935,7 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
     is the caller's."""
     return set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
                      dispatch_job=None, implement_job=None, validation_job=None,
-                     pr_url=None, reviewed_sha=None)
+                     pr_url=None, reviewed_sha=None, revision_count=0)
 
 
 def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,

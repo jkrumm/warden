@@ -4736,8 +4736,8 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-reinvestigate")
         conn.execute("UPDATE triage_items SET implement_job=?, validation_job=?, strikes=3, "
-                     "pr_url=?, reviewed_sha=? WHERE event_id=?",
-                     ("stale-impl", "stale-val", "https://github.com/demo/repo/pull/7", "a" * 40, eid))
+                     "pr_url=?, reviewed_sha=?, revision_count=? WHERE event_id=?",
+                     ("stale-impl", "stale-val", "https://github.com/demo/repo/pull/7", "a" * 40, 3, eid))
         core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
                         failure_class=core.FAILURE_WORK)
         conn.commit()
@@ -4750,7 +4750,7 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
         assert item["state"] == core.STATE_TRIAGED and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
         assert (item["dispatch_job"] is None and item["implement_job"] is None
                 and item["validation_job"] is None and item["pr_url"] is None
-                and item["reviewed_sha"] is None), dict(item)
+                and item["reviewed_sha"] is None and item["revision_count"] == 0), dict(item)
         assert [a["status"] for a in ctx.argo_acks] == ["applied", "rejected"], ctx.argo_acks
 
         calls: list[dict[str, Any]] = []

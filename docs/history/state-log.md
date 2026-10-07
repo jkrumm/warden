@@ -9757,3 +9757,14 @@ blocking finding — "investigate polling still pins the v5 scalar" — rejected
 from the improvements: the derived scalar, and the new test now asserts the branch's own
 message ("the check tool itself failed"); verified it fails with the branch disabled.
 `make check` green — `test_triage.py` 491/491 (+3), `test_warden_cli.py` 83/83.
+
+
+## 127. Reinvestigate resets `revision_count` (2026-10-07)
+
+§125's `core.reinvestigate()` cleared the PR (`pr_url`, `reviewed_sha`) and every job handle
+but kept `revision_count`, which counts revision attempts against that very PR. The first
+batch re-driven through it (1400, 1456, 1464, 1390, 1370) inherited counts of 3: 1390 opened
+a fresh PR, got one `actionable` review and went straight to `failed` (revisions exhausted);
+1456 started at "revision 4/4". A re-investigation is a fresh run, so the count resets with
+the PR. Both doors (CLI and Argo) share the transition; the Argo handler's test now seeds
+`revision_count=3` and asserts 0. `test_triage.py` 491/491.
