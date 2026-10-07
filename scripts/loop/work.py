@@ -1710,8 +1710,9 @@ VALIDATION_GATE_QUESTIONS = (
     "- A missing test or machinery the goal did not ask for is a note, never a block. An edge case "
     "the goal did not ask for is a note too — unless it is a reachable path this diff introduces or "
     "leaves and that path produces the wrong result under the goal's own terms; then it is a defect.\n"
-    "- A revision is not re-litigated: judge the diff against the goal it answers, and do not add "
-    "new blocking scope round after round."
+    "- A revision is not re-litigated: judge only whether the prior blocking findings were fixed "
+    "and whether the fix introduced a new defect; never re-open an accepted in-scope concern or "
+    "add new blocking scope."
 )
 
 

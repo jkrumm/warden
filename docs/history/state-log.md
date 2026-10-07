@@ -9894,29 +9894,20 @@ close) and `test_reinvestigate_lost_compare_and_set_closes_nothing` covers the l
 The race round 3 worried about (a fresh investigation dispatched before the close lands) is a
 sub-second window against a one-call close; not worth machinery. `test_triage.py` 505/505 → 506/506 (+1).
 
-## 137. The validation gate names out-of-goal scope and revisions as non-blocking (2026-10-07)
+## 137. The validation gate calibrates blocking to the goal, not the ideal change (2026-10-07)
 
 Items 1478 and 1480 each spent every revision on a narrower or out-of-scope finding and were landed
 by hand (§132/§136). `VALIDATION_GATE_QUESTIONS` (`work.py:1696`) — the merge gate's prompt — listed
 the three questions that block but never said an improvement beyond the goal is not one, so the
-reviewer re-litigated scope round after round. It now adds three calibration bullets: scope beyond
-the request is never blocking; a missing test, an edge case or machinery the goal did not ask for is
-a note; a revision is not re-litigated. Independent review caught the calibration over-reaching, so
-it is scoped to out-of-goal enhancements only — questions 1–3 still block on their own terms — and
-the edge-case bullet keeps a reachable path this diff introduces or leaves a defect, instead of
-exempting every out-of-goal edge case. Step-7's context carries no round number, so the revision
-bullet is phrased as a rule that holds on a first review too.
+reviewer re-litigated scope round after round. It now calibrates what is never blocking: scope
+beyond the request; a missing test, an edge case or machinery the goal did not ask for is a note —
+unless it is a reachable path this diff introduces or leaves that produces the wrong result under
+the goal's own terms, then a defect; a revision is not re-litigated, judged only on whether the
+prior blocking findings were fixed and whether the fix introduced a new defect, never re-opening an
+accepted in-scope concern or adding new blocking scope. Every blocking finding — under Goal, Safety
+or Detection alike — is a concrete defect: a reachable input or state and its wrong result, never a
+hypothetical that names neither, with loosening detection without evidence the old setting misfired
+the one block that needs no reachable path. Step-7's context carries no round number, so the
+revision bullet is phrased as a rule that holds on a first review too.
 `test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change`;
 `test_triage.py` 506/506 → 507/507 (+1).
-
-## 138. The concrete-failure criterion covers every blocking question (2026-10-07)
-
-Independent review of §137's calibration found the concrete-defect requirement was still scoped to
-"beyond the three questions above, which still block on their own terms", so a reviewer could block
-under Goal/Safety/Detection with a hypothetical that names no reachable input or state and no wrong
-result. The lead sentence now applies the concrete-reachable-failure criterion to every blocking
-finding — Goal, Safety and Detection alike — and keeps Detection's evidence rule as the one block
-that does not need a reachable path: loosening detection without evidence the old setting misfired
-stays a blocking finding on its own. The bullets that scope out-of-goal enhancements are unchanged;
-`test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change` pins the new criterion.
-`test_triage.py` stays 507/507.

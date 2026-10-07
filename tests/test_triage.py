@@ -9444,6 +9444,8 @@ def test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change():
     assert "never a hypothetical that names neither" in gate
     assert "Scope beyond the request is never blocking" in gate
     assert "A revision is not re-litigated" in gate
+    assert "whether the prior blocking findings were fixed" in gate
+    assert "never re-open an accepted in-scope concern" in gate
     assert "a reachable path this diff introduces or leaves" in gate
     assert "Loosening detection without that evidence is a blocking finding" in gate
 
