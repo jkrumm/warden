@@ -9893,3 +9893,15 @@ landed §135's first attempt instead, with the two valid findings fixed: the not
 close) and `test_reinvestigate_lost_compare_and_set_closes_nothing` covers the lost compare-and-set.
 The race round 3 worried about (a fresh investigation dispatched before the close lands) is a
 sub-second window against a one-call close; not worth machinery. `test_triage.py` 505/505 → 506/506 (+1).
+
+## 137. The validation gate names out-of-goal scope and revisions as non-blocking (2026-10-07)
+
+Items 1478 and 1480 each spent every revision on a narrower or out-of-scope finding and were landed
+by hand (§132/§136). `VALIDATION_GATE_QUESTIONS` (`work.py:1696`) — the merge gate's prompt — listed
+the three questions that block but never said an improvement beyond the goal is not one, so the
+reviewer re-litigated scope round after round. It now defines a blocking finding as a concrete
+defect in the goal and adds three calibration bullets: scope beyond the request is never blocking; a
+missing test, an edge case or machinery the goal did not ask for is a note; a revision is not
+re-litigated. Step-7's context carries no round number, so the third bullet is phrased as a rule
+that holds on a first review too. `test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change`;
+`test_triage.py` 506/506 → 507/507 (+1).

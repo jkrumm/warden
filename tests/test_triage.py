@@ -9433,6 +9433,16 @@ def test_validation_review_gets_the_goal_and_the_gate_questions():
         assert "Loosening detection without that evidence is a blocking finding" in ctx_text
 
 
+def test_the_gate_calibrates_blocking_to_the_goal_not_the_ideal_change():
+    """The gate must define a blocking finding as a concrete defect in the goal and say an
+    out-of-goal improvement is a note — the scope drift items 1478/1480 burned every revision on
+    (§132/§136)."""
+    gate = work.VALIDATION_GATE_QUESTIONS
+    assert "A blocking finding is a concrete defect in the goal in front of you" in gate
+    assert "Scope beyond the request is never blocking" in gate
+    assert "A revision is not re-litigated" in gate
+
+
 def test_validation_review_gets_the_owners_brief_and_the_investigation_goal():
     """An item that is both a `warden run`/GitHub-issue brief and a dispatch: the brief is the
     owner's actual request and must reach the reviewer alongside the investigation's conclusion,
