@@ -9277,6 +9277,49 @@ def test_validation_review_gets_the_goal_and_the_gate_questions():
         assert "Loosening detection without that evidence is a blocking finding" in ctx_text
 
 
+def test_validation_review_gets_the_owners_brief_and_the_investigation_goal():
+    """An item that is both a `warden run`/GitHub-issue brief and a dispatch: the brief is the
+    owner's actual request and must reach the reviewer alongside the investigation's conclusion,
+    not instead of it."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-ctx-both")
+        conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?",
+                     ("raise the push window to 10m", eid))
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id='investigate-job'",
+                     (json.dumps({"summary": "s", "recommendation": "cap the alert at 5m"}),))
+        conn.commit()
+        ctx_text = work.validation_context(conn, core.get_item(conn, eid))
+        assert "The owner's request: raise the push window to 10m" in ctx_text
+        assert "Goal (from the investigation that led to this PR): cap the alert at 5m" in ctx_text
+        assert "Loosening detection without that evidence is a blocking finding" in ctx_text
+
+
+def test_validation_review_without_an_investigation_gets_the_owners_brief():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-brief-only")
+        conn.execute("UPDATE triage_items SET brief=?, dispatch_job=NULL WHERE event_id=?",
+                     ("fix the flaky backup job", eid))
+        conn.commit()
+        ctx_text = work.validation_context(conn, core.get_item(conn, eid))
+        assert "The owner's request: fix the flaky backup job" in ctx_text
+        assert "Loosening detection without that evidence is a blocking finding" in ctx_text
+
+
+def test_a_long_owners_brief_cannot_crowd_out_the_gate_questions_or_the_goal():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-long-brief")
+        conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?",
+                     ("x" * (_dispatch.MAX_CONTEXT_CHARS * 2), eid))
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id='investigate-job'",
+                     (json.dumps({"summary": "s", "recommendation": "the investigation goal"}),))
+        conn.commit()
+        ctx_text = work.validation_context(conn, core.get_item(conn, eid))
+        assert len(ctx_text) <= _dispatch.MAX_CONTEXT_CHARS
+        assert ctx_text.startswith(work.VALIDATION_GATE_QUESTIONS)
+        assert work.VALIDATION_BRIEF_TRUNCATED in ctx_text
+        assert "Goal (from the investigation that led to this PR): the investigation goal" in ctx_text
+
+
 def test_a_refused_merge_is_not_retried_by_the_loop():
     """No policy-mtime retry: a confirmed PR the merge gate (or GitHub) refused
     stays parked in `failed` with the refusal on its note. Only a person

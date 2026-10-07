@@ -9768,3 +9768,18 @@ a fresh PR, got one `actionable` review and went straight to `failed` (revisions
 1456 started at "revision 4/4". A re-investigation is a fresh run, so the count resets with
 the PR. Both doors (CLI and Argo) share the transition; the Argo handler's test now seeds
 `revision_count=3` and asserts 0. `test_triage.py` 491/491.
+
+
+## 128. The step-7 review keeps the owner's brief (2026-10-07)
+
+`validation_context()` built the review's context with `if dispatch_job: … elif brief: …`, so an
+item carrying both never showed the brief: the `elif` only ran when there was no investigation.
+Exactly the items that store a brief (the non-alert origins `human` and `github_issue`, which are
+also the ones that get investigated) reached the merge gate with only the investigation's
+recommendation, so the reviewer re-asked what the owner had already answered. Both now emit, the
+brief labelled the owner's request and first, the goal second. The brief is the only unbounded part
+of the context, so when the two cannot fit the cap it is cut with a `[owner's brief truncated]`
+marker rather than letting it push the gate questions or the goal past `MAX_CONTEXT_CHARS`.
+`test_triage.py` 491/491 → 494/494 (+3). The same `elif` shape remains in
+`verify._after_revert_episode()`'s post-revert context — left alone here, it is a separate path and
+was outside this change's scope.

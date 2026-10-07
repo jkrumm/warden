@@ -1705,21 +1705,38 @@ VALIDATION_GATE_QUESTIONS = (
 )
 
 
+# The owner's brief of a `warden run`/GitHub-issue item is unbounded prose. When it and the
+# investigation's goal cannot both fit the context cap, the brief is cut and this stands in for
+# its tail, so the gate questions and the goal are the parts never lost.
+VALIDATION_BRIEF_TRUNCATED = "\n\n[owner's brief truncated]"
+
+
 def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
-    """What the reviewer needs to judge the PR against its goal: the gate questions and the
-    investigation's own conclusion. Without it "does it do what it should" is unanswerable and the
-    gate is only a code read."""
-    parts = [VALIDATION_GATE_QUESTIONS]
+    """What the reviewer needs to judge the PR against its goal: the gate questions, the owner's
+    own request when the item had one, and the investigation's conclusion.
+
+    An item can carry both: a `warden run`/GitHub-issue brief (`triage_items.brief`) and, once it has
+    been investigated, a `dispatch_job`. Both belong here — the brief is what the owner asked for,
+    the investigation's recommendation is what the implement episode was told to do — so each is
+    emitted, not one instead of the other. Without it "does it do what it should" is unanswerable
+    and the gate is only a code read."""
+    sep = "\n\n"
+    head = VALIDATION_GATE_QUESTIONS
+    brief = f"The owner's request: {item['brief']}" if item["brief"] else ""
+    goal = ""
     if item["dispatch_job"]:
         inv = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
                            (item["dispatch_job"],)).fetchone()
         verdict = core.safe_json(inv["verdict_json"] if inv else None)
-        goal = verdict.get("recommendation") or verdict.get("summary")
-        if goal:
-            parts.append(f"Goal (from the investigation that led to this PR): {goal}")
-    elif item["brief"]:
-        parts.append(f"Goal (the owner's brief): {item['brief']}")
-    return "\n\n".join(parts)[: _dispatch.MAX_CONTEXT_CHARS]
+        goal = verdict.get("recommendation") or verdict.get("summary") or ""
+    goal_part = f"Goal (from the investigation that led to this PR): {goal}" if goal else ""
+
+    if brief and goal_part:
+        room = _dispatch.MAX_CONTEXT_CHARS - len(head) - len(goal_part) - 2 * len(sep)
+        if len(brief) > room:
+            brief = brief[: room - len(VALIDATION_BRIEF_TRUNCATED)] + VALIDATION_BRIEF_TRUNCATED \
+                if room > len(VALIDATION_BRIEF_TRUNCATED) else ""
+    return sep.join(p for p in (head, brief, goal_part) if p)[: _dispatch.MAX_CONTEXT_CHARS]
 
 
 def open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: int,
