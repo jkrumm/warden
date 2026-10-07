@@ -364,6 +364,55 @@ def test_a_host_tool_dir_already_on_the_inherited_path_is_not_duplicated():
         assert entries[1:] == ["/usr/bin", "/bin"], entries
 
 
+def test_host_path_preserves_an_empty_component_as_the_working_directory():
+    # An empty PATH entry means CWD under POSIX lookup: a recipe that runs a checkout-local
+    # bare executable via CWD relies on it, so widening PATH must not drop it.
+    saved = rollout.HOST_TOOL_DIRS
+    rollout.HOST_TOOL_DIRS = ("/nonexistent/warden-test-dir",)
+    try:
+        assert rollout.host_path(base=":/usr/bin") == ":/usr/bin"
+        assert rollout.host_path(base="/usr/bin:") == "/usr/bin:"
+    finally:
+        rollout.HOST_TOOL_DIRS = saved
+
+
+def test_host_path_keeps_a_single_empty_component_when_it_repeats():
+    saved = rollout.HOST_TOOL_DIRS
+    rollout.HOST_TOOL_DIRS = ("/nonexistent/warden-test-dir",)
+    try:
+        assert rollout.host_path(base="::/usr/bin::") == ":/usr/bin"
+    finally:
+        rollout.HOST_TOOL_DIRS = saved
+
+
+def test_host_path_prepends_host_dirs_without_dropping_an_empty_component():
+    with tempfile.TemporaryDirectory() as tmp:
+        present = Path(tmp) / "bin"
+        present.mkdir()
+        saved = rollout.HOST_TOOL_DIRS
+        rollout.HOST_TOOL_DIRS = (str(present),)
+        try:
+            assert rollout.host_path(base=":/usr/bin") == f"{present}:{os.pathsep}/usr/bin"
+        finally:
+            rollout.HOST_TOOL_DIRS = saved
+
+
+def test_host_path_distinguishes_an_unset_path_from_an_explicitly_empty_one():
+    saved_dirs = rollout.HOST_TOOL_DIRS
+    saved_path = os.environ.pop("PATH", None)
+    rollout.HOST_TOOL_DIRS = ("/nonexistent/warden-test-dir",)
+    try:
+        assert rollout.host_path() == rollout.PATH_FALLBACK
+        os.environ["PATH"] = ""
+        assert rollout.host_path() == "", "an explicitly empty PATH stays empty, not the fallback"
+    finally:
+        rollout.HOST_TOOL_DIRS = saved_dirs
+        if saved_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved_path
+
+
 def test_host_path_keeps_the_inherited_path_when_no_host_tool_dir_exists():
     saved = rollout.HOST_TOOL_DIRS
     rollout.HOST_TOOL_DIRS = ("/nonexistent/warden-test-dir",)

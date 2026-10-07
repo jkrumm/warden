@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§138).
+build log (§1–§139).
 
 | | |
 |-|-|
-| Last updated | 2026-10-07 (§138 — a repo's `make deploy` sees the host PATH) |
+| Last updated | 2026-10-07 (§139 — `host_path()` keeps empty PATH components) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 16 |
@@ -32,7 +32,9 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 - **Rollout PATH.** `lifecycle/rollout.py` widens PATH for every `make`/`git`
   subprocess with the existing host tool dirs (`HOST_TOOL_DIRS`), so a repo's
   `make deploy` finds `op`/`brew` under launchd's minimal PATH; a caller's own
-  PATH in `extra_env` still wins.
+  PATH in `extra_env` still wins. An empty inherited PATH component (POSIX CWD)
+  is preserved, and an unset PATH falls back to `/usr/bin:/bin` while an
+  explicitly empty one stays empty.
 - **Merge gate:** unreadable check runs fall back to Actions runs; an empty
   fallback waits (no timeout) — a private repo with no workflows and an unreadable
   checks API never merges until the PAT can read checks. A PR merged by hand

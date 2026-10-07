@@ -9925,3 +9925,15 @@ inherited PATH. `_run()` sets `PATH` from `host_path()` before `extra_env`, so a
 its own PATH still wins. Four tests in `tests/test_rollout.py` cover the prepend, the de-dup, the
 missing-dir drop and the caller override; `DESIGN.md` §5 and `AGENTS.md` §Deploy record the
 contract. `make check` green; `test_triage.py` 507/507.
+
+## 139. `host_path()` keeps empty PATH components (2026-10-07)
+
+The first cut of §138 dropped every empty PATH component (`if d`) and collapsed an explicitly
+empty PATH into `PATH_FALLBACK`, but an empty component is the current working directory under
+POSIX lookup — an inherited `PATH=:/usr/bin` lost its leading entry, breaking a `make deploy`
+recipe that runs a checkout-local bare executable via CWD. `host_path()` now appends every
+component including the empty one (de-duplicated like any other entry), and reads
+`os.environ.get("PATH")`: unset → `PATH_FALLBACK`, explicitly empty → the single empty component.
+Four tests in `tests/test_rollout.py` cover the preserved empty component, its de-duplication,
+prepending host dirs without dropping it, and the unset-vs-empty distinction. `make check` green;
+`test_triage.py` 507/507.

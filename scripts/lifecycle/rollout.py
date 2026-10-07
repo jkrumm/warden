@@ -176,16 +176,25 @@ def host_path(base: str | None = None) -> str:
     """`base` (default the inherited PATH) with every existing HOST_TOOL_DIRS entry moved
     to the front and de-duplicated — a repo's `make deploy` runs under launchd's minimal
     PATH and must still find `/usr/local/bin/op` or Homebrew's `brew`. A dir that is not
-    on this host is left out rather than shadowing nothing."""
+    on this host is left out rather than shadowing nothing.
+
+    An empty PATH component means the current working directory under POSIX lookup, so it
+    is kept (de-duplicated like any other entry), and an *unset* PATH falls back to
+    PATH_FALLBACK while an explicitly empty PATH stays empty (CWD only)."""
     seen: set[str] = set()
     entries: list[str] = []
     for d in HOST_TOOL_DIRS:
         if os.path.isdir(d) and d not in seen:
             entries.append(d)
             seen.add(d)
-    raw = (os.environ.get("PATH", "") if base is None else base) or PATH_FALLBACK
+    if base is None:
+        raw = os.environ.get("PATH")
+        if raw is None:
+            raw = PATH_FALLBACK
+    else:
+        raw = base
     for d in raw.split(os.pathsep):
-        if d and d not in seen:
+        if d not in seen:
             entries.append(d)
             seen.add(d)
     return os.pathsep.join(entries)
