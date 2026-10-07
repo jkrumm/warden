@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§130).
+build log (§1–§131).
 
 | | |
 |-|-|
-| Last updated | 2026-10-07 (§130 — the truncation marker survives a goal that outgrows the cap) |
+| Last updated | 2026-10-07 (§131 — the goal is truncated with its own marker, never a blind slice) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 16 |

@@ -1709,6 +1709,21 @@ VALIDATION_GATE_QUESTIONS = (
 # alongside the investigation's goal — cannot fit the context cap, the brief is cut and this stands
 # in for its tail, so the gate questions and the goal are the parts never lost.
 VALIDATION_BRIEF_TRUNCATED = "\n\n[owner's brief truncated]"
+# The investigation's recommendation is bounded in practice but not guaranteed: a long verdict can
+# outgrow the cap before the brief is even considered. The goal is never silently lost either — when
+# it cannot fit after the gate questions its tail is cut and this stands in, so the reviewer still
+# sees the goal's head and a signal that content is missing.
+VALIDATION_GOAL_TRUNCATED = "\n\n[investigation goal truncated]"
+
+
+def _truncate_with_marker(text: str, marker: str, budget: int) -> str:
+    """Cut `text` to at most `budget` chars, replacing the tail with `marker` so the cut is visible.
+    Callers guarantee `budget > 0`; when even `marker` cannot fit, the bare head is kept instead —
+    still no more than `budget` chars."""
+    if len(text) <= budget:
+        return text
+    keep = budget - len(marker)
+    return (text[:keep] + marker) if keep > 0 else text[:budget]
 
 
 def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
@@ -1731,12 +1746,21 @@ def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
         goal = verdict.get("recommendation") or verdict.get("summary") or ""
     goal_part = f"Goal (from the investigation that led to this PR): {goal}" if goal else ""
 
+    cap = _dispatch.MAX_CONTEXT_CHARS
+    # The gate questions and the goal are the parts never lost: the goal is reserved before the
+    # brief and, when it alone cannot fit after the gate questions, is cut with its own marker —
+    # never an unmarked trailing slice. The brief is the lowest priority and is dropped when the
+    # goal leaves it no room at all.
+    if goal_part and len(goal_part) > cap - len(head) - len(sep):
+        goal_part = _truncate_with_marker(goal_part, VALIDATION_GOAL_TRUNCATED, cap - len(head) - len(sep))
     if brief:
         seps = 2 if goal_part else 1
-        room = _dispatch.MAX_CONTEXT_CHARS - len(head) - len(goal_part) - seps * len(sep)
-        if len(brief) > room:
-            brief = brief[: max(0, room - len(VALIDATION_BRIEF_TRUNCATED))] + VALIDATION_BRIEF_TRUNCATED
-    return sep.join(p for p in (head, brief, goal_part) if p)[: _dispatch.MAX_CONTEXT_CHARS]
+        room = cap - len(head) - len(goal_part) - seps * len(sep)
+        if room <= 0:
+            brief = ""
+        elif len(brief) > room:
+            brief = _truncate_with_marker(brief, VALIDATION_BRIEF_TRUNCATED, room)
+    return sep.join(p for p in (head, brief, goal_part) if p)
 
 
 def open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: int,

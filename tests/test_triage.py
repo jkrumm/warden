@@ -9335,10 +9335,10 @@ def test_a_long_owners_brief_with_no_investigation_goal_is_marked_as_truncated()
         assert work.VALIDATION_BRIEF_TRUNCATED in ctx_text
 
 
-def test_a_long_investigation_goal_cannot_squeeze_out_the_truncation_marker():
-    """When the investigation's recommendation is itself near the context cap, `room` can fall
-    below the marker's own length; the brief is truncated to just the marker rather than dropped,
-    and the trailing slice trims the goal's tail, never the marker."""
+def test_an_oversized_goal_is_truncated_with_its_own_marker_not_a_blind_slice():
+    """The investigation's recommendation can outgrow the context cap by itself. Its tail is then
+    cut with a marker of its own, never silently dropped by a trailing context slice, and the
+    gate questions stay first."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-huge-goal")
         conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?",
@@ -9349,7 +9349,24 @@ def test_a_long_investigation_goal_cannot_squeeze_out_the_truncation_marker():
         ctx_text = work.validation_context(conn, core.get_item(conn, eid))
         assert len(ctx_text) <= _dispatch.MAX_CONTEXT_CHARS
         assert ctx_text.startswith(work.VALIDATION_GATE_QUESTIONS)
-        assert work.VALIDATION_BRIEF_TRUNCATED in ctx_text
+        assert "Goal (from the investigation that led to this PR): y" in ctx_text
+        assert work.VALIDATION_GOAL_TRUNCATED in ctx_text
+
+
+def test_a_long_goal_on_a_briefless_item_is_marked_not_silently_cut():
+    """A `slack_alert` item has no brief, but its investigation goal can still outgrow the cap;
+    the goal is truncated with its own marker so the loss is never silent."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-briefless-huge-goal")
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id='investigate-job'",
+                     (json.dumps({"summary": "s", "recommendation": "z" * (_dispatch.MAX_CONTEXT_CHARS * 2)}),))
+        conn.commit()
+        ctx_text = work.validation_context(conn, core.get_item(conn, eid))
+        assert len(ctx_text) <= _dispatch.MAX_CONTEXT_CHARS
+        assert ctx_text.startswith(work.VALIDATION_GATE_QUESTIONS)
+        assert "Goal (from the investigation that led to this PR): " in ctx_text
+        assert work.VALIDATION_GOAL_TRUNCATED in ctx_text
+        assert work.VALIDATION_BRIEF_TRUNCATED not in ctx_text
 
 
 def test_a_refused_merge_is_not_retried_by_the_loop():

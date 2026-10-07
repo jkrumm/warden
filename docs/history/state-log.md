@@ -9808,3 +9808,16 @@ and below that (a goal so large it pushes `room` under the marker's length) it s
 marker and lets the trailing `[: MAX_CONTEXT_CHARS]` slice trim the goal's tail — the marker
 precedes the goal, so it can never be squeezed out. `test_a_long_investigation_goal_cannot_squeeze_out_the_truncation_marker`
 covers it. `test_triage.py` 495/495 → 496/496 (+1).
+
+
+## 131. The goal is truncated with its own marker, never a blind slice (2026-10-07)
+
+§130 still let the trailing `[: MAX_CONTEXT_CHARS]` slice trim the goal's tail silently: the goal
+is the last part, so a long investigation `recommendation`/`summary` — on a brief-less `slack_alert`
+item or alongside a brief — was hard-cut with no signal, contradicting the invariant §128 states
+("the gate questions and the goal are the parts never lost"). The blind slice is gone. The goal is
+now reserved before the brief and cut only when it alone cannot fit after the gate questions, with
+its own `[investigation goal truncated]` marker (`_truncate_with_marker`); the brief is the lowest
+priority and is dropped when the goal leaves it no room. `test_an_oversized_goal_is_truncated_with_its_own_marker_not_a_blind_slice`
+and `test_a_long_goal_on_a_briefless_item_is_marked_not_silently_cut` cover both paths.
+`test_triage.py` 496/496 → 497/497 (+1).
