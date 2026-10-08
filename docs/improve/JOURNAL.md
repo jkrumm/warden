@@ -63,3 +63,4 @@ One line per iteration of the improvement loop (`docs/improve/LOOP.md`). Newest 
 2026-10-08 21:54 · in 0, transitions 0, needs_decision 8, failed 1 (1464), sideclaw failedLastHour 0, Hermes 0 replies · quiet · none · herdr restart-window DECISION still open
 2026-10-08 22:55 · in 0, transitions 0, needs_decision 8, failed 1 (1464), sideclaw failedLastHour 0, Hermes 0 replies (1 msg = the evening-briefing cron) · quiet · none · herdr restart-window DECISION open 24h
 2026-10-08 23:56 · in 0, transitions 0, needs_decision 8, failed 1 (1464), sideclaw failedLastHour 0, Hermes 0 Slack replies (1 13-line msg = an orchestrator one-shot asking for a <25-line health report after the Hermes model switch; the owner session owns that) · quiet · none · herdr restart-window DECISION still open
+2026-10-09 00:57 · in 0, transitions 0, needs_decision 8, failed 1, sideclaw 0 fail/h, Hermes 0 replies · quiet · none · herdr restart-window DECISION still open (herdr not loaded)
