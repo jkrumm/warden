@@ -41,3 +41,4 @@ One line per iteration of the improvement loop (`docs/improve/LOOP.md`). Newest 
 2026-10-07 23:31 · in 0, transitions 0, needs_decision 8, failed 1 (1464), sideclaw failedLastHour 0, Hermes 0 replies · quiet · none · herdr restart-window DECISION (22:29) still open, herdr unloaded
 2026-10-08 00:32 · in 0, transitions 0, needs_decision 8, failed 1 (1464), sideclaw failedLastHour 0, Hermes 0 replies · quiet · none · herdr restart-window DECISION still open
 2026-10-08 01:33 · in 0, transitions 0, needs_decision 8, failed 1 (1464), sideclaw failedLastHour 0, Hermes 0 replies · quiet · none · herdr restart-window DECISION still open
+2026-10-08 02:34 · in 0, transitions 0, needs_decision 8, failed 1 (1464), sideclaw failedLastHour 0, Hermes 0 replies · quiet · none · herdr restart-window DECISION still open
