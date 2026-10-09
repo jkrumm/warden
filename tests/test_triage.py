@@ -1673,6 +1673,91 @@ def test_fold_needs_decision_note_prefers_decision_question_then_summary_then_re
         assert item["state"] == core.STATE_NEEDS_DECISION
 
 
+def _fold_human_verdict(conn, ext: str, *, item_repo: str, owning_repo: Any) -> sqlite3.Row:
+    """An alert item in `item_repo` whose investigation verdict is nextAction=human with the given
+    `owningRepo` (any value, so a test can hand it a non-string), folded onto it."""
+    eid = _insert_event(conn, source="slack_alert", external_id=ext, title=f"alert {ext}", first_seen=OLD)
+    intake.ingest(conn, NOW)
+    job_id = f"job-{ext}"
+    verdict: dict[str, Any] = {"summary": "the fix lives elsewhere", "nextAction": "human",
+                               "decisionQuestion": "where should this live?"}
+    if owning_repo is not None:
+        verdict["owningRepo"] = owning_repo
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (job_id, "investigate", item_repo, "b", eid, "done", json.dumps(verdict), NOW.isoformat()),
+    )
+    core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+    conn.execute("UPDATE triage_items SET repo=? WHERE event_id=?", (item_repo, eid))
+    conn.commit()
+    work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+    return core.get_item(conn, eid)
+
+
+def test_fold_a_human_verdict_naming_another_known_repo_reroutes_instead_of_paging():
+    """Item 1487: a `human` verdict whose optional `owningRepo` names a DIFFERENT known repo moves
+    the item to `triaged` IN that repo (dispatch_job cleared, so escalate() re-investigates there)
+    rather than paging the owner with a routing question."""
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "other-repo")
+        item = _fold_human_verdict(conn, "sig-reroute", item_repo="demo-repo", owning_repo="other-repo")
+        assert item["state"] == core.STATE_TRIAGED, dict(item)
+        assert item["repo"] == "other-repo", dict(item)
+        assert item["dispatch_job"] is None and item["implement_job"] is None, dict(item)
+        assert item["note"].startswith("re-routed from demo-repo to other-repo"), item["note"]
+        note = conn.execute(
+            "SELECT note FROM item_transitions WHERE event_id=? AND to_state=?",
+            (item["event_id"], core.STATE_TRIAGED),
+        ).fetchone()["note"]
+        assert note.startswith("re-routed from demo-repo to other-repo"), note
+
+
+def test_fold_a_human_verdict_owning_its_own_repo_still_pages():
+    """An `owningRepo` equal to the item's own repo is not a misroute: it lands needs_decision."""
+    with _triage_env() as (conn, ctx):
+        item = _fold_human_verdict(conn, "sig-reroute-self", item_repo="demo-repo", owning_repo="demo-repo")
+        assert item["state"] == core.STATE_NEEDS_DECISION and item["repo"] == "demo-repo", dict(item)
+        assert item["note"] == "where should this live?", item["note"]
+
+
+def test_fold_a_human_verdict_naming_an_unknown_repo_still_pages():
+    """`owningRepo` outside the known repos is ignored — warden can only inspect its own checkouts."""
+    with _triage_env() as (conn, ctx):
+        item = _fold_human_verdict(conn, "sig-reroute-unknown", item_repo="demo-repo",
+                                   owning_repo="not-a-checkout")
+        assert item["state"] == core.STATE_NEEDS_DECISION and item["repo"] == "demo-repo", dict(item)
+
+
+def test_a_non_string_owning_repo_is_ignored():
+    with _triage_env() as (conn, ctx):
+        item = _fold_human_verdict(conn, "sig-reroute-non-string", item_repo="demo-repo", owning_repo=421)
+        assert item["state"] == core.STATE_NEEDS_DECISION and item["repo"] == "demo-repo", dict(item)
+
+
+def test_a_rerouted_item_is_never_rerouted_a_second_time():
+    """The ping-pong guard: a second human verdict naming the repo the item was just moved FROM
+    lands needs_decision instead of bouncing it back (the first re-route's transition note)."""
+    with _triage_env() as (conn, ctx):
+        _add_repo(ctx, "other-repo")
+        item = _fold_human_verdict(conn, "sig-reroute-once", item_repo="demo-repo", owning_repo="other-repo")
+        assert item["state"] == core.STATE_TRIAGED and item["repo"] == "other-repo", dict(item)
+        eid = item["event_id"]
+        job_id = "job-sig-reroute-once-2"
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (job_id, "investigate", "other-repo", "b", eid, "done",
+             json.dumps({"summary": "back again", "nextAction": "human", "owningRepo": "demo-repo"}),
+             NOW.isoformat()),
+        )
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+        conn.commit()
+        work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+        again = core.get_item(conn, eid)
+        assert again["state"] == core.STATE_NEEDS_DECISION and again["repo"] == "other-repo", dict(again)
+
+
 def test_fold_an_unrecognized_next_action_fails_loudly_instead_of_guessing():
     with _triage_env() as (conn, ctx):
         item = _fold_alert_verdict(conn, "sig-bad-na", verdict={"summary": "x", "nextAction": "review"})
