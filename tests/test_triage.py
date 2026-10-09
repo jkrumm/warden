@@ -7184,6 +7184,26 @@ def test_the_shipped_policy_routes_argo_infra_signals_to_vps():
     assert not any(r["repo"] == "argo" for r in rules), "no rule may point at `argo` — the deploy target is `vps`"
 
 
+def test_the_shipped_policy_routes_every_research_gateway_alert_to_its_repo():
+    """One `slack_alert:research-gateway-*` wildcard covers every HyperDX alert on the
+    research-gateway dashboard, current and future (the alert name is the Slack title, so the
+    fingerprint starts with the service name). Real alert titles through the real match path."""
+    rules = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
+    titles = [
+        "research-gateway job.error >= 1 (15m)",
+        "research-gateway LLM provider failures >= 3 (15m)",
+        "research-gateway memory pressure >= 1 (15m)",
+        "research-gateway drain cut live jobs >= 1 (1h)",
+        "research-gateway partial rate too high (>30% over 24h, n>=5)",
+        "research-gateway synthesis/consistency failures >= 3 (1h)",
+        "research-gateway cost spike >= 1 (1h)",
+    ]
+    for title in titles:
+        row = {"source": "slack_alert", "external_id": core.fingerprint(title), "title": title}
+        matched = core.match_rule(core.match_targets(row), rules)
+        assert matched is not None and matched["repo"] == "research-gateway", (title, matched)
+
+
 def test_a_rule_match_is_a_label_route_and_the_item_still_goes_through_triage():
     policy = dict(DEFAULT_POLICY, rules=[{"match": "slack_alert:sig-rule-*", "repo": "other-repo"}])
     with _triage_env(policy=policy) as (conn, ctx):

@@ -177,8 +177,9 @@
       "repo": "rollhook"
     },
     {
-      "match": "slack_alert:*job-reaped*",
-      "repo": "vps"
+      "match": "slack_alert:research-gateway-*",
+      "repo": "research-gateway",
+      "reason": "Every HyperDX alert on the research-gateway dashboard (names start with research-gateway) and its Kuma monitors route to the gateway repo; one glob covers current and future alerts."
     },
     {
       "match": "slack_alert:*podcast-failed*",
