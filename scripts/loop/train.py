@@ -285,7 +285,7 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
 def _submit_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                    now: dt.datetime) -> None:
     """Open the step-7 review of the train's SHA. A submit that fails for infrastructure
-    reasons strikes (see strike()); a agent-gateway refusal (4xx) is final.
+    reasons strikes (see strike()); an agent-gateway refusal (4xx) is final.
 
     Claimed before the submit: the loop and the sweep both land here, and an unclaimed submit
     opens two reviews. The claim is a compare-and-set on the row as this pass read it, and its

@@ -1,5 +1,5 @@
 """The agent-gateway job-server transport — the Python port of the retired bash CLI's
-`agent_gateway_submit` (1219-1251), `agent_gateway_get` (1253-1263) and `wait_for`
+`sideclaw_submit` (1219-1251), `sideclaw_get` (1253-1263) and `wait_for`
 (1439-1462).
 
 Always `urllib.request`, never `curl`/`subprocess` — the whole point of this
@@ -45,7 +45,7 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 # Dispatch keeps a small ACCEPTANCE WINDOW instead of one version, so a
 # rolling agent-gateway restart cannot strike every in-flight episode: v5 adds the
 # `checks_tool_failed` outcome (a check-tool infrastructure failure, distinct
-# from the repo's own red suite), while a agent-gateway not yet restarted still
+# from the repo's own red suite), while an agent-gateway not yet restarted still
 # answers with v4. DISPATCH_SCHEMA_VERSIONS is what assert_result_schema()
 # enforces; a version outside the window is refused as loudly as ever. Review
 # has a single live version.
@@ -89,7 +89,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _base() -> str:
-    return os.environ.get("WARDEN_AGENT_GATEWAY_BASE", _DEFAULT_BASE)
+    return os.environ.get("WARDEN_AGENT_GATEWAY_BASE") or os.environ.get("WARDEN_SIDECLAW_BASE", _DEFAULT_BASE)
 
 
 def valid_job_id(job_id: str) -> bool:

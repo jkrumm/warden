@@ -435,7 +435,7 @@ ALTER TABLE triage_items ADD COLUMN last_reminder_at TEXT;
 """
 
 # Version 10 — the 2026-09-12 defect (item 253, `docker_homelab:unhealthy:
-# garmin-collector`): a agent-gateway `investigate` episode was killed by a
+# garmin-collector`): an agent-gateway `investigate` episode was killed by a
 # timeout, `verdict_json` was left NULL, and fold_dispatch_verdict() (which
 # never read `dispatches.status`) computed `result = {}` -> `next_action = ""`
 # -> `new_state = STATE_VERDICT` with `note = NULL`. The item parked as a
@@ -723,7 +723,7 @@ ALTER TABLE triage_items ADD COLUMN fixed_by_pr TEXT;
 #   | note contains                                       | class  | re-enters                         |
 #   | investigate episode <status> with no verdict        | infra  | triaged, dispatch_job cleared     |
 #   | step-7 review ended with no verdict / unknown review outcome | infra | merging, the train restarts at update |
-#   | exceeds the ceiling / episode not started — agent-gateway refused | policy | working (note starts with `implement`), merging (`review`/`update_pr`), else triaged |
+#   | exceeds the ceiling / episode not started — sideclaw (pre-rename) or agent-gateway refused | policy | working (note starts with `implement`), merging (`review`/`update_pr`), else triaged |
 #   | is merge-approval gated (the deleted gate)          | policy | merging, the train restarts at update |
 #   | anything else                                       | work   | never automatically; `warden retry` re-enters merging (has a PR) or triaged; none when `revert_pr` is set |
 _MIGRATION_16 = """
@@ -742,7 +742,8 @@ UPDATE triage_items SET failure_class = 'policy', retry_at = NULL,
                                       WHEN note LIKE 'review%' OR note LIKE 'update_pr%' THEN 'merging'
                                       ELSE 'triaged' END || '","columns":{},"policy_hash":null}'
   WHERE state = 'failed' AND failure_class IS NULL
-    AND (note LIKE '%exceeds the ceiling%' OR note LIKE '%episode not started — agent-gateway refused%');
+    AND (note LIKE '%exceeds the ceiling%' OR note LIKE '%episode not started — sideclaw refused%'
+         OR note LIKE '%episode not started — agent-gateway refused%');
 UPDATE triage_items SET failure_class = 'policy', retry_at = NULL,
   redrive_json = '{"state":"merging","columns":{},"policy_hash":null}'
   WHERE state = 'failed' AND failure_class IS NULL AND note LIKE '%is merge-approval gated%';

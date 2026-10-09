@@ -162,10 +162,10 @@ policy, **stays** — it bounds every dispatch, not just triage) and
 
 ## 4. LaunchAgents — current
 
-`launchctl list | grep -E 'hermes|warden|agent-gateway'`:
+`launchctl list | grep -E 'hermes|warden|sideclaw'`:
 
 ```
-12121   0   com.jkrumm.agent-gateway-server
+12121   0   com.jkrumm.sideclaw-server
 -       0   com.jkrumm.hermes-triage
 65056   75  ai.hermes.gateway
 -       0   com.jkrumm.hermes-backup
@@ -182,7 +182,7 @@ supervised-restart convention, not a triage concern.)
 | `com.jkrumm.hermes-liveness` | 300s | gateway health + Kuma push | stays |
 | `com.jkrumm.hermes-backup` | daily 03:00 | rsync `~/.hermes/` → homelab | stays; see §2 backup |
 | `ai.hermes.gateway` | — | the gateway | stays |
-| `com.jkrumm.agent-gateway-server` | — | :7705 | stays |
+| `com.jkrumm.sideclaw-server` | — | :7705 | stays |
 
 **Note the plist uses an absolute `~/SourceRoot/hermes-agent/scripts/triage.py`,
 not the `~/.hermes/scripts/` symlink** — so the triage LaunchAgent does not
@@ -269,25 +269,25 @@ being re-litigated.
 
 | repo | resolves to | DESIGN.md requires |
 |-|-|-|
-| `agent-gateway` | `implement` (default) | **never tier ≥ 1** |
+| `sideclaw` | `implement` (default) | **never tier ≥ 1** |
 | `warden` | `implement` (default) — *it exists under `~/SourceRoot` as of today* | **never tier ≥ 1** |
 
 DESIGN.md § Security model, verbatim: *"warden may never hold tier ≥ 1 on
-`agent-gateway` or on `warden` itself. agent-gateway is a valid dispatch target today;
+`sideclaw` or on `warden` itself. sideclaw is a valid dispatch target today;
 auto-merging PRs against your own executor closes a loop that has no outside."*
 
 Creating this repo **widened** that hole rather than being neutral to it. This is
 not a design conflict — the design already calls it — it is an unfixed instance,
 and it is squarely inside Wave 0's "re-assert the repo allowlist". It must be
 fixed in **both** places: `dispatch-repos.json` (warden's copy, defence in depth)
-and **inside agent-gateway** (the boundary).
+and **inside sideclaw** (the boundary).
 
 Also recorded, because a future edit will otherwise get it wrong: a name in `deny`
 that also appears in `tiers` is a **contradiction the resolver refuses to run on**,
 not a precedence question. Same for a name in `sensitive` that is not in `deny`.
 `sensitive` grants exactly one thing — `investigate` only, derived from the repo
 name alone with no caller-facing flag — and sets `"sensitive": true` on the
-submitted body so agent-gateway's `assertSensitiveTierAllowed` + `applySensitiveScan`
+submitted body so sideclaw's `assertSensitiveTierAllowed` + `applySensitiveScan`
 re-check independently.
 
 ---
@@ -300,7 +300,7 @@ Everything outside `hermes-agent` that names `watchdog.db` or `hermes-cc.sh`:
 |-|-|-|
 | `dotfiles/docs/architecture.md:171` | describes `com.jkrumm.hermes-triage` and why it is a LaunchAgent | **must be updated** when the agent repoints |
 | `dotfiles/scripts/log-rotate.sh:78` | log rotation for `hermes-cc.sh`'s audit log | check; add warden's logs |
-| `agent-gateway/docs/dispatch-security.md` | the executor-side security model | read before the agent-gateway change |
+| `sideclaw/docs/dispatch-security.md` | the executor-side security model | read before the sideclaw change |
 | `brain/wiki/engineering/incident-triage-loop.md` | knowledge page | update after the move, not during |
 | `brain/wiki/engineering/hermes-as-control-surface.md` | knowledge page | ditto |
 | `brain/wiki/engineering/agent-dispatch-paths.md` | knowledge page | ditto |
@@ -308,14 +308,14 @@ Everything outside `hermes-agent` that names `watchdog.db` or `hermes-cc.sh`:
 `hermes-agent/Makefile` couplings: `HERMES_PLISTS := com.jkrumm.hermes-liveness
 com.jkrumm.hermes-backup com.jkrumm.hermes-triage` (line 22) — the triage entry
 leaves. `make status` runs `scripts/validate-dispatch-policy.py` against
-`config/dispatch-repos.json` (line 256) and probes agent-gateway :7705 (line 266).
+`config/dispatch-repos.json` (line 256) and probes sideclaw :7705 (line 266).
 
 `hermes-agent/docs/`: `triage.md` (**1027 lines — moves with the code**),
 `watchdog.md` (41), `dispatch-bridge.md` (595 — splits, like `hermes-cc.sh`).
 
 ---
 
-## 8. agent-gateway — liveness confirmed
+## 8. sideclaw — liveness confirmed
 
 ```
 $ curl -s http://127.0.0.1:7705/api/routing
@@ -366,14 +366,14 @@ Complete. Nothing has been edited. Three things the recon changed versus the doc
 1. **The extraction is cleaner than DESIGN.md assumes** — zero hermes-package
    imports, pure stdlib, and the one named cross-dependency
    (`agents-overview.py` → `hermes-cc.sh`) does not exist. See §12.
-2. **The agent-gateway hole is wider than C5 states** — `sensitive` is caller-declared,
+2. **The sideclaw hole is wider than C5 states** — `sensitive` is caller-declared,
    so the `deny` list has no representation at the boundary at all. See §11.
 3. **The backup open question is answered, and inverts** — coverage exists today
    *because* the ledger sits under `~/.hermes/`. Moving it is what breaks it. See §2.
 
 None of the three changes the design. All three change Wave 0's shape.
 
-## 11. agent-gateway — the executor, mapped
+## 11. sideclaw — the executor, mapped
 
 Bun + Elysia. Bound `127.0.0.1:7705`, loopback only (`server/index.ts:127-131`).
 Deploy is `make reload` — **never** `bun run dev`/`start` (both `exit 1`,
@@ -419,7 +419,7 @@ The perimeter is stated only as a comment (`server/index.ts:127-131`): *"nothing
 here carries auth of its own, so a tailnet-reachable bind would be an
 unauthenticated job submitter one ACL grant away."*
 
-The only header gate in the whole app is `x-agent-gateway-shutdown: 1` on
+The only header gate in the whole app is `x-sideclaw-shutdown: 1` on
 `POST /api/shutdown` (`shutdown.ts:31,36`), and its own comment says it is
 explicitly **not** auth (`shutdown.ts:29-30`).
 
@@ -436,7 +436,7 @@ explicitly **not** auth (`shutdown.ts:29-30`).
 > `dotfiles-private` and `homelab-private` are the two repos whose entire purpose
 > is that their contents are not referenced from anywhere else.
 > **This is not a re-litigation of anything in REVIEW.md — it is the same C5
-> hole, measured, and it means the agent-gateway allowlist must be a *deny*-capable
+> hole, measured, and it means the sideclaw allowlist must be a *deny*-capable
 > policy, not merely an "is it under `~/SourceRoot`" prefix check.**
 
 ### Tiers — `TIERS`, `dispatch.ts:242-268`
@@ -547,13 +547,13 @@ Two wholesale replacements:
   > **DESIGN.md's claim verified exactly:** a withheld verdict is
   > `nextAction: "human"` with empty evidence and is **indistinguishable from a
   > genuine needs-human** except by substring-matching `"Verdict withheld: matched "`.
-  > Full text persists at `~/.local/state/agent-gateway/private-verdicts/`, mode 0600
+  > Full text persists at `~/.local/state/sideclaw/private-verdicts/`, mode 0600
   > (`dispatch-git.ts:774,795`); warn log `dispatch.verdict_withheld`
   > (`dispatch.ts:510-520`). Secret patterns: `dispatch-git.ts:66-91`, 8 of them.
 
 ### Job store — `server/jobs/store.ts`
 
-bun:sqlite on disk, `~/.local/share/agent-gateway/jobs.db` (`:29-31`), **WAL +
+bun:sqlite on disk, `~/.local/share/sideclaw/jobs.db` (`:29-31`), **WAL +
 `busy_timeout=5000`** (`:65-66`). Table `jobs` (`:67-81`), one migration (`:86-90`).
 Status enum (`types.ts:53`): `pending | running | done | failed | interrupted`;
 terminal = `done|failed|interrupted` (`:56-60`). `MAX_CONCURRENT = 3` (`store.ts:38`).
@@ -571,7 +571,7 @@ Only tool-aware behaviour is *recovery*, not pruning:
 `REQUEUE_ON_RECOVER = {check, overview, narrative, review}` (`:215-216`) —
 **`dispatch` is deliberately excluded** (`:210-214`), so an interrupted dispatch
 goes terminal-`interrupted` rather than re-running. (Matches DESIGN.md § Abort:
-*"agent-gateway deliberately never recovers `dispatch` on restart"*.)
+*"sideclaw deliberately never recovers `dispatch` on restart"*.)
 
 ### Cancel — does not exist (Wave 3, recorded now so it is not re-derived)
 
@@ -594,7 +594,7 @@ while still running its `finally` teardown (`:796-802`).
 
 ### Config pattern — where the allowlist has to live
 
-**agent-gateway has no config file. Zero JSON/YAML/TOML loading anywhere in the server.**
+**sideclaw has no config file. Zero JSON/YAML/TOML loading anywhere in the server.**
 The pattern, in order of precedence:
 
 1. `.env` at repo root, hand-rolled parser `server/lib/load-env.ts:18-52`,
@@ -656,14 +656,14 @@ on policy — there is no policy to fail on. `status` went `running` → `failed
 1 ms.
 
 **Wave 0 acceptance test, stated now so it is not invented later.** After the
-agent-gateway change, the same unauthenticated POST must be refused **by policy, at
+sideclaw change, the same unauthenticated POST must be refused **by policy, at
 submit time** (not at execution), for each of:
 
 | `cwd` | `tier` | must be refused because |
 |-|-|-|
 | `~/SourceRoot/homelab-private` | `implement` | `deny` — and `sensitive` was omitted, which is the bypass today |
 | `~/SourceRoot/dotfiles-private` | `author` | `deny`; `author` is refused for a sensitive name at any tier |
-| `~/SourceRoot/agent-gateway` | `implement` | DESIGN.md: warden may never hold tier ≥ 1 on its own executor |
+| `~/SourceRoot/sideclaw` | `implement` | DESIGN.md: warden may never hold tier ≥ 1 on its own executor |
 | `~/SourceRoot/warden` | `implement` | DESIGN.md: nor on itself |
 | `/tmp/some-git-repo` | any | outside the dispatch root entirely |
 
@@ -730,7 +730,7 @@ dispatch-sweep-cron.py ──▶ dispatch-sweep.py ──▶ triage.py
 >
 > The only occurrence is a **docstring line explicitly disclaiming the coupling**.
 > `agents-overview.py`'s sole subprocess is `secrets-run`; everything else it
-> reads is HTTP against agent-gateway at `localhost:7705`.
+> reads is HTTP against sideclaw at `localhost:7705`.
 >
 > The real seam runs the **other way** and is Python, not shell: `triage.py:711-717`
 > dynamically loads `agents-overview.py` to borrow `resolve_slack_token`. And it
@@ -834,12 +834,12 @@ under hermes-cc's 20), `MAX_CLUSTER_SIGNATURES=5`, `SUBPROCESS_TIMEOUT=60`,
 `approval_argv_json` 1085-1109 · `mint_approval` 1110-1147 ·
 **`require_signed_approval` 1148-1223** (the verifier → warden; the signer stays).
 
-**(b) agent-gateway client → thin shim**
+**(b) sideclaw client → thin shim**
 
-`agent_gateway_submit` 1248-1281 (body serialized by `python3` from env, **never string
-concat**) · `agent_gateway_get` 1282-1293 · `valid_job_id` 1294-1306 ·
+`sideclaw_submit` 1248-1281 (body serialized by `python3` from env, **never string
+concat**) · `sideclaw_get` 1282-1293 · `valid_job_id` 1294-1306 ·
 `wait_for` 1468-1498 (`WAIT_TIMEOUT=170`, `WAIT_INTERVAL=5`) ·
-`agent_gateway_get_or_record` 1545-1562 · `sync_record` 1499-1527 · `record_dispatch` 1224-1247.
+`sideclaw_get_or_record` 1545-1562 · `sync_record` 1499-1527 · `record_dispatch` 1224-1247.
 
 **(c) GitHub → its own module.** `gh_token` 1307-1323 (token never reaches argv —
 `curl -K -`) · `github_api` 1324-1342 · `json_field` 1343-1363 ·
@@ -863,15 +863,15 @@ Constants `:155-181`: `GH_OWNER=jkrumm` (a constant, not a parameter),
 
 | Status | Written by | Read by | Verdict |
 |-|-|-|-|
-| **`queued`** | `hermes-cc.sh:1237` (`record_dispatch`) — agent-gateway never emits it | `:1592` (`cmd_list` open scope), `:1534` (`record_as_job_json` → "never finished", exit 4), `:2211` (`--json` submit envelope) | delete |
+| **`queued`** | `hermes-cc.sh:1237` (`record_dispatch`) — sideclaw never emits it | `:1592` (`cmd_list` open scope), `:1534` (`record_as_job_json` → "never finished", exit 4), `:2211` (`--json` submit envelope) | delete |
 | **`lost`** | **not by `hermes-cc.sh` at all** — by `dispatch-sweep.py:34` (`LOST_STATUS`), after `LOST_AFTER_MISSES=3` consecutive 404s (`:33`) | `hermes-cc.sh:1534` (accepted as terminal), `:1539-1540` (synthesizes an `error`) | delete |
 
-**`record_as_job_json` 1528-1544** rebuilds a fake agent-gateway job envelope from the
-`dispatches` row when agent-gateway has pruned the job, emitting `{"fromRecord": true}`.
+**`record_as_job_json` 1528-1544** rebuilds a fake sideclaw job envelope from the
+`dispatches` row when sideclaw has pruned the job, emitting `{"fromRecord": true}`.
 Exit 3 = no row, exit 4 = row never terminal.
 
 > This function is the **existing workaround for the 24h/200-row prune** confirmed
-> at `agent-gateway/server/jobs/store.ts:41-42` (§11). DESIGN.md says delete it, not
+> at `sideclaw/server/jobs/store.ts:41-42` (§11). DESIGN.md says delete it, not
 > move it. That is only safe once the ledger holds the verdict itself — which is
 > what "the verdict is copied into the ledger the moment a terminal status is read"
 > means in DESIGN.md § The model. **Deleting it before that is a regression.**
@@ -1014,8 +1014,8 @@ which. **Do not start Wave 1.**
 
 | # | Slice | Repo | Stop-condition item | Status |
 |-|-|-|-|-|
-| 0.1 | Repo policy module in agent-gateway: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | agent-gateway | **3 — agent-gateway enforces the allowlist** | **DONE & LIVE** — agent-gateway `2d225d4`, verified §20 |
-| 0.2 | Typed `outcome` enum + schema version + `GET /api/dispatch-schema`. | agent-gateway | DESIGN.md Wave 0 | **DONE & LIVE** — agent-gateway `360990c`, §22 |
+| 0.1 | Repo policy module in sideclaw: root + `deny` + per-repo tier ceiling + the two self-reference bans. Wired into `runDispatch` **and** refused at submit. `bun test` first. | sideclaw | **3 — sideclaw enforces the allowlist** | **DONE & LIVE** — sideclaw `2d225d4`, verified §20 |
+| 0.2 | Typed `outcome` enum + schema version + `GET /api/dispatch-schema`. | sideclaw | DESIGN.md Wave 0 | **DONE & LIVE** — sideclaw `360990c`, §22 |
 | 0.3 | warden repo skeleton: venv (`cryptography` only), Makefile, `launchd/*.template`, hand-rolled test runner, log-rotate registration. | warden | 1, 5 | **done** — `89b0c12`, see §15 |
 | 0.4a | **Copy** the loop, the poller, the sweeper, the summary reader, the four suites and the two docs into warden. Sever the `agents-overview.py` seam. Repoint `hermes-ops.sh`. No behaviour change anywhere. | warden | 1, 2 | **done** — `040e3eb`, see §16 |
 | 0.4b | Cut over: unload `com.jkrumm.hermes-triage`, delete the two `cron/jobs.json` entries, delete the originals and the two orphan wrappers, load warden's agents. Folded into 0.6 — one short reversible flip, so there is never an interval with two loops or none. | warden + hermes-agent | 1, 5 | not started |
@@ -1043,7 +1043,7 @@ Wave 1.
 
 ## 14. Next action
 
-**Start slice 0.1.** Write `tests/repo-policy.test.ts` in agent-gateway against the
+**Start slice 0.1.** Write `tests/repo-policy.test.ts` in sideclaw against the
 acceptance table in §11 ("Live proof of the missing boundary"), then the policy
 module in the `routing.ts` shape (`const` default + env override + pure
 `buildX(env)` + read-only projection + startup log — §11 "Config pattern"), then
@@ -1222,7 +1222,7 @@ running changed.
 
 ---
 
-## 17. Slice 0.1 — agent-gateway repo policy (code complete, `agent-gateway` working tree)
+## 17. Slice 0.1 — sideclaw repo policy (code complete, `sideclaw` working tree)
 
 Not yet committed or deployed — a `/review` is running, and `make reload` refuses
 while a job is in flight.
@@ -1248,7 +1248,7 @@ cwd      must be a DIRECT child of a root — not the root, not a nested subdir
 default  { ceiling: implement, sensitive: false }
 
 PINNED (env can never raise, remove or touch):
-  agent-gateway          investigate
+  sideclaw          investigate
   warden            investigate
 
 DEFAULT (env may only narrow):
@@ -1317,7 +1317,7 @@ python3  os.path.realpath  -> /Users/jkrumm/SourceRoot/Homelab-Private   (case N
 bun      realpathSync      -> /Users/jkrumm/SourceRoot/homelab-private   (case corrected)
 ```
 
-**agent-gateway is safe**: it uses Bun's `realpathSync`, which returns the on-disk
+**sideclaw is safe**: it uses Bun's `realpathSync`, which returns the on-disk
 name, so the mixed-case spelling lands on the `homelab-private` rule. A test for
 this is owed and is added after the review lands.
 
@@ -1330,8 +1330,8 @@ this is owed and is added after the review lands.
 ### Drift, and what closes it
 
 There are now **two** copies of this policy — `dispatch-repos.json` in
-hermes-agent and `DEFAULT_RULES` in agent-gateway. DESIGN.md § Security model asks for
-precisely that ("warden's copy is defence in depth; agent-gateway's is the boundary"),
+hermes-agent and `DEFAULT_RULES` in sideclaw. DESIGN.md § Security model asks for
+precisely that ("warden's copy is defence in depth; sideclaw's is the boundary"),
 so the duplication is intended, not an accident. But it is the same drift shape
 DESIGN.md warns about for the verdict schema, and drift here presents as *"the
 boundary quietly allows something the control plane thinks it forbids."*
@@ -1345,7 +1345,7 @@ rather than defence in depth.
 
 ## 18. Slice 0.1 — review pass 1, and what it changed
 
-`/review` on the uncommitted agent-gateway diff. Outcome **`needs-human`**, and partly
+`/review` on the uncommitted sideclaw diff. Outcome **`needs-human`**, and partly
 for a reason that has nothing to do with the code: **2 of 8 reviewers failed to
 start** — `typescript` and `security`, both *"Session exited with code 1"*, neither
 having examined the diff. A security change reviewed by everything except the
@@ -1372,7 +1372,7 @@ disk lowername  query mixed   -> lowername
 
 `realpathSync` returns the **on-disk** name. And every ruled repo is lowercase on
 disk — checked one by one, `dotfiles-private`, `homelab-private`, `dotfiles`,
-`brain`, `hermes-agent`, `agent-gateway`, `warden`, all `MATCH`. **There was no live
+`brain`, `hermes-agent`, `sideclaw`, `warden`, all `MATCH`. **There was no live
 bypass.** (An earlier note in §17 read this as "bun canonicalizes, Python does
 not"; the sharper statement is that *both* return the on-disk name here — the
 Python reading came from a path whose disk name already was lowercase, which
@@ -1598,8 +1598,8 @@ multiple writers acute. The gap is named rather than narrowed.
 
 ## 20. Slice 0.1 — review pass 2, and the live acceptance test
 
-**Stop-condition item 3 — "agent-gateway enforces the allowlist" — is DONE and verified
-against the running daemon.** agent-gateway commit `2d225d4`, deployed with `make reload`.
+**Stop-condition item 3 — "sideclaw enforces the allowlist" — is DONE and verified
+against the running daemon.** sideclaw commit `2d225d4`, deployed with `make reload`.
 
 ### Review pass 2 (security and typescript angles ran this time)
 
@@ -1662,7 +1662,7 @@ submit — no job row created:**
 cwd                                        tier         result
 /Users/jkrumm/SourceRoot/homelab-private   implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'homelab-private'
 /Users/jkrumm/SourceRoot/dotfiles-private  author       400  tier 'author' exceeds the ceiling 'investigate' for repo 'dotfiles-private'
-/Users/jkrumm/SourceRoot/agent-gateway          implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'agent-gateway'
+/Users/jkrumm/SourceRoot/sideclaw          implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'sideclaw'
 /Users/jkrumm/SourceRoot/warden            implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'warden'
 /tmp                                       investigate  400  cwd is not a repo directly under a dispatch root: /tmp
 /Users/jkrumm/SourceRoot/Homelab-Private   implement    400  tier 'implement' exceeds the ceiling 'investigate' for repo 'homelab-private'
@@ -1698,7 +1698,7 @@ and against the real repos, through the pure resolver rather than by dispatching
 ## 21. Slice 0.7 (first half) — the defence-in-depth copy, in hermes-agent
 
 hermes-agent `22eb31c`. `config/dispatch-repos.json` now has
-`tiers.investigate: ["dotfiles", "brain", "hermes-agent", "agent-gateway", "warden"]`.
+`tiers.investigate: ["dotfiles", "brain", "hermes-agent", "sideclaw", "warden"]`.
 
 Both new names went into `tiers.investigate` and **not** into `deny`, for two
 reasons: investigating them is legitimate and often the point — only the write
@@ -1730,7 +1730,7 @@ artifact, not part of this change.
   boundary quietly allows what the control plane forbids."*
   **Careful, and this is the trap:** warden's side is Python, and
   `os.path.realpath` does **not** correct case the way Bun's `realpathSync` does.
-  A naive `basename()` comparison there reintroduces the fail-open the agent-gateway
+  A naive `basename()` comparison there reintroduces the fail-open the sideclaw
   side just closed (§17, §20).
 - `dotfiles/docs/architecture.md:171`, which describes `com.jkrumm.hermes-triage`
   and why it is a LaunchAgent — rewrite at the cutover, when it stops being true.
@@ -1738,7 +1738,7 @@ artifact, not part of this change.
 
 ---
 
-## 22. Slice 0.2 — the typed verdict (DONE & LIVE, agent-gateway `360990c`)
+## 22. Slice 0.2 — the typed verdict (DONE & LIVE, sideclaw `360990c`)
 
 Nine structurally different endings were concatenated onto one prose field, and a
 tenth — the sensitive-withheld verdict — had no type at all. `DISPATCH_OUTPUT` now
@@ -1987,8 +1987,8 @@ absolute.
 | # | Stop condition | Verdict | Evidence |
 |-|-|-|-|
 | 1 | The repo runs its own loop on its own LaunchAgent | **DONE** | `com.jkrumm.warden-loop`, `StartInterval 600`. All four warden agents last-exit **0**. `triage_last_run` written by the agent, not by hand. `com.jkrumm.hermes-triage` gone from `launchctl list` and from `~/Library/LaunchAgents/` |
-| 2 | The tests pass | **DONE** | warden `test_triage.py` **68/68** (the baseline), `test_ledger.py` **11/11**, three more suites green. hermes-agent **165** + **51** + eight more. agent-gateway **555 pass / 0 fail**. **No test deleted, skipped or weakened** — audited independently; both changed assertions moved *stricter* |
-| 3 | agent-gateway enforces the allowlist | **DONE** | Live, both directions. Refuses traversal, `.` segments, trailing slashes, case-flips, pinned-repo-via-`../`, a subdirectory and the root itself — all 400 at submit, no job row. Still admits `vps@implement`, `hermes-agent@investigate` |
+| 2 | The tests pass | **DONE** | warden `test_triage.py` **68/68** (the baseline), `test_ledger.py` **11/11**, three more suites green. hermes-agent **165** + **51** + eight more. sideclaw **555 pass / 0 fail**. **No test deleted, skipped or weakened** — audited independently; both changed assertions moved *stricter* |
+| 3 | sideclaw enforces the allowlist | **DONE** | Live, both directions. Refuses traversal, `.` segments, trailing slashes, case-flips, pinned-repo-via-`../`, a subdirectory and the root itself — all 400 at submit, no job row. Still admits `vps@implement`, `hermes-agent@investigate` |
 | 4 | Ledger: WAL + one writer + one migrator + a backup | **PARTIAL — one item, declared** | WAL ✓ · `schema_version` ✓ · **one migrator ✓ (as of `15e50a9`)** · backup ✓ end to end · **one writer ✗** |
 | 5 | Two cron jobs → LaunchAgents, orphan wrappers deleted | **DONE** | `jobs.json` 7 → 5, missing exactly `4b1faabda97d` and `4dd759917dd1`. `watchdog-slack.py` and `dispatch-sweep-cron.py` deleted, heartbeat ported first |
 
@@ -2105,7 +2105,7 @@ $ make test
 
 $ make check-policy
 ✓ both copies agree on all 30 repos
-notes: agent-gateway also admits roots hermes-cc.sh never uses: ['/Users/jkrumm/IuRoot']
+notes: sideclaw also admits roots hermes-cc.sh never uses: ['/Users/jkrumm/IuRoot']
 ```
 
 `test_triage.py` is **68/68**, the number §25 pins. Policy copies agree on all 30.
@@ -2478,7 +2478,7 @@ imports it and owns the spool.
 **Decision 2: no signature verification in the drain, deliberately.** This was
 the one real design question in the slice. `require_signed_approval()`
 (`hermes-cc.sh:1113`) already verifies, and a second verifier is a copied
-contract — the exact defect this repo refuses for agent-gateway's verdict schema. So
+contract — the exact defect this repo refuses for sideclaw's verdict schema. So
 the drain validates SHAPE and writes the row; the signature is checked where it
 always was, at spend time.
 
@@ -2944,9 +2944,9 @@ network rather than a stub.
 
 3b — set `state_deadline` on every transition into a non-terminal state, and a
 `sweep_deadlines()` step that acts on expiry per DESIGN.md § Deadlines. 3c — make
-`poll_implement_jobs`/`poll_validation_jobs` survive agent-gateway pruning its job
+`poll_implement_jobs`/`poll_validation_jobs` survive sideclaw pruning its job
 (`PRUNE_TTL_MS` 24h **or** `MAX_TERMINAL_ROWS` 200, confirmed at
-`agent-gateway/server/jobs/store.ts:41-42`, a cap shared with every interactive
+`sideclaw/server/jobs/store.ts:41-42`, a cap shared with every interactive
 `/check`). Both need a decision recorded first: three of the nine expiry actions
 in DESIGN.md's table target `dismissed`, and that state does not exist yet.
 
@@ -2990,16 +2990,16 @@ by a test rather than by reading.
 `snoozed_until`) and are named in the table pointing at them, so the audit passes
 without two mechanisms that could disagree.
 
-### 3c — the agent-gateway pruning gap closes with no new column
+### 3c — the sideclaw pruning gap closes with no new column
 
 `poll_implement_jobs`/`poll_validation_jobs` both did `if resp is None: continue`,
-so an item whose agent-gateway job was pruned was polled forever with nothing moving
-it. agent-gateway prunes terminal jobs at 24h **or** 200 rows
-(`agent-gateway/server/jobs/store.ts:41-42`, re-verified — a cap shared with every
+so an item whose sideclaw job was pruned was polled forever with nothing moving
+it. sideclaw prunes terminal jobs at 24h **or** 200 rows
+(`sideclaw/server/jobs/store.ts:41-42`, re-verified — a cap shared with every
 interactive `/check`, so 200 can arrive in an afternoon). The 2h/1h deadlines
 fire long before either bound, so a pruned job's item exits to `merge_blocked` on
 the clock. **No miss counter, no new column.**
-`test_a_pruned_agent_gateway_job_does_not_strand_an_item` proves it: the item does not
+`test_a_pruned_sideclaw_job_does_not_strand_an_item` proves it: the item does not
 move inside its deadline and does reach `merge_blocked` past it.
 
 ### The correction I made to the delivered work
@@ -3093,7 +3093,7 @@ by this section.
 | 1 | Silence-resolve applies only to `new`; a `needs_human` item cannot be discarded by a fault clearing itself | **MET** | `aa30ddc`. Old vs new on live snapshots: the old loop resolved all four real `needs_human` rows and erased all four notes; the new one keeps them. Reviewer's own mutation to `(new, needs_human)` fails 4 tests by name. |
 | 2 | An intent can be recorded by any surface and signed only by Slack or a TTY | **HALF MET** | `c788416` (`intents.py`, records with no DB handle at all), `0245f98` (loop drains as backstop), `3c5d516` (Slack signs). **The TTY half is item 5 and is unbuilt.** |
 | 3 | The approval plugin no longer writes the ledger directly | **MET** | `3c5d516`. Both handles `mode=ro` (`__init__.py:263,393`). Gateway restarted 15:59:27, pubkey rotated — the new plugin is live, verified by the reviewer. |
-| 4 | Every non-terminal state carries a `state_deadline` and a named poller that survives agent-gateway pruning | **MET** | `4c3b8c9`. `STATE_DEADLINES` + the principle-6 enumeration test; `grep -c 'UPDATE triage_items SET state='` → 1. The reviewer watched the **17:34:38Z** loop tick stamp all four `needs_human` rows to `2026-09-16T17:34:38Z` while the three `new` rows correctly stayed NULL. |
+| 4 | Every non-terminal state carries a `state_deadline` and a named poller that survives sideclaw pruning | **MET** | `4c3b8c9`. `STATE_DEADLINES` + the principle-6 enumeration test; `grep -c 'UPDATE triage_items SET state='` → 1. The reviewer watched the **17:34:38Z** loop tick stamp all four `needs_human` rows to `2026-09-16T17:34:38Z` while the three `new` rows correctly stayed NULL. |
 | 5 | The CLI decide path works at a TTY with the gateway stopped | **NOT MET — BLOCKED** | See below. |
 
 ### Item 5 — blocked on a contradiction inside DESIGN.md, not on effort
@@ -4288,7 +4288,7 @@ $ make test                                      # exit 0
 $ make check-policy
   dispatch policy — 30 repos under /Users/jkrumm/SourceRoot
   ✓ both copies agree on all 30 repos
-  notes: agent-gateway also admits roots hermes-cc.sh never uses: ['/Users/jkrumm/IuRoot']
+  notes: sideclaw also admits roots hermes-cc.sh never uses: ['/Users/jkrumm/IuRoot']
 
 $ grep -c 'UPDATE triage_items SET state=' scripts/triage.py
 1
@@ -4787,7 +4787,7 @@ This is what item 1 exists to fix, and it is worth having in one table.
 | `hermes-cc dispatch` (gated) | `UPDATE dispatch_approvals SET spent_at` + COMMIT | `POST /api/jobs` | **write BEFORE** | approval burned, nothing dispatched — `DESIGN.md:492`'s *"approved fix, no action completed"*, verbatim |
 | same | `INSERT INTO dispatches` | (same call) | **write AFTER** | an episode runs that warden has no record of: never swept, never reported, never budget-counted |
 | `maybe_auto_implement` | `_set_state(implementing, expect_state=verdict, expect_null=implement_job)` | `dispatch --auto-from-item` | **write BEFORE** ✅ | but `implement_job` is written *after*, so a crash in between leaves an item `implementing` that `poll_implement_jobs` never selects (`implement_job IS NOT NULL`) — rescued only by the 2h deadline |
-| same | rollback to `verdict` on a `None` return | | | **the duplication bug**: `_run_hermes_cc_auto_implement` returns `None` on `TimeoutExpired` *and* on non-JSON stdout, both reachable **after** agent-gateway accepted the job. Next tick auto-implements again — two branches, two draft PRs |
+| same | rollback to `verdict` on a `None` return | | | **the duplication bug**: `_run_hermes_cc_auto_implement` returns `None` on `TimeoutExpired` *and* on non-JSON stdout, both reachable **after** sideclaw accepted the job. Next tick auto-implements again — two branches, two draft PRs |
 | `poll_validation_jobs` | `UPDATE dispatches SET validation_status` | `merge --confirm` | **write BEFORE** | the only write-first in the chain, and the one that did not need to be |
 | `cmd_merge` | `UPDATE dispatches SET merged_at` | `PUT /pulls/:pr/merge` | **write AFTER** | crash between them → retry sees `merged_at` NULL, GitHub says `merged: true`, `policy_err` fires, warden records **`merge_blocked` for a PR that is merged and deployed**. `DESIGN.md:500`'s *"silently read as failure"*, exactly |
 | `run_deploy_if_enabled` | *nothing* | `ssh vps make hyperdx-apply` | **no write at all** | `ok`, `exitCode` and `output` are dropped; only `expectedAlerts` is persisted. "Did the deploy run?" is unanswerable except by probing HyperDX hours later — which cannot tell *"never ran"* from *"ran and the fix was wrong"* |
@@ -4814,8 +4814,8 @@ happen" check against an external operation, and it reads local state, never
 GitHub.
 
 `poll_misses` is not an attempt counter: `dispatch-sweep.py` increments it **only**
-on a agent-gateway 404, resets it to 0 on any successful poll, and gives up at 3 into
-status `lost`. It answers "has agent-gateway forgotten this job", which is a
+on a sideclaw 404, resets it to 0 on any successful poll, and gives up at 3 into
+status `lost`. It answers "has sideclaw forgotten this job", which is a
 bookkeeping debt, not an operation one.
 
 `dispatch-sweep.py:25-43` is the one place in the system where write/call ordering
@@ -4843,38 +4843,38 @@ is a closed allowlist that `validate()` raises on, and `_NEVER_FROM_FILE =
 file. An operation id has the same character and wants the same treatment — it
 must come from the row, never from the intent.
 
-### Facts about agent-gateway that bear on reconciliation
+### Facts about sideclaw that bear on reconciliation
 
-Verified against `~/SourceRoot/agent-gateway` by the second subagent; the `DESIGN.md`
-claims they check are quoted in §*Talking to agent-gateway* of `CLAUDE.md`.
+Verified against `~/SourceRoot/sideclaw` by the second subagent; the `DESIGN.md`
+claims they check are quoted in §*Talking to sideclaw* of `CLAUDE.md`.
 
 - **No cancel endpoint exists in any form.** Only `POST /api/shutdown`, which is
   process-wide and SIGTERMs every worker. `warden abort` (item 2) therefore needs
-  a real agent-gateway change, as `DESIGN.md` says.
+  a real sideclaw change, as `DESIGN.md` says.
 - **A pruned job id returns `404 "job not found"` — byte-identical to a job id
   that never existed.** Pruning is 24h **or** 200 terminal rows shared across all
   six tools, and `prune()` runs after *every* job finish, not on a timer. The
   reconciliation problem is confirmed at the wire level.
 - **`GET /api/jobs/:id` returns a view that drops `params`.** Warden cannot
-  recover a job's repo, tier or brief from agent-gateway after the fact — it must have
+  recover a job's repo, tier or brief from sideclaw after the fact — it must have
   recorded them before submitting. An independent argument for
   operation-id-before-dispatch.
 - **A drain-killed job is deliberately left at `running`** and reconciled only at
-  agent-gateway's next boot. If that boot never happens, `GET /api/jobs/:id` reports
+  sideclaw's next boot. If that boot never happens, `GET /api/jobs/:id` reports
   `running` forever, so a reconciler treating `running` as "still alive" waits
   indefinitely.
 - `DISPATCH_SCHEMA_VERSION = 1`, carried as a required `schemaVersion` literal on
   every verdict *and* served at `GET /api/dispatch-schema` — two independent
   mismatch channels. Warden's loud-refusal rule is implementable from the job
   result alone.
-- **`warden` and `agent-gateway` are hard-pinned to tier `investigate`**, merged last
+- **`warden` and `sideclaw` are hard-pinned to tier `investigate`**, merged last
   in `buildDispatchPolicy` so environment variables cannot raise them. `DESIGN.md`
   § Security model's rule holds in the executor, verified rather than assumed.
 - **One `DESIGN.md` claim is optimistic.** *"Salvage bundles are referenced only
   inside an error string"* is true of the synchronous-throw path. After a real
   SIGKILL the job's error is the fixed string `'HTTP server restarted while job
   was running'` and the bundle path appears **only in a pino warn log**
-  (`dispatch.worktree_salvaged`), reachable by grepping `~/Library/Logs/agent-gateway.*`.
+  (`dispatch.worktree_salvaged`), reachable by grepping `~/Library/Logs/sideclaw.*`.
   The bundle is derivable from the branch name, which is derivable from the job
   id; bundles self-prune at 14 days / 100 files.
 
@@ -5110,7 +5110,7 @@ the same gap, found only because the first one prompted looking.
    2 precondition / 3 remote / 4 policy / 64 usage, returned as `exitCode` in its
    `--json` error object. Only **3** can fire after an external mutation was
    attempted: `remote_err` is reached once it is already talking to something, and
-   covers the literal `remote_err "agent-gateway accepted the job but returned no id"`.
+   covers the literal `remote_err "sideclaw accepted the job but returned no id"`.
    Mapping it to `merge_blocked` is *"silently read as failure"* arriving through
    a parsed error object instead of a dead process. Exit 3 now leaves the
    operation open for GitHub to answer; 2/4/64 stay definite refusals, with a test
@@ -5159,7 +5159,7 @@ byte-identical after every restore:
 | `autoDeploy` branch → `merged` instead of `needs_human` | `test_reconcile_merged_operation_with_autodeploy_goes_to_needs_human` |
 | exit-3 REMOTE read as a refusal again | `test_merge_remote_error_is_left_for_reconcile_not_read_as_merge_blocked` |
 | `record_operation()` loses its `commit()` | `test_record_operation_commits_before_returning` |
-| agent-gateway 404 → `failed` instead of `unknown` | `test_reconcile_implement_agent_gateway_404_becomes_unknown_not_failed_and_needs_human` |
+| sideclaw 404 → `failed` instead of `unknown` | `test_reconcile_implement_sideclaw_404_becomes_unknown_not_failed_and_needs_human` |
 | GitHub says MERGED → `failed` | 3 tests |
 | `reconcile_operations()` moved after `drain_intents()` | `test_reconcile_operations_runs_before_anything_that_could_retry` |
 | `mergeCommit` dropped from the receipt | `test_successful_merge_stores_pull_request_merge_commit_and_deploy_in_receipt` |
@@ -5201,12 +5201,12 @@ pipeline working, not a side effect of this slice.
 1. **An `implement` dispatch that exits 3 (REMOTE) is still treated as `failed`
    and rolled back.** The merge path now distinguishes it because GitHub can be
    asked; the implement path cannot — `GET /api/jobs/:id` drops `params` (§46), so
-   warden cannot ask agent-gateway *"is there a job for this repo"*. Mapping exit 3 to
+   warden cannot ask sideclaw *"is there a job for this repo"*. Mapping exit 3 to
    `unknown` there would send an item to `needs_human` on **every transient
-   agent-gateway outage** — the common case, currently handled correctly by a rollback
-   and retry — to guard against agent-gateway returning 200 with a malformed body,
+   sideclaw outage** — the common case, currently handled correctly by a rollback
+   and retry — to guard against sideclaw returning 200 with a malformed body,
    which is essentially never. The honest fix is a distinct exit code in
-   `hermes-cc.sh` separating "could not reach agent-gateway" from "agent-gateway accepted
+   `hermes-cc.sh` separating "could not reach sideclaw" from "sideclaw accepted
    but I lost the id"; that is a `hermes-agent` change, not this slice.
 2. **A reconciled `done`/`failed` `implement` operation cannot occur in practice**
    — the only way its receipt carries a `jobId` is `complete_operation()` having
@@ -5539,7 +5539,7 @@ reach `implementing` in argo. That is the stop-condition exercise, and it is nex
 
 ### Next action
 
-Item 2 (`warden abort` — needs a real `POST /api/jobs/:id/cancel` in agent-gateway,
+Item 2 (`warden abort` — needs a real `POST /api/jobs/:id/cancel` in sideclaw,
 which does not exist — `warden revert`, the per-repo in-flight lock), then item 3:
 drive a dependency upgrade through the whole chain and kill the process at every
 boundary. The `autoMergePaths` decision for argo gates item 3 and is the operator's.
@@ -5581,17 +5581,17 @@ Error 403` — from the IU cost-cap window, see below.
 ### The IU key, measured
 
 `curl $ANTHROPIC_BASE_URL/v1/messages` with `model: glm-5.3-flash` → **HTTP 200**,
-`"text":"OK"`. The last `403 access_denied` in `~/Library/Logs/agent-gateway.jsonl` is
+`"text":"OK"`. The last `403 access_denied` in `~/Library/Logs/sideclaw.jsonl` is
 `2026-09-10T13:36:55Z` (a `review` adversary angle). The cap is gone; nothing in
 this wave is blocked on it. Finding 2 is closed by the provider, not by us.
 
-### agent-gateway's cheap lane — the audit's diagnosis was wrong in the way that matters
+### sideclaw's cheap lane — the audit's diagnosis was wrong in the way that matters
 
 `GET /api/routing`: `check`/`overview`/`review_router` = `glm-5.3-flash` on `iu`,
 fallback `claude-haiku-4-5` on `max`, no `.env` overrides. `GET /api/jobs?limit=30`:
 the newest `overview` jobs failed, the newest `check` failed, one `review` done.
 
-Reproduced agent-gateway's exact worker argv by hand (`-p … --output-format stream-json
+Reproduced sideclaw's exact worker argv by hand (`-p … --output-format stream-json
 --verbose --setting-sources project --settings '{"disableAllHooks":true}'
 --strict-mcp-config --max-turns … --model glm-5.3-flash`, IU env, the four
 `ANTHROPIC_DEFAULT_*_MODEL` pins) on Claude Code **2.1.267**:
@@ -5607,7 +5607,7 @@ that exit 0 — `[claude-code:unrecognized_model]` is 2.1.266+'s client-side mod
 catalog noting it cannot describe a gateway id (the long form says: *"isn't
 described by this version's model catalog; … map it with behavesAs on a
 modelPicker row … CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 restores the
-previous wait-for-the-API behavior"*). It costs nothing here: agent-gateway already sets
+previous wait-for-the-API behavior"*). It costs nothing here: sideclaw already sets
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` from its own gateway table, so the 200k assumption
 the warning describes never applies. The audit's "two distinct shapes"
 (`unrecognized_model` vs `connectors are disabled`) are one shape: the same stderr
@@ -5682,7 +5682,7 @@ reversible (one `continue`).
   vacuously or crash against a shim — the suites move with the file.
 - `hermes-agent/config/dispatch-repos.json` is not an inventory: `root`,
   `defaultTier`, `deny`, `sensitive`, `tiers.investigate`. `make check-policy`
-  compares *that* file against agent-gateway, not `triage-policy.json` — so "deleted"
+  compares *that* file against sideclaw, not `triage-policy.json` — so "deleted"
   means moved into `warden/config/`, or the check loses its subject.
 - The Hermes-side guards (`tirith-hermes-guards.patch`, `test_raw_agent_guard.py`)
   key on the literal path `~/.hermes/scripts/hermes-cc.sh`. The Hermes door keeps
@@ -5693,15 +5693,15 @@ reversible (one `continue`).
 ## 53. Wave 4 (estate chain) — steps 4.2–4.5, DONE & LIVE (2026-09-10, 17:30Z → 18:40Z)
 
 One Fable orchestrator, four Sonnet implementers, one Sonnet verifier, two
-agent-gateway reviews. Every claim below was executed, not diffed. Commits: warden
+sideclaw reviews. Every claim below was executed, not diffed. Commits: warden
 `8ca494c` (recon), `e29434a` (4.3), `968f4ac` (4.5), `c1ebe58` (4.4); hermes-agent
-`3ecbdef` (shim), `0429201` (plugin delivery); agent-gateway `df89ac5` (4.2); dotfiles
+`3ecbdef` (shim), `0429201` (plugin delivery); sideclaw `df89ac5` (4.2); dotfiles
 `dd306eb`, `3bf4b30`. Nothing pushed — the chain runs in this checkout.
 
 ### 4.2 — the cheap lane lives again
 
 Root cause was §52's, not the audit's: a 403 refusal in a result envelope plus a
-120 s cap. Landed in agent-gateway `server/mcp/session-runner.ts`: `api_error_status`
+120 s cap. Landed in sideclaw `server/mcp/session-runner.ts`: `api_error_status`
 captured off the result event and carried on `SessionResult`; a status in
 `{400, 401, 403, 404}` (or `access_denied|cost-service-denial|403` text on a
 zero-output exit) is "IU never answered" and forces the Max fallback at attempt 1;
@@ -5710,7 +5710,7 @@ zero-output exit) is "IU never answered" and forces the Max fallback at attempt 
 fallbacks on `GET /api/jobs/health`, `ok` untouched. `overview`'s per-attempt
 cap 2 → 3 min. `devhost-health-check.sh` returns WARN (rc 2) on `warnings`.
 
-The first agent-gateway review caught a real bug in the first cut: the two benign
+The first sideclaw review caught a real bug in the first cut: the two benign
 banner lines (`unrecognized_model`, `connectors are disabled`) were in the
 classifier, which would have made *every* zero-output IU transport failure skip
 the same-backend retry. Removed; a test now pins that a banner-only failure
@@ -5724,7 +5724,7 @@ Live, on the reloaded server:
 |-|-|-|
 | `check` on the cheap route | `57e2a7ed` | `done`, glm-5.3-flash/iu, 64 s, `make test` + `make check-policy` passed |
 | `overview` on the cheap route | `50db0e38` | `done`, glm-5.3-flash/iu, 166 s (under the new 180 s cap; would have died at 120) |
-| Forced route failure (`model: glm-5.3-flash-nonexistent`) | `8cfeaca4`, `b743f0a4` | `backend.fallback reason=iu-unavailable` **1.2 s** after submit, job `done` on haiku/max; `/api/jobs/health` `warnings: ["1 backend fallback(s) in the last hour: iu-unavailable×1"]`; `check_agent_gateway_jobs` → `agent-gateway jobs WARN: …` rc=2 |
+| Forced route failure (`model: glm-5.3-flash-nonexistent`) | `8cfeaca4`, `b743f0a4` | `backend.fallback reason=iu-unavailable` **1.2 s** after submit, job `done` on haiku/max; `/api/jobs/health` `warnings: ["1 backend fallback(s) in the last hour: iu-unavailable×1"]`; `check_sideclaw_jobs` → `sideclaw jobs WARN: …` rc=2 |
 
 Not done, deliberately: mapping `glm-5.3-flash` in Claude Code's model catalog
 (`modelPicker`/`behavesAs`) to silence the banner — it is cosmetic, the context
@@ -5750,7 +5750,7 @@ fails `make test` until the other follows (it fired once during 4.4, as designed
 
 Live: the loop ticked at 18:03Z and 18:13Z on the moved `triage.py` with no error;
 `hermes-cc.log` shows the shim path answering `status`; one `investigate` opened
-through `~/.hermes/scripts/hermes-cc.sh` → shim → warden's script → agent-gateway
+through `~/.hermes/scripts/hermes-cc.sh` → shim → warden's script → sideclaw
 (`c7737ef5`, 25 s, `nextAction: none`), recorded in `dispatches`. **The Hermes
 recursion guard refused the first attempt** (`CLAUDECODE` is set in this
 orchestrator's environment — "a dispatched episode may never dispatch"); the
@@ -5814,7 +5814,7 @@ happened, once, and is recorded here).
 
 ### Reviews, and what they were told
 
-Sideclaw review on agent-gateway (needs-human → fixed, above). Sideclaw review on
+Sideclaw review on sideclaw (needs-human → fixed, above). Sideclaw review on
 warden `e29434a..968f4ac` (needs-human): its adversary angle called `cmd_merge`'s
 `--confirm` gate a bypass of signed approval — that is hermes-cc.sh's pre-existing
 contract (`merge_gate_check` + budgets + `pr-required-repos.json`, the signed
@@ -5840,7 +5840,7 @@ the owner types a dispatch into Slack after this, the shim path is what answers.
 
 ## 54. Wave 5 (estate chain) — the actuator in Python (2026-09-10, 19:00Z →)
 
-One Fable orchestrator, Sonnet implementers, agent-gateway reviews. Live facts as
+One Fable orchestrator, Sonnet implementers, sideclaw reviews. Live facts as
 they happened, so the close-out below is a record and not a reconstruction.
 
 ### Timeline of the live system during the port
@@ -5850,9 +5850,9 @@ they happened, so the close-out below is a record and not a reconstruction.
 | 19:23:15 | The loop's scheduled tick ran on the working tree and migrated the live ledger **6 → 7** (`dispatch_approvals.{key_id,params_json,spent_job_id,spend_error}`, `triage_items.revert_pr`) — the designed path, and the same reminder as §53: the LaunchAgents run whatever is on disk. |
 | 19:29 | `warden-api` (long-running, loaded at 6) refused every request with the version error until `launchctl kickstart -k` at **19:31:52**; `/health` then `ok` at 7. |
 | 19:31:52 | `com.jkrumm.warden-loop` and `com.jkrumm.warden-sweep` **booted out** for the port window — `triage.py` and `dispatch-sweep.py` were mid-edit and the loop must never run half-ported code against the live ledger. `warden-poll`, `warden-backup`, `warden-api` kept running. Reloaded at the time recorded in the close-out. |
-| 19:2x | `warden-loop.err` shows `propose_mappings — model call failed: HTTP Error 403: Forbidden` on the cheap model route. The plan's header records the 403 as resolved on 2026-09-10; this is the propose-mappings OpenAI-compatible call, not agent-gateway's route — either it recurred or it is a different door. Not chased in this wave; Wave 7 (model choices) owns it. |
+| 19:2x | `warden-loop.err` shows `propose_mappings — model call failed: HTTP Error 403: Forbidden` on the cheap model route. The plan's header records the 403 as resolved on 2026-09-10; this is the propose-mappings OpenAI-compatible call, not sideclaw's route — either it recurred or it is a different door. Not chased in this wave; Wave 7 (model choices) owns it. |
 
-### agent-gateway `a08965a` — `POST /api/jobs/:id/cancel`, live at 19:2xZ
+### sideclaw `a08965a` — `POST /api/jobs/:id/cancel`, live at 19:2xZ
 
 `cancelled` is a terminal `JobStatus`, never counted as failed. Pending →
 cancelled at once; running → `cancel_requested_at` persisted on the row BEFORE
@@ -5874,7 +5874,7 @@ What replaced them, by file:
 | Module | Owns | Tests |
 |-|-|-|
 | `clients/errors.py` | the exit taxonomy as exceptions — `UsageError` 64, `PreconditionError` 2, `RemoteError` 3 (with `maybe_mutated`), `PolicyError` 4 | — |
-| `clients/agent_gateway.py` | `submit` / `get` (None on 404) / `wait` / `cancel`; `TERMINAL` includes `cancelled` | `test_clients.py` 57 |
+| `clients/sideclaw.py` | `submit` / `get` (None on 404) / `wait` / `cancel`; `TERMINAL` includes `cancelled` | `test_clients.py` 57 |
 | `clients/github.py` | read PR/repo/files/check-runs, ready-for-review, merge, branch delete, contents, **Actions runs**; token via `secrets-run`, header only | ″ |
 | `clients/signer.py` | `payload_hash`, `canonical_message`, `key_id`, `verify`; the contract is `config/approval-spec.json` with fixture vectors both repos' tests read | ″ |
 | `clients/rollout.py` | the one-arm closed argv (`hyperdx-apply`) | ″ |
@@ -5908,11 +5908,11 @@ what closes the "second writer of `dispatch_approvals`" violation the Shape
 note named. `merge --confirm` stays confirm-gated (owner decision, not
 relitigated).
 
-**What the reviews caught before commit** (agent-gateway, six angles on warden;
-five on agent-gateway; the plugin separately):
+**What the reviews caught before commit** (sideclaw, six angles on warden;
+five on sideclaw; the plugin separately):
 
 - *Critical:* the loop read `artifactUrl` and `verdict` off the top of the raw
-  job, but agent-gateway nests them under `result` — every finished implement
+  job, but sideclaw nests them under `result` — every finished implement
   would have landed `merge_blocked` and every validation `disagreed`. The
   test stubs mirrored the wrong shape, so 149 green tests could not see it.
   Fixed, with a test pinned to a literal copy of the real job JSON.
@@ -5927,7 +5927,7 @@ five on agent-gateway; the plugin separately):
   record inside `BEGIN IMMEDIATE`, with a two-connection test each.
 - A failed `autoDeploy` fell through to `merged` with the note "no deploy
   configured" — it lands `needs_human` with the exit code and output tail.
-- agent-gateway: a cancel arriving during retry backoff could be overridden by a
+- sideclaw: a cancel arriving during retry backoff could be overridden by a
   successful next attempt; the intent was in-memory only (a restart would
   requeue the job); a store↔session-runner import cycle. All three fixed
   before `a08965a`.
@@ -5988,7 +5988,7 @@ after each run. Every line below is an observed ledger state, not an expectation
 | 21:13:56 | (clean) | `poll_implement_jobs` **reclaimed** it: `verdict`, note `reclaimed: the loop stopped between claiming this item and dispatching it`. Without the reclaim rule this would have been a 2 h deadline into `merge_blocked`. |
 | 21:14:00 | `after-implement-op` | rc 137: operation row committed, `outcome NULL`, no receipt, no job. |
 | 21:14:08 | (clean) | `reconcile_operations` → `unknown` (there is nothing to ask — no job id was ever recorded), item `needs_human` with that exact sentence as its note. The designed answer; a human resumed it (state set back to `verdict`, transition row noted "human resume"). |
-| 21:14:24 | `after-implement-submit` | rc 137: agent-gateway job `f38e5cf8` running, no `dispatches` row, operation open. **This is DESIGN.md's orphan gap, reproduced.** |
+| 21:14:24 | `after-implement-submit` | rc 137: sideclaw job `f38e5cf8` running, no `dispatches` row, operation open. **This is DESIGN.md's orphan gap, reproduced.** |
 | 21:14:32 | — | `POST /api/jobs/f38e5cf8/cancel` → `cancelRequested: true`; **8 s later `status: cancelled`, `error: cancelled by request`** — 5.3's cancel, proven on a running episode. |
 | 21:14:40 | (clean) | reconcile → `unknown` → `needs_human` again; resumed by hand. |
 | 21:14:52 | (clean) | real dispatch: job `7bb4d959`, operation `done` with `{"jobId"}` receipt, item `implementing`. |
@@ -6095,7 +6095,7 @@ Wave 6 (`dotfiles/docs/waves/PLAN.md`): every origin opens an item; Hermes is
 the door. Carry forward: the reclaim note is not cleared when an item is
 re-claimed (cosmetic, seen at 21:14:00); the orphan-branch/PR ledger field
 DESIGN.md names is still not built (an `after-implement-submit` crash leaves
-agent-gateway running an episode the ledger cannot name — the cancel endpoint is
+sideclaw running an episode the ledger cannot name — the cancel endpoint is
 the manual remedy today); `abort` does not sync the Slack card itself (the
 loop's next tick does); reconcile still reads GitHub through `gh` for merges
 while everything else uses `clients/github.py`; the 4.3 "human types in
@@ -6103,7 +6103,7 @@ Slack" acceptance is still the owner's — the plugin now reports from the row.
 
 ## 55. Wave 6 (estate chain) — every origin opens an item; Hermes is the door (2026-09-10, 22:00Z →)
 
-One Fable orchestrator, Sonnet implementers, agent-gateway reviews on all three repos.
+One Fable orchestrator, Sonnet implementers, sideclaw reviews on all three repos.
 Live facts as they happened.
 
 ### Timeline of the live system
@@ -6111,9 +6111,9 @@ Live facts as they happened.
 | When (UTC) | What |
 |-|-|
 | 22:00:58 | `com.jkrumm.warden-loop` and `com.jkrumm.warden-sweep` **booted out** for the edit window (schema 8 and `triage.py` mid-edit; same reason as §54). `warden-poll`, `warden-backup`, `warden-api` kept running. |
-| 22:40:30 | agent-gateway `e9b6584` committed; `make reload` at 22:40 — `GET /api/dispatch-schema` → version **2**, twelve outcomes; `GET /api/review-schema` → version **1**. MCP children left alive on purpose (`RESTART_MCP=1` would kill this session's MCP client; warden reaches agent-gateway over HTTP, not MCP). |
+| 22:40:30 | sideclaw `e9b6584` committed; `make reload` at 22:40 — `GET /api/dispatch-schema` → version **2**, twelve outcomes; `GET /api/review-schema` → version **1**. MCP children left alive on purpose (`RESTART_MCP=1` would kill this session's MCP client; warden reaches sideclaw over HTTP, not MCP). |
 | 22:41:20 → 22:43:15 | Live proof of check-before-push: an implement on `dispatch-scratch` told to add a `package.json` whose test script exits 1. Result `outcome: checks_failed, schemaVersion: 2, nextAction: human, branch: dispatch/…-b534ccc6, artifactUrl: null` in 115 s. Branch pushed, **no PR**. Branch deleted by hand afterwards. |
-| 22:41:39 → 22:42:46 | Live proof of review-by-ref: `review {cwd: rollhook, pr: 23}` → `actionable`, 0 blocking, `schemaVersion: 1`, 67 s; `refs/agent-gateway-review/*` and the worktree gone afterwards. |
+| 22:41:39 → 22:42:46 | Live proof of review-by-ref: `review {cwd: rollhook, pr: 23}` → `actionable`, 0 blocking, `schemaVersion: 1`, 67 s; `refs/sideclaw-review/*` and the worktree gone afterwards. |
 | 23:12:04 | First hand tick (`triage.py --run`, LaunchAgent still out): live ledger **7 → 8** (`triage_items.{origin,max_tier,brief,origin_channel,origin_thread_ts}`). `warden-api` (old process, pinned 7) 503'd until `kickstart -k` at 23:17:54. Manual `VACUUM INTO` snapshot `backups/pre-schema-v8-20260910T2310Z.db` taken first. |
 | 23:12 | **Finding:** `label:"warden:go"` (quoted) returns nothing from GitHub's search index; `label:warden:go` returns the issue. Fixed in `clients/github.py`. |
 | 23:13 | **Finding, owner's:** the loop's PAT (`op://mini/github/token`) has **no Issues permission** — `GET /repos/jkrumm/dispatch-scratch/issues` → 403 "Resource not accessible by personal access token", while pulls, labels and the repo itself read fine and `gh issue create` with it fails the same way. The `github_issue` origin cannot poll or comment under the LaunchAgent until the owner grants that PAT Issues read/write. Every live run below used a one-off `WARDEN_SECRETS_RUN` shim resolving the `gh` keyring OAuth token instead — nothing durable changed. |
@@ -6124,7 +6124,7 @@ Live facts as they happened.
 | 23:17:54 | `warden-api` kickstarted: `/board` live (`investigating: 2, needs_human: 8, merge_blocked: 3`, 13 open items, 46 terminal in 24 h), `/items/989` live, `/items/abc` → 400. `/health` `ok: false` only because the loop and sweep are out. |
 | 23:18:23 | Hand sweep: 986 `investigating → verdict`; **comment-back posted on dispatch-scratch#9** (own issue). 989 **did not fold** — the CLI's `--wait` had stamped `reported_at`, and the sweep only folds unreported rows. Finding 7 below. |
 | 23:18:27 | Hand tick: 986 `verdict → implementing` through `maybe_auto_implement` (ceiling `implement`, verdict implement/high), job `edf0847e`. |
-| 23:20:21 | `edf0847e` **failed at the push**: `remote: fatal error in commit_refs … [remote rejected]` — GitHub's side, a transient; agent-gateway salvaged the commit to `~/.local/state/agent-gateway/salvage/dispatch-a-prior-read-only-investigation-of-this-edf0847e.bundle`. The check before push had passed (the repo has nothing to run). Next tick: 986 → `merge_blocked` with that error verbatim. The implement budget for the UTC day was now 5/5. |
+| 23:20:21 | `edf0847e` **failed at the push**: `remote: fatal error in commit_refs … [remote rejected]` — GitHub's side, a transient; sideclaw salvaged the commit to `~/.local/state/sideclaw/salvage/dispatch-a-prior-read-only-investigation-of-this-edf0847e.bundle`. The check before push had passed (the repo has nothing to run). Next tick: 986 → `merge_blocked` with that error verbatim. The implement budget for the UTC day was now 5/5. |
 | 23:50:34 | 989 folded by hand with the fixed fold: `closed`, note `answered: NOTES.md housekeeping steps … are still accurate`. |
 
 ### What landed, by repo
@@ -6160,7 +6160,7 @@ implement. `poll_implement_jobs` reads `result.outcome` against the pinned
 needs_human`, `no_changes` and the refusals → `merge_blocked`, `salvaged`,
 wrong-tier outcomes, unknown outcomes and `nextAction: human` → `needs_human`;
 a `schemaVersion` or outcome outside the pin is a `RemoteError` and
-`needs_human` with that sentence. Step-7 validation is a agent-gateway **`review`**
+`needs_human` with that sentence. Step-7 validation is a sideclaw **`review`**
 job on the pull request (`open_review`, tier `review` in `dispatches`):
 `clean`, or `actionable` with no `blocking` → `confirmed`; `blocking` →
 `blocked` + `merge_blocked` with the first three findings; `needs-human` →
@@ -6170,7 +6170,7 @@ and `TRIAGE_VALIDATION_MODEL` are gone. `make status` gained a `schemas` row
 (`check-schema-versions.py`: dispatch=2 review=1, outcome sets compared).
 `warden-api`: `GET /board`, `GET /items/<id>`, and `reverts` is a real count.
 
-**agent-gateway `e9b6584`.** `review` takes `pr` or `branch`, fetches into a per-job
+**sideclaw `e9b6584`.** `review` takes `pr` or `branch`, fetches into a per-job
 ref, reviews in a read worktree cut at the fetched OID, diffs `base...HEAD`,
 cleans both up on every path (the ref by its own flag); branch names and the
 GitHub-reported default branch pass one allowlist before any shell.
@@ -6195,7 +6195,7 @@ yet — no change needed).
 
 ### What the reviews caught before commit
 
-agent-gateway (two rounds): a cancel during the check was folded into
+sideclaw (two rounds): a cancel during the check was folded into
 `checks_failed` and still pushed; `identity.defaultBranch` (GitHub-controlled)
 spliced into `bash -c`; the fetch ref leaked into the caller's live repo when
 base resolution failed after the fetch; the check ran before the diff refusal
@@ -6214,7 +6214,7 @@ INSERT existed twice. Two more from the live run: the quoted label query, and
 Declined, recorded: extracting the origin subsystem into `lifecycle/origins.py`
 (right shape, but the test suite monkeypatches `triage` module globals and the
 blast radius is a wave of its own); the `runReview` orchestration refactor in
-agent-gateway (`resolveReviewSource`); `CHAIN_STATES` in `api.py` staying a
+sideclaw (`resolveReviewSource`); `CHAIN_STATES` in `api.py` staying a
 hand-mirrored tuple; `_dispatch_investigate_and_advance` not distinguishing
 `maybe_mutated` on an ambiguous investigate submit (the next tick's orphan
 reclaim covers it).
@@ -6242,7 +6242,7 @@ that may refuse it. The human-origin twin (989) became an answered question in
 Three origins open items that ride one lifecycle; the ceiling is a column, not
 a convention. Hermes hands work in through one verb and reads the board back
 through one skill instead of guessing. The implement path and the interactive
-path share agent-gateway's `check` and `review` vocabulary, typed and version-pinned
+path share sideclaw's `check` and `review` vocabulary, typed and version-pinned
 at both ends; a shape that moves is a loud refusal. A red check is a human's,
 never a pull request.
 
@@ -6263,12 +6263,12 @@ above); `warden run --tier implement` from Hermes is bounded by
 a deliberate line, recorded here so it is not rediscovered as a gap; the
 `weatherorb` venv on this box held 8 GB RSS during the wave and got a background
 runner killed for memory. `com.jkrumm.warden-loop` and `-sweep` bootstrapped again at **00:14:54Z**
-(2026-09-11); `make status` green, `agent-gateway schemas ✓ dispatch=2 review=1`.
+(2026-09-11); `make status` green, `sideclaw schemas ✓ dispatch=2 review=1`.
 
 ## 56. Wave 7 (estate chain) — the surfaces and the model choices (2026-09-11, 00:20Z →)
 
-One Fable orchestrator, Sonnet implementers and verifier, agent-gateway reviews on
-argo, agent-gateway, hermes-agent and warden. Six repos committed, nothing pushed
+One Fable orchestrator, Sonnet implementers and verifier, sideclaw reviews on
+argo, sideclaw, hermes-agent and warden. Six repos committed, nothing pushed
 except the one argo branch that is a pull request by design.
 
 ### Timeline of the live system
@@ -6279,7 +6279,7 @@ except the one argo branch that is a pull request by design.
 | 00:25 | **The carried `propose_mappings` failure root-caused by executing it**: the IU endpoint answers `gpt-5.6-luna` with 503 `Unsupported parameter: 'max_tokens'` and, once fixed, 503 `'temperature' does not support 0`; `max_completion_tokens` alone → 200 `OK`. The one LLM call in this loop had never succeeded. Hermes's `config.yaml` had recorded the same lesson for its approval classifier. |
 | 00:40 | `hermes cron remove 72aa2fb36307` — the `#agents` overview digest, paused since 2026-09-08 with `paused_reason: null` (the CLI's `cron pause` cannot record one), **retired**. Four jobs remain, all enabled. |
 | ~00:35 | The LaunchAgent loop, running the checkout, ticked with the new push: `triage: argo push — http-error:404 (73183 bytes, 12 items)` — the designed non-event until Argo deploys. Every tick since logs the same line. |
-| ~01:00 | agent-gateway `49a065e` reloaded; `GET /api/overview.txt` renders `warden · 12 open · needs_human 8 · merge_blocked 4 · in flight 0` and eight prioritised item lines under the roster; the herdr `overview` pane's `watch` picked it up on its next 30 s tick. First render clipped `merge_blocked` to `merge_blocke` — fixed to fit-the-column, seen only on the live pane. |
+| ~01:00 | sideclaw `49a065e` reloaded; `GET /api/overview.txt` renders `warden · 12 open · needs_human 8 · merge_blocked 4 · in flight 0` and eight prioritised item lines under the roster; the herdr `overview` pane's `watch` picked it up on its next 30 s tick. First render clipped `merge_blocked` to `merge_blocke` — fixed to fit-the-column, seen only on the live pane. |
 | 00:50 | argo PR **#19** (`warden-board`, draft) opened — landing it is the owner's, argo master deploys. |
 | 01:15 | **Verifier, against a local Argo on the branch with the real 73 KB snapshot: `POST /warden/snapshot` → 422** — `reverts_and_reopens` is a composite of two leaves with no top-level `value`, and the ingest schema demanded one on every metric. Every unit test had passed with hand-written fixtures. The page rendered its empty state honestly (six `n/a` tiles, no bare 0, Warden in the nav). Fixed on the branch: metrics ride through loosely (only `machine`/`generatedAt` are strict, as the contract said), and the funnel tile treats a composite as headline-from-first-real-value plus one detail line per leaf; the real snapshot file is now a test fixture. |
 | 01:16 | **Verifier, second pass, same local Argo at `402d126`:** `POST` → 201, `GET` → `raw.generatedAt` verbatim; six tiles honest (72 %, 9 %, `n/a` + reason ×2, poller age, reverts `0` with `reopen_after_fixed: n/a — …`), budget 2/20 and 1/5, `needs_human` bucket 8, Warden in the nav, no bare 0 anywhere. Three display defects seen only on the real render (an unrounded float, nested `item_states` JSON spilling into a tile, the STATE badge clipped to `NE…` because Mantine's Badge hides overflow) fixed at `1f245b1`; the row click that the headless pass could not confirm is a plain `onClick` in basalt-ui's data table (`data-table.tsx:1543`), an automation miss, not a defect. |
@@ -6313,14 +6313,14 @@ vanish (review finding), per-item timeline modal (transitions, dispatches
 with verdicts, PR, validation, operation receipts, approvals), "Recorded
 intents — not approvals". 1012 api tests, 223 dashboard tests.
 
-**agent-gateway `49a065e`.** `warden-board.ts` fetches `/board` (2 s timeout, own
+**sideclaw `49a065e`.** `warden-board.ts` fetches `/board` (2 s timeout, own
 45 s cache, `warden.board_unavailable` warn, ten counts keys required by
 schema); `renderWardenBlock` in the same file, called from `renderText`;
 needs_human and merge_blocked share bucket 0, in-flight bucket 1; `… N more`
 past eight lines; every rendered warden string control-byte stripped (alert
 and issue titles are attacker-influenced; the human-queue path already did
 this). The block rides the payload Argo already receives. Worker env
-`USAGE_LANE=agent-gateway:<tool>`. Routing table prose in CLAUDE.md/README →
+`USAGE_LANE=sideclaw:<tool>`. Routing table prose in CLAUDE.md/README →
 `GET /api/routing` + the brain page; the otel exemption stated in-repo. 648
 tests. `fallow` fails at HEAD before and after (two unused MCP tool files, 23
 never-imported `agents.ts` exports, four CRITICAL functions) — pre-existing,
@@ -6333,7 +6333,7 @@ syntax); `scripts/check-cron-registry.py` compares registry ↔ `jobs.json` in
 both directions (a paused job without a reason and a live job absent from the
 registry are findings, enabled or not; mismatch exit 1, cannot-compare exit
 2); `agents-cron.py` deleted; README/CLAUDE.md/agents-overview.md/
-dispatch-bridge.md corrected (four jobs; validation is a agent-gateway review, not
+dispatch-bridge.md corrected (four jobs; validation is a sideclaw review, not
 Opus). `make status`: `✓ cron registry (4 live, 0 paused, 1 retired)`.
 
 **dotfiles `6dfba3e`.** `rd wave`/`rd bg` default to **sonnet**
@@ -6343,20 +6343,20 @@ export survives into the pane's child processes; the SessionStart hook logs
 `lane`; `rd`/`agent-dispatch` help names the three lanes; CLAUDE.md rationale
 prose → pointers. **usage-tracker `ae805b3`**: `sub_tool` = the session's
 lane. **brain `a180ec6`**: `wiki/engineering/model-routing.md` is the one
-rationale page (two lanes, five agent-gateway tiers reconciled against modelpick,
+rationale page (two lanes, five sideclaw tiers reconciled against modelpick,
 Warden's routes, the otel decision, launcher defaults, usage lanes).
-**modelpick `baf441c`**: `docs/decisions/agent-gateway-tiers.md`.
+**modelpick `baf441c`**: `docs/decisions/sideclaw-tiers.md`.
 
 ### Decisions, recorded once
 
-- **Digest: retire**, not resume — it read agent-gateway, never the ledger; it
+- **Digest: retire**, not resume — it read sideclaw, never the ledger; it
   reposted one blocked pane 35 times; `#agents` is the card board now.
 - **otel stays inline on JUDGE/Max** — interactive, in-turn, Max has no
-  per-token cost; the only cost is quota, now visible as `agent-gateway:otel`.
+  per-token cost; the only cost is quota, now visible as `sideclaw:otel`.
 - **Warden requests no model** — every automatic dispatch passes
-  `model=None` and runs on agent-gateway's JUDGE route; `propose_mappings` stays on
+  `model=None` and runs on sideclaw's JUDGE route; `propose_mappings` stays on
   `gpt-5.6-luna` (once a day, now working).
-- **Warden pushes its own projection**; agent-gateway does not relay it to Argo on
+- **Warden pushes its own projection**; sideclaw does not relay it to Argo on
   Warden's behalf (it does carry the board inside its overview payload, which
   is a different, herdr-facing surface).
 
@@ -6365,16 +6365,16 @@ Warden's routes, the otel decision, launcher defaults, usage lanes).
 Wave 8 (`dotfiles/docs/waves/PLAN.md`): docs to the estate that exists, and
 the field-review handover. **Owner:** (1) merge argo PR #19 — until then every
 tick logs `argo push — http-error:404`; (2) `op://common/api/SECRET` must be in
-the mini's offline cache or the line reads `no-secret` (it is: the agent-gateway
+the mini's offline cache or the line reads `no-secret` (it is: the sideclaw
 push uses the same ref); (3) the PAT Issues permission and the 4.3 Slack
-acceptance from §55 are still open. Carried: agent-gateway `fallow` debt; cost per
+acceptance from §55 are still open. Carried: sideclaw `fallow` debt; cost per
 Warden item is a join on ledger job ids that nobody has built (Wave 9 will
 want it); `warden-api`'s "LAST EXIT -15" is the §55 kickstart.
 
 ## 57. Wave 8 (estate chain) — docs describe the estate that exists, and the field-review handover (2026-09-11, 01:40Z → 03:20Z)
 
 One Fable orchestrator, five Sonnet implementers on disjoint repos, three
-Explore surveys first, one agent-gateway review on this repo. Five repos
+Explore surveys first, one sideclaw review on this repo. Five repos
 committed; nothing pushed.
 
 ### What landed, by repo
@@ -6384,7 +6384,7 @@ committed; nothing pushed.
 the LaunchAgent label and interval; `docs/watchdog.md` deleted (it described
 hermes-agent scripts and `~/.hermes/watchdog.db`). `ledger.py`'s pin renamed
 `LEDGER_SCHEMA_VERSION` (finding 18's rename half; the assert half —
-`clients/agent_gateway.py` pinning `DISPATCH_SCHEMA_VERSION=2` /
+`clients/sideclaw.py` pinning `DISPATCH_SCHEMA_VERSION=2` /
 `REVIEW_SCHEMA_VERSION=1`, `assert_result_schema` per job, `make
 check-schemas` — had already landed in Wave 5). `STATE.md` (6378 lines, 287
 KB) split per finding 25: §§1–56 moved verbatim into this file, `STATE.md`
@@ -6418,7 +6418,7 @@ map green.
 still called `hermes-cc.sh` the dispatcher now names the `warden` CLI and
 `scripts/lifecycle/`, keeping the shim path only where Hermes literally
 executes it; `dispatch-repos.json` located in `warden/config`; skill roster
-20; `WARDEN_AGENT_GATEWAY_BASE`.
+20; `WARDEN_SIDECLAW_BASE`.
 
 ### Corrections caught in review, before commit
 
@@ -6427,7 +6427,7 @@ executes it; `dispatch-repos.json` located in `warden/config`; skill roster
   door and `warden run` are both `human`, the label is `github_issue` with
   event source `github_go`. Fixed from the code, not the brief.
 - `docs/api.md` said `warden budget` prints the budget object; no such verb.
-  Rewritten to `warden run`/`dispatch`/`list`, after the agent-gateway review
+  Rewritten to `warden run`/`dispatch`/`list`, after the sideclaw review
   caught the first rewrite naming `merge`, which sets no `budget` key.
 - The handover doc cited `STATE.md §56` three times after the split; repointed.
 - The dispatch-path diagram labelled the door `warden dispatch`; the verb that
@@ -6437,7 +6437,7 @@ executes it; `dispatch-repos.json` located in `warden/config`; skill roster
 
 - **The build log is append-only from here.** Each wave appends a § here and
   rewrites `STATE.md`; `CLAUDE.md` § Git says so.
-- **agent-gateway `fallow` is not a gate for this chain** — pre-existing debt in
+- **sideclaw `fallow` is not a gate for this chain** — pre-existing debt in
   another repo's tooling; Wave 9 decides whether it becomes one.
 - **`estate.html` ships as a `render`** with the crossing recorded, rather
   than splitting the diagram to satisfy a composition check.
@@ -6452,7 +6452,7 @@ argo PR #19, the PAT Issues permission, the 4.3 Slack acceptance.
 
 Not Wave 9. The owner asked, after two days unattended, why nothing was
 actionable and what the loop had cost. Three read-only forensics passes
-(ledger + logs, agent-gateway usage + routing, Slack + Argo surface) and two fixes.
+(ledger + logs, sideclaw usage + routing, Slack + Argo surface) and two fixes.
 
 ### What the ledger showed (2026-09-09 19:43Z → 2026-09-11 10:00Z)
 
@@ -6462,7 +6462,7 @@ actionable and what the loop had cost. Three read-only forensics passes
 | Dispatches | 20 (ids 24–43), all `done` except one `failed` superseded by a retry |
 | Real fixes | 1 `fixed` (the argo canary), 4 `closed` (3 resolved externally, 1 by a human) — zero infra recurrences resolved by the loop |
 | Loop cadence | 57 ticks in 534 min after 9c19ead, no gap >20 min; one `database is locked` in `ingest()`, poll/sweep each crashed twice on schema-version mismatch during the night migrations and self-healed |
-| needs_human | 6 distinct issues: hermes gateway wedged (uk:175/185, the slack-bolt reconnect signal with **362** occurrences), agent-gateway crash (uk:204), weatherorb probe (uk:220), hermes patch corruption (uk:229), research-gateway OOM (uk:193) |
+| needs_human | 6 distinct issues: hermes gateway wedged (uk:175/185, the slack-bolt reconnect signal with **362** occurrences), sideclaw crash (uk:204), weatherorb probe (uk:220), hermes patch corruption (uk:229), research-gateway OOM (uk:193) |
 | merge_blocked | 3 argo canary items (self-tests, correctly refused) + dispatch-scratch#9 (no `autoMergePaths`) |
 
 The loop is working as designed. The owner's long-standing issues are all
@@ -6471,13 +6471,13 @@ that the design sends to `needs_human` on purpose. The gap is that a
 `needs_human` card lands once and then nothing reminds until the 168h clock
 dismisses it — `docs/api.md`'s "reminder at 1d" is still **not built**.
 
-### Cost (agent-gateway.jsonl, `session.end` shadow cost since 09-09)
+### Cost (sideclaw.jsonl, `session.end` shadow cost since 09-09)
 
 All 17 real automatic dispatches ran on `claude-sonnet-5[1m]`/max (2 on
 Opus, manual `--model`), because warden passed `model=None` and landed on
-agent-gateway's JUDGE route. Validation reviews: router on glm-5.3-flash/iu, then
-angles + synthesis on Sonnet/max. Total agent-gateway spend ≈ $95, of which ≈ $80
-Sonnet/max. `usage-tracker` cannot attribute any of it to warden — agent-gateway
+sideclaw's JUDGE route. Validation reviews: router on glm-5.3-flash/iu, then
+angles + synthesis on Sonnet/max. Total sideclaw spend ≈ $95, of which ≈ $80
+Sonnet/max. `usage-tracker` cannot attribute any of it to warden — sideclaw
 sets no `USAGE_LANE`, so 98 % of the last three days' spend is untagged.
 
 ### Fixes (this §)
@@ -6485,10 +6485,10 @@ sets no `USAGE_LANE`, so 98 % of the last three days' spend is untagged.
 - `AUTO_DISPATCH_MODEL` (`scripts/triage.py`, env
   `TRIAGE_AUTO_DISPATCH_MODEL`, default `glm-5.3-flash`) replaces `model=None`
   at the two automatic call sites (auto-investigate, auto-implement).
-  agent-gateway's `withModel()` derives backend `iu` for a non-Claude id. Human
+  sideclaw's `withModel()` derives backend `iu` for a non-Claude id. Human
   paths (`warden run --model`, approval clicks) untouched. Step-7 validation
   has no per-call model knob; moving it is `SIDECLAW_MODEL_REVIEW` in
-  agent-gateway's `.env`, which is global and a separate decision.
+  sideclaw's `.env`, which is global and a separate decision.
 - `needs_human` / `merge_blocked` cards render a `section` block: bold
   `Action required — …`, `Do this: <note>`, and `Auto-dismissed in Nd if
   untouched (<date>)` from `state_deadline` at day granularity so the
@@ -6512,13 +6512,13 @@ sets no `USAGE_LANE`, so 98 % of the last three days' spend is untagged.
 
 - Automatic episodes run on the cheap IU tier; the owner overrode
   `model-routing.md`'s "JUDGE = Sonnet over Max" for warden's unattended path.
-  Review validation stays where agent-gateway routes it until measured.
+  Review validation stays where sideclaw routes it until measured.
 
 ### Next action
 
 Owner: mark argo PR #19 ready and merge it; act on or dismiss the 6
 `needs_human` cards. Loop: build the 1-day `needs_human` reminder; tag
-agent-gateway sessions with `USAGE_LANE` so cost per item is a query, not a join
+sideclaw sessions with `USAGE_LANE` so cost per item is a query, not a join
 done by hand. Wave 9 remains the field review, after the reminder exists.
 
 ## 59. Autonomy — host verbs, the board goes live, judgment work off Max (2026-09-11, 11:00Z → 13:00Z)
@@ -6573,7 +6573,7 @@ discharged.
   `kill-port 7734`, and `localhost:7734` already answered that site over
   `[::1]`. 7735 is reserved by comment in dotfiles' Caddyfile; hermes-agent's
   skills, dotfiles' docs and the brain wiki follow.
-- agent-gateway: `SIDECLAW_MODEL_REVIEW` and `SIDECLAW_MODEL_DISPATCH` set to
+- sideclaw: `SIDECLAW_MODEL_REVIEW` and `SIDECLAW_MODEL_DISPATCH` set to
   `glm-5.3-flash`, backend `iu` implied; no Max fallback remains on those
   two routes.
 
@@ -6599,8 +6599,8 @@ discharged.
 ### Next action
 
 Watch items 2, 261 and 815 reach `fixed` on the next Kuma push. Then: a
-agent-gateway host verb for uk:204 guarded by no dispatch in flight; the 1-day
-`needs_human` reminder; `USAGE_LANE` tagging in agent-gateway. Wave 9 after that.
+sideclaw host verb for uk:204 guarded by no dispatch in flight; the 1-day
+`needs_human` reminder; `USAGE_LANE` tagging in sideclaw. Wave 9 after that.
 
 ## 60. Closing the queue — reminders, a real heartbeat probe, and the Kuma sync that ignored `active` (2026-09-11, 13:00Z → 14:10Z)
 
@@ -6612,7 +6612,7 @@ or "not built" was checked against live state and either done or dispatched.
 
 | Item | Evidence | Outcome |
 |-|-|-|
-| uk:204 agent-gateway crash | Kuma push recovered 10:16Z; agent-gateway reloaded twice today, healthy | closed |
+| uk:204 sideclaw crash | Kuma push recovered 10:16Z; sideclaw reloaded twice today, healthy | closed |
 | uk:193 research-gateway OOM | monitor recovered 09:16Z; container at 111 MiB of 2 GiB; no OOM kill in the VPS kernel log for four days | closed |
 | uk:229 "Hermes - HTTP" | endpoint answers 200 with the keyword; the Kuma monitor had been **paused** since its pre-deploy 404 days and every `make uk-sync` left it paused | fixed: homelab `sync.py` now converges pause state (`resume_monitor`/`pause_monitor` after `edit_monitor`, which ignores `active`); monitor UP; closed |
 | uk:220 "WeatherOrb Watchdog - Push" | watchdog runs but skips its heartbeat because `obs_freshness:candhis` fails — five CANDHIS buoys silent 74–83 h, an upstream outage | `warden run weatherorb --tier implement` (item 996): degrade instead of blocking the heartbeat; investigate verdict came back high, auto-implement fired on GLM |
@@ -6645,9 +6645,9 @@ schema 9 by hand; poll and sweep pick it up on their next run.
 
 ### Elsewhere
 
-- agent-gateway already tagged every worker session with `USAGE_LANE`
+- sideclaw already tagged every worker session with `USAGE_LANE`
   (commit 49a065e); the §58 audit grepped the wrong directory. Review
-  sub-steps now share `agent-gateway:review` so one review is one line in
+  sub-steps now share `sideclaw:review` so one review is one line in
   usage-tracker. Not reloaded yet: a weatherorb episode was running.
 - Hermes's narratives cron delivers to `#hermes`; `#agents` is warden-only.
 - homelab: `docs(uptime-kuma)` comment and the `sync.py` pause fix, pushed
@@ -6665,7 +6665,7 @@ schema 9 by hand; poll and sweep pick it up on their next run.
 ### Next action
 
 Item 996 lands its PR; close uk:220. The first host-verb `fixed` is still
-ahead. A agent-gateway host verb for uk:204-shaped crashes, guarded by no
+ahead. A sideclaw host verb for uk:204-shaped crashes, guarded by no
 dispatch in flight. Wave 9 after a few days of this.
 
 ## 61. Warden's own Slack identity (2026-09-11, 14:20Z → 14:50Z)
@@ -6733,16 +6733,16 @@ remote-less repo, is covered by §62's bundle.
 
 Concurrent, not this §: a second session is plumbing a
 `TRIAGE_VALIDATION_DISPATCH_MODEL` through `open_review()`/`submit_review()`
-and agent-gateway's review route so step-7 validation leaves Max too. Its files
+and sideclaw's review route so step-7 validation leaves Max too. Its files
 are left uncommitted here on purpose.
 
 ## 64. A killed episode is not a verdict (2026-09-12, 09:00Z → 11:30Z)
 
 Item 253, `docker_homelab:unhealthy:garmin-collector`, sat in `verdict` for five
 hours carrying an empty note while the container recovered on its own. Two
-independent defects stacked, one on each side of the agent-gateway boundary.
+independent defects stacked, one on each side of the sideclaw boundary.
 
-**agent-gateway was killing healthy workers.** `runSessionAttempt` had a single
+**sideclaw was killing healthy workers.** `runSessionAttempt` had a single
 `setTimeout(timeoutMs)`, and `TIERS.investigate.timeoutMs` is 8 min. Both
 automatic dispatches since dispatch moved to `glm-5.3-flash` (§59) died at
 exactly 480000 ms: job `c7d73a1c` (this item) at turn 28 with **1504 ms** of
@@ -6752,16 +6752,16 @@ were working when SIGTERM landed. A single wall-clock timer cannot tell "slow"
 from "wedged", and glm-5.3-flash defaults to max reasoning effort — minutes per
 turn is its normal shape on hard work, not a symptom.
 
-Fixed in agent-gateway `3c44689`: an idle watchdog that kills only after 5 min with
+Fixed in sideclaw `3c44689`: an idle watchdog that kills only after 5 min with
 no stdout chunk (stderr never resets it) plus an absolute ceiling at
 `max(timeoutMs, 60 min)`, with `timeout_idle`/`timeout_ceiling` and
 `idleMsAtKill` on the attribution record so a wedge and a long episode stop
 reading as the same event. The same commit takes `retryAfterOutput` off
 check/overview/review-router — re-laning onto Haiku the moment a slow worker
 missed its timeout was compensating for the timer that had just been fixed —
-and moves the tier decision out of agent-gateway's `.env` into `routing.ts` (`AGENT`
+and moves the tier decision out of sideclaw's `.env` into `routing.ts` (`AGENT`
 for dispatch; review and otel stay on `JUDGE`, for the reasons dated
-2026-09-11). That last part is load-bearing: reloading agent-gateway with only the
+2026-09-11). That last part is load-bearing: reloading sideclaw with only the
 watchdog would have silently thrown dispatch back onto Sonnet/Max, because the
 `SIDECLAW_MODEL_DISPATCH` override lived in a `.env` the running process had
 read at boot and nobody had reloaded since.
@@ -6771,15 +6771,15 @@ never read `dispatches.status`. `failed` + `verdict_json` NULL gave
 `result = {}` → `next_action = ""` → `STATE_VERDICT` with `note = NULL`.
 `maybe_auto_implement()` correctly declined it (no `nextAction=implement` at
 `confidence=high`), and nothing else was scheduled to touch the row until its
-24 h deadline. agent-gateway's failure text reached Slack through `format_message()`
+24 h deadline. sideclaw's failure text reached Slack through `format_message()`
 and was persisted nowhere at all. That is DESIGN.md's "deferral must be visible"
 inverted: a failed episode was indistinguishable from a broken loop.
 
-Migration 10 adds `dispatches.error` — agent-gateway's terminal failure text
+Migration 10 adds `dispatches.error` — sideclaw's terminal failure text
 verbatim, or warden's own reason for a row `_mark_pruned()` closes without ever
 polling a real answer. No backfill: rows that failed before this genuinely have
 no recorded reason, and inventing one is worse than admitting the gap. A COLUMN,
-not a field inside `verdict_json`, because that blob is agent-gateway's *published*
+not a field inside `verdict_json`, because that blob is sideclaw's *published*
 schema and a failed dispatch has no verdict to hang a field on.
 
 `fold_dispatch_verdict()` gains exactly one branch, ordered between the
@@ -6796,9 +6796,9 @@ and retrying one is a separate decision this § does not make.
 **And the knob that would have done nothing.** §63's concurrent session left
 `TRIAGE_VALIDATION_DISPATCH_MODEL` uncommitted, plumbing a `model` through
 `open_review()`/`submit_review()` so step-7 validation could leave Max.
-agent-gateway's `REVIEW_INPUT` is a plain `z.object`, not `z.strictObject` — Zod
+sideclaw's `REVIEW_INPUT` is a plain `z.object`, not `z.strictObject` — Zod
 would have silently stripped that param and the review would have run on its
-default route looking configured. agent-gateway `4e16aa5` adds the field (reaching
+default route looking configured. sideclaw `4e16aa5` adds the field (reaching
 the angle and synthesis sessions only; the router's cheap CLASSIFY route and the
 adversary critic are excluded at the call site, commented so neither gets
 "fixed" later) and omits it from the MCP-facing schema, since an interactive
@@ -6810,7 +6810,7 @@ Ops: all five agents `make unload`ed for the duration of the edit.
 `warden-sweep` had already crashed once on its 300 s tick, refusing a
 `schema_version=9` ledger against a working tree already bumped to 10 — the one
 migrator rule working exactly as written, and the reason the agents came down.
-Tests: `test_triage.py` 244 → 248, `test_ledger.py` 26, agent-gateway 651 → 657.
+Tests: `test_triage.py` 244 → 248, `test_ledger.py` 26, sideclaw 651 → 657.
 
 **Proven in production, not only in tests.** Item 1006 re-ran the exact brief
 that died at 480000 ms (`warden run homelab --tier investigate`, job
@@ -6866,7 +6866,7 @@ current to restore FROM.
 
 Item 1007 was the owner's own voice-transcribed brief — consolidate warden,
 compare it with the other agent control planes, clean up, sharpen the
-lifecycle — sent through `warden run warden` at 09:13Z. agent-gateway's investigate
+lifecycle — sent through `warden run warden` at 09:13Z. sideclaw's investigate
 episode ran eleven minutes on `glm-5.3-flash`, did real work (29 Bash calls
 against the ledger, two fetches, a web search), and failed with
 
@@ -6882,13 +6882,13 @@ that text. The text was wrong, and that is this section's first finding.
 transcript ends on `{"attachment":{"type":"max_turns_reached","maxTurns":25,
 "turnCount":26}}` 184 ms before exit. The `unrecognized_model` line is the
 CLI's session-title helper complaining about a non-Claude model name — 88
-occurrences in `agent-gateway.jsonl`, including the two dispatches that succeeded
+occurrences in `sideclaw.jsonl`, including the two dispatches that succeeded
 right before (jobs `35c9dd64`, `42b07613`, exit 0, full cost records). The
 runner's `exitCode !== 0` branch returned before ever reading the result
 envelope it had already parsed, built `error` from whatever stderr was
 buffered, and so `isSalvageable()`'s `max_turns` regex — written for exactly
 this case — never matched. Eleven minutes discarded, no 12-turn salvage retry.
-Fixed in agent-gateway `6a9325c`: the envelope's `subtype` wins (`error_max_turns`),
+Fixed in sideclaw `6a9325c`: the envelope's `subtype` wins (`error_max_turns`),
 `noOutput` is set so the salvage path fires, known-benign stderr lines are
 stripped from constructed errors and kept in the raw debug log, and the
 model's own `result` text is deliberately *not* folded into `error` — that
@@ -6926,7 +6926,7 @@ for one row is worse than the row.
 
 **Unknown localhost client.** `warden-api.err` holds 19 739 `GET / → 404` from
 `127.0.0.1`, one every ~7 s from 2026-09-10 22:06 local to 2026-09-12 11:18
-local, then nothing. Nothing in dotfiles, agent-gateway, hermes-agent or argo names
+local, then nothing. Nothing in dotfiles, sideclaw, hermes-agent or argo names
 port 7735 except this repo; a 12 s `lsof` catch found no client. Not
 harmful; noted so a return is recognised.
 
@@ -6957,19 +6957,19 @@ harmful; noted so a return is recognised.
   `resolve_slack_token`, `post_blocks`, `_escape`. `warden.py` is a structural
   Python port of `hermes-ops.sh`'s front matter (`redact`, `audit`,
   `require_backend`, `run_plan`, `cmd_status`), same names in two languages.
-- warden ↔ agent-gateway: verdict schema pinned and drift-checked (`make
+- warden ↔ sideclaw: verdict schema pinned and drift-checked (`make
   check-schemas`); repo allowlist deliberately two-sided and drift-checked
-  (`check-dispatch-policy.py`); idle/ceiling timers live only in agent-gateway.
+  (`check-dispatch-policy.py`); idle/ceiling timers live only in sideclaw.
   **The one unchecked copy is `AUTO_DISPATCH_MODEL = "glm-5.3-flash"`** against
   `routing.ts`'s `GLM_FLASH` — a value with no `make check-*` behind it.
 
-**Redeploy survival**, the owner's other worry: already mostly true. agent-gateway's
+**Redeploy survival**, the owner's other worry: already mostly true. sideclaw's
 `make reload` polls `/api/jobs/health` and refuses while a job runs unless
 `FORCE=1`; the normal path is `POST /api/shutdown` with a ~50 min drain. All 13
 reloads in the retained log carried `killedWorkers:0`; zero `interrupted` rows
 exist. When a worker *is* killed, `check`/`review` get one re-run from scratch,
 `dispatch` lands `interrupted` with its worktree bundled to
-`~/.local/state/agent-gateway/salvage/`, and warden folds it to `needs_human` — no
+`~/.local/state/sideclaw/salvage/`, and warden folds it to `needs_human` — no
 retry anywhere, by §64's decision. The gap is that the worker's Claude
 `sessionId` reaches only the usage-tracker log, never `jobs.db`; `--resume` is
 used nowhere. Durable resumption across a forced restart is buildable — persist
@@ -6998,7 +6998,7 @@ lift duplicated helpers into `clients/` (mechanical, ~200 lines, zero
 behaviour), whether to split `triage.py` along its two big regions, whether to
 retire `agents-overview.py` in hermes-agent, whether to add
 `make check-routing` for the model pin, and whether to persist the session id
-in agent-gateway. None is blocked on evidence except the last, which is blocked on
+in sideclaw. None is blocked on evidence except the last, which is blocked on
 an interruption ever happening.
 
 ## 66. No limits, and the owner's own verdicts (2026-09-12, 12:30Z → 14:30Z)
@@ -7008,7 +7008,7 @@ The owner's answer to §65 was not a question. Three things, said plainly.
 **No turn limit, no wall-clock ceiling, anywhere.** "The workers are agents
 doing big things — why would we cap their turns? I don't need a turn limit.
 The agent runs as long as it needs." The only liveness rule left is
-agent-gateway's idle watchdog: no stdout for 5 min means wedged. agent-gateway
+sideclaw's idle watchdog: no stdout for 5 min means wedged. sideclaw
 `8459357` removes `--max-turns` from `buildSessionArgs`, deletes every
 `maxTurns`/`retryTurns`/`timeoutMs` from the dispatch tiers and from
 check/review/overview/narrative/excalidraw/otel, and deletes the 60-min
@@ -7034,14 +7034,14 @@ re-introduced "for safety".
   nag you until Friday". That was the flaw.
 - `make check-routing` — the third drift check, in the mould of
   `check-schemas` and `check-policy`: `triage.AUTO_DISPATCH_MODEL` (and
-  `TRIAGE_VALIDATION_DISPATCH_MODEL` when set) against agent-gateway's live
+  `TRIAGE_VALIDATION_DISPATCH_MODEL` when set) against sideclaw's live
   `GET /api/routing`; `make status` carries the line.
 - Helper consolidation, zero behaviour change, 248/248 untouched: one Slack
   POST primitive (`clients/slack.py:slack_raw_post`) under both `_slack_call`s;
   `ledger.now_iso` under `intents`/`operations`; `clients/secrets.resolve_secret`
   under the poll and the sweep; `clients/github.parse_pr_url` under triage;
   `ledger.apply_db_override(argv, setter)` under triage and the sweep;
-  `clients/agent-gateway.classify_dispatch_outcome` under both verdict renderers;
+  `clients/sideclaw.classify_dispatch_outcome` under both verdict renderers;
   `watchdog-summary.py` opens the ledger through `ledger.connect(readonly=True)`.
   One correction to §65's map: `connect(readonly=True)` does not assert the
   schema version — the read-only branch returns before the check.
@@ -7051,8 +7051,8 @@ re-introduced "for safety".
   copies of `_resolve_ref`/`post_blocks` stay — they are load-bearing there.
   `docs/dispatch-bridge.md` is Hermes-side only now (628 → 75). §65's audit
   also misread `make agent-overview` as hermes-agent's; it is a dotfiles herdr
-  pane over agent-gateway's `GET /api/overview.txt`, and the handover doc says so.
-- agent-gateway, in flight as this § is written: `jobs.session_id`, `--resume` on
+  pane over sideclaw's `GET /api/overview.txt`, and the handover doc says so.
+- sideclaw, in flight as this § is written: `jobs.session_id`, `--resume` on
   boot for a dispatch killed mid-episode with its worktree kept, and a
   self-drain with no wall-clock cap.
 
@@ -7087,7 +7087,7 @@ signal relay, which item 543's own investigate verdict (dispatch 51, high
 confidence, `nextAction: implement`) had already named. The bug: `dotfiles` is
 capped at `investigate` in `dispatch-repos.json`, `maybe_auto_implement` never
 checked the ceiling, so every tick it claimed the item (`verdict →
-implementing`), agent-gateway refused at its boundary (HTTP 400 `tier 'implement'
+implementing`), sideclaw refused at its boundary (HTTP 400 `tier 'implement'
 exceeds the ceiling 'investigate'`), and the rollback put it back with no
 note. Two silent transitions every 600 s, the verdict deadline reset each
 time so it could never time out, and the Argo snapshot grew ~780 B per tick
@@ -7127,7 +7127,7 @@ the 248 → 251 came from.
 
 Owner: "do all of them." Routed by where the dispatch policy lets work land:
 warden and dotfiles are `investigate`-capped and homelab-private is denied, so
-those ran as in-session implementers; argo went to a agent-gateway `implement`
+those ran as in-session implementers; argo went to a sideclaw `implement`
 dispatch on glm-5.3-flash, and the Hermes gateway friction to an `investigate`
 dispatch on the same model.
 
@@ -7268,21 +7268,21 @@ on the card and in Argo before anything closes. No public comment ever
 reaches a third-party issue (unchanged). Owner-issue routing untouched — it
 opens at `max_tier='implement'` and never reaches this branch.
 
-`config/dispatch-repos.json`: `agent-gateway`/`warden` joined `tiers.investigate`
+`config/dispatch-repos.json`: `sideclaw`/`warden` joined `tiers.investigate`
 (CLAUDE.md: warden may never hold tier ≥ 1 on its own executor or on itself).
 `watchdog-poll.py`'s `poll_github()` stopped polling issues — `github_pr`
 stays; the digest's `github_issue` events were a one-time resolve
 (`resolve_stale_github_issue_events()`), since issue items now carry a real
 verdict and supersede the age-gated "still open" line entirely.
 
-`/review` (agent-gateway multi-angle, `needs-human`) caught a real bug beyond the
+`/review` (sideclaw multi-angle, `needs-human`) caught a real bug beyond the
 brief: `search_issues()` didn't check GitHub's `incomplete_results` flag — a
 search-index timeout can return HTTP 200 with a page that isn't authoritative,
 which would have silently resolved a genuinely-still-open issue's event.
 Fixed in the same commit, with a regression test. The review's other
-blocking finding — `make check-policy` disagreement, agent-gateway's own boundary
-still allowing `implement` on `agent-gateway`/`warden` — was already anticipated
-and scoped out of this wave by the plan itself (agent-gateway is a different repo);
+blocking finding — `make check-policy` disagreement, sideclaw's own boundary
+still allowing `implement` on `sideclaw`/`warden` — was already anticipated
+and scoped out of this wave by the plan itself (sideclaw is a different repo);
 left for whoever picks up that side. `test_triage.py` 256/256, `test_clients.py`
 93/93, `make test` green, `make check-routing` green.
 
@@ -7320,7 +7320,7 @@ the same thing. DESIGN.md's original § *Budgets* (v1 sketch) gets a dated
 disposition paragraph rather than a rewrite, same pattern as the Argo
 override; `docs/triage.md`'s several budget mentions were corrected in place.
 
-`/review --deep` (agent-gateway `needs-human` + native high-effort) caught four
+`/review --deep` (sideclaw `needs-human` + native high-effort) caught four
 real bugs beyond the brief, all fixed in the same commit: (1) the `implement`
 handler's claim CAS required `implement_job IS NULL`, which permanently
 blocked a re-implement from Argo on any `needs_human` item carrying a stale
@@ -7340,8 +7340,8 @@ a stale card for up to one tick. Also hardened on review: `fetch_actions()`
 now bounds its read at `MAX_BODY_BYTES` (the one inbound body read in a file
 whose other two functions only ever POST) instead of buffering an unbounded
 response. One separately caught, unrelated regression: the implementer's own
-diff had drifted `scripts/clients/agent_gateway.py`'s `DISPATCH_SCHEMA_VERSION`
-2→3 and added an `applied_in_place` outcome with no agent-gateway-side source to
+diff had drifted `scripts/clients/sideclaw.py`'s `DISPATCH_SCHEMA_VERSION`
+2→3 and added an `applied_in_place` outcome with no sideclaw-side source to
 re-read against — reverted outright (that file's own docstring: "never guess
 a version or an outcome list") before it could break `check-schemas`/mask a
 real drift.
@@ -7350,9 +7350,9 @@ real drift.
 tests removed and ~22 Argo-action/regression tests added), `test_clients.py`
 105/105, `test_api.py` 42/42, `make test` green, `make check-routing` and
 `make check-schemas` green. `make check-policy` still fails on the same
-Wave-1-left-behind disagreement (agent-gateway's own boundary still allows
-`implement` on `agent-gateway`/`warden`) — unchanged by this wave, still a
-agent-gateway-repo fix.
+Wave-1-left-behind disagreement (sideclaw's own boundary still allows
+`implement` on `sideclaw`/`warden`) — unchanged by this wave, still a
+sideclaw-repo fix.
 
 `docs/waves/PLAN.md` Wave 3 (argo API: the action queue, in `~/SourceRoot/argo`)
 is active next.
@@ -7454,7 +7454,7 @@ Ran the whole GitHub-issue pipeline against real repos instead of unit-test
 fixtures: an owner issue (`usage-tracker#3`, "README Usage section is
 missing 'make uninstall-agent'") through ingest -> investigate (high
 confidence, `nextAction=implement`) -> auto-implement -> draft PR
-(`usage-tracker#4`) -> agent-gateway `review` validation (clean, 122 turns,
+(`usage-tracker#4`) -> sideclaw `review` validation (clean, 122 turns,
 architect/senior-dev/qa/adversary) -> `merge_blocked` (correctly refused:
 `usage-tracker` has no `autoMergePaths` declared, so nothing merges without
 an explicit scope — the safe default, not a bug). Confirmed in both the
@@ -7529,7 +7529,7 @@ Argo page with correct assessments: `research-gateway#3`/`#5` sitting in
 `merge_blocked` on real validation findings (a regex over-match, an
 under-constrained consistency-correction acceptance — both genuine, both
 worth a human look, neither this wave's to fix), `#6`/`#7` in
-`needs_human`, `agent-gateway#3`/`#4` in `needs_human` with the correct
+`needs_human`, `sideclaw#3`/`#4` in `needs_human` with the correct
 "capped at tier 'investigate'" note despite a stale `max_tier=implement`
 column stamped before Wave 1's cap took effect (the runtime check at
 dispatch/fold time catches it regardless — confirms the column being stale
@@ -7546,9 +7546,9 @@ no `CLAUDECODE` set) should clear it on its own; flagged, not touched.
 
 `make test` 267/267 (was 265, +2 for the disappearance-resolve fix),
 `make check-schemas` and `make check-routing` green; `make check-policy`
-still disagrees on the same pre-existing `agent-gateway`/`warden` ceiling drift
-Wave 1 left behind (agent-gateway's own boundary not yet capped) — unchanged by
-this wave, still a agent-gateway-repo fix.
+still disagrees on the same pre-existing `sideclaw`/`warden` ceiling drift
+Wave 1 left behind (sideclaw's own boundary not yet capped) — unchanged by
+this wave, still a sideclaw-repo fix.
 
 **Owner actions, both on `op://mini/github/token`
 (github.com/settings/personal-access-tokens):** grant `Issues: Read` on
@@ -7565,16 +7565,16 @@ in this same commit — this was the last one.
 
 ## 74. The self-repo cap, lifted (2026-09-15)
 
-Owner, after Wave 5: the `investigate` cap Wave 1 put on `agent-gateway` and
-`warden` was friction — `agent-gateway#3`/`#4` could never get past a verdict. The
+Owner, after Wave 5: the `investigate` cap Wave 1 put on `sideclaw` and
+`warden` was friction — `sideclaw#3`/`#4` could never get past a verdict. The
 rule it encoded ("warden may never hold tier ≥ 1 on its own executor or on
 itself") guarded against a closed propose-and-land loop, and that loop is
 already open without it: an implement episode ends as a draft PR, and
 neither repo carries `autoMergePaths`, so `merge_gate_check()` refuses and
 the item waits in `merge_blocked` for the owner's Argo Merge click. The rule
-is restated as "never auto-merge on agent-gateway or warden" (CLAUDE.md,
+is restated as "never auto-merge on sideclaw or warden" (CLAUDE.md,
 `config/dispatch-repos.json` readme); `tiers.investigate` is back to `brain`,
-`hermes-agent`. `make check-policy` agrees with agent-gateway again (exit 0).
+`hermes-agent`. `make check-policy` agrees with sideclaw again (exit 0).
 
 PAT probe after the owner added Issues read/write: private-repo issues,
 search, pulls and contents read now 200; `commits/{sha}/check-runs` and
@@ -7650,7 +7650,7 @@ Item 1117's investigate episode (job `33d69619`) derived the fix and returned
 `nextAction: implement` at high confidence — but 1117 itself was dispatched at
 tier `investigate` and closed as `answered`, and 1118, its implement
 continuation, could not run at all: **this repo has no git remote** (§62), and
-agent-gateway's `resolveRepoIdentity()` (`server/jobs/handlers/dispatch.ts` →
+sideclaw's `resolveRepoIdentity()` (`server/jobs/handlers/dispatch.ts` →
 `dispatch-git.ts:349`) requires a GitHub `origin` for every episode that is not
 `investigate` and not `worktree: in-place`. Job `a8850cc5` failed in 39 ms with
 `git remote get-url origin failed (2): Remote-Repository 'origin' nicht
@@ -7717,11 +7717,11 @@ the *quality* of those 24 PRs, and the funnel still closes almost everything on
 silence rather than on a verified fix. The owner's two interactive failures
 were a different lane: `ca deepseek-v4-pro` auto-compacted constantly because
 `_ca_ctx` (dotfiles `config/zsh/iu-models.sh`) and its mirror
-`GATEWAY_CONTEXT_TOKENS` (agent-gateway `server/mcp/session-runner.ts`) each carry
+`GATEWAY_CONTEXT_TOKENS` (sideclaw `server/mcp/session-runner.ts`) each carry
 exactly one row, `glm-5.3-flash`, and every other gateway id falls back to the
 200k budget Claude Code assumes over a custom base URL; and the `glm-5.3-flash`
 "hang" matches modelpick's measured 13.3 tok/s effective in-loop rate, which is
-a latency fact, not a fault. Neither is a warden change. agent-gateway prunes
+a latency fact, not a fault. Neither is a warden change. sideclaw prunes
 terminal jobs after 24 h, so its side of any incident older than a day is
 unrecoverable — only this ledger kept the period.
 
@@ -7763,11 +7763,11 @@ evidence the next routing decision rests on.
 nine open PRs — the rest were already closed as superseded (glm closed its own
 intermediate drafts with ancestry checks) or merged. Verdicts: merge
 research-gateway #20 → #9 → reconcile #13/#15 (both edit `groundReport`),
-weatherorb #4, agent-gateway #8; fix first agent-gateway #6 (the CI-path guard is
+weatherorb #4, sideclaw #8; fix first sideclaw #6 (the CI-path guard is
 `.github/`-only, so the new GitLab write path has no block on `.gitlab-ci.yml`)
 and homelab #2 (docs contradict themselves on the cron mechanism); close
 dotfiles #5 (conflicts with a better fix already on master, salvage
-`scripts/lib/bun-bin.sh`); rollhook #26 works around agent-gateway's 180 s `check`
+`scripts/lib/bun-bin.sh`); rollhook #26 works around sideclaw's 180 s `check`
 cap inside rollhook. `glm-5.3-flash` graded B-…A- on correctness, A- on scope
 and tests, C on validation evidence (self-reported; most repos have no test
 CI). Two recurring misses worth a brief-level fix: it acts on an inherited
@@ -7792,7 +7792,7 @@ the 1.1M probe ceiling), 262,144 exact for kimi-k2.7-code. `kimi-k3` and
 `deepseek-v4.1-flash` 404 on the Anthropic leg (OpenAI route only). `glm-5.2`
 is dead under Claude Code 2.1.278 (the backend rejects the CLI's `verbosity`
 field; the gateway masks it as a 503). The rows are in dotfiles `_ca_ctx`
-(`41ab2e2`); **agent-gateway's mirror `GATEWAY_CONTEXT_TOKENS` is not updated** —
+(`41ab2e2`); **sideclaw's mirror `GATEWAY_CONTEXT_TOKENS` is not updated** —
 its working tree carried another session's uncommitted work, so it was left
 alone. Switching dispatch means three edits that must land together: that
 table, `routing.ts`'s AGENT route, and `AUTO_DISPATCH_MODEL` here
@@ -7804,7 +7804,7 @@ It loads `~/.claude/CLAUDE.md` and discovers `~/.claude/skills` natively;
 `rules/*.md` needs an `instructions` glob; PreToolUse hooks, `~/.claude/agents`
 and Claude-only skill syntax are lost; no JSON-schema flag on `opencode run`,
 so a verdict is fenced JSON the runner must strip and validate. Estimated 2–3
-days for a second runner behind agent-gateway's same submit/get interface. Not
+days for a second runner behind sideclaw's same submit/get interface. Not
 needed to get off glm — DeepSeek-V4-Flash under Claude Code already is — but it
 is the only way to reach `kimi-k3`.
 
@@ -7830,14 +7830,14 @@ kill folding to `needs_human`.
 **POC.** The same six read-only briefs ("decide this open PR: MERGE /
 FIX-THEN-MERGE / CLOSE") went through `warden dispatch --tier investigate
 --model …` on both models: 12/12 `done`, one attempt each, no stall, no
-compaction. agent-gateway's own clock: Flash 0.7–2.9 min per episode, Pro 1.0–6.0
+compaction. sideclaw's own clock: Flash 0.7–2.9 min per episode, Pro 1.0–6.0
 (glm's field median for investigate was 7.1). Against the independent Sonnet
 reviews of §78:
 
 | PR | Sonnet | V4-Pro | V4-Flash |
 |-|-|-|-|
 | weatherorb #4 | merge | merge | fix-then-merge: the secrets-run smoke test does not traverse the uv hop it claims to (Pro listed it as a nit) |
-| rollhook #26 | fix in agent-gateway instead | **merge** — missed it | fix in agent-gateway instead, verified in agent-gateway's `check.md`/`check.ts` |
+| rollhook #26 | fix in sideclaw instead | **merge** — missed it | fix in sideclaw instead, verified in sideclaw's `check.md`/`check.ts` |
 | homelab #2 | fix-then-merge | **merge**, nits only | fix-then-merge, plus a defect neither other reviewer found: `setup.sh` emits the cron line without the profile prefix the PR's own docs assert |
 | dotfiles #5 | close, salvage `bun-bin.sh` | close, salvage it; found the `shlock` guard never releases a dead pid's lock (verified live) | rebase and cut the hunks master already has; found the pinned-tailscale branch is now unconditionally true |
 | research-gateway #20 | merge after running tests | merge; title understates scope | fix-then-merge: a new unconditional per-job LLM call lands without re-measuring `docs/measurements.md` § Job duration, which that repo's CLAUDE.md requires |
@@ -7847,7 +7847,7 @@ Flash agreed with the independent review wherever Pro was lenient, and read the
 target repos' own rules more closely. Six episodes is a small sample; the
 direction is not ambiguous.
 
-**The change.** `AUTO_DISPATCH_MODEL` defaults to `DeepSeek-V4-Flash`; agent-gateway's
+**The change.** `AUTO_DISPATCH_MODEL` defaults to `DeepSeek-V4-Flash`; sideclaw's
 AGENT route moves in the same sitting (its `GATEWAY_CONTEXT_TOKENS` row,
 1,000,000, landed the day before in `1d94541`), CLASSIFY stays on glm —
 untested there. `TRIAGE_AUTO_DISPATCH_MODEL` is the one-line way back.
@@ -7855,25 +7855,25 @@ untested there. `TRIAGE_AUTO_DISPATCH_MODEL` is the one-line way back.
 idle-watchdog kills, and the tool-error rate (4% in ccbench against glm's 0%).
 
 **Found on the way, not fixed.** `dispatches.finished_at` is stamped with the
-time warden *observes* a terminal job, not the time agent-gateway finished it: the
+time warden *observes* a terminal job, not the time sideclaw finished it: the
 twelve POC rows read 614–625 minutes because the polling shell was suspended
 overnight and `warden status` stamped them on resume, while `reported_at` (the
 sweep) had them at 5–20 minutes. It also explains why §77's implement
 durations cluster on multiples of ten minutes — they are tick-quantized. Every
-duration this ledger reports is an upper bound; agent-gateway's `started_at` /
+duration this ledger reports is an upper bound; sideclaw's `started_at` /
 `finished_at` are the real numbers, and it prunes them after 24 h.
 
 ## 80. The first full lifecycle on the new dispatch model (2026-09-21, 02:40Z → 03:07Z)
 
 Two `human`-origin items ran investigate → verdict → implement → step-7 review
-on `DeepSeek-V4-Flash`, review on agent-gateway's JUDGE route as before:
+on `DeepSeek-V4-Flash`, review on sideclaw's JUDGE route as before:
 
 | item | repo | investigate | implement | review | outcome |
 |-|-|-|-|-|-|
 | 1142 | usage-tracker | 0.4 min | 2.0 min | 0.7 min, `confirmed` | draft PR #5, `merge_blocked` — no `autoMergePaths` (by design) |
 | 1143 | homelab | 1.3 min | 4.9 min | 1.8 min, `blocked` | draft PR #3, `merge_blocked` on a real review finding: the cron line now sources `/root/.profile`, but the install steps only tell the operator to fill the user's `.profile` |
 
-Durations are agent-gateway's clock. glm's field medians were 7.1 and 40.1 minutes.
+Durations are sideclaw's clock. glm's field medians were 7.1 and 40.1 minutes.
 **The lifecycle took 27 minutes of wall clock for under nine minutes of work** —
 every stage boundary waits for the next 600 s loop tick (`verdict` 02:41/02:46 →
 `implementing` 02:47:25 → `validating` 02:57:29 → `merge_blocked` 03:07:31).
@@ -7891,10 +7891,10 @@ an exact `--why`. No other warden session was running on the host. The dedup
 was right and the ledger shows every step of it; who decided to re-file is not
 recorded anywhere but the CLI audit log's `why`.
 
-Also noted: agent-gateway appends "Opened automatically by a bounded dispatch
+Also noted: sideclaw appends "Opened automatically by a bounded dispatch
 episode, from this brief: …" to every PR body. One of the §79 review episodes
 flagged it against the owner's global no-attribution rule. It is provenance,
-written by the tooling rather than the model, and it is agent-gateway's to decide.
+written by the tooling rather than the model, and it is sideclaw's to decide.
 
 ## 81. The digest's notes heading drops what has already resolved (2026-09-22)
 
@@ -7937,7 +7937,7 @@ treated that job as the cluster's membership. `cmd_abort` did not. It stamped
 the shared `dispatches` row cancelled (cluster-wide) and `reported_at` with it,
 then transitioned only the item it was called on, so every sibling was left in
 an in-flight state with **no exit at all**: `close` refuses in-flight states by
-design, a second `abort` refused on agent-gateway's 409 (`PolicyError: job already
+design, a second `abort` refused on sideclaw's 409 (`PolicyError: job already
 cancelled`, untolerated where the 404 `no job` case was), and the sweep only
 reads rows with `reported_at IS NULL` — the stamp the abort itself had just
 written. The one thing left for such a row was its deadline, which files a
@@ -7945,7 +7945,7 @@ needs_human card for work a human has already decided against. Hit live: item
 1114 aborted on the checkpoint alert, sibling 1153 stranded `investigating`
 with a 2 h deadline.
 
-Two changes, both in `scripts/warden.py`. An already-terminal job (agent-gateway's
+Two changes, both in `scripts/warden.py`. An already-terminal job (sideclaw's
 409) is now tolerated exactly as the 404 `no job` case already was — the
 abort's intent, "no episode is running against this cluster", already holds —
 and the abort discharges every other row sharing the job, in the same
@@ -7983,7 +7983,7 @@ investigate-capped, so that stays a report.
 The global `--dry-run` flag is accepted on every verb, and `cmd_close`, `merge`
 and `dispatch` honour it (DESIGN.md's contract: nothing outward-facing, nothing
 written). `cmd_abort` never looked at it. `warden abort 1114 --why … --dry-run`
-cancelled job `6e53fcb4` on agent-gateway and transitioned item 1114 to `closed`;
+cancelled job `6e53fcb4` on sideclaw and transitioned item 1114 to `closed`;
 the follow-up call *without* the flag then refused with "state 'closed', no
 in-flight episode". The audit log has it in two adjacent lines — `mode=aborted
 rc=0` for the "dry run", `mode=refused rc=4` for the real one: the preview was
@@ -8005,8 +8005,8 @@ read-only investigate episodes and Argo's re-investigate; a new
 `AUTO_IMPLEMENT_MODEL` (env `TRIAGE_AUTO_IMPLEMENT_MODEL`, `DeepSeek-V4-Pro`)
 covers `maybe_auto_implement()` and Argo's implement click. Both carry the
 same Claude-id guard. `make check-routing` still compares only the investigate
-model against agent-gateway's dispatch default — the implement model is passed
-explicitly per job and agent-gateway's `GATEWAY_CONTEXT_TOKENS` has had its 1M row
+model against sideclaw's dispatch default — the implement model is passed
+explicitly per job and sideclaw's `GATEWAY_CONTEXT_TOKENS` has had its 1M row
 since `1d94541`. `tests/test_triage.py` 276/276 (§81–§83's tests plus the
 implement assertion re-pointed and a guard that the two knobs differ).
 
@@ -8105,14 +8105,14 @@ Every step inside the chain already re-derives its own eligibility from the
 ledger on each call and is CAS-guarded end to end:
 `maybe_auto_implement()`'s claim is `UPDATE ... WHERE state='verdict' AND
 implement_job IS NULL` (wins once, ever); `poll_implement_jobs()` and
-`poll_validation_jobs()` each do their own fresh agent-gateway poll per row
+`poll_validation_jobs()` each do their own fresh sideclaw poll per row
 before touching a state, and a `done` job stays `done` no matter which of
 two processes reads it first. Two cron processes calling this chain is
 exactly as safe as the loop calling it twice in a row already was, which it
 always tolerated (a slow tick immediately followed by a fast one on
 restart). DESIGN.md's "no second loop" is about a SECOND SCHEDULE deciding
 state — this adds no schedule at all: dispatch-sweep.py already existed,
-already runs every 300s, and is already the one process watching agent-gateway
+already runs every 300s, and is already the one process watching sideclaw
 for exactly the signal ("a job just went terminal") that makes this chain
 worth re-running. The alternative — dropping the loop's own `StartInterval`
 so `run()` itself ticks faster — was rejected: `run()` also does GitHub
@@ -8127,30 +8127,30 @@ process already watching for the trigger runs at. `maybe_check_liveness()`
 600s tick alone: its window is `LIVENESS_WINDOW_HOURS`, not seconds, so
 300s buys it nothing.
 
-**`dispatches.finished_at` was the poll's own wall clock, not agent-gateway's**
+**`dispatches.finished_at` was the poll's own wall clock, not sideclaw's**
 (§79's open item). Every terminal fold — `lifecycle/dispatch.py`'s
 `sync_record()` (called by `poll_implement_jobs()`/`poll_validation_jobs()`/
 `warden status`) and dispatch-sweep.py's own per-row fold — stamped
 `finished_at` with `now`, the moment THIS process happened to observe the
-job terminal, not the moment agent-gateway itself finished it. §79's own
+job terminal, not the moment sideclaw itself finished it. §79's own
 12-episode POC already proved the gap: twelve rows read 614–625 minutes
-because the polling shell was suspended overnight. agent-gateway's job envelope
+because the polling shell was suspended overnight. sideclaw's job envelope
 (`GET /api/jobs/:id`, `JobView.finishedAt` — server/jobs/types.ts) already
 carries this as an epoch-ms field on every terminal job; warden received it
-on every poll and discarded it. `clients/agent_gateway.py` gets one new
+on every poll and discarded it. `clients/sideclaw.py` gets one new
 function, `finished_at_iso(job, fallback=now)`, converting that field to an
 ISO UTC string when present and falling back to the caller's own `now`
 only for the rare terminal job that carries none (there never was a
 "pruned" job's envelope to read — `dispatch-sweep.py`'s `_mark_pruned()`
-path is unchanged, correctly, since there agent-gateway's own value could never
+path is unchanged, correctly, since there sideclaw's own value could never
 exist). Both fold sites now call it. `dispatches.finished_at` is now
-agent-gateway's own ground truth, not an upper bound.
+sideclaw's own ground truth, not an upper bound.
 
 **Tests.** `tests/test_triage.py` stays **276/276** — `advance_implement_chain()`
 is a pure extraction, exercised by every existing test that calls
 `triage.run()`, with no test edits needed to keep it green. Ten new tests,
 none touching that gate: `test_clients.py` 105 → **107/107**
-(`finished_at_iso()`'s own two cases — prefers agent-gateway's timestamp, falls
+(`finished_at_iso()`'s own two cases — prefers sideclaw's timestamp, falls
 back on a missing/non-numeric/boolean value); `test_lifecycle.py` 98 →
 **100/100** (`sync_record()` end to end — a job finished hours before an
 overnight-suspended poll observes it must not stamp the late observation
@@ -8192,12 +8192,12 @@ moved verbatim to `AGENTS.md`; `CLAUDE.md` is now exactly `@AGENTS.md`, the
 only shape that loads on every Claude lane (a cold `CLAUDE_CONFIG_DIR` over the
 IU endpoint drops a bare AGENTS.md) while OpenCode and Codex read `AGENTS.md`
 natively. No `@import` lines to relocate. Pointers that meant *this repo's*
-instructions (`§The ledger`, `§Talking to agent-gateway`, the regression gate, the
+instructions (`§The ledger`, `§Talking to sideclaw`, the regression gate, the
 closed allowlists) now name `AGENTS.md`, as do the cross-repo ones into
 dotfiles and brain, which migrate the same way. Pointers into hermes-agent's
 and the global `~/.claude/CLAUDE.md` are unchanged. No warden code reads a
 repo's instruction file — dispatched episodes get the target repo's context
-from agent-gateway's `claude` invocation, which follows the shim — so there is no
+from sideclaw's `claude` invocation, which follows the shim — so there is no
 code path to switch. `requirements.txt` (`cryptography==50.0.0`) left pinned.
 
 ## 89. The deliberate fallback probe stops minting a card (2026-09-23)
@@ -8417,7 +8417,7 @@ guard.
 
 **The approval path for the gated repos never worked.** `plan_or_land()` runs
 `merge_gate_check()`, which refuses any repo without `autoMergePaths` — and
-`warden`, `agent-gateway`, `dotfiles` have none by design. So the `warden merge …
+`warden`, `sideclaw`, `dotfiles` have none by design. So the `warden merge …
 --confirm` every gated card told the owner to run, and Argo's Merge, refused
 every time; and a gated fix waited in `needs_human`, where Argo offered no Merge
 button at all. Now: `OWNER_AUTHORIZERS = ("owner:argo", "cli:confirm")` —
@@ -8486,7 +8486,7 @@ Tests: `test_triage.py` 313/313 (+5).
 
 ## 96. The review of §91–§95, and what it changed (2026-09-28)
 
-A multi-angle agent-gateway review of `16aab36..1927d8c` (security, concurrency,
+A multi-angle sideclaw review of `16aab36..1927d8c` (security, concurrency,
 resilience, backend; job `2c7fe918`) returned three blocking findings, all real,
 all in the merge sharing §93/§94 introduced, plus a fourth this session found
 first:
@@ -8562,7 +8562,7 @@ merge commit under linear history). Numbered cases 825 → 826.
 - `scripts/validate-dispatch-policy.py` deleted (90 lines): no Makefile target or
   script calls it since `make status` dropped it; `dispatch-repos.json` is
   validated where it is used (`policy.resolve_repo()`/`resolve_tier()`) and
-  checked against agent-gateway by `make check-policy`. No property depended on it.
+  checked against sideclaw by `make check-policy`. No property depended on it.
 - The merged `.claude/worktrees/advance-on-completion` worktree and its branch
   removed — a full second copy of every script that every grep hit.
 
@@ -8589,7 +8589,7 @@ parked as a draft PR.
   files, package manifests and lockfiles, `.env*`/`*.tpl`. Only the owner's Argo
   merge passes it.
 - **"The loop never merges its own executor" moved into the merge itself.**
-  Before, only triage's routing kept `warden`/`agent-gateway`/`dotfiles` from an
+  Before, only triage's routing kept `warden`/`sideclaw`/`dotfiles` from an
   unattended merge, and `_merge_needs_approval()` failed *open* on an unreadable
   `dispatch-repos.json`. `effective_repo_entry()` fails closed: a gated repo, or
   an unreadable policy, gets no default scope, so the gate refuses there too.
@@ -8800,7 +8800,7 @@ restores homelab's copy; a restic restore needs the B2 credentials held in the
 homelab container and writes a full repository snapshot — its own drill);
 putting a snapshot back over a lost live ledger (a deliberate human step:
 `make unload`, copy, `make setup`); the loop's *outbound* behaviour on a restored
-ledger (the dry-run makes no Slack/agent-gateway/Argo writes by contract).
+ledger (the dry-run makes no Slack/sideclaw/Argo writes by contract).
 
 Tests: new `tests/test_restore.py` 11/11 (guard ×4, a good snapshot, a real
 schema-(N-1) snapshot migrated, corrupt, newer schema, stale data, empty, missing);
@@ -8946,7 +8946,7 @@ Tests: `tests/test_triage.py` 340 → 341 (the vanished-shadow case: retried, ne
 owner's words: "mach es. Es soll effektiv sein, es soll funktionieren." —
 Makefiles, `ops/`, `.github/`, plists, manifests, lockfiles, `pyproject.toml`,
 everything that stops a fix at a draft PR, with one exception he named and did
-not withdraw: `warden`, `agent-gateway` and `dotfiles`, the loop's own executor.
+not withdraw: `warden`, `sideclaw` and `dotfiles`, the loop's own executor.
 
 **What changed.** `NEVER_AUTO_MERGE` (§99) is deleted from
 `scripts/lifecycle/merge.py`, and with it the path-class refusal in
@@ -8954,7 +8954,7 @@ not withdraw: `warden`, `agent-gateway` and `dotfiles`, the loop's own executor.
 The CI-definition refusal in `plan_or_land()` (`.github/workflows`,
 `.github/actions`, older than §99 and applied even to the owner's click) is kept
 for the executor repos only. What he kept is now code, not policy:
-`EXECUTOR_REPOS = frozenset({"warden", "agent-gateway", "dotfiles"})`, checked in
+`EXECUTOR_REPOS = frozenset({"warden", "sideclaw", "dotfiles"})`, checked in
 `effective_repo_entry()` before the dispatch policy's `merge_approval` is even
 read — an edit to that policy file can add a gated repo, never remove one of
 these three. A gated repo gets no scope, so nothing unattended lands there
@@ -8997,7 +8997,7 @@ launchd-shaped `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) resolves `make`,
 nothing changed is a no-op by construction, and one with a change is the
 deploy itself — the next merged plist is its proof.
 
-**What still stops at a draft PR, everywhere.** `warden`, `agent-gateway`,
+**What still stops at a draft PR, everywhere.** `warden`, `sideclaw`,
 `dotfiles` (no scope, Argo click only, CI definitions refused even then); a PR
 over `MAX_MERGE_FILES` (40) or `MAX_MERGE_LINES` (2000); a failed or missing
 check-run without `noCiRequired`; a step-7 review that did not confirm; a
@@ -9383,15 +9383,15 @@ trust/approval/policy gates. Commits 405aee5..64b4f7a:
   `approval-spec.json`; `warden dispatch --tier implement` submits directly;
   ledger migration 12 drops `dispatch_approvals` (tested on a copy: 1406 events,
   414 dispatches, 288 items unchanged, integrity ok). `requirements.txt` is empty.
-- **agent-gateway is the only boundary** — `dispatch-repos.json`, `resolve_repo/tier`,
+- **sideclaw is the only boundary** — `dispatch-repos.json`, `resolve_repo/tier`,
   `check-dispatch-policy.py`, `check-routing.py`, the `TRIAGE_*_MODEL` knobs gone.
-  `policy.repo_cwd()` keeps the one `cwd` agent-gateway's wire still needs. A submit
+  `policy.repo_cwd()` keeps the one `cwd` sideclaw's wire still needs. A submit
   4xx raises `SubmitRefused`; `_end_on_refusal()` ends the item `needs_human`
-  with agent-gateway's message, never retried.
+  with sideclaw's message, never retried.
 - **Merge gate = four facts** (`merge.merge_gate_check()` / `plan_or_land()`):
   PR open, checks green or none, review `confirmed`, GitHub's merge call allows.
   Unreadable check runs refuse (unknown ≠ none). Executor repos are no longer
-  special — warden may now auto-merge on agent-gateway/warden/dotfiles.
+  special — warden may now auto-merge on sideclaw/warden/dotfiles.
 - **Meta-machinery deleted** — reminders, self-audit, stranded-PR sweep, chaos,
   restore drill (backup kept), `check-schema-versions.py`, `propose_mappings`,
   env-check, `warden_self`, `require_no_recursion` (agents may `warden run`).
@@ -9422,7 +9422,7 @@ redeploy).
 - **One retry rule** replaces the 12-row `STATE_DEADLINES`: `_strike()` — infra
   failure (no-verdict terminal, 5xx, review synthesis error, pruned job, PR-less
   implement, ambiguous submit after a 30 min grace) backs off 10 then 30 min; the
-  third strike is `failed`. A agent-gateway 4xx is `failed` at once. No timer on a
+  third strike is `failed`. A sideclaw 4xx is `failed` at once. No timer on a
   running episode.
 - **Verdict fold:** `implement`/`issue` → `working` (auto-implement), `human` →
   `needs_decision` with `decisionQuestion` (summary fallback), `none` or an
@@ -9448,8 +9448,8 @@ test_triage 302 → 318. Rejected review findings: "migration 13 already ran liv
 ## 118. Agent-platform Wave 3 — intake and dedup (2026-10-04)
 
 Commits 98d7798, de5a620, 6635bb9, f8f237c here; the schema-v4 pin bump is the
-next commit on branch `wave-3`, deliberately not on master (see below). agent-gateway
-52037de on branch `warden-w3-dispatch-schema-v4` (agent-gateway W3 was live in that
+next commit on branch `wave-3`, deliberately not on master (see below). sideclaw
+52037de on branch `warden-w3-dispatch-schema-v4` (sideclaw W3 was live in that
 checkout).
 
 - **Fingerprint.** `watchdog_poll.fingerprint()` — title minus timestamps, UUIDs,
@@ -9460,7 +9460,7 @@ checkout).
   Existing open rows keep their old keys and drain; a re-keyed recurrence becomes a
   new item that triage attaches to the old one.
 - **Triage step.** Every `new` item (alerts once debounce-eligible, issues and
-  `warden run` at once) gets one agent-gateway `triage` job: `attach | new(repo) |
+  `warden run` at once) gets one sideclaw `triage` job: `attach | new(repo) |
   fixed_by | ignore`, validated against the ledger before it moves (`triaged` is its
   output; `escalate()` reads nothing else). Candidate repos come from a label —
   native (Kuma tag, container, OTel `service.name`, issue repo) then a policy rule —
@@ -9476,14 +9476,14 @@ checkout).
   the replay $0.21, p50 2.7 s. The rule-selected evidence gatherers are deleted
   (W4 scope, landed early: rules were their only selector).
 - **Revisions are attempts.** Up to 4 implement attempts per item; a blocked
-  review re-dispatches with `revisionOf` the prior `dispatch/*` branch and agent-gateway
-  updates the same PR (`pr_updated`). Attempt 3+ sends the model of agent-gateway's
+  review re-dispatches with `revisionOf` the prior `dispatch/*` branch and sideclaw
+  updates the same PR (`pr_updated`). Attempt 3+ sends the model of sideclaw's
   `dispatch_implement_escalation` route — **that route does not exist yet**, so
-  every attempt runs on agent-gateway's default until it does; a refused model
+  every attempt runs on sideclaw's default until it does; a refused model
   resubmits once without it. A struck revision rewinds to its prior attempt.
 - **New outcomes.** `conflict` re-derives from the new base, carrying the old
   verdict, the earlier review findings and the commits' git bundle path; `pr_updated`
-  is handled as `pr_opened`; agent-gateway's per-repo lease refusal retries in 10 min
+  is handled as `pr_opened`; sideclaw's per-repo lease refusal retries in 10 min
   with no strike and no attempt spent (unbounded by design).
 - **Root-cause merge.** A verdict's `rootCause` is stored; an open same-repo
   alert with the same key merges into the older one (`closed(duplicate)`,
@@ -9491,7 +9491,7 @@ checkout).
 - **Migration 14:** `root_cause`, `duplicate_of`, `triage_job`, `triage_job_at`.
   Verified on a copy of the live ledger (13 → 14, rows unchanged).
 
-test_triage 318 → 423. Review: agent-gateway `/review` ran twice but its synthesis
+test_triage 318 → 423. Review: sideclaw `/review` ran twice but its synthesis
 failed both times ("OAuth session expired and could not be refreshed"), so two
 independent read-only reviewers covered the diff — 6 blocking findings, all
 fixed in f8f237c. Not done from review: the lease retry stays unbounded; a
@@ -9518,11 +9518,11 @@ Commits 93f9c68, e4ac47d, 0376a50, fdb5886, 6953f2a on branch `wave-4`, fast-for
   Deleted: `clients/rollout.py`, policy `repos` keys, `LIVENESS_ALLOWLIST` gatherers,
   `kuma-trip.py` and the trip, `collect_expected_alerts`, `github.actions_runs/contents`.
 - **Merge train.** `advance_merge_trains()` walks the oldest `merging` item per repo
-  (a revert first): `update` (agent-gateway `update_pr`; lease refusal retries, `conflict`
+  (a revert first): `update` (sideclaw `update_pr`; lease refusal retries, `conflict`
   and red checks go to the revision path) → `checks` on `train_sha` (no deadline; an
   empty run list within 2 min of a push is pending; unreadable runs refuse) → `review`
   on that SHA (skipped when `reviewed_sha` equals it; after a rebase the context asks
-  for delta focus — agent-gateway has no PR delta scope, so it is text only) → `merge`
+  for delta focus — sideclaw has no PR delta scope, so it is text only) → `merge`
   (`plan_or_land(expected_sha=)`, squash first; a 409 head-moved rewinds to `update`).
   Rewinds strike from the third. Argo / `warden merge` pin `reviewed_sha` (or
   `train_sha`); none on record → the item rejoins the train. `poll_validation_jobs`
@@ -9534,7 +9534,7 @@ Commits 93f9c68, e4ac47d, 0376a50, fdb5886, 6953f2a on branch `wave-4`, fast-for
   and passes `make verify`; then the item gets a fresh implement attempt carrying the
   evidence and the reverted diff (attempts exhausted → `failed`). `make verify`
   failing 3× after a revert landed → `failed`. `revert_pr` stays the CLI's record only.
-- **Fixed-by sweep.** Every non-revert merge queues one agent-gateway `triage` job: merged
+- **Fixed-by sweep.** Every non-revert merge queues one sideclaw `triage` job: merged
   PR title/body + diff (≤12k) + the repo's `triaged` and idle `working` items (human
   origin excluded, private repos skipped). Matches validated against what was shown
   move to `verifying` signal-only (`fixed_by_pr`): quiet → `closed(fixed_by)`,
@@ -9547,7 +9547,7 @@ Commits 93f9c68, e4ac47d, 0376a50, fdb5886, 6953f2a on branch `wave-4`, fast-for
   `merging` rows restart at `update`; `verifying` rows skip the deploy. Verified on a
   copy of the live ledger (14 → 15).
 
-test_triage 423 → 461 (25 deleted with their code). Review: agent-gateway `/review`
+test_triage 423 → 461 (25 deleted with their code). Review: sideclaw `/review`
 synthesis failed again ("OAuth session expired and could not be refreshed"); an
 independent read-only reviewer found 12 issues (3 blocking), 11 fixed in 6953f2a, one
 rejected with a regression test (a pre-migration review job is never polled: the
@@ -9585,7 +9585,7 @@ Commits 7f5ea2a, d5fb7c3, 074f48d + close-out on branch `wave-5`, fast-forwarded
   landed. hermes-agent: `scripts/warden-live-sync.sh` and cron `e9e72d028dc5` removed
   now that warden deploys itself.
 
-`make check` green, test_triage 461 → 460 (the trip test). agent-gateway `/review` synthesis
+`make check` green, test_triage 461 → 460 (the trip test). sideclaw `/review` synthesis
 failed again (Max OAuth expired); an independent reviewer's two blocking findings on the
 deploy/verify draft are fixed (above); the split and the docs came back clean. The split
 worker once ran `triage.py --help`, which `main()` treats as a live pass: verified on a
@@ -9619,11 +9619,11 @@ from the `/review` of `67463ac..afd348d`.
 - **Shape.** 66 cross-module helpers lost their underscore (`set_state`, `get_item`,
   `now_iso`, `strike`, `is_claim`, …); `intake.is_private` without alias; policy's
   in-flight SQL built from core's state constants; `tests/test_loop_imports.py` imports
-  each loop module first in a fresh interpreter. One `_submit_job` in the agent-gateway
+  each loop module first in a fresh interpreter. One `_submit_job` in the sideclaw
   client; the owner-note idempotency tag survives the note cap; `make -n check` runs
   nothing.
 
-`make check` green, test_triage 461 → 466. agent-gateway `/review` worked again: 3 blocking
+`make check` green, test_triage 461 → 466. sideclaw `/review` worked again: 3 blocking
 (lock released between sync and deploy could roll back past unseen commits; snapshot
 name collision; missing `total_count` read as complete) — all fixed in c701098. A second
 review of that fix found HEAD sampled before the health check (a move during it could be
@@ -9653,13 +9653,13 @@ closing.
 
 After the program Argo's "needs you" held 21 `failed` items, nearly all infra (expired
 Max OAuth killed review synthesis, OpenCode/IU 503s, the deleted merge-approval gate, a
-agent-gateway tier cap). `failed` was a graveyard for work that only failed because infra was
+sideclaw tier cap). `failed` was a graveyard for work that only failed because infra was
 down.
 
 - **Classified at the moment of failure.** `set_state()` refuses a `failed` transition
   without `failure_class` ∈ `infra | policy | work` and stores a re-entry recipe
   (`redrive_json`: state, columns, policy hash). `strike()` at its limit is infra with
-  its own retry state + columns; `end_on_refusal()` is policy with agent-gateway's
+  its own retry state + columns; `end_on_refusal()` is policy with sideclaw's
   dispatch-policy hash; checks/merge refusals, exhausted revisions, rewind loops, a
   failed `make deploy`, unreadable check runs and every verify dead end are work. A
   work failure out of `working` re-enters `merging` (PR) or `triaged`, never a judged
@@ -9686,7 +9686,7 @@ down.
 - Argo `warden-w7` (d3b72d9, bc1a983): `retry` verb, failure-class badge + re-drive
   count, Retry button; `failure_class` is an open string so a new class never 422s.
 
-`make check` green, test_triage 467 → 488. agent-gateway `/review` two rounds: round 1 — 4
+`make check` green, test_triage 467 → 488. sideclaw `/review` two rounds: round 1 — 4
 blocking (retry could redo a hand revert; deploy failure as infra re-runs a bad deploy;
 policy and infra shared one budget; backfill LIKE missed non-`failed` episode
 statuses); round 2 — 3 accepted (budget reset skipped on the real handoff; work
@@ -9719,8 +9719,8 @@ close, so the old stub would have failed).
 ## 125. `warden reinvestigate` — the CLI twin of Argo's reinvestigate (2026-10-06)
 
 Re-running an item's investigation was an Argo button only, so neither the improvement loop
-nor Hermes could re-drive a `needs_decision` item whose question predates agent-gateway's
-tightened escalation rules (agent-gateway 9baee68). `warden reinvestigate <event-id> --why` now
+nor Hermes could re-drive a `needs_decision` item whose question predates sideclaw's
+tightened escalation rules (sideclaw 9baee68). `warden reinvestigate <event-id> --why` now
 does it through `core.reinvestigate()`, the one transition both the CLI and Argo's handler
 call; the allowed states moved to `core.REINVESTIGATE_ALLOWED_STATES`
 (`needs_decision`/`failed`/`quiet`, still mirrored by hand in `api.py` for `/board`).
@@ -9731,7 +9731,7 @@ caught it: `set_state()`'s `work`-failure recipe routes back to `merging` whenev
 is set, so a stale URL would mis-route a later failure of the fresh run. The Argo handler's
 existing test now seeds and asserts both columns.
 
-Item 1470, PR #12. Its revision's repo check died on agent-gateway's `check` route (the
+Item 1470, PR #12. Its revision's repo check died on sideclaw's `check` route (the
 claude-harness `DeepSeek-V4-Flash` id is rejected by IU, `unrecognized_model`) and parked
 the item; landed by hand. `make check` green — `test_triage.py` 488/488,
 `test_warden_cli.py` 83/83 (+3).
@@ -9742,11 +9742,11 @@ the item; landed by hand. `make check` green — `test_triage.py` 488/488,
 An implement episode whose repo check TOOL crashed or was idle-killed reported
 `checks_failed` + `human`, identical to a red suite except in prose, so the item parked in
 `needs_decision` (1470, 1472, 1400 on 2026-10-06, each landed or re-driven by hand).
-agent-gateway will report it as its own outcome, `checks_tool_failed`, at dispatch schema v5.
+sideclaw will report it as its own outcome, `checks_tool_failed`, at dispatch schema v5.
 
-warden goes first: `clients/agent_gateway.py` accepts a dispatch schema WINDOW
+warden goes first: `clients/sideclaw.py` accepts a dispatch schema WINDOW
 (`DISPATCH_SCHEMA_VERSIONS = {4, 5}`, the scalar derived as its max so the two cannot
-drift) — a agent-gateway not yet restarted still answers v4 — and anything outside it is
+drift) — a sideclaw not yet restarted still answers v4 — and anything outside it is
 refused as loudly as before; review stays pinned at 1. `poll_implement_jobs()` strikes on
 `checks_tool_failed` (backoff, third strike `failed` infra) and never calls
 `hand_back_for_revision()`: no `revision_count` spent, no `validation_status`.
@@ -9944,7 +9944,7 @@ prepending host dirs without dropping it, and the unset-vs-empty distinction. `m
 Item 1487 — a nightly build-failure alert routed to homelab whose fix lives in another
 repo — paged the owner with a routing question. `_member_outcome()` sent every `nextAction=human`
 verdict to `needs_decision`, and the investigation's only way to say "this is not my repo" was to
-ask a human. agent-gateway step 1 (item 1488, agent-gateway #22) added the optional `owningRepo` to the
+ask a human. sideclaw step 1 (item 1488, sideclaw #22) added the optional `owningRepo` to the
 dispatch verdict schema; step 2 is here. `work._reroute_repo()` reads `owningRepo` on a `human`
 verdict: when it names a repo in `intake.known_repos()` that differs from the item's own, the item
 folds to `triaged` with `repo=<owningRepo>` and `dispatch_job=None` (escalate() then re-investigates

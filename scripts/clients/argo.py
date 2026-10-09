@@ -32,7 +32,7 @@ _ARGO_TOKEN_REF = "op://common/api/SECRET"
 
 
 def argo_api_base() -> str:
-    """`ARGO_URL` env, re-read at call time (same reason `agent-gateway._base()`/
+    """`ARGO_URL` env, re-read at call time (same reason `agent_gateway._base()`/
     `slack.slack_api_base()` are functions, not captured module constants: a
     test can retarget this without reimporting), else Argo's own default —
     trailing slashes stripped so the `/warden/snapshot` join never doubles

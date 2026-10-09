@@ -150,9 +150,9 @@ fixed. See `docs/api.md`.
 
 ### 2. Abort and revert, and the per-repo in-flight lock
 
-- `cancel` does not cancel: agent-gateway exposes submit/list/get only, so warden marks
+- `cancel` does not cancel: sideclaw exposes submit/list/get only, so warden marks
   its own row `abandoned` while the episode keeps running. Needs
-  `POST /api/jobs/:id/cancel` **in agent-gateway**, and `warden abort <item>` as a
+  `POST /api/jobs/:id/cancel` **in sideclaw**, and `warden abort <item>` as a
   lifecycle transition.
 - `warden revert <item>` as a first-class transition recording the revert PR on
   the item. This is what makes `/metrics`' `reverts` stop returning `null`, and it
@@ -225,7 +225,7 @@ deploy into an environment is the unscoped one) — ask, do not seed one yoursel
   ordered**.
 - **Delegate search to `Explore`.** Never read ten files in the orchestrator.
 - Run independent subagents in parallel in one message.
-- **`mcp__agent_gateway__check` / `review`** — async: submit → `job_wait({jobId})` →
+- **`mcp__sideclaw__check` / `review`** — async: submit → `job_wait({jobId})` →
   loop while `stillRunning: true`. The submit call is not the answer.
 - **`/research`** for any library/API/version fact. Never from memory.
 - Long shell work runs in the background; do not poll with `sleep`.

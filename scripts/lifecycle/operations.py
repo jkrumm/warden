@@ -7,7 +7,7 @@ next pass, before anything could retry.
 
 Four kinds, each one external mutation:
 
-  implement  — a agent-gateway implement episode (branch + draft PR)
+  implement  — an agent-gateway implement episode (branch + draft PR)
   merge      — ready-for-review + PUT /merge + branch delete
   deploy     — `make deploy` in the repo after a merge (lifecycle/rollout.py, run by
                loop/verify.py's verify pass). A crashed one is simply run again: the

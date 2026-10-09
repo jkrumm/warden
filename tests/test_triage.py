@@ -108,7 +108,7 @@ def _default_fake_get(job_id):
 
 def _triage_job(answer: dict[str, Any], *, job_id: str = "triage-job-000001",
                 status: str = "done", error: str | None = None) -> dict[str, Any]:
-    """A agent-gateway `triage` job as `get()` returns it: the schema-validated answer sits at
+    """An agent-gateway `triage` job as `get()` returns it: the schema-validated answer sits at
     `result.result`."""
     job: dict[str, Any] = {"id": job_id, "status": status}
     if status == "done":
@@ -780,7 +780,7 @@ def _refusing_submit(calls: list[dict[str, Any]], *, status: int = 400,
 
 
 def test_agent_gateway_refusal_of_an_investigate_dispatch_ends_the_item_and_is_never_retried():
-    """warden carries no repo/tier policy: it submits, and a agent-gateway 4xx ends the
+    """warden carries no repo/tier policy: it submits, and an agent-gateway 4xx ends the
     item `failed` carrying agent-gateway's own message, immediately — a 4xx is not an
     infrastructure failure, so no strike and no retry. The next tick must not submit
     the same refused dispatch again."""
@@ -3462,7 +3462,7 @@ def test_implement_result_schema_mismatch_is_a_loud_strike():
 
 
 def test_implement_v4_result_is_still_parsed():
-    """A agent-gateway not yet restarted still answers with v4, and the window keeps it
+    """An agent-gateway not yet restarted still answers with v4, and the window keeps it
     parseable rather than striking every in-flight episode."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-schema-v4", job_id="impl-schema-v4")
@@ -5755,7 +5755,7 @@ def test_auto_implement_maps_each_failure_mode():
 
     - RemoteError(maybe_mutated=True): agent-gateway MAY have accepted the job —
       the item stays claimed and the operation stays OPEN (outcome NULL), never
-      rolled back (that would duplicate the episode next tick). Sideclaw hands
+      rolled back (that would duplicate the episode next tick). agent-gateway hands
       back no job id and cannot list jobs, so reconcile_operations() holds it for
       a 30 min grace window, then resolves it `unknown` and strikes the item.
     - RemoteError(maybe_mutated=False): a definite failure — agent-gateway was

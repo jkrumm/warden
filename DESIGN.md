@@ -38,7 +38,7 @@ quiet · closed(duplicate | fixed_by | ignored | resolved)      terminal
 in that repo instead (once per item; the re-route's transition note is the
 ping-pong guard). `needs_decision` and `failed` never expire. Every
 infrastructure failure strikes (`core.strike()`): 10 then 30 minutes of backoff,
-the third strike is `failed` carrying the error. A agent-gateway 4xx on submit is a
+the third strike is `failed` carrying the error. An agent-gateway 4xx on submit is a
 refusal, not a strike: the item ends `failed` with agent-gateway's message — except a
 refused escalation `model` (resubmitted once without it), a lease refusal (retry
 in 10 minutes, no strike) and a refused triage submit (strikes; never the item's
@@ -55,7 +55,7 @@ never a strike and another episode.
 `failed` is classified where it happens (`failure_class`) and is not a graveyard for
 what was never the work's fault. `infra` (agent-gateway 5xx/unreachable, a synthesis
 failure, the third strike) is re-driven after 60, 180, 480 minutes, three times;
-`policy` (a agent-gateway 4xx refusal) once whenever agent-gateway's
+`policy` (an agent-gateway 4xx refusal) once whenever agent-gateway's
 dispatch policy hash differs from the one stored with the refusal, so a refusal
 under the new policy waits for the next change; `work` (checks failed, review
 blocked past the last attempt, a rewind loop, a revert by hand) never. A failed row

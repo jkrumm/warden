@@ -87,7 +87,7 @@ GROUPED_TRIAGE_SOURCES = ("slack_alert", "hermes_log")
 # `verifying` merged; `make deploy` runs, then `make verify` and the item's own signal stay quiet
 #            for the window (maybe_verify()). Nothing to verify -> `fixed` at once.
 # `needs_decision` a verdict carried a question only the owner can answer.
-# `failed`   three infrastructure strikes, a agent-gateway refusal, a merge refusal that will not
+# `failed`   three infrastructure strikes, an agent-gateway refusal, a merge refusal that will not
 #            clear, or revisions exhausted. Never expires, never silence-resolved. Always carries a
 #            failure_class: `infra` and `policy` are re-driven automatically (redrive_failed()),
 #            `work` waits for the owner (`warden retry`).
@@ -150,7 +150,7 @@ NOT_OPEN_STATES = (*TERMINAL_STATES, STATE_FAILED)
 STRIKE_LIMIT = 3
 STRIKE_BACKOFF_MINUTES = (10, 30)   # after strike 1, after strike 2
 
-# implement_job values that mean "claimed, not yet (or no longer) a agent-gateway job".
+# implement_job values that mean "claimed, not yet (or no longer) an agent-gateway job".
 # The claim is a compare-and-set on `implement_job IS NULL`, written BEFORE the
 # external call, so two processes (the loop and the sweep) never submit twice.
 IMPLEMENT_CLAIM = "claiming"

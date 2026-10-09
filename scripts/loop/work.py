@@ -1644,7 +1644,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     prefixed `deferred: ` (DESIGN.md § What must not be lost), and the card is synced immediately. A
     deferral is not a strike: nothing failed.
 
-    A submit that fails definitively (5xx, connection refused) strikes (see strike()); a agent-gateway
+    A submit that fails definitively (5xx, connection refused) strikes (see strike()); an agent-gateway
     4xx ends the item `failed` and is never retried (an attempt that carried an escalation model is
     first resubmitted once without it, open_implement_episode()). A submit that MAY have reached
     agent-gateway (a timeout) is never retried blind: the claim and the open operation stay put for
@@ -2465,7 +2465,7 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     attempt's verdict and its git bundle (or, when the merge train's `update_pr` could not rebase
     the PR, a pointer to its branch), without `revisionOf`; the PR on record is closed when its
     replacement opens (poll_implement_jobs()). Attempt ESCALATION_ATTEMPT and later run on the
-    escalation model (implement_model()); a agent-gateway refusal of that model is retried once without
+    escalation model (implement_model()); an agent-gateway refusal of that model is retried once without
     it (open_implement_episode())."""
     ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(

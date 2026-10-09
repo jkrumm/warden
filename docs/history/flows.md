@@ -6,13 +6,13 @@ where the friction is.
 
 **The default is no approval.** A gate appears only under one of the four
 human-essential cases in `DESIGN.md`, plus one structural exception: the
-`merge_approval` list in `config/dispatch-repos.json` (`agent-gateway`, `warden`,
+`merge_approval` list in `config/dispatch-repos.json` (`sideclaw`, `warden`,
 `dotfiles`). On those repos a clean step-7 validation routes the item to
 `needs_human` instead of auto-merging — the owner lands it with
 `warden merge`. If a flow below asks for a decision, the case number is
 named. If it doesn't, that is deliberate.
 
-Legend: **W** warden · **S** agent-gateway episode · **You** the operator.
+Legend: **W** warden · **S** sideclaw episode · **You** the operator.
 
 ---
 
@@ -31,7 +31,7 @@ S  reads observability/alerts/*.json, returns typed verdict
    nextAction=implement, confidence=high
 W  auto-implement (no human: case 1 fails - scoped; case 4 FIRES - see below)
 S  opens draft PR
-W  validate: a agent-gateway review job, a typed verdict from a second session (model per agent-gateway's routing)
+W  validate: a sideclaw review job, a typed verdict from a second session (model per sideclaw's routing)
 W  merge if every changed path is inside observability/**
 W  deploy: ssh vps -- make hyperdx-apply ENV=prod
 W  verify: re-read live thresholds; must match the merged diff

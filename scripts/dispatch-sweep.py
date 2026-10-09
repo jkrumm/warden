@@ -166,7 +166,7 @@ DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
 # copy of it: a job in any of these is done reporting, one way or another.
 TERMINAL_STATUSES = _agent_gateway.TERMINAL
 # Consecutive agent-gateway 404s before a row is declared pruned. Three sweeps = 15
-# min, long enough to ride out a agent-gateway restart that briefly answers 404 for
+# min, long enough to ride out an agent-gateway restart that briefly answers 404 for
 # everything, short enough that a pruned job does not haunt every sweep for
 # weeks. There is no local `lost` status any more — a pruned job is recorded
 # as a genuine `status='failed'` with `verdict_json` left NULL (there never
