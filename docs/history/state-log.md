@@ -9938,3 +9938,18 @@ component including the empty one (de-duplicated like any other entry), and read
 Four tests in `tests/test_rollout.py` cover the preserved empty component, its de-duplication,
 prepending host dirs without dropping it, and the unset-vs-empty distinction. `make check` green;
 `test_triage.py` 507/507.
+
+## 140. A misrouted verdict re-routes to the owning repo instead of paging (2026-10-09)
+
+Item 1487 — a nightly build-failure alert routed to homelab whose fix lives in the private infra
+repo — paged the owner with a routing question. `_member_outcome()` sent every `nextAction=human`
+verdict to `needs_decision`, and the investigation's only way to say "this is not my repo" was to
+ask a human. sideclaw step 1 (item 1488, sideclaw #22) added the optional `owningRepo` to the
+dispatch verdict schema; step 2 is here. `work._reroute_repo()` reads `owningRepo` on a `human`
+verdict: when it names a repo in `intake.known_repos()` that differs from the item's own, the item
+folds to `triaged` with `repo=<owningRepo>` and `dispatch_job=None` (escalate() then re-investigates
+it in the repo that owns it) instead of `needs_decision`. Once per item: the first re-route's
+`item_transitions` note (`re-routed from <old> to <new>`) is the ping-pong guard, so a later verdict
+naming the repo the item was just moved from lands as `needs_decision`. An equal repo, an unknown
+repo and a non-string `owningRepo` all keep the old behaviour. Five cases join `tests/test_triage.py`
+(a)-(e); `test_triage.py` 507/507 → 512/512 (+5). `make check` green.

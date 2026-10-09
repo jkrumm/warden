@@ -17,7 +17,7 @@ from typing import Any
 
 from clients import github as _github, sideclaw as _sideclaw
 from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError, WardenError
-from lifecycle import dispatch as _dispatch, items as _items, operations as _operations, policy as _policy
+from lifecycle import dispatch as _dispatch, intake as _intake, items as _items, operations as _operations, policy as _policy
 from loop import core, intake, train, verify, notify
 
 
@@ -914,6 +914,36 @@ def maybe_dissolve_clusters(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
         _dissolve_cluster(conn, list(members), now, text_blob, dry_run=dry_run)
 
 
+# The `item_transitions.note` prefix a re-route writes. The ping-pong guard below keys on it, so a
+# verdict that names the repo the item was already moved FROM cannot move it a second time.
+REROUTE_NOTE_PREFIX = "re-routed from"
+
+
+def _reroute_repo(conn: sqlite3.Connection, m: sqlite3.Row, result: dict[str, Any]) -> str | None:
+    """The known repo a `human` verdict's optional `owningRepo` names, when it differs from the
+    repo the item was investigated in and the item has not already been re-routed — else None.
+
+    `owningRepo` is the investigation saying "this finding is not mine; it lives in <repo>". On its
+    own, `nextAction=human` would page the owner with a routing question (item 1487: a nightly
+    build-failure alert routed to homelab whose fix lives in the private infra repo). A re-route
+    instead sends the item back to `triaged` with `repo=<owningRepo>`, so escalate() re-investigates
+    it in the repo that actually owns it. Once per item: the first re-route's `item_transitions`
+    note is the ping-pong guard, so a second verdict naming the repo it was just moved from lands as
+    `needs_decision` rather than bouncing back. An `owningRepo` outside the known repos is ignored:
+    warden can only inspect checkouts it knows (`intake.known_repos()`)."""
+    target = result.get("owningRepo")
+    if not isinstance(target, str) or not target.strip():
+        return None
+    target = target.strip()
+    if target == m["repo"] or target not in _intake.known_repos():
+        return None
+    prior = conn.execute(
+        "SELECT 1 FROM item_transitions WHERE event_id=? AND note LIKE ? LIMIT 1",
+        (m["event_id"], f"{REROUTE_NOTE_PREFIX}%"),
+    ).fetchone()
+    return None if prior is not None else target
+
+
 def _decision_note(result: dict[str, Any]) -> str:
     """What a `needs_decision` item shows the owner: the verdict's `decisionQuestion` when sideclaw
     carried one (an optional field), else the summary, else the recommendation."""
@@ -1003,7 +1033,10 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 
       implement | issue                       -> working (maybe_auto_implement() picks it up)
       human                                   -> needs_decision, note = decisionQuestion,
-                                                 else summary, else recommendation
+                                                 else summary, else recommendation —
+                                                 unless `owningRepo` names a different known repo
+                                                 (once per item): -> triaged in that repo (see
+                                                 _reroute_repo())
       none                                    -> closed(resolved), note = summary
       an artifact (an author-tier issue)      -> closed(resolved), note = "filed <url>"
       origin human/github_issue capped at
@@ -1047,24 +1080,30 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     no_verdict = not result and not d["artifact_url"]
     clustered_marker = len(all_members) > 1 and core.DISSOLVE_MARKER in text_blob
 
-    def _member_outcome(m: sqlite3.Row) -> tuple[str, str | None, str | None]:
-        """(state, note, close_reason) for one member."""
+    def _member_outcome(m: sqlite3.Row) -> tuple[str, str | None, str | None, str | None]:
+        """(state, note, close_reason, reroute_repo) for one member. `reroute_repo` is the repo a
+        `human` verdict re-routes the item to (see _reroute_repo()), which the caller writes as
+        `repo` and clears `dispatch_job` for; None on every other outcome."""
         if d["artifact_url"]:
-            return core.STATE_CLOSED, f"filed {d['artifact_url']}", core.CLOSE_RESOLVED
+            return core.STATE_CLOSED, f"filed {d['artifact_url']}", core.CLOSE_RESOLVED, None
         if next_action == "human":
-            return core.STATE_NEEDS_DECISION, _decision_note(result), None
+            reroute = _reroute_repo(conn, m, result)
+            if reroute is not None:
+                note = f"{REROUTE_NOTE_PREFIX} {m['repo']} to {reroute}"
+                return core.STATE_TRIAGED, f"{note}: {answer}" if answer else note, None, reroute
+            return core.STATE_NEEDS_DECISION, _decision_note(result), None, None
         if clustered_marker:
-            return core.STATE_WORKING, None, None
+            return core.STATE_WORKING, None, None, None
         # An origin item capped at `investigate` (a `human` question, or a GitHub issue that is not the
         # owner's own) asked for an ANSWER: it is delivered (the comment-back below for the owner's own
         # issue) and the item closes.
         if m["max_tier"] == "investigate" or next_action == "none":
-            return core.STATE_CLOSED, answer, core.CLOSE_RESOLVED
+            return core.STATE_CLOSED, answer, core.CLOSE_RESOLVED, None
         if next_action not in ("implement", "issue"):
             return (core.STATE_FAILED,
                     f"investigation verdict carried nextAction {next_action or '(missing)'!r}, "
-                    f"expected none|issue|implement|human", None)
-        return core.STATE_WORKING, None, None
+                    f"expected none|issue|implement|human", None, None)
+        return core.STATE_WORKING, None, None, None
 
     if dry_run:
         label = "infrastructure failure (strike)" if no_verdict else ", ".join(
@@ -1075,7 +1114,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
         for m in members:
             event_row = core.get_event(conn, m["event_id"])
             if event_row is not None:
-                outcome_state, outcome_note, _reason = _member_outcome(m)
+                outcome_state, outcome_note, _reason, _repo = _member_outcome(m)
                 maybe_comment_back_on_issue(conn, m, event_row, result, now, state=outcome_state,
                                              note=outcome_note, dry_run=True)
         return
@@ -1089,8 +1128,14 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
                          dispatch_job=None)
             conn.commit()
             continue
-        member_state, member_note, close_reason = _member_outcome(m)
+        member_state, member_note, close_reason, reroute_repo = _member_outcome(m)
         columns: dict[str, Any] = {"note": member_note, "strikes": 0, "retry_at": None}
+        if reroute_repo is not None:
+            # The item moves to another repo and re-enters triage there: `repo` so escalate() picks
+            # it up under the right repo, `dispatch_job=None` so the stale investigation is not kept
+            # as a cooldown anchor against the fresh run (intake is what re-opens it).
+            columns["repo"] = reroute_repo
+            columns["dispatch_job"] = None
         if close_reason:
             columns["close_reason"] = close_reason
         if member_state == core.STATE_FAILED:

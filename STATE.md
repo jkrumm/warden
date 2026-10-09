@@ -6,7 +6,7 @@ build log (§1–§139).
 
 | | |
 |-|-|
-| Last updated | 2026-10-07 (§139 — `host_path()` keeps empty PATH components) |
+| Last updated | 2026-10-09 (§140 — a misrouted verdict re-routes to the owning repo) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 16 |
@@ -50,6 +50,10 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 - **Reinvestigate** (`warden reinvestigate` / Argo) sends an item back to `triaged` for a fresh
   investigation and closes the pull request it clears (best-effort GitHub call), keeping its URL in
   the note as `superseded PR <url>`.
+- **Re-route.** A `human` verdict whose optional `owningRepo` names a different known repo moves the
+  item back to `triaged` in that repo (once per item; the re-route's transition note is the
+  ping-pong guard) instead of paging the owner — a misrouted finding re-investigates where it
+  belongs (`work._reroute_repo()`).
 - **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
   superseded/fixed), 2 `needs_decision`.
 
