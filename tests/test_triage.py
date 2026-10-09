@@ -1222,6 +1222,7 @@ def test_cluster_brief_carries_the_prior_close_note_on_reopen():
         brief = calls[0]["brief"]
         assert "threshold raised to 80 in homelab PR #12" in brief, brief
         assert "prior resolution" in brief, brief
+        assert core.fmt_ts(OLD.isoformat()) in brief, brief
         assert "nextAction `none`" in brief and "re-asking the owner" in brief, brief
 
 
