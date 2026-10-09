@@ -1,4 +1,4 @@
-"""The triage step: one single-shot sideclaw `triage` job per `new` item decides where it goes
+"""The triage step: one single-shot agent-gateway `triage` job per `new` item decides where it goes
 (attach | new | fixed_by | ignore). Submit, fold, poll and settle; the answer is validated
 against the ledger before any item moves."""
 
@@ -10,14 +10,14 @@ import sys
 import time
 from typing import Any
 
-from clients import sideclaw as _sideclaw
+from clients import agent_gateway as _agent_gateway
 from clients.errors import RemoteError, WardenError
 from lifecycle import intake as _intake
 from loop import core, intake, work
 
 
 # Issues, alerts and `warden run` share one pool: every `new` item that is ready (an alert
-# once debounce-eligible, an issue or `warden run` immediately) gets one single-shot sideclaw
+# once debounce-eligible, an issue or `warden run` immediately) gets one single-shot agent-gateway
 # `triage` job that answers attach | new(repo, title) | fixed_by | ignore. The signal's own
 # label picks the candidate repos first (intake.route_by_label()); with no label every known
 # repo is a candidate. The submit is a compare-and-set claim on `triage_job`; the fold is a
@@ -55,7 +55,7 @@ def _submit_triage(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
     """Claim one `new` item, submit its triage job, record the job id. Returns the job, or None
     when nothing is in flight afterwards: the claim was lost, or the submit failed and the item
     was struck. EVERY submit failure strikes (retry after backoff, `failed` on the third) — a
-    sideclaw 4xx included: a refused triage prompt is sideclaw's or the prompt's problem, never
+    agent-gateway 4xx included: a refused triage prompt is agent-gateway's or the prompt's problem, never
     the item's, so it must not end the item on the first refusal. The strike is a compare-and-set
     on the claim."""
     event_id = item["event_id"]
@@ -71,7 +71,7 @@ def _submit_triage(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
     item = core.get_item(conn, event_id)
     prompt = _intake.build_triage_prompt(conn, item, event, _triage_candidates(item, event), now)
     try:
-        job = _sideclaw.submit_triage(prompt=prompt, schema=_intake.TRIAGE_SCHEMA)
+        job = _agent_gateway.submit_triage(prompt=prompt, schema=_intake.TRIAGE_SCHEMA)
     except WardenError as e:
         print(f"triage: triage submit failed for {item['signature']}: {e}", file=sys.stderr)
         core.strike(conn, event_id, now, f"triage submit failed: {e}", retry_state=core.STATE_NEW,
@@ -204,7 +204,7 @@ def _fixed_reference(conn: sqlite3.Connection, answer: dict[str, Any], *, exclud
 def poll_triage_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
     """Fold every finished triage job onto its item (see _fold_triage_job()). A claim older than
     TRIAGE_CLAIM_STALE_MINUTES is a submitter that died between claiming and recording the job:
-    released, so the item is submitted again. A job sideclaw no longer knows is lost, and strikes,
+    released, so the item is submitted again. A job agent-gateway no longer knows is lost, and strikes,
     and so does one still not terminal TRIAGE_JOB_STALE_MINUTES after it was submitted
     (`triage_job_at`): cancelled best-effort first, so a job that is merely slow cannot also fold."""
     if dry_run:
@@ -228,23 +228,23 @@ def poll_triage_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: boo
                           file=sys.stderr)
             continue
         try:
-            job = _sideclaw.get(job_id)
+            job = _agent_gateway.get(job_id)
         except RemoteError as e:
-            print(f"triage: could not poll sideclaw triage job {job_id} for {row['signature']}: {e}",
+            print(f"triage: could not poll agent-gateway triage job {job_id} for {row['signature']}: {e}",
                   file=sys.stderr)
             continue
         if job is None:
-            core.strike(conn, event_id, now, f"sideclaw has no record of triage job {job_id} (pruned or lost)",
+            core.strike(conn, event_id, now, f"agent-gateway has no record of triage job {job_id} (pruned or lost)",
                          retry_state=core.STATE_NEW, expect_state=core.STATE_NEW, expect_eq={"triage_job": job_id},
                          triage_job=None)
             conn.commit()
             continue
-        if job.get("status") not in _sideclaw.TERMINAL:
+        if job.get("status") not in _agent_gateway.TERMINAL:
             submitted_at = core.parse_ts(row["triage_job_at"])
             if submitted_at is None or now - submitted_at < dt.timedelta(minutes=TRIAGE_JOB_STALE_MINUTES):
                 continue
             try:
-                _sideclaw.cancel(job_id)
+                _agent_gateway.cancel(job_id)
             except WardenError as e:
                 print(f"triage: could not cancel stuck triage job {job_id}: {e}", file=sys.stderr)
             core.strike(conn, event_id, now, f"triage job {job_id} still {job.get('status')} after "
@@ -291,7 +291,7 @@ def submit_triage_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: dt
         job = _submit_triage(conn, item, now, policy)
         if job is None:
             continue
-        if job.get("status") in _sideclaw.TERMINAL:
+        if job.get("status") in _agent_gateway.TERMINAL:
             _fold_triage_job(conn, item["event_id"], job["id"], job, now)
         else:
             running.append(job["id"])
@@ -319,7 +319,7 @@ def settle_triage_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: b
 def triage_item_now(conn: sqlite3.Connection, event_id: int, now: dt.datetime) -> str | None:
     """Triage one item synchronously — `warden run`'s intake: submit, wait for the job, fold it.
     Returns the outcome (see _fold_triage_job()), or None when the item was not triaged here (not
-    `new`, already has a job, or sideclaw could not be reached — the loop retries those)."""
+    `new`, already has a job, or agent-gateway could not be reached — the loop retries those)."""
     item = core.get_item(conn, event_id)
     if item is None or item["state"] != core.STATE_NEW or item["triage_job"] is not None:
         return None
@@ -327,8 +327,8 @@ def triage_item_now(conn: sqlite3.Connection, event_id: int, now: dt.datetime) -
     if job is None:
         return None
     try:
-        if job.get("status") not in _sideclaw.TERMINAL:
-            job = _sideclaw.wait(job["id"], timeout_s=TRIAGE_WAIT_GUARD_S, interval_s=2)
+        if job.get("status") not in _agent_gateway.TERMINAL:
+            job = _agent_gateway.wait(job["id"], timeout_s=TRIAGE_WAIT_GUARD_S, interval_s=2)
     except RemoteError as e:
         print(f"triage: could not wait for triage job {job['id']}: {e}", file=sys.stderr)
         return None

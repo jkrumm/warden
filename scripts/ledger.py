@@ -60,8 +60,8 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # so if you are reading this to work out which database is real, it is this one.
 
 # Named LEDGER_SCHEMA_VERSION, not SCHEMA_VERSION, deliberately: it pins this
-# module's own SQLite schema, distinct from scripts/clients/sideclaw.py's
-# DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin sideclaw's published
+# module's own SQLite schema, distinct from scripts/clients/agent_gateway.py's
+# DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
 LEDGER_SCHEMA_VERSION = 16
@@ -435,17 +435,17 @@ ALTER TABLE triage_items ADD COLUMN last_reminder_at TEXT;
 """
 
 # Version 10 — the 2026-09-12 defect (item 253, `docker_homelab:unhealthy:
-# garmin-collector`): a sideclaw `investigate` episode was killed by a
+# garmin-collector`): a agent-gateway `investigate` episode was killed by a
 # timeout, `verdict_json` was left NULL, and fold_dispatch_verdict() (which
 # never read `dispatches.status`) computed `result = {}` -> `next_action = ""`
 # -> `new_state = STATE_VERDICT` with `note = NULL`. The item parked as a
 # verdict-less verdict, invisible until its 24h deadline, and the ledger held
-# no reason at all — sideclaw's own failure text reached Slack via
+# no reason at all — agent-gateway's own failure text reached Slack via
 # dispatch-sweep.py's format_message() but was never persisted anywhere.
 # DESIGN.md's "deferral must be visible" is exactly the property this closes.
 #
-#   dispatches.error   sideclaw's terminal failure text verbatim (job.get
-#     ("error") — see clients/sideclaw.py's own job shape), or warden's own
+#   dispatches.error   agent-gateway's terminal failure text verbatim (job.get
+#     ("error") — see clients/agent_gateway.py's own job shape), or warden's own
 #     pruned-notice reason for a row _mark_pruned() closes without ever
 #     polling a real answer (dispatch-sweep.py's `_mark_pruned()`). NULL on
 #     every successful dispatch, and NULL on every pre-existing row — no
@@ -454,9 +454,9 @@ ALTER TABLE triage_items ADD COLUMN last_reminder_at TEXT;
 #     gap (the same "empty by construction, not zero" rule migrations 4 and 5
 #     already document for their own no-backfill tables).
 #
-# A COLUMN, not a field folded into `verdict_json`: that column is sideclaw's
-# own PUBLISHED verdict schema (see AGENTS.md § Talking to sideclaw — "the
-# verdict schema is published by sideclaw, not copied here"), and a failed
+# A COLUMN, not a field folded into `verdict_json`: that column is agent-gateway's
+# own PUBLISHED verdict schema (see AGENTS.md § Talking to agent-gateway — "the
+# verdict schema is published by agent-gateway, not copied here"), and a failed
 # dispatch has no verdict at all to carry a field on. The reason needs
 # somewhere of its own that is not shaped like an answer to a question
 # nobody answered.
@@ -587,7 +587,7 @@ UPDATE item_transitions SET
 #     verdict is compared against to merge two items that are one defect.
 #   duplicate_of  event_id of the item this one was merged into; set together with
 #     state closed / close_reason duplicate. NULL on every other row.
-#   triage_job    the sideclaw `triage` job that is deciding this item's intake
+#   triage_job    the agent-gateway `triage` job that is deciding this item's intake
 #     (the single-shot triage step); NULL until one is opened. Cleared again when the
 #     fold settles it (except an `ignore`, which is how a model's ignore is told from a
 #     human's).
@@ -629,7 +629,7 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #
 #   train_stage     the stage the item is on; NULL outside `merging`.
 #   train_sha       the PR head the train is checking, reviewing and will merge — set by the
-#     update stage from sideclaw's `update_pr` result; NULL outside `merging`.
+#     update stage from agent-gateway's `update_pr` result; NULL outside `merging`.
 #   train_job       the in-flight `update_pr` job (or the `claiming` sentinel during its submit);
 #     NULL otherwise.
 #   reviewed_sha    the last PR head a step-7 review confirmed. Survives leaving `merging` (an
@@ -662,7 +662,7 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #
 #   sweep_pr          the merged pull request awaiting its sweep; set when a non-revert merge lands,
 #     NULL once the sweep folded or gave up.
-#   sweep_job         the sideclaw `triage` job deciding the sweep (or its `claiming:<time>`
+#   sweep_job         the agent-gateway `triage` job deciding the sweep (or its `claiming:<time>`
 #     sentinel during the submit); NULL until submitted.
 #   sweep_job_at      when `sweep_job` was claimed/submitted — what a stuck job is aged from.
 #   sweep_attempts    failed submits/jobs so far; the sweep gives up (quietly) at the limit.
@@ -703,14 +703,14 @@ ALTER TABLE triage_items ADD COLUMN fixed_by_pr TEXT;
 # Version 16 — `failed` is classified, and infra failures are re-driven (Wave 7). Three
 # columns on triage_items, set when an item lands `failed` and cleared when it leaves it:
 #
-#   failure_class  infra | policy | work. infra = sideclaw 5xx/timeouts/auth, a synthesis or
-#     serialization failure, sideclaw unreachable (re-driven on a backoff, three times);
-#     policy = sideclaw refused the submit with a 4xx
-#     (re-driven once whenever sideclaw's dispatch policy changes); work = anything a human must
+#   failure_class  infra | policy | work. infra = agent-gateway 5xx/timeouts/auth, a synthesis or
+#     serialization failure, agent-gateway unreachable (re-driven on a backoff, three times);
+#     policy = agent-gateway refused the submit with a 4xx
+#     (re-driven once whenever agent-gateway's dispatch policy changes); work = anything a human must
 #     judge (checks failed, review blocked after the last attempt, conflict loops; never re-driven).
 #     NULL on every state but `failed`.
 #   redrive_json   {"state": <state to re-enter>, "columns": {<column>: <value>}, "policy_hash":
-#     <hash of sideclaw's dispatch policy at the refusal, or null>}: where `warden retry` and the
+#     <hash of agent-gateway's dispatch policy at the refusal, or null>}: where `warden retry` and the
 #     automatic re-drive put the item. NULL on every state but `failed`, and NULL on a `failed`
 #     item with no stage to re-enter.
 #   redrives       automatic INFRA re-drives done on this item (a policy re-drive is not counted); an
@@ -723,7 +723,7 @@ ALTER TABLE triage_items ADD COLUMN fixed_by_pr TEXT;
 #   | note contains                                       | class  | re-enters                         |
 #   | investigate episode <status> with no verdict        | infra  | triaged, dispatch_job cleared     |
 #   | step-7 review ended with no verdict / unknown review outcome | infra | merging, the train restarts at update |
-#   | exceeds the ceiling / episode not started — sideclaw refused | policy | working (note starts with `implement`), merging (`review`/`update_pr`), else triaged |
+#   | exceeds the ceiling / episode not started — agent-gateway refused | policy | working (note starts with `implement`), merging (`review`/`update_pr`), else triaged |
 #   | is merge-approval gated (the deleted gate)          | policy | merging, the train restarts at update |
 #   | anything else                                       | work   | never automatically; `warden retry` re-enters merging (has a PR) or triaged; none when `revert_pr` is set |
 _MIGRATION_16 = """
@@ -742,7 +742,7 @@ UPDATE triage_items SET failure_class = 'policy', retry_at = NULL,
                                       WHEN note LIKE 'review%' OR note LIKE 'update_pr%' THEN 'merging'
                                       ELSE 'triaged' END || '","columns":{},"policy_hash":null}'
   WHERE state = 'failed' AND failure_class IS NULL
-    AND (note LIKE '%exceeds the ceiling%' OR note LIKE '%episode not started — sideclaw refused%');
+    AND (note LIKE '%exceeds the ceiling%' OR note LIKE '%episode not started — agent-gateway refused%');
 UPDATE triage_items SET failure_class = 'policy', retry_at = NULL,
   redrive_json = '{"state":"merging","columns":{},"policy_hash":null}'
   WHERE state = 'failed' AND failure_class IS NULL AND note LIKE '%is merge-approval gated%';

@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from clients import github, sideclaw
+from clients import github, agent_gateway
 from clients.errors import (
     CheckRunsUnreadable, HeadMoved, PolicyError, PreconditionError, RemoteError, UsageError,
 )
@@ -233,7 +233,7 @@ def plan_or_land(
             "unattended episode was allowed to land code on a default branch. "
             "There is no default."
         )
-    if not sideclaw.valid_job_id(job_id):
+    if not agent_gateway.valid_job_id(job_id):
         raise UsageError(f"{job_id!r} is not a valid job id")
 
     row = conn.execute(

@@ -4,14 +4,14 @@ Prepared 2026-09-28 (§105) as a per-repo question; answered and landed
 2026-09-29. The owner, in words: "mach es. Es soll effektiv sein, es soll
 funktionieren." — everything that stops a fix at a draft PR goes, Makefiles,
 `ops/`, `.github/`, plists, manifests, lockfiles, `pyproject.toml` included; the
-one exception he did not withdraw is his own executor: `warden`, `sideclaw`,
+one exception he did not withdraw is his own executor: `warden`, `agent-gateway`,
 `dotfiles`.
 
 **What landed is broader than the diff below proposed**, and the reason is his
 wording: the answer was not "weatherorb", it was "everything but the executor".
 So instead of a `FULL_AUTONOMY_REPOS` exemption the tuple itself is gone from
 `scripts/lifecycle/merge.py`, and the part he kept moved into code as
-`EXECUTOR_REPOS = {"warden", "sideclaw", "dotfiles"}` — gated there even if
+`EXECUTOR_REPOS = {"warden", "agent-gateway", "dotfiles"}` — gated there even if
 `merge_approval` in the dispatch policy were emptied, no scope ever, and the
 CI-definition refusal (`.github/workflows`, `.github/actions`) now applies to
 those three only, still on the owner's Argo click too. The four tests that
@@ -93,7 +93,7 @@ merges unattended; (2) the same PR on `homelab` still refuses with
 `NEVER_AUTO_MERGE`; (3) `FULL_AUTONOMY_REPOS & merge_approval == ∅` is asserted.
 The existing pin test at the bottom of `test_merge.py` stays byte-identical.
 
-Not part of this diff, whatever the answer: `warden`, `sideclaw`, `dotfiles`
+Not part of this diff, whatever the answer: `warden`, `agent-gateway`, `dotfiles`
 keep no `autoMergePaths`, stay in `merge_approval`, and land only on the Argo click.
 
 ## What changes if he says yes

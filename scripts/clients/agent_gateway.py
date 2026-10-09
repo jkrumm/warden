@@ -1,11 +1,11 @@
-"""The sideclaw job-server transport — the Python port of the retired bash CLI's
-`sideclaw_submit` (1219-1251), `sideclaw_get` (1253-1263) and `wait_for`
+"""The agent-gateway job-server transport — the Python port of the retired bash CLI's
+`agent_gateway_submit` (1219-1251), `agent_gateway_get` (1253-1263) and `wait_for`
 (1439-1462).
 
 Always `urllib.request`, never `curl`/`subprocess` — the whole point of this
 port is that a Python process can talk HTTP directly. Base URL is read at
 call time via `_base()` (not module load) so a test can set
-`WARDEN_SIDECLAW_BASE` before calling into this module without reimporting
+`WARDEN_AGENT_GATEWAY_BASE` before calling into this module without reimporting
 it.
 """
 
@@ -29,13 +29,13 @@ from .errors import PolicyError, RemoteError, SubmitRefused
 _DEFAULT_BASE = "http://localhost:7705"
 _TIMEOUT_S = 30
 
-# sideclaw's own JobStatus. "cancelled" arrives with the cancel endpoint this
+# agent-gateway's own JobStatus. "cancelled" arrives with the cancel endpoint this
 # wave adds.
 TERMINAL = frozenset({"done", "failed", "interrupted", "cancelled"})
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 
-# The verdict schemas warden consumes — published by sideclaw
+# The verdict schemas warden consumes — published by agent-gateway
 # (server/jobs/handlers/{dispatch,review}.ts) at GET /api/dispatch-schema and
 # GET /api/review-schema, pinned here rather than copied by hand so drift is
 # a loud refusal (assert_result_schema()) instead of a silently-ignored
@@ -43,9 +43,9 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 # — never guess a version or an outcome list.
 #
 # Dispatch keeps a small ACCEPTANCE WINDOW instead of one version, so a
-# rolling sideclaw restart cannot strike every in-flight episode: v5 adds the
+# rolling agent-gateway restart cannot strike every in-flight episode: v5 adds the
 # `checks_tool_failed` outcome (a check-tool infrastructure failure, distinct
-# from the repo's own red suite), while a sideclaw not yet restarted still
+# from the repo's own red suite), while a agent-gateway not yet restarted still
 # answers with v4. DISPATCH_SCHEMA_VERSIONS is what assert_result_schema()
 # enforces; a version outside the window is refused as loudly as ever. Review
 # has a single live version.
@@ -89,7 +89,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _base() -> str:
-    return os.environ.get("WARDEN_SIDECLAW_BASE", _DEFAULT_BASE)
+    return os.environ.get("WARDEN_AGENT_GATEWAY_BASE", _DEFAULT_BASE)
 
 
 def valid_job_id(job_id: str) -> bool:
@@ -112,9 +112,9 @@ def _request(method: str, path: str, body: dict[str, Any] | None) -> tuple[int, 
 
 
 def _raise_for_submit_status(status: int, text: str) -> None:
-    """A 4xx on submit is sideclaw refusing (its repo allowlist, a tier above a
+    """A 4xx on submit is agent-gateway refusing (its repo allowlist, a tier above a
     repo's ceiling, an unverified model, bad params): `SubmitRefused`, carrying
-    sideclaw's own `error` text, never retried. Anything else non-200 (5xx) is
+    agent-gateway's own `error` text, never retried. Anything else non-200 (5xx) is
     a plain `RemoteError` and keeps its retry behaviour."""
     if status == 200:
         return
@@ -126,9 +126,9 @@ def _raise_for_submit_status(status: int, text: str) -> None:
         except json.JSONDecodeError:
             pass
         raise SubmitRefused(
-            f"sideclaw refused the job (HTTP {status}): {message or text[:300]}", status=status,
+            f"agent-gateway refused the job (HTTP {status}): {message or text[:300]}", status=status,
         )
-    raise RemoteError(f"sideclaw returned HTTP {status}: {text[:300]}")
+    raise RemoteError(f"agent-gateway returned HTTP {status}: {text[:300]}")
 
 
 def submit(
@@ -155,27 +155,27 @@ def submit(
         # Connection refused is definitive: nothing was sent, so a retry cannot duplicate.
         # Anything else (a timeout, a reset) is ambiguous — the POST may have landed.
         raise RemoteError(
-            f"sideclaw job submit failed (is the LaunchAgent up? curl {_base()}/health)",
+            f"agent-gateway job submit failed (is the LaunchAgent up? curl {_base()}/health)",
             maybe_mutated=not isinstance(e.reason, ConnectionRefusedError),
         )
     except (TimeoutError, OSError):
         raise RemoteError(
-            f"sideclaw job submit failed (is the LaunchAgent up? curl {_base()}/health)",
+            f"agent-gateway job submit failed (is the LaunchAgent up? curl {_base()}/health)",
             maybe_mutated=True,
         )
 
     _raise_for_submit_status(status, text)
 
-    # From here sideclaw answered 200: the job EXISTS, whatever the body says.
+    # From here agent-gateway answered 200: the job EXISTS, whatever the body says.
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}",
+        raise RemoteError(f"agent-gateway returned HTTP {status} with unparseable body: {text[:300]}",
                           maybe_mutated=True)
 
     job = parsed.get("job") if isinstance(parsed, dict) else None
     if not isinstance(job, dict) or "id" not in job:
-        raise RemoteError("sideclaw accepted the job but returned no id", maybe_mutated=True)
+        raise RemoteError("agent-gateway accepted the job but returned no id", maybe_mutated=True)
     return job
 
 
@@ -187,7 +187,7 @@ def _submit_job(tool: str, params: dict[str, Any]) -> dict[str, Any]:
         status, text = _request("POST", "/api/jobs", {"tool": tool, "params": params})
     except (urllib.error.URLError, TimeoutError, OSError):
         raise RemoteError(
-            f"sideclaw {tool} submit failed (is the LaunchAgent up? curl {_base()}/health)",
+            f"agent-gateway {tool} submit failed (is the LaunchAgent up? curl {_base()}/health)",
             maybe_mutated=True,
         )
 
@@ -196,11 +196,11 @@ def _submit_job(tool: str, params: dict[str, Any]) -> dict[str, Any]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw returned HTTP {status} with unparseable body: {text[:300]}")
+        raise RemoteError(f"agent-gateway returned HTTP {status} with unparseable body: {text[:300]}")
 
     job = parsed.get("job") if isinstance(parsed, dict) else None
     if not isinstance(job, dict) or "id" not in job:
-        raise RemoteError(f"sideclaw accepted the {tool} job but returned no id")
+        raise RemoteError(f"agent-gateway accepted the {tool} job but returned no id")
     return job
 
 
@@ -218,8 +218,8 @@ def submit_review(*, cwd: Path, pr: int, context: str | None = None, model: str 
 
 def submit_triage(*, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     """The single-shot `triage` job: `POST /api/jobs {"tool":"triage","params":{prompt,schema}}`.
-    sideclaw validates the model's answer against `schema` and, on a `done` job, returns it at
-    `job.result.result`. No `model` param — sideclaw routes the tool itself. Same transport and
+    agent-gateway validates the model's answer against `schema` and, on a `done` job, returns it at
+    `job.result.result`. No `model` param — agent-gateway routes the tool itself. Same transport and
     error handling as `submit_review()`: a 4xx is `SubmitRefused`, anything else a `RemoteError`."""
     return _submit_job("triage", {"prompt": prompt, "schema": schema})
 
@@ -241,29 +241,29 @@ def update_pr_result(job: dict[str, Any]) -> dict[str, Any]:
     best-effort read: a train that guessed would merge a SHA nobody checked."""
     result = job.get("result")
     if job.get("status") != "done" or not isinstance(result, dict):
-        raise RemoteError(f"sideclaw update_pr job {job.get('id')} ended '{job.get('status')}' with no result")
+        raise RemoteError(f"agent-gateway update_pr job {job.get('id')} ended '{job.get('status')}' with no result")
     status = result.get("status")
     if status not in UPDATE_PR_STATUSES:
         raise RemoteError(
-            f"sideclaw update_pr result status {status!r}, warden expects one of {UPDATE_PR_STATUSES} — "
+            f"agent-gateway update_pr result status {status!r}, warden expects one of {UPDATE_PR_STATUSES} — "
             f"refusing to parse"
         )
     for key in ("headSha", "previousHeadSha"):
         value = result.get(key)
         if not isinstance(value, str) or not _SHA_RE.match(value):
-            raise RemoteError(f"sideclaw update_pr result {key} {value!r} is not a 40-hex commit — refusing to parse")
+            raise RemoteError(f"agent-gateway update_pr result {key} {value!r} is not a 40-hex commit — refusing to parse")
     if not isinstance(result.get("prUrl"), str):
-        raise RemoteError("sideclaw update_pr result carries no prUrl — refusing to parse")
+        raise RemoteError("agent-gateway update_pr result carries no prUrl — refusing to parse")
     checks = result.get("checks")
     if checks is None and status == "updated":
-        raise RemoteError("sideclaw update_pr result is 'updated' but carries no checks — refusing to parse")
+        raise RemoteError("agent-gateway update_pr result is 'updated' but carries no checks — refusing to parse")
     if checks is not None and not (isinstance(checks, dict) and isinstance(checks.get("passed"), bool)
                                    and isinstance(checks.get("summary"), str)):
-        raise RemoteError(f"sideclaw update_pr result checks {checks!r} are malformed — refusing to parse")
+        raise RemoteError(f"agent-gateway update_pr result checks {checks!r} are malformed — refusing to parse")
     return result
 
 
-# sideclaw's per-repo lease refusal (server/lib/repo-lease.ts `repoLeaseRefusal(holder, tool)`):
+# agent-gateway's per-repo lease refusal (server/lib/repo-lease.ts `repoLeaseRefusal(holder, tool)`):
 # `<tool> refused: an implement episode is already running in this repo (job <holder>) — …`,
 # where <tool> is `dispatch` for an implement episode and `update_pr` for the merge train's
 # rebase — both take the same lease. The POST is accepted (HTTP 200); the job then FAILS
@@ -274,14 +274,14 @@ _LEASE_REFUSAL_RE = re.compile(r"\b(?:dispatch|update_pr) refused: an implement 
 _BUNDLE_PATH_RE = re.compile(r"bundled at (\S+?)\.?(\s|$)")
 
 # GET /api/routing's route for the stronger implement model (attempt 3+). Warden never
-# names a model id itself: when sideclaw has no such route, the dispatch carries no
-# `model` key and sideclaw's own default applies.
+# names a model id itself: when agent-gateway has no such route, the dispatch carries no
+# `model` key and agent-gateway's own default applies.
 _ESCALATION_ROUTE = "dispatch_implement_escalation"
 _escalation_cache: dict[str, str] = {}
 
 
 def is_lease_refusal(job: dict[str, Any]) -> bool:
-    """True for a FAILED job whose error is sideclaw's per-repo lease refusal — of an implement
+    """True for a FAILED job whose error is agent-gateway's per-repo lease refusal — of an implement
     dispatch or of an `update_pr`."""
     if job.get("status") != "failed":
         return False
@@ -290,7 +290,7 @@ def is_lease_refusal(job: dict[str, Any]) -> bool:
 
 
 def conflict_bundle_path(result: dict[str, Any]) -> str | None:
-    """The path of the git bundle holding a `conflict` episode's commits. sideclaw puts it
+    """The path of the git bundle holding a `conflict` episode's commits. agent-gateway puts it
     only in the verdict's prose ("... The episode's commits were bundled at <path>."), and
     only when bundling worked — None when absent."""
     verdict = result.get("verdict")
@@ -309,13 +309,13 @@ def escalation_model() -> str | None:
         status, text = _request("GET", "/api/routing", None)
         parsed = json.loads(text) if status == 200 else None
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
-        print(f"sideclaw: could not read /api/routing for the escalation model: {e}", file=sys.stderr)
+        print(f"agent-gateway: could not read /api/routing for the escalation model: {e}", file=sys.stderr)
         return None
     routes = parsed.get("routes") if isinstance(parsed, dict) else None
     route = routes.get(_ESCALATION_ROUTE) if isinstance(routes, dict) else None
     model = route.get("model") if isinstance(route, dict) else None
     if not isinstance(model, str) or not model:
-        print(f"sideclaw: no {_ESCALATION_ROUTE} route (HTTP {status}) — escalating on the default model",
+        print(f"agent-gateway: no {_ESCALATION_ROUTE} route (HTTP {status}) — escalating on the default model",
               file=sys.stderr)
         return None
     _escalation_cache["model"] = model
@@ -323,22 +323,22 @@ def escalation_model() -> str | None:
 
 
 def dispatch_policy() -> dict[str, Any]:
-    """sideclaw's dispatch policy (`GET /api/dispatch-policy`: the repo roots, each repo's tier
+    """agent-gateway's dispatch policy (`GET /api/dispatch-policy`: the repo roots, each repo's tier
     ceiling, the overrides) as it answers now. A refusal that the policy caused (a tier above a
     repo's ceiling) can only clear when this changes; see policy_hash(). Raises RemoteError when
-    sideclaw is unreachable or answers anything but a JSON object."""
+    agent-gateway is unreachable or answers anything but a JSON object."""
     try:
         status, text = _request("GET", "/api/dispatch-policy", None)
     except (urllib.error.URLError, TimeoutError, OSError):
-        raise RemoteError("sideclaw dispatch-policy read failed (is the LaunchAgent up?)")
+        raise RemoteError("agent-gateway dispatch-policy read failed (is the LaunchAgent up?)")
     if status != 200:
-        raise RemoteError(f"sideclaw returned HTTP {status} for its dispatch policy")
+        raise RemoteError(f"agent-gateway returned HTTP {status} for its dispatch policy")
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw's dispatch policy is not JSON: {text[:300]}")
+        raise RemoteError(f"agent-gateway's dispatch policy is not JSON: {text[:300]}")
     if not isinstance(parsed, dict):
-        raise RemoteError("sideclaw's dispatch policy is not a JSON object")
+        raise RemoteError("agent-gateway's dispatch policy is not a JSON object")
     return parsed
 
 
@@ -351,21 +351,21 @@ def get(job_id: str) -> dict[str, Any] | None:
     try:
         status, text = _request("GET", f"/api/jobs/{job_id}", None)
     except (urllib.error.URLError, TimeoutError, OSError):
-        raise RemoteError(f"sideclaw job poll failed for {job_id} (is the LaunchAgent up?)")
+        raise RemoteError(f"agent-gateway job poll failed for {job_id} (is the LaunchAgent up?)")
 
     if status == 404:
         return None
     if status != 200:
-        raise RemoteError(f"sideclaw returned HTTP {status} for job {job_id}")
+        raise RemoteError(f"agent-gateway returned HTTP {status} for job {job_id}")
 
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw returned HTTP {status} for job {job_id} with unparseable body: {text[:300]}")
+        raise RemoteError(f"agent-gateway returned HTTP {status} for job {job_id} with unparseable body: {text[:300]}")
 
     job = parsed.get("job") if isinstance(parsed, dict) else None
     if not isinstance(job, dict):
-        raise RemoteError(f"sideclaw returned no job for {job_id}")
+        raise RemoteError(f"agent-gateway returned no job for {job_id}")
     return job
 
 
@@ -394,10 +394,10 @@ def cancel(job_id: str) -> dict[str, Any]:
     try:
         status, text = _request("POST", f"/api/jobs/{job_id}/cancel", {})
     except (urllib.error.URLError, TimeoutError, OSError):
-        raise RemoteError(f"sideclaw job cancel failed for {job_id} (is the LaunchAgent up?)")
+        raise RemoteError(f"agent-gateway job cancel failed for {job_id} (is the LaunchAgent up?)")
 
     if status == 404:
-        raise RemoteError(f"sideclaw has no job {job_id}")
+        raise RemoteError(f"agent-gateway has no job {job_id}")
     if status == 409:
         try:
             parsed = json.loads(text)
@@ -406,16 +406,16 @@ def cancel(job_id: str) -> dict[str, Any]:
             message = None
         raise PolicyError(message or f"job {job_id} is already terminal")
     if status != 200:
-        raise RemoteError(f"sideclaw returned HTTP {status} cancelling job {job_id}: {text[:300]}")
+        raise RemoteError(f"agent-gateway returned HTTP {status} cancelling job {job_id}: {text[:300]}")
 
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise RemoteError(f"sideclaw returned HTTP {status} cancelling job {job_id} with unparseable body: {text[:300]}")
+        raise RemoteError(f"agent-gateway returned HTTP {status} cancelling job {job_id} with unparseable body: {text[:300]}")
 
     job = parsed.get("job") if isinstance(parsed, dict) else None
     if not isinstance(job, dict):
-        raise RemoteError(f"sideclaw returned no job cancelling {job_id}")
+        raise RemoteError(f"agent-gateway returned no job cancelling {job_id}")
     return job
 
 
@@ -430,7 +430,7 @@ def assert_result_schema(job: dict[str, Any], expected: int | Collection[int], t
 
     `expected` is a single version (review, `REVIEW_SCHEMA_VERSION`) or a
     collection of them (dispatch, `DISPATCH_SCHEMA_VERSIONS` — the acceptance
-    window that spans a rolling sideclaw restart). Only checked on
+    window that spans a rolling agent-gateway restart). Only checked on
     `status == "done"`: a failed/interrupted/cancelled job carries no `result`
     worth pinning a shape to."""
     if job.get("status") != "done":
@@ -442,7 +442,7 @@ def assert_result_schema(job: dict[str, Any], expected: int | Collection[int], t
         expected_text = (str(expected) if isinstance(expected, int)
                          else "one of " + ", ".join(str(v) for v in sorted(versions)))
         raise RemoteError(
-            f"sideclaw {tool} result schemaVersion {version}, warden expects {expected_text} — refusing to parse"
+            f"agent-gateway {tool} result schemaVersion {version}, warden expects {expected_text} — refusing to parse"
         )
 
 
@@ -465,19 +465,19 @@ def assert_outcome(job: dict[str, Any], outcomes: tuple[str, ...], tool: str) ->
     outcome = result.get("outcome") if isinstance(result, dict) else None
     if outcome not in outcomes:
         raise RemoteError(
-            f"sideclaw {tool} result outcome {outcome!r}, warden expects one of {outcomes} — refusing to parse"
+            f"agent-gateway {tool} result outcome {outcome!r}, warden expects one of {outcomes} — refusing to parse"
         )
 
 
 def finished_at_iso(job: dict[str, Any], *, fallback: dt.datetime) -> str:
-    """The ledger's `finished_at` should read when sideclaw itself finished
+    """The ledger's `finished_at` should read when agent-gateway itself finished
     the job (`JobView.finishedAt`, epoch ms — server/jobs/types.ts), not when
     this process happened to poll it. Every terminal poll response already
     carries this field; warden used to discard it and stamp its own wall
     clock instead, which is why a poll suspended overnight recorded a
     614-minute dispatch that actually took 20 (docs/history/state-log.md
     §79). Falls back to `fallback` (the caller's own `now`) only when
-    sideclaw's value is missing or not a number — every real terminal job
+    agent-gateway's value is missing or not a number — every real terminal job
     carries one, but a fallback is cheaper than a caller-side branch."""
     raw = job.get("finishedAt")
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
@@ -486,7 +486,7 @@ def finished_at_iso(job: dict[str, Any], *, fallback: dt.datetime) -> str:
 
 
 def classify_dispatch_outcome(status: str | None, verdict_json: str | None) -> tuple[str, str | None]:
-    """Classify a finished dispatch's outcome from sideclaw's own published
+    """Classify a finished dispatch's outcome from agent-gateway's own published
     verdict shape — the ladder `scripts/watchdog-poll.py`'s `_dispatch_summary()`
     and `scripts/watchdog-summary.py`'s `_dispatch_outcome_note()` used to carry
     as two hand-mirrored copies. Returns `(kind, detail)`:

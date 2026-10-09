@@ -3,9 +3,9 @@
 the Wave 5.2 port of the retired bash CLI's policy/dispatch half into
 Python modules the loop calls as functions.
 
-Every sideclaw call is faked by assigning `clients.sideclaw.submit` (the
-import-style the brief specifies: `from clients import sideclaw`, called as
-`sideclaw.submit(...)` at call time, so a test can inject a fake without any
+Every agent-gateway call is faked by assigning `clients.agent_gateway.submit` (the
+import-style the brief specifies: `from clients import agent_gateway`, called as
+`agent-gateway.submit(...)` at call time, so a test can inject a fake without any
 HTTP stub).
 
 Run: .venv/bin/python3 tests/test_lifecycle.py  (or: make test, from warden/)
@@ -27,7 +27,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 from lifecycle import dispatch, operations, policy  # noqa: E402
-from clients import sideclaw  # noqa: E402
+from clients import agent_gateway  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError  # noqa: E402
 
 _ledger_spec = importlib.util.spec_from_file_location("ledger", REPO / "scripts" / "ledger.py")
@@ -52,7 +52,7 @@ def _now() -> dt.datetime:
 
 class _patch:
     """Swap one attribute on a module object for the duration of a `with`
-    block — the monkeypatch shape the brief specifies: `sideclaw.submit =
+    block — the monkeypatch shape the brief specifies: `agent-gateway.submit =
     fake`, restored afterward so tests cannot leak into one another."""
 
     def __init__(self, obj, name: str, value):
@@ -150,7 +150,7 @@ def _expect(exc_type, fn, *args, **kwargs):
 
 
 # --- policy: repo_cwd() ---------------------------------------
-# No repo/tier policy lives here any more: sideclaw is the only boundary. These
+# No repo/tier policy lives here any more: agent-gateway is the only boundary. These
 # only pin the one path the wire protocol still needs and its name-shape guard.
 
 def test_repo_cwd_is_root_slash_name():
@@ -164,7 +164,7 @@ def test_repo_cwd_default_root_is_source_root():
 
 
 def test_repo_cwd_does_not_check_existence_or_allowlist():
-    """Whether the repo exists / may be dispatched is sideclaw's call (a 4xx)."""
+    """Whether the repo exists / may be dispatched is agent-gateway's call (a 4xx)."""
     with _env(WARDEN_REPOS_ROOT="/nonexistent-root"):
         assert policy.repo_cwd("homelab-private") == Path("/nonexistent-root/homelab-private")
 
@@ -453,7 +453,7 @@ def test_check_context_oversize_raises():
 
 def test_open_episode_ungated_has_no_operation_row():
     conn, _ = _fresh_ledger()
-    with _patch(sideclaw, "submit", lambda **kw: {"id": "j-invest", "status": "running"}):
+    with _patch(agent_gateway, "submit", lambda **kw: {"id": "j-invest", "status": "running"}):
         opened = dispatch.open_episode(
             conn, repo="warden", tier="investigate", brief="do it", context=None,
             why=None, model=None, origin=dispatch.Origin(), authorized_by=None,
@@ -538,7 +538,7 @@ def test_open_episode_gated_records_operation_before_submit():
         seen["ops"] = conn.execute("SELECT COUNT(*) FROM operations").fetchone()[0]
         return {"id": "j-impl", "status": "running"}
 
-    with _patch(sideclaw, "submit", fake_submit):
+    with _patch(agent_gateway, "submit", fake_submit):
         opened = dispatch.open_episode(
             conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
             model=None, origin=dispatch.Origin(), authorized_by="U1",
@@ -551,7 +551,7 @@ def test_open_episode_gated_records_operation_before_submit():
 
 def test_open_episode_remote_error_marks_operation_failed():
     conn, _ = _fresh_ledger()
-    with _patch(sideclaw, "submit", _raiser(RemoteError("boom"))):
+    with _patch(agent_gateway, "submit", _raiser(RemoteError("boom"))):
         try:
             dispatch.open_episode(
                 conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
@@ -567,7 +567,7 @@ def test_open_episode_remote_error_marks_operation_failed():
 
 def test_open_episode_remote_error_maybe_mutated_leaves_the_operation_open():
     conn, _ = _fresh_ledger()
-    with _patch(sideclaw, "submit", _raiser(RemoteError("boom", maybe_mutated=True))):
+    with _patch(agent_gateway, "submit", _raiser(RemoteError("boom", maybe_mutated=True))):
         try:
             dispatch.open_episode(
                 conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
@@ -584,7 +584,7 @@ def test_open_episode_remote_error_maybe_mutated_leaves_the_operation_open():
 
 def test_open_episode_submits_the_composed_cwd_and_no_sensitive_or_model_key():
     """A dispatch names the repo; warden composes only the cwd and sends no
-    `sensitive` (sideclaw derives it) and no `model` unless the owner passed one."""
+    `sensitive` (agent-gateway derives it) and no `model` unless the owner passed one."""
     conn, _ = _fresh_ledger()
     sent: list[dict] = []
 
@@ -592,7 +592,7 @@ def test_open_episode_submits_the_composed_cwd_and_no_sensitive_or_model_key():
         sent.append(kw)
         return {"id": "j-cwd", "status": "running"}
 
-    with _env(WARDEN_REPOS_ROOT="/tmp/repos-root"), _patch(sideclaw, "submit", _submit):
+    with _env(WARDEN_REPOS_ROOT="/tmp/repos-root"), _patch(agent_gateway, "submit", _submit):
         dispatch.open_episode(
             conn, repo="warden", tier="investigate", brief="do it", context=None, why=None,
             origin=dispatch.Origin(), authorized_by=None,
@@ -609,7 +609,7 @@ def test_open_episode_threads_revision_of_and_model_to_the_submit():
         sent.append(kw)
         return {"id": "j-rev", "status": "running"}
 
-    with _env(WARDEN_REPOS_ROOT="/tmp/repos-root"), _patch(sideclaw, "submit", _submit):
+    with _env(WARDEN_REPOS_ROOT="/tmp/repos-root"), _patch(agent_gateway, "submit", _submit):
         dispatch.open_episode(
             conn, repo="warden", tier="implement", brief="fix it", context=None, why=None,
             origin=dispatch.Origin(event_id=None), authorized_by="auto-from-item",
@@ -620,7 +620,7 @@ def test_open_episode_threads_revision_of_and_model_to_the_submit():
 
 def test_open_episode_submit_refused_marks_operation_failed_not_unknown():
     conn, _ = _fresh_ledger()
-    with _patch(sideclaw, "submit", _raiser(SubmitRefused("sideclaw refused the job (HTTP 400): nope", status=400))):
+    with _patch(agent_gateway, "submit", _raiser(SubmitRefused("agent-gateway refused the job (HTTP 400): nope", status=400))):
         try:
             dispatch.open_episode(
                 conn, repo="warden", tier="implement", brief="do it", context=None, why="w",
@@ -637,7 +637,7 @@ def test_open_episode_submit_refused_marks_operation_failed_not_unknown():
 
 def test_open_episode_status_comes_from_job_not_a_literal():
     conn, _ = _fresh_ledger()
-    with _patch(sideclaw, "submit", lambda **kw: {"id": "j-status", "status": "pending"}):
+    with _patch(agent_gateway, "submit", lambda **kw: {"id": "j-status", "status": "pending"}):
         dispatch.open_episode(
             conn, repo="warden", tier="investigate", brief="do it", context=None,
             why=None, model=None, origin=dispatch.Origin(), authorized_by=None,
@@ -670,8 +670,8 @@ def test_sync_record_not_reported_leaves_reported_at_null():
     assert row["delivery_status"] is None
 
 
-def test_sync_record_finished_at_uses_sideclaws_own_timestamp():
-    """docs/history/state-log.md §87: `finished_at` must read when sideclaw
+def test_sync_record_finished_at_uses_agent_gateways_own_timestamp():
+    """docs/history/state-log.md §87: `finished_at` must read when agent-gateway
     itself finished the job (`job["finishedAt"]`, epoch ms), not when this
     process happened to poll it — a poll suspended for hours must not
     misreport how long the episode actually ran (§79's 614-minute dispatch
@@ -687,10 +687,10 @@ def test_sync_record_finished_at_uses_sideclaws_own_timestamp():
     expected = dt.datetime.fromtimestamp(finished_epoch_ms / 1000, tz=dt.timezone.utc)
     assert abs((recorded - expected).total_seconds()) < 1, row["finished_at"]
     assert recorded < observed_late - dt.timedelta(hours=1), (
-        "finished_at must not fall back to the late observation time when sideclaw's own value is present")
+        "finished_at must not fall back to the late observation time when agent-gateway's own value is present")
 
 
-def test_sync_record_finished_at_falls_back_to_now_when_sideclaw_omits_it():
+def test_sync_record_finished_at_falls_back_to_now_when_agent_gateway_omits_it():
     conn, _ = _fresh_ledger()
     _seed_dispatch(conn, "job-no-finished-at")
     now = _now()

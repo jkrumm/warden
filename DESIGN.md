@@ -1,7 +1,7 @@
 # warden — design
 
 **warden turns a signal into a verified outcome and is the only thing that holds
-that state.** Pollers feed it, sideclaw executes for it, Argo and Slack render it.
+that state.** Pollers feed it, agent-gateway executes for it, Argo and Slack render it.
 It is the "Warden — the loop" part of the platform spec,
 `~/SourceRoot/dotfiles/docs/agent-platform.md`; where this file and the spec
 disagree, the spec wins. This file describes what exists in this repo.
@@ -38,12 +38,12 @@ quiet · closed(duplicate | fixed_by | ignored | resolved)      terminal
 in that repo instead (once per item; the re-route's transition note is the
 ping-pong guard). `needs_decision` and `failed` never expire. Every
 infrastructure failure strikes (`core.strike()`): 10 then 30 minutes of backoff,
-the third strike is `failed` carrying the error. A sideclaw 4xx on submit is a
-refusal, not a strike: the item ends `failed` with sideclaw's message — except a
+the third strike is `failed` carrying the error. A agent-gateway 4xx on submit is a
+refusal, not a strike: the item ends `failed` with agent-gateway's message — except a
 refused escalation `model` (resubmitted once without it), a lease refusal (retry
 in 10 minutes, no strike) and a refused triage submit (strikes; never the item's
 fault).
-An implement whose repo check TOOL failed to run (sideclaw's `checks_tool_failed`,
+An implement whose repo check TOOL failed to run (agent-gateway's `checks_tool_failed`,
 dispatch schema v5) is an infrastructure failure too: it strikes and never spends a
 revision — only a red suite (`checks_failed`) goes back to the implementer.
 An implement that found nothing to change (`no_changes`) is the opposite: a terminal
@@ -53,9 +53,9 @@ would have to touch it), goes to `needs_decision` instead, its note naming the o
 never a strike and another episode.
 
 `failed` is classified where it happens (`failure_class`) and is not a graveyard for
-what was never the work's fault. `infra` (sideclaw 5xx/unreachable, a synthesis
+what was never the work's fault. `infra` (agent-gateway 5xx/unreachable, a synthesis
 failure, the third strike) is re-driven after 60, 180, 480 minutes, three times;
-`policy` (a sideclaw 4xx refusal) once whenever sideclaw's
+`policy` (a agent-gateway 4xx refusal) once whenever agent-gateway's
 dispatch policy hash differs from the one stored with the refusal, so a refusal
 under the new policy waits for the next change; `work` (checks failed, review
 blocked past the last attempt, a rewind loop, a revert by hand) never. A failed row
@@ -76,7 +76,7 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    no model call. A `new` alert whose signal goes quiet resolves `quiet`
    (recovery-paired first, `quietResolveHours` as the fallback); silence resolves
    `new` and nothing else.
-2. **Triage** (`triaging.py`). Each `new` item gets one single-shot sideclaw
+2. **Triage** (`triaging.py`). Each `new` item gets one single-shot agent-gateway
    `triage` job — alerts once debounced (≥`minOccurrences` or ≥`minOpenMinutes`
    open), issues and runs at once. Candidates come from the signal's own label
    (`label_route()`: Kuma tag, container name, OTel `service.name`, the issue's
@@ -95,12 +95,12 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    paging (`_reroute_repo()`, once per item). A matching `rootCause` on another
    open item merges them (older survives, the other `closed(duplicate)`). A
    blocked review is a revision on the same item and PR (`revisionOf`), up to 4
-   attempts; attempt 3+ asks for sideclaw's escalation model. `conflict`
+   attempts; attempt 3+ asks for agent-gateway's escalation model. `conflict`
    re-dispatches from the new base with the old diff as context. Confident host
    restarts run through `HOST_VERB_ALLOWLIST` and verify on
    `HOST_VERB_LIVENESS_MONITOR`.
 4. **Merge train** (`train.py`). One per repo, oldest item first, single-flight:
-   sideclaw `update_pr` onto the latest base → GitHub checks green (or none — only
+   agent-gateway `update_pr` onto the latest base → GitHub checks green (or none — only
    a readable check-runs API may say so; unreadable, the gate reads Actions runs
    and none there is still pending) on that SHA → review `confirmed` on that SHA → squash merge pinned to it. A head
    that moves goes back to `update`. The gate is exactly those four facts plus
@@ -124,7 +124,7 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    else) whose PR rides the same train with no revisions. A passing revert gives
    the item a fresh attempt with the evidence and the reverted diff; the failed
    fix counts as an attempt, the revert does not.
-7. **Fixed-by sweep.** Every fix merge (never a revert) queues one sideclaw
+7. **Fixed-by sweep.** Every fix merge (never a revert) queues one agent-gateway
    `triage` job over the PR's title, body and diff against the repo's `triaged`
    and idle `working` items. A match enters `verifying` with `fixed_by_pr` and
    closes `closed(fixed_by)` once its own signal stays quiet; recurrence sends it
@@ -141,10 +141,10 @@ the loop's 10-minute tick.
 
 ## Boundaries
 
-- **sideclaw is the only boundary.** warden depends on `submit(tier, repo, brief)
+- **agent-gateway is the only boundary.** warden depends on `submit(tier, repo, brief)
   -> jobId` and `get(jobId)`. It carries no repo allowlist, tier ceiling or model
-  choice; sideclaw enforces its allowlist and routes each tier
-  (`GET /api/routing`). The verdict schema is sideclaw's; a version mismatch is a
+  choice; agent-gateway enforces its allowlist and routes each tier
+  (`GET /api/routing`). The verdict schema is agent-gateway's; a version mismatch is a
   loud refusal, never a best-effort parse.
 - **The episode is not contained.** `readOnly` is three tool names on a CLI flag
   under `--dangerously-skip-permissions`; `Bash` is unrestricted and the brief is
@@ -205,7 +205,7 @@ every merge.
 
 ## Known limits
 
-- Review is not delta-only: sideclaw `review` has no PR delta scope and reports
+- Review is not delta-only: agent-gateway `review` has no PR delta scope and reports
   no reviewed SHA; warden pins by reading the PR head before submit and after the
   fold.
 - Policy `rules` remain a label tier until the `## Verify & Monitor` sections

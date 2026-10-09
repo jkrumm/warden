@@ -22,7 +22,7 @@ NUDGE below for why the Hermes case specifically still matters.
 
 WHAT IT DOES, one pass: read every dispatch row with `reported_at IS NULL`
 (watchdog.db's `dispatches` table, owned by scripts/hermes-cc.sh — see
-docs/dispatch-bridge.md § "The dispatch record"). For each, poll sideclaw's
+docs/dispatch-bridge.md § "The dispatch record"). For each, poll agent-gateway's
 job endpoint. A still-running job is left alone. A terminal job (done,
 failed, interrupted) gets folded back into the row (status, verdict_json,
 finished_at), then — if the dispatch has an origin_channel — a deterministic,
@@ -35,7 +35,7 @@ below.
 
 ITEM-BACKED DISPATCHES post nothing. A dispatch opened for a triage item
 (`origin_event_id` set) is folded onto the item and closed with
-`delivery_status = ITEM_TRACKED` — a dispatch sideclaw PRUNED is folded too, as a
+`delivery_status = ITEM_TRACKED` — a dispatch agent-gateway PRUNED is folded too, as a
 terminal dispatch with no verdict, so its item strikes and retries rather than
 staying `working` forever; Slack hears about the item itself, once, when it
 enters `fixed` or `needs_decision` (loop/notify.py `notify_cluster()`, a one-line post
@@ -104,8 +104,8 @@ dispatch bridge itself owns (job id, repo, tier, artifact URL) and never
 carries episode-authored text — see build_nudge_body()'s docstring for why
 that boundary is a security property, not a style choice.
 
-PRUNED JOBS. sideclaw prunes a job ~24 h after it finishes. A dispatch whose
-verdict was never folded in before that (sideclaw restarted mid-run, the
+PRUNED JOBS. agent-gateway prunes a job ~24 h after it finishes. A dispatch whose
+verdict was never folded in before that (agent-gateway restarted mid-run, the
 sweeper was down for a day, the job id was never real) answers 404 forever,
 and "retry next sweep" forever is a debt that can never be paid. So a 404 —
 and ONLY a 404, never a connection failure — increments `poll_misses` on the
@@ -113,9 +113,9 @@ row; the third consecutive one marks the row terminal `failed` (verdict_json
 left NULL — there never was one), delivers a one-line notice into the origin
 thread (or the undeliverable sentinel), and stamps `reported_at` so it is
 never polled again. A successful poll resets the counter, so three misses
-spread across a flapping sideclaw do not count.
+spread across a flapping agent-gateway do not count.
 
-CANCELLED JOBS. `cancelled` (sideclaw's own cancel endpoint) is terminal
+CANCELLED JOBS. `cancelled` (agent-gateway's own cancel endpoint) is terminal
 exactly like done/failed/interrupted — folded back into the row, delivered
 with its own short "cancelled (aborted)" message, and folded onto a triage
 card via `fold_dispatch_verdict()` the same as any other terminal status.
@@ -146,7 +146,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from clients import secrets as _secrets, sideclaw as _sideclaw  # noqa: E402
+from clients import secrets as _secrets, agent_gateway as _agent_gateway  # noqa: E402
 from clients.errors import RemoteError  # noqa: E402
 
 HERMES_HOME = Path.home() / ".hermes"
@@ -161,12 +161,12 @@ WARDEN_HOME = (Path(os.environ["WARDEN_HOME"]).expanduser()
 DB_PATH = (Path(os.environ["WARDEN_DB"]).expanduser()
            if os.environ.get("WARDEN_DB") else WARDEN_HOME / "warden.db")
 
-# sideclaw's own terminal statuses (done/failed/interrupted/cancelled) —
-# clients/sideclaw.py's TERMINAL is this sweeper's own vocabulary now, not a
+# agent-gateway's own terminal statuses (done/failed/interrupted/cancelled) —
+# clients/agent_gateway.py's TERMINAL is this sweeper's own vocabulary now, not a
 # copy of it: a job in any of these is done reporting, one way or another.
-TERMINAL_STATUSES = _sideclaw.TERMINAL
-# Consecutive sideclaw 404s before a row is declared pruned. Three sweeps = 15
-# min, long enough to ride out a sideclaw restart that briefly answers 404 for
+TERMINAL_STATUSES = _agent_gateway.TERMINAL
+# Consecutive agent-gateway 404s before a row is declared pruned. Three sweeps = 15
+# min, long enough to ride out a agent-gateway restart that briefly answers 404 for
 # everything, short enough that a pruned job does not haunt every sweep for
 # weeks. There is no local `lost` status any more — a pruned job is recorded
 # as a genuine `status='failed'` with `verdict_json` left NULL (there never
@@ -268,16 +268,16 @@ NOT_FOUND = "not_found"
 
 
 def poll_job(job_id: str) -> dict[str, Any] | str | None:
-    """GET the sideclaw job via `clients.sideclaw.get()`. The job dict on a
-    real read; the sentinel NOT_FOUND on a 404 (sideclaw pruned it, or never
-    had it — `sideclaw.get()` already turns that into a bare `None`, which
+    """GET the agent-gateway job via `clients.agent_gateway.get()`. The job dict on a
+    real read; the sentinel NOT_FOUND on a 404 (agent-gateway pruned it, or never
+    had it — `agent-gateway.get()` already turns that into a bare `None`, which
     this function re-labels); None on any other transport/parse failure
     (`RemoteError`) — never raises, so one unreachable poll can't take the
     sweep down."""
     try:
-        job = _sideclaw.get(job_id)
+        job = _agent_gateway.get(job_id)
     except RemoteError as e:
-        print(f"dispatch-sweep: could not poll sideclaw for job {job_id}: {e}", file=sys.stderr)
+        print(f"dispatch-sweep: could not poll agent-gateway for job {job_id}: {e}", file=sys.stderr)
         return None
     return NOT_FOUND if job is None else job
 
@@ -458,7 +458,7 @@ def format_message(*, repo: str, tier: str, job_id: str, status: str,
                     result: dict[str, Any] | None, error: Any,
                     merged_at: str | None = None) -> str:
     """Deterministic Slack mrkdwn body for one terminal dispatch. No LLM —
-    every field comes straight from sideclaw's schema-shaped verdict object
+    every field comes straight from agent-gateway's schema-shaped verdict object
     (`{verdict, confidence, evidence[], recommendation, nextAction, summary,
     degraded?, artifactUrl?, branch?}`) or, for a failed/interrupted job, its
     `error` string.
@@ -485,19 +485,19 @@ def format_message(*, repo: str, tier: str, job_id: str, status: str,
     if status in ("failed", "interrupted"):
         lines = [
             f":warning: Dispatch {status} — {repo}",
-            f"error: {error if error else 'no error detail returned by sideclaw'}",
+            f"error: {error if error else 'no error detail returned by agent-gateway'}",
             "",
             f"_tier {tier} · job `{job_short}`_",
         ]
         return _finalize(lines)
 
     if not isinstance(result, dict):
-        # status == "done" but sideclaw returned no result object at all —
+        # status == "done" but agent-gateway returned no result object at all —
         # render this plainly rather than staying silent, since silence is
         # exactly the debt this sweeper exists to close.
         lines = [
             f":warning: Dispatch done with no verdict — {repo}",
-            "sideclaw reported status=done but returned no result object.",
+            "agent-gateway reported status=done but returned no result object.",
             "",
             f"_tier {tier} · job `{job_short}`_",
         ]
@@ -565,7 +565,7 @@ def format_message(*, repo: str, tier: str, job_id: str, status: str,
 def pruned_notice(*, repo: str, tier: str, job_id: str, misses: int) -> str:
     """The one line a pruned dispatch gets. Bridge-owned fields only."""
     return (
-        f":ghost: Dispatch pruned — {repo}: sideclaw pruned this job before it reported "
+        f":ghost: Dispatch pruned — {repo}: agent-gateway pruned this job before it reported "
         f"(`{job_id[:8]}`, {misses} consecutive 404s) and no verdict was ever recorded. "
         f"Not retried. _tier {tier}_"
     )
@@ -586,14 +586,14 @@ def _mark_pruned(conn: sqlite3.Connection, row: sqlite3.Row, misses: int, *, dry
     # verdict_json is explicitly cleared — there never was one to record, and
     # this is now a genuine status='failed' row indistinguishable from a real
     # failure except by having no verdict at all. `error` gets warden's OWN
-    # reason (there is no sideclaw failure text for a job sideclaw itself has
+    # reason (there is no agent-gateway failure text for a job agent-gateway itself has
     # forgotten) — kept consistent with, not a duplicate of, pruned_notice()'s
     # Slack wording.
     conn.execute(
         "UPDATE dispatches SET status=?, verdict_json=NULL, finished_at=?, poll_misses=?, error=? "
         "WHERE job_id=?",
         (PRUNED_STATUS, now_iso, misses,
-         f"sideclaw pruned this job before it reported ({misses} consecutive 404s)", job_id),
+         f"agent-gateway pruned this job before it reported ({misses} consecutive 404s)", job_id),
     )
     conn.commit()
     if item_tracked:
@@ -645,7 +645,7 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
     job = poll_job(job_id)
     if job is None:
         print(
-            f"dispatch-sweep: could not poll sideclaw for job {job_id} (repo {repo}) "
+            f"dispatch-sweep: could not poll agent-gateway for job {job_id} (repo {repo}) "
             f"— retrying next sweep",
             file=sys.stderr,
         )
@@ -657,7 +657,7 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
         # No `row["status"]`-based fallback here any more: the pruned status
         # IS `'failed'` now (PRUNED_STATUS), the same value a real failure
         # gets, so branching on it would misfire on a genuinely failed
-        # dispatch that sideclaw later prunes. `poll_misses` alone is the
+        # dispatch that agent-gateway later prunes. `poll_misses` alone is the
         # trigger — and it is durable across passes (a delivery that failed
         # after marking pruned leaves poll_misses already at/above the
         # threshold, so the very next pass re-enters this branch regardless).
@@ -665,7 +665,7 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
             _mark_pruned(conn, row, misses, dry_run=dry_run)
             return
         print(
-            f"dispatch-sweep: sideclaw has no job {job_id} (repo {repo}) — miss {misses}/"
+            f"dispatch-sweep: agent-gateway has no job {job_id} (repo {repo}) — miss {misses}/"
             f"{LOST_AFTER_MISSES}, marking pruned at {LOST_AFTER_MISSES}",
             file=sys.stderr,
         )
@@ -675,7 +675,7 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
         return
     if misses and not dry_run:
         # A successful poll ends the streak — three misses across a flapping
-        # sideclaw are not three consecutive ones.
+        # agent-gateway are not three consecutive ones.
         conn.execute("UPDATE dispatches SET poll_misses=0 WHERE job_id=?", (job_id,))
         conn.commit()
 
@@ -699,13 +699,13 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
     # delivery attempt — see the module docstring's crash-safety contract.
     if not dry_run:
         now = dt.datetime.now(dt.timezone.utc)
-        # sideclaw's own `finishedAt` (when it stamped the job terminal), not
+        # agent-gateway's own `finishedAt` (when it stamped the job terminal), not
         # this poll's wall clock — a sweep that finds a job late (an
         # unloaded LaunchAgent, a suspended host) must not misreport how
         # long the episode actually ran (docs/history/state-log.md §79: a
         # poll suspended overnight recorded a 614-minute dispatch that took
         # 20). `now` is still the fallback for the rare job with no such field.
-        finished_at = _sideclaw.finished_at_iso(job, fallback=now)
+        finished_at = _agent_gateway.finished_at_iso(job, fallback=now)
         # `artifact_url` is denormalized out of the verdict into its own column so the
         # GitHub projection is a column read, not a JSON parse — the briefing and the
         # watchdog both want "what did this dispatch produce" without unpacking a blob.

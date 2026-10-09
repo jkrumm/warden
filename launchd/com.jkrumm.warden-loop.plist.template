@@ -4,7 +4,7 @@
 <dict>
   <key>Label</key><string>com.jkrumm.warden-loop</string>
   <!-- The act-loop. Turns deduplicated ledger events into one durable,
-       updated-in-place Slack card per problem and, once eligible, a real sideclaw
+       updated-in-place Slack card per problem and, once eligible, a real agent-gateway
        episode in the owning repo. No LLM call decides a state transition — the
        episodes each run one, the loop never does.
 

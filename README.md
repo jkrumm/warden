@@ -1,7 +1,7 @@
 # warden
 
 **warden turns a signal into a verified outcome, and it is the only thing that
-holds that state.** Pollers feed it, sideclaw executes for it, Argo and Slack
+holds that state.** Pollers feed it, agent-gateway executes for it, Argo and Slack
 render it. What it is: `DESIGN.md`. Where it is: `STATE.md`. How to work on it:
 `AGENTS.md`.
 

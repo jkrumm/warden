@@ -14,7 +14,7 @@ build log (§1–§139).
 
 ## What is live
 
-The whole loop in `DESIGN.md` § The loop runs: one intake pool → single-shot sideclaw
+The whole loop in `DESIGN.md` § The loop runs: one intake pool → single-shot agent-gateway
 triage (`attach | new | fixed_by | ignore`) → investigate → implement at any
 confidence, revisions on the same PR up to 4 attempts → one merge train per repo
 (`update_pr` → checks → review → squash, all on one SHA) → `make deploy` / `make
@@ -44,7 +44,7 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 - **`failed` is classified.** Every `failed` row carries `failure_class` (`infra` |
   `policy` | `work`) and a re-entry recipe (`redrive_json`). The loop re-drives infra
   after 60/180/480 min (≤3, `redrives` is that budget; it resets once the item reaches
-  merging+), policy once per change of sideclaw's `GET /api/dispatch-policy` hash; work
+  merging+), policy once per change of agent-gateway's `GET /api/dispatch-policy` hash; work
   waits for `warden retry <id> [--why]` or Argo's Retry button. A hand-reverted item is
   never re-driven. `failed` still never posts; the daily count does.
 - **Reinvestigate** (`warden reinvestigate` / Argo) sends an item back to `triaged` for a fresh
@@ -67,11 +67,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `basalt-ui` have no `make deploy`. (`vps`'s `make deploy` without `APP=` deploys
   the affected apps, forwarded to the VPS; `homelab` master has `check`/`verify` and
   the contract sections, 9bc1b5d.)
-- sideclaw serves `dispatch_implement_escalation`; attempt 3+ escalates to it.
-- hermes-agent's sideclaw ceiling is `investigate`: its 6 policy-failed items
+- agent-gateway serves `dispatch_implement_escalation`; attempt 3+ escalates to it.
+- hermes-agent's agent-gateway ceiling is `investigate`: its 6 policy-failed items
   (1114, 1420–1424) re-drive once after the deploy, are refused again, and wait for
-  the ceiling to change. Lift it in sideclaw or close them.
-- sideclaw#10 (item 1302) is an owner call (keep matching `op://` pointers in the diff
+  the ceiling to change. Lift it in agent-gateway or close them.
+- agent-gateway#10 (item 1302) is an owner call (keep matching `op://` pointers in the diff
   secret-scan or not) — left `failed(work)`.
 
 ## Carried debt
@@ -86,7 +86,7 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   ignore later. A `checks_failed` revision loses earlier review findings. Policy
   `rules` stay a label tier until the `## Verify & Monitor` sections cover the
   fleet and a replay routes at least as well.
-- **Review** is not delta-only (sideclaw has no PR delta scope or reviewed SHA).
+- **Review** is not delta-only (agent-gateway has no PR delta scope or reviewed SHA).
 - **Metrics:** auto-reverts are missing from `/metrics`' revert count.
 - **Backup** is `VACUUM INTO` → homelab → restic → B2; restoring from B2 has never
   been drilled.

@@ -4,7 +4,7 @@ record (the Python port of the retired bash CLI's `read_brief`/`read_context`
 1557-1585, and the submit half of `cmd_dispatch` 1395-1414).
 
 `open_episode()` is the one function in this module that did not exist in
-the bash script in this shape: it submits the sideclaw episode in-process,
+the bash script in this shape: it submits the agent-gateway episode in-process,
 with no approval step in front of it.
 """
 
@@ -15,7 +15,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
-from clients import sideclaw
+from clients import agent_gateway
 from clients.errors import PolicyError, RemoteError, UsageError
 
 from . import operations, policy
@@ -109,13 +109,13 @@ def open_episode(
     now: dt.datetime | None = None,
     count_merging: bool = True,
 ) -> Opened:
-    """Submit one sideclaw episode and record it. `revision_of` (a prior episode's
-    `dispatch/*` branch) makes it a revision sideclaw applies to that branch's open PR.
+    """Submit one agent-gateway episode and record it. `revision_of` (a prior episode's
+    `dispatch/*` branch) makes it a revision agent-gateway applies to that branch's open PR.
     `count_merging` is check_repo_not_in_flight()'s (False for a revert).
 
     A gated tier (`implement`) is covered by an `operations` row committed
     BEFORE the submit — DESIGN.md § Crash recovery. A submit that fails definitively
-    resolves it `failed`; one that MAY have reached sideclaw (`maybe_mutated`) leaves it
+    resolves it `failed`; one that MAY have reached agent-gateway (`maybe_mutated`) leaves it
     open, annotated, for reconcile_operations(). `authorized_by` is the
     audit label that row records and is required for a gated tier."""
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -158,7 +158,7 @@ def open_episode(
         conn.commit()
 
     try:
-        job = sideclaw.submit(
+        job = agent_gateway.submit(
             cwd=str(policy.repo_cwd(repo)),
             tier=tier,
             brief=brief,
@@ -169,7 +169,7 @@ def open_episode(
     except RemoteError as exc:
         if gated and opened_op_id is not None:
             if exc.maybe_mutated:
-                # sideclaw MAY have accepted the job, and no job id came back to ask
+                # agent-gateway MAY have accepted the job, and no job id came back to ask
                 # about: the operation stays OPEN (it is also what holds the per-repo
                 # in-flight lock) and reconcile_operations() decides — never a blind
                 # re-submit, which would open a second episode for the same work.
@@ -202,7 +202,7 @@ def open_review(
     model: str | None = None,
     now: dt.datetime | None = None,
 ) -> Opened:
-    """Submit one sideclaw `review` episode and record it in `dispatches`
+    """Submit one agent-gateway `review` episode and record it in `dispatches`
     with `tier='review'` — the review counterpart to `open_episode()` above,
     sharing its exact `dispatches` INSERT shape (job_id, tier, repo, brief,
     why, origin_channel, origin_thread_ts, origin_event_id, status,
@@ -210,17 +210,17 @@ def open_review(
     row. `brief` has no review equivalent — `dispatches.brief` is NOT NULL,
     so this stores a short description of what was reviewed instead.
 
-    Not gated: `review` runs read-only on sideclaw's side (no write tool
+    Not gated: `review` runs read-only on agent-gateway's side (no write tool
     profile, no branch, no PR), so unlike `open_episode()`'s `implement`
     path there is no `operations` row to cover a crash between submit and
     record — a review job with no matching `dispatches` row is, at worst, an
-    orphaned read-only sideclaw session, not an unaccounted mutation.
+    orphaned read-only agent-gateway session, not an unaccounted mutation.
 
     `model` mirrors `open_episode()`'s own parameter — `None` leaves the job
-    on sideclaw's own routing, a non-Claude IU model id pins it there
+    on agent-gateway's own routing, a non-Claude IU model id pins it there
     instead."""
     now = now or dt.datetime.now(dt.timezone.utc)
-    job = sideclaw.submit_review(cwd=policy.repo_cwd(repo), pr=pr, context=context, model=model)
+    job = agent_gateway.submit_review(cwd=policy.repo_cwd(repo), pr=pr, context=context, model=model)
     job_id = job["id"]
     status = job.get("status") or "unknown"
     _insert_dispatch_row(conn, job_id=job_id, tier="review", repo=repo,
@@ -234,14 +234,14 @@ def sync_record(conn: sqlite3.Connection, job: dict, *, reported: bool, now: dt.
     port of the retired bash CLI's `sync_record` (1470-1498), schema-6
     `delivery_status` included.
 
-    `finished_at` is sideclaw's own `job["finishedAt"]` (see
-    `clients.sideclaw.finished_at_iso()`), not `now` — `now` is only the
+    `finished_at` is agent-gateway's own `job["finishedAt"]` (see
+    `clients.agent_gateway.finished_at_iso()`), not `now` — `now` is only the
     fallback for the rare terminal job that carries no such field, and it is
     still used for `reported_at`/`delivery_status`, which genuinely are
     stamped at THIS moment (this call is the report)."""
     now = now or dt.datetime.now(dt.timezone.utc)
     now_iso = now.isoformat()
-    finished_at = sideclaw.finished_at_iso(job, fallback=now)
+    finished_at = agent_gateway.finished_at_iso(job, fallback=now)
     result = job.get("result")
     artifact = (result.get("artifactUrl") or None) if isinstance(result, dict) else None
     reported_at = now_iso if reported else None
@@ -269,7 +269,7 @@ def list_dispatches(conn: sqlite3.Connection, scope: str, now: dt.datetime) -> l
         raise UsageError(f"unknown list scope: {scope} (must be one of: open today all)")
 
     if scope == "open":
-        terminal = tuple(sideclaw.TERMINAL)
+        terminal = tuple(agent_gateway.TERMINAL)
         placeholders = ",".join("?" for _ in terminal)
         rows = conn.execute(
             f"SELECT * FROM dispatches WHERE status NOT IN ({placeholders}) OR reported_at IS NULL "

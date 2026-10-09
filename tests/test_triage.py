@@ -2,7 +2,7 @@
 """Regression suite for scripts/triage.py — the act-loop that turns
 deduplicated watchdog.db events into one durable, updated-in-place Slack card
 per problem (or per CLUSTER of co-occurring problems in one repo), with a
-real sideclaw investigation attached once a signature repeats or stays open.
+real agent-gateway investigation attached once a signature repeats or stays open.
 
 HOUSE CONVENTION, not pytest: this repo's `~/.hermes/hermes-agent/venv` has no
 pytest installed (see docs/patches.md's "unrunnable here anyway" note) and
@@ -50,7 +50,7 @@ TRIAGE_PATH = REPO_ROOT / "scripts" / "triage.py"
 # The loop modules are imported as real packages, so the module objects patched here are
 # the very ones scripts/triage.py (loaded by path below) and its stages read at call time.
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-from clients import argo as _argo, github as _github, sideclaw as _sideclaw  # noqa: E402
+from clients import argo as _argo, github as _github, agent_gateway as _agent_gateway  # noqa: E402
 from clients.errors import HeadMoved, PolicyError, RemoteError, SubmitRefused  # noqa: E402
 from lifecycle import dispatch as _dispatch, intake as _intake, items as _items  # noqa: E402
 from lifecycle import merge as _merge, rollout as _rollout  # noqa: E402
@@ -95,7 +95,7 @@ def _write_json(path: Path, data: Any) -> None:
 
 
 def _default_fake_submit(*, cwd, tier, brief, context=None, model=None, revision_of=None):
-    """The module-level default for `triage._sideclaw.submit` inside
+    """The module-level default for `triage._agent_gateway.submit` inside
     `_triage_env()` — used by every test that never touches dispatch at all
     (classify-only, resolve-only tests) so an accidental real HTTP call is
     structurally impossible rather than merely unlikely."""
@@ -108,7 +108,7 @@ def _default_fake_get(job_id):
 
 def _triage_job(answer: dict[str, Any], *, job_id: str = "triage-job-000001",
                 status: str = "done", error: str | None = None) -> dict[str, Any]:
-    """A sideclaw `triage` job as `get()` returns it: the schema-validated answer sits at
+    """A agent-gateway `triage` job as `get()` returns it: the schema-validated answer sits at
     `result.result`."""
     job: dict[str, Any] = {"id": job_id, "status": status}
     if status == "done":
@@ -147,7 +147,7 @@ def _triage_pass(conn, now=None) -> None:
 
 
 def _default_fake_submit_triage(*, prompt, schema):
-    """The module-level default for `triage._sideclaw.submit_triage` inside `_triage_env()`:
+    """The module-level default for `triage._agent_gateway.submit_triage` inside `_triage_env()`:
     every item is routed `new` to demo-repo, in a job that is already finished when the submit
     returns (so a pass needs no `get()` fake) — the role the retired `slack_alert:sig-*` rule
     played for every test that is not about intake."""
@@ -156,7 +156,7 @@ def _default_fake_submit_triage(*, prompt, schema):
 
 
 def _default_fake_submit_review(*, cwd, pr, context=None, model=None):
-    """The module-level default for `triage._sideclaw.submit_review` inside
+    """The module-level default for `triage._agent_gateway.submit_review` inside
     `_triage_env()` — same "an accidental real HTTP call is structurally
     impossible" contract as `_default_fake_submit` above, for the step-7
     `review` dispatch (Wave 6.2)."""
@@ -179,7 +179,7 @@ TRAIN_SHA = "a" * 40
 REBASED_SHA = "b" * 40
 PR_HEAD: dict[str, Any] = {}
 CHECK_RUNS: dict[str, Any] = {}
-# sideclaw's `GET /api/dispatch-policy` as the fixture answers it: `body` is the JSON object, or None
+# agent-gateway's `GET /api/dispatch-policy` as the fixture answers it: `body` is the JSON object, or None
 # for "unreachable" (a RemoteError). A policy re-drive test changes it between passes.
 DISPATCH_POLICY: dict[str, Any] = {}
 
@@ -203,7 +203,7 @@ def _default_fake_submit_update_pr(*, cwd, pr):
 
 def _default_fake_dispatch_policy():
     if DISPATCH_POLICY["body"] is None:
-        raise RemoteError("test: sideclaw is unreachable")
+        raise RemoteError("test: agent-gateway is unreachable")
     return dict(DISPATCH_POLICY["body"])
 
 
@@ -212,9 +212,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
     """Stand up a throwaway watchdog.db + policy fixture,
     point loop/core.py's module globals at them, stub Slack (post_line/
     resolve_slack_token) to record calls with no network, fake
-    the client boundary (`_sideclaw`, `_github`) so no test ever reaches a real HTTP call, and restore
+    the client boundary (`_agent_gateway`, `_github`) so no test ever reaches a real HTTP call, and restore
     every patched attribute on exit. Yields (conn, ctx) where ctx exposes the
-    recorded Slack calls; a test overrides `_sideclaw.submit`/`.get`
+    recorded Slack calls; a test overrides `_agent_gateway.submit`/`.get`
     or `_merge.plan_or_land` directly for its own scenario, the same
     monkeypatch shape tests/test_lifecycle.py already uses."""
     tmp_dir = Path(tempfile.mkdtemp(prefix="triage-test-"))
@@ -230,21 +230,21 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         "TRIAGE_REPO_DIR": core.TRIAGE_REPO_DIR,
     }
     # The client-boundary modules: the SAME module objects `lifecycle`
-    # itself imports (`from clients import sideclaw`, `from lifecycle import
+    # itself imports (`from clients import agent_gateway`, `from lifecycle import
     # policy`), so patching an attribute here is visible to lifecycle/*.py
     # too.
     saved_client_attrs = {
-        ("_sideclaw", "submit"): _sideclaw.submit,
-        ("_sideclaw", "submit_review"): _sideclaw.submit_review,
-        ("_sideclaw", "submit_triage"): _sideclaw.submit_triage,
-        ("_sideclaw", "submit_update_pr"): _sideclaw.submit_update_pr,
+        ("_agent_gateway", "submit"): _agent_gateway.submit,
+        ("_agent_gateway", "submit_review"): _agent_gateway.submit_review,
+        ("_agent_gateway", "submit_triage"): _agent_gateway.submit_triage,
+        ("_agent_gateway", "submit_update_pr"): _agent_gateway.submit_update_pr,
         ("_github", "check_runs"): _github.check_runs,
         ("_github", "workflow_runs"): _github.workflow_runs,
-        ("_sideclaw", "get"): _sideclaw.get,
-        ("_sideclaw", "wait"): _sideclaw.wait,
-        ("_sideclaw", "cancel"): _sideclaw.cancel,
-        ("_sideclaw", "escalation_model"): _sideclaw.escalation_model,
-        ("_sideclaw", "dispatch_policy"): _sideclaw.dispatch_policy,
+        ("_agent_gateway", "get"): _agent_gateway.get,
+        ("_agent_gateway", "wait"): _agent_gateway.wait,
+        ("_agent_gateway", "cancel"): _agent_gateway.cancel,
+        ("_agent_gateway", "escalation_model"): _agent_gateway.escalation_model,
+        ("_agent_gateway", "dispatch_policy"): _agent_gateway.dispatch_policy,
         ("_github", "search_issues"): _github.search_issues,
         ("_github", "create_issue_comment"): _github.create_issue_comment,
         ("_github", "close_pr"): _github.close_pr,
@@ -272,16 +272,16 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         (tmp_dir / "repos-root" / "demo-repo").mkdir(parents=True)
         (tmp_dir / "repos-root" / "demo-repo" / "AGENTS.md").write_text("# demo-repo\n\nA demo service.\n")
 
-        _sideclaw.submit = _default_fake_submit
-        _sideclaw.submit_triage = _default_fake_submit_triage
-        _sideclaw.submit_review = _default_fake_submit_review
-        _sideclaw.submit_update_pr = _default_fake_submit_update_pr
-        _sideclaw.get = _default_fake_get
-        _sideclaw.escalation_model = lambda: None
+        _agent_gateway.submit = _default_fake_submit
+        _agent_gateway.submit_triage = _default_fake_submit_triage
+        _agent_gateway.submit_review = _default_fake_submit_review
+        _agent_gateway.submit_update_pr = _default_fake_submit_update_pr
+        _agent_gateway.get = _default_fake_get
+        _agent_gateway.escalation_model = lambda: None
         DISPATCH_POLICY.clear()
         DISPATCH_POLICY.update(body={"rules": {}, "overrides": []})
-        _sideclaw.dispatch_policy = _default_fake_dispatch_policy
-        _sideclaw.cancel = lambda job_id: (_ for _ in ()).throw(
+        _agent_gateway.dispatch_policy = _default_fake_dispatch_policy
+        _agent_gateway.cancel = lambda job_id: (_ for _ in ()).throw(
             RemoteError(f"test: no fake cancel registered for {job_id}"))
         # ingest_github_issues() runs unconditionally on every run() pass
         # (Wave 6.1, same as ingest() itself) — unlike the writes below, an
@@ -412,14 +412,14 @@ def _insert_event(conn: sqlite3.Connection, *, source: str, external_id: str, ti
 
 
 def _fake_submit(calls: list[dict[str, Any]], *, ok: bool = True):
-    """Replaces `triage._sideclaw.submit` for tests that care about
+    """Replaces `triage._agent_gateway.submit` for tests that care about
     triage.py's OWN orchestration (dedup, clustering, caps, edges) rather
-    than sideclaw's own transport — see test_dispatch_brief_on_stdin_and_capped
+    than agent-gateway's own transport — see test_dispatch_brief_on_stdin_and_capped
     for the one test that asserts on the exact brief this fake receives.
     `open_episode()` (lifecycle/dispatch.py) does its own `dispatches` INSERT
     from this fake's return value, so — unlike the retired `_fake_dispatcher`
     — this fake has no ledger to write to at all; `calls` only ever records
-    what `sideclaw.submit()` itself receives (`cwd`, `tier`, `brief`, …),
+    what `agent-gateway.submit()` itself receives (`cwd`, `tier`, `brief`, …),
     never `repo`/`event_id`/`channel`/`thread_ts`, which are never part of
     that call — a test that needs one of those reads the `dispatches` row
     `open_episode()` wrote instead."""
@@ -456,7 +456,7 @@ def _fake_submit_review(calls: list[dict[str, Any]], *, ok: bool = True):
 
 def _review_result(outcome: str, *, blocking: list[dict[str, Any]] | None = None,
                     summary: str = "looks right.", schema_version: int = 1) -> dict[str, Any]:
-    """A literal sideclaw `review` job result (server/jobs/handlers/
+    """A literal agent-gateway `review` job result (server/jobs/handlers/
     review.ts SYNTHESIS_OUTPUT) — replaces the old VALIDATION_CONFIRM/
     DISAGREE marker-in-prose fixtures the step-7 poll used to substring-match."""
     return {
@@ -557,7 +557,7 @@ def test_repeated_signature_one_investigation_and_no_slack_post():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-a", title="Alert A", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         assert triage.run(conn, dry_run=False) == 0
         assert triage.run(conn, dry_run=False) == 0  # a second cron cycle, nothing changed
@@ -576,7 +576,7 @@ def test_new_state_item_gets_no_post():
     with _triage_env(policy=policy) as (conn, ctx):
         _insert_event(conn, source="slack_alert", external_id="sig-fresh", title="Not yet eligible", first_seen=NOW)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == []
         assert ctx.total_calls() == 0, "an item still in `new` must never post"
@@ -589,12 +589,12 @@ def test_ignored_backlog_posts_zero_slack_calls():
     noise signatures close `ignored`, silent, and nothing dispatches."""
     with _triage_env() as (conn, ctx):
         ignore = {"action": "ignore", "reason": "noise"}
-        _sideclaw.submit_triage = _fake_triage({f"Nowhere {i}": ignore for i in range(5)})
+        _agent_gateway.submit_triage = _fake_triage({f"Nowhere {i}": ignore for i in range(5)})
         for i in range(5):
             _insert_event(conn, source="slack_alert", external_id=f"sig-nowhere-{i}",
                            title=f"Nowhere {i}", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == []
         assert ctx.total_calls() == 0, f"expected zero Slack calls, got {ctx.total_calls()}"
@@ -607,7 +607,7 @@ def test_both_missing_edges_are_written():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-edges", title="Edges", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
 
         event_row = core.get_event(conn, eid)
@@ -626,7 +626,7 @@ def test_min_occurrences_withholds():
         eid = _insert_event(conn, source="slack_alert", external_id="sig-thresh", title="Low count",
                              first_seen=NOW, reminder_count=0)  # occurrences resolves to 1
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == [], "should not have escalated below minOccurrences and inside minOpenMinutes"
         item = core.get_item(conn, eid)
@@ -639,7 +639,7 @@ def test_min_open_minutes_withholds_then_allows():
         fresh = NOW - dt.timedelta(minutes=5)
         eid = _insert_event(conn, source="slack_alert", external_id="sig-age", title="Too fresh", first_seen=fresh)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == [], "should not escalate before minOpenMinutes has elapsed"
 
@@ -653,12 +653,12 @@ def test_min_open_minutes_withholds_then_allows():
 
 def test_triage_ignore_never_posts_or_escalates():
     with _triage_env() as (conn, ctx):
-        _sideclaw.submit_triage = _fake_triage(
+        _agent_gateway.submit_triage = _fake_triage(
             {"All good now": {"action": "ignore", "reason": "a recovery notice"}})
         _insert_event(conn, source="slack_alert", external_id="ignoreme-recovery", title="All good now",
                        first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == []
         assert ctx.total_calls() == 0, "an ignored signature must never post"
@@ -682,8 +682,8 @@ def test_unstructured_prose_is_closed_ignored_and_never_escalates_or_posts():
                        title="[API - HTTP] [:red_circle: Down] timeout <!channel>", first_seen=OLD)
         calls: list[dict[str, Any]] = []
         triage_calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
-        _sideclaw.submit_triage = _fake_triage(
+        _agent_gateway.submit = _fake_submit(calls)
+        _agent_gateway.submit_triage = _fake_triage(
             {"[API - HTTP] [:red_circle: Down] timeout <!channel>": "demo-repo"}, calls=triage_calls)
         triage.run(conn, dry_run=False)
 
@@ -714,7 +714,7 @@ def test_bold_wrapped_bot_alert_prefixes_are_not_unstructured_prose():
         _insert_event(conn, source="slack_alert", external_id="bold-warning-alert",
                       title="*⚠️ Queue backed up", first_seen=OLD)
         triage_calls: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = _fake_triage({
+        _agent_gateway.submit_triage = _fake_triage({
             "*🚨 Disk almost full on mini": "demo-repo",
             "*⚠️ Queue backed up": "demo-repo",
         }, calls=triage_calls)
@@ -758,10 +758,10 @@ def test_max_open_investigations_cap():
         # A different repo so it does NOT cluster with sig-cap-a — this test
         # is about the concurrency cap across independent clusters.
         _add_repo(ctx, "other-repo")
-        _sideclaw.submit_triage = _fake_triage({"A": "demo-repo", "B": "other-repo"})
+        _agent_gateway.submit_triage = _fake_triage({"A": "demo-repo", "B": "other-repo"})
         _insert_event(conn, source="slack_alert", external_id="sig-cap-b", title="B", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert len(calls) == 1, f"MAX_OPEN_INVESTIGATIONS=1 must cap concurrent clusters, got {len(calls)}"
         states = [r["state"] for r in conn.execute("SELECT state FROM triage_items ORDER BY event_id").fetchall()]
@@ -771,25 +771,25 @@ def test_max_open_investigations_cap():
 
 def _refusing_submit(calls: list[dict[str, Any]], *, status: int = 400,
                      message: str = "dispatch refused: tier 'implement' exceeds the ceiling for repo 'demo-repo'"):
-    """A `submit` that answers like sideclaw refusing the job: a 4xx, which the
+    """A `submit` that answers like agent-gateway refusing the job: a 4xx, which the
     client raises as `SubmitRefused` — a refusal the same submit will hit again."""
     def _submit(*, cwd, tier, brief, context=None, model=None, revision_of=None):
         calls.append({"cwd": cwd, "tier": tier, "model": model})
-        raise SubmitRefused(f"sideclaw refused the job (HTTP {status}): {message}", status=status)
+        raise SubmitRefused(f"agent-gateway refused the job (HTTP {status}): {message}", status=status)
     return _submit
 
 
-def test_sideclaw_refusal_of_an_investigate_dispatch_ends_the_item_and_is_never_retried():
-    """warden carries no repo/tier policy: it submits, and a sideclaw 4xx ends the
-    item `failed` carrying sideclaw's own message, immediately — a 4xx is not an
+def test_agent_gateway_refusal_of_an_investigate_dispatch_ends_the_item_and_is_never_retried():
+    """warden carries no repo/tier policy: it submits, and a agent-gateway 4xx ends the
+    item `failed` carrying agent-gateway's own message, immediately — a 4xx is not an
     infrastructure failure, so no strike and no retry. The next tick must not submit
     the same refused dispatch again."""
     with _triage_env() as (conn, ctx):
         _add_repo(ctx, "refused-repo")
-        _sideclaw.submit_triage = _fake_triage({"Refused": "refused-repo"})
+        _agent_gateway.submit_triage = _fake_triage({"Refused": "refused-repo"})
         _insert_event(conn, source="slack_alert", external_id="sig-refused", title="Refused", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _refusing_submit(calls, message="dispatch refused: repo is not allowed")
+        _agent_gateway.submit = _refusing_submit(calls, message="dispatch refused: repo is not allowed")
         triage.run(conn, dry_run=False)
         assert len(calls) == 1, calls
         item = conn.execute("SELECT state, repo, note, dispatch_job, failure_class FROM triage_items").fetchone()
@@ -805,7 +805,7 @@ def test_sideclaw_refusal_of_an_investigate_dispatch_ends_the_item_and_is_never_
         assert conn.execute("SELECT state FROM triage_items").fetchone()["state"] == core.STATE_FAILED
 
 
-def test_sideclaw_5xx_on_an_investigate_dispatch_retries_with_backoff_and_fails_on_the_third():
+def test_agent_gateway_5xx_on_an_investigate_dispatch_retries_with_backoff_and_fails_on_the_third():
     """The refusal path is 4xx only: a 5xx / connection failure is an infrastructure
     failure. The item strikes back to `triaged`, the next submit waits out the
     backoff (10 min, then 30), and the third strike lands `failed` carrying the
@@ -813,7 +813,7 @@ def test_sideclaw_5xx_on_an_investigate_dispatch_retries_with_backoff_and_fails_
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-flaky", title="Flaky", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls, ok=False)
+        _agent_gateway.submit = _fake_submit(calls, ok=False)
         triage.run(conn, dry_run=False)
         item = core.get_item(conn, eid)
         assert len(calls) == 1
@@ -841,11 +841,11 @@ def test_sideclaw_5xx_on_an_investigate_dispatch_retries_with_backoff_and_fails_
 
 
 def test_auto_dispatches_send_no_model_key():
-    """warden never picks the worker model: sideclaw routes each tier."""
+    """warden never picks the worker model: agent-gateway routes each tier."""
     with _triage_env() as (conn, ctx):
         _insert_event(conn, source="slack_alert", external_id="sig-nomodel", title="No model", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert len(calls) == 1 and calls[0]["model"] is None, calls
         assert not _loop_defines("AUTO_DISPATCH_MODEL") and not _loop_defines("AUTO_IMPLEMENT_MODEL")
@@ -853,7 +853,7 @@ def test_auto_dispatches_send_no_model_key():
 
 def test_triage_naming_an_unknown_repo_never_dispatches():
     with _triage_env() as (conn, ctx):
-        _sideclaw.submit_triage = _fake_triage({"Nowhere": "no-such-repo"})
+        _agent_gateway.submit_triage = _fake_triage({"Nowhere": "no-such-repo"})
         _insert_event(conn, source="slack_alert", external_id="sig-nowhere", title="Nowhere", first_seen=OLD)
         # Pre-seed today's unmapped-digest cursor so the separate, deliberate
         # digest mechanism doesn't count against "an unescalated item gets no card".
@@ -862,7 +862,7 @@ def test_triage_naming_an_unknown_repo_never_dispatches():
                      (core.DAILY_DIGEST_CURSOR_KEY, today, NOW.isoformat()))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert calls == [], "a repo no checkout backs must never produce a dispatch"
         item = conn.execute("SELECT state, repo, strikes, triage_job FROM triage_items").fetchone()
@@ -876,7 +876,7 @@ def test_cluster_same_repo_one_dispatch_both_edges():
         e1 = _insert_event(conn, source="slack_alert", external_id="sig-cluster-a", title="A", first_seen=OLD)
         e2 = _insert_event(conn, source="slack_alert", external_id="sig-cluster-b", title="B", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
 
         assert len(calls) == 1, f"two eligible items in the same repo must open exactly one dispatch, got {len(calls)}"
@@ -895,11 +895,11 @@ def test_cluster_same_repo_one_dispatch_both_edges():
 def test_cluster_different_repos_two_dispatches():
     with _triage_env() as (conn, ctx):
         _add_repo(ctx, "other-repo")
-        _sideclaw.submit_triage = _fake_triage({"A": "demo-repo", "B": "other-repo"})
+        _agent_gateway.submit_triage = _fake_triage({"A": "demo-repo", "B": "other-repo"})
         _insert_event(conn, source="slack_alert", external_id="sig-diff-a", title="A", first_seen=OLD)
         _insert_event(conn, source="slack_alert", external_id="sig-diff-b", title="B", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert len(calls) == 2, f"two eligible items in different repos must open two dispatches, got {len(calls)}"
 
@@ -909,7 +909,7 @@ def test_cluster_dissolves_on_unrelated_verdict():
         e1 = _insert_event(conn, source="slack_alert", external_id="sig-split-a", title="A", first_seen=OLD)
         e2 = _insert_event(conn, source="slack_alert", external_id="sig-split-b", title="B", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         job_id = core.get_item(conn, e1)["dispatch_job"]
         assert job_id is not None
@@ -954,7 +954,7 @@ def test_dissolve_cluster_dry_run_performs_state_change_without_slack_call():
         e2 = _insert_event(conn, source="slack_alert", external_id="sig-dryrun-split-b", title="B",
                             first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         job_id = core.get_item(conn, e1)["dispatch_job"]
         assert job_id is not None
@@ -990,7 +990,7 @@ def test_split_state_survives_apply_resolutions_state_43_regression():
         e1 = _insert_event(conn, source="slack_alert", external_id="sig-43-a", title="A", first_seen=OLD)
         e2 = _insert_event(conn, source="slack_alert", external_id="sig-43-b", title="B", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         job_id = core.get_item(conn, e1)["dispatch_job"]
 
@@ -1034,7 +1034,7 @@ def test_escalate_singleton_splits_never_group():
         e1 = _seed_split_item(conn, external_id="sig-solo-a", dispatch_job="job-old-cluster")
         e2 = _seed_split_item(conn, external_id="sig-solo-b", dispatch_job="job-old-cluster")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert len(calls) == 1, (
@@ -1048,7 +1048,7 @@ def test_escalate_singleton_splits_never_group():
         # NOT "the other signature's text is absent from the brief": the
         # waiting item legitimately still appears there as sibling CONTEXT
         # (_sibling_open_items(), unrelated to cluster membership), same as
-        # any other open item in the repo would. `sideclaw.submit()` itself
+        # any other open item in the repo would. `agent-gateway.submit()` itself
         # never receives an event_id (open_episode() writes it straight to
         # the dispatches row), so this reads the row instead of `calls`.
         origin_event_id = _last_dispatch_origin_event_id(conn)
@@ -1078,7 +1078,7 @@ def test_escalate_prefers_singleton_over_cluster_in_same_repo_and_defers_cluster
         )
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -1127,7 +1127,7 @@ def test_a_capped_attempt_does_not_claim_to_have_deferred_anyone():
             )
             conn.commit()
             calls: list[dict[str, Any]] = []
-            _sideclaw.submit = _fake_submit(calls)
+            _agent_gateway.submit = _fake_submit(calls)
             core.MAX_OPEN_INVESTIGATIONS = 0
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -1158,14 +1158,14 @@ def test_cooldown_holds_back_split_member_inside_cooldown_hours():
         _insert_dispatch_row(conn, "job-recent", recent)
         eid = _seed_split_item(conn, external_id="sig-cooldown-split", dispatch_job="job-recent")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "inside cooldownHours, a split item must not re-escalate"
         assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
 
 
 def test_dispatch_brief_on_stdin_and_capped():
-    """The brief travels to `sideclaw.submit()` as a plain function argument
+    """The brief travels to `agent-gateway.submit()` as a plain function argument
     now — there is no argv, no subprocess, no stdin at all, so "never
     touches argv" is a structural property of the Python call, not
     something to assert against a stub script any more. What still needs a
@@ -1178,7 +1178,7 @@ def test_dispatch_brief_on_stdin_and_capped():
         eid = _insert_event(conn, source="slack_alert", external_id="sig-huge", title=huge_title, first_seen=OLD)
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         triage.run(conn, dry_run=False)
 
@@ -1190,7 +1190,7 @@ def test_dispatch_brief_on_stdin_and_capped():
         )
         assert brief, "brief was empty"
         assert calls[0]["model"] is None, (
-            "auto-investigate must send no model override by default, so sideclaw "
+            "auto-investigate must send no model override by default, so agent-gateway "
             f"routes the tier itself — got {calls[0]['model']!r}"
         )
 
@@ -1205,7 +1205,7 @@ def test_quiet_resolution_never_posts():
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="sig-resolve", title="Resolve me", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
 
         conn.execute("UPDATE triage_items SET state=? WHERE event_id=?", (core.STATE_NEW, eid))
@@ -1222,8 +1222,8 @@ def test_dry_run_never_calls_slack_or_dispatch():
         _insert_event(conn, source="slack_alert", external_id="sig-dry", title="Dry run", first_seen=OLD)
         calls: list[dict[str, Any]] = []
         triage_calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
-        _sideclaw.submit_triage = _fake_triage({"Dry run": "demo-repo"}, calls=triage_calls)
+        _agent_gateway.submit = _fake_submit(calls)
+        _agent_gateway.submit_triage = _fake_triage({"Dry run": "demo-repo"}, calls=triage_calls)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             triage.run(conn, dry_run=True)
@@ -1353,7 +1353,7 @@ def test_human_item_escalates_as_a_cluster_of_one_with_its_own_brief():
             external_id="human:solo-1", title="flaky test", now=NOW,
         )
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _triage_pass(conn)
         work.escalate_origin_items(conn, NOW)
 
@@ -1379,7 +1379,7 @@ def test_human_item_with_its_own_origin_thread_routes_the_dispatch_there():
         item = core.get_item(conn, eid)
         assert item["origin_channel"] == "C0ORIGIN0001" and item["origin_thread_ts"] == "1111.000001"
 
-        _sideclaw.submit = _fake_submit([])
+        _agent_gateway.submit = _fake_submit([])
         _triage_pass(conn)
         work.escalate_origin_items(conn, NOW)
 
@@ -1402,7 +1402,7 @@ def test_human_item_without_its_own_origin_thread_falls_back_to_the_card_channel
         item = core.get_item(conn, eid)
         assert item["origin_channel"] is None and item["origin_thread_ts"] is None
 
-        _sideclaw.submit = _fake_submit([])
+        _agent_gateway.submit = _fake_submit([])
         _triage_pass(conn)
         work.escalate_origin_items(conn, NOW)
 
@@ -1423,7 +1423,7 @@ def test_escalate_origin_items_overflow_waits_in_triaged_with_note():
                 external_id="human:overflow-1", title="ask", now=NOW,
             )
             calls: list[dict[str, Any]] = []
-            _sideclaw.submit = _fake_submit(calls)
+            _agent_gateway.submit = _fake_submit(calls)
             _triage_pass(conn)
             work.escalate_origin_items(conn, NOW)
 
@@ -1482,7 +1482,7 @@ def test_escalate_origin_items_reclaims_investigating_orphan_with_no_dispatch_jo
         conn.commit()
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate_origin_items(conn, NOW)
 
         item = core.get_item(conn, eid)
@@ -1505,7 +1505,7 @@ def test_escalate_origin_items_leaves_a_live_claim_alone_and_a_lost_cas_skips():
                         expect_state=core.STATE_NEW)   # the other caller's claim, mid-dispatch
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate_origin_items(conn, NOW)
         item = core.get_item(conn, eid)
         assert calls == [] and item["state"] == core.STATE_WORKING and item["dispatch_job"] is None, dict(item)
@@ -1550,7 +1550,7 @@ def test_maybe_auto_implement_blocked_by_investigate_ceiling():
         conn.commit()
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert calls == [], "max_tier='investigate' must never reach an implement dispatch"
@@ -1625,7 +1625,7 @@ def _fold_alert_verdict(conn, ext: str, *, status: str = "done", verdict: dict[s
 
 
 def test_fold_dispatch_verdict_next_action_to_state_table():
-    """The verdict -> state table of the spec (sideclaw's nextAction enum
+    """The verdict -> state table of the spec (agent-gateway's nextAction enum
     none|issue|implement|human):
 
       implement | issue -> working (waiting for its implement dispatch)
@@ -1770,7 +1770,7 @@ def test_fold_dispatch_verdict_failed_with_no_verdict_is_a_strike_not_a_parked_v
     collector — see ledger.py migration 10): a killed episode with
     verdict_json left NULL must never park as a verdict-less verdict. It is an
     infrastructure failure: the item strikes back to `triaged` for a fresh
-    investigation after the backoff, the note naming the tier and sideclaw's own
+    investigation after the backoff, the note naming the tier and agent-gateway's own
     error text."""
     with _triage_env() as (conn, ctx):
         item = _fold_alert_verdict(conn, "sig-timeout-1", status="failed", verdict=None,
@@ -2165,7 +2165,7 @@ def test_escalate_origin_items_wraps_third_party_github_issue_body_as_untrusted(
             payload={"repo": "demo-repo", "number": 12, "author": "some-stranger"}, now=NOW,
         )
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _triage_pass(conn)
         work.escalate_origin_items(conn, NOW)
 
@@ -2212,7 +2212,7 @@ def test_escalate_origin_items_own_github_issue_brief_carries_closes_guidance():
             payload={"repo": "demo-repo", "number": 13, "author": _github.GH_OWNER}, now=NOW,
         )
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _triage_pass(conn)
         work.escalate_origin_items(conn, NOW)
 
@@ -2280,7 +2280,7 @@ def test_fold_dispatch_verdict_updates_every_cluster_member():
         e1 = _insert_event(conn, source="slack_alert", external_id="sig-fm-a", title="A", first_seen=OLD)
         e2 = _insert_event(conn, source="slack_alert", external_id="sig-fm-b", title="B", first_seen=OLD)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         job_id = core.get_item(conn, e1)["dispatch_job"]
 
@@ -2793,8 +2793,8 @@ def test_recovery_pairing_skipped_under_dry_run():
 
 # =============================================================================
 # The auto-implement chain (steps 6-10) — verdict -> implement -> validate ->
-# merge -> deploy -> verify. The client boundary (sideclaw, GitHub) is faked
-# via triage._sideclaw/triage._policy/triage._github/triage._merge — the
+# merge -> deploy -> verify. The client boundary (agent-gateway, GitHub) is faked
+# via triage._agent_gateway/triage._policy/triage._github/triage._merge — the
 # same shape _fake_submit already uses for escalate_cluster() above, now the
 # only points this file ever crosses into a remote call for this chain.
 # =============================================================================
@@ -2868,12 +2868,12 @@ def test_auto_implement_fires_at_any_confidence_with_no_wait():
                 for c in ("high", "medium", "low")}
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert len(calls) == 3, f"every confidence must auto-implement, got {len(calls)} submit call(s)"
         assert all(c["model"] is None for c in calls), (
-            "auto-implement must send no model override by default, so sideclaw routes the implement tier itself")
+            "auto-implement must send no model override by default, so agent-gateway routes the implement tier itself")
         for conf, eid in eids.items():
             item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_WORKING, f"{conf}: {item['state']}"
@@ -2886,7 +2886,7 @@ def test_auto_implement_ignores_a_verdict_that_does_not_say_implement():
                                     confidence="high", investigate_job=f"investigate-na-{na}")
                 for na in ("none", "review", "monitor", "human")]
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], f"only nextAction=implement may auto-implement, got {calls}"
         for eid in eids:
@@ -2914,7 +2914,7 @@ def test_auto_implement_claims_the_item_before_dispatching():
             observed.append([r["implement_job"] for r in rows])
             return {"id": "implement-job-claim", "status": "queued"}
 
-        _sideclaw.submit = _observing_submit
+        _agent_gateway.submit = _observing_submit
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert observed == [[core.IMPLEMENT_CLAIM]], (
             f"item must already be claimed while the dispatch runs, saw {observed}")
@@ -2923,7 +2923,7 @@ def test_auto_implement_claims_the_item_before_dispatching():
         # A refused (definitely-failed, not merely ambiguous) dispatch hands the claim back.
         eid2 = _seed_verdict_item(conn, external_id="sig-claim-fail", confidence="high", repo="other-repo",
                                   investigate_job="investigate-claim-fail")
-        _sideclaw.submit = _fake_submit([], ok=False)
+        _agent_gateway.submit = _fake_submit([], ok=False)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         back = core.get_item(conn, eid2)
         assert back["state"] == core.STATE_WORKING and back["strikes"] == 1, dict(back)
@@ -2951,7 +2951,7 @@ def test_auto_implement_in_flight_lock_defers_with_a_visible_note():
         conn.commit()
 
         submit_calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(submit_calls)
+        _agent_gateway.submit = _fake_submit(submit_calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         assert submit_calls == [], "an in-flight repo must never open a second implement episode"
@@ -2960,15 +2960,15 @@ def test_auto_implement_in_flight_lock_defers_with_a_visible_note():
         assert item["note"] is not None and item["note"].startswith("deferred: "), item["note"]
 
 
-def test_auto_implement_refused_by_sideclaw_ends_the_item_and_is_never_retried():
-    """A repo capped below `implement` is sideclaw's call, answered as a 4xx on
+def test_auto_implement_refused_by_agent_gateway_ends_the_item_and_is_never_retried():
+    """A repo capped below `implement` is agent-gateway's call, answered as a 4xx on
     submit. The claim is NOT handed back to `verdict` (that flapped item 543
     between verdict and implementing every tick, §67): the item ends
-    `failed` carrying sideclaw's message and the next tick does not submit."""
+    `failed` carrying agent-gateway's message and the next tick does not submit."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-capped", repo="capped-repo")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _refusing_submit(
+        _agent_gateway.submit = _refusing_submit(
             calls, message="dispatch refused: tier 'implement' exceeds the ceiling 'investigate' for 'capped-repo'")
 
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -2996,13 +2996,13 @@ def test_implement_success_joins_the_merge_train_at_update():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-002")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": {"outcome": "pr_opened", "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/9",
-                       "branch": "dispatch/demo-repo-9", "schemaVersion": _sideclaw.DISPATCH_SCHEMA_VERSION},
+                       "branch": "dispatch/demo-repo-9", "schemaVersion": _agent_gateway.DISPATCH_SCHEMA_VERSION},
         }
         validation_calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(validation_calls)
+        _agent_gateway.submit_review = _fake_submit_review(validation_calls)
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -3015,12 +3015,12 @@ def test_implement_success_joins_the_merge_train_at_update():
 
 
 def test_poll_reads_artifact_and_verdict_from_the_nested_result():
-    """Pins the nested sideclaw job envelope shape (server/jobs/jobs/types.ts
+    """Pins the nested agent-gateway job envelope shape (server/jobs/jobs/types.ts
     `JobView`, server/jobs/handlers/dispatch.ts `DISPATCH_OUTPUT`) —
     `{id, tool, status, result: {...}, error, progress, ...}` — with the
     verdict fields (`artifactUrl`, `branch`, `verdict`, `summary`, ...)
     nested INSIDE `result`, never at the top level. A literal copy of a real
-    sideclaw job (fetched live via `curl -s localhost:7705/api/jobs`,
+    agent-gateway job (fetched live via `curl -s localhost:7705/api/jobs`,
     `tool: "dispatch"`), extended with the implement tier's `artifactUrl`/
     `branch` the live sample (an investigate-tier `verdict_only`) did not
     carry. If either poller regresses to reading these off the top level,
@@ -3034,9 +3034,9 @@ def test_poll_reads_artifact_and_verdict_from_the_nested_result():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-nested")
 
-        # A literal sideclaw job envelope — the same shape as the live
+        # A literal agent-gateway job envelope — the same shape as the live
         # `GET /api/jobs` response, `tool: "dispatch"`, `status: "done"`.
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "id": "c7737ef5-9fa6-4a93-9d07-53099bc61864",
             "tool": "dispatch",
             "status": "done",
@@ -3061,7 +3061,7 @@ def test_poll_reads_artifact_and_verdict_from_the_nested_result():
             "idleMs": None,
         }
         validation_calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(validation_calls)
+        _agent_gateway.submit_review = _fake_submit_review(validation_calls)
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -3078,7 +3078,7 @@ def test_poll_reads_artifact_and_verdict_from_the_nested_result():
         )
         conn.commit()
         _on_train(conn, eid)
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "id": "validation-job-nested",
             "tool": "review",
             "status": "done",
@@ -3113,9 +3113,9 @@ def test_implement_failure_is_a_strike_without_opening_validation():
         )
         conn.commit()
 
-        _sideclaw.get = lambda job_id: {"status": "failed", "error": "budget exhausted"}
+        _agent_gateway.get = lambda job_id: {"status": "failed", "error": "budget exhausted"}
         validation_calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(validation_calls)
+        _agent_gateway.submit_review = _fake_submit_review(validation_calls)
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -3127,7 +3127,7 @@ def test_implement_failure_is_a_strike_without_opening_validation():
 
 
 def test_cancelled_implement_job_is_a_strike_without_opening_validation():
-    """A cancelled implement episode (sideclaw's own cancel endpoint) is
+    """A cancelled implement episode (agent-gateway's own cancel endpoint) is
     terminal exactly like a failure — it must never be read as still
     running, and must never open a validation episode."""
     with _triage_env() as (conn, ctx):
@@ -3138,9 +3138,9 @@ def test_cancelled_implement_job_is_a_strike_without_opening_validation():
         )
         conn.commit()
 
-        _sideclaw.get = lambda job_id: {"status": "cancelled"}
+        _agent_gateway.get = lambda job_id: {"status": "cancelled"}
         validation_calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(validation_calls)
+        _agent_gateway.submit_review = _fake_submit_review(validation_calls)
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -3172,7 +3172,7 @@ def _dispatch_result(outcome: str, *, next_action: str | None = None, summary: s
     those)."""
     out: dict[str, Any] = {
         "outcome": outcome, "summary": summary,
-        "schemaVersion": schema_version if schema_version is not None else _sideclaw.DISPATCH_SCHEMA_VERSION,
+        "schemaVersion": schema_version if schema_version is not None else _agent_gateway.DISPATCH_SCHEMA_VERSION,
     }
     if next_action is not None:
         out["nextAction"] = next_action
@@ -3186,7 +3186,7 @@ def _dispatch_result(outcome: str, *, next_action: str | None = None, summary: s
 def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_none_are_left():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-checks-failed", job_id="impl-checks-failed")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("checks_failed", branch="dispatch/x-1", summary="lint failed"),
         }
@@ -3210,13 +3210,13 @@ def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_no
 
 
 def test_implement_outcome_checks_tool_failed_is_an_infra_strike_never_a_revision():
-    """sideclaw's v5 `checks_tool_failed` — the check TOOL itself crashed — is an
+    """agent-gateway's v5 `checks_tool_failed` — the check TOOL itself crashed — is an
     infrastructure failure: it strikes for a fresh attempt and never spends a
     revision or marks the dispatch as a code finding."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-checks-tool-failed",
                                        job_id="impl-checks-tool-failed")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("checks_tool_failed", branch="dispatch/x-1",
                                         summary="the check harness was idle-killed"),
@@ -3237,7 +3237,7 @@ def test_implement_outcome_no_changes_closes_resolved():
     no implement job behind for a recurrence to re-poll or block a fresh implement on."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-no-changes", job_id="impl-no-changes")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("no_changes", summary="nothing to do"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3258,7 +3258,7 @@ def test_implement_outcome_no_changes_on_a_revision_goes_to_needs_decision():
         conn.execute("UPDATE triage_items SET revision_count=1, pr_url=? WHERE event_id=?",
                      ("https://github.com/jkrumm/demo-repo/pull/7", eid))
         conn.commit()
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("no_changes", summary="the finding does not apply"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3280,7 +3280,7 @@ def test_implement_outcome_no_changes_with_a_pr_on_record_goes_to_needs_decision
         conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=?",
                      ("https://github.com/jkrumm/demo-repo/pull/11", eid))
         conn.commit()
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("no_changes", summary="the finding does not apply"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3296,7 +3296,7 @@ def test_implement_no_changes_next_action_human_wins_over_the_close():
     asks for a decision goes to needs_decision, never closed(resolved), even on a first attempt."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-no-changes-human", job_id="impl-no-changes-human")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("no_changes", next_action="human",
                                         summary="two ways to fix this, the owner must pick"),
@@ -3311,7 +3311,7 @@ def test_implement_no_changes_next_action_human_wins_over_the_close():
 def test_implement_outcome_diff_refused_is_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-diff-refused", job_id="impl-diff-refused")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("diff_refused", summary="diff too large"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3324,7 +3324,7 @@ def test_implement_outcome_diff_refused_is_a_strike():
 def test_implement_outcome_branch_no_pr_is_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-branch-no-pr", job_id="impl-branch-no-pr")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("branch_no_pr", summary="no PR text"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3337,7 +3337,7 @@ def test_implement_outcome_branch_no_pr_is_a_strike():
 def test_implement_outcome_pr_failed_is_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-pr-failed", job_id="impl-pr-failed")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("pr_failed", summary="opening the PR threw"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3350,7 +3350,7 @@ def test_implement_outcome_pr_failed_is_a_strike():
 def test_implement_outcome_withheld_is_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-withheld", job_id="impl-withheld")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("withheld", summary="secret scanner matched"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3363,7 +3363,7 @@ def test_implement_outcome_withheld_is_a_strike():
 def test_implement_outcome_salvaged_is_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-salvaged", job_id="impl-salvaged")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("salvaged", summary="degraded verdict"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3375,13 +3375,13 @@ def test_implement_outcome_salvaged_is_a_strike():
 
 def test_implement_outcome_unexpected_for_implement_tier_is_a_strike():
     """An `author`/`investigate`-tier outcome landing on an `implement` job
-    (sideclaw itself would never send this — the guard is defensive) is never
+    (agent-gateway itself would never send this — the guard is defensive) is never
     guessed at: the episode produced no pull request, so it strikes."""
     for outcome in ("issue_declined", "issue_failed", "issue_filed", "verdict_only"):
         with _triage_env() as (conn, ctx):
             eid = _seed_implementing_item(conn, external_id=f"sig-outcome-unexpected-{outcome}",
                                            job_id=f"impl-unexpected-{outcome}")
-            _sideclaw.get = lambda job_id, outcome=outcome: {
+            _agent_gateway.get = lambda job_id, outcome=outcome: {
                 "status": "done", "result": _dispatch_result(outcome),
             }
             work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3393,15 +3393,15 @@ def test_implement_outcome_unexpected_for_implement_tier_is_a_strike():
 def test_implement_outcome_missing_is_a_strike_never_guessed():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-missing", job_id="impl-missing")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
-            "result": {"summary": "s", "schemaVersion": _sideclaw.DISPATCH_SCHEMA_VERSION},
+            "result": {"summary": "s", "schemaVersion": _agent_gateway.DISPATCH_SCHEMA_VERSION},
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
-        # assert_outcome() (clients/sideclaw.py) catches a missing outcome
+        # assert_outcome() (clients/agent_gateway.py) catches a missing outcome
         # before poll_implement_jobs()'s own switch ever runs.
         assert 'result outcome None' in item["note"], item["note"]
 
@@ -3409,14 +3409,14 @@ def test_implement_outcome_missing_is_a_strike_never_guessed():
 def test_implement_outcome_unrecognized_is_a_strike_never_guessed():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-unrecognized", job_id="impl-unrecognized")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("a_future_outcome_this_warden_does_not_know"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
-        # assert_outcome() (clients/sideclaw.py) catches a value outside
+        # assert_outcome() (clients/agent_gateway.py) catches a value outside
         # DISPATCH_OUTCOMES before poll_implement_jobs()'s own switch ever runs.
         assert 'a_future_outcome_this_warden_does_not_know' in item["note"], item["note"]
 
@@ -3424,18 +3424,18 @@ def test_implement_outcome_unrecognized_is_a_strike_never_guessed():
 def test_implement_next_action_human_overrides_pr_opened():
     """`nextAction == "human"` overrides every outcome, per the poll's own
     docstring — even a `pr_opened` that would otherwise open validation —
-    and lands `needs_decision` (the summary stands in when sideclaw sent no
+    and lands `needs_decision` (the summary stands in when agent-gateway sent no
     `decisionQuestion`)."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-next-action-human", job_id="impl-next-human")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", next_action="human",
                                         artifact_url="https://github.com/jkrumm/demo-repo/pull/50",
                                         summary="needs a human to decide"),
         }
         validation_calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(validation_calls)
+        _agent_gateway.submit_review = _fake_submit_review(validation_calls)
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -3448,10 +3448,10 @@ def test_implement_next_action_human_overrides_pr_opened():
 def test_implement_result_schema_mismatch_is_a_loud_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-schema-mismatch", job_id="impl-schema-mismatch")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/51",
-                                        schema_version=_sideclaw.DISPATCH_SCHEMA_VERSION - 2),
+                                        schema_version=_agent_gateway.DISPATCH_SCHEMA_VERSION - 2),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
@@ -3462,14 +3462,14 @@ def test_implement_result_schema_mismatch_is_a_loud_strike():
 
 
 def test_implement_v4_result_is_still_parsed():
-    """A sideclaw not yet restarted still answers with v4, and the window keeps it
+    """A agent-gateway not yet restarted still answers with v4, and the window keeps it
     parseable rather than striking every in-flight episode."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-schema-v4", job_id="impl-schema-v4")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/53",
-                                        schema_version=_sideclaw.DISPATCH_SCHEMA_VERSION - 1),
+                                        schema_version=_agent_gateway.DISPATCH_SCHEMA_VERSION - 1),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
@@ -3478,14 +3478,14 @@ def test_implement_v4_result_is_still_parsed():
 
 
 def test_implement_future_schema_version_is_a_loud_strike():
-    """A schemaVersion above the window (sideclaw moved again) is refused exactly
+    """A schemaVersion above the window (agent-gateway moved again) is refused exactly
     as before — never guessed at."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-schema-future", job_id="impl-schema-future")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/54",
-                                        schema_version=_sideclaw.DISPATCH_SCHEMA_VERSION + 1),
+                                        schema_version=_agent_gateway.DISPATCH_SCHEMA_VERSION + 1),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
@@ -3497,7 +3497,7 @@ def test_implement_future_schema_version_is_a_loud_strike():
 def test_implement_pr_opened_with_unparseable_pr_url_strikes_the_merge_train():
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-bad-pr-url", job_id="impl-bad-pr-url")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/not-a-pr"),
         }
@@ -3527,7 +3527,7 @@ def test_blocking_validation_blocks_the_merge_and_sends_the_findings_back_for_a_
             conn.commit()
             _seed_implement_dispatch(conn, "implement-job-004")
 
-            _sideclaw.get = lambda job_id: {
+            _agent_gateway.get = lambda job_id: {
                 "status": "done",
                 "result": _review_result(
                     "actionable",
@@ -3569,7 +3569,7 @@ def test_cancelled_validation_job_never_merges_and_strikes_the_review():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-004b")
 
-        _sideclaw.get = lambda job_id: {"status": "cancelled"}
+        _agent_gateway.get = lambda job_id: {"status": "cancelled"}
         merge_calls: list[int] = []
 
         def _unexpected_merge(*a, **kw):
@@ -3614,7 +3614,7 @@ def _fake_update_pr(calls: list[dict[str, Any]]):
 
 def _update_pr_job(status: str, *, job_id: str = "update-job-000001", head: str = TRAIN_SHA,
                    previous: str = TRAIN_SHA, passed: bool = True, note: str | None = None) -> dict[str, Any]:
-    """A `done` sideclaw update_pr job (server/jobs/handlers/update-pr.ts UPDATE_PR_OUTPUT)."""
+    """A `done` agent-gateway update_pr job (server/jobs/handlers/update-pr.ts UPDATE_PR_OUTPUT)."""
     result: dict[str, Any] = {"status": status, "headSha": head, "previousHeadSha": previous,
                               "prUrl": "https://github.com/jkrumm/demo-repo/pull/10"}
     if status != "conflict":
@@ -3642,10 +3642,10 @@ def test_failed_review_is_resubmitted_after_the_backoff_and_the_third_failure_fa
     with _triage_env() as (conn, ctx):
         eid = _seed_validating_item(conn, external_id="sig-rv-infra", implement_job="impl-rv-infra",
                                     review_job="review-job-first")
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "failed",
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "failed",
                                         "error": "synthesis failed: could not serialize"}
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(calls)
+        _agent_gateway.submit_review = _fake_submit_review(calls)
 
         def _unexpected_merge(*a, **kw):
             raise AssertionError("a review with no verdict must never call merge")
@@ -3690,9 +3690,9 @@ def test_done_review_with_no_result_is_an_infra_failure_too():
     with _triage_env() as (conn, ctx):
         eid = _seed_validating_item(conn, external_id="sig-rv-empty", implement_job="impl-rv-empty",
                                     review_job="review-job-empty")
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": None}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": None}
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(calls)
+        _agent_gateway.submit_review = _fake_submit_review(calls)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1 and item["validation_job"] is None, dict(item)
@@ -3707,7 +3707,7 @@ def test_a_review_with_a_verdict_resets_the_strike_count():
                                     review_job="review-job-now")
         conn.execute("UPDATE triage_items SET strikes=2 WHERE event_id=?", (eid,))
         conn.commit()
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _review_result("clean")}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": _review_result("clean")}
 
         def _flaky_merge(*a, **kw):
             raise RemoteError("GitHub returned 502")
@@ -3719,7 +3719,7 @@ def test_a_review_with_a_verdict_resets_the_strike_count():
         assert item["validation_job"] == "review-job-now", "the confirmed review is kept; only the merge retries"
 
 
-def test_review_resubmit_refused_by_sideclaw_ends_the_item_without_retry():
+def test_review_resubmit_refused_by_agent_gateway_ends_the_item_without_retry():
     with _triage_env() as (conn, ctx):
         eid = _seed_validating_item(conn, external_id="sig-rv-refused", implement_job="impl-rv-refused",
                                     review_job="review-job-refused")
@@ -3730,9 +3730,9 @@ def test_review_resubmit_refused_by_sideclaw_ends_the_item_without_retry():
 
         def _refuse(*, cwd, pr, context=None, model=None):
             refusals.append(1)
-            raise SubmitRefused("sideclaw refused the job (HTTP 400): nope", status=400)
+            raise SubmitRefused("agent-gateway refused the job (HTTP 400): nope", status=400)
 
-        _sideclaw.submit_review = _refuse
+        _agent_gateway.submit_review = _refuse
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
         item = core.get_item(conn, eid)
@@ -3746,13 +3746,13 @@ def test_real_blocked_review_is_not_retried():
     with _triage_env() as (conn, ctx):
         eid = _seed_validating_item(conn, external_id="sig-rv-blocked", implement_job="impl-rv-blocked",
                                     review_job="review-job-blocked")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "id": job_id, "status": "done",
             "result": _review_result("actionable", blocking=[
                 {"file": "scripts/x.py", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}]),
         }
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(calls)
+        _agent_gateway.submit_review = _fake_submit_review(calls)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "a review that returned a verdict must never be re-submitted"
         item = core.get_item(conn, eid)
@@ -3771,7 +3771,7 @@ def test_validation_outcome_needs_decision_routes_to_needs_decision():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-needs-human")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result("needs-human", summary="the PR grants scope its body never mentions"),
         }
@@ -3811,7 +3811,7 @@ def test_validation_needs_decision_with_blocking_goes_to_the_owner_and_is_never_
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-nh-blocking")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result(
                 "needs-human",
@@ -3840,7 +3840,7 @@ def test_validation_needs_decision_with_blocking_goes_to_the_owner_and_is_never_
         assert d["validation_status"] == "needs_decision"
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         assert calls == [], "a needs-human review is never a revisable finding"
         assert core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
@@ -3861,7 +3861,7 @@ def test_validation_actionable_with_empty_blocking_confirms():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-actionable")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result("actionable", blocking=[], summary="only improvements, nothing blocking"),
         }
@@ -3879,10 +3879,10 @@ def test_validation_actionable_with_empty_blocking_confirms():
 
 def test_confirmed_validation_auto_lands_on_every_repo_including_the_loops_own_executors():
     """There is no per-repo merge-approval route any more: a clean step-7 validation calls
-    `plan_or_land()` on warden, sideclaw and dotfiles exactly as on any other
+    `plan_or_land()` on warden, agent-gateway and dotfiles exactly as on any other
     repo — the merge gate (PR open, checks green, review confirmed, GitHub's
     rules) is the same everywhere."""
-    for repo in ("warden", "sideclaw", "dotfiles", "demo-repo"):
+    for repo in ("warden", "agent-gateway", "dotfiles", "demo-repo"):
         with _triage_env() as (conn, ctx):
             eid = _seed_verdict_item(conn, external_id=f"sig-val-{repo}", repo=repo)
             conn.execute(
@@ -3893,7 +3893,7 @@ def test_confirmed_validation_auto_lands_on_every_repo_including_the_loops_own_e
             conn.commit()
             _seed_implement_dispatch(conn, f"implement-job-{repo}", repo=repo)
 
-            _sideclaw.get = lambda job_id: {
+            _agent_gateway.get = lambda job_id: {
                 "status": "done",
                 "result": _review_result("clean", summary="looks right."),
             }
@@ -3922,7 +3922,7 @@ def test_blocking_validation_on_an_executor_repo_still_blocks():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-gated-block", repo="warden")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result(
                 "actionable",
@@ -3952,7 +3952,7 @@ def test_validation_unknown_outcome_is_a_strike_never_merged():
     """The fail-open bug this test pins: an unrecognised `outcome` with an
     empty `blocking` list must never fall through to `confirmed` — it is an
     unusable review (a strike), and merge must never be called. Caught here by
-    `assert_outcome()` (clients/sideclaw.py) before poll_validation_jobs()'s own
+    `assert_outcome()` (clients/agent_gateway.py) before poll_validation_jobs()'s own
     switch ever runs — see that switch's own fail-closed `else` for the second
     line of defence."""
     with _triage_env() as (conn, ctx):
@@ -3965,7 +3965,7 @@ def test_validation_unknown_outcome_is_a_strike_never_merged():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-unknown-outcome")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result("a_future_outcome_this_warden_does_not_know", blocking=[]),
         }
@@ -3999,9 +3999,9 @@ def test_validation_missing_outcome_never_reaches_confirmed():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-missing-outcome")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
-            "result": {"blocking": [], "summary": "s", "schemaVersion": _sideclaw.REVIEW_SCHEMA_VERSION},
+            "result": {"blocking": [], "summary": "s", "schemaVersion": _agent_gateway.REVIEW_SCHEMA_VERSION},
         }
         merge_calls: list[int] = []
 
@@ -4029,9 +4029,9 @@ def test_validation_result_schema_mismatch_is_a_loud_strike():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-schema-mismatch")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
-            "result": _review_result("clean", schema_version=_sideclaw.REVIEW_SCHEMA_VERSION + 1),
+            "result": _review_result("clean", schema_version=_agent_gateway.REVIEW_SCHEMA_VERSION + 1),
         }
         merge_calls: list[int] = []
 
@@ -4063,7 +4063,7 @@ def test_confirmed_validation_merge_policy_error_fails_the_item():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-005")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result("clean", summary="looks right."),
         }
@@ -4093,7 +4093,7 @@ def test_confirmed_validation_merge_remote_error_maybe_mutated_leaves_validating
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-006")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result("clean", summary="looks right."),
         }
@@ -4122,7 +4122,7 @@ def test_confirmed_validation_merge_remote_error_not_mutated_is_a_strike():
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-007")
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result("clean", summary="looks right."),
         }
@@ -4151,7 +4151,7 @@ def _confirmed_merging_item(conn, ext: str) -> int:
     )
     conn.commit()
     _seed_implement_dispatch(conn, f"implement-{ext}")
-    _sideclaw.get = lambda job_id: {"status": "done", "result": _review_result("clean")}
+    _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result("clean")}
     return eid
 
 
@@ -4174,7 +4174,7 @@ def test_a_merge_waiting_on_pending_checks_stays_merging_without_a_strike():
         fake_merged = types.SimpleNamespace(merge_method="squash", deploy={}, merge_commit=None, repo_slug="jkrumm/demo-repo",
                                              pull_request=13)
         CHECK_RUNS["runs"] = [{"name": "build", "status": "completed", "conclusion": "success"}]
-        _sideclaw.submit_review = lambda **kw: (_ for _ in ()).throw(
+        _agent_gateway.submit_review = lambda **kw: (_ for _ in ()).throw(
             AssertionError("the SHA a review confirmed is not reviewed again"))
         with _patched(_merge, plan_or_land=lambda *a, **kw: merges.append(kw) or fake_merged):
             train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
@@ -4195,7 +4195,7 @@ def test_a_merge_another_process_is_already_landing_changes_nothing():
 
 
 # --- the test that runs lifecycle/merge.py's REAL plan_or_land(), with
-# only the sideclaw/GitHub client boundary faked ----------------------------
+# only the agent-gateway/GitHub client boundary faked ----------------------------
 
 _MERGE_FIXTURE_POLICY = dict(DEFAULT_POLICY)
 
@@ -4214,7 +4214,7 @@ def test_confirmed_validation_merges_real_path_no_deploy():
         _seed_mergeable_dispatch(conn, "implement-job-real-1", repo="demo-repo", pr_number=30,
                                   origin_event_id=eid)
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result("clean", summary="looks right."),
         }
@@ -4245,7 +4245,7 @@ def test_confirmed_validation_merges_real_path_no_deploy():
 # --- the loop syncs its own dispatches row before any state transition ------
 #
 # The defect (state-log.md, item 986): poll_implement_jobs()/poll_validation_jobs()
-# read a terminal sideclaw job and moved the ITEM, but never folded the
+# read a terminal agent-gateway job and moved the ITEM, but never folded the
 # outcome back onto the `dispatches` row that job belongs to — that fold
 # lived only on dispatch-sweep.py's own 300s cadence. With the sweep
 # unloaded, an item rode straight through `validating -> confirmed -> merge
@@ -4263,14 +4263,14 @@ def test_poll_implement_syncs_its_own_dispatch_row_before_moving_to_validating()
         conn.execute("UPDATE dispatches SET status='running' WHERE job_id=?", ("impl-sync-001",))
         conn.commit()
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "id": "impl-sync-001",
             "status": "done",
             "result": {"outcome": "pr_opened",
                        "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/60",
-                       "schemaVersion": _sideclaw.DISPATCH_SCHEMA_VERSION},
+                       "schemaVersion": _agent_gateway.DISPATCH_SCHEMA_VERSION},
         }
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.submit_review = _fake_submit_review([])
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -4306,7 +4306,7 @@ def test_poll_validation_syncs_the_review_jobs_own_dispatch_row():
         )
         conn.commit()
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "id": "review-sync-001", "status": "done",
             "result": _review_result("needs-human", summary="ambiguous diff"),
         }
@@ -4335,9 +4335,9 @@ def test_poll_sync_is_idempotent_and_the_sweep_can_still_deliver_afterwards():
         job = {
             "id": "impl-sync-002", "status": "done",
             "result": {"outcome": "no_changes", "summary": "nothing to do",
-                       "schemaVersion": _sideclaw.DISPATCH_SCHEMA_VERSION},
+                       "schemaVersion": _agent_gateway.DISPATCH_SCHEMA_VERSION},
         }
-        _sideclaw.get = lambda job_id: job
+        _agent_gateway.get = lambda job_id: job
 
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         before = conn.execute("SELECT reported_at, delivery_status FROM dispatches WHERE job_id=?",
@@ -4379,10 +4379,10 @@ def test_merge_precheck_no_longer_refuses_on_a_stale_implement_row():
                 return {"id": "implement-job-stale", "status": "done",
                          "result": {"outcome": "pr_opened",
                                     "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/62",
-                                    "schemaVersion": _sideclaw.DISPATCH_SCHEMA_VERSION}}
+                                    "schemaVersion": _agent_gateway.DISPATCH_SCHEMA_VERSION}}
             return {"id": "validation-job-stale", "status": "done",
                     "result": _review_result("clean", summary="looks right.")}
-        _sideclaw.get = _fake_get
+        _agent_gateway.get = _fake_get
 
         pr = _fake_pr(number=62, head_sha=TRAIN_SHA, repo="demo-repo")
         with _env(WARDEN_TRIAGE_POLICY=str(core.POLICY_PATH)):
@@ -4719,13 +4719,13 @@ def test_apply_argo_implement_on_needs_decision_item_opens_episode_and_sets_impl
         core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="ship it?")
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _argo.fetch_actions = lambda machine, **kw: (
             "ok", [_argo_action("a1", eid, "implement")]
         )
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
-        assert len(calls) == 1, "implement must open exactly one sideclaw episode"
+        assert len(calls) == 1, "implement must open exactly one agent-gateway episode"
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, item["state"]
         assert item["implement_job"], "implement_job must be recorded"
@@ -4745,7 +4745,7 @@ def test_apply_argo_implement_on_wrong_state_item_is_rejected():
         assert item_before["state"] == core.STATE_NEW
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _argo.fetch_actions = lambda machine, **kw: (
             "ok", [_argo_action("a1", eid, "implement")]
         )
@@ -4848,7 +4848,7 @@ def test_apply_argo_implement_on_needs_decision_with_stale_implement_job_still_a
         conn.commit()
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _argo.fetch_actions = lambda machine, **kw: (
             "ok", [_argo_action("a1", eid, "implement")]
         )
@@ -4902,7 +4902,7 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
         assert [a["status"] for a in ctx.argo_acks] == ["applied", "rejected"], ctx.argo_acks
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1, "the next escalation pass opens the fresh investigation"
         assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
@@ -5310,25 +5310,25 @@ def test_strike_retries_with_backoff_then_the_third_strike_fails_with_the_reason
     with _triage_env() as (conn, _ctx):
         eid = _seed_item(conn, external_id="sig-strikes", state=core.STATE_WORKING,
                           implement_job="job-lost")
-        landed = core.strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING,
+        landed = core.strike(conn, eid, NOW, "agent-gateway 503", retry_state=core.STATE_WORKING,
                               implement_job=None)
         item = core.get_item(conn, eid)
         assert landed == core.STATE_WORKING and item["state"] == core.STATE_WORKING
         assert item["strikes"] == 1 and item["implement_job"] is None
         assert item["retry_at"] == (NOW + dt.timedelta(minutes=10)).isoformat(), item["retry_at"]
-        assert "sideclaw 503" in item["note"], item["note"]
+        assert "agent-gateway 503" in item["note"], item["note"]
 
         later = NOW + dt.timedelta(minutes=11)
-        core.strike(conn, eid, later, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
+        core.strike(conn, eid, later, "agent-gateway 503", retry_state=core.STATE_WORKING, implement_job=None)
         item = core.get_item(conn, eid)
         assert item["strikes"] == 2
         assert item["retry_at"] == (later + dt.timedelta(minutes=30)).isoformat(), item["retry_at"]
 
-        landed = core.strike(conn, eid, later, "sideclaw 503 again", retry_state=core.STATE_WORKING,
+        landed = core.strike(conn, eid, later, "agent-gateway 503 again", retry_state=core.STATE_WORKING,
                               implement_job=None)
         item = core.get_item(conn, eid)
         assert landed == core.STATE_FAILED and item["state"] == core.STATE_FAILED
-        assert item["note"] == "sideclaw 503 again", item["note"]
+        assert item["note"] == "agent-gateway 503 again", item["note"]
         assert item["strikes"] == 3
         # An infra failure is re-driven: the first backoff is out, the recipe re-enters the step.
         assert item["retry_at"] == (later + dt.timedelta(minutes=60)).isoformat(), item["retry_at"]
@@ -5363,7 +5363,7 @@ def test_needs_decision_and_failed_never_expire_and_are_never_silence_resolved()
         conn.execute("UPDATE events SET resolved_at=? WHERE id IN (?, ?)", (ancient, decide, failed))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         for _ in range(3):
             triage.run(conn, dry_run=False)
@@ -5383,13 +5383,13 @@ def test_needs_decision_and_failed_never_expire_and_are_never_silence_resolved()
 
 
 def test_a_pruned_implement_job_is_a_strike_not_a_stranded_item():
-    """sideclaw prunes terminal jobs at 24h or at 200 terminal rows — once pruned,
-    `_sideclaw.get()` returns None. The result is lost, which is an infrastructure
+    """agent-gateway prunes terminal jobs at 24h or at 200 terminal rows — once pruned,
+    `_agent_gateway.get()` returns None. The result is lost, which is an infrastructure
     failure of the step: it strikes, the attempt starts over after the backoff."""
     with _triage_env() as (conn, _ctx):
         eid = _seed_item(conn, external_id="sig-pruned", state=core.STATE_WORKING,
                           implement_job="impl-pruned", dispatch_job="inv-1")
-        _sideclaw.get = lambda job_id: None
+        _agent_gateway.get = lambda job_id: None
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
@@ -5402,7 +5402,7 @@ def test_a_row_waiting_out_its_backoff_is_not_resubmitted_until_retry_at():
         eid = _seed_item(conn, external_id="sig-backoff", state=core.STATE_TRIAGED,
                           retry_at=(NOW + dt.timedelta(minutes=10)).isoformat())
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "inside its backoff the row is skipped"
         assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
@@ -5753,12 +5753,12 @@ def test_auto_implement_maps_each_failure_mode():
     item is claimed (see test_auto_implement_claims_the_item_before_dispatching
     for the claim-ordering property itself):
 
-    - RemoteError(maybe_mutated=True): sideclaw MAY have accepted the job —
+    - RemoteError(maybe_mutated=True): agent-gateway MAY have accepted the job —
       the item stays claimed and the operation stays OPEN (outcome NULL), never
       rolled back (that would duplicate the episode next tick). Sideclaw hands
       back no job id and cannot list jobs, so reconcile_operations() holds it for
       a 30 min grace window, then resolves it `unknown` and strikes the item.
-    - RemoteError(maybe_mutated=False): a definite failure — sideclaw was
+    - RemoteError(maybe_mutated=False): a definite failure — agent-gateway was
       never reached — so the claim is safely handed back to `verdict` and
       the operation resolves `failed`.
     - PolicyError (open_episode() does not raise this today, but a future
@@ -5780,7 +5780,7 @@ def test_auto_implement_maps_each_failure_mode():
             submits.append(kw)
             raise RemoteError("timed out mid-submit", maybe_mutated=True)
 
-        _sideclaw.submit = _timing_out_submit
+        _agent_gateway.submit = _timing_out_submit
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item1 = core.get_item(conn, eid1)
         assert item1["state"] == core.STATE_WORKING and item1["strikes"] == 0, (
@@ -5816,8 +5816,8 @@ def test_auto_implement_maps_each_failure_mode():
 
         eid2 = _seed_verdict_item(conn, external_id="sig-map-failed", confidence="high",
                                    investigate_job="investigate-map-failed", repo="other-repo")
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(
-            RemoteError("sideclaw refused the submission"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(
+            RemoteError("agent-gateway refused the submission"))
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item2 = core.get_item(conn, eid2)
         assert item2["state"] == core.STATE_WORKING, "a definite failure must hand the claim back"
@@ -5837,7 +5837,7 @@ def test_auto_implement_maps_each_failure_mode():
 
         eid4 = _seed_verdict_item(conn, external_id="sig-map-success", confidence="high",
                                    investigate_job="investigate-map-success", repo="argo")
-        _sideclaw.submit = _fake_submit([])
+        _agent_gateway.submit = _fake_submit([])
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item4 = core.get_item(conn, eid4)
         assert item4["state"] == core.STATE_WORKING
@@ -5847,8 +5847,8 @@ def test_auto_implement_maps_each_failure_mode():
         assert op4 is not None and op4["outcome"] == "done", op4["outcome"]
 
 
-def test_reconcile_implement_sideclaw_404_becomes_unknown_not_failed_and_strikes():
-    """A pruned sideclaw job returns 404, byte-identical to a job id that
+def test_reconcile_implement_agent_gateway_404_becomes_unknown_not_failed_and_strikes():
+    """A pruned agent-gateway job returns 404, byte-identical to a job id that
     never existed (state-log.md §46) — absence proves nothing, so an in-flight
     implement operation reconcile_operations() cannot confirm must land on
     `unknown`, never `failed`, and the item strikes (a lost in-flight operation is an
@@ -5863,12 +5863,12 @@ def test_reconcile_implement_sideclaw_404_becomes_unknown_not_failed_and_strikes
                                        authorized_by="auto-from-item")
         # Simulates a crash AFTER a job id was learned but BEFORE this process
         # recorded the outcome — the row reconcile_operations() has to ask
-        # sideclaw about.
+        # agent-gateway about.
         conn.execute("UPDATE operations SET receipt_json=? WHERE op_id=?",
                      (json.dumps({"jobId": "implement-job-orphan"}), op_id))
         conn.commit()
 
-        _sideclaw.get = lambda job_id: None  # sideclaw: 404 / unreachable
+        _agent_gateway.get = lambda job_id: None  # agent-gateway: 404 / unreachable
 
         work.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -5993,8 +5993,8 @@ def test_reconcile_operations_runs_before_anything_that_could_retry():
                                authorized_by="auto-from-item")
 
         implement_calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(implement_calls)
-        _sideclaw.get = lambda job_id: None
+        _agent_gateway.submit = _fake_submit(implement_calls)
+        _agent_gateway.get = lambda job_id: None
 
         triage.run(conn, dry_run=False)
 
@@ -6029,7 +6029,7 @@ def test_reconcile_operation_with_no_event_id_resolves_without_touching_any_item
         conn.execute("UPDATE operations SET receipt_json=? WHERE op_id=?",
                      (json.dumps({"jobId": "implement-job-no-item"}), op_id))
         conn.commit()
-        _sideclaw.get = lambda job_id: {"status": "done"}
+        _agent_gateway.get = lambda job_id: {"status": "done"}
 
         work.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -6206,7 +6206,7 @@ def test_full_pass_with_nothing_notifiable_posts_nothing():
     """A full pass over a ledger with nothing in a notify state and nothing failed posts nothing."""
     with _triage_env() as (conn, ctx):
         _insert_event(conn, source="slack_alert", external_id="sig-pass-silent", title="x", first_seen=OLD)
-        _sideclaw.submit = _fake_submit([])
+        _agent_gateway.submit = _fake_submit([])
         triage.run(conn, dry_run=False)
         assert ctx.posted == []
 
@@ -6527,7 +6527,7 @@ def test_submitted_prompt_for_a_labelled_alert_lists_only_the_labelled_repo():
         _add_repo(ctx, "audio-gateway")
         calls: list[dict[str, Any]] = []
         title = "🚨 podcast.failed >= 1 service.name: audio-gateway"
-        _sideclaw.submit_triage = _fake_triage({title: "audio-gateway"}, calls=calls)
+        _agent_gateway.submit_triage = _fake_triage({title: "audio-gateway"}, calls=calls)
         eid = _insert_event(conn, source="slack_alert", external_id="lbl", title=title, first_seen=OLD)
         intake.ingest(conn, NOW)
         _triage_pass(conn)
@@ -6542,7 +6542,7 @@ def test_unlabelled_alert_prompt_lists_every_known_repo():
     with _triage_env() as (conn, ctx):
         _add_repo(ctx, "zeta")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = _fake_triage({"No label": "zeta"}, calls=calls)
+        _agent_gateway.submit_triage = _fake_triage({"No label": "zeta"}, calls=calls)
         _insert_event(conn, source="slack_alert", external_id="nl", title="No label", first_seen=OLD)
         intake.ingest(conn, NOW)
         _triage_pass(conn)
@@ -6728,7 +6728,7 @@ def test_two_passes_over_the_same_finished_job_fold_it_once():
         conn.commit()
         job = _triage_job({"action": "attach", "item": target, "reason": "r"}, job_id="t-cas")
         polled: list[str] = []
-        _sideclaw.get = lambda job_id: polled.append(job_id) or job
+        _agent_gateway.get = lambda job_id: polled.append(job_id) or job
         triaging.poll_triage_jobs(conn, NOW, dry_run=False)
         transitions = conn.execute("SELECT COUNT(*) FROM item_transitions WHERE event_id=?", (eid,)).fetchone()[0]
         triaging.poll_triage_jobs(conn, NOW, dry_run=False)
@@ -6762,7 +6762,7 @@ def test_submit_is_claimed_once_and_a_second_pass_does_not_resubmit():
             calls.append({"prompt": prompt})
             return {"id": f"t-q-{queued['n']}", "status": "queued"}
 
-        _sideclaw.submit_triage = _submit
+        _agent_gateway.submit_triage = _submit
         eid = _seed_row(conn, external_id="once", title="Once", occurrences=3)
         _triage_pass(conn)
         _triage_pass(conn)
@@ -6774,7 +6774,7 @@ def test_submit_is_claimed_once_and_a_second_pass_does_not_resubmit():
 def test_a_lost_claim_submits_nothing():
     with _triage_env() as (conn, ctx):
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = _fake_triage({"Raced": "demo-repo"}, calls=calls)
+        _agent_gateway.submit_triage = _fake_triage({"Raced": "demo-repo"}, calls=calls)
         eid = _seed_row(conn, external_id="raced", title="Raced")
         item = _rows(conn, eid)
         conn.execute("UPDATE triage_items SET triage_job='claiming:other-process' WHERE event_id=?", (eid,))
@@ -6785,11 +6785,11 @@ def test_a_lost_claim_submits_nothing():
 
 def test_poll_leaves_a_running_job_and_folds_it_when_done():
     with _triage_env() as (conn, ctx):
-        _sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-slow", "status": "queued"}
+        _agent_gateway.submit_triage = lambda *, prompt, schema: {"id": "t-slow", "status": "queued"}
         eid = _seed_row(conn, external_id="slow", title="Slow")
         _triage_pass(conn)
         state = {"job": {"id": "t-slow", "status": "running"}}
-        _sideclaw.get = lambda job_id: state["job"]
+        _agent_gateway.get = lambda job_id: state["job"]
         triaging.poll_triage_jobs(conn, NOW, dry_run=False)
         assert _rows(conn, eid)["state"] == core.STATE_NEW and _rows(conn, eid)["triage_job"] == "t-slow"
         state["job"] = _triage_job({"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"},
@@ -6798,7 +6798,7 @@ def test_poll_leaves_a_running_job_and_folds_it_when_done():
         assert _rows(conn, eid)["state"] == core.STATE_TRIAGED
 
 
-def test_poll_strikes_a_failed_job_and_a_job_sideclaw_lost_and_skips_a_transient_error():
+def test_poll_strikes_a_failed_job_and_a_job_agent_gateway_lost_and_skips_a_transient_error():
     with _triage_env() as (conn, ctx):
         ids = {}
         for key in ("failed", "lost", "flaky"):
@@ -6811,15 +6811,15 @@ def test_poll_strikes_a_failed_job_and_a_job_sideclaw_lost_and_skips_a_transient
                 return {"id": job_id, "status": "failed", "error": "triage: transport error"}
             if job_id == "t-lost":
                 return None
-            raise RemoteError("sideclaw unreachable")
+            raise RemoteError("agent-gateway unreachable")
 
-        _sideclaw.get = _get
+        _agent_gateway.get = _get
         with contextlib.redirect_stderr(io.StringIO()):
             triaging.poll_triage_jobs(conn, NOW, dry_run=False)
         assert _rows(conn, ids["failed"])["strikes"] == 1 and _rows(conn, ids["failed"])["triage_job"] is None
         assert _rows(conn, ids["lost"])["strikes"] == 1 and "no record" in _rows(conn, ids["lost"])["note"]
         assert _rows(conn, ids["flaky"])["strikes"] == 0 and _rows(conn, ids["flaky"])["triage_job"] == "t-flaky", (
-            "an unreachable sideclaw is not the job's failure")
+            "an unreachable agent-gateway is not the job's failure")
 
 
 def test_poll_releases_a_stale_claim_but_not_a_fresh_one():
@@ -6836,16 +6836,16 @@ def test_poll_releases_a_stale_claim_but_not_a_fresh_one():
         assert _rows(conn, stale)["triage_job"] is None and _rows(conn, fresh)["triage_job"] == new_claim
 
 
-def test_submit_failure_strikes_and_a_sideclaw_refusal_strikes_too():
+def test_submit_failure_strikes_and_a_agent_gateway_refusal_strikes_too():
     """I5: a refused triage prompt is never the item's fault — it strikes like any other submit
     failure (backoff, `failed` only on the third) instead of ending the item on the first 4xx."""
     with _triage_env() as (conn, ctx):
         down = _seed_row(conn, external_id="down", title="Down")
 
         def _unreachable(*, prompt, schema):
-            raise RemoteError("sideclaw triage submit failed", maybe_mutated=True)
+            raise RemoteError("agent-gateway triage submit failed", maybe_mutated=True)
 
-        _sideclaw.submit_triage = _unreachable
+        _agent_gateway.submit_triage = _unreachable
         with contextlib.redirect_stderr(io.StringIO()):
             _triage_pass(conn)
         item = _rows(conn, down)
@@ -6855,10 +6855,10 @@ def test_submit_failure_strikes_and_a_sideclaw_refusal_strikes_too():
 
         def _refuse(*, prompt, schema):
             calls.append({"prompt": prompt})
-            raise SubmitRefused("sideclaw refused the job (HTTP 400): invalid params: prompt too long",
+            raise SubmitRefused("agent-gateway refused the job (HTTP 400): invalid params: prompt too long",
                                 status=400)
 
-        _sideclaw.submit_triage = _refuse
+        _agent_gateway.submit_triage = _refuse
         with contextlib.redirect_stderr(io.StringIO()):
             _triage_pass(conn)
             assert calls == [], "an item waiting out its backoff is not submitted"
@@ -6880,7 +6880,7 @@ def test_alerts_wait_for_the_debounce_but_issues_and_runs_are_immediate():
     policy = dict(DEFAULT_POLICY, minOccurrences=5, minOpenMinutes=999999)
     with _triage_env(policy=policy) as (conn, ctx):
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = _fake_triage({"Young": "demo-repo", "Frequent": "demo-repo",
+        _agent_gateway.submit_triage = _fake_triage({"Young": "demo-repo", "Frequent": "demo-repo",
                                                 "Issue": "demo-repo"}, calls=calls)
         young = _seed_row(conn, external_id="young", title="Young", occurrences=1, first_seen=NOW)
         frequent = _seed_row(conn, external_id="freq", title="Frequent", occurrences=5, first_seen=NOW)
@@ -6896,7 +6896,7 @@ def test_a_recurrence_inside_the_cooldown_is_not_triaged_again_yet():
     with _triage_env() as (conn, ctx):
         _insert_dispatch_row(conn, "job-prior", NOW - dt.timedelta(hours=1))
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = _fake_triage({"Cooling": "demo-repo"}, calls=calls)
+        _agent_gateway.submit_triage = _fake_triage({"Cooling": "demo-repo"}, calls=calls)
         eid = _seed_row(conn, external_id="cool", title="Cooling")
         conn.execute("UPDATE triage_items SET dispatch_job='job-prior' WHERE event_id=?", (eid,))
         conn.commit()
@@ -6914,7 +6914,7 @@ def test_triage_submissions_per_run_are_capped_and_the_rest_wait_new():
         with _triage_env() as (conn, ctx):
             titles = {f"Item {i}": "demo-repo" for i in range(5)}
             calls: list[dict[str, Any]] = []
-            _sideclaw.submit_triage = _fake_triage(titles, calls=calls)
+            _agent_gateway.submit_triage = _fake_triage(titles, calls=calls)
             ids = [_seed_row(conn, external_id=f"cap-{i}", title=f"Item {i}") for i in range(5)]
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -6933,7 +6933,7 @@ def test_origin_items_are_triaged_before_alerts_when_the_cap_binds():
     try:
         with _triage_env() as (conn, ctx):
             calls: list[dict[str, Any]] = []
-            _sideclaw.submit_triage = _fake_triage({"Alert": "demo-repo", "Issue": "demo-repo"}, calls=calls)
+            _agent_gateway.submit_triage = _fake_triage({"Alert": "demo-repo", "Issue": "demo-repo"}, calls=calls)
             _seed_row(conn, external_id="a", title="Alert")
             _seed_row(conn, external_id="o/r#4", title="Issue", origin="github_issue", source="github_go",
                       repo="demo-repo")
@@ -6947,14 +6947,14 @@ def test_origin_items_are_triaged_before_alerts_when_the_cap_binds():
 def test_a_job_that_is_already_finished_at_submit_is_folded_in_the_same_pass():
     with _triage_env() as (conn, ctx):
         eid = _seed_row(conn, external_id="fast", title="Fast")
-        _sideclaw.get = lambda job_id: (_ for _ in ()).throw(AssertionError("no poll needed"))
+        _agent_gateway.get = lambda job_id: (_ for _ in ()).throw(AssertionError("no poll needed"))
         _triage_pass(conn)
         assert _rows(conn, eid)["state"] == core.STATE_TRIAGED
 
 
 def test_settle_polls_until_the_jobs_finish():
     with _triage_env() as (conn, ctx):
-        _sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-settle", "status": "queued"}
+        _agent_gateway.submit_triage = lambda *, prompt, schema: {"id": "t-settle", "status": "queued"}
         eid = _seed_row(conn, external_id="settle", title="Settle")
         _triage_pass(conn)
         reads = {"n": 0}
@@ -6965,7 +6965,7 @@ def test_settle_polls_until_the_jobs_finish():
                 return {"id": job_id, "status": "running"}
             return _triage_job({"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"}, job_id=job_id)
 
-        _sideclaw.get = _get
+        _agent_gateway.get = _get
         saved_sleep = time.sleep
         time.sleep = lambda s: None
         try:
@@ -6980,10 +6980,10 @@ def test_settle_gives_up_after_the_window_without_failing_the_job():
     triaging.TRIAGE_SETTLE_S = 0
     try:
         with _triage_env() as (conn, ctx):
-            _sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-never", "status": "queued"}
+            _agent_gateway.submit_triage = lambda *, prompt, schema: {"id": "t-never", "status": "queued"}
             eid = _seed_row(conn, external_id="never", title="Never")
             _triage_pass(conn)
-            _sideclaw.get = lambda job_id: {"id": job_id, "status": "running"}
+            _agent_gateway.get = lambda job_id: {"id": job_id, "status": "running"}
             triaging.settle_triage_jobs(conn, NOW, dry_run=False, job_ids=["t-never"])
             item = _rows(conn, eid)
             assert item["triage_job"] == "t-never" and item["strikes"] == 0, "the next tick folds it"
@@ -7042,7 +7042,7 @@ def test_escalate_picks_only_triaged_items():
         triaged = _seed_row(conn, external_id="ready", title="T", repo="demo-repo", state=core.STATE_TRIAGED,
                             occurrences=5)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and _last_dispatch_origin_event_id(conn) == triaged
         assert _rows(conn, triaged)["state"] == core.STATE_WORKING
@@ -7054,7 +7054,7 @@ def test_escalate_clusters_fresh_triaged_items_by_repo_and_keeps_split_items_sin
         a = _seed_row(conn, external_id="c-a", title="A", repo="demo-repo", state=core.STATE_TRIAGED, occurrences=5)
         b = _seed_row(conn, external_id="c-b", title="B", repo="demo-repo", state=core.STATE_TRIAGED, occurrences=5)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and "c-a" in calls[0]["brief"] and "c-b" in calls[0]["brief"]
         assert _rows(conn, a)["dispatch_job"] == _rows(conn, b)["dispatch_job"]
@@ -7065,7 +7065,7 @@ def test_escalate_never_clusters_an_origin_item_into_an_alert_brief():
         _seed_row(conn, external_id="o/r#5", title="Issue", origin="github_issue", source="github_go",
                   repo="demo-repo", state=core.STATE_TRIAGED, occurrences=9, brief="the issue body")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [], "an issue is dispatched by escalate_origin_items() with its own brief"
 
@@ -7076,8 +7076,8 @@ def test_an_issue_is_triaged_and_dispatched_in_one_loop_pass():
             {"repo": "demo-repo", "number": 21, "title": "Add a health check", "body": "please", "url": "u",
              "author": _github.GH_OWNER, "labels": [], "updated_at": None}]
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
-        _sideclaw.submit_triage = _fake_triage({"Add a health check": "demo-repo"})
+        _agent_gateway.submit = _fake_submit(calls)
+        _agent_gateway.submit_triage = _fake_triage({"Add a health check": "demo-repo"})
         triage.run(conn, dry_run=False)
         item = conn.execute("SELECT state, dispatch_job, triage_job FROM triage_items").fetchone()
         assert item["state"] == core.STATE_WORKING and item["dispatch_job"] and item["triage_job"] is None
@@ -7091,8 +7091,8 @@ def test_an_issue_attached_by_triage_is_never_dispatched():
             {"repo": "demo-repo", "number": 22, "title": "Same bug", "body": "b", "url": "u",
              "author": _github.GH_OWNER, "labels": [], "updated_at": None}]
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
-        _sideclaw.submit_triage = _fake_triage(
+        _agent_gateway.submit = _fake_submit(calls)
+        _agent_gateway.submit_triage = _fake_triage(
             {"Same bug": {"action": "attach", "item": target, "reason": "same"}})
         triage.run(conn, dry_run=False)
         assert calls == []
@@ -7106,13 +7106,13 @@ def test_triage_item_now_submits_waits_and_folds():
         eid = intake.open_origin_item(conn, origin="human", repo="demo-repo", brief="b", max_tier="investigate",
                                        external_id="human:now", title="ask", now=NOW)
         waits: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-now", "status": "queued"}
+        _agent_gateway.submit_triage = lambda *, prompt, schema: {"id": "t-now", "status": "queued"}
 
         def _wait(job_id, *, timeout_s, interval_s, **kw):
             waits.append({"job_id": job_id, "timeout_s": timeout_s})
             return _triage_job({"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"}, job_id=job_id)
 
-        _sideclaw.wait = _wait
+        _agent_gateway.wait = _wait
         assert triaging.triage_item_now(conn, eid, NOW) == "triaged to demo-repo"
         assert waits == [{"job_id": "t-now", "timeout_s": triaging.TRIAGE_WAIT_GUARD_S}]
         assert triaging.TRIAGE_WAIT_GUARD_S >= 1800, "a hang guard, never a budget (rules/agent-limits.md)"
@@ -7124,8 +7124,8 @@ def test_triage_item_now_that_times_out_leaves_the_job_for_the_loop():
     with _triage_env() as (conn, ctx):
         eid = intake.open_origin_item(conn, origin="human", repo="demo-repo", brief="b", max_tier="investigate",
                                        external_id="human:slowjob", title="ask", now=NOW)
-        _sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-hang", "status": "queued"}
-        _sideclaw.wait = lambda job_id, **kw: None
+        _agent_gateway.submit_triage = lambda *, prompt, schema: {"id": "t-hang", "status": "queued"}
+        _agent_gateway.wait = lambda job_id, **kw: None
         assert triaging.triage_item_now(conn, eid, NOW) is None
         item = _rows(conn, eid)
         assert item["state"] == core.STATE_NEW and item["triage_job"] == "t-hang" and item["strikes"] == 0
@@ -7210,7 +7210,7 @@ def test_a_rule_match_is_a_label_route_and_the_item_still_goes_through_triage():
     with _triage_env(policy=policy) as (conn, ctx):
         _add_repo(ctx, "other-repo")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = _fake_triage({"Ruled": "other-repo"}, calls=calls)
+        _agent_gateway.submit_triage = _fake_triage({"Ruled": "other-repo"}, calls=calls)
         eid = _insert_event(conn, source="slack_alert", external_id="sig-rule-1", title="Ruled", first_seen=OLD)
         intake.ingest(conn, NOW)
         intake.classify(conn, policy, NOW)
@@ -7226,7 +7226,7 @@ def test_a_rule_labelled_alert_can_still_be_attached_or_ignored_by_triage():
     with _triage_env(policy=policy) as (conn, ctx):
         target = _seed_row(conn, external_id="o/r#33", title="Open", repo="demo-repo", state=core.STATE_WORKING,
                            origin="github_issue", source="github_go")
-        _sideclaw.submit_triage = _fake_triage({
+        _agent_gateway.submit_triage = _fake_triage({
             "Same": {"action": "attach", "item": target, "reason": "same"},
             "Noise": {"action": "ignore", "reason": "noise"}})
         same = _seed_row(conn, external_id="sig-rule-same", title="Same")
@@ -7282,9 +7282,9 @@ def test_the_ignore_list_closes_before_any_triage_call():
     policy = dict(DEFAULT_POLICY, ignore=["slack_alert:ignoreme-*"])
     with _triage_env(policy=policy) as (conn, ctx):
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = _fake_triage({}, calls=calls)
+        _agent_gateway.submit_triage = _fake_triage({}, calls=calls)
         dispatches: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(dispatches)
+        _agent_gateway.submit = _fake_submit(dispatches)
         _insert_event(conn, source="slack_alert", external_id="ignoreme-recovery", title="All good now",
                       first_seen=OLD)
         triage.run(conn, dry_run=False)
@@ -7343,7 +7343,7 @@ def test_a_reopened_ignore_is_closed_again_by_the_ignore_list_without_a_triage_c
     policy = dict(DEFAULT_POLICY, ignore=["slack_alert:mi-3"])
     with _triage_env(policy=policy) as (conn, ctx):
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_triage = _fake_triage({}, calls=calls)
+        _agent_gateway.submit_triage = _fake_triage({}, calls=calls)
         eid = _model_ignored(conn, "mi-3", closed_at=NOW - dt.timedelta(hours=8))
         _recur_ts(conn, eid, "1788850795.862159")
         intake.reopen_if_needed(conn, NOW, policy)
@@ -7357,7 +7357,7 @@ def test_a_reopened_model_ignore_gets_a_fresh_triage():
     with _triage_env() as (conn, ctx):
         calls: list[dict[str, Any]] = []
         eid = _model_ignored(conn, "mi-4", closed_at=NOW - dt.timedelta(hours=8))
-        _sideclaw.submit_triage = _fake_triage({"Alert mi-4": "demo-repo"}, calls=calls)
+        _agent_gateway.submit_triage = _fake_triage({"Alert mi-4": "demo-repo"}, calls=calls)
         _recur_ts(conn, eid, "1788850795.862159")
         triage.run(conn, dry_run=False)
         assert len(calls) == 1
@@ -7390,7 +7390,7 @@ def _recipe(item) -> dict[str, Any]:
 def _fail_by_strikes(conn, *, external_id: str, now=NOW, state=core.STATE_WORKING, **columns) -> int:
     """An item whose next strike is its third: lands `failed(infra)` re-entering `state`."""
     eid = _seed_item(conn, external_id=external_id, state=state, strikes=2, **columns)
-    landed = core.strike(conn, eid, now, "sideclaw 503", retry_state=state, implement_job=None)
+    landed = core.strike(conn, eid, now, "agent-gateway 503", retry_state=state, implement_job=None)
     assert landed == core.STATE_FAILED, landed
     return eid
 
@@ -7465,9 +7465,9 @@ def test_strike_limit_lands_infra_with_a_recipe_and_a_backoff_and_a_caller_may_o
 def test_end_on_refusal_lands_policy_with_the_state_it_came_from_and_the_policy_hash():
     with _triage_env() as (conn, _ctx):
         DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
-        expected = _sideclaw.policy_hash(DISPATCH_POLICY["body"])
+        expected = _agent_gateway.policy_hash(DISPATCH_POLICY["body"])
         eid = _seed_verdict_item(conn, external_id="sig-fc-refusal")
-        _sideclaw.submit = _refusing_submit([])
+        _agent_gateway.submit = _refusing_submit([])
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_POLICY, dict(item)
@@ -7530,15 +7530,15 @@ def test_an_unknown_review_outcome_lands_infra_and_unreadable_checks_land_work()
     with _triage_env() as (conn, _ctx):
         DISPATCH_POLICY["body"] = {"rules": {"x": 1}, "overrides": []}
         # The outcome check in the client is the first line of defence; the switch's own `else` the second.
-        real_assert_outcome = _sideclaw.assert_outcome
-        _sideclaw.assert_outcome = lambda *a, **kw: None
+        real_assert_outcome = _agent_gateway.assert_outcome
+        _agent_gateway.assert_outcome = lambda *a, **kw: None
         try:
             eid = _seed_validating_item(conn, external_id="sig-fc-unknown", implement_job="impl-fc-unknown",
                                         review_job="val-fc-unknown")
-            _sideclaw.get = lambda job_id: {"status": "done", "result": _review_result("a_future_outcome")}
+            _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result("a_future_outcome")}
             _train_pass(conn)
         finally:
-            _sideclaw.assert_outcome = real_assert_outcome
+            _agent_gateway.assert_outcome = real_assert_outcome
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_INFRA, dict(item)
         assert item["retry_at"] == (NOW + dt.timedelta(minutes=60)).isoformat()
@@ -7553,7 +7553,7 @@ def test_an_unknown_review_outcome_lands_infra_and_unreadable_checks_land_work()
         assert _recipe(item) == {"state": "merging", "columns": {}, "policy_hash": None}
         DISPATCH_POLICY["body"] = {"rules": {"changed": 1}, "overrides": []}
         work.redrive_failed(conn, NOW + dt.timedelta(days=30), dry_run=False)
-        assert core.get_item(conn, unreadable)["state"] == core.STATE_FAILED, "a token problem is not sideclaw's policy"
+        assert core.get_item(conn, unreadable)["state"] == core.STATE_FAILED, "a token problem is not agent-gateway's policy"
 
 
 def test_infra_failures_are_redriven_after_the_backoff_three_times_then_stay_failed():
@@ -7576,9 +7576,9 @@ def test_infra_failures_are_redriven_after_the_backoff_three_times_then_stay_fai
             assert item["implement_job"] is None, "the recipe's columns are applied"
             assert item["pr_url"] == "https://x/pull/1" and item["revision_count"] == 1, "everything else stays"
             assert item["strikes"] == 0 and item["retry_at"] is None and item["failure_class"] is None
-            assert item["note"].startswith(f"re-drive {k}/3 after infra failure: sideclaw 503"), item["note"]
+            assert item["note"].startswith(f"re-drive {k}/3 after infra failure: agent-gateway 503"), item["note"]
             for _ in range(3):
-                core.strike(conn, eid, t, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
+                core.strike(conn, eid, t, "agent-gateway 503", retry_state=core.STATE_WORKING, implement_job=None)
             item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_FAILED and item["redrives"] == k, dict(item)
         assert item["retry_at"] is None, "the budget is spent: nothing is due any more"
@@ -7603,7 +7603,7 @@ def test_policy_failures_are_redriven_when_the_policy_hash_changes_and_not_when_
         DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
         eid = _seed_verdict_item(conn, external_id="sig-fc-policy")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _refusing_submit(calls)
+        _agent_gateway.submit = _refusing_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert core.get_item(conn, eid)["failure_class"] == core.FAILURE_POLICY and len(calls) == 1
 
@@ -7630,7 +7630,7 @@ def test_policy_failures_are_redriven_when_the_policy_hash_changes_and_not_when_
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and len(calls) == 2, dict(item)
-        assert _recipe(item)["policy_hash"] == _sideclaw.policy_hash(DISPATCH_POLICY["body"])
+        assert _recipe(item)["policy_hash"] == _agent_gateway.policy_hash(DISPATCH_POLICY["body"])
         work.redrive_failed(conn, NOW + dt.timedelta(days=30), dry_run=False)
         assert core.get_item(conn, eid)["state"] == core.STATE_FAILED and len(calls) == 2
         DISPATCH_POLICY["body"] = {"rules": {}, "overrides": []}
@@ -7662,7 +7662,7 @@ def test_redriving_into_merging_restarts_the_train_at_update_and_run_calls_the_p
         core.strike(conn, eid, NOW, "GitHub 502", retry_state=core.STATE_MERGING)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and item["train_stage"] is None, dict(item)
-        _sideclaw.submit_update_pr = _fake_update_pr([])
+        _agent_gateway.submit_update_pr = _fake_update_pr([])
         due = NOW + dt.timedelta(minutes=61)
         work.redrive_failed(conn, due, dry_run=False)
         item = core.get_item(conn, eid)
@@ -7693,10 +7693,10 @@ def test_failed_and_redrive_transitions_post_nothing_to_slack():
 def test_column_writes_on_a_failed_item_keep_its_class_and_recipe():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-fc-keeps")
-        core.strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None,
+        core.strike(conn, eid, NOW, "agent-gateway 503", retry_state=core.STATE_WORKING, implement_job=None,
                     failure_class=core.FAILURE_POLICY)
         conn.execute("UPDATE triage_items SET strikes=2 WHERE event_id=?", (eid,))
-        core.strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None,
+        core.strike(conn, eid, NOW, "agent-gateway 503", retry_state=core.STATE_WORKING, implement_job=None,
                     failure_class=core.FAILURE_POLICY)
         before = core.get_item(conn, eid)
         assert before["state"] == core.STATE_FAILED, dict(before)
@@ -7709,9 +7709,9 @@ def test_column_writes_on_a_failed_item_keep_its_class_and_recipe():
         assert "looking" in after["note"], after["note"]
         assert after["failure_class"] == "policy" and after["redrive_json"] == before["redrive_json"], dict(after)
 
-        # An owner's implement that sideclaw cannot take right now hands the item back as it was.
+        # An owner's implement that agent-gateway cannot take right now hands the item back as it was.
         ctx.argo_acks.clear()
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(RemoteError("sideclaw is down"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(RemoteError("agent-gateway is down"))
         _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("i1", eid, "implement")])
         notify.apply_argo_actions(conn, NOW, dry_run=False)
         assert [a["status"] for a in ctx.argo_acks] == ["failed"], ctx.argo_acks
@@ -7763,7 +7763,7 @@ def test_an_owner_implement_handed_back_keeps_the_pending_infra_backoff():
         eid = _fail_by_strikes(conn, external_id="sig-fc-backoff", state=core.STATE_WORKING)
         before = core.get_item(conn, eid)
         assert before["retry_at"] is not None
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(RemoteError("sideclaw is down"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(RemoteError("agent-gateway is down"))
         _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("hb1", eid, "implement")])
         notify.apply_argo_actions(conn, NOW + dt.timedelta(minutes=5), dry_run=False)
         after = core.get_item(conn, eid)
@@ -7817,7 +7817,7 @@ def test_redrives_is_the_infra_budget_policy_re_drives_do_not_spend_it_and_progr
     with _triage_env() as (conn, ctx):
         DISPATCH_POLICY["body"] = {"v": 0}
         eid = _seed_verdict_item(conn, external_id="sig-fc-budget")
-        _sideclaw.submit = _refusing_submit([])
+        _agent_gateway.submit = _refusing_submit([])
         for v in (1, 2, 3):
             work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
             assert core.get_item(conn, eid)["failure_class"] == core.FAILURE_POLICY
@@ -7827,7 +7827,7 @@ def test_redrives_is_the_infra_budget_policy_re_drives_do_not_spend_it_and_progr
             assert item["state"] == core.STATE_WORKING and item["redrives"] == 0, dict(item)
         # An infra failure afterwards still gets its three automatic re-drives.
         conn.execute("UPDATE triage_items SET strikes=2 WHERE event_id=?", (eid,))
-        core.strike(conn, eid, NOW, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
+        core.strike(conn, eid, NOW, "agent-gateway 503", retry_state=core.STATE_WORKING, implement_job=None)
         t = NOW
         for k in (1, 2, 3):
             t += dt.timedelta(days=1)
@@ -7835,7 +7835,7 @@ def test_redrives_is_the_infra_budget_policy_re_drives_do_not_spend_it_and_progr
             item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_WORKING and item["redrives"] == k, dict(item)
             conn.execute("UPDATE triage_items SET strikes=2 WHERE event_id=?", (eid,))
-            core.strike(conn, eid, t, "sideclaw 503", retry_state=core.STATE_WORKING, implement_job=None)
+            core.strike(conn, eid, t, "agent-gateway 503", retry_state=core.STATE_WORKING, implement_job=None)
         assert core.get_item(conn, eid)["redrives"] == 3
 
         # The spent budget does not follow the item into an unrelated later failure.
@@ -7858,7 +7858,7 @@ def test_owner_retry_through_argo_re_enters_any_class_with_a_fresh_budget():
         conn.commit()
         assert "retry" in notify.ARGO_ACTION_VERBS
         _argo.fetch_actions = lambda machine, **kw: ("ok", [
-            _argo_action("r1", spent, "retry", {"why": "sideclaw is back"}),
+            _argo_action("r1", spent, "retry", {"why": "agent-gateway is back"}),
             _argo_action("r2", work_failed, "retry"),
             _argo_action("r3", stageless, "retry"),
             _argo_action("r4", working, "retry"),
@@ -7870,7 +7870,7 @@ def test_owner_retry_through_argo_re_enters_any_class_with_a_fresh_budget():
 
         item = core.get_item(conn, spent)
         assert item["state"] == core.STATE_WORKING and item["redrives"] == 0 and item["implement_job"] is None
-        assert item["note"] == "retried by owner via Argo: sideclaw is back", item["note"]
+        assert item["note"] == "retried by owner via Argo: agent-gateway is back", item["note"]
         item = core.get_item(conn, work_failed)
         assert item["state"] == core.STATE_MERGING and item["note"] == "retried by owner via Argo: no reason given"
         assert core.get_item(conn, stageless)["state"] == core.STATE_FAILED
@@ -7922,7 +7922,7 @@ def test_auto_implement_hands_the_verdict_to_the_episode_as_context():
         }), "investigate-ctx"))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1, calls
         ctx_text = calls[0].get("context") or ""
@@ -7949,7 +7949,7 @@ def test_a_claim_with_no_job_and_no_operation_is_released_for_a_fresh_dispatch()
         conn.commit()
         work.record_operation(conn, event_id=eid2, kind="implement", repo="other-repo",
                               authorized_by="auto-from-item")
-        _sideclaw.get = lambda job_id: None
+        _agent_gateway.get = lambda job_id: None
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["implement_job"] is None, dict(item)
@@ -7979,7 +7979,7 @@ def test_merging_item_already_merged_lands_from_the_receipt_without_a_second_mer
         op_id = work.record_operation(conn, event_id=eid, kind="merge", repo="argo", authorized_by="auto-from-item")
         work.complete_operation(conn, op_id, outcome="done",
                                 receipt=json.dumps({"pullRequest": 40, "mergeCommit": merge_sha}))
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _review_result("clean", summary="ok"),
         }
         merges: list[Any] = []
@@ -8678,7 +8678,7 @@ def test_chronic_signature_escalates_instead_of_recovery_resolving():
         _seed_reopens(conn, eid, 3)
         core._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", "✅ sig-chronic-p95")])
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         triage.run(conn, dry_run=False)
 
@@ -8780,7 +8780,7 @@ def test_chronic_signature_investigated_once_per_window():
         conn.commit()
         core._watchdog_poll = _fake_wp_module([_slack_msg("999.000001", "✅ sig-chronic-done")])
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         triage.run(conn, dry_run=False)
         assert core.get_item(conn, eid)["state"] == core.STATE_QUIET
         assert calls == []
@@ -8824,7 +8824,7 @@ def test_blocked_implementation_goes_back_to_the_implementer_with_findings():
     with _triage_env() as (conn, ctx):
         eid = _seed_blocked_item(conn, external_id="sig-revise")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
 
@@ -8833,13 +8833,13 @@ def test_blocked_implementation_goes_back_to_the_implementer_with_findings():
         assert item["revision_count"] == 1
         assert item["implement_job"] and item["implement_job"] != "impl-sig-revise"
         assert item["validation_job"] is None
-        assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/7", "the PR stays: sideclaw updates it"
+        assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/7", "the PR stays: agent-gateway updates it"
         assert len(calls) == 1 and calls[0]["tier"] == "implement"
         brief = calls[0]["brief"]
         assert "scripts/check.sh:808" in brief and "fails open on crash loops" in brief
         assert calls[0]["revision_of"] == "dispatch/prior-branch", calls[0]
         assert "Attempt 2 of 4" in brief, brief
-        assert calls[0]["model"] is None, "attempt 2 runs on sideclaw's default model"
+        assert calls[0]["model"] is None, "attempt 2 runs on agent-gateway's default model"
         assert CLOSED_PRS == [], "a revision updates the same PR; the superseded-PR close is gone"
 
 
@@ -8848,7 +8848,7 @@ def test_revision_stops_at_the_attempt_cap():
         eid = _seed_blocked_item(conn, external_id="sig-capped",
                                  revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         assert calls == [], "no revision is dispatched past the cap (the pollers fail the item instead)"
         assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
@@ -8863,7 +8863,7 @@ def test_non_finding_blocks_are_not_revised():
                      ("impl-sig-nofinding",))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         assert calls == []
         assert core.get_item(conn, eid)["revision_count"] == 0
@@ -8878,7 +8878,7 @@ def test_checks_failed_before_push_is_revised():
                                   "branch": "dispatch/red"}), "impl-sig-redchecks"))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
         assert "bun test: 2 failing" in calls[0]["brief"]
@@ -8887,7 +8887,7 @@ def test_checks_failed_before_push_is_revised():
 def test_revision_that_cannot_start_hands_the_item_back_as_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _seed_blocked_item(conn, external_id="sig-refused")
-        _sideclaw.submit = _fake_submit([], ok=False)
+        _agent_gateway.submit = _fake_submit([], ok=False)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
@@ -8897,14 +8897,14 @@ def test_revision_that_cannot_start_hands_the_item_back_as_a_strike():
         assert CLOSED_PRS == []
 
 
-def test_revision_refused_by_sideclaw_ends_the_item_and_is_never_retried():
+def test_revision_refused_by_agent_gateway_ends_the_item_and_is_never_retried():
     """A 4xx on a revision's submit is final. The item ends `failed` with
-    sideclaw's message, keeps its implement job/PR for the card, and a `failed` item is
+    agent-gateway's message, keeps its implement job/PR for the card, and a `failed` item is
     never polled, so no later tick submits the same refused dispatch again."""
     with _triage_env() as (conn, ctx):
         eid = _seed_blocked_item(conn, external_id="sig-rev-refused")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _refusing_submit(calls, message="dispatch refused: repo is not allowed")
+        _agent_gateway.submit = _refusing_submit(calls, message="dispatch refused: repo is not allowed")
 
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
@@ -8917,25 +8917,25 @@ def test_revision_refused_by_sideclaw_ends_the_item_and_is_never_retried():
         assert CLOSED_PRS == [], "the superseded PR must stay open when no revision started"
 
 
-def test_update_pr_refused_by_sideclaw_ends_the_item_with_its_pr():
+def test_update_pr_refused_by_agent_gateway_ends_the_item_with_its_pr():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-update-refused")
         conn.execute("UPDATE triage_items SET state=?, implement_job=? WHERE event_id=?",
                      (core.STATE_WORKING, "implement-job-rr", eid))
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-rr")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": {"outcome": "pr_opened", "artifactUrl": "https://github.com/jkrumm/demo-repo/pull/9",
-                       "branch": "dispatch/demo-repo-9", "schemaVersion": _sideclaw.DISPATCH_SCHEMA_VERSION},
+                       "branch": "dispatch/demo-repo-9", "schemaVersion": _agent_gateway.DISPATCH_SCHEMA_VERSION},
         }
         refusals: list[int] = []
 
         def _refuse(*, cwd, pr):
             refusals.append(pr)
-            raise SubmitRefused("sideclaw refused the job (HTTP 400): update_pr refused: nope", status=400)
+            raise SubmitRefused("agent-gateway refused the job (HTTP 400): update_pr refused: nope", status=400)
 
-        _sideclaw.submit_update_pr = _refuse
+        _agent_gateway.submit_update_pr = _refuse
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=1), dry_run=False)
@@ -8947,13 +8947,13 @@ def test_update_pr_refused_by_sideclaw_ends_the_item_with_its_pr():
         assert refusals == [9], "a refused update_pr is never submitted again"
 
 
-def test_argo_implement_refused_by_sideclaw_ends_the_item_and_reports_failed():
+def test_argo_implement_refused_by_agent_gateway_ends_the_item_and_reports_failed():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-refused")
         core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="ship it?")
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _refusing_submit(calls, message="dispatch refused: ceiling")
+        _agent_gateway.submit = _refusing_submit(calls, message="dispatch refused: ceiling")
         _argo.fetch_actions = lambda machine, **kw: ("ok", [_argo_action("r1", eid, "implement")])
         notify.apply_argo_actions(conn, NOW, dry_run=False)
 
@@ -8977,11 +8977,11 @@ def test_pr_updated_hands_the_updated_pr_to_the_merge_train_without_closing_it()
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-pr-updated", job_id="impl-pr-updated", pr=pr,
                                     revision_count=1)
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done", "result": _dispatch_result("pr_updated", artifact_url=pr, branch="dispatch/prior-branch"),
         }
         review_calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(review_calls)
+        _agent_gateway.submit_review = _fake_submit_review(review_calls)
         conn.execute("UPDATE triage_items SET reviewed_sha=? WHERE event_id=?", (TRAIN_SHA, eid))
         conn.commit()
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -8996,11 +8996,11 @@ def test_a_newer_pr_closes_the_one_it_supersedes():
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-superseded", job_id="impl-superseded",
                                     pr="https://github.com/jkrumm/demo-repo/pull/7", revision_count=1)
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/9"),
         }
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.submit_review = _fake_submit_review([])
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["pr_url"].endswith("/pull/9"), dict(item)
@@ -9010,7 +9010,7 @@ def test_a_newer_pr_closes_the_one_it_supersedes():
 def test_pr_updated_without_an_artifact_url_is_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-pr-updated-bare", job_id="impl-pr-updated-bare", pr=None)
-        _sideclaw.get = lambda job_id: {"status": "done", "result": _dispatch_result("pr_updated")}
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _dispatch_result("pr_updated")}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
@@ -9032,7 +9032,7 @@ def test_conflict_is_an_attempt_that_redispatches_from_the_new_base_with_the_bun
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-conflict", job_id="impl-conflict", pr=pr,
                                     revision_count=1)
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 0, dict(item)
@@ -9041,7 +9041,7 @@ def test_conflict_is_an_attempt_that_redispatches_from_the_new_base_with_the_bun
         assert d["validation_status"] == "conflict"
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
         item = core.get_item(conn, eid)
@@ -9054,11 +9054,11 @@ def test_conflict_is_an_attempt_that_redispatches_from_the_new_base_with_the_bun
         assert item["pr_url"] == pr and CLOSED_PRS == [], "the stale PR closes when its replacement opens"
 
         # The replacement PR opens: the stale one is closed with it.
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/9"),
         }
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.submit_review = _fake_submit_review([])
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert core.get_item(conn, eid)["state"] == core.STATE_MERGING
         assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
@@ -9069,10 +9069,10 @@ def test_conflict_without_a_bundle_still_redispatches():
         eid = _outcome_item_with_pr(conn, external_id="sig-conflict-nobundle", job_id="impl-conflict-nb", pr=None)
         result = _conflict_result()
         result["verdict"] = "Rebase onto main conflicted."
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": result}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": result}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and "git bundle" not in calls[0]["context"], calls
         assert core.get_item(conn, eid)["revision_count"] == 1
@@ -9082,7 +9082,7 @@ def test_conflict_with_no_attempts_left_fails_the_item_with_the_note():
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-conflict-last", job_id="impl-conflict-last", pr=None,
                                     revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
-        _sideclaw.get = lambda job_id: {"status": "done", "result": _conflict_result()}
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "conflicted" in item["note"], dict(item)
@@ -9091,7 +9091,7 @@ def test_conflict_with_no_attempts_left_fails_the_item_with_the_note():
 def test_lease_refusal_of_a_first_attempt_retries_later_without_a_strike_or_an_attempt():
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-lease", job_id="impl-lease", pr=None)
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "failed",
             "error": "dispatch refused: an implement episode is already running in this repo (job x)",
         }
@@ -9105,7 +9105,7 @@ def test_lease_refusal_of_a_first_attempt_retries_later_without_a_strike_or_an_a
 
         # Not before retry_at ...
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == []
         # ... and then the same attempt is submitted again.
@@ -9121,13 +9121,13 @@ def test_lease_refusal_of_a_revision_puts_the_previous_attempt_back_and_keeps_th
                      ("val-sig-lease-rev", "impl-sig-lease-rev"))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         revision_job = item["implement_job"]
         assert item["revision_count"] == 1 and revision_job != "impl-sig-lease-rev", dict(item)
 
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "failed",
             "error": "update_pr refused: an implement episode is already running in this repo",
         }
@@ -9147,30 +9147,30 @@ def test_lease_refusal_of_a_revision_puts_the_previous_attempt_back_and_keeps_th
 def test_a_failed_job_that_is_not_the_lease_still_strikes():
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-notlease", job_id="impl-notlease", pr=None)
-        _sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
+        _agent_gateway.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert core.get_item(conn, eid)["strikes"] == 1
 
 
-def test_attempt_three_escalates_the_model_when_sideclaw_routes_one_and_sends_none_when_it_does_not():
+def test_attempt_three_escalates_the_model_when_agent_gateway_routes_one_and_sends_none_when_it_does_not():
     for escalation, want in (("escalation-model-x", "escalation-model-x"), (None, None)):
         with _triage_env() as (conn, ctx):
-            _sideclaw.escalation_model = lambda esc=escalation: esc
+            _agent_gateway.escalation_model = lambda esc=escalation: esc
             eid = _seed_blocked_item(conn, external_id="sig-escalate", revision_count=1)
             calls: list[dict[str, Any]] = []
-            _sideclaw.submit = _fake_submit(calls)
+            _agent_gateway.submit = _fake_submit(calls)
             work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
             assert len(calls) == 1 and calls[0]["model"] == want, calls
             assert "Attempt 3 of 4" in calls[0]["brief"], calls[0]["brief"]
 
 
-def test_attempt_two_sends_no_model_even_when_sideclaw_routes_an_escalation_model():
+def test_attempt_two_sends_no_model_even_when_agent_gateway_routes_an_escalation_model():
     with _triage_env() as (conn, ctx):
         asked: list[int] = []
-        _sideclaw.escalation_model = lambda: asked.append(1) or "escalation-model-x"
+        _agent_gateway.escalation_model = lambda: asked.append(1) or "escalation-model-x"
         _seed_blocked_item(conn, external_id="sig-attempt-two", revision_count=0)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and calls[0]["model"] is None and asked == [], (calls, asked)
 
@@ -9179,12 +9179,12 @@ def test_a_third_attempt_after_a_strike_retry_also_escalates():
     """maybe_auto_implement() re-submits a strike-cleared item: the attempt number comes
     from revision_count, so a late attempt does not slip back onto the default model."""
     with _triage_env() as (conn, ctx):
-        _sideclaw.escalation_model = lambda: "escalation-model-x"
+        _agent_gateway.escalation_model = lambda: "escalation-model-x"
         eid = _seed_verdict_item(conn, external_id="sig-late-first")
         conn.execute("UPDATE triage_items SET revision_count=2 WHERE event_id=?", (eid,))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and calls[0]["model"] == "escalation-model-x", calls
 
@@ -9193,7 +9193,7 @@ def test_four_attempts_in_total_then_the_pollers_fail_the_item():
     with _triage_env() as (conn, ctx):
         eid = _seed_blocked_item(conn, external_id="sig-four", revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 2)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and "Attempt 4 of 4" in calls[0]["brief"], calls
         assert core.get_item(conn, eid)["revision_count"] == core.MAX_IMPLEMENT_ATTEMPTS - 1
@@ -9333,8 +9333,8 @@ def test_the_implement_result_root_cause_merges_other_open_items():
         conn.commit()
         result = _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/12")
         result["rootCause"] = "impl-cause"
-        _sideclaw.get = lambda job_id: {"status": "done", "result": result}
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": result}
+        _agent_gateway.submit_review = _fake_submit_review([])
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert core.get_item(conn, eid)["root_cause"] == "impl-cause"
         merged = core.get_item(conn, other["event_id"])
@@ -9388,7 +9388,7 @@ def test_a_process_only_blocking_finding_parks_for_a_human_instead_of_blocking()
         )
         conn.commit()
         _seed_implement_dispatch(conn, "implement-job-po")
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _review_result("actionable", blocking=[_PROCESS_ONLY_FINDING],
                                      summary="1 blocking finding."),
@@ -9419,7 +9419,7 @@ def test_a_process_only_finding_is_never_spent_as_a_revision():
     with _triage_env() as (conn, ctx):
         eid = _seed_blocked_item(conn, external_id="sig-po-rev", blocking=[_PROCESS_ONLY_FINDING])
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
 
@@ -9441,7 +9441,7 @@ def test_a_mixed_round_revises_the_code_findings_and_carries_the_closing_instruc
                      (json.dumps({"author": _github.GH_OWNER}), eid))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
 
@@ -9459,7 +9459,7 @@ def test_a_revision_brief_carries_the_closing_instruction_only_for_a_trusted_iss
     with _triage_env() as (conn, ctx):
         _seed_blocked_item(conn, external_id="sig-alert-origin")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
 
@@ -9473,7 +9473,7 @@ def test_a_revision_brief_carries_the_closing_instruction_only_for_a_trusted_iss
                      (json.dumps({"author": "some-stranger"}), untrusted))
         conn.commit()
         calls = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
 
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
 
@@ -9512,7 +9512,7 @@ def _seed_validating(conn, *, external_id: str, source: str = "uk", title: str =
 
 
 def _confirm_and_merge(conn, policy, deploy: dict, merge_commit: str | None = None) -> None:
-    _sideclaw.get = lambda job_id: {"status": "done", "result": _review_result("clean", blocking=[])}
+    _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result("clean", blocking=[])}
     fake = types.SimpleNamespace(merge_method="squash", deploy=deploy, merge_commit=merge_commit, repo_slug="jkrumm/demo-repo",
                                  pull_request=31)
     with _patched(_merge, plan_or_land=lambda *a, **kw: fake):
@@ -9814,7 +9814,7 @@ def test_implement_handoff_that_lost_the_race_opens_no_second_review():
         eid = _seed_implementing_item(conn, external_id="sig-handoff-race", job_id="impl-handoff-race")
         url = "https://github.com/jkrumm/demo-repo/pull/10"
         review_calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(review_calls)
+        _agent_gateway.submit_review = _fake_submit_review(review_calls)
         done = {"status": "done", "result": _dispatch_result("pr_opened", artifact_url=url)}
 
         def _get(job_id):
@@ -9824,7 +9824,7 @@ def test_implement_handoff_that_lost_the_race_opens_no_second_review():
             conn.commit()
             return done
 
-        _sideclaw.get = _get
+        _agent_gateway.get = _get
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert review_calls == [], "the loser must not submit a review"
         item = core.get_item(conn, eid)
@@ -9849,7 +9849,7 @@ def test_update_pr_submit_claim_is_visible_and_released():
             train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)   # the other cron
             return inner(**kw)
 
-        _sideclaw.submit_update_pr = _submit
+        _agent_gateway.submit_update_pr = _submit
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert seen["mid"] == (train.TRAIN_CLAIM, (NOW + dt.timedelta(minutes=5)).isoformat()), seen
         assert len(calls) == 1, "the other cron's pass inside the claim window submitted a second update_pr"
@@ -9868,7 +9868,7 @@ def test_a_crashed_handoff_claim_is_retaken_once_it_expires():
                      ((NOW + dt.timedelta(minutes=5)).isoformat(), eid))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(calls)
+        _agent_gateway.submit_review = _fake_submit_review(calls)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=1), dry_run=False)
         assert calls == [], "a live claim holds"
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=6), dry_run=False)
@@ -9891,7 +9891,7 @@ def test_a_review_result_is_acted_on_once_when_two_passes_race():
             raise _merge.ChecksPending("CI still running")
 
         _merge.plan_or_land = _land
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _review_result("clean")}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": _review_result("clean")}
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert landed == [1], "the other cron's pass inside the claim window must not act on the result"
         assert inside["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat(), inside
@@ -9913,14 +9913,14 @@ def test_a_review_result_claim_lost_to_another_pass_does_nothing():
             conn.commit()
             return {"id": job_id, "status": "done", "result": _review_result("clean")}
 
-        _sideclaw.get = _get
+        _agent_gateway.get = _get
         _merge.plan_or_land = lambda *a, **kw: landed.append(1)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert landed == [], "a lost claim must not merge"
         assert core.get_item(conn, eid)["retry_at"] == (NOW + dt.timedelta(minutes=5)).isoformat()
 
 
-def test_reconcile_leaves_an_implement_operation_open_while_sideclaw_still_runs_it():
+def test_reconcile_leaves_an_implement_operation_open_while_agent_gateway_still_runs_it():
     with _triage_env() as (conn, ctx):
         eid = _seed_item(conn, external_id="sig-recon-running", state=core.STATE_WORKING,
                          implement_job="impl-still-running", max_tier="implement")
@@ -9929,7 +9929,7 @@ def test_reconcile_leaves_an_implement_operation_open_while_sideclaw_still_runs_
         conn.execute("UPDATE operations SET receipt_json=? WHERE op_id=?", (json.dumps({"jobId": "impl-still-running"}), op))
         conn.commit()
         for status in ("running", "pending"):
-            _sideclaw.get = lambda job_id, status=status: {"id": job_id, "status": status}
+            _agent_gateway.get = lambda job_id, status=status: {"id": job_id, "status": status}
             work.reconcile_operations(conn, DEFAULT_POLICY, NOW, dry_run=False)
             row = conn.execute("SELECT outcome, reconciled_at FROM operations WHERE op_id=?", (op,)).fetchone()
             assert row["outcome"] is None and row["reconciled_at"] is None, (status, dict(row))
@@ -10012,8 +10012,8 @@ def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_
         assert ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
         # ...and the train re-drives it: once the checks settle the merge lands.
         landed: list[int] = []
-        _sideclaw.submit_update_pr = _fake_update_pr([])
-        _sideclaw.submit_review = lambda **kw: (_ for _ in ()).throw(
+        _agent_gateway.submit_update_pr = _fake_update_pr([])
+        _agent_gateway.submit_review = lambda **kw: (_ for _ in ()).throw(
             AssertionError("the confirmed head is not reviewed again"))
         CHECK_RUNS["runs"] = []
 
@@ -10025,7 +10025,7 @@ def test_argo_merge_with_checks_still_running_moves_the_item_to_merging_for_the_
 
         _merge.plan_or_land = _land
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
-        _sideclaw.get = lambda job_id: _update_pr_job("up_to_date", job_id=job_id)
+        _agent_gateway.get = lambda job_id: _update_pr_job("up_to_date", job_id=job_id)
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=11), dry_run=False)
         assert landed == [1] and core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
 
@@ -10038,7 +10038,7 @@ def test_argo_implement_and_merge_are_rejected_for_a_reverted_item():
         conn.execute("UPDATE triage_items SET revert_pr=14 WHERE event_id=?", (eid,))
         conn.commit()
         submits: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(submits)
+        _agent_gateway.submit = _fake_submit(submits)
         landed: list[int] = []
         _merge.plan_or_land = lambda *a, **kw: landed.append(1)
         _argo.fetch_actions = lambda machine, **kw: ("ok", [
@@ -10179,7 +10179,7 @@ def _revision_in_flight(conn, ext: str, *, with_prior: bool = True) -> tuple[int
         conn.execute("UPDATE dispatches SET origin_event_id=?, validation_job_id=? WHERE job_id=?",
                      (eid, f"val-{ext}", f"impl-{ext}"))
         conn.commit()
-    _sideclaw.submit = _numbered_submit([], "rev-first")
+    _agent_gateway.submit = _numbered_submit([], "rev-first")
     work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
     item = core.get_item(conn, eid)
     assert item["revision_count"] == 1 and item["implement_job"] != f"impl-{ext}", dict(item)
@@ -10193,7 +10193,7 @@ def test_a_struck_revision_is_handed_back_not_restarted_from_scratch():
     pr = "https://github.com/jkrumm/demo-repo/pull/7"
     with _triage_env() as (conn, ctx):
         eid, _job = _revision_in_flight(conn, "sig-strike-rev")
-        _sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
+        _agent_gateway.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
@@ -10201,7 +10201,7 @@ def test_a_struck_revision_is_handed_back_not_restarted_from_scratch():
         assert item["revision_count"] == 0 and item["pr_url"] == pr, dict(item)
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _numbered_submit(calls, "rev-second")
+        _agent_gateway.submit = _numbered_submit(calls, "rev-second")
         later = NOW + dt.timedelta(minutes=11)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, later, dry_run=False)
         assert calls == [], "a struck revision must not restart as a from-scratch first attempt"
@@ -10216,22 +10216,22 @@ def test_a_struck_revision_with_no_previous_attempt_on_record_keeps_the_pr_to_su
     pr = "https://github.com/jkrumm/demo-repo/pull/7"
     with _triage_env() as (conn, ctx):
         eid, _job = _revision_in_flight(conn, "sig-strike-noprior", with_prior=False)
-        _sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
+        _agent_gateway.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["pr_url"] == pr, dict(item)
 
         # The from-scratch attempt that follows opens its own PR: the old one is closed as superseded.
-        _sideclaw.submit = _numbered_submit([], "rev-scratch")
+        _agent_gateway.submit = _numbered_submit([], "rev-scratch")
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=11), dry_run=False)
         new_job = core.get_item(conn, eid)["implement_job"]
         assert new_job, "a fresh attempt was submitted"
-        _sideclaw.get = lambda job_id: {
+        _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/9"),
         }
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.submit_review = _fake_submit_review([])
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=12), dry_run=False)
         assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
 
@@ -10239,20 +10239,20 @@ def test_a_struck_revision_with_no_previous_attempt_on_record_keeps_the_pr_to_su
 def test_a_struck_first_attempt_still_clears_its_handles():
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-strike-first", job_id="impl-strike-first", pr=None)
-        _sideclaw.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
+        _agent_gateway.get = lambda job_id: {"status": "failed", "error": "worker crashed"}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["implement_job"] is None and item["pr_url"] is None and item["strikes"] == 1, dict(item)
 
 
 def _escalation_refusing_submit(calls: list[dict[str, Any]], *, always: bool = False):
-    """sideclaw refuses any submit that names a `model` (HTTP 400); with `always`, every submit."""
+    """agent-gateway refuses any submit that names a `model` (HTTP 400); with `always`, every submit."""
     counter = {"n": 0}
 
     def _submit(*, cwd, tier, brief, context=None, model=None, revision_of=None):
         calls.append({"cwd": cwd, "tier": tier, "model": model, "revision_of": revision_of})
         if model is not None or always:
-            raise SubmitRefused("sideclaw refused the job (HTTP 400): dispatch refused: unknown model",
+            raise SubmitRefused("agent-gateway refused the job (HTTP 400): dispatch refused: unknown model",
                                 status=400)
         counter["n"] += 1
         return {"id": f"job-esc-{counter['n']:04d}", "status": "queued"}
@@ -10261,10 +10261,10 @@ def _escalation_refusing_submit(calls: list[dict[str, Any]], *, always: bool = F
 
 def test_a_refused_escalation_model_is_resubmitted_once_without_it_on_a_revision():
     with _triage_env() as (conn, ctx):
-        _sideclaw.escalation_model = lambda: "escalation-model-x"
+        _agent_gateway.escalation_model = lambda: "escalation-model-x"
         eid = _seed_blocked_item(conn, external_id="sig-esc-refused-rev", revision_count=1)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _escalation_refusing_submit(calls)
+        _agent_gateway.submit = _escalation_refusing_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert [c["model"] for c in calls] == ["escalation-model-x", None], calls
         assert calls[1]["revision_of"] == "dispatch/prior-branch", calls
@@ -10275,12 +10275,12 @@ def test_a_refused_escalation_model_is_resubmitted_once_without_it_on_a_revision
 
 def test_a_refused_escalation_model_is_resubmitted_once_without_it_on_an_auto_implement():
     with _triage_env() as (conn, ctx):
-        _sideclaw.escalation_model = lambda: "escalation-model-x"
+        _agent_gateway.escalation_model = lambda: "escalation-model-x"
         eid = _seed_verdict_item(conn, external_id="sig-esc-refused-first")
         conn.execute("UPDATE triage_items SET revision_count=2 WHERE event_id=?", (eid,))
         conn.commit()
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _escalation_refusing_submit(calls)
+        _agent_gateway.submit = _escalation_refusing_submit(calls)
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert [c["model"] for c in calls] == ["escalation-model-x", None], calls
         item = core.get_item(conn, eid)
@@ -10289,10 +10289,10 @@ def test_a_refused_escalation_model_is_resubmitted_once_without_it_on_an_auto_im
 
 def test_a_refusal_without_a_model_still_ends_the_item_after_the_one_retry():
     with _triage_env() as (conn, ctx):
-        _sideclaw.escalation_model = lambda: "escalation-model-x"
+        _agent_gateway.escalation_model = lambda: "escalation-model-x"
         eid = _seed_blocked_item(conn, external_id="sig-esc-always", revision_count=1)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _escalation_refusing_submit(calls, always=True)
+        _agent_gateway.submit = _escalation_refusing_submit(calls, always=True)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert [c["model"] for c in calls] == ["escalation-model-x", None], calls
         item = core.get_item(conn, eid)
@@ -10343,16 +10343,16 @@ def test_a_conflict_on_a_revision_keeps_the_original_review_findings():
         conn.execute("UPDATE dispatches SET origin_event_id=?, validation_job_id=? WHERE job_id=?",
                      (eid, "val-sig-conflict-findings", "impl-sig-conflict-findings"))
         conn.commit()
-        _sideclaw.submit = _numbered_submit([], "cf-first")
+        _agent_gateway.submit = _numbered_submit([], "cf-first")
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         revision_job = core.get_item(conn, eid)["implement_job"]
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["implement_job"] == revision_job and item["state"] == core.STATE_WORKING, dict(item)
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _numbered_submit(calls, "cf-second")
+        _agent_gateway.submit = _numbered_submit(calls, "cf-second")
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and calls[0]["revision_of"] is None, calls
         brief = calls[0]["brief"]
@@ -10364,10 +10364,10 @@ def test_a_conflict_on_a_revision_keeps_the_original_review_findings():
 def test_a_conflict_on_a_first_attempt_carries_no_review_findings():
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-conflict-plain", job_id="impl-conflict-plain", pr=None)
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and "BLOCKED" not in calls[0]["brief"], calls
 
@@ -10380,7 +10380,7 @@ def test_exhausted_attempts_on_checks_failed_or_conflict_leave_the_pr_open_and_s
         with _triage_env() as (conn, ctx):
             eid = _outcome_item_with_pr(conn, external_id=f"sig-spent-{outcome}", job_id=f"impl-spent-{outcome}",
                                         pr=pr, revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
-            _sideclaw.get = lambda job_id, r=result: {"id": job_id, "status": "done", "result": r}
+            _agent_gateway.get = lambda job_id, r=result: {"id": job_id, "status": "done", "result": r}
             work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
             item = core.get_item(conn, eid)
             assert item["state"] == core.STATE_FAILED, dict(item)
@@ -10392,7 +10392,7 @@ def test_exhausted_attempts_without_a_pr_say_nothing_about_one():
     with _triage_env() as (conn, ctx):
         eid = _outcome_item_with_pr(conn, external_id="sig-spent-nopr", job_id="impl-spent-nopr", pr=None,
                                     revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": _conflict_result()}
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "PR left open" not in item["note"], dict(item)
@@ -10436,7 +10436,7 @@ def test_the_fold_clears_the_triage_job_on_every_outcome_but_ignore():
 def test_a_model_ignore_still_reopens_after_a_dismissed_one_does_not():
     """The two ends of the I1 rule through the real fold: a model's ignore reopens after the cooldown."""
     with _triage_env() as (conn, ctx):
-        _sideclaw.submit_triage = lambda *, prompt, schema: _triage_job(
+        _agent_gateway.submit_triage = lambda *, prompt, schema: _triage_job(
             {"action": "ignore", "reason": "noise"}, job_id="t-model-ignore")
         eid = _insert_event(conn, source="slack_alert", external_id="model-ign", title="Model ign", first_seen=OLD)
         intake.ingest(conn, NOW)
@@ -10577,7 +10577,7 @@ def test_an_item_in_a_private_repo_sends_no_content_to_the_triage_job():
     with _triage_env() as (conn, ctx):
         _add_repo(ctx, "homelab-private")
         prompts: list[str] = []
-        _sideclaw.submit_triage = _capturing_triage(prompts)
+        _agent_gateway.submit_triage = _capturing_triage(prompts)
         eid = intake.open_origin_item(conn, origin="human", repo="homelab-private",
                                       brief="TOP SECRET: rotate the vault key", max_tier="investigate",
                                       external_id="human:private", title="TOP SECRET: rotate the vault key", now=NOW)
@@ -10677,9 +10677,9 @@ def test_a_triage_job_stuck_past_thirty_minutes_is_cancelled_and_struck():
     with _triage_env() as (conn, ctx):
         stuck = _stuck_triage_item(conn, "stuck", submitted_at=NOW - dt.timedelta(minutes=31))
         fresh = _stuck_triage_item(conn, "fresh", submitted_at=NOW - dt.timedelta(minutes=29))
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "running"}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "running"}
         cancelled: list[str] = []
-        _sideclaw.cancel = lambda job_id: cancelled.append(job_id) or {"id": job_id, "status": "cancelled"}
+        _agent_gateway.cancel = lambda job_id: cancelled.append(job_id) or {"id": job_id, "status": "cancelled"}
         triaging.poll_triage_jobs(conn, NOW, dry_run=False)
         assert cancelled == ["t-stuck"], cancelled
         item = _rows(conn, stuck)
@@ -10691,7 +10691,7 @@ def test_a_triage_job_stuck_past_thirty_minutes_is_cancelled_and_struck():
 def test_a_stuck_triage_job_that_cannot_be_cancelled_is_still_struck():
     with _triage_env() as (conn, ctx):
         stuck = _stuck_triage_item(conn, "stuck2", submitted_at=NOW - dt.timedelta(hours=2))
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "queued"}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "queued"}
         with contextlib.redirect_stderr(io.StringIO()):
             triaging.poll_triage_jobs(conn, NOW, dry_run=False)   # the default fake cancel raises
         assert _rows(conn, stuck)["strikes"] == 1 and _rows(conn, stuck)["triage_job"] is None
@@ -10700,16 +10700,16 @@ def test_a_stuck_triage_job_that_cannot_be_cancelled_is_still_struck():
 def test_a_job_that_finished_late_folds_instead_of_being_cancelled():
     with _triage_env() as (conn, ctx):
         eid = _stuck_triage_item(conn, "late", submitted_at=NOW - dt.timedelta(hours=2))
-        _sideclaw.get = lambda job_id: _triage_job(
+        _agent_gateway.get = lambda job_id: _triage_job(
             {"action": "new", "repo": "demo-repo", "title": "t", "reason": "r"}, job_id=job_id)
-        _sideclaw.cancel = lambda job_id: (_ for _ in ()).throw(AssertionError("a finished job is not cancelled"))
+        _agent_gateway.cancel = lambda job_id: (_ for _ in ()).throw(AssertionError("a finished job is not cancelled"))
         triaging.poll_triage_jobs(conn, NOW, dry_run=False)
         assert _rows(conn, eid)["state"] == core.STATE_TRIAGED
 
 
 def test_the_triage_job_age_is_recorded_when_the_job_is_submitted():
     with _triage_env() as (conn, ctx):
-        _sideclaw.submit_triage = lambda *, prompt, schema: {"id": "t-aged", "status": "queued"}
+        _agent_gateway.submit_triage = lambda *, prompt, schema: {"id": "t-aged", "status": "queued"}
         eid = _seed_row(conn, external_id="aged", title="Aged")
         running = triaging.submit_triage_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = _rows(conn, eid)
@@ -10720,7 +10720,7 @@ def test_settle_waits_only_on_jobs_submitted_in_this_run():
     """I9: an older job that is still running must not cost the whole settle window every tick."""
     with _triage_env() as (conn, ctx):
         _stuck_triage_item(conn, "older", submitted_at=NOW - dt.timedelta(minutes=5))
-        _sideclaw.get = lambda job_id: {"id": job_id, "status": "running"}
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "running"}
 
         def _no_sleep(seconds):
             raise AssertionError("settle must not wait on a job from an earlier run")
@@ -10788,7 +10788,7 @@ def _train_item(conn, ext: str, *, stage: str = "update", sha: str | None = None
 
 
 def _jobs(table: dict[str, Any]):
-    """`sideclaw.get` answering from `table` (job id -> job, or a callable returning one)."""
+    """`agent-gateway.get` answering from `table` (job id -> job, or a callable returning one)."""
     def _get(job_id):
         job = table.get(job_id)
         return job() if callable(job) else job
@@ -10812,15 +10812,15 @@ def test_train_happy_path_updates_checks_reviews_and_merges_the_pinned_sha():
         updates: list[dict[str, Any]] = []
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
-        _sideclaw.submit_update_pr = _fake_update_pr(updates)
-        _sideclaw.submit_review = _fake_submit_review(reviews)
+        _agent_gateway.submit_update_pr = _fake_update_pr(updates)
+        _agent_gateway.submit_review = _fake_submit_review(reviews)
         table: dict[str, Any] = {
             "impl-train-happy": {"id": "impl-train-happy", "status": "done",
                                  "result": _dispatch_result("pr_opened", artifact_url=_TRAIN_PR)},
             "update-job-000001": _update_pr_job("up_to_date"),
             "review-job-000001": {"id": "review-job-000001", "status": "done", "result": _review_result("clean")},
         }
-        _sideclaw.get = _jobs(table)
+        _agent_gateway.get = _jobs(table)
         CHECK_RUNS["runs"] = [{"name": "ci", "status": "completed", "conclusion": "success"}]
         _merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
             merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="d" * 40)
@@ -10849,8 +10849,8 @@ def test_train_happy_path_updates_checks_reviews_and_merges_the_pinned_sha():
 def test_train_updated_branch_waits_for_pending_checks_without_a_deadline():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-pending", job="update-job-pending")
-        _sideclaw.get = _jobs({"update-job-pending": _update_pr_job("updated", head=REBASED_SHA)})
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.get = _jobs({"update-job-pending": _update_pr_job("updated", head=REBASED_SHA)})
+        _agent_gateway.submit_review = _fake_submit_review([])
         PR_HEAD["sha"] = REBASED_SHA
         CHECK_RUNS["runs"] = [{"name": "ci", "status": "in_progress", "conclusion": None}]
         _train_pass(conn)
@@ -10874,11 +10874,11 @@ def test_train_head_moved_during_review_goes_back_to_update():
         eid = _train_item(conn, "sig-train-moved", stage="review", sha=TRAIN_SHA)
         conn.execute("UPDATE triage_items SET validation_job='review-moved' WHERE event_id=?", (eid,))
         conn.commit()
-        _sideclaw.get = _jobs({"review-moved": {"id": "review-moved", "status": "done",
+        _agent_gateway.get = _jobs({"review-moved": {"id": "review-moved", "status": "done",
                                                 "result": _review_result("clean")}})
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
         updates: list[dict[str, Any]] = []
-        _sideclaw.submit_update_pr = _fake_update_pr(updates)
+        _agent_gateway.submit_update_pr = _fake_update_pr(updates)
         PR_HEAD["sha"] = REBASED_SHA   # someone pushed while the review ran
         _train_pass(conn)
         item = core.get_item(conn, eid)
@@ -10891,8 +10891,8 @@ def test_train_head_moved_during_review_goes_back_to_update():
 def test_train_head_moved_before_the_review_is_submitted_goes_back_to_update():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-moved-early", stage="review", sha=TRAIN_SHA)
-        _sideclaw.submit_review = _no_review
-        _sideclaw.submit_update_pr = _fake_update_pr([])
+        _agent_gateway.submit_review = _no_review
+        _agent_gateway.submit_update_pr = _fake_update_pr([])
         PR_HEAD["sha"] = REBASED_SHA
         _train_pass(conn)
         item = core.get_item(conn, eid)
@@ -10904,7 +10904,7 @@ def test_train_skips_the_review_of_a_sha_a_review_already_confirmed():
         eid = _train_item(conn, "sig-train-same-sha", stage="checks", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
         conn.execute("UPDATE dispatches SET validation_status='confirmed' WHERE job_id='impl-sig-train-same-sha'")
         conn.commit()
-        _sideclaw.submit_review = _no_review
+        _agent_gateway.submit_review = _no_review
         CHECK_RUNS["runs"] = []
         merges: list[dict[str, Any]] = []
         _merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
@@ -10917,14 +10917,14 @@ def test_train_skips_the_review_of_a_sha_a_review_already_confirmed():
 def test_train_rebased_after_a_confirmed_review_is_reviewed_again_with_delta_context():
     """A review confirmed TRAIN_SHA; the branch was rebased (REBASED_SHA): the review runs again,
     and its context names the confirmed SHA and asks for focus on what changed — text only,
-    sideclaw's review has no delta scope."""
+    agent-gateway's review has no delta scope."""
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-delta", job="update-job-delta", reviewed=TRAIN_SHA)
-        _sideclaw.get = _jobs({"update-job-delta": _update_pr_job("updated", head=REBASED_SHA)})
+        _agent_gateway.get = _jobs({"update-job-delta": _update_pr_job("updated", head=REBASED_SHA)})
         PR_HEAD["sha"] = REBASED_SHA
         CHECK_RUNS["runs"] = [{"name": "ci", "status": "completed", "conclusion": "success"}]
         reviews: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(reviews)
+        _agent_gateway.submit_review = _fake_submit_review(reviews)
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("not yet reviewed"))
         _train_pass(conn)
         assert len(reviews) == 1, reviews
@@ -10938,7 +10938,7 @@ def test_train_rebased_after_a_confirmed_review_is_reviewed_again_with_delta_con
     with _triage_env() as (conn, ctx):   # a first review carries no delta text
         _train_item(conn, "sig-train-first-review", stage="review", sha=TRAIN_SHA)
         reviews = []
-        _sideclaw.submit_review = _fake_submit_review(reviews)
+        _agent_gateway.submit_review = _fake_submit_review(reviews)
         _train_pass(conn)
         assert len(reviews) == 1 and "Focus on what changed" not in reviews[0]["context"], reviews
 
@@ -10949,7 +10949,7 @@ def test_train_conflict_goes_back_to_working_for_a_revision_from_the_new_base():
     and the PR it opens supersedes the conflicting one."""
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-conflict", job="update-job-conflict")
-        _sideclaw.get = _jobs({"update-job-conflict": _update_pr_job(
+        _agent_gateway.get = _jobs({"update-job-conflict": _update_pr_job(
             "conflict", note="rebase onto master failed: CONFLICT (content): Merge conflict in scripts/a.py")})
         _train_pass(conn)
         item = core.get_item(conn, eid)
@@ -10960,7 +10960,7 @@ def test_train_conflict_goes_back_to_working_for_a_revision_from_the_new_base():
         assert d["validation_status"] == "conflict"
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1, calls
         assert calls[0]["revision_of"] is None, "a conflicting branch is not continued — the base moved under it"
@@ -10976,7 +10976,7 @@ def test_train_conflict_with_no_attempt_left_fails_and_leaves_the_pr_open():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-conflict-spent", job="update-job-spent",
                           revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
-        _sideclaw.get = _jobs({"update-job-spent": _update_pr_job("conflict", note="rebase failed")})
+        _agent_gateway.get = _jobs({"update-job-spent": _update_pr_job("conflict", note="rebase failed")})
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, dict(item)
@@ -10987,7 +10987,7 @@ def test_train_conflict_with_no_attempt_left_fails_and_leaves_the_pr_open():
 def test_train_failed_checks_after_the_update_is_a_checks_failed_revision_of_the_same_pr():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-red", job="update-job-red")
-        _sideclaw.get = _jobs({"update-job-red": _update_pr_job("updated", head=REBASED_SHA, passed=False)})
+        _agent_gateway.get = _jobs({"update-job-red": _update_pr_job("updated", head=REBASED_SHA, passed=False)})
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and "checks failed" in item["note"], dict(item)
@@ -10996,7 +10996,7 @@ def test_train_failed_checks_after_the_update_is_a_checks_failed_revision_of_the
         assert d["validation_status"] == "checks_failed"
 
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and calls[0]["revision_of"] == "dispatch/demo-repo-10", calls
         assert "checks FAILED" in calls[0]["brief"] and "test_x.py::test_y" in calls[0]["brief"], calls[0]["brief"]
@@ -11005,7 +11005,7 @@ def test_train_failed_checks_after_the_update_is_a_checks_failed_revision_of_the
 def test_train_failed_ci_on_the_train_sha_is_a_checks_failed_revision():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-ci-red", stage="checks", sha=TRAIN_SHA)
-        _sideclaw.submit_review = _no_review
+        _agent_gateway.submit_review = _no_review
         CHECK_RUNS["runs"] = [{"name": "build", "status": "completed", "conclusion": "success"},
                               {"name": "e2e", "status": "completed", "conclusion": "failure"}]
         _train_pass(conn)
@@ -11026,7 +11026,7 @@ def test_train_checks_403_falls_back_to_actions_runs():
             _merge.CheckRunsUnreadable("HTTP 403: Resource not accessible by personal access token"))
         _github.workflow_runs = lambda owner, repo, sha: [
             {"name": "CI", "status": "completed", "conclusion": "success"}]
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.submit_review = _fake_submit_review([])
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
@@ -11039,7 +11039,7 @@ def test_train_checks_unreadable_never_pass():
     train strikes and stays off `review` rather than advancing on an unknown state."""
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-unreadable", stage="checks", sha=TRAIN_SHA)
-        _sideclaw.submit_review = _no_review
+        _agent_gateway.submit_review = _no_review
         _github.check_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
             _merge.CheckRunsUnreadable("HTTP 403: Resource not accessible by personal access token"))
         _github.workflow_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
@@ -11053,7 +11053,7 @@ def test_train_checks_unreadable_never_pass():
 def test_train_checks_on_a_moved_head_go_back_to_update():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-checks-moved", stage="checks", sha=TRAIN_SHA)
-        _sideclaw.submit_update_pr = _fake_update_pr([])
+        _agent_gateway.submit_update_pr = _fake_update_pr([])
         PR_HEAD["sha"] = REBASED_SHA
         _train_pass(conn)
         item = core.get_item(conn, eid)
@@ -11065,7 +11065,7 @@ def test_train_merge_refused_because_the_head_moved_goes_back_to_update_without_
         eid = _train_item(conn, "sig-train-409", stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
             HeadMoved("GitHub refused the merge (409): the head moved"))
-        _sideclaw.submit_update_pr = _fake_update_pr([])
+        _agent_gateway.submit_update_pr = _fake_update_pr([])
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_UPDATE, dict(item)
@@ -11075,13 +11075,13 @@ def test_train_merge_refused_because_the_head_moved_goes_back_to_update_without_
 def test_train_update_lease_refusal_retries_later_without_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-lease", job="update-job-lease")
-        _sideclaw.get = _jobs({"update-job-lease": {
+        _agent_gateway.get = _jobs({"update-job-lease": {
             "id": "update-job-lease", "status": "failed",
             "error": "update_pr refused: an implement episode is already running in this repo (job x) — "
                      "implement episodes serialize per repo because their edits and pushes would interleave. "
                      "Re-submit once it finishes."}})
         updates: list[dict[str, Any]] = []
-        _sideclaw.submit_update_pr = _fake_update_pr(updates)
+        _agent_gateway.submit_update_pr = _fake_update_pr(updates)
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
@@ -11095,30 +11095,30 @@ def test_train_update_lease_refusal_retries_later_without_a_strike():
 
 
 def test_train_update_infrastructure_failures_strike():
-    """A 5xx on submit, a job that failed for any reason but the lease, and a job sideclaw no
+    """A 5xx on submit, a job that failed for any reason but the lease, and a job agent-gateway no
     longer knows are infrastructure failures: each strikes, the third lands `failed`."""
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-5xx")
 
         def _down(*, cwd, pr):
-            raise RemoteError("sideclaw returned HTTP 502: bad gateway")
+            raise RemoteError("agent-gateway returned HTTP 502: bad gateway")
 
-        _sideclaw.submit_update_pr = _down
+        _agent_gateway.submit_update_pr = _down
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
         assert item["train_job"] is None and item["retry_at"] == (NOW + dt.timedelta(minutes=10)).isoformat()
         assert "502" in item["note"], item["note"]
 
-        _sideclaw.submit_update_pr = _fake_update_pr([])
-        _sideclaw.get = _jobs({"update-job-000001": {"id": "update-job-000001", "status": "failed",
+        _agent_gateway.submit_update_pr = _fake_update_pr([])
+        _agent_gateway.get = _jobs({"update-job-000001": {"id": "update-job-000001", "status": "failed",
                                                       "error": "git push --force-with-lease rejected"}})
         _train_pass(conn, 11)   # submits
         _train_pass(conn, 11)   # folds the failure
         item = core.get_item(conn, eid)
         assert item["strikes"] == 2 and "force-with-lease rejected" in item["note"], dict(item)
 
-        _sideclaw.get = _default_fake_get   # the next job is pruned/lost
+        _agent_gateway.get = _default_fake_get   # the next job is pruned/lost
         _train_pass(conn, 42)
         _train_pass(conn, 42)
         item = core.get_item(conn, eid)
@@ -11130,7 +11130,7 @@ def test_train_malformed_update_pr_result_is_a_loud_strike():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-malformed", job="update-job-bad")
         bad = _update_pr_job("rebased")
-        _sideclaw.get = _jobs({"update-job-bad": bad})
+        _agent_gateway.get = _jobs({"update-job-bad": bad})
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["strikes"] == 1 and "refusing to parse" in item["note"], dict(item)
@@ -11143,7 +11143,7 @@ def test_train_walks_only_the_oldest_merging_item_of_a_repo():
         newer = _train_item(conn, "sig-train-newer")
         other = _train_item(conn, "sig-train-other-repo", repo="other-repo")
         updates: list[dict[str, Any]] = []
-        _sideclaw.submit_update_pr = _fake_update_pr(updates)
+        _agent_gateway.submit_update_pr = _fake_update_pr(updates)
         _train_pass(conn)
         assert len(updates) == 2, updates
         assert core.get_item(conn, older)["train_job"] == "update-job-000001"
@@ -11171,7 +11171,7 @@ def test_train_update_job_folded_by_two_passes_is_acted_on_once():
                 _train_pass(conn)   # the other cron folds the same job first
             return done
 
-        _sideclaw.get = _get
+        _agent_gateway.get = _get
         real_set_state = core.set_state
         written: list[str] = []
 
@@ -11189,7 +11189,7 @@ def test_train_update_job_folded_by_two_passes_is_acted_on_once():
 
     with _triage_env() as (conn, ctx):   # an up_to_date fold: one hop to checks, no double write
         eid = _train_item(conn, "sig-train-cas-ok", job="update-job-cas-ok")
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.submit_review = _fake_submit_review([])
         CHECK_RUNS["runs"] = [{"name": "ci", "status": "queued", "conclusion": None}]
         seen: list[str] = []
 
@@ -11199,7 +11199,7 @@ def test_train_update_job_folded_by_two_passes_is_acted_on_once():
                 _train_pass(conn)
             return _update_pr_job("up_to_date", job_id="update-job-cas-ok")
 
-        _sideclaw.get = _get_ok
+        _agent_gateway.get = _get_ok
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_CHECKS and item["train_sha"] == TRAIN_SHA, dict(item)
@@ -11211,7 +11211,7 @@ def test_a_merging_item_with_no_stage_starts_its_train_at_update():
         eid = _train_item(conn, "sig-train-no-stage")
         conn.execute("UPDATE triage_items SET train_stage=NULL WHERE event_id=?", (eid,))
         conn.commit()
-        _sideclaw.submit_update_pr = _fake_update_pr([])
+        _agent_gateway.submit_update_pr = _fake_update_pr([])
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
@@ -11269,7 +11269,7 @@ def test_a_verify_failure_reverts_the_merged_commit_through_an_implement_episode
         eid = _merged_fix(conn, "sig-revert-recurs")
         _fake_rollout(targets=("verify",), verify=_ran())
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
 
@@ -11298,7 +11298,7 @@ def test_a_host_verb_verify_failure_has_nothing_to_revert_and_goes_back_to_triag
     with _triage_env() as (conn, ctx):
         eid = _seed_verifying(conn, "sig-revert-nothing", started=NOW - dt.timedelta(minutes=30))
         _fake_rollout(targets=())
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
@@ -11309,7 +11309,7 @@ def test_the_revert_rides_the_train_then_a_verified_revert_starts_a_fresh_attemp
     with _triage_env() as (conn, ctx):
         eid = _merged_fix(conn, "sig-revert-chain")
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _fake_rollout(targets=("verify",), verify=_ran())
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -11317,9 +11317,9 @@ def test_the_revert_rides_the_train_then_a_verified_revert_starts_a_fresh_attemp
 
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
-        _sideclaw.submit_update_pr = _fake_update_pr([])
-        _sideclaw.submit_review = _fake_submit_review(reviews)
-        _sideclaw.get = _jobs({
+        _agent_gateway.submit_update_pr = _fake_update_pr([])
+        _agent_gateway.submit_review = _fake_submit_review(reviews)
+        _agent_gateway.get = _jobs({
             "job-000001": {"id": "job-000001", "status": "done",
                            "result": _dispatch_result("pr_opened", artifact_url=_TRAIN_PR, branch="dispatch/r")},
             "update-job-000001": _update_pr_job("up_to_date"),
@@ -11377,7 +11377,7 @@ def test_a_revert_whose_make_verify_fails_three_passes_fails_the_item():
         eid = _reverting(conn, "sig-revert-unhealthy", state=core.STATE_VERIFYING,
                          verify_started_at=NOW.isoformat(), merged_sha=REVERT_SHA)
         _fake_rollout(targets=("verify",), verify=[_ran(False, 1, "x"), _ran(False, 1, "y"), _ran(False, 2, "db down")])
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
         for n in (1, 2):
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10 * n), dry_run=False)
             item = core.get_item(conn, eid)
@@ -11393,7 +11393,7 @@ def test_a_landed_revert_with_no_attempt_left_fails_with_the_evidence():
         eid = _reverting(conn, "sig-revert-spent", state=core.STATE_VERIFYING, verify_started_at=NOW.isoformat(),
                          revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
         _fake_rollout(targets=("verify",), verify=_ran())
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no episode: {kw}"))
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and item["reverting_sha"] is None, dict(item)
@@ -11408,7 +11408,7 @@ def test_a_blocked_revert_review_fails_the_item_with_the_pr_left_open_and_no_rev
         conn.execute("UPDATE triage_items SET validation_job='review-blocked', reverting_sha=?, revert_json=? "
                      "WHERE event_id=?", (MERGED_SHA, json.dumps(record), eid))
         conn.commit()
-        _sideclaw.get = _jobs({"review-blocked": {"id": "review-blocked", "status": "done", "result":
+        _agent_gateway.get = _jobs({"review-blocked": {"id": "review-blocked", "status": "done", "result":
                                _review_result("actionable", blocking=[{"file": "a.py", "line": 1,
                                                                        "message": "more than a revert"}])}})
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
@@ -11418,7 +11418,7 @@ def test_a_blocked_revert_review_fails_the_item_with_the_pr_left_open_and_no_rev
         assert "not revised" in item["note"] and _TRAIN_PR in item["note"], item["note"]
         assert CLOSED_PRS == []
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         work.advance_implement_chain(conn, DEFAULT_POLICY, NOW + dt.timedelta(hours=1), dry_run=False)
         assert calls == [], "a revert is never revised"
 
@@ -11428,7 +11428,7 @@ def test_a_conflicting_revert_update_fails_instead_of_revising():
         eid = _train_item(conn, "sig-revert-conflict", job="update-job-conflict")
         conn.execute("UPDATE triage_items SET reverting_sha=?, revert_json='{}' WHERE event_id=?", (MERGED_SHA, eid))
         conn.commit()
-        _sideclaw.get = _jobs({"update-job-conflict": _update_pr_job("conflict", note="rebase failed")})
+        _agent_gateway.get = _jobs({"update-job-conflict": _update_pr_job("conflict", note="rebase failed")})
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED and "not revised" in item["note"], dict(item)
@@ -11439,10 +11439,10 @@ def test_a_lease_refused_revert_is_submitted_again_later_without_a_strike():
     with _triage_env() as (conn, ctx):
         eid = _reverting(conn, "sig-revert-lease", state=core.STATE_WORKING)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and core.get_item(conn, eid)["implement_job"] == "job-000001"
-        _sideclaw.get = _jobs({"job-000001": {"id": "job-000001", "status": "failed", "error": _LEASE_ERROR},
+        _agent_gateway.get = _jobs({"job-000001": {"id": "job-000001", "status": "failed", "error": _LEASE_ERROR},
                                "job-000002": {"id": "job-000002", "status": "running"}})
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
@@ -11462,14 +11462,14 @@ def test_a_lease_refused_revert_is_submitted_again_later_without_a_strike():
 def test_a_refused_revert_submit_fails_the_item_and_a_5xx_strikes():
     with _triage_env() as (conn, ctx):
         struck = _reverting(conn, "sig-revert-5xx", state=core.STATE_WORKING)
-        _sideclaw.submit = _fake_submit([], ok=False)
+        _agent_gateway.submit = _fake_submit([], ok=False)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, struck)
         assert item["state"] == core.STATE_WORKING and item["strikes"] == 1, dict(item)
         assert item["implement_job"] is None and item["retry_at"], dict(item)
 
         refused = _reverting(conn, "sig-revert-4xx", state=core.STATE_WORKING)
-        _sideclaw.submit = _refusing_submit([])
+        _agent_gateway.submit = _refusing_submit([])
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert core.get_item(conn, refused)["state"] == core.STATE_FAILED
 
@@ -11477,7 +11477,7 @@ def test_a_refused_revert_submit_fails_the_item_and_a_5xx_strikes():
 def test_revert_dry_run_submits_nothing():
     with _triage_env() as (conn, ctx):
         eid = _reverting(conn, "sig-revert-dry", state=core.STATE_WORKING)
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"dry-run submitted: {kw}"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"dry-run submitted: {kw}"))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             work.advance_implement_chain(conn, DEFAULT_POLICY, NOW, dry_run=True)
@@ -11492,7 +11492,7 @@ def test_auto_implement_leaves_an_item_on_its_revert_alone():
         conn.execute("UPDATE triage_items SET reverting_sha=?, revert_json='{}', retry_at=? WHERE event_id=?",
                      (MERGED_SHA, (NOW + dt.timedelta(hours=1)).isoformat(), eid))
         conn.commit()
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"auto-implemented: {kw}"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"auto-implemented: {kw}"))
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert core.get_item(conn, eid)["implement_job"] is None
 
@@ -11520,9 +11520,9 @@ def _sweep_env(*, matches: list[dict[str, Any]] | None = None, job_status: str =
                                                    "body": "Stops the flapping alert."}
     _github.pr_files = lambda owner, repo, number: [
         {"filename": "watchdog.json", "patch": "@@ -1 +1 @@\n-\"threshold\": 3\n+\"threshold\": 30"}]
-    _sideclaw.submit_triage = lambda *, prompt, schema: submitted.append(
+    _agent_gateway.submit_triage = lambda *, prompt, schema: submitted.append(
         {"prompt": prompt, "schema": schema}) or {"id": SWEEP_JOB, "status": "queued"}
-    _sideclaw.get = lambda job_id: _triage_job(
+    _agent_gateway.get = lambda job_id: _triage_job(
         {"matches": matches if matches is not None else []}, job_id=job_id, status=job_status)
     return submitted
 
@@ -11654,7 +11654,7 @@ def test_a_finished_sweep_moves_only_the_valid_match_to_verifying_by_signal():
                      ("inv-late", "investigate", "demo-repo", "b", "running", NOW.isoformat()))
         conn.execute("UPDATE triage_items SET dispatch_job='inv-late' WHERE event_id=?", (investigating,))
         conn.commit()
-        _sideclaw.get = lambda job_id: _triage_job({"matches": [
+        _agent_gateway.get = lambda job_id: _triage_job({"matches": [
             {"item": valid, "reason": reason}, {"item": working, "reason": "same defect"},
             {"item": stale, "reason": "r"}, {"item": started, "reason": "r"}, {"item": investigating, "reason": "r"},
             {"item": foreign, "reason": "r"}, {"item": merged, "reason": "r"}, {"item": 9999, "reason": "r"},
@@ -11711,7 +11711,7 @@ def test_a_swept_item_quiet_for_the_window_closes_fixed_by_with_no_make_verify_a
 def test_a_swept_item_whose_signal_recurs_goes_back_to_triaged_without_a_revert():
     with _triage_env() as (conn, ctx):
         eid = _seed_verifying(conn, "sig-swept-recurs", started=NOW - dt.timedelta(minutes=30), fixed_by_pr=_TRAIN_PR)
-        _sideclaw.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"a revert was submitted: {kw}"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"a revert was submitted: {kw}"))
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
@@ -11778,7 +11778,7 @@ def test_sweep_dry_run_prints_what_it_would_submit_and_submits_nothing():
     with _triage_env() as (conn, ctx):
         merged = _merged_with_sweep(conn, "sig-sweep-dry")
         _seed_item(conn, external_id="sig-sweep-dry-cand", state=core.STATE_TRIAGED)
-        _sideclaw.submit_triage = lambda **kw: (_ for _ in ()).throw(AssertionError(f"dry-run submitted: {kw}"))
+        _agent_gateway.submit_triage = lambda **kw: (_ for _ in ()).throw(AssertionError(f"dry-run submitted: {kw}"))
         _github.read_pr = lambda *a: (_ for _ in ()).throw(AssertionError("dry-run read GitHub"))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -11793,7 +11793,7 @@ def test_a_failing_sweep_never_touches_the_merged_item_and_gives_up_after_the_li
         merged = _merged_with_sweep(conn, "sig-sweep-fails")
         cand = _seed_item(conn, external_id="sig-sweep-fails-cand", state=core.STATE_TRIAGED)
         _sweep_env()
-        _sideclaw.submit_triage = lambda **kw: (_ for _ in ()).throw(RemoteError("sideclaw is down"))
+        _agent_gateway.submit_triage = lambda **kw: (_ for _ in ()).throw(RemoteError("agent-gateway is down"))
         for n in range(1, verify.SWEEP_ATTEMPT_LIMIT):
             _sweep_pass(conn, n)
             row = core.get_item(conn, merged)
@@ -11815,7 +11815,7 @@ def test_a_failed_sweep_job_and_an_unusable_answer_are_failed_attempts_not_folds
         _sweep_pass(conn, 1)   # the job is failed: attempt 1
         row = core.get_item(conn, merged)
         assert row["sweep_job"] is None and row["sweep_attempts"] == 1, dict(row)
-        _sideclaw.get = lambda job_id: _triage_job({"matches": "not-a-list"}, job_id=job_id)
+        _agent_gateway.get = lambda job_id: _triage_job({"matches": "not-a-list"}, job_id=job_id)
         _sweep_pass(conn, 2)   # resubmitted
         _sweep_pass(conn, 3)   # unusable answer: attempt 2
         assert core.get_item(conn, merged)["sweep_attempts"] == 2
@@ -11898,9 +11898,9 @@ def test_a_migrated_merging_row_never_folds_its_pre_train_review():
         asked: list[str] = []
         table = {"update-job-mig": _update_pr_job("updated", head=REBASED_SHA),
                  "review-old": {"id": "review-old", "status": "done", "result": _review_result("clean")}}
-        _sideclaw.get = lambda job_id: asked.append(job_id) or _jobs(table)(job_id)
+        _agent_gateway.get = lambda job_id: asked.append(job_id) or _jobs(table)(job_id)
         reviews: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(reviews)
+        _agent_gateway.submit_review = _fake_submit_review(reviews)
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
         PR_HEAD["sha"] = REBASED_SHA
         CHECK_RUNS["runs"] = _green_runs()
@@ -11913,13 +11913,13 @@ def test_a_migrated_merging_row_never_folds_its_pre_train_review():
 
 def test_a_revert_is_submitted_past_a_pr_waiting_on_its_train_but_waits_for_a_running_update_pr():
     """Finding 4: a PR waiting on CI holds no episode — the revert must not starve behind it. An
-    `update_pr` running on the train does hold sideclaw's lease, so the revert waits for it. The
+    `update_pr` running on the train does hold agent-gateway's lease, so the revert waits for it. The
     fresh attempt after a revert is an ordinary implement and still waits behind the train."""
     with _triage_env() as (conn, ctx):
         _train_item(conn, "sig-waiting-ci", stage="checks", sha=TRAIN_SHA)
         eid = _reverting(conn, "sig-revert-now", state=core.STATE_WORKING)
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert len(calls) == 1 and f"git revert --no-edit {MERGED_SHA}" in calls[0]["brief"], calls
         assert core.get_item(conn, eid)["implement_job"] == "job-000001"
@@ -11928,7 +11928,7 @@ def test_a_revert_is_submitted_past_a_pr_waiting_on_its_train_but_waits_for_a_ru
         _train_item(conn, "sig-updating", stage="update", job="update-job-running")
         eid = _reverting(conn, "sig-revert-waits", state=core.STATE_WORKING)
         calls = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert calls == [] and item["implement_job"] is None and "deferred" in item["note"], dict(item)
@@ -11939,7 +11939,7 @@ def test_a_revert_is_submitted_past_a_pr_waiting_on_its_train_but_waits_for_a_ru
         eid = _seed_item(conn, external_id="sig-after-revert", state=core.STATE_WORKING,
                          revert_json=json.dumps(record), max_tier="implement")
         calls = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         verify.maybe_submit_reverts(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert calls == [] and core.get_item(conn, eid)["implement_job"] is None
 
@@ -11953,7 +11953,7 @@ def test_a_revert_goes_first_on_its_repos_merge_train():
         conn.execute("UPDATE triage_items SET reverting_sha=?, revert_json=? WHERE event_id=?",
                      (MERGED_SHA, json.dumps(record), revert))
         conn.commit()
-        _sideclaw.submit_review = _fake_submit_review([])
+        _agent_gateway.submit_review = _fake_submit_review([])
         CHECK_RUNS["runs"] = _green_runs()
         _train_pass(conn)
         assert core.get_item(conn, revert)["train_stage"] == train.TRAIN_REVIEW
@@ -12004,7 +12004,7 @@ def test_a_verify_failure_of_a_merge_that_is_not_one_commit_fails_with_the_evide
             conn.commit()
             _fake_rollout(targets=("verify",), verify=_ran())
             calls: list[dict[str, Any]] = []
-            _sideclaw.submit = _fake_submit(calls)
+            _agent_gateway.submit = _fake_submit(calls)
             _signal_fires_again(conn, eid)
             verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
             item = core.get_item(conn, eid)
@@ -12022,7 +12022,7 @@ def test_a_verify_failure_of_a_merge_commit_reverts_it_with_mainline_one():
         conn.commit()
         _fake_rollout(targets=("verify",), verify=_ran())
         calls: list[dict[str, Any]] = []
-        _sideclaw.submit = _fake_submit(calls)
+        _agent_gateway.submit = _fake_submit(calls)
         _signal_fires_again(conn, eid)
         verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
         assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
@@ -12041,7 +12041,7 @@ def test_merge_landings_are_compare_and_set_and_a_loser_never_rewrites_verifying
                         merge_method="squash")
         conn.commit()
         assert work.land_already_merged_item(conn, DEFAULT_POLICY, stale, NOW) is False
-        _sideclaw.get = _jobs({})
+        _agent_gateway.get = _jobs({})
         _merge.plan_or_land = lambda conn_, **kw: types.SimpleNamespace(
             merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="e" * 40)
         train.merge_and_rollout(conn, DEFAULT_POLICY, stale, NOW, expected_sha=TRAIN_SHA)
@@ -12057,7 +12057,7 @@ def test_a_review_whose_pr_cannot_be_read_strikes_out_instead_of_resetting_its_s
         eid = _train_item(conn, "sig-fold-gh-down", stage="review", sha=TRAIN_SHA)
         conn.execute("UPDATE triage_items SET validation_job='review-gh' WHERE event_id=?", (eid,))
         conn.commit()
-        _sideclaw.get = _jobs({"review-gh": {"id": "review-gh", "status": "done",
+        _agent_gateway.get = _jobs({"review-gh": {"id": "review-gh", "status": "done",
                                              "result": _review_result("clean")}})
         _github.read_pr = lambda owner, repo, number: (_ for _ in ()).throw(RemoteError("GitHub 502"))
         for n, minutes in enumerate((0, 11, 42), start=1):
@@ -12073,8 +12073,8 @@ def test_a_train_whose_head_keeps_moving_is_bounded_by_strikes():
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-rewinds", stage="checks", sha=TRAIN_SHA)
         updates: list[dict[str, Any]] = []
-        _sideclaw.submit_update_pr = _fake_update_pr(updates)
-        _sideclaw.get = lambda job_id: _update_pr_job("up_to_date", job_id=job_id)   # always TRAIN_SHA
+        _agent_gateway.submit_update_pr = _fake_update_pr(updates)
+        _agent_gateway.get = lambda job_id: _update_pr_job("up_to_date", job_id=job_id)   # always TRAIN_SHA
         PR_HEAD["sha"] = REBASED_SHA                                                        # ...never the head
         for hour in range(40):
             _train_pass(conn, hour * 60)
@@ -12128,7 +12128,7 @@ def test_a_merge_whose_answer_was_lost_lands_the_item_when_github_says_merged():
                                    authorized_by="auto-from-item", note="job:impl-sig-lost-answer")
         work.complete_operation(conn, op, outcome="unknown",
                                 receipt=json.dumps({"error": "read timed out", "mergeMethod": "squash"}))
-        _sideclaw.get = _jobs({})
+        _agent_gateway.get = _jobs({})
 
         def _already(conn_, **kw):
             raise _merge.AlreadyMerged("jkrumm/demo-repo#10 is already merged.", merge_commit="f" * 40,
@@ -12150,7 +12150,7 @@ def _hand_merged(conn, ext: str, *, reviewed: str | None, head: str = TRAIN_SHA)
     merge answer): `reviewed` is the last head a review confirmed, if any. Returns the item and
     the outcome `merge_and_rollout` reports."""
     eid = _train_item(conn, ext, stage="merge", sha=TRAIN_SHA, reviewed=reviewed)
-    _sideclaw.get = _jobs({})
+    _agent_gateway.get = _jobs({})
 
     def _already(conn_, **kw):
         raise _merge.AlreadyMerged("jkrumm/demo-repo#10 is already merged.", merge_commit="f" * 40, head_sha=head)
@@ -12200,11 +12200,11 @@ def test_no_check_runs_right_after_update_pr_pushed_is_pending_not_green():
     same pass (or within CHECKS_REGISTER_GRACE) waits instead of passing as "none exist"."""
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-fresh-push", job="update-job-push")
-        _sideclaw.get = _jobs({"update-job-push": _update_pr_job("updated", head=REBASED_SHA)})
+        _agent_gateway.get = _jobs({"update-job-push": _update_pr_job("updated", head=REBASED_SHA)})
         PR_HEAD["sha"] = REBASED_SHA
         CHECK_RUNS["runs"] = []
         reviews: list[dict[str, Any]] = []
-        _sideclaw.submit_review = _fake_submit_review(reviews)
+        _agent_gateway.submit_review = _fake_submit_review(reviews)
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_CHECKS and item["train_pushed_at"] == NOW.isoformat(), dict(item)

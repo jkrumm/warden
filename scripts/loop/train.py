@@ -9,7 +9,7 @@ import sqlite3
 import sys
 from typing import Any
 
-from clients import github as _github, sideclaw as _sideclaw
+from clients import github as _github, agent_gateway as _agent_gateway
 from clients.errors import HeadMoved, PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError
 from lifecycle import dispatch as _dispatch, merge as _merge, policy as _policy
 from loop import core, work, verify
@@ -19,7 +19,7 @@ from loop import core, work, verify
 # at a time: advance_merge_trains() walks only the oldest `merging` item of each repo, and
 # check_repo_not_in_flight() keeps a second one from getting there in the first place.
 #
-#   update  sideclaw's `update_pr` rebases the PR onto the latest default branch, re-runs the
+#   update  agent-gateway's `update_pr` rebases the PR onto the latest default branch, re-runs the
 #           repo's checks on the result and pushes. `conflict` -> a revision from the new base;
 #           `updated` with failed checks -> a `checks_failed` revision; a lease refusal -> again
 #           in LEASE_RETRY_MINUTES; otherwise the head it reports is the train's SHA (`train_sha`).
@@ -147,7 +147,7 @@ def _open_pr_head(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime)
 
 def _submit_update_pr(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                       now: dt.datetime) -> None:
-    """Claim, then submit sideclaw's `update_pr` for the item's PR. A refusal (4xx) ends the
+    """Claim, then submit agent-gateway's `update_pr` for the item's PR. A refusal (4xx) ends the
     item; any other submit failure strikes."""
     ref = _github.parse_pr_url(item["pr_url"] or "")
     if ref is None:
@@ -158,7 +158,7 @@ def _submit_update_pr(conn: sqlite3.Connection, policy: dict[str, Any], item: sq
         return
     item = core.get_item(conn, item["event_id"])
     try:
-        job = _sideclaw.submit_update_pr(cwd=_policy.repo_cwd(item["repo"]), pr=ref[2])
+        job = _agent_gateway.submit_update_pr(cwd=_policy.repo_cwd(item["repo"]), pr=ref[2])
     except SubmitRefused as e:
         work.end_on_refusal(conn, [item], e, tier="update_pr", now=now, policy=policy, retry_at=None)
         return
@@ -175,18 +175,18 @@ def _train_update(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         _submit_update_pr(conn, policy, item, now)
         return False
     try:
-        resp = _sideclaw.get(job_id)
+        resp = _agent_gateway.get(job_id)
     except RemoteError as e:
         print(f"triage: could not poll update_pr job {job_id} for {item['signature']}: {e}", file=sys.stderr)
         return False
     if resp is None:
-        _train_strike(conn, item, now, f"sideclaw has no record of update_pr job {job_id} (pruned or lost)",
+        _train_strike(conn, item, now, f"agent-gateway has no record of update_pr job {job_id} (pruned or lost)",
                       train_job=None)
         return False
     status = resp.get("status")
-    if status not in _sideclaw.TERMINAL:
+    if status not in _agent_gateway.TERMINAL:
         return False
-    if _sideclaw.is_lease_refusal(resp):
+    if _agent_gateway.is_lease_refusal(resp):
         work.lease_retry(conn, item, now, what="the PR update", expect_eq=_train_expect(item), train_job=None)
         return False
     if status != "done":
@@ -194,7 +194,7 @@ def _train_update(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         _train_strike(conn, item, now, f"update_pr {job_id} finished '{status}': {reason}", train_job=None)
         return False
     try:
-        result = _sideclaw.update_pr_result(resp)
+        result = _agent_gateway.update_pr_result(resp)
     except RemoteError as e:
         _train_strike(conn, item, now, str(e), train_job=None)
         return False
@@ -249,7 +249,7 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         return False
     except (PolicyError, PreconditionError) as e:
         # Unreadable check runs: an unknown CI state never passes, and waiting does not fix a token. A
-        # GitHub problem, not sideclaw's policy, so `work` like merge_and_rollout()'s same exception pair.
+        # GitHub problem, not agent-gateway's policy, so `work` like merge_and_rollout()'s same exception pair.
         core.set_state(conn, item["event_id"], core.STATE_FAILED, now, expect_state=core.STATE_MERGING,
                         expect_eq=_train_expect(item), failure_class=core.FAILURE_WORK,
                         note=f"{MERGE_REFUSED_NOTE_PREFIX}{e}")
@@ -266,7 +266,7 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     """The review's context: the gate questions and the goal (validation_context()), plus, when a
     review already confirmed an earlier head of this PR, what moved since.
 
-    Text only: sideclaw's `review` job reviews the PR's whole head and has no delta/range scope, so
+    Text only: agent-gateway's `review` job reviews the PR's whole head and has no delta/range scope, so
     "focus on what changed" is a request to the reviewer, not a narrower diff.
 
     A revert (is_revert()) is judged as one: the exact inverse of the reverted commit, nothing
@@ -285,7 +285,7 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
 def _submit_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                    now: dt.datetime) -> None:
     """Open the step-7 review of the train's SHA. A submit that fails for infrastructure
-    reasons strikes (see strike()); a sideclaw refusal (4xx) is final.
+    reasons strikes (see strike()); a agent-gateway refusal (4xx) is final.
 
     Claimed before the submit: the loop and the sweep both land here, and an unclaimed submit
     opens two reviews. The claim is a compare-and-set on the row as this pass read it, and its
@@ -329,7 +329,7 @@ def _train_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
 
 def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                  now: dt.datetime) -> bool:
-    """Act on the step-7 review of the train's SHA: sideclaw's own `review` job on the PR's own
+    """Act on the step-7 review of the train's SHA: agent-gateway's own `review` job on the PR's own
     branch, a TYPED verdict (`outcome`/`blocking`/...), not a marker phrase matched out of prose.
     `outcome == "clean"`, or `"actionable"` with an EMPTY `blocking` list, confirms: `reviewed_sha`
     records the SHA and the train moves to merge.
@@ -343,7 +343,7 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     (maybe_revise_blocked()) while any are left, else `failed` carrying the blocking findings.
 
     A review job that ends with NO verdict (failed/interrupted/cancelled, or `done` with an empty
-    result, a schemaVersion mismatch, a job sideclaw no longer knows) is an infrastructure failure
+    result, a schemaVersion mismatch, a job agent-gateway no longer knows) is an infrastructure failure
     and strikes: the review is re-submitted after the backoff (`_submit_review()`), the third strike
     lands `failed`. `dispatches.validation_status` lands one of `confirmed | blocked |
     needs_decision | error`.
@@ -366,17 +366,17 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         _train_strike(conn, item, now, f"step-7 review ended with no verdict: {reason}", validation_job=None)
 
     try:
-        resp = _sideclaw.get(review_job)
+        resp = _agent_gateway.get(review_job)
     except RemoteError as e:
-        print(f"triage: could not poll sideclaw job {review_job} for {item['signature']}: {e}", file=sys.stderr)
+        print(f"triage: could not poll agent-gateway job {review_job} for {item['signature']}: {e}", file=sys.stderr)
         return False
     if resp is None:
         # Same pruned-job case as poll_implement_jobs(), same answer: the review's result is lost, so
         # the review is run again.
-        _review_failed(f"sideclaw has no record of review job {review_job}")
+        _review_failed(f"agent-gateway has no record of review job {review_job}")
         return False
     status = resp.get("status")
-    if status not in _sideclaw.TERMINAL:
+    if status not in _agent_gateway.TERMINAL:
         return False
 
     # Folded onto the REVIEW job's own dispatches row (opened by open_validation_dispatch(), a
@@ -390,8 +390,8 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
             "cancelled" if status == "cancelled" else f"review job {status} with no verdict"))
         return False
     try:
-        _sideclaw.assert_result_schema(resp, _sideclaw.REVIEW_SCHEMA_VERSION, "review")
-        _sideclaw.assert_outcome(resp, _sideclaw.REVIEW_OUTCOMES, "review")
+        _agent_gateway.assert_result_schema(resp, _agent_gateway.REVIEW_SCHEMA_VERSION, "review")
+        _agent_gateway.assert_outcome(resp, _agent_gateway.REVIEW_OUTCOMES, "review")
     except RemoteError as e:
         _review_failed(str(e))
         return False
@@ -580,7 +580,7 @@ def merge_and_rollout(conn: sqlite3.Connection, policy: dict[str, Any], item: sq
     # row; a failed re-read never blocks the merge attempt, the precheck still fails closed against
     # whatever the row already says.
     try:
-        impl_resp = _sideclaw.get(item["implement_job"])
+        impl_resp = _agent_gateway.get(item["implement_job"])
     except RemoteError as e:
         print(f"triage: could not refresh implement dispatch {item['implement_job']} "
               f"before merge for {item['signature']}: {e}", file=sys.stderr)

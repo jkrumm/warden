@@ -4,7 +4,7 @@
 see *Why a LaunchAgent, not `hermes cron`* below) closes the loop
 `scripts/watchdog-poll.py` opened but never acted on: deduplicated `events`
 rows become one durable, updated-in-place Slack card per problem, with a real
-sideclaw investigation attached once a signature repeats or stays open.
+agent-gateway investigation attached once a signature repeats or stays open.
 **The act path (ingest → classify → cluster → escalate → card → resolve)
 makes no LLM call at all.** The one exception is `propose_mappings()` — a
 bounded, once-a-day maintenance pass that proposes new policy entries for
@@ -33,7 +33,7 @@ and the two edges it writes.
 |-|-|-|
 | Signal | One deduplicated alert row, owned by `watchdog-poll.py` | `events` |
 | Item | One triage problem, 1:1 with an `events` row, owned by `triage.py` | `triage_items` |
-| Episode | One sideclaw `investigate` dispatch, owned by `scripts/lifecycle/dispatch.py` | `dispatches` |
+| Episode | One agent-gateway `investigate` dispatch, owned by `scripts/lifecycle/dispatch.py` | `dispatches` |
 
 `triage_items.event_id` is both the primary key and the stable identity across
 a resolve -> recur cycle: a grouped or state source reuses the *same*
@@ -141,7 +141,7 @@ goes next splits by WHO asked (`fold_dispatch_verdict()`'s
       `STATE_NOTE`: terminal, but VISIBLE in the daily digest — see *Notes vs
       ignored* below.
    3. `rules` (first match wins) — resolves EITHER `repo` (escalate to a
-      sideclaw episode) OR `verb` (run a declared local command — see *Verb
+      agent-gateway episode) OR `verb` (run a declared local command — see *Verb
       outcomes*).
    Only ever touches a row still in state `new` — an escalated, snoozed, or
    manually ignored/noted item is never reclassified out from under itself.
@@ -171,7 +171,7 @@ goes next splits by WHO asked (`fold_dispatch_verdict()`'s
    member moves to `split` — carrying that verdict in `note` — and waits to
    be re-evaluated on its own. See *The `split` state* below.
 6. **Escalate** — every eligible `new`+`repo`-mapped item, GROUPED BY REPO,
-   becomes at most ONE sideclaw dispatch per repo per run (a cluster, capped
+   becomes at most ONE agent-gateway dispatch per repo per run (a cluster, capped
    at `MAX_CLUSTER_SIGNATURES` = 5 members; the rest wait for a later run) —
    not one dispatch per item. A `split` item is ALSO a candidate, considered
    BEFORE `new` clusters, but escalates as a SINGLETON, never grouped — and
@@ -254,7 +254,7 @@ whole redesign exists to kill. Routing it to `ignored` was the original
 
 A policy rule can carry `verb` instead of `repo` — routes to a declared,
 CODE-SIDE ALLOWLISTED local command (`VERB_ALLOWLIST` in `scripts/triage.py`)
-rather than a sideclaw episode. The policy file names a KEY (`"env-check"`),
+rather than a agent-gateway episode. The policy file names a KEY (`"env-check"`),
 never a command — a policy file must never be able to name an arbitrary
 argv, the same closed-verb-set principle the `warden` CLI's own
 `dispatch|status|list|merge|abort|revert` verbs use, applied to a bounded
@@ -265,15 +265,15 @@ sequential ssh probes of homelab/vps's shared `.env.tpl`), which
 `op_refs_homelab`/`op_refs_vps` route to. A dead 1Password ref blocks every
 future reseal of the mini's offline secrets cache (`dotfiles/AGENTS.md`
 §Secrets) — it is a deterministic, already-diagnosed condition the moment
-`env-check` runs, so dispatching a sideclaw episode to "investigate" it would
+`env-check` runs, so dispatching a agent-gateway episode to "investigate" it would
 be both slower and actively worse: a bare 1Password item name in a
-DISPATCHED verdict can collide with sideclaw's own `op://vault/item/field`
+DISPATCHED verdict can collide with agent-gateway's own `op://vault/item/field`
 secret-scan pattern and get withheld from the card, whereas `env-check`'s
 output reaching the card directly does not have that problem.
 
 `run_verbs()` applies the same `minOccurrences`/`minOpenMinutes` eligibility
 gate as an episode escalation, but NO concurrency cap (a verb is a bounded
-local probe, not a sideclaw episode, and doesn't compete with
+local probe, not a agent-gateway episode, and doesn't compete with
 `MAX_OPEN_INVESTIGATIONS`) and NO cooldown tracking — a verb-routed item runs AT MOST ONCE,
 because its terminal state (`needs_human`) permanently falls out of the
 `state=new` candidate query. If the underlying condition later clears, the
@@ -307,7 +307,7 @@ source depends on its current behavior.
 ## Evidence commands
 
 Every real investigation this loop has run so far (weatherorb, vps, hermes-agent)
-came back `nextAction: human` citing the SAME reason: the dispatched sideclaw
+came back `nextAction: human` citing the SAME reason: the dispatched agent-gateway
 episode runs in a read-only repo WORKTREE, which has the repo but never the
 live machine — `var/health.json` and `watchdog-alerts.log` are gitignored/
 empty there, live OTel data isn't in the checkout at all, and the one episode
@@ -517,7 +517,7 @@ verdict ──────(24h)──> needs_human      needs_human ──(7d)�
 implementing ─(2h)──> merge_blocked     pr_open ─────(14d)──> dismissed
 validating ───(1h)──> merge_blocked     merged ──────(1h)──> closed
 
-implementing ──(outcome=pr_opened)────────────────────> validating (step 7, sideclaw's own `review` job)
+implementing ──(outcome=pr_opened)────────────────────> validating (step 7, agent-gateway's own `review` job)
              └──(checks_failed / salvaged / unexpected)─> needs_human
              └──(no_changes / diff_refused / etc.)──────> merge_blocked
 
@@ -598,7 +598,7 @@ deadline derived from it would move further away every run and never fire. The
 rows that predate schema version 2 print on every pass until they next
 transition.
 
-This also closes the pruned-job gap: `sideclaw` prunes terminal jobs at 24h
+This also closes the pruned-job gap: `agent-gateway` prunes terminal jobs at 24h
 *or* 200 terminal rows (a cap shared with every interactive `/check`), after
 which `poll_implement_jobs()`/`poll_validation_jobs()` poll a job that no
 longer exists and nothing moves the item. The 2h/1h deadlines fire long before
@@ -611,7 +611,7 @@ Multiple signatures can share one root cause — the concrete example this was
 built for: `research-gateway job.reaped` and `audio-gateway podcast.failed`
 were both `threshold: 0` in the same commit, fixed by the same two-line diff
 in `vps/observability/alerts/`. `escalate()` groups every eligible `new`+
-mapped item BY RESOLVED REPO and opens AT MOST ONE sideclaw dispatch per repo
+mapped item BY RESOLVED REPO and opens AT MOST ONE agent-gateway dispatch per repo
 per run (capped at `MAX_CLUSTER_SIGNATURES` = 5 members; the overflow items
 stay in `new` and wait for a later run — never dropped, never silently
 folded in anyway).
@@ -927,7 +927,7 @@ A "signature" is `source:external_id` (`triage_items.signature`, and the
 argument every `--snooze`/`--ignore`/`--reopen` CLI verb takes) — this is
 distinct from a "match target", which is one of the two strings a `rules`/
 `ignore` pattern is actually tried against (see *Match targets*). A rule
-carries EITHER `repo` (escalate to a sideclaw episode) OR `verb` (run a
+carries EITHER `repo` (escalate to a agent-gateway episode) OR `verb` (run a
 declared local command — see *Verb outcomes*), never both; `rules` is
 matched top-to-bottom, first match across either target wins.
 
@@ -983,7 +983,7 @@ it explains the same contract from inside the file itself.
 
 | Constant | Default | Env override | Why |
 |-|-|-|-|
-| `MAX_OPEN_INVESTIGATIONS` | 3 | `TRIAGE_MAX_OPEN_INVESTIGATIONS` | Concurrency ceiling on open CLUSTERS (distinct `dispatch_job`s in `investigating`) — sideclaw's own concurrency is shared with every other dispatch source. Since 2026-09-15 (Wave 2, "absurd friction") this is the ONLY ceiling left on autonomous spend — `DAILY_INVESTIGATE_BUDGET` and every `WARDEN_*_BUDGET` env var were removed entirely |
+| `MAX_OPEN_INVESTIGATIONS` | 3 | `TRIAGE_MAX_OPEN_INVESTIGATIONS` | Concurrency ceiling on open CLUSTERS (distinct `dispatch_job`s in `investigating`) — agent-gateway's own concurrency is shared with every other dispatch source. Since 2026-09-15 (Wave 2, "absurd friction") this is the ONLY ceiling left on autonomous spend — `DAILY_INVESTIGATE_BUDGET` and every `WARDEN_*_BUDGET` env var were removed entirely |
 | `MAX_CLUSTER_SIGNATURES` | 5 | — | Signatures riding in one cluster's brief; the rest wait for a later run |
 | `VERB_TIMEOUT` | 260s | — | `env-check` runs TWO sequential ssh probes, each individually bounded by hermes-ops.sh's own `SSH_TIMEOUT=120` — the outer bound has to clear 240s or it would kill a legitimately slow-but-healthy probe |
 | `MAX_BRIEF_CHARS` | 8000 | — | Mirrors `lifecycle/dispatch.py`'s own `MAX_BRIEF_CHARS`; enforced in Python (`_cap_brief()`) BEFORE `open_episode()` is ever called, so an oversize brief is capped, never refused |
@@ -997,10 +997,10 @@ it explains the same contract from inside the file itself.
 `MAX_OPEN_INVESTIGATIONS` is checked once per run and decremented as clusters
 open, so a later repo in the same run correctly sees an exhausted cap —
 including under `--dry-run`, where `escalate_cluster()` always returns `None`
-(it never calls sideclaw, GitHub or Slack — the `clients`/`lifecycle` modules
+(it never calls agent-gateway, GitHub or Slack — the `clients`/`lifecycle` modules
 are the boundary, and dry-run never crosses it), so the cap still advances on
 the dry-run path specifically so a multi-repo preview simulates what a real
-run would actually allow. A Slack or sideclaw failure for one cluster logs to
+run would actually allow. A Slack or agent-gateway failure for one cluster logs to
 stderr and returns without aborting the rest of the run — every DB write in
 the loop is per-cluster and independently committed.
 
@@ -1010,13 +1010,13 @@ the loop is per-cluster and independently committed.
 `--snooze <signature> --hours N` · `--ignore <signature>` · `--reopen
 <signature>` · `--close <signature> --reason <text>` · `--list`.
 `--snooze`/`--ignore`/`--reopen`/`--close` mutate `triage_items` and exit
-immediately — they never call Slack or sideclaw. `--close` transitions to
+immediately — they never call Slack or agent-gateway. `--close` transitions to
 `closed` and refuses (non-zero) an empty `--reason` or an unknown signature,
 same as `_set_state()` already refuses a reasonless `dismissed`. `--dry-run` runs the local bookkeeping
 passes for real (ingest/reopen/unsnooze/classify/resolve — all side-effect-free
 against `triage_items` alone) so a preview against a throwaway copy of
 `watchdog.db` is meaningful, but never calls Slack (`post_blocks`/
-`update_blocks`), sideclaw or GitHub — those are the only externally-visible
+`update_blocks`), agent-gateway or GitHub — those are the only externally-visible
 actions this file can take.
 
 Separately, `scripts/warden` — the general-purpose CLI over the same
@@ -1025,7 +1025,7 @@ agent driving a dispatch by hand:
 
 | Verb | What |
 |-|-|
-| `dispatch <repo>` | Open a BARE sideclaw episode, no `triage_items` row (`--tier`, `--why`, `--context-file`, `--origin-*`) |
+| `dispatch <repo>` | Open a BARE agent-gateway episode, no `triage_items` row (`--tier`, `--why`, `--context-file`, `--origin-*`) |
 | `run <repo>` | Open an ITEM riding this file's own lifecycle (`--tier investigate\|implement`, `--why`, `--origin-*`) — see *Origins* below |
 | `status <job>` | Read one job's current status |
 | `list` | Open/today/all dispatches |
@@ -1068,7 +1068,7 @@ the wrong home for this loop, and a dead loader that still works correctly is
 a trap for the next reader (it would silently duplicate every card/dispatch if
 ever registered by hand). `dispatch-sweep.py`'s own cron loader
 (`dispatch-sweep-cron.py`) is unrelated and unaffected: that job only *reads*
-sideclaw and folds a verdict onto a card `triage.py` already wrote, so it has
+agent-gateway and folds a verdict onto a card `triage.py` already wrote, so it has
 no chicken-and-egg dependency on the gateway being up.
 
 ## Operations — the crash-recovery unit (schema 5)
@@ -1090,7 +1090,7 @@ the ssh-argv path (`autoDeploy`) and the GitHub-Actions path
 window, and now that both run as in-process Python calls (not one bash
 subprocess covering merge+deploy together) there is nothing stopping a write
 between them — so there is one. `investigate`/validation episodes never get
-one — they are read-only, run in their own sideclaw worktree, mutate nothing
+one — they are read-only, run in their own agent-gateway worktree, mutate nothing
 outside it, and `dispatch-sweep.py`'s own pruned-job handling already covers
 a forgotten job.
 
@@ -1108,7 +1108,7 @@ the external call runs — the commit is the entire contract: the row has to be
 durable before this process goes on to make the call. `complete_operation()`
 writes the outcome AFTER the call returns — but ONLY when the return is
 unambiguous. A `RemoteError` can follow a call the external system already
-accepted (sideclaw may have already accepted the submission, or the merge may
+accepted (agent-gateway may have already accepted the submission, or the merge may
 have already landed before the response was lost), so the call sites
 deliberately leave the row's `outcome` NULL in that case rather than guess —
 "an ambiguous return is not a refusal." (`open_episode()` and `plan_or_land()`
@@ -1128,7 +1128,7 @@ keeps it out of every eligibility query that could re-fire the same call.
 **`reconcile_operations()` runs FIRST in every pass**, before even
 `drain_intents()` — see `run()`'s own ordering. Every `operations` row with
 `outcome IS NULL` (a genuine crash — nothing ever ran the completion code at
-all) gets asked about directly: `clients.sideclaw.get(job_id)` for
+all) gets asked about directly: `clients.agent_gateway.get(job_id)` for
 `implement` (a pruned job returns a bare `None`, byte-identical to a job id
 that never existed, so absence maps to `unknown`, never `failed`; `cancelled`
 joins `failed`/`interrupted`); `gh pr view <pr> --repo <owner>/<repo>` for
@@ -1186,15 +1186,15 @@ visible), and the card is synced immediately. On success the item is claimed
 whole fix for the historical duplication bug, see `lifecycle/dispatch.py`'s
 own `open_episode()`), then `open_episode(tier="implement", …)` is called
 directly — no subprocess, no CLI door. `RemoteError(maybe_mutated=True)`
-(sideclaw may have already accepted the job) leaves the item claimed with
+(agent-gateway may have already accepted the job) leaves the item claimed with
 the operation already resolved `unknown` by `open_episode()` itself; every
 other refusal hands the claim back to `verdict`. State: `verdict` →
 `implementing`.
 
 **Step 6 → 7 — `poll_implement_jobs()` reads a TYPED outcome, not just
 `artifactUrl`.** A `done` implement job's `result.outcome`
-(`clients.sideclaw.DISPATCH_OUTCOMES`, schema version
-`DISPATCH_SCHEMA_VERSION` — pinned in `clients/sideclaw.py`, checked by
+(`clients.agent_gateway.DISPATCH_OUTCOMES`, schema version
+`DISPATCH_SCHEMA_VERSION` — pinned in `clients/agent_gateway.py`, checked by
 `assert_result_schema()` on every poll; a mismatch is a loud `needs_human`,
 never a best-effort parse) drives the state, not a guess from which fields
 happen to be present:
@@ -1205,7 +1205,7 @@ happen to be present:
 | `checks_failed` | `needs_human` | a red check is a human's, never a PR |
 | `no_changes` | `merge_blocked` | the episode's own reason |
 | `diff_refused` / `branch_no_pr` / `pr_failed` / `withheld` | `merge_blocked` | outcome named in the note |
-| `salvaged` | `needs_human` | sideclaw itself failed to get a structured verdict |
+| `salvaged` | `needs_human` | agent-gateway itself failed to get a structured verdict |
 | `issue_declined` / `issue_failed` / `issue_filed` / `verdict_only` | `needs_human` | wrong tier's outcome — never guessed |
 | missing / unrecognized | `needs_human` | `unknown implement outcome '<x>'` |
 | `result.nextAction == "human"` | `needs_human` | overrides every row above |
@@ -1214,13 +1214,13 @@ A non-`done` terminal status (`failed`/`interrupted`/`cancelled`) blocks the
 chain outright — `merge_blocked`, never a silent drop. State: `implementing`
 → `validating` | `merge_blocked` | `needs_human`.
 
-**Step 7 — `_open_validation_dispatch()` → sideclaw's own `review` job, not a
+**Step 7 — `_open_validation_dispatch()` → agent-gateway's own `review` job, not a
 second `investigate` episode.** Once the implement job's outcome is
 `pr_opened`, this parses the PR number out of `artifactUrl` (a strict
 `/pull/(\d+)$` regex — unparseable is `merge_blocked` with `could not parse
-the PR number`, never a guess) and opens a sideclaw **`review`** job
-(`clients/sideclaw.py`'s `submit_review()`, `lifecycle/dispatch.py`'s
-`open_review()`) against that PR, in a throwaway read-only worktree sideclaw
+the PR number`, never a guess) and opens a agent-gateway **`review`** job
+(`clients/agent_gateway.py`'s `submit_review()`, `lifecycle/dispatch.py`'s
+`open_review()`) against that PR, in a throwaway read-only worktree agent-gateway
 manages itself — not a second `dispatch` episode on a different model asked
 to end its prose with a marker phrase. `review` already runs a multi-angle
 synthesis (architect, senior-dev, security, ... — its own router picks the
@@ -1250,7 +1250,7 @@ prose:
 mismatch is a loud `needs_human`, never a best-effort parse, same rule as
 step 6→7. Only `confirmed` calls `plan_or_land(confirm=True, dry_run=False)`
 in-process — and it does NOT do so on a `merge_approval`-gated repo
-(`sideclaw`/`warden`/`dotfiles`): there the item routes to `needs_human`
+(`agent-gateway`/`warden`/`dotfiles`): there the item routes to `needs_human`
 carrying the repo, the PR URL and the `warden merge` call, with
 `validation_status` already `confirmed` so the owner's land re-checks the
 merge gate, never re-runs the review. `confirm=True` is instruction-level,
@@ -1425,7 +1425,7 @@ independent dispatches, a cluster dissolving back to individually-eligible
 `new` items on a `UNRELATED SIGNATURES` verdict, the brief traveling on
 stdin capped at 8000 chars (the one test using a real subprocess stub rather
 than the in-process fake dispatcher), resolution updating the card exactly
-once, `--dry-run` touching neither Slack nor sideclaw, artifact-url survival
+once, `--dry-run` touching neither Slack nor agent-gateway, artifact-url survival
 across a reopen, `fold_dispatch_verdict()` updating every member of a cluster
 (not just the primary), and — directly against `scripts/watchdog-poll.py`,
 not through triage.py — two `raw:` op-refs stderr strings differing only in

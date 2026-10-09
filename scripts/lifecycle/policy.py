@@ -3,10 +3,10 @@
 The Python port of the retired bash CLI's `require_auto_from_item` (639-705) and
 `valid_origin` (745-766).
 
-There is no repo/tier policy here: sideclaw is the only boundary (it enforces
+There is no repo/tier policy here: agent-gateway is the only boundary (it enforces
 its own repo allowlist and tier ceilings and answers a refusal with a 4xx,
-which `clients.sideclaw` raises as `SubmitRefused`). A dispatch names the repo
-string; `repo_cwd()` composes the one path sideclaw's wire protocol still
+which `clients.agent_gateway` raises as `SubmitRefused`). A dispatch names the repo
+string; `repo_cwd()` composes the one path agent-gateway's wire protocol still
 requires and decides nothing.
 """
 
@@ -43,9 +43,9 @@ def repos_root() -> Path:
 
 
 def repo_cwd(name: str) -> Path:
-    """`<root>/<name>` — the absolute `cwd` sideclaw's submit wire protocol
+    """`<root>/<name>` — the absolute `cwd` agent-gateway's submit wire protocol
     requires. Only the shape of the name is checked (no traversal out of the
-    root); whether the repo exists or may be dispatched into is sideclaw's call,
+    root); whether the repo exists or may be dispatched into is agent-gateway's call,
     answered as a 4xx."""
     if not name or name in (".", "..") or name.startswith(".") or not set(name) <= _NAME_CHARS:
         raise UsageError(f"not a repo name: {name}")
@@ -158,7 +158,7 @@ def _in_flight_sql(count_merging: bool) -> str:
 
     `count_merging=False` (a revert): a `merging` item counts only while its train's `update_pr`
     runs (or is being submitted) — a PR waiting on CI or review holds no episode, and a revert
-    must not starve behind it. sideclaw's per-repo lease is the backstop for the race (a lease
+    must not starve behind it. agent-gateway's per-repo lease is the backstop for the race (a lease
     retry).
 
     The state names come from loop/core.py. It is imported here, in the function body, not at

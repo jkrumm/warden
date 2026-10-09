@@ -2,9 +2,9 @@
 """Regression suite for the ledger-integration behavior docs/history/state-log.md
 §87 added to scripts/dispatch-sweep.py:
 
-  1. `process_dispatch()` stamps `dispatches.finished_at` from sideclaw's own
+  1. `process_dispatch()` stamps `dispatches.finished_at` from agent-gateway's own
      job envelope (`job["finishedAt"]`), not from the moment this sweep pass
-     happened to observe the terminal status — see clients/sideclaw.py's
+     happened to observe the terminal status — see clients/agent_gateway.py's
      `finished_at_iso()` and its own dedicated tests in test_clients.py.
 
   2. `main()` calls `work.advance_implement_chain()` — the same
@@ -81,14 +81,14 @@ class _patch:
         setattr(self.obj, self.name, self.original)
 
 
-# --- process_dispatch(): finished_at from sideclaw's own envelope -----------
+# --- process_dispatch(): finished_at from agent-gateway's own envelope -----------
 
-def test_process_dispatch_finished_at_uses_sideclaws_own_timestamp_not_poll_time():
+def test_process_dispatch_finished_at_uses_agent_gateways_own_timestamp_not_poll_time():
     db_path = _fresh_db()
     conn = _ledger.connect(db_path)
     try:
         now = _now()
-        # sideclaw finished this job hours ago; this sweep pass is only NOW
+        # agent-gateway finished this job hours ago; this sweep pass is only NOW
         # observing it — the exact §79 shape ("a poll suspended overnight").
         finished = now - dt.timedelta(hours=10)
         conn.execute(
@@ -119,7 +119,7 @@ def test_process_dispatch_finished_at_uses_sideclaws_own_timestamp_not_poll_time
         conn.close()
 
 
-def test_process_dispatch_finished_at_falls_back_to_now_when_sideclaw_omits_it():
+def test_process_dispatch_finished_at_falls_back_to_now_when_agent_gateway_omits_it():
     db_path = _fresh_db()
     conn = _ledger.connect(db_path)
     try:
@@ -314,7 +314,7 @@ def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
 
 
 def test_a_pruned_item_backed_dispatch_is_folded_so_its_item_strikes_instead_of_staying_working():
-    """sideclaw pruned an investigation that a triage item was waiting on: the dispatch closes
+    """agent-gateway pruned an investigation that a triage item was waiting on: the dispatch closes
     ITEM_TRACKED, and the item takes the no-verdict path (a strike back to `triaged` with its
     dispatch handle cleared) rather than sitting `working` forever."""
     db_path = _fresh_db()

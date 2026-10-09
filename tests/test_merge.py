@@ -500,7 +500,7 @@ def test_size_and_ci_definition_changes_are_not_gates_in_any_repo():
     """No diff-size ceiling and no `.github` path rule: a large diff touching CI
     definitions merges in any repo, the loop's own executors included, when the
     PR is open, checks are green and the review confirmed."""
-    for repo in ("gamma", "warden", "sideclaw", "dotfiles"):
+    for repo in ("gamma", "warden", "agent-gateway", "dotfiles"):
         conn = _fresh_ledger()
         try:
             _seed_pr_dispatch(conn, repo=repo, validation_status="confirmed",

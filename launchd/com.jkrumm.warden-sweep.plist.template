@@ -3,8 +3,8 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.jkrumm.warden-sweep</string>
-  <!-- Folds a terminal sideclaw verdict onto the card the act-loop already wrote.
-       Read-only against sideclaw; the only thing it mutates is the ledger and the
+  <!-- Folds a terminal agent-gateway verdict onto the card the act-loop already wrote.
+       Read-only against agent-gateway; the only thing it mutates is the ledger and the
        card.
 
        Was gateway cron job 4dd759917dd1 ("Dispatch sweep", */5, no_agent: true).

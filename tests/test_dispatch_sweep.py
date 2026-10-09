@@ -225,11 +225,11 @@ def main() -> int:
     # --- failed / interrupted rows are unaffected by merged_at ----------
     failed_without_merge = format_message(
         repo="example", tier="investigate", job_id=JOB_ID, status="failed",
-        result=None, error="sideclaw timed out",
+        result=None, error="agent-gateway timed out",
     )
     failed_with_merge = format_message(
         repo="example", tier="investigate", job_id=JOB_ID, status="failed",
-        result=None, error="sideclaw timed out", merged_at="2026-08-02T19:06:00+00:00",
+        result=None, error="agent-gateway timed out", merged_at="2026-08-02T19:06:00+00:00",
     )
     interrupted_without_merge = format_message(
         repo="example", tier="investigate", job_id=JOB_ID, status="interrupted",
@@ -269,7 +269,7 @@ def main() -> int:
     #
     # An implement job whose repo checks failed before push carries `branch`
     # but no `artifactUrl`, and the worker's own `verdict` prose is where the
-    # failing-steps summary lives (sideclaw appends it there — there is no
+    # failing-steps summary lives (agent-gateway appends it there — there is no
     # separate field). Pins that format_message() already surfaces both
     # without any change: the branch line, and the verdict prose beneath it.
     checks_failed_body = format_message(
@@ -393,7 +393,7 @@ def main() -> int:
     nudge_ok = sum(1 for _, cond in nudge_checks if cond)
 
     # --- cancelled jobs: terminal exactly like done/failed/interrupted --
-    check("cancelled is one of sideclaw's own TERMINAL statuses",
+    check("cancelled is one of agent-gateway's own TERMINAL statuses",
           "cancelled" in dispatch_sweep.TERMINAL_STATUSES)
     cancelled_body = format_message(
         repo="example", tier="investigate", job_id=JOB_ID, status="cancelled",
@@ -628,7 +628,7 @@ def main() -> int:
         check(f"review-tier: {label}", cond)
     review_ok = sum(1 for _, cond in review_checks if cond)
 
-    # --- dispatches.error: a terminal failed job persists sideclaw's reason ---
+    # --- dispatches.error: a terminal failed job persists agent-gateway's reason ---
     #
     # See ledger.py migration 10 and loop/work.py's fold_dispatch_verdict() — the
     # 2026-09-12 defect (item 253) where a timed-out episode's failure text

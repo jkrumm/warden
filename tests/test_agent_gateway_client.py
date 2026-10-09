@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Regression suite for the shared `_submit_job()` behind clients/sideclaw.py's
+"""Regression suite for the shared `_submit_job()` behind clients/agent_gateway.py's
 `submit_review`, `submit_triage` and `submit_update_pr`.
 
 `submit_review` is covered in tests/test_clients.py; this pins the same contract for the
 other two and the failure shapes all three share. Against an in-process stub server,
 never a real network call.
 
-Run: .venv/bin/python3 tests/test_sideclaw_client.py  (or: make test, from warden/)
+Run: .venv/bin/python3 tests/test_agent_gateway_client.py  (or: make test, from warden/)
 """
 
 from __future__ import annotations
@@ -20,21 +20,21 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO / "tests"))
 
-from clients import sideclaw  # noqa: E402
+from clients import agent_gateway  # noqa: E402
 from clients.errors import RemoteError, SubmitRefused  # noqa: E402
 from stubs import StubServer as _StubServer  # noqa: E402
 from stubs import closed_port as _closed_port  # noqa: E402
 
 _SUBMITS = (
-    ("review", lambda: sideclaw.submit_review(cwd=Path("/repo"), pr=3)),
-    ("triage", lambda: sideclaw.submit_triage(prompt="p", schema={"type": "object"})),
-    ("update_pr", lambda: sideclaw.submit_update_pr(cwd="/repo", pr=3)),
+    ("review", lambda: agent_gateway.submit_review(cwd=Path("/repo"), pr=3)),
+    ("triage", lambda: agent_gateway.submit_triage(prompt="p", schema={"type": "object"})),
+    ("update_pr", lambda: agent_gateway.submit_update_pr(cwd="/repo", pr=3)),
 )
 
 
 def _with_stub(routes, fn):
     srv = _StubServer(routes)
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         return fn(srv)
     finally:
@@ -43,8 +43,8 @@ def _with_stub(routes, fn):
 
 def test_triage_and_update_pr_body_shapes():
     def run(srv):
-        assert sideclaw.submit_triage(prompt="p", schema={"type": "object"}) == {"id": "j1"}
-        assert sideclaw.submit_update_pr(cwd=Path("/repo"), pr=9) == {"id": "j1"}
+        assert agent_gateway.submit_triage(prompt="p", schema={"type": "object"}) == {"id": "j1"}
+        assert agent_gateway.submit_update_pr(cwd=Path("/repo"), pr=9) == {"id": "j1"}
         assert srv.requests[0]["body"] == {
             "tool": "triage", "params": {"prompt": "p", "schema": {"type": "object"}}}, srv.requests[0]["body"]
         assert srv.requests[1]["body"] == {
@@ -88,13 +88,13 @@ def test_a_200_without_a_job_id_names_the_tool():
         _with_stub({("POST", "/api/jobs"): (200, {"ok": True, "job": {}})}, run)
 
 
-def test_an_unreachable_sideclaw_may_have_mutated_and_names_the_tool():
-    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+def test_an_unreachable_agent_gateway_may_have_mutated_and_names_the_tool():
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = f"http://127.0.0.1:{_closed_port()}"
     for tool, call in _SUBMITS:
         try:
             call()
         except RemoteError as e:
-            assert f"sideclaw {tool} submit failed" in str(e) and e.maybe_mutated is True, (tool, e)
+            assert f"agent-gateway {tool} submit failed" in str(e) and e.maybe_mutated is True, (tool, e)
         else:
             raise AssertionError(f"{tool}: expected RemoteError")
 

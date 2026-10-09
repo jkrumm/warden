@@ -12,8 +12,8 @@ line. Spec it serves: `~/SourceRoot/dotfiles/docs/agent-platform.md`.
      the last journal entry (read-only sqlite, `?mode=ro`): items in, fixed, failed by
      `failure_class`, needs_decision, closed as duplicate/fixed_by, re-drives, median
      time new → fixed, merge-train refusals, auto-reverts.
-   - sideclaw: `curl -s localhost:7705/api/jobs/health`, `job.fail` events in
-     `~/Library/Logs/sideclaw.jsonl` since the last entry, degraded routes.
+   - agent-gateway: `curl -s localhost:7705/api/jobs/health`, `job.fail` events in
+     `~/Library/Logs/agent-gateway.jsonl` since the last entry, degraded routes.
    - Hermes: replies in #agents / #hermes since the last entry and their length
      (`~/.hermes/state.db`, read-only); any reply over 3 lines is friction.
    - Argo `/warden`: every few iterations, have `@verifier` screenshot it and confirm

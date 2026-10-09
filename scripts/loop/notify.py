@@ -239,7 +239,7 @@ def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id:
     except RemoteError as exc:
         if exc.maybe_mutated:
             work.hold_ambiguous_submit(item, exc)
-            return "applied", {"note": "implement submit may have reached sideclaw, outcome ambiguous — "
+            return "applied", {"note": "implement submit may have reached agent-gateway, outcome ambiguous — "
                                        "left for reconcile_operations()"}, None
         _hand_back(f"deferred: {exc}")
         return "failed", None, str(exc)

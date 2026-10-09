@@ -33,7 +33,7 @@ class PreconditionError(WardenError):
 
 
 class RemoteError(WardenError):
-    """sideclaw/GitHub unreachable or non-2xx. MAY have happened remotely —
+    """agent-gateway/GitHub unreachable or non-2xx. MAY have happened remotely —
     a request can fail after it was already sent, which is what
     `maybe_mutated` is for."""
 
@@ -62,7 +62,7 @@ class CheckRunsUnreadable(RemoteError):
 
 
 class SubmitRefused(RemoteError):
-    """sideclaw answered a job submit with a 4xx: it REFUSED (repo outside its
+    """agent-gateway answered a job submit with a 4xx: it REFUSED (repo outside its
     allowlist, tier above the repo's ceiling, unknown model, bad params). The
     same submit will be refused again, so a caller ends the item with
     `str(exc)` and never retries; a 5xx or a connection failure stays a plain

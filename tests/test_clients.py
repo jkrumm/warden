@@ -2,7 +2,7 @@
 """Regression suite for scripts/clients/ — the Python port of the transport
 half of the retired bash dispatch bridge (Wave 5.1).
 
-Every HTTP-facing client (sideclaw, github) is exercised against an
+Every HTTP-facing client (agent-gateway, github) is exercised against an
 in-process `ThreadingHTTPServer` whose handler records every request
 (method, path, headers, parsed body) and replies from a per-test route
 table — never a real network call. `github.token()` is exercised against a
@@ -29,7 +29,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
-from clients import argo, github, sideclaw  # noqa: E402
+from clients import argo, github, agent_gateway  # noqa: E402
 from clients import slack as clients_slack  # noqa: E402
 from clients.errors import HeadMoved, PolicyError, PreconditionError, RemoteError, SubmitRefused  # noqa: E402
 
@@ -79,19 +79,19 @@ def _reset_github_token() -> None:
     github._token_cache = None  # noqa: SLF001
 
 
-# --- sideclaw ------------------------------------------------------------------
+# --- agent-gateway ------------------------------------------------------------------
 
 def test_valid_job_id():
-    assert sideclaw.valid_job_id("abc-123")
-    assert not sideclaw.valid_job_id("abc/123")
-    assert not sideclaw.valid_job_id("")
+    assert agent_gateway.valid_job_id("abc-123")
+    assert not agent_gateway.valid_job_id("abc/123")
+    assert not agent_gateway.valid_job_id("")
 
 
 def test_submit_body_shape_minimal():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "j1", "status": "running"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        job = sideclaw.submit(cwd="/repo", tier="investigate", brief="do the thing")
+        job = agent_gateway.submit(cwd="/repo", tier="investigate", brief="do the thing")
         assert job == {"id": "j1", "status": "running"}, job
         req = srv.requests[0]
         assert req["body"] == {"tool": "dispatch", "params": {"cwd": "/repo", "tier": "investigate", "brief": "do the thing"}}, req["body"]
@@ -101,9 +101,9 @@ def test_submit_body_shape_minimal():
 
 def test_submit_body_shape_with_optional_keys_and_order():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "j2"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        sideclaw.submit(cwd="/repo", tier="implement", brief="b", context="ctx", model="haiku")
+        agent_gateway.submit(cwd="/repo", tier="implement", brief="b", context="ctx", model="haiku")
         params = srv.requests[0]["body"]["params"]
         assert list(params.keys()) == ["cwd", "tier", "brief", "context", "model"], params
         assert params["context"] == "ctx" and params["model"] == "haiku"
@@ -111,15 +111,15 @@ def test_submit_body_shape_with_optional_keys_and_order():
         srv.stop()
 
 
-def test_submit_4xx_raises_submit_refused_with_sideclaws_message():
-    """A 4xx is sideclaw REFUSING (allowlist, tier ceiling, bad model): its own
+def test_submit_4xx_raises_submit_refused_with_agent_gateways_message():
+    """A 4xx is agent-gateway REFUSING (allowlist, tier ceiling, bad model): its own
     `error` text, the status, and a type callers can tell from a 5xx."""
     srv = _StubServer({("POST", "/api/jobs"): (
         400, {"ok": False, "error": "dispatch refused: cwd is not a repo directly under a dispatch root: /x"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit(cwd="/x", tier="implement", brief="b")
+            agent_gateway.submit(cwd="/x", tier="implement", brief="b")
         except SubmitRefused as e:
             assert e.status == 400 and e.maybe_mutated is False, (e.status, e.maybe_mutated)
             assert "dispatch refused: cwd is not a repo directly under a dispatch root: /x" in str(e), e
@@ -131,10 +131,10 @@ def test_submit_4xx_raises_submit_refused_with_sideclaws_message():
 
 def test_submit_4xx_without_a_json_error_still_carries_the_body():
     srv = _StubServer({("POST", "/api/jobs"): (422, "params invalid")})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit(cwd="/x", tier="implement", brief="b")
+            agent_gateway.submit(cwd="/x", tier="implement", brief="b")
         except SubmitRefused as e:
             assert e.status == 422 and "params invalid" in str(e), e
         else:
@@ -145,10 +145,10 @@ def test_submit_4xx_without_a_json_error_still_carries_the_body():
 
 def test_submit_5xx_is_a_plain_remote_error_not_a_refusal():
     srv = _StubServer({("POST", "/api/jobs"): (503, {"error": "overloaded"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit(cwd="/x", tier="implement", brief="b")
+            agent_gateway.submit(cwd="/x", tier="implement", brief="b")
         except SubmitRefused:
             raise AssertionError("a 5xx must keep its retry behaviour, not read as a refusal")
         except RemoteError as e:
@@ -161,10 +161,10 @@ def test_submit_5xx_is_a_plain_remote_error_not_a_refusal():
 
 def test_submit_500_raises_remote_error():
     srv = _StubServer({("POST", "/api/jobs"): (500, {"error": "boom"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
+            agent_gateway.submit(cwd="/repo", tier="investigate", brief="x")
         except RemoteError as e:
             assert "500" in str(e), e
         else:
@@ -174,9 +174,9 @@ def test_submit_500_raises_remote_error():
 
 
 def test_submit_connection_refused_raises_remote_error():
-    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = f"http://127.0.0.1:{_closed_port()}"
     try:
-        sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
+        agent_gateway.submit(cwd="/repo", tier="investigate", brief="x")
     except RemoteError as e:
         assert e.maybe_mutated is False, "connection refused is definitive: nothing was sent, a retry is safe"
     else:
@@ -184,26 +184,26 @@ def test_submit_connection_refused_raises_remote_error():
 
 
 def test_submit_timeout_is_ambiguous_and_flagged_maybe_mutated():
-    real = sideclaw._request
+    real = agent_gateway._request
     def _timeout(*a, **kw):
         raise TimeoutError("timed out")
-    sideclaw._request = _timeout
+    agent_gateway._request = _timeout
     try:
-        sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
+        agent_gateway.submit(cwd="/repo", tier="investigate", brief="x")
     except RemoteError as e:
         assert e.maybe_mutated is True, "a timeout may have landed — must be flagged"
     else:
         raise AssertionError("expected RemoteError")
     finally:
-        sideclaw._request = real
+        agent_gateway._request = real
 
 
 def test_submit_5xx_is_definitive_and_not_maybe_mutated():
     srv = _StubServer({("POST", "/api/jobs"): (503, {"error": "busy"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
+            agent_gateway.submit(cwd="/repo", tier="investigate", brief="x")
         except RemoteError as e:
             assert e.maybe_mutated is False, e.maybe_mutated
         else:
@@ -214,10 +214,10 @@ def test_submit_5xx_is_definitive_and_not_maybe_mutated():
 
 def test_submit_no_id_raises_remote_error():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"status": "running"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit(cwd="/repo", tier="investigate", brief="x")
+            agent_gateway.submit(cwd="/repo", tier="investigate", brief="x")
         except RemoteError as e:
             assert "no id" in str(e), e
             assert e.maybe_mutated is True, "a 200 means the job exists — a retry would duplicate it"
@@ -229,28 +229,28 @@ def test_submit_no_id_raises_remote_error():
 
 def test_get_returns_job_dict():
     srv = _StubServer({("GET", "/api/jobs/j1"): (200, {"job": {"id": "j1", "status": "done"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        assert sideclaw.get("j1") == {"id": "j1", "status": "done"}
+        assert agent_gateway.get("j1") == {"id": "j1", "status": "done"}
     finally:
         srv.stop()
 
 
 def test_get_404_returns_none():
     srv = _StubServer({("GET", "/api/jobs/missing"): (404, {"error": "not found"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        assert sideclaw.get("missing") is None
+        assert agent_gateway.get("missing") is None
     finally:
         srv.stop()
 
 
 def test_get_non200_raises_remote_error():
     srv = _StubServer({("GET", "/api/jobs/j1"): (500, {"error": "boom"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.get("j1")
+            agent_gateway.get("j1")
         except RemoteError as e:
             assert "j1" in str(e), e
         else:
@@ -261,9 +261,9 @@ def test_get_non200_raises_remote_error():
 
 def test_wait_returns_terminal_job():
     srv = _StubServer({("GET", "/api/jobs/j1"): (200, {"job": {"id": "j1", "status": "done"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        job = sideclaw.wait("j1", timeout_s=5, interval_s=1, sleep=lambda s: None, clock=lambda: 0.0)
+        job = agent_gateway.wait("j1", timeout_s=5, interval_s=1, sleep=lambda s: None, clock=lambda: 0.0)
         assert job == {"id": "j1", "status": "done"}
     finally:
         srv.stop()
@@ -271,10 +271,10 @@ def test_wait_returns_terminal_job():
 
 def test_wait_times_out_returns_none():
     srv = _StubServer({("GET", "/api/jobs/j1"): (200, {"job": {"id": "j1", "status": "running"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         clock = _FakeClock()
-        job = sideclaw.wait("j1", timeout_s=1, interval_s=1, sleep=lambda s: None, clock=clock)
+        job = agent_gateway.wait("j1", timeout_s=1, interval_s=1, sleep=lambda s: None, clock=clock)
         assert job is None
     finally:
         srv.stop()
@@ -299,10 +299,10 @@ def test_wait_404_mid_poll_raises_remote_error():
         return 404, {"error": "gone"}
 
     srv = _StubServer({("GET", "/api/jobs/j1"): route})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.wait("j1", timeout_s=5, interval_s=0.01, sleep=time.sleep, clock=time.monotonic)
+            agent_gateway.wait("j1", timeout_s=5, interval_s=0.01, sleep=time.sleep, clock=time.monotonic)
         except RemoteError as e:
             assert "j1" in str(e), e
         else:
@@ -313,9 +313,9 @@ def test_wait_404_mid_poll_raises_remote_error():
 
 def test_cancel_200_returns_job():
     srv = _StubServer({("POST", "/api/jobs/j1/cancel"): (200, {"job": {"id": "j1", "status": "cancelled"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        job = sideclaw.cancel("j1")
+        job = agent_gateway.cancel("j1")
         assert job == {"id": "j1", "status": "cancelled"}
         assert srv.requests[0]["body"] == {}
     finally:
@@ -324,10 +324,10 @@ def test_cancel_200_returns_job():
 
 def test_cancel_404_raises_remote_error():
     srv = _StubServer({("POST", "/api/jobs/j1/cancel"): (404, {"error": "no such job"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.cancel("j1")
+            agent_gateway.cancel("j1")
         except RemoteError:
             pass
         else:
@@ -338,10 +338,10 @@ def test_cancel_404_raises_remote_error():
 
 def test_cancel_409_raises_policy_error():
     srv = _StubServer({("POST", "/api/jobs/j1/cancel"): (409, {"error": "already terminal"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.cancel("j1")
+            agent_gateway.cancel("j1")
         except PolicyError as e:
             assert "already terminal" in str(e), e
         else:
@@ -352,9 +352,9 @@ def test_cancel_409_raises_policy_error():
 
 def test_submit_review_body_shape():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "r1", "status": "running"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        job = sideclaw.submit_review(cwd=Path("/repo"), pr=17, context="ctx")
+        job = agent_gateway.submit_review(cwd=Path("/repo"), pr=17, context="ctx")
         assert job == {"id": "r1", "status": "running"}, job
         assert srv.requests[0]["body"] == {
             "tool": "review", "params": {"cwd": "/repo", "pr": 17, "context": "ctx"},
@@ -365,9 +365,9 @@ def test_submit_review_body_shape():
 
 def test_submit_review_body_shape_with_model():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "r3"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        sideclaw.submit_review(cwd=Path("/repo"), pr=17, context="ctx", model="glm-5.3-flash")
+        agent_gateway.submit_review(cwd=Path("/repo"), pr=17, context="ctx", model="glm-5.3-flash")
         assert srv.requests[0]["body"] == {
             "tool": "review", "params": {"cwd": "/repo", "pr": 17, "context": "ctx", "model": "glm-5.3-flash"},
         }, srv.requests[0]["body"]
@@ -377,9 +377,9 @@ def test_submit_review_body_shape_with_model():
 
 def test_submit_review_omits_context_when_absent():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "r2"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        sideclaw.submit_review(cwd=Path("/repo"), pr=5)
+        agent_gateway.submit_review(cwd=Path("/repo"), pr=5)
         assert srv.requests[0]["body"]["params"] == {"cwd": "/repo", "pr": 5}
     finally:
         srv.stop()
@@ -387,10 +387,10 @@ def test_submit_review_omits_context_when_absent():
 
 def test_submit_review_4xx_raises_submit_refused():
     srv = _StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": "dispatch refused: nope"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit_review(cwd=Path("/repo"), pr=1)
+            agent_gateway.submit_review(cwd=Path("/repo"), pr=1)
         except SubmitRefused as e:
             assert e.status == 400 and "dispatch refused: nope" in str(e), e
         else:
@@ -401,10 +401,10 @@ def test_submit_review_4xx_raises_submit_refused():
 
 def test_submit_review_500_raises_remote_error():
     srv = _StubServer({("POST", "/api/jobs"): (500, {"error": "boom"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit_review(cwd=Path("/repo"), pr=1)
+            agent_gateway.submit_review(cwd=Path("/repo"), pr=1)
         except RemoteError as e:
             assert "500" in str(e), e
         else:
@@ -415,9 +415,9 @@ def test_submit_review_500_raises_remote_error():
 
 def test_submit_update_pr_body_shape():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "u1", "status": "queued"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        job = sideclaw.submit_update_pr(cwd=Path("/repo"), pr=17)
+        job = agent_gateway.submit_update_pr(cwd=Path("/repo"), pr=17)
         assert job == {"id": "u1", "status": "queued"}, job
         assert srv.requests[0]["body"] == {"tool": "update_pr", "params": {"cwd": "/repo", "pr": 17}}, \
             srv.requests[0]["body"]
@@ -427,10 +427,10 @@ def test_submit_update_pr_body_shape():
 
 def test_submit_update_pr_4xx_is_a_refusal_and_500_or_unreachable_a_remote_error():
     srv = _StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": "update_pr refused: not allowed"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit_update_pr(cwd="/repo", pr=1)
+            agent_gateway.submit_update_pr(cwd="/repo", pr=1)
         except SubmitRefused as e:
             assert e.status == 400 and "update_pr refused: not allowed" in str(e), e
         else:
@@ -438,10 +438,10 @@ def test_submit_update_pr_4xx_is_a_refusal_and_500_or_unreachable_a_remote_error
     finally:
         srv.stop()
     srv = _StubServer({("POST", "/api/jobs"): (500, {"error": "boom"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit_update_pr(cwd="/repo", pr=1)
+            agent_gateway.submit_update_pr(cwd="/repo", pr=1)
         except SubmitRefused:
             raise AssertionError("a 5xx is not a refusal")
         except RemoteError as e:
@@ -450,9 +450,9 @@ def test_submit_update_pr_4xx_is_a_refusal_and_500_or_unreachable_a_remote_error
             raise AssertionError("expected RemoteError")
     finally:
         srv.stop()
-    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = f"http://127.0.0.1:{_closed_port()}"
     try:
-        sideclaw.submit_update_pr(cwd="/repo", pr=1)
+        agent_gateway.submit_update_pr(cwd="/repo", pr=1)
     except RemoteError as e:
         assert "update_pr submit failed" in str(e), e
     else:
@@ -469,15 +469,15 @@ def _update_pr_job(**result) -> dict:
 
 
 def test_update_pr_result_accepts_every_published_status():
-    assert sideclaw.update_pr_result(_update_pr_job())["status"] == "updated"
+    assert agent_gateway.update_pr_result(_update_pr_job())["status"] == "updated"
     up = _update_pr_job(status="up_to_date", headSha=_SHA_A, checks=None)
     up["result"].pop("checks")
-    assert sideclaw.update_pr_result(up)["headSha"] == _SHA_A
+    assert agent_gateway.update_pr_result(up)["headSha"] == _SHA_A
     conflict = _update_pr_job(status="conflict", headSha=_SHA_A, note="rebase onto master failed: x")
     conflict["result"].pop("checks")
-    assert sideclaw.update_pr_result(conflict)["note"] == "rebase onto master failed: x"
+    assert agent_gateway.update_pr_result(conflict)["note"] == "rebase onto master failed: x"
     failed = _update_pr_job(checks={"passed": False, "summary": "1 failed", "failed": "lint"})
-    assert sideclaw.update_pr_result(failed)["checks"]["passed"] is False
+    assert agent_gateway.update_pr_result(failed)["checks"]["passed"] is False
 
 
 def test_update_pr_result_refuses_any_shape_it_does_not_know():
@@ -495,7 +495,7 @@ def test_update_pr_result_refuses_any_shape_it_does_not_know():
     ]
     for why, job in bad:
         try:
-            sideclaw.update_pr_result(job)
+            agent_gateway.update_pr_result(job)
         except RemoteError:
             pass
         else:
@@ -504,10 +504,10 @@ def test_update_pr_result_refuses_any_shape_it_does_not_know():
 
 def test_submit_triage_body_shape_has_no_model():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "t1", "status": "queued"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         schema = {"type": "object", "properties": {"action": {"type": "string"}}}
-        job = sideclaw.submit_triage(prompt="decide", schema=schema)
+        job = agent_gateway.submit_triage(prompt="decide", schema=schema)
         assert job == {"id": "t1", "status": "queued"}, job
         assert srv.requests[0]["body"] == {
             "tool": "triage", "params": {"prompt": "decide", "schema": schema},
@@ -518,10 +518,10 @@ def test_submit_triage_body_shape_has_no_model():
 
 def test_submit_triage_4xx_raises_submit_refused():
     srv = _StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": "invalid params: prompt too long"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit_triage(prompt="x", schema={"type": "object"})
+            agent_gateway.submit_triage(prompt="x", schema={"type": "object"})
         except SubmitRefused as e:
             assert e.status == 400 and "invalid params: prompt too long" in str(e), e
         else:
@@ -532,19 +532,19 @@ def test_submit_triage_4xx_raises_submit_refused():
 
 def test_submit_triage_500_and_unreachable_are_remote_errors():
     srv = _StubServer({("POST", "/api/jobs"): (500, {"error": "boom"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         try:
-            sideclaw.submit_triage(prompt="x", schema={"type": "object"})
+            agent_gateway.submit_triage(prompt="x", schema={"type": "object"})
         except RemoteError as e:
             assert "500" in str(e), e
         else:
             raise AssertionError("expected RemoteError")
     finally:
         srv.stop()
-    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = f"http://127.0.0.1:{_closed_port()}"
     try:
-        sideclaw.submit_triage(prompt="x", schema={"type": "object"})
+        agent_gateway.submit_triage(prompt="x", schema={"type": "object"})
     except RemoteError as e:
         assert "triage submit failed" in str(e), e
     else:
@@ -552,37 +552,37 @@ def test_submit_triage_500_and_unreachable_are_remote_errors():
 
 
 def test_assert_result_schema_ok_on_matching_version():
-    sideclaw.assert_result_schema(
+    agent_gateway.assert_result_schema(
         {"status": "done", "result": {"schemaVersion": 2}}, 2, "implement"
     )  # must not raise
 
 
 def test_assert_result_schema_raises_on_mismatch():
     try:
-        sideclaw.assert_result_schema({"status": "done", "result": {"schemaVersion": 1}}, 2, "implement")
+        agent_gateway.assert_result_schema({"status": "done", "result": {"schemaVersion": 1}}, 2, "implement")
     except RemoteError as e:
         assert str(e) == (
-            "sideclaw implement result schemaVersion 1, warden expects 2 — refusing to parse"
+            "agent-gateway implement result schemaVersion 1, warden expects 2 — refusing to parse"
         ), e
     else:
         raise AssertionError("expected RemoteError")
 
 
 def test_assert_result_schema_skips_non_done_jobs():
-    sideclaw.assert_result_schema({"status": "failed", "result": None}, 2, "implement")  # must not raise
-    sideclaw.assert_result_schema({"status": "cancelled"}, 2, "review")  # must not raise
+    agent_gateway.assert_result_schema({"status": "failed", "result": None}, 2, "implement")  # must not raise
+    agent_gateway.assert_result_schema({"status": "cancelled"}, 2, "review")  # must not raise
 
 
 def test_assert_outcome_ok_on_known_outcome():
-    sideclaw.assert_outcome({"status": "done", "result": {"outcome": "clean"}},
-                             sideclaw.REVIEW_OUTCOMES, "review")  # must not raise
+    agent_gateway.assert_outcome({"status": "done", "result": {"outcome": "clean"}},
+                             agent_gateway.REVIEW_OUTCOMES, "review")  # must not raise
 
 
 def test_assert_outcome_raises_on_unrecognized_outcome():
     try:
-        sideclaw.assert_outcome(
+        agent_gateway.assert_outcome(
             {"status": "done", "result": {"outcome": "a_future_outcome"}},
-            sideclaw.REVIEW_OUTCOMES, "review",
+            agent_gateway.REVIEW_OUTCOMES, "review",
         )
     except RemoteError as e:
         assert "'a_future_outcome'" in str(e) and "refusing to parse" in str(e), e
@@ -592,32 +592,32 @@ def test_assert_outcome_raises_on_unrecognized_outcome():
 
 def test_assert_outcome_raises_on_missing_outcome():
     try:
-        sideclaw.assert_outcome({"status": "done", "result": {}}, sideclaw.DISPATCH_OUTCOMES, "implement")
+        agent_gateway.assert_outcome({"status": "done", "result": {}}, agent_gateway.DISPATCH_OUTCOMES, "implement")
     except RemoteError as e:
         assert "None" in str(e) and "refusing to parse" in str(e), e
     else:
         raise AssertionError("expected RemoteError")
 
 
-def test_finished_at_iso_prefers_sideclaws_own_timestamp():
+def test_finished_at_iso_prefers_agent_gateways_own_timestamp():
     fallback = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     finished = dt.datetime(2026, 1, 1, 0, 5, tzinfo=dt.timezone.utc)
     job = {"status": "done", "finishedAt": int(finished.timestamp() * 1000)}
-    assert sideclaw.finished_at_iso(job, fallback=fallback) == finished.isoformat()
+    assert agent_gateway.finished_at_iso(job, fallback=fallback) == finished.isoformat()
 
 
 def test_finished_at_iso_falls_back_when_missing_or_not_a_number():
     fallback = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
-    assert sideclaw.finished_at_iso({"status": "failed"}, fallback=fallback) == fallback.isoformat()
-    assert sideclaw.finished_at_iso({"finishedAt": None}, fallback=fallback) == fallback.isoformat()
-    assert sideclaw.finished_at_iso({"finishedAt": "not-a-number"}, fallback=fallback) == fallback.isoformat()
+    assert agent_gateway.finished_at_iso({"status": "failed"}, fallback=fallback) == fallback.isoformat()
+    assert agent_gateway.finished_at_iso({"finishedAt": None}, fallback=fallback) == fallback.isoformat()
+    assert agent_gateway.finished_at_iso({"finishedAt": "not-a-number"}, fallback=fallback) == fallback.isoformat()
     # bool is an int subclass in Python — must not be read as an epoch-ms timestamp.
-    assert sideclaw.finished_at_iso({"finishedAt": True}, fallback=fallback) == fallback.isoformat()
+    assert agent_gateway.finished_at_iso({"finishedAt": True}, fallback=fallback) == fallback.isoformat()
 
 
 def test_assert_outcome_skips_non_done_jobs():
-    sideclaw.assert_outcome({"status": "failed", "result": None}, sideclaw.DISPATCH_OUTCOMES, "implement")
-    sideclaw.assert_outcome({"status": "cancelled"}, sideclaw.REVIEW_OUTCOMES, "review")
+    agent_gateway.assert_outcome({"status": "failed", "result": None}, agent_gateway.DISPATCH_OUTCOMES, "implement")
+    agent_gateway.assert_outcome({"status": "cancelled"}, agent_gateway.REVIEW_OUTCOMES, "review")
 
 
 # --- github ----------------------------------------------------------------
@@ -1658,10 +1658,10 @@ def test_resolve_slack_token_falls_back_to_hermes_and_warns_once():
 
 def test_submit_revision_of_goes_out_as_params_revisionOf_only_when_set():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "j-rev"}})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        sideclaw.submit(cwd="/repo", tier="implement", brief="b", revision_of="dispatch/fix-1")
-        sideclaw.submit(cwd="/repo", tier="implement", brief="b")
+        agent_gateway.submit(cwd="/repo", tier="implement", brief="b", revision_of="dispatch/fix-1")
+        agent_gateway.submit(cwd="/repo", tier="implement", brief="b")
         assert srv.requests[0]["body"]["params"]["revisionOf"] == "dispatch/fix-1", srv.requests[0]["body"]
         assert "revisionOf" not in srv.requests[1]["body"]["params"], srv.requests[1]["body"]
     finally:
@@ -1670,33 +1670,33 @@ def test_submit_revision_of_goes_out_as_params_revisionOf_only_when_set():
 
 def test_dispatch_outcomes_include_pr_updated_and_conflict():
     for outcome in ("pr_updated", "conflict"):
-        sideclaw.assert_outcome({"status": "done", "result": {"outcome": outcome}}, sideclaw.DISPATCH_OUTCOMES,
+        agent_gateway.assert_outcome({"status": "done", "result": {"outcome": outcome}}, agent_gateway.DISPATCH_OUTCOMES,
                                 "implement")
 
 
 def test_is_lease_refusal_matches_only_a_failed_job_with_the_lease_text():
-    # sideclaw server/lib/repo-lease.ts repoLeaseRefusal(holder, tool), for both tools that take the lease.
+    # agent-gateway server/lib/repo-lease.ts repoLeaseRefusal(holder, tool), for both tools that take the lease.
     tail = ("an implement episode is already running in this repo (job abc) — implement episodes serialize "
             "per repo because their edits and pushes would interleave. Re-submit once it finishes.")
     lease = f"dispatch refused: {tail}"
-    assert sideclaw.is_lease_refusal({"status": "failed", "error": lease})
-    assert sideclaw.is_lease_refusal({"status": "failed", "error": f"update_pr refused: {tail}"})
-    assert sideclaw.is_lease_refusal({"status": "failed", "error": f"Error: update_pr refused: {tail}"})
-    assert not sideclaw.is_lease_refusal({"status": "failed", "error": "update_pr refused: PR #3 is closed, not open"})
-    assert not sideclaw.is_lease_refusal({"status": "failed", "error": "worker crashed"})
-    assert not sideclaw.is_lease_refusal({"status": "failed", "error": None})
-    assert not sideclaw.is_lease_refusal({"status": "done", "error": lease})
-    assert not sideclaw.is_lease_refusal({"status": "failed"})
+    assert agent_gateway.is_lease_refusal({"status": "failed", "error": lease})
+    assert agent_gateway.is_lease_refusal({"status": "failed", "error": f"update_pr refused: {tail}"})
+    assert agent_gateway.is_lease_refusal({"status": "failed", "error": f"Error: update_pr refused: {tail}"})
+    assert not agent_gateway.is_lease_refusal({"status": "failed", "error": "update_pr refused: PR #3 is closed, not open"})
+    assert not agent_gateway.is_lease_refusal({"status": "failed", "error": "worker crashed"})
+    assert not agent_gateway.is_lease_refusal({"status": "failed", "error": None})
+    assert not agent_gateway.is_lease_refusal({"status": "done", "error": lease})
+    assert not agent_gateway.is_lease_refusal({"status": "failed"})
 
 
 def test_conflict_bundle_path_is_read_from_the_verdict_prose():
     path = "/tmp/dispatch-bundles/fix-1.bundle"
-    assert sideclaw.conflict_bundle_path(
+    assert agent_gateway.conflict_bundle_path(
         {"verdict": f"Rebase conflicted. The episode's commits were bundled at {path}."}) == path
-    assert sideclaw.conflict_bundle_path({"verdict": f"bundled at {path}"}) == path
-    assert sideclaw.conflict_bundle_path({"verdict": f"bundled at {path}. More text follows."}) == path
-    assert sideclaw.conflict_bundle_path({"verdict": "Rebase conflicted, nothing bundled."}) is None
-    assert sideclaw.conflict_bundle_path({"summary": "no verdict key"}) is None
+    assert agent_gateway.conflict_bundle_path({"verdict": f"bundled at {path}"}) == path
+    assert agent_gateway.conflict_bundle_path({"verdict": f"bundled at {path}. More text follows."}) == path
+    assert agent_gateway.conflict_bundle_path({"verdict": "Rebase conflicted, nothing bundled."}) is None
+    assert agent_gateway.conflict_bundle_path({"summary": "no verdict key"}) is None
 
 
 def _routing(routes: dict) -> dict:
@@ -1704,42 +1704,42 @@ def _routing(routes: dict) -> dict:
 
 
 def test_escalation_model_reads_the_route_and_caches_it():
-    sideclaw._escalation_cache.clear()
+    agent_gateway._escalation_cache.clear()
     srv = _StubServer(_routing({"dispatch_implement": {"model": "default-m", "backend": "x"},
                                 "dispatch_implement_escalation": {"model": "strong-m", "backend": "x"}}))
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
-        assert sideclaw.escalation_model() == "strong-m"
-        assert sideclaw.escalation_model() == "strong-m"
+        assert agent_gateway.escalation_model() == "strong-m"
+        assert agent_gateway.escalation_model() == "strong-m"
         assert len(srv.requests) == 1, "cached for the life of the process"
     finally:
         srv.stop()
-        sideclaw._escalation_cache.clear()
+        agent_gateway._escalation_cache.clear()
 
 
 def test_escalation_model_is_none_when_the_route_is_absent_or_the_call_fails():
-    sideclaw._escalation_cache.clear()
+    agent_gateway._escalation_cache.clear()
     srv = _StubServer(_routing({"dispatch_implement": {"model": "default-m"}}))
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            assert sideclaw.escalation_model() is None
+            assert agent_gateway.escalation_model() is None
         assert "dispatch_implement_escalation" in err.getvalue(), err.getvalue()
     finally:
         srv.stop()
 
     srv = _StubServer({("GET", "/api/routing"): (500, {"error": "boom"})})
-    os.environ["WARDEN_SIDECLAW_BASE"] = srv.base
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
     try:
         with contextlib.redirect_stderr(io.StringIO()):
-            assert sideclaw.escalation_model() is None
+            assert agent_gateway.escalation_model() is None
     finally:
         srv.stop()
 
-    os.environ["WARDEN_SIDECLAW_BASE"] = f"http://127.0.0.1:{_closed_port()}"
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = f"http://127.0.0.1:{_closed_port()}"
     with contextlib.redirect_stderr(io.StringIO()):
-        assert sideclaw.escalation_model() is None, "an unreachable sideclaw means no model key, not an error"
-    assert sideclaw._escalation_cache == {}, "a failure is never cached"
+        assert agent_gateway.escalation_model() is None, "an unreachable agent-gateway means no model key, not an error"
+    assert agent_gateway._escalation_cache == {}, "a failure is never cached"
 
 
 # --- runner --------------------------------------------------------------------

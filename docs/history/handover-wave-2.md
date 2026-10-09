@@ -170,7 +170,7 @@ The six funnel numbers from DESIGN.md § Observability, read-only, off the ledge
   say why.
 - **Python's `os.path.realpath` does NOT correct case; Bun's `realpathSync` does.**
   If you reimplement a path allowlist in Python, compare case-insensitively or you
-  reintroduce a fail-open the sideclaw side already closed.
+  reintroduce a fail-open the agent-gateway side already closed.
 - The rollback is `~/.warden-cutover-backup/`. `cron/jobs.json` is **not in git**.
 
 ## How to work — and this session can run long
@@ -187,8 +187,8 @@ You are on Claude Code with a large context and durable tooling. Use it:
   find one thing.
 - **Run independent subagents in parallel in one message.** They hold their own
   context and their own prompt cache; that is the real argument for delegating.
-- **`mcp__sideclaw__check` / `review`** for validation and multi-angle review —
-  async, submit → `job_wait({jobId})` → read `result`. sideclaw's wait returns
+- **`mcp__agent_gateway__check` / `review`** for validation and multi-angle review —
+  async, submit → `job_wait({jobId})` → read `result`. agent-gateway's wait returns
   after ~50s regardless, so **loop while `stillRunning: true`**. The submit call is
   not the answer.
 - **`/research`** for any library/API/version fact. Never from memory.

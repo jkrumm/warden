@@ -5,12 +5,12 @@ replaced `scripts/hermes-cc.sh` (Wave 5.2/5.3).
 Every test runs the real launcher (`scripts/warden`, exec'ing
 `scripts/warden.py`) as a subprocess, against a throwaway `HOME`, a fresh
 migrated ledger, a sandboxed dispatch policy, and a single in-process
-`stubs.StubServer` per test standing in for sideclaw / GitHub / Slack — never
+`stubs.StubServer` per test standing in for agent-gateway / GitHub / Slack — never
 a real network call, never the developer's own `~/.warden` or `~/.hermes`.
 
 This is a deliberately reduced port of the retired tests/test_hermes_cc.py
 (165 cases). Dropped outright, because the CLI itself dropped them:
-  - the `cancel` verb (sideclaw grew a real cancel endpoint; `abort` replaced
+  - the `cancel` verb (agent-gateway grew a real cancel endpoint; `abort` replaced
     it) and its `lost`/`queued` dispatch statuses.
   - `--confirm` as a dispatch flag, and the signed-approval gate on
     `dispatch --tier implement` (it now submits directly).
@@ -106,7 +106,7 @@ class Harness:
 
     # -- env / run --
 
-    def base_env(self, *, db: Path | None = None, sideclaw: str | None = None,
+    def base_env(self, *, db: Path | None = None, agent_gateway: str | None = None,
                  gh: str | None = None, slack: str | None = None,
                  log: Path | None = None) -> dict[str, str]:
         return {
@@ -119,7 +119,7 @@ class Harness:
             "WARDEN_SECRETS_RUN": str(self.secrets_run),
             "SECRETS_BACKEND_FILE": str(self.backend_file),
             "SLACK_BOT_TOKEN": "xoxb-stub-token",
-            "WARDEN_SIDECLAW_BASE": sideclaw or f"http://127.0.0.1:{stubs.closed_port()}",
+            "WARDEN_AGENT_GATEWAY_BASE": agent_gateway or f"http://127.0.0.1:{stubs.closed_port()}",
             "WARDEN_GH_API": gh or f"http://127.0.0.1:{stubs.closed_port()}",
             "WARDEN_SLACK_API": slack or f"http://127.0.0.1:{stubs.closed_port()}",
         }
@@ -302,7 +302,7 @@ def test_brief_file_is_read_instead_of_stdin():
     srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-bf", "status": "running"}})})
     try:
         proc = h.run(["dispatch", "alpha", "--brief-file", str(path), "--json"],
-                      env=h.base_env(sideclaw=srv.base), stdin=None)
+                      env=h.base_env(agent_gateway=srv.base), stdin=None)
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -327,7 +327,7 @@ def test_dispatch_names_the_repo_and_sends_cwd_only_no_policy_keys():
     srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-s", "status": "running"}})})
     try:
         proc = h.run(["dispatch", "secretrepo", "--tier", "author", "--json"],
-                     env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+                     env=h.base_env(agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     assert proc.returncode == 0, proc.stderr
@@ -343,7 +343,7 @@ def test_dispatch_dry_run_carries_no_repo_ceiling():
     assert out["cwd"] == str(h.repos_root / "alpha"), out
 
 
-# --- tier vocabulary + sideclaw is the only boundary ------------------------------
+# --- tier vocabulary + agent-gateway is the only boundary ------------------------------
 
 
 def test_unknown_tier_is_a_usage_error():
@@ -353,15 +353,15 @@ def test_unknown_tier_is_a_usage_error():
     assert proc.returncode == 64 and "unknown tier" in out["error"], out
 
 
-def test_sideclaw_refusal_is_reported_verbatim_and_exits_4():
-    """A 4xx on submit is sideclaw refusing (allowlist / tier ceiling): its own
+def test_agent_gateway_refusal_is_reported_verbatim_and_exits_4():
+    """A 4xx on submit is agent-gateway refusing (allowlist / tier ceiling): its own
     message reaches the caller, exit 4 — and warden never decided it locally."""
     h = Harness()
     msg = "dispatch refused: tier 'implement' exceeds the ceiling 'investigate' for repo 'alpha'"
     srv = stubs.StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": msg})})
     try:
         proc = h.run(["dispatch", "alpha", "--tier", "implement", "--json"],
-                     env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+                     env=h.base_env(agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -409,7 +409,7 @@ def test_audit_log_records_refused_dispatch():
     srv = stubs.StubServer({("POST", "/api/jobs"): (400, {"ok": False, "error": "dispatch refused: nope"})})
     try:
         h.run(["dispatch", "alpha", "--tier", "implement", "--json"],
-              env=h.base_env(log=log, sideclaw=srv.base), stdin=VALID_BRIEF)
+              env=h.base_env(log=log, agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     line = log.read_text(encoding="utf-8").strip()
@@ -425,7 +425,7 @@ def test_dispatch_works_inside_an_agent_session():
     h = Harness()
     srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-s", "status": "running"}})})
     try:
-        proc = h.run(["dispatch", "alpha", "--json"], env=h.base_env(sideclaw=srv.base),
+        proc = h.run(["dispatch", "alpha", "--json"], env=h.base_env(agent_gateway=srv.base),
                      env_extra={"CLAUDECODE": "1", "CLAUDE_ENTRYPOINT": "worker"}, stdin=VALID_BRIEF)
     finally:
         srv.stop()
@@ -445,7 +445,7 @@ def test_dispatch_record_and_status_and_list_round_trip():
                                                      "result": {"summary": "s", "artifactUrl": None}}}),
     })
     try:
-        env["WARDEN_SIDECLAW_BASE"] = srv.base
+        env["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
         dispatched = h.run(["dispatch", "alpha", "--json"], env=env, stdin=VALID_BRIEF)
         d_out = _json_or_fail(dispatched)
         assert dispatched.returncode == 0 and d_out["status"] == "running", d_out
@@ -468,7 +468,7 @@ def test_dispatch_wait_returns_terminal_result():
         ("GET", "/api/jobs/job-w"): (200, {"job": {"id": "job-w", "status": "done", "result": {"summary": "ok"}}}),
     })
     try:
-        proc = h.run(["dispatch", "alpha", "--wait", "--json"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+        proc = h.run(["dispatch", "alpha", "--wait", "--json"], env=h.base_env(agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -504,7 +504,7 @@ def test_run_record_round_trip():
     h = Harness()
     srv = stubs.StubServer(_run_routes({"id": "job-run-rt", "status": "running"}))
     try:
-        proc = h.run(["run", "alpha", "--json"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+        proc = h.run(["run", "alpha", "--json"], env=h.base_env(agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -523,7 +523,7 @@ def test_run_tier_investigate_caps_the_item_at_investigate():
     srv = stubs.StubServer(_run_routes({"id": "job-run-inv", "status": "running"}))
     try:
         proc = h.run(["run", "alpha", "--tier", "investigate", "--json"],
-                     env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+                     env=h.base_env(agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -538,7 +538,7 @@ def test_run_triages_first_then_dispatches_on_new():
     db = h.new_db()
     srv = stubs.StubServer(_run_routes({"id": "job-run-t", "status": "running"}))
     try:
-        proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF)
+        proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db, agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -558,7 +558,7 @@ def test_run_never_attaches_the_owners_own_request_to_another_item():
     answer = {"action": "attach", "item": 50, "reason": "same flaky check"}
     srv = stubs.StubServer(_run_routes({"id": "job-never", "status": "running"}, answer=answer))
     try:
-        proc = h.run(["run", "alpha"], env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF)
+        proc = h.run(["run", "alpha"], env=h.base_env(db=db, agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     assert proc.returncode == 0, proc
@@ -573,7 +573,7 @@ def test_run_never_attaches_the_owners_own_request_to_another_item():
 
 
 def test_run_with_triage_down_queues_the_item_for_the_loop():
-    """sideclaw unreachable: the item is opened and left `new` with a strike — the loop retries it."""
+    """agent-gateway unreachable: the item is opened and left `new` with a strike — the loop retries it."""
     h = Harness()
     db = h.new_db()
     proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db), stdin=VALID_BRIEF)
@@ -589,7 +589,7 @@ def test_run_text_output_prints_the_real_state_not_a_stale_literal():
     h = Harness()
     srv = stubs.StubServer(_run_routes({"id": "job-run-txt", "status": "running"}))
     try:
-        proc = h.run(["run", "alpha"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+        proc = h.run(["run", "alpha"], env=h.base_env(agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     assert proc.returncode == 0, proc
@@ -607,7 +607,7 @@ def test_run_with_origin_channel_and_thread_carries_onto_the_dispatch_row():
     try:
         proc = h.run(
             ["run", "alpha", "--origin-channel", "C0ORIGIN0001", "--origin-thread", "1111.000001", "--json"],
-            env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF,
+            env=h.base_env(db=db, agent_gateway=srv.base), stdin=VALID_BRIEF,
         )
     finally:
         srv.stop()
@@ -628,7 +628,7 @@ def test_run_without_origin_channel_uses_the_shared_card_as_before():
     db = h.new_db()
     srv = stubs.StubServer(_run_routes({"id": "job-run-noorigin", "status": "running"}))
     try:
-        proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF)
+        proc = h.run(["run", "alpha", "--json"], env=h.base_env(db=db, agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -660,7 +660,7 @@ def test_run_tier_implement_needs_no_why_like_dispatch():
     db = h.new_db()
     srv = stubs.StubServer(_run_routes({"id": "job-run-impl", "status": "running"}))
     try:
-        proc = h.run(["run", "gamma", "--tier", "implement", "--json"], env=h.base_env(db=db, sideclaw=srv.base),
+        proc = h.run(["run", "gamma", "--tier", "implement", "--json"], env=h.base_env(db=db, agent_gateway=srv.base),
                      stdin=VALID_BRIEF)
     finally:
         srv.stop()
@@ -675,7 +675,7 @@ def test_run_wait_returns_result():
                                                         "result": {"summary": "ok"}}}),
     }))
     try:
-        proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(sideclaw=srv.base), stdin=VALID_BRIEF)
+        proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(agent_gateway=srv.base), stdin=VALID_BRIEF)
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -699,7 +699,7 @@ def test_run_wait_folds_the_verdict_before_returning():
                                                                       "nextAction": "none"}}}),
     }))
     try:
-        proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(db=db, sideclaw=srv.base),
+        proc = h.run(["run", "alpha", "--wait", "--json"], env=h.base_env(db=db, agent_gateway=srv.base),
                       stdin=VALID_BRIEF)
     finally:
         srv.stop()
@@ -719,7 +719,7 @@ def test_status_unknown_job_is_usage_error():
     h = Harness()
     srv = stubs.StubServer({"default": (404, {"error": "no such job"})})
     try:
-        proc = h.run(["status", "job-nope", "--json"], env=h.base_env(sideclaw=srv.base))
+        proc = h.run(["status", "job-nope", "--json"], env=h.base_env(agent_gateway=srv.base))
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -732,7 +732,7 @@ def test_status_terminal_record_survives_a_pruned_job():
     _seed_dispatch(db, "job-pruned", status="done", verdict_json=json.dumps({"summary": "s"}))
     srv = stubs.StubServer({"default": (404, {"error": "gone"})})
     try:
-        proc = h.run(["status", "job-pruned", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
+        proc = h.run(["status", "job-pruned", "--json"], env=h.base_env(db=db, agent_gateway=srv.base))
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -745,7 +745,7 @@ def test_status_non_terminal_record_with_pruned_job_is_remote_error():
     _seed_dispatch(db, "job-lost", status="running")
     srv = stubs.StubServer({"default": (404, {"error": "gone"})})
     try:
-        proc = h.run(["status", "job-lost", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
+        proc = h.run(["status", "job-lost", "--json"], env=h.base_env(db=db, agent_gateway=srv.base))
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -758,17 +758,17 @@ def test_status_non_terminal_record_with_pruned_job_is_remote_error():
 def test_implement_dispatch_submits_directly_with_no_approval_or_slack():
     h = Harness()
     db = h.new_db()
-    sideclaw_srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-impl", "status": "running"}})})
+    agent_gateway_srv = stubs.StubServer({("POST", "/api/jobs"): (200, {"job": {"id": "job-impl", "status": "running"}})})
     slack_srv = stubs.StubServer({("POST", "/chat.postMessage"): (200, {"ok": True})})
     try:
-        env = h.base_env(db=db, sideclaw=sideclaw_srv.base, slack=slack_srv.base)
+        env = h.base_env(db=db, agent_gateway=agent_gateway_srv.base, slack=slack_srv.base)
         proc = h.run(["dispatch", "gamma", "--tier", "implement", "--json"], env=env, stdin=VALID_BRIEF)
         out = _json_or_fail(proc)
         assert proc.returncode == 0 and out["jobId"] == "job-impl" and "dryRun" not in out, out
-        assert sideclaw_srv.requests[0]["body"]["params"]["brief"] == VALID_BRIEF
+        assert agent_gateway_srv.requests[0]["body"]["params"]["brief"] == VALID_BRIEF
         assert slack_srv.requests == [], slack_srv.requests
     finally:
-        sideclaw_srv.stop()
+        agent_gateway_srv.stop()
         slack_srv.stop()
 
     conn, _ = _connect(db)
@@ -799,7 +799,7 @@ def test_auto_from_item_happy_path_opens_directly_no_plan():
     try:
         proc = h.run(
             ["dispatch", "gamma", "--tier", "implement", "--auto-from-item", "1", "--why", "w", "--json"],
-            env=h.base_env(db=db, sideclaw=srv.base), stdin=VALID_BRIEF,
+            env=h.base_env(db=db, agent_gateway=srv.base), stdin=VALID_BRIEF,
         )
     finally:
         srv.stop()
@@ -976,7 +976,7 @@ def test_abort_cancels_running_episode_and_closes_the_item():
     _seed_item(db, 5, state="working", repo="gamma", implement_job="job-abort")
     srv = stubs.StubServer({("POST", "/api/jobs/job-abort/cancel"): (200, {"job": {"id": "job-abort", "status": "cancelled"}})})
     try:
-        proc = h.run(["abort", "5", "--why", "stuck", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
+        proc = h.run(["abort", "5", "--why", "stuck", "--json"], env=h.base_env(db=db, agent_gateway=srv.base))
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -998,7 +998,7 @@ def test_abort_of_a_merging_item_cancels_its_running_update_pr():
     srv = stubs.StubServer({("POST", "/api/jobs/job-update/cancel"): (200, {"job": {"id": "job-update",
                                                                                    "status": "cancelled"}})})
     try:
-        proc = h.run(["abort", "8", "--why", "stuck", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
+        proc = h.run(["abort", "8", "--why", "stuck", "--json"], env=h.base_env(db=db, agent_gateway=srv.base))
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -1035,7 +1035,7 @@ def test_abort_discharges_every_member_of_the_cluster_sharing_the_job():
     srv = stubs.StubServer({("POST", "/api/jobs/job-cluster/cancel"): (200, {"job": {"id": "job-cluster", "status": "cancelled"}})})
     try:
         proc = h.run(["abort", "21", "--why", "one batch, one cause", "--json"],
-                     env=h.base_env(db=db, sideclaw=srv.base))
+                     env=h.base_env(db=db, agent_gateway=srv.base))
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -1050,7 +1050,7 @@ def test_abort_discharges_every_member_of_the_cluster_sharing_the_job():
 
 
 def test_abort_tolerates_an_already_terminal_job_and_still_discharges_the_cluster():
-    """The sibling's abort is the second one against this job, so sideclaw
+    """The sibling's abort is the second one against this job, so agent-gateway
     answers 409 'job already cancelled'. The abort's own intent — no episode
     running — already holds, so it must proceed to the transition instead of
     refusing and abandoning every member of the cluster."""
@@ -1062,7 +1062,7 @@ def test_abort_tolerates_an_already_terminal_job_and_still_discharges_the_cluste
     srv = stubs.StubServer({("POST", "/api/jobs/job-dead/cancel"): (409, {"error": "job already cancelled"})})
     try:
         proc = h.run(["abort", "31", "--why", "already cancelled by the sibling", "--json"],
-                     env=h.base_env(db=db, sideclaw=srv.base))
+                     env=h.base_env(db=db, agent_gateway=srv.base))
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -1084,7 +1084,7 @@ def test_abort_leaves_a_cluster_sibling_that_already_opened_a_pr_alone():
     _seed_item(db, 42, state="working", repo="gamma", dispatch_job="job-pr", implement_job="job-pr-impl")
     srv = stubs.StubServer({("POST", "/api/jobs/job-pr/cancel"): (200, {"job": {"id": "job-pr", "status": "cancelled"}})})
     try:
-        proc = h.run(["abort", "41", "--why", "duplicate", "--json"], env=h.base_env(db=db, sideclaw=srv.base))
+        proc = h.run(["abort", "41", "--why", "duplicate", "--json"], env=h.base_env(db=db, agent_gateway=srv.base))
     finally:
         srv.stop()
     out = _json_or_fail(proc)
@@ -1170,7 +1170,7 @@ def test_revert_wrong_state_is_policy_error():
 
 
 def _fail(db: Path, event_id: int, *, failure_class: str = "infra", recipe: str | None = None, redrives: int = 3,
-          note: str = "sideclaw 503") -> None:
+          note: str = "agent-gateway 503") -> None:
     conn, _ = _connect(db)
     conn.execute(
         "UPDATE triage_items SET failure_class=?, redrive_json=?, redrives=?, note=?, strikes=3, "

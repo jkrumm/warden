@@ -54,7 +54,7 @@ if str(REPO_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(REPO_SCRIPTS))
 
 import ledger  # noqa: E402
-from clients import github, sideclaw  # noqa: E402
+from clients import github, agent_gateway  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError, WardenError  # noqa: E402
 from lifecycle import dispatch, items, merge, operations, policy  # noqa: E402
 # The `run` verb opens its triage_items row through the loop's own functions, not a copy.
@@ -378,7 +378,7 @@ def _result_payload(
 
 
 def _require_known_tier(tier: str) -> None:
-    """The flag's vocabulary only — which repo may run which tier is sideclaw's
+    """The flag's vocabulary only — which repo may run which tier is agent-gateway's
     call, answered as a 4xx."""
     if tier not in policy.VALID_TIERS:
         raise UsageError(f"unknown tier: {tier} (must be one of: {', '.join(policy.VALID_TIERS)})")
@@ -432,7 +432,7 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> di
     state.target = f"{name}:{tier}:{opened.job_id}"
 
     if flags.wait:
-        job = sideclaw.wait(opened.job_id, timeout_s=WAIT_TIMEOUT, interval_s=WAIT_INTERVAL)
+        job = agent_gateway.wait(opened.job_id, timeout_s=WAIT_TIMEOUT, interval_s=WAIT_INTERVAL)
         if job is None:
             out: dict[str, Any] = {
                 "verb": "dispatch", "ok": True, "jobId": opened.job_id, "repo": name, "tier": tier,
@@ -537,7 +537,7 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
     }
 
     if flags.wait and job_id:
-        job = sideclaw.wait(job_id, timeout_s=WAIT_TIMEOUT, interval_s=WAIT_INTERVAL)
+        job = agent_gateway.wait(job_id, timeout_s=WAIT_TIMEOUT, interval_s=WAIT_INTERVAL)
         out["waited"] = True
         if job is None:
             out["waitedSeconds"] = WAIT_TIMEOUT
@@ -588,25 +588,25 @@ def cmd_status(conn, flags: Flags, positional: list[str], state: _State) -> dict
     if not positional:
         raise UsageError("usage: warden status <job-id> [--json]")
     job_id = positional[0]
-    if not sideclaw.valid_job_id(job_id):
+    if not agent_gateway.valid_job_id(job_id):
         raise UsageError(f"not a valid job id: {job_id}")
     state.target = job_id
 
-    job = sideclaw.get(job_id)
+    job = agent_gateway.get(job_id)
     from_record = False
     if job is None:
         row = conn.execute("SELECT * FROM dispatches WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             raise UsageError(f"no such job: {job_id}")
-        if row["status"] not in sideclaw.TERMINAL:
+        if row["status"] not in agent_gateway.TERMINAL:
             raise RemoteError(
-                f"sideclaw no longer has job {job_id} and the dispatch record never saw it finish — "
+                f"agent-gateway no longer has job {job_id} and the dispatch record never saw it finish — "
                 "the verdict is lost"
             )
         result = json.loads(row["verdict_json"]) if row["verdict_json"] else None
         job = {"id": job_id, "status": row["status"], "result": result, "finishedAt": row["finished_at"]}
         from_record = True
-    elif job.get("status") in sideclaw.TERMINAL:
+    elif job.get("status") in agent_gateway.TERMINAL:
         dispatch.sync_record(conn, job, reported=False)
 
     return _result_payload(conn, job_id=job_id, name="-", tier=None, job=job, waited=False, from_record=from_record)
@@ -628,7 +628,7 @@ def cmd_merge(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 
     require_backend()
 
-    if not sideclaw.valid_job_id(job_id):
+    if not agent_gateway.valid_job_id(job_id):
         raise UsageError(f"not a valid job id: {job_id}")
     state.target = job_id
 
@@ -662,7 +662,7 @@ def cmd_merge(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 
 
 def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
-    # No require_backend(): abort only ever reaches sideclaw's cancel
+    # No require_backend(): abort only ever reaches agent-gateway's cancel
     # endpoint, never GitHub — no token to resolve.
     if not positional:
         raise UsageError('usage: warden abort <event-id> --why "<reason>" [--json]')
@@ -709,13 +709,13 @@ def cmd_abort(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     cancelled = False
     if job_id:
         try:
-            sideclaw.cancel(job_id)
+            agent_gateway.cancel(job_id)
             cancelled = True
         except RemoteError as exc:
             if "no job" not in str(exc).lower():
                 raise
         except PolicyError:
-            # sideclaw's 409 — the job is already terminal (a sibling's abort,
+            # agent-gateway's 409 — the job is already terminal (a sibling's abort,
             # an idle-watchdog kill, a run that finished between our read and
             # this call). The abort's own intent, "no episode is running
             # against this cluster", already holds, so this is not a failure to
@@ -829,7 +829,7 @@ def cmd_retry(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     (`redrives` back to 0): the owner's "try again". The same re-entry as the loop's automatic
     re-drive (core.redrive()), so the stored recipe decides the state and the columns. An item with
     no stage to re-enter (a revert recorded by hand, a failure that came from nowhere) is refused.
-    Local ledger only, like `close`: no GitHub or sideclaw call."""
+    Local ledger only, like `close`: no GitHub or agent-gateway call."""
     if not positional:
         raise UsageError('usage: warden retry <event-id> [--why "<reason>"] [--json]')
     event_id = _parse_int(positional[0], "event-id")
@@ -870,7 +870,7 @@ def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) 
     CLI counterpart to Argo's reinvestigate action, through the same shared core.reinvestigate().
     Accepts the states owner actions act on (needs_decision/failed/quiet). Writes the local ledger;
     the pull request on record is closed as a best-effort GitHub call (core.close_pr_best_effort()),
-    and sideclaw is never reached."""
+    and agent-gateway is never reached."""
     # No require_backend(): the transition is local and the PR close is best-effort — a token that
     # cannot be resolved is logged by close_pr_best_effort(), and must not block the owner's command.
     if not positional:
@@ -948,7 +948,7 @@ def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     every other CLI-only transition uses, so the state change and its
     `item_transitions` row are the loop's own shape, not a hand-rolled UPDATE."""
     # No require_backend(): close only ever writes triage_items/item_transitions
-    # in the local ledger — no GitHub or sideclaw call to authenticate for.
+    # in the local ledger — no GitHub or agent-gateway call to authenticate for.
     if not positional:
         raise UsageError('usage: warden close <event-id> --why "<reason>" [--reason resolved|ignored] [--json]')
     event_id = _parse_int(positional[0], "event-id")

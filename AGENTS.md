@@ -1,14 +1,14 @@
 # warden — Developer Notes
 
 warden is the autonomous loop of the agent platform: it owns one SQLite ledger and
-drives every unattended item from a signal to `fixed`, through sideclaw jobs.
+drives every unattended item from a signal to `fixed`, through agent-gateway jobs.
 **Read `STATE.md` first** (where the implementation is, what is next), then
 `DESIGN.md` (what exists, and § *What must not be lost* — check it before every
 merge). The spec is `~/SourceRoot/dotfiles/docs/agent-platform.md`; it wins over
 anything here. `docs/history/` is the archive: the append-only build log
 (`state-log.md`, §1 onward), old flows, design reviews.
 
-**Code owns every state transition.** The only LLM inputs are sideclaw's episode
+**Code owns every state transition.** The only LLM inputs are agent-gateway's episode
 verdicts and triage answers, and each is validated against the ledger before an
 item moves.
 
@@ -19,7 +19,7 @@ item moves.
 | `scripts/triage.py` | the loop's entry point: `run()` (one pass), CLI flags, heartbeat |
 | `scripts/loop/` | the loop by stage: `core` (paths, states, `set_state`, strikes, policy), `intake`, `triaging`, `work`, `train`, `verify`, `notify` |
 | `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate (check runs, falling back to Actions workflow runs when the token cannot read checks), rollout (`make deploy`/`verify`), dispatch, operations |
-| `scripts/clients/` | the only HTTP/CLI boundaries: sideclaw, GitHub, Argo, Slack, secrets |
+| `scripts/clients/` | the only HTTP/CLI boundaries: agent-gateway, GitHub, Argo, Slack, secrets |
 | `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`, `reinvestigate`) |
 | `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents |
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
@@ -43,7 +43,7 @@ argument-free `test_*` functions and exits non-zero on failure. `make test` fail
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
 **512/512** — any other number is a finding to report, not a count to edit.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
-and every client boundary, so nothing reaches Slack, sideclaw, GitHub or Argo.
+and every client boundary, so nothing reaches Slack, agent-gateway, GitHub or Argo.
 Patch a name on the module that defines it (`loop.core.DB_PATH`, `loop.core.post_line`) —
 cross-module references are attribute lookups, so that is the one place it takes
 effect. **Never delete, skip or weaken a test to make it pass**; if it cannot pass
@@ -100,7 +100,7 @@ tool even though launchd hands the loop a minimal PATH.
   fast-forwards only a clean default-branch checkout that ends at origin, else it
   strikes (third → `failed`). That includes this one.
 - **`scripts/triage.py` has no `--help`**: any flag it does not know runs a full live
-  pass against the real ledger. Run the loop by hand only with `--dry-run` and `env -u CLAUDECODE …` (sideclaw's
+  pass against the real ledger. Run the loop by hand only with `--dry-run` and `env -u CLAUDECODE …` (agent-gateway's
   recursion guard refuses dispatches from inside a Claude session).
 - **Cross-repo:** `hermes-ops.sh`, `agents-overview.py` and the dispatch shim (which
   `exec`s `scripts/warden`) live in `hermes-agent`; `~/.hermes/{scripts,config}` are

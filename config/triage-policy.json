@@ -4,7 +4,7 @@
     "an issue or a `warden run` goes is decided in this order: (1) `ignore` and the prose pre-filter close it",
     "`ignored` with no model call; (2) the signal's LABEL picks the candidate repos: a native label (a Kuma tag,",
     "a container name equal to a repo, an OTel `service.name`, the GitHub repo) first, then a `rules` match, which",
-    "is exactly a label route; (3) one sideclaw `triage` job runs for every item that gets that far and answers",
+    "is exactly a label route; (3) one agent-gateway `triage` job runs for every item that gets that far and answers",
     "attach | new(repo, title) | fixed_by | ignore, choosing among the label's repo or, with no label, among every",
     "checkout with an AGENTS.md (it reads their `## Verify & Monitor` sections). `rules` is the tier a later wave",
     "deletes once those sections cover the fleet; nothing else depends on it.",

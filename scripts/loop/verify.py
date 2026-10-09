@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from clients import github as _github, sideclaw as _sideclaw
+from clients import github as _github, agent_gateway as _agent_gateway
 from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError, WardenError
 from lifecycle import dispatch as _dispatch, intake as _intake, policy as _policy, rollout as _rollout
 from loop import core, triaging, work
@@ -252,7 +252,7 @@ def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datet
 # A merged fix may also fix other items waiting in its repo. When a fix's merge lands (a revert's
 # never does: is_revert()) merged_entry() queues the sweep on the merged item (`sweep_pr`), and
 # advance_fixed_by_sweeps(), in the implement chain so both crons run it, turns that into one
-# sideclaw `triage` job: the merged PR's title, body and diff against the repo's `triaged` items
+# agent-gateway `triage` job: the merged PR's title, body and diff against the repo's `triaged` items
 # and its `working` items with no episode in flight, answering `{matches: [{item, reason}]}`. It
 # follows the intake triage pattern: a claim sentinel, then the job id, then a compare-and-set
 # fold. A match is validated against the ledger (an id the prompt showed, still in the state it was
@@ -361,7 +361,7 @@ def _submit_sweep(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) 
     prompt = _intake.build_sweep_prompt(repo=row["repo"], pr_title=str(pr.get("title") or ""),
                                         pr_body=str(pr.get("body") or ""), diff=diff, candidates=candidates)
     try:
-        job = _sideclaw.submit_triage(prompt=prompt, schema=_intake.SWEEP_SCHEMA)
+        job = _agent_gateway.submit_triage(prompt=prompt, schema=_intake.SWEEP_SCHEMA)
     except WardenError as e:
         _sweep_failed(conn, row, claim, f"submit failed: {e}")
         return None
@@ -477,7 +477,7 @@ def advance_fixed_by_sweeps(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
             continue
         if job_id is None:
             job = _submit_sweep(conn, row, now)
-            if job is not None and job.get("status") in _sideclaw.TERMINAL:
+            if job is not None and job.get("status") in _agent_gateway.TERMINAL:
                 _fold_sweep_job(conn, row["event_id"], job["id"], job, now)
             continue
         if triaging.is_triage_claim(job_id):
@@ -486,21 +486,21 @@ def advance_fixed_by_sweeps(conn: sqlite3.Connection, now: dt.datetime, *, dry_r
                 _sweep_failed(conn, row, job_id, "a stale claim (the submitter died)")
             continue
         try:
-            job = _sideclaw.get(job_id)
+            job = _agent_gateway.get(job_id)
         except RemoteError as e:
             print(f"triage: could not poll fixed-by sweep job {job_id}: {e}", file=sys.stderr)
             continue
         if job is None:
-            _sweep_failed(conn, row, job_id, f"sideclaw has no record of job {job_id}")
+            _sweep_failed(conn, row, job_id, f"agent-gateway has no record of job {job_id}")
             continue
-        if job.get("status") in _sideclaw.TERMINAL:
+        if job.get("status") in _agent_gateway.TERMINAL:
             _fold_sweep_job(conn, row["event_id"], job_id, job, now)
             continue
         submitted_at = core.parse_ts(row["sweep_job_at"])
         if submitted_at is None or now - submitted_at < dt.timedelta(minutes=triaging.TRIAGE_JOB_STALE_MINUTES):
             continue
         try:
-            _sideclaw.cancel(job_id)
+            _agent_gateway.cancel(job_id)
         except WardenError as e:
             print(f"triage: could not cancel stuck fixed-by sweep job {job_id}: {e}", file=sys.stderr)
         _sweep_failed(conn, row, job_id, f"job {job_id} still {job.get('status')} after "

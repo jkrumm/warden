@@ -1,10 +1,10 @@
 """stubs — the in-process `ThreadingHTTPServer` stub shared by every test
-suite that needs to stand in for sideclaw, GitHub, or Slack's HTTP APIs
+suite that needs to stand in for agent-gateway, GitHub, or Slack's HTTP APIs
 without a real network call.
 
 Extracted from tests/test_clients.py (Wave 5.1) so tests/test_warden_cli.py
 can drive the same recording, per-test route table against a single stub
-server for sideclaw submit/get/cancel, GitHub, and Slack — rather than
+server for agent-gateway submit/get/cancel, GitHub, and Slack — rather than
 reimplementing it a second time.
 
 Usage: `StubServer({("POST", "/api/jobs"): (200, {...}), "default": (404, {...})})`.

@@ -10,7 +10,7 @@ Produces three artifacts, implements nothing: a dated `§` appended to
 ## Before you start
 
 - `make status` — expect the agents block all `✓`, `api (/health)` reachable
-  and `ok`, `policy` agreeing, `sideclaw schemas` matching. A green baseline
+  and `ok`, `policy` agreeing, `agent-gateway schemas` matching. A green baseline
   from a live run:
 
   ```
@@ -24,7 +24,7 @@ Produces three artifacts, implements nothing: a dated `§` appended to
       ✗ com.jkrumm.warden-api  [pid 52538, LAST EXIT -15] — read .../warden-api.err
     api (/health)            ✓ reachable, ok
     policy                   ✓ both copies agree on all N repos
-    sideclaw schemas         ✓ dispatch=2 review=1
+    agent-gateway schemas         ✓ dispatch=2 review=1
     ledger                   <size> <date>
   ```
 
@@ -43,7 +43,7 @@ Produces three artifacts, implements nothing: a dated `§` appended to
   value, updated_at FROM cursors WHERE key='triage_last_run';"` — `value` is
   the last pass's state histogram, `updated_at` its timestamp. Compare against
   `600s` (the LaunchAgent interval) and `/health`'s own `poller_ages.loop`.
-- `git status` clean in `warden`, `sideclaw`, `hermes-agent`, `argo`.
+- `git status` clean in `warden`, `agent-gateway`, `hermes-agent`, `argo`.
 - **Did argo PR #19 land?** If not, every tick has logged `triage: argo push —
   http-error:404 (… items)` in `warden-loop.err` and the Argo `/warden` board
   has never received a snapshot — it will show its empty state, not stale
@@ -148,8 +148,8 @@ should have expired to `needs_human`, not sat deferred forever).
 
 Honestly: there is no join today. Two sides exist, unwired: **ledger side** —
 `dispatches.job_id`/`tier`/`repo`/`status`/`created_at`/`finished_at`;
-**usage side** — sideclaw's usage-tracker records lanes `sideclaw:dispatch`
-and `sideclaw:review` (`AGENTS.md` § Talking to sideclaw, `docs/history/state-log.md` §56's
+**usage side** — agent-gateway's usage-tracker records lanes `agent-gateway:dispatch`
+and `agent-gateway:review` (`AGENTS.md` § Talking to agent-gateway, `docs/history/state-log.md` §56's
 "Warden requests no model" note) but has no column keyed on `job_id`. Wave 9
 decides whether building that join (usage row → job id → `dispatches` →
 `triage_items`) is worth it before answering "what did this fix cost."
@@ -183,7 +183,7 @@ code fix)?
   by state (`deferred (budget)` and `unknown` are first-class), per-item
   timeline, banner "Recorded intents — not approvals." Could you answer "what
   happened to item X" from the board alone, without the ledger?
-- dotfiles' `make agent-overview` herdr pane, or sideclaw's `GET /api/overview.txt` behind it
+- dotfiles' `make agent-overview` herdr pane, or agent-gateway's `GET /api/overview.txt` behind it
   — the `warden` block (`warden · N open · needs_human … · merge_blocked … ·
   in flight …` plus prioritised item lines), the herdr-facing surface.
 - `scripts/warden list` (`open`/`today`/`all`) and `scripts/warden status
@@ -219,9 +219,9 @@ Each as a question, the evidence, and where the knob lives:
 |-|-|-|
 | Widen `autoMergePaths` beyond the current canary scope? | (b),(d),(g), FLOWS.md flow 1/2 friction | `config/triage-policy.json` per-repo `autoMergePaths`, enforced by `scripts/lifecycle/merge.py`'s `merge_gate_check()` |
 | Promote or demote a tier ceiling per origin? | (g), FLOWS.md's third-party-issues rule | `config/dispatch-repos.json` per-repo `maxTier`/`defaultTier`, `triage_items.max_tier` |
-| Retire a surface (Slack cards, overview block, Argo board)? | "Where was the friction" above — the digest was already retired this way in Wave 7 (`docs/history/state-log.md` §56), it read sideclaw, never the ledger | the surface's own LaunchAgent/cron entry |
+| Retire a surface (Slack cards, overview block, Argo board)? | "Where was the friction" above — the digest was already retired this way in Wave 7 (`docs/history/state-log.md` §56), it read agent-gateway, never the ledger | the surface's own LaunchAgent/cron entry |
 | Change `quietResolveHours` or a state deadline? | (b),(c),(d) | `config/triage-policy.json`'s `quietResolveHours`, or `scripts/triage.py`'s `STATE_DEADLINES` |
-| Keep validation as a sideclaw `review` job? | false-`fixed`/reopen counts (c)/(d), `/board`'s `merge_blocked` rate | `scripts/lifecycle/dispatch.py`'s `open_review()` |
+| Keep validation as a agent-gateway `review` job? | false-`fixed`/reopen counts (c)/(d), `/board`'s `merge_blocked` rate | `scripts/lifecycle/dispatch.py`'s `open_review()` |
 | Build the cost join? | (f) | none yet — this is the decision to build one |
 
 Carried owner items, check each against `git log`/`gh`: argo PR #19

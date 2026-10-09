@@ -87,7 +87,7 @@ GROUPED_TRIAGE_SOURCES = ("slack_alert", "hermes_log")
 # `verifying` merged; `make deploy` runs, then `make verify` and the item's own signal stay quiet
 #            for the window (maybe_verify()). Nothing to verify -> `fixed` at once.
 # `needs_decision` a verdict carried a question only the owner can answer.
-# `failed`   three infrastructure strikes, a sideclaw refusal, a merge refusal that will not
+# `failed`   three infrastructure strikes, a agent-gateway refusal, a merge refusal that will not
 #            clear, or revisions exhausted. Never expires, never silence-resolved. Always carries a
 #            failure_class: `infra` and `policy` are re-driven automatically (redrive_failed()),
 #            `work` waits for the owner (`warden retry`).
@@ -116,8 +116,8 @@ CLOSE_RESOLVED = "resolved"
 CLOSE_REASONS = (CLOSE_DUPLICATE, CLOSE_FIXED_BY, CLOSE_IGNORED, CLOSE_RESOLVED)
 
 # `failed` always carries one of these in triage_items.failure_class (scripts/ledger.py mirrors it):
-#   infra   sideclaw 5xx / timeout / unreachable / auth, a synthesis or serialization failure
-#   policy  sideclaw refused the submit (4xx), or its permissions could not be read
+#   infra   agent-gateway 5xx / timeout / unreachable / auth, a synthesis or serialization failure
+#   policy  agent-gateway refused the submit (4xx), or its permissions could not be read
 #   work    anything a human must judge: checks failed, review blocked after the last attempt, a
 #           conflict loop, a revert that cannot be done mechanically
 FAILURE_INFRA = "infra"
@@ -127,7 +127,7 @@ FAILURE_CLASSES = (FAILURE_INFRA, FAILURE_POLICY, FAILURE_WORK)
 
 # Automatic re-drives of a `failed` item (redrive_failed()): an `infra` failure waits
 # REDRIVE_BACKOFF_MINUTES[redrives] before its next re-drive, REDRIVE_LIMIT times (`redrives` counts
-# infra re-drives only); a `policy` failure is re-driven once per change of sideclaw's dispatch policy
+# infra re-drives only); a `policy` failure is re-driven once per change of agent-gateway's dispatch policy
 # and is not bound by the limit; `work` is never re-driven.
 REDRIVE_LIMIT = 3
 REDRIVE_BACKOFF_MINUTES = (60, 180, 480)   # indexed by `redrives`, so one wait per allowed re-drive
@@ -142,7 +142,7 @@ _END_STATES = (STATE_NEEDS_DECISION, STATE_FAILED, *TERMINAL_STATES)
 # An item in one of these is no longer open: not a target to attach or merge another into.
 NOT_OPEN_STATES = (*TERMINAL_STATES, STATE_FAILED)
 
-# The one retry rule. An INFRASTRUCTURE failure (sideclaw 5xx or unreachable, a terminal episode
+# The one retry rule. An INFRASTRUCTURE failure (agent-gateway 5xx or unreachable, a terminal episode
 # with no verdict, a review that produced no verdict, an implement episode that ended without a
 # pull request, a lost in-flight operation) is retried with backoff; the third strike lands
 # `failed` carrying the reason. Never a clock on a RUNNING episode: a strike is only recorded once
@@ -150,7 +150,7 @@ NOT_OPEN_STATES = (*TERMINAL_STATES, STATE_FAILED)
 STRIKE_LIMIT = 3
 STRIKE_BACKOFF_MINUTES = (10, 30)   # after strike 1, after strike 2
 
-# implement_job values that mean "claimed, not yet (or no longer) a sideclaw job".
+# implement_job values that mean "claimed, not yet (or no longer) a agent-gateway job".
 # The claim is a compare-and-set on `implement_job IS NULL`, written BEFORE the
 # external call, so two processes (the loop and the sweep) never submit twice.
 IMPLEMENT_CLAIM = "claiming"
@@ -218,11 +218,11 @@ DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 # never a turn or time limit on the episode itself.
 MAX_IMPLEMENT_ATTEMPTS = 4
 
-# Attempt N >= this one runs on sideclaw's escalation implement model (GET /api/routing), when
+# Attempt N >= this one runs on agent-gateway's escalation implement model (GET /api/routing), when
 # it has one; see implement_model().
 ESCALATION_ATTEMPT = 3
 
-# How long an item waits after sideclaw's per-repo implement lease refused its episode (another
+# How long an item waits after agent-gateway's per-repo implement lease refused its episode (another
 # implement episode holds the repo) before the attempt is submitted again. Not a strike.
 LEASE_RETRY_MINUTES = 10
 
@@ -243,9 +243,9 @@ DEFAULT_HOST_VERB_MIN_CONFIDENCE = "medium"
 
 # Concurrency ceiling: simultaneously-open CLUSTERS (distinct dispatch_job values of a `working`
 # investigation) this loop may have outstanding. It bounds how many run AT THE SAME TIME, which
-# matters because sideclaw's own concurrency limits are shared with every other dispatch source.
+# matters because agent-gateway's own concurrency limits are shared with every other dispatch source.
 MAX_OPEN_INVESTIGATIONS = int(os.environ.get("TRIAGE_MAX_OPEN_INVESTIGATIONS", "3"))
-# A bare GET/POST against sideclaw or Slack must never hang a 10-minute cron indefinitely.
+# A bare GET/POST against agent-gateway or Slack must never hang a 10-minute cron indefinitely.
 SUBPROCESS_TIMEOUT = int(os.environ.get("TRIAGE_SUBPROCESS_TIMEOUT", "60"))
 # How many signatures ride in one cluster's brief. The rest stay in `new` and wait for a later
 # run: never dropped, never silently merged in anyway.
@@ -304,10 +304,10 @@ ALERTS_CHANNEL = "C0AS1LAUQ3C"  # #alerts — same channel watchdog-poll.py's sl
 # The own-monitor probe is bounded by a hard wall-clock timeout: a hung hermes-ops call must never stall a 10-minute cron.
 EVIDENCE_TIMEOUT = int(os.environ.get("TRIAGE_EVIDENCE_TIMEOUT", "20"))
 
-# Step 7 is a genuinely SEPARATE read of the implement episode's diff: sideclaw's `review` job,
+# Step 7 is a genuinely SEPARATE read of the implement episode's diff: agent-gateway's `review` job,
 # which returns a TYPED verdict (`outcome`/`blocking`/...), so the step is machine-readable without
 # a substring match on prose. See open_validation_dispatch(), advance_merge_trains() and
-# clients/sideclaw.py's REVIEW_SCHEMA_VERSION/assert_result_schema().
+# clients/agent_gateway.py's REVIEW_SCHEMA_VERSION/assert_result_schema().
 #
 # Matches a GitHub pull-request URL's trailing `/pull/<n>`, deliberately strict (anchored at the
 # end, digits only) so an unexpected URL fails loudly rather than reviewing the wrong number.
@@ -869,7 +869,7 @@ def redrive_spec(state: str | None, columns: dict[str, Any] | None = None, *,
                  policy_hash: str | None = None) -> str | None:
     """The `redrive_json` of a `failed` item: the state to re-enter, the columns to apply on the way
     in (the failed step's handle cleared, so its poller starts a fresh attempt) and, for a `policy`
-    failure, the hash of sideclaw's dispatch policy it was refused under. NULL when there is no
+    failure, the hash of agent-gateway's dispatch policy it was refused under. NULL when there is no
     stage to re-enter. A `Coalesce` is stored as its value."""
     if state not in _REDRIVE_STAGES:
         return None
@@ -989,7 +989,7 @@ def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: st
     item landed in, or, when `expect_state`/`expect_eq` no longer matched (another pass moved it
     first) and nothing was written, the state it is actually in, logged to stderr.
 
-    A SUBMIT REFUSED by sideclaw (4xx) is not an infrastructure failure and never comes through
+    A SUBMIT REFUSED by agent-gateway (4xx) is not an infrastructure failure and never comes through
     here; see end_on_refusal()."""
     row = get_item(conn, event_id)
     if row is None:

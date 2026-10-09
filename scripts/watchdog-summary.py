@@ -44,7 +44,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from clients import sideclaw as _sideclaw  # noqa: E402
+from clients import agent_gateway as _agent_gateway  # noqa: E402
 
 # "Overnight" for the morning briefing: a dispatch that finished within this
 # many hours of the poll is still worth mentioning; older ones have already
@@ -64,9 +64,9 @@ def fmt_age(now: dt.datetime, iso: str) -> str:
 
 
 def _dispatch_outcome_note(status: str, verdict_json: str | None) -> str:
-    """Renders clients/sideclaw.py's classify_dispatch_outcome() into the
+    """Renders clients/agent_gateway.py's classify_dispatch_outcome() into the
     briefing's own wording."""
-    kind, detail = _sideclaw.classify_dispatch_outcome(status, verdict_json)
+    kind, detail = _agent_gateway.classify_dispatch_outcome(status, verdict_json)
     if kind == "failed":
         return detail or status
     if kind == "no_verdict":

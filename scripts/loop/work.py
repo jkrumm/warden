@@ -15,7 +15,7 @@ import sys
 import traceback
 from typing import Any
 
-from clients import github as _github, sideclaw as _sideclaw
+from clients import github as _github, agent_gateway as _agent_gateway
 from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError, WardenError
 from lifecycle import dispatch as _dispatch, intake as _intake, items as _items, operations as _operations, policy as _policy
 from loop import core, intake, train, verify, notify
@@ -335,7 +335,7 @@ def redrive_failed(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool)
 
       infra   after REDRIVE_BACKOFF_MINUTES[redrives], at most REDRIVE_LIMIT times (a row with no
               `retry_at`, a backfilled one, is due at once)
-      policy  once whenever sideclaw's dispatch policy hash differs from the one the refusal was
+      policy  once whenever agent-gateway's dispatch policy hash differs from the one the refusal was
               stored under (none stored counts as different), however many re-drives it has had; a
               refusal under the new policy stores the new hash and waits for the next change. The
               policy is read once per pass; unreadable, every policy re-drive waits for the next one."""
@@ -377,21 +377,21 @@ def redrive_failed(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool)
 
 
 def current_policy_hash() -> str | None:
-    """The hash of sideclaw's dispatch policy as it answers now, or None when it cannot be read:
+    """The hash of agent-gateway's dispatch policy as it answers now, or None when it cannot be read:
     a policy refusal's re-drive never depends on, and never fails because of, this call."""
     try:
-        return _sideclaw.policy_hash(_sideclaw.dispatch_policy())
+        return _agent_gateway.policy_hash(_agent_gateway.dispatch_policy())
     except WardenError as e:
-        print(f"triage: could not read sideclaw's dispatch policy: {e}", file=sys.stderr)
+        print(f"triage: could not read agent-gateway's dispatch policy: {e}", file=sys.stderr)
         return None
 
 
 def end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: SubmitRefused, *,
                     tier: str, now: dt.datetime, policy: dict[str, Any], **columns: Any) -> None:
-    """sideclaw answered the submit with a 4xx, a refusal (repo outside its allowlist, tier above the
+    """agent-gateway answered the submit with a 4xx, a refusal (repo outside its allowlist, tier above the
     repo's ceiling, bad params). The same submit is refused again, so every item the dispatch was
-    for ends `failed(policy)`, carrying sideclaw's own message. It re-enters the state it came from
-    (with `columns`) once sideclaw's dispatch policy differs from the hash stored here
+    for ends `failed(policy)`, carrying agent-gateway's own message. It re-enters the state it came from
+    (with `columns`) once agent-gateway's dispatch policy differs from the hash stored here
     (redrive_failed()). A 5xx or a connection failure is not this: it is an infrastructure failure
     and strikes (see strike())."""
     note = _cap_brief(f"{tier} episode not started — {exc}")
@@ -404,7 +404,7 @@ def end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: Su
         core.set_state(conn, m["event_id"], core.STATE_FAILED, now, note=note,
                        failure_class=core.FAILURE_POLICY, redrive_json=redrive, **columns)
     conn.commit()
-    print(f"triage: {tier} dispatch refused by sideclaw, ending {[m['signature'] for m in members]}: {exc}",
+    print(f"triage: {tier} dispatch refused by agent-gateway, ending {[m['signature'] for m in members]}: {exc}",
           file=sys.stderr)
 
 
@@ -481,7 +481,7 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
 
 
 def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
-    """Groups every eligible `triaged` alert item BY REPO and opens at most one sideclaw dispatch per
+    """Groups every eligible `triaged` alert item BY REPO and opens at most one agent-gateway dispatch per
     repo per run (a cluster), capped at MAX_CLUSTER_SIGNATURES members per brief. `triaged` is the
     triage step's output (submit_triage_jobs()/_fold_triage_job()), so every candidate already has
     its repo; the checks here are retry_at, is_escalation_eligible() and cooldown_ok().
@@ -945,7 +945,7 @@ def _reroute_repo(conn: sqlite3.Connection, m: sqlite3.Row, result: dict[str, An
 
 
 def _decision_note(result: dict[str, Any]) -> str:
-    """What a `needs_decision` item shows the owner: the verdict's `decisionQuestion` when sideclaw
+    """What a `needs_decision` item shows the owner: the verdict's `decisionQuestion` when agent-gateway
     carried one (an optional field), else the summary, else the recommendation."""
     for key in ("decisionQuestion", "summary", "recommendation"):
         text = str(result.get(key) or "").strip()
@@ -1029,7 +1029,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     A re-fold of a dispatch whose delivery failed (the sweep retries those) must never drag an item
     that has since moved on back to an earlier state; an already-folded member is a same-state no-op.
 
-    The verdict -> state table (sideclaw's `nextAction` enum none|issue|implement|human):
+    The verdict -> state table (agent-gateway's `nextAction` enum none|issue|implement|human):
 
       implement | issue                       -> working (maybe_auto_implement() picks it up)
       human                                   -> needs_decision, note = decisionQuestion,
@@ -1122,7 +1122,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
     for m in members:
         prior_state = m["state"]
         if no_verdict:
-            reason = (d["error"] or "").strip() or "sideclaw recorded no reason"
+            reason = (d["error"] or "").strip() or "agent-gateway recorded no reason"
             reason = _cap_brief(f"{d['tier']} episode {d['status']} with no verdict: {reason}")
             core.strike(conn, m["event_id"], now, reason, retry_state=core.STATE_TRIAGED, expect_state=prior_state,
                          dispatch_job=None)
@@ -1172,7 +1172,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
 # Three mutating kinds get an operation: `implement` (opens a branch + draft PR), `merge`
 # (ready-for-review + PUT /merge + branch delete) and `deploy` (`make deploy` after a merge, run by
 # maybe_verify()). `investigate`/validation episodes are excluded: they run read-only in their own
-# worktree, mutate nothing outside sideclaw, and dispatch-sweep.py's poll_misses path covers a
+# worktree, mutate nothing outside agent-gateway, and dispatch-sweep.py's poll_misses path covers a
 # forgotten job.
 #
 # record_operation()/complete_operation() are thin aliases onto lifecycle/operations.py's
@@ -1208,7 +1208,7 @@ def _run_gh_pr_view(owner: str, repo: str, pr: int) -> dict[str, Any] | None:
     by reconcile_operations() to ask GitHub whether a `merge` operation whose outcome was never
     recorded actually landed. `gh` holds its own credential; this file never reads a GitHub token,
     the same discipline as clients/github.py's `token()`. Same single-bounded-poll, never-raises
-    shape as `_sideclaw.get()`: None on anything that could not even be read.
+    shape as `_agent_gateway.get()`: None on anything that could not even be read.
 
     `mergeCommit` in `gh`'s JSON is a nested `{"oid": "<sha>"}` object, not a plain string; the
     caller unwraps it, this function returns the raw object verbatim."""
@@ -1230,7 +1230,7 @@ def _run_gh_pr_view(owner: str, repo: str, pr: int) -> dict[str, Any] | None:
         return None
 
 
-# An implement operation with no sideclaw job id (a timed-out submit, or a crash between the
+# An implement operation with no agent-gateway job id (a timed-out submit, or a crash between the
 # operation record and the submit's answer) stays open this long before it resolves `unknown`.
 AMBIGUOUS_SUBMIT_GRACE = dt.timedelta(minutes=30)
 AMBIGUOUS_SUBMIT_NOTE = "ambiguous implement submit — retried after 30 min grace"
@@ -1250,7 +1250,7 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     `unknown` is an infrastructure failure of the step it covered: its item strikes (see strike())
     and the step's poller re-submits it, the third strike landing `failed` with the reason."""
     if dry_run:
-        # Every branch below reaches out (sideclaw, `gh pr view`), and the dry-run contract is "never
+        # Every branch below reaches out (agent-gateway, `gh pr view`), and the dry-run contract is "never
         # shells out"/"never calls a remote service", the same reason poll_implement_jobs()/
         # advance_merge_trains() return outright below.
         return
@@ -1265,29 +1265,29 @@ def reconcile_operations(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             job_id = receipt.get("jobId")
             if not job_id:
                 # No job id was ever recorded: either the submit timed out (open_episode() annotated the row)
-                # or this process crashed between recording the operation and learning sideclaw's answer. sideclaw
+                # or this process crashed between recording the operation and learning agent-gateway's answer. agent-gateway
                 # may be running the episode, and it cannot list jobs by what they were for, so there is no id to
                 # ask about. Give a started episode time to open its PR (the row stays open, no write, no strike,
                 # and it keeps the repo's in-flight lock), then resolve it `unknown` and strike: the duplicate risk
-                # is accepted, bounded by the strike limit and sideclaw's per-repo lease.
+                # is accepted, bounded by the strike limit and agent-gateway's per-repo lease.
                 started = core.parse_ts(row["started_at"])
                 if started is not None and (now - started) < AMBIGUOUS_SUBMIT_GRACE:
                     continue
                 outcome = "unknown"
-                note = "no sideclaw job id was ever recorded for this implement dispatch"
+                note = "no agent-gateway job id was ever recorded for this implement dispatch"
                 strike_reason = AMBIGUOUS_SUBMIT_NOTE
             else:
                 try:
-                    resp = _sideclaw.get(job_id)
+                    resp = _agent_gateway.get(job_id)
                 except RemoteError as e:
                     outcome = "unknown"
-                    note = f"could not read sideclaw status for job {job_id}: {e}"
+                    note = f"could not read agent-gateway status for job {job_id}: {e}"
                 else:
                     if resp is None:
-                        # A pruned job returns 404 (`sideclaw.get()` -> None), byte-identical to a job id that never
+                        # A pruned job returns 404 (`agent-gateway.get()` -> None), byte-identical to a job id that never
                         # existed: absence proves nothing, so this is unknown, never failed.
                         outcome = "unknown"
-                        note = f"sideclaw has no record of job {job_id} (pruned, unreachable, or never accepted)"
+                        note = f"agent-gateway has no record of job {job_id} (pruned, unreachable, or never accepted)"
                     else:
                         status = resp.get("status")
                         if status == "done":
@@ -1615,13 +1615,13 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
 
 def hold_ambiguous_submit(item: sqlite3.Row, exc: RemoteError) -> None:
-    """An implement submit that MAY have reached sideclaw (a timeout): the item keeps its claim and
+    """An implement submit that MAY have reached agent-gateway (a timeout): the item keeps its claim and
     its implement operation stays open. Clearing either would let the next tick submit the same work
-    again while the first episode runs. reconcile_operations() resolves it: sideclaw handed back no
+    again while the first episode runs. reconcile_operations() resolves it: agent-gateway handed back no
     job id, so there is nothing to poll; after a grace window the operation resolves `unknown` and
     the item strikes back to `working` (see its `implement` branch)."""
     print(f"triage: implement submit for {item['signature']} (event {item['event_id']}) may have reached "
-          f"sideclaw ({exc}) — claim and operation left open for reconcile_operations()", file=sys.stderr)
+          f"agent-gateway ({exc}) — claim and operation left open for reconcile_operations()", file=sys.stderr)
 
 
 def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
@@ -1644,10 +1644,10 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     prefixed `deferred: ` (DESIGN.md § What must not be lost), and the card is synced immediately. A
     deferral is not a strike: nothing failed.
 
-    A submit that fails definitively (5xx, connection refused) strikes (see strike()); a sideclaw
+    A submit that fails definitively (5xx, connection refused) strikes (see strike()); a agent-gateway
     4xx ends the item `failed` and is never retried (an attempt that carried an escalation model is
     first resubmitted once without it, open_implement_episode()). A submit that MAY have reached
-    sideclaw (a timeout) is never retried blind: the claim and the open operation stay put for
+    agent-gateway (a timeout) is never retried blind: the claim and the open operation stay put for
     reconcile_operations() (hold_ambiguous_submit()), which strikes the item back to `working` once
     the grace window has passed."""
     ready_sql, ready_params = core.retry_ready_sql(now)
@@ -1719,7 +1719,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             if exc.maybe_mutated:
                 hold_ambiguous_submit(item, exc)
                 continue
-            # sideclaw 5xx or unreachable-before-send: definitively not sent, an infrastructure failure, so
+            # agent-gateway 5xx or unreachable-before-send: definitively not sent, an infrastructure failure, so
             # the claim is handed back as a strike (open_episode() already completed the operation `failed`).
             core.strike(conn, item["event_id"], now, f"implement dispatch failed: {exc}",
                          retry_state=core.STATE_WORKING, expect_state=core.STATE_WORKING, implement_job=None)
@@ -1821,7 +1821,7 @@ def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
 def open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: int,
                                implement_job: str, pr_url: str,
                                context: str | None = None) -> tuple[str | None, str | None]:
-    """Step 7: sideclaw's own `review` job against the pull request itself, reading its actual diff
+    """Step 7: agent-gateway's own `review` job against the pull request itself, reading its actual diff
     through a multi-angle synthesis and returning a TYPED verdict (`outcome`/`blocking`/...), not a
     second `investigate` episode asked to end its prose with a marker phrase. A genuinely separate
     read matters: an implement episode can assert wrong semantics in its own PR body while the diff
@@ -1833,7 +1833,7 @@ def open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: i
 
     Returns `(job_id, None)` on success, `(None, reason)` otherwise: the PR number could not be
     parsed out of `pr_url`, or the review dispatch raised a WardenError (logged either way). A
-    sideclaw refusal (`SubmitRefused`, a 4xx) is NOT folded into that tuple: it propagates so the
+    agent-gateway refusal (`SubmitRefused`, a 4xx) is NOT folded into that tuple: it propagates so the
     caller ends the item instead of parking it for a retry that is refused the same way."""
     match = core.PR_NUMBER_RE.search(pr_url)
     if not match:
@@ -1888,15 +1888,15 @@ def revisable(item: sqlite3.Row) -> bool:
 
 
 def implement_model(attempt: int) -> str | None:
-    """The `model` an implement attempt is submitted with. Attempts 1 and 2 send none (sideclaw's
-    default); attempt ESCALATION_ATTEMPT and later send the escalation model sideclaw's registry
+    """The `model` an implement attempt is submitted with. Attempts 1 and 2 send none (agent-gateway's
+    default); attempt ESCALATION_ATTEMPT and later send the escalation model agent-gateway's registry
     names, or none when it names no such route. Warden never carries a model id of its own."""
-    return _sideclaw.escalation_model() if attempt >= core.ESCALATION_ATTEMPT else None
+    return _agent_gateway.escalation_model() if attempt >= core.ESCALATION_ATTEMPT else None
 
 
 def open_implement_episode(conn: sqlite3.Connection, *, model: str | None, **kwargs: Any) -> Any:
-    """`open_episode()` for an implement attempt. A refusal (sideclaw 4xx) of an attempt that carried
-    an escalation `model` is retried ONCE without it, on sideclaw's default: a registry that names a
+    """`open_episode()` for an implement attempt. A refusal (agent-gateway 4xx) of an attempt that carried
+    an escalation `model` is retried ONCE without it, on agent-gateway's default: a registry that names a
     model the allowlist then refuses must not fail the item. A refusal with no model to drop is
     final and reaches the caller."""
     try:
@@ -1904,7 +1904,7 @@ def open_implement_episode(conn: sqlite3.Connection, *, model: str | None, **kwa
     except SubmitRefused as exc:
         if model is None:
             raise
-        print(f"triage: sideclaw refused model {model!r} for the implement attempt ({exc}); "
+        print(f"triage: agent-gateway refused model {model!r} for the implement attempt ({exc}); "
               f"resubmitting without a model", file=sys.stderr)
         return _dispatch.open_episode(conn, model=None, **kwargs)
 
@@ -1950,12 +1950,12 @@ def _attempt_rewind_columns(conn: sqlite3.Connection, item: sqlite3.Row, job_id:
 
 def lease_retry(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *, what: str,
                  expect_eq: dict[str, Any], **columns: Any) -> None:
-    """sideclaw's per-repo implement lease refused this item's job (an implement episode, or the
+    """agent-gateway's per-repo implement lease refused this item's job (an implement episode, or the
     merge train's `update_pr`; both take the lease): the work is fine, the slot was taken. The item
     stays where it is with `retry_at` pushed LEASE_RETRY_MINUTES out, no strike, no attempt spent,
     and `columns` hand the refused job back so it is submitted again.
 
-    Unbounded by design: sideclaw's lease is in-memory and released when its holder's job ends, so a
+    Unbounded by design: agent-gateway's lease is in-memory and released when its holder's job ends, so a
     refusal is always transient, and an external holder that never lets go stays visible in the
     item's note.
 
@@ -1963,7 +1963,7 @@ def lease_retry(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, *
     it back."""
     won = core.set_state(
         conn, item["event_id"], item["state"], now, expect_state=item["state"], expect_eq=expect_eq,
-        note=f"sideclaw's implement lease for {item['repo']} is held by another episode — "
+        note=f"agent-gateway's implement lease for {item['repo']} is held by another episode — "
              f"{what} retries after {core.LEASE_RETRY_MINUTES} min",
         retry_at=core.now_iso(now + dt.timedelta(minutes=core.LEASE_RETRY_MINUTES)), **columns)
     conn.commit()
@@ -2015,7 +2015,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                          *, dry_run: bool) -> None:
     """Step 6 -> 7. Polls every `working` item that has an implement episode on record and has not
     been judged yet, routing on the DONE job's own typed `result.outcome`
-    (clients.sideclaw.DISPATCH_OUTCOMES) rather than "read artifactUrl, guess the rest":
+    (clients.agent_gateway.DISPATCH_OUTCOMES) rather than "read artifactUrl, guess the rest":
 
       pr_opened | pr_updated                   -> merging, at the merge train's `update` stage
                                                   (advance_merge_trains()); a newer PR than the
@@ -2024,9 +2024,9 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                                                   are left, else failed; the PR on record is left
                                                   open, its URL in the note
       checks_tool_failed                       -> a strike and a fresh attempt: the check tool
-                                                  itself crashed (sideclaw's infrastructure), so it
+                                                  itself crashed (agent-gateway's infrastructure), so it
                                                   is never a revision and never spends revision_count
-      a failed job refused by sideclaw's
+      a failed job refused by agent-gateway's
         per-repo implement lease               -> retry later (retry_at), no strike, no attempt
       result.nextAction == "human"             -> needs_decision (decisionQuestion, else summary)
       no_changes                               -> a terminal answer, not an infrastructure failure:
@@ -2040,7 +2040,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                                                   the PR named in the note
       everything else: diff_refused, branch_no_pr, pr_failed, withheld,
         salvaged, a wrong tier's outcome, a missing/unrecognized outcome, a failed/
-        interrupted/cancelled job, a job sideclaw no longer knows, a schemaVersion
+        interrupted/cancelled job, a job agent-gateway no longer knows, a schemaVersion
         mismatch                               -> an episode that ended without a pull request:
                                                   an infrastructure failure, so it strikes and
                                                   maybe_auto_implement() starts a fresh attempt
@@ -2090,14 +2090,14 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             conn.commit()
 
         try:
-            resp = _sideclaw.get(job_id)
+            resp = _agent_gateway.get(job_id)
         except RemoteError as e:
-            print(f"triage: could not poll sideclaw job {job_id} for {item['signature']}: {e}", file=sys.stderr)
+            print(f"triage: could not poll agent-gateway job {job_id} for {item['signature']}: {e}", file=sys.stderr)
             continue
         if resp is None:
-            # sideclaw no longer knows this job (it prunes terminal jobs at 24h or at 200 terminal rows): the
+            # agent-gateway no longer knows this job (it prunes terminal jobs at 24h or at 200 terminal rows): the
             # episode's result is lost, an infrastructure failure of the step, not something to poll forever.
-            _strike_attempt(f"sideclaw has no record of implement job {job_id} (pruned or lost)")
+            _strike_attempt(f"agent-gateway has no record of implement job {job_id} (pruned or lost)")
             continue
         status = resp.get("status")
         if status not in ("done", "failed", "interrupted", "cancelled"):
@@ -2111,7 +2111,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         # (COALESCE on both columns).
         _dispatch.sync_record(conn, resp, reported=False, now=now)
         conn.commit()
-        if _sideclaw.is_lease_refusal(resp):
+        if _agent_gateway.is_lease_refusal(resp):
             _retry_after_lease_refusal(conn, item, now)
             continue
         if status != "done":
@@ -2120,13 +2120,13 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             continue
 
         try:
-            _sideclaw.assert_result_schema(resp, _sideclaw.DISPATCH_SCHEMA_VERSIONS, "implement")
-            _sideclaw.assert_outcome(resp, _sideclaw.DISPATCH_OUTCOMES, "implement")
+            _agent_gateway.assert_result_schema(resp, _agent_gateway.DISPATCH_SCHEMA_VERSIONS, "implement")
+            _agent_gateway.assert_outcome(resp, _agent_gateway.DISPATCH_OUTCOMES, "implement")
         except RemoteError as e:
             _strike_attempt(str(e))
             continue
 
-        # sideclaw's job envelope nests the verdict inside `result` (`{id, tool, status, result: {...},
+        # agent-gateway's job envelope nests the verdict inside `result` (`{id, tool, status, result: {...},
         # error, progress, ...}`), and for a dispatch job `artifactUrl`/`branch`/`outcome`/`summary` all
         # live INSIDE `result`, never at the top level (server/jobs/types.ts `JobView`,
         # server/jobs/handlers/dispatch.ts `DISPATCH_OUTPUT`).
@@ -2162,7 +2162,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             _strike_attempt(f"implement {job_id}: {outcome} outcome carried no artifactUrl")
             continue
         elif outcome == "checks_tool_failed":
-            # The check TOOL crashed (sideclaw's own infrastructure), not the repo's
+            # The check TOOL crashed (agent-gateway's own infrastructure), not the repo's
             # suite: an infrastructure failure, never a finding to revise. Strike so a
             # fresh attempt retries, and never hand_back_for_revision() — that would
             # spend revision_count and re-brief the implementer about a red suite that
@@ -2420,12 +2420,12 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
 
 def _conflict_context(job_id: str, result: dict[str, Any]) -> str:
     """What a re-dispatch after a `conflict` needs beyond the investigation: the conflicting
-    episode's own verdict, and where its commits are (a git bundle, when sideclaw made one)."""
+    episode's own verdict, and where its commits are (a git bundle, when agent-gateway made one)."""
     parts = [f"Previous implement attempt: {job_id} (outcome: conflict)"]
     verdict = result.get("verdict") or result.get("summary")
     if verdict:
         parts.append(f"verdict: {verdict}")
-    bundle = _sideclaw.conflict_bundle_path(result)
+    bundle = _agent_gateway.conflict_bundle_path(result)
     if bundle:
         parts.append(f"The previous attempt's commits are in git bundle {bundle}; "
                      f"`git fetch {bundle}` to read them.")
@@ -2459,13 +2459,13 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     shape maybe_auto_implement() uses.
 
     A review block or failed checks on a pushed branch: the episode is sent `revisionOf` the previous
-    `dispatch/*` branch, so sideclaw cuts its worktree from that tip and updates the SAME pull
+    `dispatch/*` branch, so agent-gateway cuts its worktree from that tip and updates the SAME pull
     request (`pr_updated`); `pr_url` stays and the step-7 review runs again on it. A `conflict` (the
     base moved; nothing was pushed): a fresh episode from the new base carrying the conflicting
     attempt's verdict and its git bundle (or, when the merge train's `update_pr` could not rebase
     the PR, a pointer to its branch), without `revisionOf`; the PR on record is closed when its
     replacement opens (poll_implement_jobs()). Attempt ESCALATION_ATTEMPT and later run on the
-    escalation model (implement_model()); a sideclaw refusal of that model is retried once without
+    escalation model (implement_model()); a agent-gateway refusal of that model is retried once without
     it (open_implement_episode())."""
     ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
@@ -2591,7 +2591,7 @@ def advance_implement_chain(conn: sqlite3.Connection, policy: dict[str, Any], no
     its eligibility from the DB on each call and is CAS-guarded end to end.
     `maybe_auto_implement()`'s claim-before-dispatch UPDATE only ever wins once (`AND
     state='working' AND implement_job IS NULL`), and `poll_implement_jobs()`/
-    `advance_merge_trains()` each do a fresh sideclaw poll per row before touching a state. A second
+    `advance_merge_trains()` each do a fresh agent-gateway poll per row before touching a state. A second
     call landing on a row the other process already advanced changes zero rows and moves on.
 
     Why the sweep and not a shorter loop interval: everything else in `run()` (GitHub ingest,

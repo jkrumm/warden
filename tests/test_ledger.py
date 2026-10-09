@@ -1102,12 +1102,12 @@ def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_r
     conn.execute("DELETE FROM triage_items")
     notes = {
         1: ("failed", "investigate episode failed with no verdict: opencode error: Service Unavailable"),
-        2: ("failed", "implement episode not started — sideclaw refused the job (HTTP 400): tier 'implement' exceeds the ceiling"),
-        3: ("failed", "investigate episode not started — sideclaw refused the job (HTTP 400): repo is not allowed"),
+        2: ("failed", "implement episode not started — agent-gateway refused the job (HTTP 400): tier 'implement' exceeds the ceiling"),
+        3: ("failed", "investigate episode not started — agent-gateway refused the job (HTTP 400): repo is not allowed"),
         4: ("failed", "step-7 review confirmed https://x/pull/6; warden is merge-approval gated (never merges)"),
         5: ("failed", "step-7 validation (needs-human): 2 items to address"),
-        6: ("failed", "review episode not started — sideclaw refused the job (HTTP 400): nope"),
-        7: ("working", "implement episode not started — sideclaw refused the job"),
+        6: ("failed", "review episode not started — agent-gateway refused the job (HTTP 400): nope"),
+        7: ("working", "implement episode not started — agent-gateway refused the job"),
         8: ("failed", None),
     }
     for event_id, (state, note) in notes.items():

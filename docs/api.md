@@ -109,7 +109,7 @@ Every non-terminal `triage_items` row plus counts.
   non-terminal state.
 - `failure_class` is `infra`, `policy` or `work` on a `failed` item and `null` on every other
   state; `redrives` counts the automatic INFRA re-drives (3 at most, on a 60/180/480 minute
-  backoff after `retry_at`); a policy re-drive (once per change of sideclaw's dispatch policy) is
+  backoff after `retry_at`); a policy re-drive (once per change of agent-gateway's dispatch policy) is
   not counted, and `work` is never re-driven. An owner `retry` and any forward progress of the item
   reset `redrives` to 0. `retry` is never offered once `revert_pr` is set.
 - `issue` is `null` except for `origin: "github_issue"`, where it is `{repo, number, url,

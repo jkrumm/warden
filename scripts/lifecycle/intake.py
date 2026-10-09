@@ -1,8 +1,8 @@
 """intake — how a new event finds its repo: the deterministic label route and the
-prompt for the single-shot sideclaw `triage` job (agent-platform.md §Warden step 2).
+prompt for the single-shot agent-gateway `triage` job (agent-platform.md §Warden step 2).
 
 Pure functions plus two read-only queries; nothing here writes the ledger or
-calls sideclaw. loop/triaging.py owns the submit, the fold and every state change.
+calls agent-gateway. loop/triaging.py owns the submit, the fold and every state change.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from . import policy
 
 PRIVATE_SUFFIX = "-private"
 
-# The four answers the triage job may give, as the JSON Schema sideclaw validates against.
+# The four answers the triage job may give, as the JSON Schema agent-gateway validates against.
 TRIAGE_ACTIONS = ("attach", "new", "fixed_by", "ignore")
 TRIAGE_SCHEMA: dict[str, Any] = {
     "type": "object",
