@@ -9941,7 +9941,7 @@ prepending host dirs without dropping it, and the unset-vs-empty distinction. `m
 
 ## 140. A misrouted verdict re-routes to the owning repo instead of paging (2026-10-09)
 
-Item 1487 — a nightly build-failure alert routed to homelab whose fix lives in the private infra
+Item 1487 — a nightly build-failure alert routed to homelab whose fix lives in another
 repo — paged the owner with a routing question. `_member_outcome()` sent every `nextAction=human`
 verdict to `needs_decision`, and the investigation's only way to say "this is not my repo" was to
 ask a human. sideclaw step 1 (item 1488, sideclaw #22) added the optional `owningRepo` to the

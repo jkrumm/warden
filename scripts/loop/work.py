@@ -925,7 +925,7 @@ def _reroute_repo(conn: sqlite3.Connection, m: sqlite3.Row, result: dict[str, An
 
     `owningRepo` is the investigation saying "this finding is not mine; it lives in <repo>". On its
     own, `nextAction=human` would page the owner with a routing question (item 1487: a nightly
-    build-failure alert routed to homelab whose fix lives in the private infra repo). A re-route
+    build-failure alert routed to homelab whose fix lives in another repo). A re-route
     instead sends the item back to `triaged` with `repo=<owningRepo>`, so escalate() re-investigates
     it in the repo that actually owns it. Once per item: the first re-route's `item_transitions`
     note is the ping-pong guard, so a second verdict naming the repo it was just moved from lands as

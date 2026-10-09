@@ -26,19 +26,23 @@ HTTP client under its own app identity, never the gateway's connection.
 
 ```
 new → triaged → working → merging → verifying → fixed
-                   │          │          │
+        ↑          │          │          │
+        └─ re-route┤          │          │
                    └──────────┴──────────┴──→ needs_decision | failed
 quiet · closed(duplicate | fixed_by | ignored | resolved)      terminal
 ```
 
-`needs_decision` is the only human exit, reached only by a verdict with
-`nextAction=human` (its `decisionQuestion` is the Slack line). `needs_decision`
-and `failed` never expire. Every infrastructure failure strikes
-(`core.strike()`): 10 then 30 minutes of backoff, the third strike is `failed`
-carrying the error. A sideclaw 4xx on submit is a refusal, not a strike: the item
-ends `failed` with sideclaw's message — except a refused escalation `model`
-(resubmitted once without it), a lease refusal (retry in 10 minutes, no strike)
-and a refused triage submit (strikes; never the item's fault).
+`needs_decision` is the only human exit, reached by a `nextAction=human` verdict
+(its `decisionQuestion` is the Slack line) — unless that verdict's optional
+`owningRepo` names a different known repo, which re-routes the item to `triaged`
+in that repo instead (once per item; the re-route's transition note is the
+ping-pong guard). `needs_decision` and `failed` never expire. Every
+infrastructure failure strikes (`core.strike()`): 10 then 30 minutes of backoff,
+the third strike is `failed` carrying the error. A sideclaw 4xx on submit is a
+refusal, not a strike: the item ends `failed` with sideclaw's message — except a
+refused escalation `model` (resubmitted once without it), a lease refusal (retry
+in 10 minutes, no strike) and a refused triage submit (strikes; never the item's
+fault).
 An implement whose repo check TOOL failed to run (sideclaw's `checks_tool_failed`,
 dispatch schema v5) is an infrastructure failure too: it strikes and never spends a
 revision — only a red suite (`checks_failed`) goes back to the implementer.
@@ -86,12 +90,15 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    dispatches one investigate episode; origin items go through
    `escalate_origin_items()`. The verdict carries a ≤200-char `summary`, a
    `rootCause` and a `nextAction`. `implement` dispatches at any confidence —
-   review is the gate. A matching `rootCause` on another open item merges them
-   (older survives, the other `closed(duplicate)`). A blocked review is a revision
-   on the same item and PR (`revisionOf`), up to 4 attempts; attempt 3+ asks for
-   sideclaw's escalation model. `conflict` re-dispatches from the new base with
-   the old diff as context. Confident host restarts run through
-   `HOST_VERB_ALLOWLIST` and verify on `HOST_VERB_LIVENESS_MONITOR`.
+   review is the gate. A `human` verdict whose optional `owningRepo` names a
+   different known repo re-routes the item to `triaged` in that repo instead of
+   paging (`_reroute_repo()`, once per item). A matching `rootCause` on another
+   open item merges them (older survives, the other `closed(duplicate)`). A
+   blocked review is a revision on the same item and PR (`revisionOf`), up to 4
+   attempts; attempt 3+ asks for sideclaw's escalation model. `conflict`
+   re-dispatches from the new base with the old diff as context. Confident host
+   restarts run through `HOST_VERB_ALLOWLIST` and verify on
+   `HOST_VERB_LIVENESS_MONITOR`.
 4. **Merge train** (`train.py`). One per repo, oldest item first, single-flight:
    sideclaw `update_pr` onto the latest base → GitHub checks green (or none — only
    a readable check-runs API may say so; unreadable, the gate reads Actions runs
