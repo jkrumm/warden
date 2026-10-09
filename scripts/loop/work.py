@@ -218,10 +218,30 @@ def kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
     return None
 
 
+def _prior_resolution_note(conn: sqlite3.Connection, event_id: int) -> str | None:
+    """The note of this item's most recent terminal transition, or None. Reopen_if_needed() sends a
+    terminal item back to `new` via set_state(), which clears close_reason but leaves item_transitions
+    append-only, so this is the only memory of WHY the item last ended. A pure-silence close note
+    (QUIET_RESOLVE_NOTE_PREFIX) is skipped: it says only that the signal stopped, never what resolved
+    it, so it is noise in a fresh brief."""
+    placeholders = ",".join("?" * len(core.TERMINAL_STATES))
+    row = conn.execute(
+        f"SELECT note FROM item_transitions WHERE event_id=? AND to_state IN ({placeholders}) "
+        f"ORDER BY id DESC LIMIT 1",
+        (event_id, *core.TERMINAL_STATES),
+    ).fetchone()
+    note = (row["note"] or "").strip() if row is not None else ""
+    if not note or note.startswith(core.QUIET_RESOLVE_NOTE_PREFIX):
+        return None
+    return note
+
+
 def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by_id: dict[int, sqlite3.Row],
                           sibling_events: list[dict[str, str]],
-                          chronic: dict[int, int] | None = None, chronic_window_days: float = 0.0) -> str:
+                          chronic: dict[int, int] | None = None, chronic_window_days: float = 0.0,
+                          prior_resolutions: dict[int, str] | None = None) -> str:
     chronic = chronic or {}
+    prior_resolutions = prior_resolutions or {}
     lines = [f"Repo: {repo}"]
     if len(members) == 1:
         lines.append("Alert:")
@@ -236,6 +256,9 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
         if m["event_id"] in chronic:
             lines.append(f"    CHRONIC: cleared on its own and came back {chronic[m['event_id']]} times "
                           f"in the last {chronic_window_days:g} days")
+        if m["event_id"] in prior_resolutions:
+            lines.append(f"    prior resolution — WHY this signature last closed, context only and NOT "
+                          f"a verdict to re-affirm: {prior_resolutions[m['event_id']]}")
         if m["artifact_url"]:
             lines.append(f"    already-linked artifact from a prior investigation of this EXACT "
                           f"signature: {m['artifact_url']} — check whether it already fixes this "
@@ -473,9 +496,15 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
     recurrences = {m["event_id"]: intake.chronic_recurrences(conn, m["event_id"], m["repo"], policy, now)
                    for m in members}
     chronic = {eid: n for eid, n in recurrences.items() if n}
+    prior_resolutions = {}
+    for m in members:
+        note = _prior_resolution_note(conn, m["event_id"])
+        if note:
+            prior_resolutions[m["event_id"]] = note
     brief = _build_cluster_brief(repo=repo, members=members, event_rows_by_id=event_rows_by_id,
                                   sibling_events=sibling_events,
-                                  chronic=chronic, chronic_window_days=window)
+                                  chronic=chronic, chronic_window_days=window,
+                                  prior_resolutions=prior_resolutions)
     return _dispatch_investigate_and_advance(conn, repo=repo, brief=brief, members=members, now=now,
                                               policy=policy, dry_run=False)
 

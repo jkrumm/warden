@@ -1199,6 +1199,65 @@ def test_dispatch_brief_on_stdin_and_capped():
         assert item["dispatch_job"] is not None
 
 
+def test_cluster_brief_carries_the_prior_close_note_on_reopen():
+    """A reopened signature is re-investigated without its own close note: reopen_if_needed() clears
+    close_reason but item_transitions is append-only, so the brief is the one place the previous
+    investigation's resolution can still reach the fresh episode. It must ride there, labelled as
+    context rather than a verdict to re-affirm."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="sig-prior-note", repo="demo-repo",
+                        state=core.STATE_TRIAGED)
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_WORKING, core.STATE_CLOSED, OLD.isoformat(),
+             "closed(fixed_by): threshold raised to 80 in homelab PR #12"),
+        )
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _fake_submit(calls)
+        work.escalate_cluster(conn, "demo-repo", [core.get_item(conn, eid)], NOW, DEFAULT_POLICY,
+                              dry_run=False)
+        assert len(calls) == 1, calls
+        brief = calls[0]["brief"]
+        assert "threshold raised to 80 in homelab PR #12" in brief, brief
+        assert "prior resolution" in brief and "NOT a verdict" in brief, brief
+
+
+def test_cluster_brief_skips_the_silence_quiet_note_on_reopen():
+    """The 2h quiet-resolve note only says the signal stopped, never what resolved it, so it must not
+    be surfaced as a prior resolution — it would read as a resolution the fresh episode should trust."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="sig-silence-note", repo="demo-repo",
+                        state=core.STATE_TRIAGED)
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_NEW, core.STATE_QUIET, OLD.isoformat(),
+             f"{core.QUIET_RESOLVE_NOTE_PREFIX}{OLD.isoformat()} — no new occurrence for 2h"),
+        )
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _fake_submit(calls)
+        work.escalate_cluster(conn, "demo-repo", [core.get_item(conn, eid)], NOW, DEFAULT_POLICY,
+                              dry_run=False)
+        assert len(calls) == 1, calls
+        brief = calls[0]["brief"]
+        assert "prior resolution" not in brief, brief
+        assert core.QUIET_RESOLVE_NOTE_PREFIX not in brief, brief
+
+
+def test_cluster_brief_omits_prior_resolution_with_no_terminal_note():
+    """A signature with no terminal transition at all (its first investigation) gets no
+    prior-resolution line: there is nothing to remember and nothing to invent."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="sig-fresh", repo="demo-repo", state=core.STATE_TRIAGED)
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _fake_submit(calls)
+        work.escalate_cluster(conn, "demo-repo", [core.get_item(conn, eid)], NOW, DEFAULT_POLICY,
+                              dry_run=False)
+        assert len(calls) == 1, calls
+        assert "prior resolution" not in calls[0]["brief"], calls[0]["brief"]
+
+
 def test_quiet_resolution_never_posts():
     """An escalated item returned to `new` and then silence-resolved lands `quiet`,
     which Slack never hears about — on that pass or any later one."""
