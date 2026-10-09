@@ -91,6 +91,21 @@ def _cap_brief(text: str) -> str:
     return text[: core.MAX_BRIEF_CHARS - 1].rstrip() + "…"
 
 
+# A prior-resolution note gets its OWN fixed budget before it is spliced into the cluster brief,
+# independent of _cap_brief(). The note is one inline line per member (up to MAX_CLUSTER_SIGNATURES
+# of them), and an uncapped one — a legacy/direct `warden close --why`, or triaging.py's folded
+# reason — would push later members' alert lines and the closing investigate instructions past
+# MAX_BRIEF_CHARS, where _cap_brief() truncates them from the end. Mirrors _origin_item_brief()'s
+# budget-then-truncate: cut the note first, so the wrapper around it always survives.
+PRIOR_RESOLUTION_NOTE_CHARS = 1000
+
+
+def _cap_prior_resolution_note(note: str) -> str:
+    if len(note) <= PRIOR_RESOLUTION_NOTE_CHARS:
+        return note
+    return note[: PRIOR_RESOLUTION_NOTE_CHARS].rstrip() + "…"
+
+
 def run_bounded(fn: Any, *args: Any, timeout: int = core.EVIDENCE_TIMEOUT) -> tuple[bool, str]:
     """Runs fn(*args) with a hard wall-clock timeout. Every liveness gatherer is read-only and
     side-effect-free, so this is the in-process equivalent of the `timeout=` subprocess.run() gives
@@ -219,21 +234,25 @@ def kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
 
 
 def _prior_resolution_note(conn: sqlite3.Connection, event_id: int) -> str | None:
-    """The note of this item's most recent terminal transition, or None. Reopen_if_needed() sends a
-    terminal item back to `new` via set_state(), which clears close_reason but leaves item_transitions
-    append-only, so this is the only memory of WHY the item last ended. A pure-silence close note
-    (QUIET_RESOLVE_NOTE_PREFIX) is skipped: it says only that the signal stopped, never what resolved
-    it, so it is noise in a fresh brief."""
+    """The note of this item's most recent INFORMATIVE terminal transition, or None. Reopen_if_needed()
+    sends a terminal item back to `new` via set_state(), which clears close_reason but leaves
+    item_transitions append-only, so this is the only memory of WHY the item last ended.
+
+    The filter is in the query, not applied to the newest row afterwards: a real close note can be
+    followed by a LATER empty terminal row (a model `ignore` -> `closed(ignored)` with no note, or a
+    silence-resolve carrying only QUIET_RESOLVE_NOTE_PREFIX) plus a reopen. Picking the latest terminal
+    row and discarding it when blank would drop the earlier substantive resolution and re-ask the owner
+    the already-answered question, so only informative rows are considered and the newest of those wins.
+    A pure-silence note is skipped for the same reason: it says the signal stopped, never what resolved
+    it."""
     placeholders = ",".join("?" * len(core.TERMINAL_STATES))
     row = conn.execute(
         f"SELECT note FROM item_transitions WHERE event_id=? AND to_state IN ({placeholders}) "
+        f"AND note IS NOT NULL AND trim(note) != '' AND trim(note) NOT LIKE ? "
         f"ORDER BY id DESC LIMIT 1",
-        (event_id, *core.TERMINAL_STATES),
+        (event_id, *core.TERMINAL_STATES, f"{core.QUIET_RESOLVE_NOTE_PREFIX}%"),
     ).fetchone()
-    note = (row["note"] or "").strip() if row is not None else ""
-    if not note or note.startswith(core.QUIET_RESOLVE_NOTE_PREFIX):
-        return None
-    return note
+    return row["note"].strip() if row is not None else None
 
 
 def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by_id: dict[int, sqlite3.Row],
@@ -257,8 +276,11 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
             lines.append(f"    CHRONIC: cleared on its own and came back {chronic[m['event_id']]} times "
                           f"in the last {chronic_window_days:g} days")
         if m["event_id"] in prior_resolutions:
-            lines.append(f"    prior resolution — WHY this signature last closed, context only and NOT "
-                          f"a verdict to re-affirm: {prior_resolutions[m['event_id']]}")
+            note = _cap_prior_resolution_note(prior_resolutions[m["event_id"]])
+            lines.append(f"    prior resolution — WHY this signature last closed: {note}. If it still "
+                          f"explains the occurrence you are investigating, report nextAction `none` and "
+                          f"cite it instead of re-asking the owner; report `human` only for what the "
+                          f"note does not already answer")
         if m["artifact_url"]:
             lines.append(f"    already-linked artifact from a prior investigation of this EXACT "
                           f"signature: {m['artifact_url']} — check whether it already fixes this "

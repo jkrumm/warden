@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§139).
+build log (§1–§141).
 
 | | |
 |-|-|
-| Last updated | 2026-10-09 (§140 — a misrouted verdict re-routes to the owning repo) |
+| Last updated | 2026-10-09 (§141 — an investigate brief carries the item's prior resolution) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 16 |
@@ -54,6 +54,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   item back to `triaged` in that repo (once per item; the re-route's transition note is the
   ping-pong guard) instead of paging the owner — a misrouted finding re-investigates where it
   belongs (`work._reroute_repo()`).
+- **Prior resolution in the brief.** A reopened signature is re-investigated with the note of its
+  most recent *informative* terminal transition (empty notes and silence-resolves skipped by the
+  query itself, so a later blank row never hides a real close), capped to its own fixed budget and
+  carrying the instruction to report `none` citing it when it still explains the occurrence
+  (`work._build_cluster_brief()` / `_prior_resolution_note()`).
 - **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
   superseded/fixed), 2 `needs_decision`.
 

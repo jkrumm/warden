@@ -1202,8 +1202,9 @@ def test_dispatch_brief_on_stdin_and_capped():
 def test_cluster_brief_carries_the_prior_close_note_on_reopen():
     """A reopened signature is re-investigated without its own close note: reopen_if_needed() clears
     close_reason but item_transitions is append-only, so the brief is the one place the previous
-    investigation's resolution can still reach the fresh episode. It must ride there, labelled as
-    context rather than a verdict to re-affirm."""
+    investigation's resolution can still reach the fresh episode. It must ride there, carrying the
+    instruction to answer from it — report nextAction `none` and cite it rather than re-asking — not
+    just a warning not to re-affirm it."""
     with _triage_env() as (conn, ctx):
         eid = _seed_row(conn, external_id="sig-prior-note", repo="demo-repo",
                         state=core.STATE_TRIAGED)
@@ -1220,7 +1221,60 @@ def test_cluster_brief_carries_the_prior_close_note_on_reopen():
         assert len(calls) == 1, calls
         brief = calls[0]["brief"]
         assert "threshold raised to 80 in homelab PR #12" in brief, brief
-        assert "prior resolution" in brief and "NOT a verdict" in brief, brief
+        assert "prior resolution" in brief, brief
+        assert "nextAction `none`" in brief and "re-asking the owner" in brief, brief
+
+
+def test_cluster_brief_caps_a_long_prior_resolution_note():
+    """The note is spliced inline per member, so an uncapped one can push a LATER member's alert line
+    and the closing investigate instructions past MAX_BRIEF_CHARS, where _cap_brief() cuts them from
+    the end. The note gets its own fixed budget first, so the rest of the brief survives it."""
+    with _triage_env() as (conn, ctx):
+        first = _seed_row(conn, external_id="sig-long-note-a", repo="demo-repo",
+                          state=core.STATE_TRIAGED)
+        second = _seed_row(conn, external_id="sig-long-note-b", repo="demo-repo",
+                           state=core.STATE_TRIAGED)
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (first, core.STATE_WORKING, core.STATE_CLOSED, OLD.isoformat(), "X" * 30000),
+        )
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _fake_submit(calls)
+        work.escalate_cluster(conn, "demo-repo",
+                              [core.get_item(conn, first), core.get_item(conn, second)],
+                              NOW, DEFAULT_POLICY, dry_run=False)
+        assert len(calls) == 1, calls
+        brief = calls[0]["brief"]
+        assert len(brief) <= core.MAX_BRIEF_CHARS, len(brief)
+        assert "slack_alert:sig-long-note-b" in brief, brief
+        assert "X" * (work.PRIOR_RESOLUTION_NOTE_CHARS + 1) not in brief, "the note must be capped"
+        assert "X" * 100 in brief, "the note itself must still be present"
+
+
+def test_cluster_brief_falls_back_past_a_newer_blank_or_silence_terminal_row():
+    """A substantive close note can be followed by a LATER terminal row that answers nothing — a model
+    `closed(ignored)` with no note, or a silence-resolve. Selecting the latest terminal row and then
+    discarding a blank one would drop the real resolution; the most recent INFORMATIVE row must win."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="sig-blank-latest", repo="demo-repo",
+                        state=core.STATE_TRIAGED)
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_WORKING, core.STATE_CLOSED, OLD.isoformat(),
+             "closed(fixed_by): fix landed in homelab PR #99"),
+        )
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_NEW, core.STATE_CLOSED, OLD.isoformat(), None),
+        )
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _sideclaw.submit = _fake_submit(calls)
+        work.escalate_cluster(conn, "demo-repo", [core.get_item(conn, eid)], NOW, DEFAULT_POLICY,
+                              dry_run=False)
+        assert len(calls) == 1, calls
+        assert "fix landed in homelab PR #99" in calls[0]["brief"], calls[0]["brief"]
 
 
 def test_cluster_brief_skips_the_silence_quiet_note_on_reopen():

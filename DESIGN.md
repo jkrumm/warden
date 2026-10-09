@@ -89,7 +89,10 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
 3. **Work** (`work.py`). `escalate()` clusters `triaged` items per repo and
    dispatches one investigate episode; origin items go through
    `escalate_origin_items()`. The verdict carries a ≤200-char `summary`, a
-   `rootCause` and a `nextAction`. `implement` dispatches at any confidence —
+   `rootCause` and a `nextAction`. A reopened signature's brief carries the note of its most recent
+   informative terminal transition (`_prior_resolution_note()`), capped and paired with the
+   instruction to report `none` citing it when it still explains the occurrence. `implement`
+   dispatches at any confidence —
    review is the gate. A `human` verdict whose optional `owningRepo` names a
    different known repo re-routes the item to `triaged` in that repo instead of
    paging (`_reroute_repo()`, once per item). A matching `rootCause` on another

@@ -9953,3 +9953,27 @@ it in the repo that owns it) instead of `needs_decision`. Once per item: the fir
 naming the repo the item was just moved from lands as `needs_decision`. An equal repo, an unknown
 repo and a non-string `owningRepo` all keep the old behaviour. Five cases join `tests/test_triage.py`
 (a)-(e); `test_triage.py` 507/507 → 512/512 (+5). `make check` green.
+
+## 141. A reopened signature's investigate brief carries its prior resolution (2026-10-09)
+
+Item 13's `slack_alert:homelab-temperature-above-threshold` was closed 2026-09-27 with a note that
+answered the question a fresh investigate episode then asked again: `_build_cluster_brief()`
+(`work.py`) emitted only each member's `artifact_url`, never the note of the item's most recent
+terminal transition. `reopen_if_needed()` clears `close_reason` through `set_state()` but leaves
+`item_transitions` append-only, so that note is the only memory of WHY the item last ended. Added
+`_prior_resolution_note()` and threaded a `prior_resolutions` map through `escalate_cluster()` into a
+per-member brief line. A review of the first cut found four defects, all fixed here: (1) the note was
+spliced uncapped, so a long one — a legacy `warden close --why`, or triaging.py's folded reason —
+could push later members' alert lines and the closing instructions past `MAX_BRIEF_CHARS`, where
+`_cap_brief()` truncates from the end; it now gets its own fixed budget
+(`PRIOR_RESOLUTION_NOTE_CHARS = 1000`) before splicing, mirroring `_origin_item_brief()`'s
+budget-then-truncate. (2) the line framed the note as "context only, NOT a verdict to re-affirm" but
+never told the episode to ANSWER from it; it now says: if the note still explains the occurrence,
+report `nextAction none` and cite it instead of re-asking the owner, and report `human` only for what
+it does not answer. (3) the note query took the single latest terminal row and then discarded a blank
+or silence note, dropping an earlier substantive resolution whenever a later model-ignore or
+silence-resolve intervened; the filter (`note IS NOT NULL AND trim(note) != '' AND note NOT LIKE
+'signal quiet since %'`) is now in the query, so the most recent informative row wins. Five tests in
+`tests/test_triage.py` cover the carried-note-with-instruction, the cap, the blank-later-row
+fallback, the silence skip and the no-terminal-note case; the first cut's 516/516 gate rises to
+518/518 (+2 from the review rework). `make check` green.
