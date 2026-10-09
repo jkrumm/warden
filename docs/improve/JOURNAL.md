@@ -76,3 +76,4 @@ One line per iteration of the improvement loop (`docs/improve/LOOP.md`). Newest 
 2026-10-09 10:08 · Argo check (API-only, no screenshot): ledger, /board awaiting_owner and Argo snapshot 3714 (2 min old) all = {1370,1390,1400,1424,1456,1458,1469,1476,1487} + failed 1464: MATCH
 2026-10-09 11:08 · in 0, transitions 0, needs_decision 9, failed 1, sideclaw ok again (0 fail/h), Hermes 1 one-line reply · quiet · none · herdr restart-window DECISION still open
 2026-10-09 12:09 · in 0, transitions 0, needs_decision 9, failed 1, sideclaw 0 fail/h, Hermes 0 replies · quiet · none · herdr restart-window DECISION still open
+2026-10-09 13:10 · in 0, transitions 0, needs_decision 9, failed 1, sideclaw 0 fail/h, Hermes 0 replies · quiet · none · herdr restart-window DECISION still open
