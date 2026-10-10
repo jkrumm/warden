@@ -1864,7 +1864,14 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             continue
 
         if over_ceiling:
+            # Compare-and-set, the claim below's own guard: a second pass that claimed the item in
+            # the window between this candidate read and here (`implement_job` already the claim,
+            # state still `working`) must win, or the live episode is orphaned — poll_implement_jobs()
+            # only selects `working` rows, so an unconditional write here would flip it to
+            # `needs_decision` and its result/PR would be silently lost while the owner is told to
+            # apply by hand. The losing pass changes 0 rows and does nothing.
             core.set_state(conn, item["event_id"], core.STATE_NEEDS_DECISION, now,
+                           expect_state=core.STATE_WORKING, expect_null=("implement_job",),
                            note=_apply_by_hand_note(verdict))
             conn.commit()
             continue
