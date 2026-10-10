@@ -7077,19 +7077,22 @@ def test_truncate_is_a_no_op_under_the_limit_and_ellipsizes_over_it():
 
 
 def test_cluster_brief_renders_a_reopened_members_prior_resolution_note():
-    """A member whose signature closed before carries its prior close note into the brief, with
-    the instruction not to re-ask what it already answered."""
+    """A member whose signature closed before carries its prior close note into the brief, dated,
+    with the instruction not to re-ask what it already answered."""
     with _triage_env() as (conn, ctx):
         eid = _seed_row(conn, external_id="b-prior", title="Recurring", repo="demo-repo",
                         state=core.STATE_TRIAGED, occurrences=5)
         brief = work._build_cluster_brief(
             repo="demo-repo", members=[_rows(conn, eid)],
             event_rows_by_id={eid: core.get_event(conn, eid)}, sibling_events=[],
-            prior_notes={eid: "signal quiet since 2026-01-01 00:00 UTC"},
+            prior_notes={eid: ("signal quiet since 2026-01-01 00:00 UTC", OLD.isoformat())},
         )
         assert "PRIOR RESOLUTION" in brief, brief
         assert "signal quiet since 2026-01-01 00:00 UTC" in brief, brief
+        assert core.fmt_ts(OLD.isoformat()) in brief, brief
         assert "re-ask the owner" in brief, brief
+        assert "explains ONLY this signature" in brief, brief
+        assert "every member is independently explained" in brief, brief
 
 
 def test_escalate_cluster_carries_the_latest_prior_resolution_note_into_the_brief():
@@ -7115,6 +7118,81 @@ def test_escalate_cluster_carries_the_latest_prior_resolution_note_into_the_brie
         brief = calls[0]["brief"]
         assert "owner answered: already fixed by the config change" in brief, brief
         assert "older note" not in brief, brief
+
+
+def test_latest_terminal_note_prefers_the_real_note_over_a_later_silence_note():
+    """A later pure-silence close must not shadow an earlier note that actually answered: the
+    silence auto-resolve carries no answer, so the substantive note must win."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="b-silence", title="Recurring", repo="demo-repo")
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_WORKING, core.STATE_CLOSED, OLD.isoformat(), "owner answered: real cause"),
+        )
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_NEW, core.STATE_QUIET, NOW.isoformat(),
+             f"{core.QUIET_RESOLVE_NOTE_PREFIX}2026-01-01 00:00 UTC"),
+        )
+        conn.commit()
+        assert work._latest_terminal_note(conn, eid) == ("owner answered: real cause", OLD.isoformat())
+
+
+def test_latest_terminal_note_falls_back_to_a_silence_note_when_that_is_all_there_is():
+    """With no substantive close note, the silence resolution IS the prior resolution and must be
+    rendered rather than dropped."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="b-only-silence", title="Recurring", repo="demo-repo")
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_NEW, core.STATE_QUIET, NOW.isoformat(),
+             f"{core.QUIET_RESOLVE_NOTE_PREFIX}2026-01-01 00:00 UTC"),
+        )
+        conn.commit()
+        assert work._latest_terminal_note(conn, eid) == (
+            f"{core.QUIET_RESOLVE_NOTE_PREFIX}2026-01-01 00:00 UTC", NOW.isoformat())
+
+
+def test_latest_terminal_note_skips_a_blank_note_for_an_earlier_real_one():
+    """A blank `note=''` terminal row (legacy/out-of-band) is not an answer and must not shadow an
+    earlier real close note."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="b-blank", title="Recurring", repo="demo-repo")
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_WORKING, core.STATE_CLOSED, OLD.isoformat(), "owner answered: real cause"),
+        )
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_NEW, core.STATE_CLOSED, NOW.isoformat(), ""),
+        )
+        conn.commit()
+        assert work._latest_terminal_note(conn, eid) == ("owner answered: real cause", OLD.isoformat())
+
+
+def test_escalate_cluster_brief_carries_the_prior_resolution_and_cluster_fold_safeguard():
+    """A two-member cluster where only one member has a prior resolution still carries the
+    per-cluster restriction: the note explains ONLY its own signature and nextAction=none is valid
+    for the cluster only if every member is independently explained."""
+    with _triage_env() as (conn, ctx):
+        a = _seed_row(conn, external_id="d-a", title="A", repo="demo-repo",
+                      state=core.STATE_TRIAGED, occurrences=5)
+        _seed_row(conn, external_id="d-b", title="B", repo="demo-repo",
+                  state=core.STATE_TRIAGED, occurrences=5)
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (a, core.STATE_WORKING, core.STATE_CLOSED, OLD.isoformat(), "owner answered: A is benign"),
+        )
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1, calls
+        brief = calls[0]["brief"]
+        assert "owner answered: A is benign" in brief, brief
+        assert "explains ONLY this signature" in brief, brief
+        assert ("answer nextAction=none for the cluster only if every member is independently "
+                "explained") in brief, brief
 
 
 def test_escalate_never_clusters_an_origin_item_into_an_alert_brief():

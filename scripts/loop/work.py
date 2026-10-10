@@ -225,27 +225,39 @@ def kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
     return None
 
 
-def _latest_terminal_note(conn: sqlite3.Connection, event_id: int) -> str | None:
-    """The note recorded on this event's most recent transition INTO a terminal state
+def _latest_terminal_note(conn: sqlite3.Connection, event_id: int) -> tuple[str, str] | None:
+    """(note, at) recorded on this event's most recent SUBSTANTIVE transition INTO a terminal state
     (fixed/quiet/closed), or None if it has never closed. A reopened item reuses the same event_id,
-    so its prior close note — the answer a `closed(resolved)` carried, or the quiet-resolve
-    explanation — survives in `item_transitions` but is otherwise invisible to the fresh
-    investigation, which would re-ask the owner a question its own prior episode already answered.
-    `ORDER BY id DESC` picks the LATEST close, not an earlier one."""
+    so its prior close note — the answer a `closed(resolved)` carried — survives in
+    `item_transitions` but is otherwise invisible to the fresh investigation, which would re-ask the
+    owner a question its own prior episode already answered. The transition's `at` rides along so
+    the brief can date the resolution and the investigation can judge whether it still applies.
+
+    A pure-silence close (`core.QUIET_RESOLVE_NOTE_PREFIX`, what the grouped-source auto-resolve
+    writes when an alert simply stops firing) answers nothing, so it must never SHADOW an earlier
+    note that did: the first query takes the latest terminal note that is neither blank nor a
+    silence note. Only when no such note exists does the fallback let a silence note stand in — it
+    is still a real prior resolution when it is all there is. A blank note (`note=''`, a legacy or
+    out-of-band row) is skipped rather than read as an answer. `ORDER BY id DESC` picks the LATEST
+    qualifying note, not an earlier one."""
     placeholders = ",".join("?" * len(core.TERMINAL_STATES))
+    base = (f"SELECT note, at FROM item_transitions WHERE event_id=? AND to_state IN ({placeholders}) "
+            f"AND note IS NOT NULL AND TRIM(note) <> ''")
     row = conn.execute(
-        f"SELECT note FROM item_transitions WHERE event_id=? AND to_state IN ({placeholders}) "
-        f"AND note IS NOT NULL ORDER BY id DESC LIMIT 1",
-        (event_id, *core.TERMINAL_STATES),
+        f"{base} AND note NOT LIKE ? ORDER BY id DESC LIMIT 1",
+        (event_id, *core.TERMINAL_STATES, core.QUIET_RESOLVE_NOTE_PREFIX + "%"),
     ).fetchone()
-    note = (row["note"] or "").strip() if row else ""
-    return note or None
+    if row is None:
+        row = conn.execute(f"{base} ORDER BY id DESC LIMIT 1", (event_id, *core.TERMINAL_STATES)).fetchone()
+    if row is None:
+        return None
+    return (row["note"].strip(), row["at"])
 
 
 def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by_id: dict[int, sqlite3.Row],
                           sibling_events: list[dict[str, str]],
                           chronic: dict[int, int] | None = None, chronic_window_days: float = 0.0,
-                          prior_notes: dict[int, str] | None = None) -> str:
+                          prior_notes: dict[int, tuple[str, str]] | None = None) -> str:
     chronic = chronic or {}
     prior_notes = prior_notes or {}
     lines = [f"Repo: {repo}"]
@@ -263,10 +275,13 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
             lines.append(f"    CHRONIC: cleared on its own and came back {chronic[m['event_id']]} times "
                           f"in the last {chronic_window_days:g} days")
         if m["event_id"] in prior_notes:
+            note, at = prior_notes[m["event_id"]]
             lines.append(
-                f"    PRIOR RESOLUTION (this signature closed before and has now recurred — do NOT "
-                f"re-ask the owner what this note already answered unless the new occurrence changes "
-                f"the picture): {_truncate(prior_notes[m['event_id']], _items.NOTE_MAX)}"
+                f"    PRIOR RESOLUTION (this signature closed before, on {core.fmt_ts(at)}, and has "
+                f"now recurred): {_truncate(note, _items.NOTE_MAX)} — this note explains ONLY this "
+                f"signature; do NOT re-ask the owner what it already answered unless the new "
+                f"occurrence changes the picture, and answer nextAction=none for the cluster only if "
+                f"every member is independently explained."
             )
         if m["artifact_url"]:
             lines.append(f"    already-linked artifact from a prior investigation of this EXACT "
@@ -505,11 +520,11 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
     recurrences = {m["event_id"]: intake.chronic_recurrences(conn, m["event_id"], m["repo"], policy, now)
                    for m in members}
     chronic = {eid: n for eid, n in recurrences.items() if n}
-    prior_notes: dict[int, str] = {}
+    prior_notes: dict[int, tuple[str, str]] = {}
     for m in members:
-        note = _latest_terminal_note(conn, m["event_id"])
-        if note:
-            prior_notes[m["event_id"]] = note
+        prior = _latest_terminal_note(conn, m["event_id"])
+        if prior is not None:
+            prior_notes[m["event_id"]] = prior
     brief = _build_cluster_brief(repo=repo, members=members, event_rows_by_id=event_rows_by_id,
                                   sibling_events=sibling_events,
                                   chronic=chronic, chronic_window_days=window,
