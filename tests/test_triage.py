@@ -3164,6 +3164,86 @@ def test_maybe_auto_implement_still_submits_when_the_ceiling_read_fails():
         assert item["state"] == core.STATE_WORKING and item["implement_job"] is not None, dict(item)
 
 
+def test_ceiling_diversion_moves_every_member_sharing_the_job_in_one_step():
+    """A clustered alert's members all share one `dispatch_job`, and the ceiling diversion rewrites
+    the shared `dispatches.verdict_json`. Diverting only the first member would strand every sibling
+    in `working` forever: the next loop iteration re-reads the now-`human` verdict and skips it. The
+    diversion must move every still-eligible member to `needs_decision` in one step."""
+    with _triage_env() as (conn, ctx):
+        first = _seed_verdict_item(conn, external_id="sig-cluster-ceiling-a", repo="capped-repo")
+        second = _insert_event(conn, source="slack_alert", external_id="sig-cluster-ceiling-b",
+                               title="Verdict item", first_seen=OLD)
+        conn.execute(
+            "INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, "
+            "last_seen, created_at, updated_at, dispatch_job) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (second, "slack_alert:sig-cluster-ceiling-b", "capped-repo", core.STATE_WORKING, 3,
+             OLD.isoformat(), OLD.isoformat(), NOW.isoformat(), NOW.isoformat(), "investigate-job"),
+        )
+        conn.commit()
+        conn.execute(
+            "UPDATE dispatches SET verdict_json=? WHERE job_id=?",
+            (json.dumps({"summary": "s", "nextAction": "implement", "confidence": "high",
+                         "recommendation": "patch the host threshold and reload"}),
+             "investigate-job"),
+        )
+        conn.commit()
+        DISPATCH_POLICY["body"] = {"rules": {"capped-repo": {"ceiling": "investigate"}}, "overrides": []}
+
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert calls == [], "a repo the gateway caps below implement must never be submitted to"
+        states = [r["state"] for r in conn.execute(
+            "SELECT state FROM triage_items WHERE dispatch_job=? ORDER BY event_id",
+            ("investigate-job",))]
+        assert states == [core.STATE_NEEDS_DECISION, core.STATE_NEEDS_DECISION], states
+        for eid in (first, second):
+            item = core.get_item(conn, eid)
+            assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+            assert item["implement_job"] is None, dict(item)
+            assert item["note"] == ("[blocker] capped-repo is investigate-only for agents — apply "
+                                    "by hand: patch the host threshold and reload"), item["note"]
+        row = conn.execute(
+            "SELECT verdict_json FROM dispatches WHERE job_id=?", ("investigate-job",)
+        ).fetchone()
+        diverted = json.loads(row["verdict_json"])
+        assert diverted["nextAction"] == "human" and diverted["escalationCategory"] == "blocker", diverted
+
+
+def test_ceiling_check_uses_the_action_tier_not_a_hard_coded_implement():
+    """An `issue` verdict only needs an `author`-tier action (filing an issue), so a repo whose
+    ceiling is `author` must not divert it — the pre-check compares the action's tier, not a
+    hard-coded `implement`. An `investigate` ceiling still diverts an `issue` verdict, since
+    `author` outranks it."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-issue-author-ceiling", repo="author-repo",
+                                 next_action="issue")
+        DISPATCH_POLICY["body"] = {"rules": {"author-repo": {"ceiling": "author"}}, "overrides": []}
+
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert len(calls) == 1, "an issue verdict is allowed by an author ceiling and must be submitted"
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["implement_job"] is not None, dict(item)
+
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-issue-investigate-ceiling",
+                                 repo="investigate-repo", next_action="issue")
+        DISPATCH_POLICY["body"] = {"rules": {"investigate-repo": {"ceiling": "investigate"}},
+                                   "overrides": []}
+
+        calls = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert calls == [], "an issue verdict (author tier) still outranks an investigate ceiling"
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+
+
 def test_implement_success_joins_the_merge_train_at_update():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-impl-ok")

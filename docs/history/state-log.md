@@ -10081,3 +10081,16 @@ VISIBLE investigate ceiling the pre-check now pre-empts, so they were re-pointed
 their `failed(policy)`/policy-hash-redrive machinery is unchanged. `make check` green. Not covered: the Argo
 `implement` action still submits to the capped repo and is refused — the note says apply by hand, and that path
 is outside this item (`maybe_revise_blocked()` and reverts can likewise still be refused at submit).
+
+## 146. Ceiling diversion compares the action tier and moves every job-sharing member (2026-10-10, item 1504)
+
+The second review round of PR #27 blocked the first fix on two defects, both corrected. (1) The ceiling check
+hard-coded the required tier as `implement`, so an `issue` verdict (whose action — filing an issue — only needs
+`author`) was diverted off a repo an `author` ceiling would allow. `maybe_auto_implement()` now derives
+`required_tier` from the verdict's `nextAction` (`implement` → `implement`, `issue` → `author`) and passes it to
+`_repo_ceiling_exceeded()` instead of a literal `implement`. (2) The diversion rewrote the shared
+`dispatches.verdict_json` while diverting only the first member of a clustered alert, so every sibling re-read the
+now-`human` verdict and was stranded in `working` — never submitted, failed, or surfaced. The diversion now moves
+every still-eligible member sharing the `dispatch_job` to `needs_decision` in one step, before the shared row is
+rewritten. Two tests join `tests/test_triage.py` (a cluster diverts all members; an `issue` verdict passes an
+`author` ceiling and is still diverted by an `investigate` one), 541 → 543. `make check` green.

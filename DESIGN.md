@@ -66,8 +66,10 @@ under the new policy waits for the next change; `work` (checks failed, review
 blocked past the last attempt, a rewind loop, a revert by hand) never. A `policy`
 refusal an implement cannot even be submitted for is caught first:
 `maybe_auto_implement()` reads agent-gateway's `GET /api/dispatch-policy` once per
-pass and, when `implement` outranks `rules[<repo>].ceiling` (a re-route into a
-lower-ceiling repo), diverts the item to `needs_decision` tagged `[blocker]`
+pass and, when the tier the verdict's action needs (`implement` for
+`nextAction=implement`, `author` for `nextAction=issue`) outranks
+`rules[<repo>].ceiling` (a re-route into a lower-ceiling repo), diverts every
+member sharing the job to `needs_decision` tagged `[blocker]`
 (`<repo> is <ceiling>-only for agents — apply by hand: <recommendation>`) instead
 of submitting an episode the gateway refuses. A failed row
 carries `redrive_json` — the state to re-enter and the columns that clear the failed

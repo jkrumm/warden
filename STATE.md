@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§145).
+build log (§1–§146).
 
 | | |
 |-|-|
-| Last updated | 2026-10-10 (§145 — a repo tier ceiling is read before implement, diverting to a `[blocker]` owner escalation) |
+| Last updated | 2026-10-10 (§146 — ceiling diversion compares the action's tier and moves every job-sharing member) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 17 |
@@ -63,12 +63,14 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `dispatches.validation_status = 'redriven:<sha>'`, a `PRIOR ESCALATION` paragraph in the review context), then
   read as the decision: blocking findings revise, none confirms. Schema-1 and revert reviews keep the old path.
 - **Tier ceiling before implement.** `maybe_auto_implement()` reads agent-gateway's
-  `GET /api/dispatch-policy` once per pass (lazily) and, when `implement` outranks
+  `GET /api/dispatch-policy` once per pass (lazily) and, when the tier the verdict's action needs
+  (`implement` for `nextAction=implement`, `author` for `nextAction=issue`) outranks
   `rules[<repo>].ceiling` — a re-route puts an item whose `max_tier` stays `implement` into a
   lower-ceiling repo — diverts it instead of submitting an episode the gateway refuses into
   `failed(policy)`: `needs_decision`, verdict rewritten to `nextAction=human` +
   `escalationCategory=blocker`, note led by `[blocker]` (`work._repo_ceiling_exceeded`,
-  `work.maybe_auto_implement`). A read that fails leaves agent-gateway's own 4xx as the boundary.
+  `work.maybe_auto_implement`). Every member sharing the job is diverted in one step, before the
+  shared verdict row is rewritten. A read that fails leaves agent-gateway's own 4xx as the boundary.
 - **Prior resolution in the brief.** A reopened item's most recent SUBSTANTIVE close note and its
   date (`item_transitions`, terminal state; a later silence close or a blank row never shadows a
   real answer, and a pure-silence close on its own yields no `PRIOR RESOLUTION` line at all) ride
