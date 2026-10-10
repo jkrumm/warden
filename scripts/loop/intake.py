@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 import sys
 from typing import Any
@@ -63,6 +64,42 @@ ORIGIN_EVENT_SOURCE = {"human": "human", "github_issue": "github_go"}
 GITHUB_SKIP_LABEL = "warden:skip"
 
 
+BRIEF_OVERLAP_MIN = 0.8
+_TOKEN_RE = re.compile(r"[a-z0-9_./-]{3,}")
+
+
+def _brief_tokens(text: str) -> frozenset[str]:
+    return frozenset(_TOKEN_RE.findall(text.lower()))
+
+
+def brief_overlap(a: str, b: str) -> float:
+    """Jaccard similarity of the two briefs' word sets: 1.0 for the same words in any order."""
+    ta, tb = _brief_tokens(a), _brief_tokens(b)
+    return len(ta & tb) / len(ta | tb) if ta and tb else 0.0
+
+
+def overlapping_open_item(conn: sqlite3.Connection, *, repo: str, origin: str, brief: str,
+                           thread_ts: str | None) -> int | None:
+    """The `event_id` of an open item in `repo` of the same origin whose brief says (nearly) the same
+    thing, or None. Only a `human` request: an issue is keyed on its number already. Duplicate work starts at the
+    door: a second `warden run` for a request still in flight must not open a second investigation and a second pull request. `failed` and terminal
+    items do not count (a re-run after a failure is a decision), and a request that arrives with its
+    own Slack thread only matches an item answering into that same thread, so nobody's answer is
+    dropped."""
+    placeholders = ",".join("?" * len(core.NOT_OPEN_STATES))
+    rows = conn.execute(
+        f"SELECT event_id, brief, origin_thread_ts FROM triage_items WHERE repo=? AND origin=? "
+        f"AND brief IS NOT NULL AND state NOT IN ({placeholders}) ORDER BY event_id",
+        (repo, origin, *core.NOT_OPEN_STATES),
+    ).fetchall()
+    for row in rows:
+        if thread_ts and row["origin_thread_ts"] != thread_ts:
+            continue
+        if brief_overlap(brief, row["brief"]) >= BRIEF_OVERLAP_MIN:
+            return row["event_id"]
+    return None
+
+
 def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief: str, max_tier: str,
                       external_id: str, title: str, url: str | None = None,
                       payload: dict[str, Any] | None = None, now: dt.datetime | None = None,
@@ -106,6 +143,13 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
         if existing_item["state"] in core.TERMINAL_STATES:
             return None
         return event_id
+
+    twin = (overlapping_open_item(conn, repo=repo, origin=origin, brief=brief, thread_ts=origin_thread_ts)
+            if origin == "human" else None)
+    if twin is not None:
+        print(f"triage: {origin} request for {repo} overlaps open item #{twin}, not opening a second one",
+              file=sys.stderr)
+        return twin
 
     conn.execute(
         "INSERT INTO triage_items(event_id, signature, repo, state, origin, max_tier, brief, "
