@@ -115,8 +115,8 @@ CHAIN_STATES = (
 #
 # Mirrors loop/notify.py's apply_argo_actions() per-verb allowed-state sets
 # (ARGO_ACTION_VERBS = {"implement", "merge", "dismiss", "reinvestigate",
-# "note", "retry"}). Must stay in sync by hand with apply_argo_actions()'s handlers if
-# either changes. implement and merge share one set: both act on an item that is
+# "note", "retry", "adopt"}). Must stay in sync by hand with apply_argo_actions()'s handlers if
+# either changes. implement, merge and adopt share one state set: all act on an item that is
 # waiting on the owner; retry acts on a `failed` item that has a stage to re-enter.
 _OWNER_STATES = (_ledger.STATE_NEEDS_DECISION, _ledger.STATE_FAILED)
 _DISMISS_STATES = (_ledger.STATE_NEW, _ledger.STATE_TRIAGED, *_OWNER_STATES, _ledger.STATE_QUIET)
@@ -125,17 +125,20 @@ _REINVESTIGATE_STATES = (*_OWNER_STATES, _ledger.STATE_QUIET)
 
 def _available_actions(state: str, mergeable: bool = False, reverted: bool = False,
                        retryable: bool = False) -> list[str]:
-    """Zero or more of `implement`/`merge`/`dismiss`/`reinvestigate`/`retry`/`note` —
+    """Zero or more of `implement`/`merge`/`adopt`/`dismiss`/`reinvestigate`/`retry`/`note` —
     what the owner could click for a card in `state`, from state alone. The
     real per-repo/per-tier gate runs server-side in loop/notify.py's
     apply_argo_actions() when an action is actually applied; this list is
     only what the UI offers. A `reverted` item (`revert_pr` set) already merged and was
-    rolled back by hand: re-implementing or re-merging it would redo the very change
-    that was reverted, so neither is offered. `retryable`: a `failed` item whose
-    `redrive_json` names the stage it re-enters (never offered once `revert_pr` is set)."""
+    rolled back by hand: re-implementing, re-merging or adopting it would redo the very change
+    that was reverted, so none is offered. `retryable`: a `failed` item whose
+    `redrive_json` names the stage it re-enters (never offered once `revert_pr` is set). `adopt`
+    takes a pull request number the owner types into the card's free-text input; whether any such
+    PR exists is validated when the action is applied, not here."""
     actions: list[str] = []
     if state in _OWNER_STATES and not reverted:
         actions.append("implement")
+        actions.append("adopt")
     # `mergeable`: the item carries a PR. The owner's merge lands it when a review
     # confirmed the head, else rejoins the merge train (notify.py's _apply_argo_merge),
     # so a review is not a prerequisite for the UI to offer the verb.

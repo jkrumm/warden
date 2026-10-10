@@ -162,7 +162,7 @@ ARGO_SNAPSHOT_HISTORY_LIMIT = 50
 # The closed set of verbs Argo's action queue may name, like HOST_VERB_ALLOWLIST: the string
 # reaches a dispatcher that branches on it, so an unrecognized value is a loud, acked rejection,
 # never a silent drop or a guess.
-ARGO_ACTION_VERBS = frozenset({"implement", "merge", "dismiss", "reinvestigate", "note", "retry"})
+ARGO_ACTION_VERBS = frozenset({"implement", "merge", "dismiss", "reinvestigate", "note", "retry", "adopt"})
 
 # Owner actions are gated on the same state sets api.py's `availableActions` offers (mirrored
 # there by state name, kept in sync by hand). An owner dismissal is the same terminal call as
@@ -335,6 +335,40 @@ def _apply_argo_reinvestigate(conn: sqlite3.Connection, item: sqlite3.Row, event
     return "applied", None, None
 
 
+def _apply_argo_adopt(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int, now: dt.datetime,
+                      payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None, str | None]:
+    """The owner's "take over an already-open PR" on an item whose fix already exists as a pull
+    request warden itself opened for it — the same transition as `warden adopt --pr <n>`, sharing
+    work.adopt_own_pr(). The PR number rides in the payload (`payload.pr`), like dismiss's `reason`,
+    retry's `why` and note's `text` — a free-text owner input the Argo card already supports, so a
+    PR number is no different. The number is validated against the ledger (the PR must be one this
+    item's own implement episode opened, still open and unmerged) before any state is written."""
+    if item["state"] not in work.ADOPT_ALLOWED_STATES:
+        return "rejected", None, f"item is in state {item['state']!r}, not needs_decision/failed"
+    if item["revert_pr"] is not None:
+        return "rejected", None, _ARGO_REVERTED_REFUSAL
+    raw = str(payload.get("pr") or "").strip()
+    if not raw:
+        return "rejected", None, "adopt requires a pull request number (payload.pr)"
+    try:
+        pr_number = int(raw)
+    except ValueError:
+        return "rejected", None, f"not a pull request number: {raw!r}"
+    note = f"adopted by owner: PR #{pr_number}"
+    try:
+        rowcount, old_pr = work.adopt_own_pr(conn, event_id, pr_number, now,
+                                             expect_state=item["state"], note=note)
+    except PreconditionError as exc:
+        return "rejected", None, str(exc)
+    conn.commit()
+    if not rowcount:
+        return "rejected", None, "item state changed before this action could be applied — retry from Argo"
+    if old_pr:
+        core.close_pr_best_effort(old_pr, f"Superseded: the owner adopted pull request #{pr_number} "
+                                          "for this item, so this one is closed rather than left open.")
+    return "applied", {"pullRequest": pr_number}, None
+
+
 def _apply_argo_retry(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int, now: dt.datetime,
                       payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None, str | None]:
     """The owner's "try again" on a `failed` item of any class: the same re-entry as the loop's
@@ -412,6 +446,8 @@ def _apply_one_argo_action(conn: sqlite3.Connection, action: dict[str, Any], now
             status, result, error = _apply_argo_reinvestigate(conn, item, event_id, now)
         elif verb == "retry":
             status, result, error = _apply_argo_retry(conn, item, event_id, now, payload)
+        elif verb == "adopt":
+            status, result, error = _apply_argo_adopt(conn, item, event_id, now, payload)
         else:
             status, result, error = _apply_argo_note(conn, item, event_id, now, payload, action_id)
 
@@ -423,7 +459,7 @@ def _apply_one_argo_action(conn: sqlite3.Connection, action: dict[str, Any], now
 
 def apply_argo_actions(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool) -> None:
     """Pulls the owner's queued actions off Argo (`implement`/`merge`/`dismiss`/`reinvestigate`/
-    `note`/`retry`, see ARGO_ACTION_VERBS) and applies each one, immediately before this pass's
+    `note`/`retry`/`adopt`, see ARGO_ACTION_VERBS) and applies each one, immediately before this pass's
     push_argo_snapshot() reflects the outcome. Idempotency: see _apply_one_argo_action()."""
     if dry_run:
         print("[dry-run] would poll Argo for pending owner actions")
