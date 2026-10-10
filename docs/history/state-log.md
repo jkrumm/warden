@@ -9982,10 +9982,16 @@ A signature that self-clears (quiet-resolved) or is answered (`closed(resolved)`
 `item_transitions` — but `_build_cluster_brief()` built the investigate brief only from
 `triage_items` columns and `events`, so the note was invisible and the fresh episode re-asked the
 owner a question its own prior investigation had already answered. `work._latest_terminal_note()`
-now reads the note on the most recent transition INTO a terminal state (`fixed`/`quiet`/`closed`,
-`ORDER BY id DESC`), `escalate_cluster()` gathers it per member beside `chronic`, and
-`_build_cluster_brief()` renders a `PRIOR RESOLUTION` line with the instruction not to re-ask unless
-the recurrence changes the picture. The truncation `_cap_brief()` already carried was extracted into
-a shared `work._truncate(text, limit)`; the note is capped with it at `NOTE_MAX`. Three cases join
-`tests/test_triage.py` (`_truncate`, the brief render, and the latest-note-wins gather);
-`test_triage.py` 519 → 522. `make check` green.
+now reads `(note, at)` on the most recent SUBSTANTIVE transition INTO a terminal state
+(`fixed`/`quiet`/`closed`): the latest terminal note that is neither blank (`TRIM(note) <> ''`) nor a
+silence note (`QUIET_RESOLVE_NOTE_PREFIX`), falling back to a silence note only when no substantive
+one exists, so a later silence close or an empty legacy row can never shadow a real answer, and the
+brief can date the resolution. `escalate_cluster()` gathers it per member beside `chronic`, and
+`_build_cluster_brief()` renders a `PRIOR RESOLUTION` line with the note's date and the cluster-fold
+restriction: the note explains ONLY its own signature, and `nextAction=none` is valid for the cluster
+only if every member is independently explained (a cluster's single verdict folds onto every member).
+The truncation `_cap_brief()` already carried was extracted into a shared `work._truncate(text,
+limit)`; the note is capped with it at `NOTE_MAX`. Seven cases join `tests/test_triage.py`
+(`_truncate`, the dated brief render, the latest-note-wins gather, substantive-beats-later-silence,
+silence-only fallback, blank-note skip, and the two-member cluster-fold safeguard);
+`test_triage.py` 519 → 526. `make check` green.
