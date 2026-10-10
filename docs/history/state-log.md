@@ -9963,7 +9963,7 @@ waves reshaped master, and step-7 review blocking twice after three revisions.
 
 Changes. `rollout.checkout_in_use()` + `core.park()`: a dirty / off-default / ahead-of-origin checkout
 or a herdr agent working in it parks that repo's merge and deploy without a strike, one note line, retry
-in 10 min (a failed fetch still strikes; `Deferred.parked` carries the distinction). `MAX_IMPLEMENT_ATTEMPTS`
+in 25 min (a failed fetch still strikes; `Deferred.parked` carries the distinction). `MAX_IMPLEMENT_ATTEMPTS`
 4 → 3. `intake.overlapping_open_item()` reuses an open `human` item with a ≥ 0.8 word-overlap brief.
 Schema 17 (data only) backfills items 1281, 1290, 1314, 1317, 1321 from `closed(resolved)` to `fixed`,
 pinned to ids, repo and the clock's own note, with a transition row. `clients/kuma.py` pings the new

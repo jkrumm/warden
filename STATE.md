@@ -107,7 +107,7 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 
 - **Parking.** A repo whose checkout is dirty, off-default or ahead of origin, or has a herdr agent
   working in it, parks its merge (`train._train_merge`) and deploy (`verify._deploy_item`): same state,
-  note `parked: …`, `retry_at` +10 min, no strike (`core.park`, `rollout.checkout_in_use`).
+  note `parked: …`, `retry_at` +25 min, no strike (`core.park`, `rollout.checkout_in_use`).
 - **Revision cap 2.** `MAX_IMPLEMENT_ATTEMPTS` 4 → 3; the last attempt is the one escalation.
 - **Duplicates at the door.** A `warden run` whose brief overlaps (Jaccard ≥ 0.8) an open item of the
   same repo reuses that item (`intake.overlapping_open_item`); alert duplicates were already merged by

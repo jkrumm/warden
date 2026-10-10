@@ -102,7 +102,7 @@ tool even though launchd hands the loop a minimal PATH.
 - **A busy checkout parks, it does not strike.** The loop fast-forwards only a clean
   default-branch checkout that ends at origin. A dirty, off-default or ahead-of-origin checkout,
   or a herdr agent `working` inside it (`rollout.checkout_in_use`), **parks** that repo's merge and
-  deploy (`core.park`: same state, `retry_at` +10 min, note `parked: …`, no strike). A failed fetch
+  deploy (`core.park`: same state, `retry_at` +25 min, note `parked: …`, no strike). A failed fetch
   still strikes. That includes this checkout: an agent working in `~/SourceRoot/warden` holds warden's
   own merges.
 - **`scripts/triage.py` has no `--help`**: any flag it does not know runs a full live
