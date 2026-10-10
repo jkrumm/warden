@@ -3115,8 +3115,9 @@ def test_auto_implement_refused_by_agent_gateway_ends_the_item_and_is_never_retr
 def test_maybe_auto_implement_lands_needs_decision_when_repo_ceiling_blocks_implement():
     """An item whose OWN `max_tier` is `implement` but whose repo agent-gateway caps at
     `investigate` (a re-route into an investigate-only repo) must not submit an implement episode
-    the gateway will refuse. The verdict's recommendation goes to the owner as `needs_decision`
-    instead of being buried in a `failed(policy)` note (JOURNAL 1503)."""
+    the gateway will refuse. It reaches the owner as a well-formed Wave-12 escalation —
+    `needs_decision`, note led by `[blocker]`, the verdict rewritten from `nextAction=implement`
+    to `human`+`escalationCategory=blocker` — instead of a `failed(policy)` note (JOURNAL 1503)."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-rerouted-ceiling", repo="capped-repo")
         conn.execute(
@@ -3136,8 +3137,15 @@ def test_maybe_auto_implement_lands_needs_decision_when_repo_ceiling_blocks_impl
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
         assert item["implement_job"] is None, dict(item)
-        assert item["note"] == ("capped-repo is investigate-only for agents — apply by hand: "
-                                "patch the host threshold and reload"), item["note"]
+        assert item["note"] == ("[blocker] capped-repo is investigate-only for agents — apply "
+                                "by hand: patch the host threshold and reload"), item["note"]
+        row = conn.execute(
+            "SELECT verdict_json FROM dispatches WHERE job_id=?", ("investigate-job",)
+        ).fetchone()
+        diverted = json.loads(row["verdict_json"])
+        assert diverted["nextAction"] == "human", diverted
+        assert diverted["escalationCategory"] == "blocker", diverted
+        assert diverted["recommendation"] == "patch the host threshold and reload", diverted
 
 
 def test_maybe_auto_implement_still_submits_when_the_ceiling_read_fails():

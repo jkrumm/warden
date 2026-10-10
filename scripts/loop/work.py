@@ -1807,7 +1807,12 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     because a re-route (`_reroute_repo()`) moves an item whose `max_tier` stays `implement` into a
     repo agent-gateway caps below it. Above that ceiling the submit would be refused and the item
     would end `failed(policy)` with the verdict's recommendation buried in a note the owner never
-    sees, so it lands `needs_decision` naming the ceiling and the recommendation instead.
+    sees, so it lands `needs_decision` instead. The reason is the repo's ceiling — an obstacle the
+    agent cannot get past, not a choice — so the diversion is a well-formed Wave-12 owner
+    escalation: the verdict is rewritten to `nextAction=human` with `escalationCategory=blocker` and
+    the note is built by the shared `_decision_note()` (`[blocker] …`), never a bare
+    `nextAction=implement` verdict with no category that a consumer would read as an
+    unclassified escalation.
 
     `require_auto_from_item()`/`check_repo_not_in_flight()` are checked BEFORE the claim, not after:
     both read the item's OWN current state off the ledger, so checking them against a row this call
@@ -1852,15 +1857,24 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         if ceiling is not None:
             # The item's OWN `max_tier` is `implement`, but the repo it was re-routed into is capped
             # below it: the submit would be refused and the recommendation buried in a `failed(policy)`
-            # note. Surface it to the owner instead (JOURNAL 1503).
+            # note. Surface it to the owner instead (JOURNAL 1503), through the SAME owner-escalation
+            # path a `human` verdict takes: the repo's ceiling is an obstacle the agent cannot get
+            # past, so `escalationCategory=blocker` (the Wave 12 taxonomy), the note built by
+            # `_decision_note()` (led by `[blocker]`), and the stored verdict rewritten with it so no
+            # consumer sees a `needs_decision` item whose verdict still reads `nextAction=implement`
+            # with no category.
             if dry_run:
                 print(f"[dry-run] would leave {item['signature']} for the owner — {item['repo']} is "
                       f"{ceiling}-only for agents (event {item['event_id']})")
                 continue
             by_hand = str(verdict.get("recommendation") or verdict.get("summary") or "").strip()
-            note = _truncate(f"{item['repo']} is {ceiling}-only for agents — apply by hand: "
-                             f"{by_hand or 'no recommendation'}", _items.NOTE_MAX)
-            core.set_state(conn, item["event_id"], core.STATE_NEEDS_DECISION, now, note=note)
+            diverted = dict(verdict, nextAction="human", escalationCategory="blocker",
+                            decisionQuestion=f"{item['repo']} is {ceiling}-only for agents — "
+                                             f"apply by hand: {by_hand or 'no recommendation'}")
+            core.set_state(conn, item["event_id"], core.STATE_NEEDS_DECISION, now,
+                           note=_decision_note(diverted, escalation_category(diverted)))
+            conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id=?",
+                         (json.dumps(diverted), item["dispatch_job"]))
             conn.commit()
             continue
 

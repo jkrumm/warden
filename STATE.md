@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§144).
+build log (§1–§145).
 
 | | |
 |-|-|
-| Last updated | 2026-10-10 (§144 — a step-7 `needs-human` review names its escalation too; otherwise warden decides) |
+| Last updated | 2026-10-10 (§145 — a repo tier ceiling is read before implement, diverting to a `[blocker]` owner escalation) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 17 |
@@ -62,6 +62,13 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `needs_decision`, `[category]`-led; a schema-2 one without is re-reviewed once per head (latch
   `dispatches.validation_status = 'redriven:<sha>'`, a `PRIOR ESCALATION` paragraph in the review context), then
   read as the decision: blocking findings revise, none confirms. Schema-1 and revert reviews keep the old path.
+- **Tier ceiling before implement.** `maybe_auto_implement()` reads agent-gateway's
+  `GET /api/dispatch-policy` once per pass (lazily) and, when `implement` outranks
+  `rules[<repo>].ceiling` — a re-route puts an item whose `max_tier` stays `implement` into a
+  lower-ceiling repo — diverts it instead of submitting an episode the gateway refuses into
+  `failed(policy)`: `needs_decision`, verdict rewritten to `nextAction=human` +
+  `escalationCategory=blocker`, note led by `[blocker]` (`work._repo_ceiling_exceeded`,
+  `work.maybe_auto_implement`). A read that fails leaves agent-gateway's own 4xx as the boundary.
 - **Prior resolution in the brief.** A reopened item's most recent SUBSTANTIVE close note and its
   date (`item_transitions`, terminal state; a later silence close or a blank row never shadows a
   real answer, and a pure-silence close on its own yields no `PRIOR RESOLUTION` line at all) ride

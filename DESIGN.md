@@ -34,7 +34,8 @@ quiet · closed(duplicate | fixed_by | ignored | resolved)      terminal
 
 `needs_decision` is the only human exit, reached by a `nextAction=human` verdict
 (its `decisionQuestion` is the Slack line, led by a `[category]` tag) that names an owner-only
-`escalationCategory` (product, data_loss, spend, other_people, security, blocker). An investigate
+`escalationCategory` (product, data_loss, spend, other_people, security, blocker), or by an
+implement verdict the item's repo tier ceiling forbids (a `[blocker]` diversion, below). An investigate
 verdict that names none is sent back once to `triaged` ("re-driven to decide", the brief quotes its
 own question and says decide it yourself); a second one takes its `recommendation` (implement, or
 close with the answer on an investigate-only item) — unless that verdict's optional
@@ -62,7 +63,13 @@ failure, the third strike) is re-driven after 60, 180, 480 minutes, three times;
 `policy` (an agent-gateway 4xx refusal) once whenever agent-gateway's
 dispatch policy hash differs from the one stored with the refusal, so a refusal
 under the new policy waits for the next change; `work` (checks failed, review
-blocked past the last attempt, a rewind loop, a revert by hand) never. A failed row
+blocked past the last attempt, a rewind loop, a revert by hand) never. A `policy`
+refusal an implement cannot even be submitted for is caught first:
+`maybe_auto_implement()` reads agent-gateway's `GET /api/dispatch-policy` once per
+pass and, when `implement` outranks `rules[<repo>].ceiling` (a re-route into a
+lower-ceiling repo), diverts the item to `needs_decision` tagged `[blocker]`
+(`<repo> is <ceiling>-only for agents — apply by hand: <recommendation>`) instead
+of submitting an episode the gateway refuses. A failed row
 carries `redrive_json` — the state to re-enter and the columns that clear the failed
 attempt's handle — and a re-drive (`redrive_failed()`, first in the pass) puts it
 back there silently, keeping the PR and the revision count. `warden retry` and

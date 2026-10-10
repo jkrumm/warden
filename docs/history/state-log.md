@@ -10050,3 +10050,34 @@ Replay on the deployed pair (agent-gateway review of open warden PR #25, schemaV
 one concrete blocking finding, `needs-human` not raised, nothing paged. Caveat: shows "decides when it can", not
 "never asks"; the three old items were not re-run. Not covered by an end-to-end test: the gateway's forced-blocker
 paths (only the coercion/normalizer/enum are unit-tested).
+
+## 145. A repo tier ceiling is read before implement, not discovered as a 400 (2026-10-10, item 1504)
+
+`maybe_auto_implement()` gated only on the item's OWN `max_tier='implement'` and never read agent-gateway's
+per-repo ceiling. A re-route (`_reroute_repo()`, item 1489) moves an item whose `max_tier` stays `implement` into
+an investigate-only repo, so warden submitted an implement episode agent-gateway refuses with HTTP 400;
+`end_on_refusal()` then landed the item `failed(policy)` with the investigation's recommendation buried in the
+refusal note, and `failed` posts nothing — the owner never saw the fix they could apply by hand (items 1000/1002,
+`JOURNAL.md:85`, filed as 1503, re-filed against current master as 1504).
+
+`_repo_ceiling_exceeded()` (pure) compares the needed `implement` against `rules[<repo>].ceiling` in
+`lifecycle.policy.VALID_TIERS` order (`investigate < author < implement`). `maybe_auto_implement()` reads
+`agent-gateway.dispatch_policy()` once per pass (lazily, on the first candidate) and, above the ceiling, diverts
+the item to `needs_decision` with no episode submitted. A policy read that fails (`RemoteError`) is not fatal:
+the check is a best-effort pre-check and the submit's own 4xx stays the boundary.
+
+The independent review of PR #27 (the first attempt) blocked on two things, both fixed here. (1) The diversion
+wrote a bare note and left the stored verdict at `nextAction=implement` with no `escalationCategory`, so a
+`needs_decision` item reached the Wave-12 owner-action path as an unclassified escalation; the diversion now goes
+through the SAME mechanism a `human` verdict does — the verdict is rewritten to `nextAction=human` +
+`escalationCategory=blocker` (the ceiling is an obstacle the agent cannot get past, not a choice) and the note is
+built by `_decision_note()`, led by `[blocker]`: `<repo> is <ceiling>-only for agents — apply by hand:
+<recommendation>`. (2) The commit omitted the required doc updates; STATE.md, DESIGN.md's failure-class paragraph
+and this § carry the behavior.
+
+Two cases join `tests/test_triage.py` (capped repo → no submit, `needs_decision`, `[blocker]` note, verdict
+rewritten; unreadable policy → submit proceeds), 539 → 541. Two existing `end_on_refusal()` tests drove a
+VISIBLE investigate ceiling the pre-check now pre-empts, so they were re-pointed at a policy the pre-check allows;
+their `failed(policy)`/policy-hash-redrive machinery is unchanged. `make check` green. Not covered: the Argo
+`implement` action still submits to the capped repo and is refused — the note says apply by hand, and that path
+is outside this item (`maybe_revise_blocked()` and reverts can likewise still be refused at submit).
