@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 16
+LEDGER_SCHEMA_VERSION = 17
 
 
 class LedgerBehind(RuntimeError):
@@ -754,6 +754,24 @@ UPDATE triage_items SET failure_class = 'work', retry_at = NULL,
   WHERE state = 'failed' AND failure_class IS NULL;
 """
 
+# Version 17 — data only (Wave 6). The 1h "sat in `merged`" deadline that used to close a merged item
+# is gone from the code; five weatherorb items it closed as `resolved` had really merged (PRs #21,
+# #33, #44, #47, #48 merged and deployed, `verifying` entered each time), so the ledger reads them
+# back as `fixed`. Pinned to their ids AND to the clock's own note, so it touches nothing else and
+# running it twice is a no-op. The transition row keeps the correction auditable.
+_MIGRATION_17 = """
+INSERT INTO item_transitions(event_id, from_state, to_state, at, note)
+  SELECT event_id, 'closed', 'fixed', strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'),
+         'backfill: the pull request had merged; the 1h merged deadline closed it as resolved'
+  FROM triage_items
+  WHERE event_id IN (1281, 1290, 1314, 1317, 1321) AND repo = 'weatherorb' AND state = 'closed'
+    AND close_reason = 'resolved' AND note LIKE 'deadline expired: sat in `merged`%';
+UPDATE triage_items SET state = 'fixed', close_reason = NULL,
+  note = 'merged and deployed; recorded as fixed by the Wave 6 backfill (the 1h merged deadline had closed it as resolved)'
+  WHERE event_id IN (1281, 1290, 1314, 1317, 1321) AND repo = 'weatherorb' AND state = 'closed'
+    AND close_reason = 'resolved' AND note LIKE 'deadline expired: sat in `merged`%';
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -771,6 +789,7 @@ MIGRATIONS: dict[int, str] = {
     14: _MIGRATION_14,
     15: _MIGRATION_15,
     16: _MIGRATION_16,
+    17: _MIGRATION_17,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live

@@ -1057,7 +1057,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     conn = ledger.connect(path, migrate=True)
     after = dt.datetime.now(dt.timezone.utc)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 16 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 17 == ledger.LEDGER_SCHEMA_VERSION
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
     assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
@@ -1135,7 +1135,7 @@ def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_r
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 16 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 17 == ledger.LEDGER_SCHEMA_VERSION
     assert {"failure_class", "redrive_json", "redrives"} <= _table_columns(conn, "triage_items")
     rows = {r["event_id"]: r for r in conn.execute("SELECT * FROM triage_items")}
 
@@ -1213,6 +1213,36 @@ def test_failed_snapshot_aborts_the_migration():
     check = sqlite3.connect(path)
     assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 14, "migrated without a backup"
     check.close()
+
+
+def test_migration_17_backfills_only_the_five_misrecorded_weatherorb_items_as_fixed():
+    path = _tmp_path()
+    conn = ledger.connect(path, migrate=True)
+    conn.close()
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("UPDATE schema_version SET version = 16")
+    clock = "deadline expired: sat in `merged` for its full 1h without sweep_deadlines advancing it"
+    rows = [(1281, "weatherorb", "closed", "resolved", clock), (1321, "weatherorb", "closed", "resolved", clock),
+            (1314, "other", "closed", "resolved", clock),                       # right id, wrong repo
+            (1290, "weatherorb", "closed", "resolved", "closed by hand: superseded"),  # right id, not the clock
+            (1500, "weatherorb", "closed", "resolved", clock)]                   # the clock's note, not a listed id
+    for event_id, repo, state, reason, note in rows:
+        conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (?, 's', ?, 't', 'now')",
+                     (event_id, f"e{event_id}"))
+        conn.execute("INSERT INTO triage_items(event_id, signature, repo, state, close_reason, note, created_at, updated_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, 'now', 'now')", (event_id, f"s:e{event_id}", repo, state, reason, note))
+    conn.commit()
+    conn.close()
+    conn = ledger.connect(path, migrate=True)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(ledger.MIGRATIONS[17])   # a second run is the idempotency check
+    got = {r["event_id"]: (r["state"], r["close_reason"]) for r in conn.execute("SELECT * FROM triage_items")}
+    assert got == {1281: ("fixed", None), 1321: ("fixed", None), 1314: ("closed", "resolved"),
+                   1290: ("closed", "resolved"), 1500: ("closed", "resolved")}, got
+    moved = conn.execute("SELECT event_id FROM item_transitions WHERE to_state='fixed' ORDER BY event_id").fetchall()
+    assert [r[0] for r in moved] == [1281, 1321], moved
+    conn.close()
 
 
 def main() -> int:
