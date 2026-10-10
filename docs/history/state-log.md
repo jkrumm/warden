@@ -10020,3 +10020,13 @@ implement-episode `human` is tagged (`[category]` or `[no category]`), not re-dr
 
 Not covered: step-7 review `needs-human` (a `review` job outcome, no category in its schema). `test_triage.py`
 526 → 534.
+
+Review follow-ups (agent-gateway `/review` + warden `/review`, both fixed): the "decide it yourself" paragraph is
+PREPENDED to the brief so tail truncation takes the original body, never the paragraph; the typed
+`took_recommendation` set replaces a note-prefix match; `_uncategorized_human_outcome()` holds the
+re-drive/take-recommendation rule. agent-gateway went to `DISPATCH_SCHEMA_VERSION` 7 (`fcec70a`) and warden's
+accepted window to {5, 6, 7} first (`500e777`, deployed before the gateway), and the enum survives the sensitive
+redaction. One test changed target, not strength: the schema-mismatch case now uses a version below the window.
+Replay on the deployed pair (standalone `agw` investigate episodes, no ledger item): the homelab Kuma-push
+question (item 1496's shape) came back `nextAction=implement`, the hermes-agent stale cron pin (item 1497's shape)
+`none`; neither asked the owner. Both deployed (`make deploy` green on both sides); warden 534/534.
