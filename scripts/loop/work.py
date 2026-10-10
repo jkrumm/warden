@@ -1783,12 +1783,14 @@ def _read_dispatch_policy() -> dict[str, Any] | None:
         return None
 
 
-def _apply_by_hand_note(verdict: dict[str, Any]) -> str:
-    """The note a ceiling-capped item parks under: the investigation's own recommendation, so the
-    owner has the change to make by hand (`apply by hand: <recommendation>`, falling back to the
-    summary when the verdict carried none)."""
+def _apply_by_hand_note(repo: str, ceiling: str, verdict: dict[str, Any]) -> str:
+    """The note a ceiling-capped item parks under: why it was not auto-implemented
+    (`<repo> is <ceiling>-only for agents` — agent-gateway's ceiling for the repo) and the
+    investigation's own recommendation, so the owner has the change to make by hand
+    (`apply by hand: <recommendation>`, falling back to the summary when the verdict carried none)."""
     recommendation = str(verdict.get("recommendation") or verdict.get("summary") or "").strip()
-    note = f"apply by hand: {recommendation}" if recommendation else "apply by hand"
+    note = f"{repo} is {ceiling}-only for agents"
+    note = f"{note} — apply by hand: {recommendation}" if recommendation else f"{note} — apply by hand"
     return _truncate(note, _items.NOTE_MAX)
 
 
@@ -1808,8 +1810,9 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     Before submitting, the item's repo is checked against agent-gateway's dispatch policy (read once
     per pass): a repo whose ceiling is below `implement` is never submitted to — agent-gateway would
     refuse it with a 4xx and the item would land `failed(policy)`, burying the investigation's
-    recommendation. Such an item goes to `needs_decision` with `apply by hand: <recommendation>`
-    (`_apply_by_hand_note()`). An unreadable policy skips the check and submits as before.
+    recommendation. Such an item goes to `needs_decision` with
+    `<repo> is <ceiling>-only for agents — apply by hand: <recommendation>` (`_apply_by_hand_note()`).
+    An unreadable policy skips the check and submits as before.
 
     `require_auto_from_item()`/`check_repo_not_in_flight()` are checked BEFORE the claim, not after:
     both read the item's OWN current state off the ledger, so checking them against a row this call
@@ -1872,7 +1875,7 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             # apply by hand. The losing pass changes 0 rows and does nothing.
             core.set_state(conn, item["event_id"], core.STATE_NEEDS_DECISION, now,
                            expect_state=core.STATE_WORKING, expect_null=("implement_job",),
-                           note=_apply_by_hand_note(verdict))
+                           note=_apply_by_hand_note(item["repo"], ceiling, verdict))
             conn.commit()
             continue
 

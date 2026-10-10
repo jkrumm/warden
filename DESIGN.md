@@ -56,7 +56,8 @@ with its summary; a revision, or an attempt with a pull request already on recor
 would have to touch it), goes to `needs_decision` instead, its note naming the open PR —
 never a strike and another episode. An implement whose repo agent-gateway caps below
 `implement` is never submitted to: `maybe_auto_implement()` reads the dispatch policy once
-per pass and parks the item `needs_decision` with `apply by hand: <recommendation>`, so the
+per pass and parks the item `needs_decision` with
+`<repo> is <ceiling>-only for agents — apply by hand: <recommendation>`, so the
 recommendation is not buried in a `failed(policy)` (a repo with no rule has no ceiling; an
 unreadable policy submits as before).
 

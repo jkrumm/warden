@@ -10059,7 +10059,8 @@ the item's OWN `max_tier`, never the repo's ceiling. agent-gateway answered the 
 `failed(policy)`, and the recommendation was buried (items 1000/1002; 1503's re-file).
 
 `maybe_auto_implement()` now reads agent-gateway's `GET /api/dispatch-policy` ONCE per pass and, when the item's repo
-names a ceiling below `implement`, routes the item to `needs_decision` with `apply by hand: <recommendation>` instead
+names a ceiling below `implement`, routes the item to `needs_decision` with
+`<repo> is <ceiling>-only for agents — apply by hand: <recommendation>` instead
 of submitting — no episode, no operation, nothing to re-drive. A repo absent from `rules` has no ceiling (agent-gateway's
 own default is the top); an unreadable policy skips the check and submits as before, leaving agent-gateway to refuse.
 The check runs against the tier actually submitted, diverts only that item, writes no `verdict_json` and touches no

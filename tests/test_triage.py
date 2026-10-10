@@ -3116,8 +3116,9 @@ def test_auto_implement_refused_by_agent_gateway_ends_the_item_and_is_never_retr
 def test_auto_implement_over_the_repo_ceiling_parks_for_the_owner_instead_of_submitting():
     """A repo agent-gateway caps below `implement` must never be submitted to: the 4xx lands the
     item `failed(policy)`, burying the investigation's recommendation. maybe_auto_implement() reads
-    the ceiling first and routes the item to `needs_decision` with `apply by hand: <recommendation>`,
-    opening no episode and no operation. It is inert on the next pass (not `working`)."""
+    the ceiling first and routes the item to `needs_decision` with
+    `<repo> is <ceiling>-only for agents — apply by hand: <recommendation>`, opening no episode and no
+    operation. It is inert on the next pass (not `working`)."""
     with _triage_env() as (conn, ctx):
         DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
         eid = _seed_verdict_item(conn, external_id="sig-ceiling-divert")
@@ -3136,7 +3137,7 @@ def test_auto_implement_over_the_repo_ceiling_parks_for_the_owner_instead_of_sub
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
         assert item["implement_job"] is None and item["failure_class"] is None
-        assert item["note"] == "apply by hand: re-pin the route in config", item["note"]
+        assert item["note"] == "demo-repo is investigate-only for agents — apply by hand: re-pin the route in config", item["note"]
         assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE kind='implement'").fetchone()["n"] == 0
 
         work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
