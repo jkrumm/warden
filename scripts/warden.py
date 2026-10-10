@@ -22,6 +22,8 @@ VERBS
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
   retry <event-id>    put a `failed` item back where it failed, with a fresh re-drive budget (--why)
   reinvestigate <event-id>  send an item back for a fresh investigation (--why required)
+  adopt <event-id>    point an item at an open pull request warden itself opened for it
+                     and rejoin the merge train (--pr <number>)
   help
 
 Global flags, anywhere on the line, `--flag value` or `--flag=value`:
@@ -141,6 +143,10 @@ def _mode(verb: str | None, state: _State) -> str:
     if verb == "reinvestigate":
         if state.did_mutate:
             return "reinvestigated"
+        return "dry-run" if state.dry_run else "refused"
+    if verb == "adopt":
+        if state.did_mutate:
+            return "adopted"
         return "dry-run" if state.dry_run else "refused"
     if verb == "close":
         if state.did_mutate:
@@ -912,6 +918,64 @@ def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) 
             "state": core.STATE_TRIAGED, "note": core.get_item(conn, event_id)["note"]}
 
 
+# --- adopt -----------------------------------------------------------------------
+
+
+def cmd_adopt(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
+    """Point an item at an already-open pull request warden itself opened for it and put it back on
+    its repo's merge train — the owner's alternative to hand-merging on GitHub, which leaves the
+    ledger blind and the superseded draft open. The PR must be one this item's own implement episode
+    opened (a `dispatches` row): merge's gate only ever lands a `dispatch/…` branch warden cut, so a
+    foreign PR is refused, not guessed at. Writes the local ledger; any prior `pr_url` is closed
+    best-effort, and agent-gateway is never reached."""
+    # No require_backend(): the transition is local and the PR close is best-effort — a token that
+    # cannot be resolved is logged by close_pr_best_effort(), and must not block the owner's
+    # command, the same reasoning `reinvestigate` carries.
+    if not positional:
+        raise UsageError('usage: warden adopt <event-id> --pr <number> [--why "<reason>"] [--json]')
+    event_id = _parse_int(positional[0], "event-id")
+    if not flags.pr:
+        raise UsageError("adopt requires --pr <number>")
+    pr_number = _parse_int(flags.pr, "--pr")
+    state.target = str(event_id)
+
+    item = core.get_item(conn, event_id)
+    if item is None:
+        raise UsageError(f"no triage_items row for event_id {event_id}")
+    if item["state"] not in work.ADOPT_ALLOWED_STATES:
+        raise PreconditionError(
+            f"triage item {event_id} is in state '{item['state']}', not one of "
+            f"{'/'.join(work.ADOPT_ALLOWED_STATES)} — nothing to adopt into"
+        )
+    if item["revert_pr"] is not None:
+        raise PolicyError(
+            f"triage item {event_id} was reverted (revert_pr is set) — adopting and merging a pull "
+            "request would redo the reverted change"
+        )
+    note = f"adopted by owner: PR #{pr_number}" + (f" — {flags.why}" if flags.why else "")
+
+    if flags.dry_run:
+        state.dry_run = True
+        return {"verb": "adopt", "ok": True, "dryRun": True, "eventId": event_id,
+                "pullRequest": pr_number, "fromState": item["state"], "state": core.STATE_MERGING,
+                "note": "nothing written — no transition row, no state change"}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    rowcount, old_pr = work.adopt_own_pr(conn, event_id, pr_number, now,
+                                         expect_state=item["state"], note=note)
+    if not rowcount:
+        conn.rollback()
+        raise PreconditionError(f"triage item {event_id} moved while this adopt was applied — look again")
+    conn.commit()
+    if old_pr:
+        core.close_pr_best_effort(old_pr, f"Superseded: the owner adopted pull request #{pr_number} "
+                                          "for this item, so this one is closed rather than left open.")
+    state.did_mutate = True
+    return {"verb": "adopt", "ok": True, "eventId": event_id, "pullRequest": pr_number,
+            "fromState": item["state"], "state": core.STATE_MERGING,
+            "note": core.get_item(conn, event_id)["note"]}
+
+
 # --- close ---------------------------------------------------------------------
 
 # States a human can resolve by hand: no episode or operation is in flight,
@@ -1090,6 +1154,8 @@ VERBS
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
   retry <event-id>    put a `failed` item back where it failed, with a fresh re-drive budget (--why)
   reinvestigate <event-id>  send an item back for a fresh investigation (--why required)
+  adopt <event-id>    point an item at an open pull request warden itself opened for it
+                     and rejoin the merge train (--pr <number>)
   help
 
 Global flags, anywhere on the line, --flag value or --flag=value:
@@ -1166,6 +1232,8 @@ def main(argv: list[str]) -> int:
                 out = cmd_retry(conn, flags, rest, state)
             elif verb == "reinvestigate":
                 out = cmd_reinvestigate(conn, flags, rest, state)
+            elif verb == "adopt":
+                out = cmd_adopt(conn, flags, rest, state)
             else:
                 raise UsageError(
                     f"unknown verb: {verb}\n"
@@ -1180,6 +1248,7 @@ def main(argv: list[str]) -> int:
                     "  close <event-id>  resolve an open item by hand (--why required; --reason resolved|ignored)\n"
                     "  retry <event-id>  put a failed item back where it failed (--why)\n"
                     "  reinvestigate <event-id>  send an item back for a fresh investigation (--why)\n"
+                    "  adopt <event-id>  point an item at an open warden PR and rejoin the merge train (--pr)\n"
                     "  help"
                 )
         finally:
