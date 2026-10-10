@@ -2067,8 +2067,8 @@ def _close_superseded_pr(old_pr: str, new_pr: str) -> None:
 
 # The states an owner may adopt a pull request from: the same two owner states every other owner
 # action acts on, never an in-flight one (`working`/`merging`/`verifying` have an episode or a train
-# of their own). scripts/api.py's `availableActions` does not list `adopt` by hand — it needs a PR
-# number the board cannot know, so a form/CLI is its door, not a one-click button.
+# of their own). Shared by the `warden adopt` CLI verb and notify.py's Argo `adopt` handler; the PR
+# number rides in the Argo action payload (`payload.pr`), like dismiss's `reason` and note's `text`.
 ADOPT_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED)
 
 

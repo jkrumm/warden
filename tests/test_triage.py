@@ -5278,6 +5278,55 @@ def test_adopt_own_pr_refuses_a_pr_warden_never_opened_and_writes_nothing():
             assert item["implement_job"] is None and item["pr_url"] is None, dict(item)
 
 
+def test_apply_argo_adopt_rejoins_the_merge_train_and_closes_the_prior_pr():
+    with _triage_env() as (conn, ctx):
+        old = "https://github.com/jkrumm/demo-repo/pull/7"
+        eid = _seed_adoptable_item(conn, external_id="sig-argo-adopt", pr_number=9, old_pr=old)
+        _argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "adopt", {"pr": "9"})]
+        )
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING, dict(item)
+        assert item["implement_job"] == "impl-sig-argo-adopt", dict(item)
+        assert item["pr_url"].endswith("/pull/9"), dict(item)
+        assert item["reviewed_sha"] is None and item["revision_count"] == 0, dict(item)
+        assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
+        assert len(ctx.argo_acks) == 1 and ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
+        assert ctx.argo_acks[0]["result"] == {"pullRequest": 9}, ctx.argo_acks[0]
+
+
+def test_apply_argo_adopt_without_a_pr_number_is_rejected():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_adoptable_item(conn, external_id="sig-argo-adopt-nopr", pr_number=9)
+        _argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "adopt")]
+        )
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION and item["implement_job"] is None, dict(item)
+        assert CLOSED_PRS == [], CLOSED_PRS
+        assert len(ctx.argo_acks) == 1 and ctx.argo_acks[0]["status"] == "rejected", ctx.argo_acks
+        assert "pull request number" in (ctx.argo_acks[0]["error"] or ""), ctx.argo_acks[0]
+
+
+def test_apply_argo_adopt_refuses_a_pr_warden_never_opened():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_adoptable_item(conn, external_id="sig-argo-adopt-foreign", pr_number=9, owner="someone")
+        _argo.fetch_actions = lambda machine, **kw: (
+            "ok", [_argo_action("a1", eid, "adopt", {"pr": "9"})]
+        )
+        notify.apply_argo_actions(conn, NOW, dry_run=False)
+
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION and item["implement_job"] is None, dict(item)
+        assert CLOSED_PRS == [], CLOSED_PRS
+        assert len(ctx.argo_acks) == 1 and ctx.argo_acks[0]["status"] == "rejected", ctx.argo_acks
+        assert "no pull request warden opened" in (ctx.argo_acks[0]["error"] or ""), ctx.argo_acks[0]
+
+
 def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():
     with _triage_env() as (conn, ctx):
         eid1 = _seed_verdict_item(conn, external_id="sig-argo-raise", investigate_job="investigate-job-raise")

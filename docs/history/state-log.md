@@ -10068,9 +10068,12 @@ dispatch's own `done` row is what `plan_or_land()` reads, so the `dispatch/…`-
 review-confirmed preconditions all still hold; adopt is not a second merge authority. A prior
 `pr_url` is closed best-effort (`core.close_pr_best_effort()`), and a PR warden did not open — or one
 already merged — is refused before any state write. Allowed from `needs_decision`/`failed`
-(`work.ADOPT_ALLOWED_STATES`, mirrored by the CLI), never an in-flight state; a reverted item
-(`revert_pr`) is refused. CLI-only for now: `adopt` needs a PR number the Argo board cannot know, so
-`api.py`'s `availableActions` deliberately does not list it (a form/CLI is its door). No schema
-change, no migration. Tests: two in `tests/test_triage.py` (rejoin + close prior, refuse a foreign/
-merged PR) and four in `tests/test_warden_cli.py` (adopt, refuse, dry-run, usage/state); 539 → 541,
-CLI 83 → 87. `make check` green.
+(`work.ADOPT_ALLOWED_STATES`, mirrored by the CLI and the Argo handler), never an in-flight state; a
+reverted item (`revert_pr`) is refused. Both doors share `work.adopt_own_pr()`: the CLI
+(`warden adopt --pr <n>`) and an Argo `adopt` action whose PR number rides in the payload
+(`payload.pr`, like dismiss's `reason`/note's `text`/retry's `why` — a PR number is no different),
+and `api.py`'s `availableActions` lists `adopt` beside `implement` for an owner-state item, so the
+board offers it and the owner no longer has to drop to the CLI. No schema change, no migration.
+Tests: five in `tests/test_triage.py` (rejoin + close prior, refuse a foreign/merged PR, and the
+three Argo-handler cases) and four in `tests/test_warden_cli.py` (adopt, refuse, dry-run, usage/
+state); 539 → 544, CLI 83 → 87. `make check` green.
