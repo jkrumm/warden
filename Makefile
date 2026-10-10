@@ -42,14 +42,27 @@ help:
 	@echo "  make slack-app-update SLACK_CONFIG_TOKEN=xoxe-... APP_ID=... update it — see slack/README.md"
 
 .PHONY: setup
-setup: venv render-plists agents link
+setup: assert-main-checkout venv render-plists agents link
 	@echo "warden: setup complete — run 'make status'"
 
 # A wrapper, not a symlink: scripts/warden resolves the venv relative to its own path.
 BIN_LINK := $(HOME)/.local/bin/warden
 
+# WARDEN_REPO is $(shell pwd), so `make link` from a linked worktree would repoint
+# ~/.local/bin/warden at a checkout that is deleted when the worktree goes — an episode
+# once left the CLI dangling that way. Refuse unless this is the main checkout: a linked
+# worktree reports a per-worktree --git-dir but shares the main --git-common-dir.
+.PHONY: assert-main-checkout
+assert-main-checkout:
+	@[ "$$(git -C "$(WARDEN_REPO)" rev-parse --git-dir 2>/dev/null)" = "$$(git -C "$(WARDEN_REPO)" rev-parse --git-common-dir 2>/dev/null)" ] || { \
+		echo "warden: refusing — $(WARDEN_REPO) is a git worktree, not the live checkout."; \
+		echo "        The wrapper would point every shell at a checkout deleted with the worktree."; \
+		echo "        Run 'make link' from the live checkout ($(HOME)/SourceRoot/warden) instead."; \
+		exit 1; \
+	}
+
 .PHONY: link
-link:
+link: assert-main-checkout
 	@mkdir -p "$(dir $(BIN_LINK))"
 	@printf '#!/bin/sh\nexec "%s/scripts/warden" "$$@"\n' "$(WARDEN_REPO)" > "$(BIN_LINK)"
 	@chmod +x "$(BIN_LINK)"

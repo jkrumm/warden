@@ -92,7 +92,9 @@ tool even though launchd hands the loop a minimal PATH.
 
 - **The working tree is live.** The LaunchAgents import this checkout every tick; a
   saved half-edit (even a migration) acts on the real ledger. Do non-trivial work
-  in a git worktree and fast-forward master when green.
+  in a git worktree and fast-forward master when green. `make link`/`make setup`
+  refuse from a worktree — they write `~/.local/bin/warden` from `$(shell pwd)`,
+  which would point every shell at a checkout that is deleted with the worktree.
 - **Never start a second loop.** Two loops against one ledger double every post and
   every dispatch. Check `make status` before loading anything.
 - **The ledger** `~/.warden/warden.db` is live and not in git. Never migrate it from
