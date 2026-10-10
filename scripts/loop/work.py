@@ -234,21 +234,17 @@ def _latest_terminal_note(conn: sqlite3.Connection, event_id: int) -> tuple[str,
     the brief can date the resolution and the investigation can judge whether it still applies.
 
     A pure-silence close (`core.QUIET_RESOLVE_NOTE_PREFIX`, what the grouped-source auto-resolve
-    writes when an alert simply stops firing) answers nothing, so it must never SHADOW an earlier
-    note that did: the first query takes the latest terminal note that is neither blank nor a
-    silence note. Only when no such note exists does the fallback let a silence note stand in — it
-    is still a real prior resolution when it is all there is. A blank note (`note=''`, a legacy or
-    out-of-band row) is skipped rather than read as an answer. `ORDER BY id DESC` picks the LATEST
+    writes when an alert simply stops firing) answers nothing, so it is skipped entirely: it must
+    never SHADOW an earlier note that did, and when it is the only terminal note there is no prior
+    answer to carry, so this returns None. A blank note (`note=''`, a legacy or out-of-band row) is
+    skipped the same way rather than read as an answer. `ORDER BY id DESC` picks the LATEST
     qualifying note, not an earlier one."""
     placeholders = ",".join("?" * len(core.TERMINAL_STATES))
-    base = (f"SELECT note, at FROM item_transitions WHERE event_id=? AND to_state IN ({placeholders}) "
-            f"AND note IS NOT NULL AND TRIM(note) <> ''")
     row = conn.execute(
-        f"{base} AND note NOT LIKE ? ORDER BY id DESC LIMIT 1",
+        (f"SELECT note, at FROM item_transitions WHERE event_id=? AND to_state IN ({placeholders}) "
+         f"AND note IS NOT NULL AND TRIM(note) <> '' AND note NOT LIKE ? ORDER BY id DESC LIMIT 1"),
         (event_id, *core.TERMINAL_STATES, core.QUIET_RESOLVE_NOTE_PREFIX + "%"),
     ).fetchone()
-    if row is None:
-        row = conn.execute(f"{base} ORDER BY id DESC LIMIT 1", (event_id, *core.TERMINAL_STATES)).fetchone()
     if row is None:
         return None
     return (row["note"].strip(), row["at"])

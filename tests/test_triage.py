@@ -7085,10 +7085,10 @@ def test_cluster_brief_renders_a_reopened_members_prior_resolution_note():
         brief = work._build_cluster_brief(
             repo="demo-repo", members=[_rows(conn, eid)],
             event_rows_by_id={eid: core.get_event(conn, eid)}, sibling_events=[],
-            prior_notes={eid: ("signal quiet since 2026-01-01 00:00 UTC", OLD.isoformat())},
+            prior_notes={eid: ("owner answered: real cause", OLD.isoformat())},
         )
         assert "PRIOR RESOLUTION" in brief, brief
-        assert "signal quiet since 2026-01-01 00:00 UTC" in brief, brief
+        assert "owner answered: real cause" in brief, brief
         assert core.fmt_ts(OLD.isoformat()) in brief, brief
         assert "re-ask the owner" in brief, brief
         assert "explains ONLY this signature" in brief, brief
@@ -7138,9 +7138,10 @@ def test_latest_terminal_note_prefers_the_real_note_over_a_later_silence_note():
         assert work._latest_terminal_note(conn, eid) == ("owner answered: real cause", OLD.isoformat())
 
 
-def test_latest_terminal_note_falls_back_to_a_silence_note_when_that_is_all_there_is():
-    """With no substantive close note, the silence resolution IS the prior resolution and must be
-    rendered rather than dropped."""
+def test_latest_terminal_note_returns_none_when_the_only_terminal_note_is_a_silence_note():
+    """A pure-silence close answers nothing, so when it is the only terminal note there is no prior
+    resolution to carry and `_latest_terminal_note` returns None — rendering a 'signal quiet since'
+    auto-closure as a PRIOR RESOLUTION would suppress investigation of a genuine recurrence."""
     with _triage_env() as (conn, ctx):
         eid = _seed_row(conn, external_id="b-only-silence", title="Recurring", repo="demo-repo")
         conn.execute(
@@ -7149,8 +7150,7 @@ def test_latest_terminal_note_falls_back_to_a_silence_note_when_that_is_all_ther
              f"{core.QUIET_RESOLVE_NOTE_PREFIX}2026-01-01 00:00 UTC"),
         )
         conn.commit()
-        assert work._latest_terminal_note(conn, eid) == (
-            f"{core.QUIET_RESOLVE_NOTE_PREFIX}2026-01-01 00:00 UTC", NOW.isoformat())
+        assert work._latest_terminal_note(conn, eid) is None
 
 
 def test_latest_terminal_note_skips_a_blank_note_for_an_earlier_real_one():

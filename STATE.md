@@ -56,11 +56,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   belongs (`work._reroute_repo()`).
 - **Prior resolution in the brief.** A reopened item's most recent SUBSTANTIVE close note and its
   date (`item_transitions`, terminal state; a later silence close or a blank row never shadows a
-  real answer) ride into the fresh investigate brief as a dated `PRIOR RESOLUTION` line
-  (`work._latest_terminal_note`). The line states the note explains ONLY its own signature, and that
-  `nextAction=none` closes the whole cluster only if every member is independently explained, so the
-  episode does not re-ask the owner what a prior one answered nor silently close an unexplained
-  sibling.
+  real answer, and a pure-silence close on its own yields no `PRIOR RESOLUTION` line at all) ride
+  into the fresh investigate brief as a dated `PRIOR RESOLUTION` line (`work._latest_terminal_note`).
+  The line states the note explains ONLY its own signature, and that `nextAction=none` closes the
+  whole cluster only if every member is independently explained, so the episode does not re-ask the
+  owner what a prior one answered nor silently close an unexplained sibling.
 - **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
   superseded/fixed), 2 `needs_decision`.
 
