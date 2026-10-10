@@ -4023,7 +4023,8 @@ def test_review_needs_human_without_a_category_is_re_reviewed_once_then_decided(
 def test_second_uncategorized_needs_human_with_blocking_findings_goes_back_for_a_revision():
     with _triage_env() as (conn, ctx):
         eid = _seed_review_item(conn, "rv-nocat-block", 33)
-        conn.execute("UPDATE dispatches SET validation_status='redriven' WHERE job_id='implement-rv-nocat-block'")
+        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id='implement-rv-nocat-block'",
+                     ('redriven:' + "a" * 40,))
         conn.commit()
         _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result(
             "needs-human", schema_version=2, summary="unsure",
@@ -4032,6 +4033,27 @@ def test_second_uncategorized_needs_human_with_blocking_findings_goes_back_for_a
         train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and "off by one" in item["note"], dict(item)
+
+
+def test_a_redrive_latch_from_another_head_does_not_suppress_the_ask_and_the_context_keeps_it():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "rv-newhead", 35)
+        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id='implement-rv-newhead'",
+                     ("redriven:" + "b" * 40,))
+        # A reviewed-before SHA adds the delta paragraph; both must survive the cap.
+        conn.execute("UPDATE triage_items SET reviewed_sha=?, brief=? WHERE event_id=?",
+                     ("c" * 40, "x" * 30000, eid))
+        conn.commit()
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result(
+            "needs-human", schema_version=2, summary="accept the descope or not?")}
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit_review = _fake_submit_review(calls)
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert core.get_item(conn, eid)["reviewed_sha"] == "c" * 40, "the other head's latch must not decide this one"
+        assert len(calls) == 1, calls
+        ctxt = calls[0]["context"]
+        assert "PRIOR ESCALATION" in ctxt and "Focus on what changed" in ctxt, ctxt[-400:]
+        assert len(ctxt) <= _dispatch.MAX_CONTEXT_CHARS, len(ctxt)
 
 
 def test_schema_one_needs_human_review_still_goes_to_the_owner_untouched():

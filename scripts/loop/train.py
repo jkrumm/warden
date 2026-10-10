@@ -275,30 +275,34 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     if core.is_revert(item):
         return verify.revert_review_context(item)
     base = work.validation_context(conn, item)
+    extras: list[str] = []
     prior = _review_decide_note(conn, item)
     if prior is not None:
-        decide = _decide_review_paragraph(prior)
-        base = "\n\n".join((base[: _dispatch.MAX_CONTEXT_CHARS - len(decide) - 2], decide))
+        extras.append(_decide_review_paragraph(prior))
     reviewed, sha = item["reviewed_sha"], item["train_sha"]
-    if not reviewed or reviewed == sha:
-        return base
-    delta = (f"A review already confirmed this pull request at {reviewed}; the branch was since rebased "
-             f"onto a newer base and is now {sha}. Focus on what changed since that review.")
-    return "\n\n".join((base[: _dispatch.MAX_CONTEXT_CHARS - len(delta) - 2], delta))
+    if reviewed and reviewed != sha:
+        extras.append(f"A review already confirmed this pull request at {reviewed}; the branch was since rebased "
+                      f"onto a newer base and is now {sha}. Focus on what changed since that review.")
+    # One truncation for every appended paragraph: the base gives way, never an instruction.
+    room = _dispatch.MAX_CONTEXT_CHARS - sum(len(e) + 2 for e in extras)
+    return "\n\n".join((base[:room], *extras))
 
 
 REVIEW_DECIDE_NOTE_PREFIX = "re-reviewed to decide"
-REVIEW_REDRIVEN = "redriven"
+REVIEW_REDRIVEN = "redriven"  # validation_status prefix, followed by ":<train sha>"
+# The first review schema whose verdict can carry `escalationCategory`.
+REVIEW_CATEGORY_SCHEMA = 2
 
 
 def _review_decide_note(conn: sqlite3.Connection, item: sqlite3.Row) -> str | None:
     """The once-per-implement-job guard for a `needs-human` review that named no owner-only category:
-    `dispatches.validation_status == 'redriven'` on the implement row (a `merging` hop to `merging`
-    writes no transition, so there is none to read). Returns the question to quote: the item's note
+    `dispatches.validation_status == 'redriven:<train sha>'` on the implement row (a `merging` hop to
+    `merging` writes no transition, so there is none to read; scoped to the SHA, so a rewound train
+    reviewing a new head is asked again). Returns the question to quote: the item's note
     while it still carries REVIEW_DECIDE_NOTE_PREFIX, else a generic stand-in. None = not yet sent back."""
     row = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?",
                        (item["implement_job"],)).fetchone()
-    if row is None or row["validation_status"] != REVIEW_REDRIVEN:
+    if row is None or row["validation_status"] != f"{REVIEW_REDRIVEN}:{item['train_sha']}":
         return None
     note = item["note"] or ""
     return note if note.startswith(REVIEW_DECIDE_NOTE_PREFIX) else f"{REVIEW_DECIDE_NOTE_PREFIX}: (question not kept)"
@@ -370,8 +374,10 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     records the SHA and the train moves to merge.
 
     A non-empty `blocking` list refuses the merge outright, never read as a pass, with ONE
-    precedence above it: `"needs-human"` goes to the owner (`needs_decision`) even when it carries
-    findings, because that outcome says the REVIEW is incomplete and a revision would be spent on
+    precedence above it: `"needs-human"` with an `escalationCategory` (or a schema-1 or revert verdict,
+    which cannot be re-driven) goes to the owner (`needs_decision`, note led by `[category]`) even when
+    it carries findings; a schema-2 one with no category is re-reviewed once per head, then read as the
+    decision (blocking findings revise, none confirms), because that outcome says the REVIEW is incomplete and a revision would be spent on
     findings its own reviewer would not stand behind. A finding about the PR's own *wrapper* never
     blocks-and-revises either, since no episode can satisfy it; it also goes to the owner with the
     finding on the card. A `blocked` review goes back to `working` for a revision attempt
@@ -384,7 +390,7 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     needs_decision | error`.
 
     Fail-closed: `"clean"` confirms; `"actionable"` with nothing in `blocking` confirms;
-    `"needs-human"` goes to the owner whatever it carries; any other non-empty `blocking` blocks,
+    `"needs-human"` goes to the owner whatever it carries once it names a category (or cannot be re-driven); any other non-empty `blocking` blocks,
     regardless of `outcome`; anything else (missing, or an outcome this switch does not recognise)
     is `failed`, never a silent confirm. `assert_outcome()` is the first line of defence (a value
     outside `REVIEW_OUTCOMES` is a loud `RemoteError` before this switch runs); this switch's own
@@ -396,8 +402,9 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     event_id, review_job = item["event_id"], item["validation_job"]
 
     def _review_failed(reason: str) -> None:
-        conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
-                     ("error", item["implement_job"]))
+        # An infra failure keeps the redrive latch: the once-per-head guarantee must survive it.
+        conn.execute("UPDATE dispatches SET validation_status='error' WHERE job_id=? "
+                     "AND COALESCE(validation_status, '') NOT LIKE ?", (item["implement_job"], f"{REVIEW_REDRIVEN}:%"))
         _train_strike(conn, item, now, f"step-7 review ended with no verdict: {reason}", validation_job=None)
 
     try:
@@ -463,13 +470,15 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     human_question_note = None
     category = work.escalation_category(verdict) if outcome == "needs-human" else None
     decided_note = None
-    if outcome == "needs-human" and category is None and verdict.get("schemaVersion", 1) >= 2:
-        # A schema-2 needs-human naming no owner-only reason is not an owner question. Once: a fresh
-        # review is asked to decide (the transition note is the guard and the next context's quote).
-        # Twice: the review is read as the decision it is, findings or none.
+    if (outcome == "needs-human" and category is None and not core.is_revert(item)
+            and verdict.get("schemaVersion", 1) >= REVIEW_CATEGORY_SCHEMA):
+        # A needs-human naming no owner-only reason is not an owner question (a schema-1 verdict cannot
+        # name one, and a revert's review carries no decide paragraph, so both go to the owner as
+        # before). Once per head: a fresh review is asked to decide (REVIEW_REDRIVEN is the guard, the
+        # item note the next context's quote). Twice: the review is read as the decision it is.
         if _review_decide_note(conn, item) is None:
             conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?",
-                         (REVIEW_REDRIVEN, item["implement_job"]))
+                         (f"{REVIEW_REDRIVEN}:{item['train_sha']}", item["implement_job"]))
             hopped = _train_hop(conn, item, now, validation_job=None, retry_at=None, **_stage_success(item),
                                 note=f"{REVIEW_DECIDE_NOTE_PREFIX}: {summary}")
             _release_review_claim(conn, event_id, claim_until)
