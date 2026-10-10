@@ -54,7 +54,11 @@ An implement that found nothing to change (`no_changes`) is the opposite: a term
 answer, not infrastructure. An attempt with nothing on record closes `closed(resolved)`
 with its summary; a revision, or an attempt with a pull request already on record (which
 would have to touch it), goes to `needs_decision` instead, its note naming the open PR —
-never a strike and another episode.
+never a strike and another episode. An implement whose repo agent-gateway caps below
+`implement` is never submitted to: `maybe_auto_implement()` reads the dispatch policy once
+per pass and parks the item `needs_decision` with `apply by hand: <recommendation>`, so the
+recommendation is not buried in a `failed(policy)` (a repo with no rule has no ceiling; an
+unreadable policy submits as before).
 
 `failed` is classified where it happens (`failure_class`) and is not a graveyard for
 what was never the work's fault. `infra` (agent-gateway 5xx/unreachable, a synthesis

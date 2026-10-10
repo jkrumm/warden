@@ -3087,10 +3087,11 @@ def test_auto_implement_in_flight_lock_defers_with_a_visible_note():
 
 
 def test_auto_implement_refused_by_agent_gateway_ends_the_item_and_is_never_retried():
-    """A repo capped below `implement` is agent-gateway's call, answered as a 4xx on
-    submit. The claim is NOT handed back to `verdict` (that flapped item 543
-    between verdict and implementing every tick, §67): the item ends
-    `failed` carrying agent-gateway's message and the next tick does not submit."""
+    """A refusal the ceiling pre-check cannot foresee — a repo the policy names no rule for (so no
+    ceiling here) that agent-gateway still refuses, e.g. a policy that changed between the read and
+    the submit, or another 4xx (an unlisted repo, a bad model). The claim is NOT handed back to
+    `verdict` (that flapped item 543 between verdict and implementing every tick, §67): the item
+    ends `failed` carrying agent-gateway's message and the next tick does not submit."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-capped", repo="capped-repo")
         calls: list[dict[str, Any]] = []
@@ -3110,6 +3111,67 @@ def test_auto_implement_refused_by_agent_gateway_ends_the_item_and_is_never_retr
         states = [r[0] for r in conn.execute(
             "SELECT to_state FROM item_transitions WHERE event_id=? ORDER BY id", (eid,))]
         assert states == [core.STATE_FAILED], states   # the claim is not a state change; the refusal is
+
+
+def test_auto_implement_over_the_repo_ceiling_parks_for_the_owner_instead_of_submitting():
+    """A repo agent-gateway caps below `implement` must never be submitted to: the 4xx lands the
+    item `failed(policy)`, burying the investigation's recommendation. maybe_auto_implement() reads
+    the ceiling first and routes the item to `needs_decision` with `apply by hand: <recommendation>`,
+    opening no episode and no operation. It is inert on the next pass (not `working`)."""
+    with _triage_env() as (conn, ctx):
+        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
+        eid = _seed_verdict_item(conn, external_id="sig-ceiling-divert")
+        conn.execute(
+            "UPDATE dispatches SET verdict_json=? WHERE job_id='investigate-job'",
+            (json.dumps({"summary": "s", "nextAction": "implement", "confidence": "high",
+                         "recommendation": "re-pin the route in config"}),),
+        )
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert calls == [], "an over-ceiling repo must never be submitted to"
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["implement_job"] is None and item["failure_class"] is None
+        assert item["note"] == "apply by hand: re-pin the route in config", item["note"]
+        assert conn.execute("SELECT COUNT(*) AS n FROM operations WHERE kind='implement'").fetchone()["n"] == 0
+
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert calls == [] and core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
+
+
+def test_auto_implement_ceiling_diversion_writes_nothing_under_dry_run():
+    """The dry-run contract (DESIGN.md § What must not be lost): a --dry-run pass must not move an
+    over-ceiling item, only report that it would."""
+    with _triage_env() as (conn, ctx):
+        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
+        eid = _seed_verdict_item(conn, external_id="sig-ceiling-dryrun")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=True)
+        assert "would route" in out.getvalue() and "needs_decision" in out.getvalue(), out.getvalue()
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING, dict(item)
+
+
+def test_auto_implement_submits_when_the_policy_names_no_ceiling_for_the_repo():
+    """No rule for the repo means no ceiling below the top: the submit proceeds exactly as before.
+    This is the same shape the default fixture policy has, pinned so a future policy parse cannot
+    silently divert every repo."""
+    with _triage_env() as (conn, ctx):
+        DISPATCH_POLICY["body"] = {"rules": {"other-repo": {"ceiling": "investigate"}}, "overrides": []}
+        eid = _seed_verdict_item(conn, external_id="sig-no-ceiling")
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert len(calls) == 1, calls
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["implement_job"] is not None, dict(item)
 
 
 def test_implement_success_joins_the_merge_train_at_update():
@@ -7813,7 +7875,10 @@ def test_strike_limit_lands_infra_with_a_recipe_and_a_backoff_and_a_caller_may_o
 
 def test_end_on_refusal_lands_policy_with_the_state_it_came_from_and_the_policy_hash():
     with _triage_env() as (conn, _ctx):
-        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
+        # The item's repo (demo-repo) must NOT be capped in the policy: an over-ceiling submit is
+        # diverted to needs_decision before it is ever attempted (see the ceiling test below), so
+        # end_on_refusal() is exercised with a refusal the ceiling pre-check cannot pre-empt.
+        DISPATCH_POLICY["body"] = {"rules": {"other-repo": {"ceiling": "investigate"}}, "overrides": []}
         expected = _agent_gateway.policy_hash(DISPATCH_POLICY["body"])
         eid = _seed_verdict_item(conn, external_id="sig-fc-refusal")
         _agent_gateway.submit = _refusing_submit([])
@@ -7949,7 +8014,9 @@ def test_a_backfilled_infra_failure_with_no_retry_at_is_due_at_once():
 
 def test_policy_failures_are_redriven_when_the_policy_hash_changes_and_not_when_it_is_unreadable():
     with _triage_env() as (conn, ctx):
-        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
+        # The capped repo is deliberately NOT the item's own: demo-repo must stay submitable so the
+        # policy-failure machinery (a refusal the ceiling pre-check cannot pre-empt) is what runs.
+        DISPATCH_POLICY["body"] = {"rules": {"other-repo": {"ceiling": "investigate"}}, "overrides": []}
         eid = _seed_verdict_item(conn, external_id="sig-fc-policy")
         calls: list[dict[str, Any]] = []
         _agent_gateway.submit = _refusing_submit(calls)
@@ -7967,7 +8034,7 @@ def test_policy_failures_are_redriven_when_the_policy_hash_changes_and_not_when_
         assert core.get_item(conn, eid)["state"] == core.STATE_FAILED
 
         # Policy changed: re-driven once, back where it came from, no infra limit or backoff involved.
-        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "implement"}}, "overrides": []}
+        DISPATCH_POLICY["body"] = {"rules": {"other-repo": {"ceiling": "implement"}}, "overrides": []}
         work.redrive_failed(conn, NOW, dry_run=True)
         assert core.get_item(conn, eid)["state"] == core.STATE_FAILED, "a dry run writes nothing"
         work.redrive_failed(conn, NOW, dry_run=False)

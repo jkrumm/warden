@@ -28,6 +28,26 @@ VALID_TIERS = ("investigate", "author", "implement")
 GATED_TIERS = ("implement",)
 
 
+def dispatch_ceiling(dispatch_policy: dict[str, Any], repo: str) -> str | None:
+    """The tier ceiling agent-gateway's `GET /api/dispatch-policy` names for `repo`
+    (`rules[<repo>].ceiling`), or None when the policy names no rule for it: a repo absent
+    from `rules` has no ceiling below the top (agent-gateway's own default). A malformed rule
+    (no string `ceiling`, or one outside `VALID_TIERS`) is also no ceiling here — it stays
+    agent-gateway's to enforce on submit."""
+    rules = dispatch_policy.get("rules")
+    rule = rules.get(repo) if isinstance(rules, dict) else None
+    ceiling = rule.get("ceiling") if isinstance(rule, dict) else None
+    return ceiling if ceiling in VALID_TIERS else None
+
+
+def tier_over_ceiling(tier: str, ceiling: str | None) -> bool:
+    """Whether `tier` ranks above `ceiling` in `VALID_TIERS` order. No ceiling is never
+    exceeded."""
+    if ceiling is None or tier not in VALID_TIERS:
+        return False
+    return VALID_TIERS.index(tier) > VALID_TIERS.index(ceiling)
+
+
 def triage_policy_path() -> Path:
     if os.environ.get("WARDEN_TRIAGE_POLICY"):
         return Path(os.environ["WARDEN_TRIAGE_POLICY"]).expanduser()

@@ -313,6 +313,28 @@ def test_require_auto_from_item_not_done():
         raise AssertionError("expected PolicyError")
 
 
+def test_dispatch_ceiling_reads_the_repo_rule_and_is_none_without_one():
+    body = {"rules": {"capped": {"ceiling": "investigate", "sensitive": True},
+                      "malformed": {"sensitive": True},
+                      "unknown": {"ceiling": "whenever"}},
+            "overrides": []}
+    assert policy.dispatch_ceiling(body, "capped") == "investigate"
+    assert policy.dispatch_ceiling(body, "malformed") is None, "no string ceiling is no ceiling"
+    assert policy.dispatch_ceiling(body, "unknown") is None, "a tier outside VALID_TIERS is no ceiling"
+    assert policy.dispatch_ceiling(body, "absent") is None, "no rule for the repo is no ceiling"
+    assert policy.dispatch_ceiling({"rules": []}, "capped") is None, "a non-dict rules is no ceiling"
+    assert policy.dispatch_ceiling({}, "capped") is None
+
+
+def test_tier_over_ceiling_ranks_by_valid_tiers_order():
+    assert policy.tier_over_ceiling("implement", "investigate") is True
+    assert policy.tier_over_ceiling("implement", "author") is True
+    assert policy.tier_over_ceiling("implement", "implement") is False
+    assert policy.tier_over_ceiling("author", "investigate") is True
+    assert policy.tier_over_ceiling("investigate", "investigate") is False
+    assert policy.tier_over_ceiling("implement", None) is False, "no ceiling is never exceeded"
+
+
 def test_require_auto_from_item_no_verdict():
     conn, _ = _fresh_ledger()
     _seed_dispatch_row(conn, "job-1", status="done", verdict=None)

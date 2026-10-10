@@ -6,7 +6,7 @@ build log (§1–§144).
 
 | | |
 |-|-|
-| Last updated | 2026-10-10 (§144 — a step-7 `needs-human` review names its escalation too; otherwise warden decides) |
+| Last updated | 2026-10-10 (§145 — an over-ceiling auto-implement parks for the owner instead of failing) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 17 |
@@ -54,6 +54,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   item back to `triaged` in that repo (once per item; the re-route's transition note is the
   ping-pong guard) instead of paging the owner — a misrouted finding re-investigates where it
   belongs (`work._reroute_repo()`).
+- **Ceiling diversion.** `maybe_auto_implement()` reads agent-gateway's dispatch policy once per pass:
+  an item in a repo capped below `implement` is parked in `needs_decision` with
+  `apply by hand: <recommendation>` instead of being submitted (a 4xx would otherwise land it
+  `failed(policy)` and bury the recommendation). A repo with no rule has no ceiling; an unreadable
+  policy submits as before, leaving agent-gateway to refuse.
 - **Owner-only escalation.** A `human` verdict reaches `needs_decision` only with an
   `escalationCategory` (product, data_loss, spend, other_people, security, blocker); the note carries
   it as `[category]`. An investigate verdict without one is re-driven once ("decide it yourself"), then

@@ -10050,3 +10050,18 @@ Replay on the deployed pair (agent-gateway review of open warden PR #25, schemaV
 one concrete blocking finding, `needs-human` not raised, nothing paged. Caveat: shows "decides when it can", not
 "never asks"; the three old items were not re-run. Not covered by an end-to-end test: the gateway's forced-blocker
 paths (only the coercion/normalizer/enum are unit-tested).
+
+## 145. An over-ceiling auto-implement parks for the owner instead of failing (2026-10-10)
+
+A `working` item whose folded investigation said implement, in a repo agent-gateway caps below `implement`, was
+submitted anyway: `maybe_auto_implement()` hard-codes `tier="implement"` and `require_auto_from_item()` checked only
+the item's OWN `max_tier`, never the repo's ceiling. agent-gateway answered the 4xx, `end_on_refusal()` landed the item
+`failed(policy)`, and the recommendation was buried (items 1000/1002; 1503's re-file).
+
+`maybe_auto_implement()` now reads agent-gateway's `GET /api/dispatch-policy` ONCE per pass and, when the item's repo
+names a ceiling below `implement`, routes the item to `needs_decision` with `apply by hand: <recommendation>` instead
+of submitting — no episode, no operation, nothing to re-drive. A repo absent from `rules` has no ceiling (agent-gateway's
+own default is the top); an unreadable policy skips the check and submits as before, leaving agent-gateway to refuse.
+The check runs against the tier actually submitted, diverts only that item, writes no `verdict_json` and touches no
+sibling; `--dry-run` reports the diversion and writes nothing. `lifecycle/policy.py` grows `dispatch_ceiling()` and
+`tier_over_ceiling()`. `test_triage.py` 539 → 542, `test_lifecycle.py` 55 → 57.
