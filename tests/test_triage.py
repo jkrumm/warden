@@ -3454,7 +3454,9 @@ def test_implement_outcome_no_changes_closes_resolved():
 def test_implement_outcome_no_changes_on_a_revision_goes_to_needs_decision():
     """A REVISION that comes back no_changes declines to touch the pull request already on
     record; only the owner can decide what happens to it, so it goes to needs_decision — never
-    closed(resolved), never struck back into another episode."""
+    closed(resolved), never struck back into another episode. With no reviewed head on record
+    (`blocked_sha` None, the seed's case here) there is nothing to compare the PR head against, so
+    the owner is the conservative answer; the moved-head rejoin is a separate test."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-no-changes-revision", job_id="impl-no-changes-rev")
         conn.execute("UPDATE triage_items SET revision_count=1, pr_url=? WHERE event_id=?",
@@ -3491,6 +3493,91 @@ def test_implement_outcome_no_changes_with_a_pr_on_record_goes_to_needs_decision
         assert item["close_reason"] is None, dict(item)
         assert "https://github.com/jkrumm/demo-repo/pull/11" in item["note"], item["note"]
         assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/11", "the open PR stays on record"
+
+
+def test_implement_outcome_no_changes_on_a_revision_rejoins_the_train_when_the_head_moved():
+    """A revision no_changes on a PR whose head moved since the blocking review (`blocked_sha`) is not
+    a "declined to fix" for the owner: the head the review refused is gone, so the item rejoins the
+    merge train for a fresh review, exactly as a `pr_updated` outcome would (weatherorb #60 / item
+    1464: the fix landed after the block and the next revision paged anyway)."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-no-changes-moved", job_id="impl-no-changes-moved")
+        conn.execute("UPDATE triage_items SET revision_count=1, pr_url=?, blocked_sha=? WHERE event_id=?",
+                     ("https://github.com/jkrumm/demo-repo/pull/7", TRAIN_SHA, eid))
+        conn.commit()
+        PR_HEAD.update(sha=REBASED_SHA, state="open")
+        _agent_gateway.get = lambda job_id: {
+            "status": "done", "result": _dispatch_result("no_changes", summary="the fix already landed"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING, dict(item)
+        assert item["train_stage"] == train.TRAIN_UPDATE and item["train_sha"] is None, dict(item)
+        assert item["blocked_sha"] is None, "a fresh attempt's train starts without a refused head"
+        assert item["pr_url"] == "https://github.com/jkrumm/demo-repo/pull/7", dict(item)
+        assert REBASED_SHA[:12] in item["note"], item["note"]
+
+
+def test_implement_outcome_no_changes_on_a_revision_pages_when_the_head_is_unchanged():
+    """The head the blocking review refused is still the head now (`blocked_sha` == the PR head): the
+    revision really did decline to address the finding, so it stays the owner's call."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-no-changes-same", job_id="impl-no-changes-same")
+        conn.execute("UPDATE triage_items SET revision_count=1, pr_url=?, blocked_sha=? WHERE event_id=?",
+                     ("https://github.com/jkrumm/demo-repo/pull/8", TRAIN_SHA, eid))
+        conn.commit()
+        PR_HEAD.update(sha=TRAIN_SHA, state="open")
+        _agent_gateway.get = lambda job_id: {
+            "status": "done", "result": _dispatch_result("no_changes", summary="still not applicable"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert "https://github.com/jkrumm/demo-repo/pull/8" in item["note"], item["note"]
+
+
+def test_implement_outcome_no_changes_on_a_revision_pages_when_the_pr_read_fails():
+    """A GitHub read that cannot confirm the PR head moved must never silently rejoin the train: the
+    item stays the owner's call, the conservative side."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-no-changes-unread", job_id="impl-no-changes-unread")
+        conn.execute("UPDATE triage_items SET revision_count=1, pr_url=?, blocked_sha=? WHERE event_id=?",
+                     ("https://github.com/jkrumm/demo-repo/pull/9", TRAIN_SHA, eid))
+        conn.commit()
+        _github.read_pr = lambda owner, repo, number: (_ for _ in ()).throw(RemoteError("GitHub 502"))
+        _agent_gateway.get = lambda job_id: {
+            "status": "done", "result": _dispatch_result("no_changes", summary="unknown"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert "https://github.com/jkrumm/demo-repo/pull/9" in item["note"], item["note"]
+
+
+def test_a_blocking_review_records_the_refused_head_for_a_later_revision():
+    """The head a step-7 review refused is persisted on the row (`blocked_sha`) before the item
+    leaves `merging` (which clears `train_sha`), so a revision that comes back no_changes can tell
+    whether the PR moved under the review (poll_implement_jobs())."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-block-head")
+        conn.execute(
+            "UPDATE triage_items SET train_stage='review', train_sha=?, state=?, implement_job=?, validation_job=?, pr_url=? "
+            "WHERE event_id=?",
+            (TRAIN_SHA, core.STATE_MERGING, "implement-job-bh", "validation-job-bh",
+             "https://github.com/jkrumm/demo-repo/pull/10", eid))
+        conn.commit()
+        _seed_implement_dispatch(conn, "implement-job-bh")
+        PR_HEAD.update(sha=TRAIN_SHA, state="open")
+        _agent_gateway.get = lambda job_id: {
+            "status": "done",
+            "result": _review_result("actionable",
+                                     blocking=[{"file": "scripts/x.py", "line": 12, "message": "broken"}]),
+        }
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING, dict(item)
+        assert item["blocked_sha"] == TRAIN_SHA, "the refused head must survive leaving `merging`"
+        assert item["train_sha"] is None, "the train's own SHA is cleared as before"
 
 
 def test_implement_no_changes_next_action_human_wins_over_the_close():
@@ -5176,8 +5263,8 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-argo-reinvestigate")
         conn.execute("UPDATE triage_items SET implement_job=?, validation_job=?, strikes=3, "
-                     "pr_url=?, reviewed_sha=?, revision_count=? WHERE event_id=?",
-                     ("stale-impl", "stale-val", "https://github.com/demo/repo/pull/7", "a" * 40, 3, eid))
+                     "pr_url=?, reviewed_sha=?, blocked_sha=?, revision_count=? WHERE event_id=?",
+                     ("stale-impl", "stale-val", "https://github.com/demo/repo/pull/7", "a" * 40, "b" * 40, 3, eid))
         core.set_state(conn, eid, core.STATE_FAILED, NOW, note="retries exhausted", strikes=3,
                         failure_class=core.FAILURE_WORK)
         conn.commit()
@@ -5190,7 +5277,8 @@ def test_apply_argo_reinvestigate_sends_the_item_back_to_triaged_for_a_fresh_inv
         assert item["state"] == core.STATE_TRIAGED and item["strikes"] == 0 and item["retry_at"] is None, dict(item)
         assert (item["dispatch_job"] is None and item["implement_job"] is None
                 and item["validation_job"] is None and item["pr_url"] is None
-                and item["reviewed_sha"] is None and item["revision_count"] == 0), dict(item)
+                and item["reviewed_sha"] is None and item["blocked_sha"] is None
+                and item["revision_count"] == 0), dict(item)
         assert [a["status"] for a in ctx.argo_acks] == ["applied", "rejected"], ctx.argo_acks
 
         calls: list[dict[str, Any]] = []

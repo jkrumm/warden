@@ -295,7 +295,7 @@ def test_migrate_adopts_pre_versioned_database():
         "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
         "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
         "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
-        "failure_class", "redrive_json", "redrives",
+        "failure_class", "redrive_json", "redrives", "blocked_sha",
     }, (
         f"unexpected column change on triage_items: "
         f"{post_cols['triage_items'] - pre_cols['triage_items']}")
@@ -1057,7 +1057,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     conn = ledger.connect(path, migrate=True)
     after = dt.datetime.now(dt.timezone.utc)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 17 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 18 == ledger.LEDGER_SCHEMA_VERSION
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
     assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
@@ -1135,7 +1135,7 @@ def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_r
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 17 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 18 == ledger.LEDGER_SCHEMA_VERSION
     assert {"failure_class", "redrive_json", "redrives"} <= _table_columns(conn, "triage_items")
     rows = {r["event_id"]: r for r in conn.execute("SELECT * FROM triage_items")}
 
@@ -1217,11 +1217,14 @@ def test_failed_snapshot_aborts_the_migration():
 
 def test_migration_17_backfills_only_the_five_misrecorded_weatherorb_items_as_fixed():
     path = _tmp_path()
-    conn = ledger.connect(path, migrate=True)
-    conn.close()
+    # A v16 database, built directly: migration 18 adds a COLUMN, so this test can no longer
+    # migrate fully and then downgrade the stamp (a re-run would re-add the column).
     conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("UPDATE schema_version SET version = 16")
+    conn.executescript(ledger.BASE_SCHEMA)
+    for version in range(2, 17):
+        conn.executescript(ledger.MIGRATIONS[version])
+    conn.execute(ledger._SCHEMA_VERSION_TABLE)
+    conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (16, 'test')")
     clock = "deadline expired: sat in `merged` for its full 1h without sweep_deadlines advancing it"
     rows = [(1281, "weatherorb", "closed", "resolved", clock), (1321, "weatherorb", "closed", "resolved", clock),
             (1314, "other", "closed", "resolved", clock),                       # right id, wrong repo
@@ -1242,6 +1245,30 @@ def test_migration_17_backfills_only_the_five_misrecorded_weatherorb_items_as_fi
                    1290: ("closed", "resolved"), 1500: ("closed", "resolved")}, got
     moved = conn.execute("SELECT event_id FROM item_transitions WHERE to_state='fixed' ORDER BY event_id").fetchall()
     assert [r[0] for r in moved] == [1281, 1321], moved
+    conn.close()
+
+
+def test_migration_18_adds_blocked_sha_without_touching_rows():
+    path = _tmp_path()
+    old = sqlite3.connect(path)
+    old.executescript(ledger.BASE_SCHEMA)
+    for version in range(2, 18):
+        old.executescript(ledger.MIGRATIONS[version])
+    old.execute(ledger._SCHEMA_VERSION_TABLE)
+    old.execute("INSERT INTO schema_version (version, applied_at) VALUES (17, 'test')")
+    old.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (1, 's', 'e1', 't', 'now')")
+    old.execute("INSERT INTO triage_items(event_id, signature, state, note, created_at, updated_at) "
+                "VALUES (1, 's:e1', 'working', 'a note', 'now', 'now')")
+    old.commit()
+    assert "blocked_sha" not in _table_columns(old, "triage_items"), "the v17 fixture predates the column"
+    old.close()
+
+    conn = ledger.connect(path, migrate=True)
+    conn.row_factory = sqlite3.Row
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
+    assert "blocked_sha" in _table_columns(conn, "triage_items")
+    row = conn.execute("SELECT * FROM triage_items WHERE event_id=1").fetchone()
+    assert row["blocked_sha"] is None and row["note"] == "a note", "adding the column touches no row"
     conn.close()
 
 

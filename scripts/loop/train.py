@@ -58,9 +58,11 @@ CHECKS_REGISTER_GRACE = dt.timedelta(minutes=2)
 # What entering the train writes (poll_implement_jobs()'s handoff): a new attempt's head was
 # never reviewed and has nothing to revise from yet. The handoff stamps `train_pushed_at` itself:
 # the episode just pushed, so an `up_to_date` update must not read an empty run list as green.
+# `blocked_sha` is reset too: it names the head a PREVIOUS step-7 review refused, and this attempt's
+# head has not been reviewed.
 TRAIN_START: dict[str, Any] = {"train_stage": TRAIN_UPDATE, "train_sha": None, "train_job": None,
                                 "reviewed_sha": None, "train_evidence": None, "train_rewinds": 0,
-                                "train_pushed_at": None}
+                                "train_pushed_at": None, "blocked_sha": None}
 
 MERGE_REFUSED_NOTE_PREFIX = "merge refused: "
 MERGE_PENDING_NOTE_PREFIX = "waiting for checks: "
@@ -533,8 +535,12 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         if core.is_revert(item):
             note = f"revert of {item['reverting_sha'][:12]} blocked, not revised — PR left open: {item['pr_url']}; {note}"
         # The findings go back to a fresh implement episode — see maybe_revise_blocked().
+        # `blocked_sha` keeps the head the review just refused: `train_sha` is cleared the moment the
+        # item leaves `merging` below, and a revision that comes back `no_changes` needs it to tell
+        # whether the pull request moved under the review (a fix that landed after the block) or is
+        # frozen at the refused head (poll_implement_jobs()).
         core.set_state(conn, event_id, core.STATE_WORKING if work.revisable(item) else core.STATE_FAILED, now, strikes=0,
-                        failure_class=core.FAILURE_WORK, note=note)
+                        failure_class=core.FAILURE_WORK, note=note, blocked_sha=sha)
     conn.commit()
     _release_review_claim(conn, event_id, claim_until)
     return False
@@ -583,9 +589,10 @@ def _walk_train(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int,
             break
         stage = _TRAIN_STAGES.get(item["train_stage"])
         if stage is None:
-            # A `merging` row on no stage (an entry path that set none): its train starts at update.
+            # A `merging` row on no stage (an entry path that set none, e.g. a redrive of a `failed`
+            # item): its train starts at update, and any `blocked_sha` from a previous train is stale.
             if not _train_hop(conn, item, now, train_stage=TRAIN_UPDATE, train_sha=None, train_job=None,
-                              validation_job=None):
+                              validation_job=None, blocked_sha=None):
                 break
             continue
         if not stage(conn, policy, item, now):
