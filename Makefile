@@ -41,8 +41,12 @@ help:
 	@echo "  make slack-app-create SLACK_CONFIG_TOKEN=xoxe-...           create the Warden Slack app"
 	@echo "  make slack-app-update SLACK_CONFIG_TOKEN=xoxe-... APP_ID=... update it — see slack/README.md"
 
+# `assert-main-checkout` is a prerequisite of every side-effecting target, not a sibling of
+# them: under `make -j setup` a sibling assertion can still be running while venv/render/
+# agents — which touch machine-global LaunchAgent state — are scheduled. Gate each of them
+# instead, so the assertion completes (or fails) before any side effect starts.
 .PHONY: setup
-setup: assert-main-checkout venv render-plists agents link
+setup: venv render-plists agents link
 	@echo "warden: setup complete — run 'make status'"
 
 # A wrapper, not a symlink: scripts/warden resolves the venv relative to its own path.
@@ -53,13 +57,18 @@ BIN_LINK := $(HOME)/.local/bin/warden
 # once left the CLI dangling that way. Refuse unless this is the main checkout: a linked
 # worktree reports a per-worktree --git-dir but shares the main --git-common-dir.
 #
+# The guard must discover the checkout actually being invoked, not an inherited override:
+# clear GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE first, or `GIT_DIR=/main/.git make link`
+# from a worktree reports the main dir for both answers and the check passes.
+#
 # Fail closed: if git cannot answer at all (not on PATH, not a git repo, or the worktree
 # metadata is already gone) both substitutions are empty and `[ "" = "" ]` would be true,
 # treating an unknown checkout as the main one and overwriting the wrapper anyway. Require
 # both answers to be non-empty before the equality test can pass.
 .PHONY: assert-main-checkout
 assert-main-checkout:
-	@dir="$$(git -C "$(WARDEN_REPO)" rev-parse --git-dir 2>/dev/null)"; \
+	@unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE; \
+	 dir="$$(git -C "$(WARDEN_REPO)" rev-parse --git-dir 2>/dev/null)"; \
 	 common="$$(git -C "$(WARDEN_REPO)" rev-parse --git-common-dir 2>/dev/null)"; \
 	[ -n "$$dir" ] && [ "$$dir" = "$$common" ] || { \
 		echo "warden: refusing — cannot confirm $(WARDEN_REPO) is the main checkout."; \
@@ -81,7 +90,7 @@ link: assert-main-checkout
 # ---------------------------------------------------------------------------
 
 .PHONY: venv
-venv:
+venv: assert-main-checkout
 	@command -v $(BASE_PY) >/dev/null 2>&1 || { \
 		echo "warden: $(BASE_PY) not found. It is pinned on purpose — see BASE_PY above."; \
 		echo "        install it (uv python install 3.11) rather than switching interpreters here."; \
@@ -161,7 +170,7 @@ logs:
 LA := $(HOME)/Library/LaunchAgents
 
 .PHONY: render-plists
-render-plists:
+render-plists: assert-main-checkout
 	@mkdir -p "$(LA)"
 	@for name in $(WARDEN_PLISTS); do \
 		src="$(WARDEN_REPO)/launchd/$$name.plist.template"; \
@@ -179,7 +188,7 @@ render-plists:
 # Unchanged content is a no-op above, so re-running never rewrites a plist — but a
 # rewritten one still has to be re-bootstrapped for launchd to see it.
 .PHONY: agents
-agents: render-plists
+agents: render-plists assert-main-checkout
 	@mkdir -p "$(WARDEN_HOME)"
 	@chmod +x "$(WARDEN_REPO)"/scripts/*.sh "$(WARDEN_REPO)"/scripts/warden 2>/dev/null || true
 	@for name in $(WARDEN_PLISTS); do \

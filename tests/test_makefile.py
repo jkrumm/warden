@@ -99,6 +99,33 @@ def test_link_refuses_when_git_cannot_read_the_checkout():
             "an unreadable checkout must fail closed, not overwrite the wrapper"
 
 
+def test_link_refuses_when_git_dir_is_inherited_from_the_main_checkout():
+    # From a linked worktree, inherited GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE pointing at
+    # the main checkout would make git report the main dir for both rev-parse answers, so the
+    # equality test wrongly passes. The guard must clear those overrides first.
+    with Fixture() as f:
+        env = {**f.env, "GIT_DIR": str(f.main / ".git"),
+               "GIT_COMMON_DIR": str(f.main / ".git"),
+               "GIT_WORK_TREE": str(f.main)}
+        res = subprocess.run(["make", "-C", str(f.worktree), "-f", str(MAKEFILE), "link"],
+                             capture_output=True, text=True, env=env, timeout=60)
+        assert res.returncode != 0, (res.stdout, res.stderr)
+        assert not f.wrapper().exists(), "the guard must ignore inherited git overrides"
+
+
+def test_setup_parallel_refuses_from_a_linked_worktree_before_any_side_effect():
+    # Under `make -j setup` the assertion must be a completed gate, not a parallel sibling:
+    # none of venv/render-plists/agents/link may run at all when the checkout is a worktree.
+    with Fixture() as f:
+        res = subprocess.run(["make", "-j", "-C", str(f.worktree), "-f", str(MAKEFILE), "setup"],
+                             capture_output=True, text=True, env=f.env, timeout=60)
+        assert res.returncode != 0, (res.stdout, res.stderr)
+        assert not f.wrapper().exists()
+        assert not (f.worktree / ".venv").exists()
+        assert not (f.home / "Library" / "LaunchAgents").exists(), \
+            "render-plists must not run before the assertion gate fails"
+
+
 def test_link_writes_the_wrapper_from_the_main_checkout():
     with Fixture() as f:
         res = f.make(f.main, "link")
