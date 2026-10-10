@@ -94,8 +94,19 @@ def test_venv_is_not_gated_from_a_linked_worktree():
 def test_link_refuses_from_a_worktree_even_with_ignore_errors():
     # `make -i` skips a failed prerequisite; the write must still not happen.
     with Fixture() as f:
-        f.make(f.worktree, "-i", "link")
+        res = f.make(f.worktree, "-i", "link")
+        assert "refusing" in res.stdout + res.stderr, res.stdout + res.stderr
         assert not f.wrapper().exists(), "-i must not let link write the global wrapper"
+
+
+def test_ignore_errors_is_refused_for_every_global_target():
+    # -i would skip any failed guard; the Makefile refuses it before considering a target.
+    with Fixture() as f:
+        for target in ("render-plists", "agents", "setup"):
+            res = f.make(f.worktree, "-i", target)
+            assert res.returncode != 0, (target, res.stdout, res.stderr)
+            assert "make -i" in res.stdout + res.stderr, (target, res.stdout + res.stderr)
+            assert not (f.home / "Library" / "LaunchAgents").exists(), target
 
 def test_link_refuses_when_git_cannot_read_the_checkout():
     # Fail closed: with no git repo here, both rev-parse substitutions are empty and a bare

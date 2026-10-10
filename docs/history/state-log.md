@@ -10077,4 +10077,4 @@ inherited `GIT_*` overrides cleared, fail closed when git cannot read the checko
 sub-make, so `make -j setup` from a worktree starts nothing. `venv` is not gated — it writes only the
 checkout's own `.venv`, and `make check` in a worktree needs it. `link` also chains the check and
 the write on one recipe line, so `make -i` (which skips a failed prerequisite) still cannot write
-the wrapper, and writes it via a temp file + `mv`. `tests/test_makefile.py` (new, 8).
+the wrapper, and writes it via a temp file + `mv`. The Makefile refuses `make -i` outright (it would skip any failed guard). `tests/test_makefile.py` (new, 9).

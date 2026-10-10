@@ -9,6 +9,16 @@
 # see its own template for why.
 
 WARDEN_REPO := $(shell pwd)
+
+# `make -i` ignores a failed recipe line and a failed prerequisite, so a guarded target would
+# run its side effects after its guard refused (link, render-plists, agents write machine-global
+# state). Nothing here is safe to half-run: refuse -i outright, before any target is considered.
+# GNU make puts the single-letter flags first in MAKEFLAGS without a dash; long options and
+# command-line variables are filtered out so their letters are not mistaken for -i.
+_SHORT_MAKEFLAGS := $(filter-out -% %=%,$(firstword $(MAKEFLAGS)))
+ifneq (,$(findstring i,$(_SHORT_MAKEFLAGS)))
+$(error warden: refusing `make -i` — a failed guard must stop the target, not be ignored)
+endif
 WARDEN_HOME := $(HOME)/.warden
 VENV        := $(WARDEN_REPO)/.venv
 PY          := $(VENV)/bin/python3
@@ -88,7 +98,7 @@ assert-main-checkout:
 .PHONY: link
 link: assert-main-checkout
 	@$(ASSERT_MAIN_CHECKOUT) && mkdir -p "$(dir $(BIN_LINK))" && \
-	 tmp="$$(mktemp "$(BIN_LINK).XXXXXX")" && \
+	 tmp="$$(mktemp "$(BIN_LINK).XXXXXX")" && trap 'rm -f "$$tmp"' EXIT && \
 	 printf '#!/bin/sh\nexec "%s/scripts/warden" "$$@"\n' "$(WARDEN_REPO)" > "$$tmp" && \
 	 chmod +x "$$tmp" && mv -f "$$tmp" "$(BIN_LINK)" && \
 	 echo "  ✓ $(BIN_LINK) -> $(WARDEN_REPO)/scripts/warden"
