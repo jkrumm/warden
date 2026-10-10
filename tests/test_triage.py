@@ -3112,6 +3112,50 @@ def test_auto_implement_refused_by_agent_gateway_ends_the_item_and_is_never_retr
         assert states == [core.STATE_FAILED], states   # the claim is not a state change; the refusal is
 
 
+def test_maybe_auto_implement_lands_needs_decision_when_repo_ceiling_blocks_implement():
+    """An item whose OWN `max_tier` is `implement` but whose repo agent-gateway caps at
+    `investigate` (a re-route into an investigate-only repo) must not submit an implement episode
+    the gateway will refuse. The verdict's recommendation goes to the owner as `needs_decision`
+    instead of being buried in a `failed(policy)` note (JOURNAL 1503)."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-rerouted-ceiling", repo="capped-repo")
+        conn.execute(
+            "UPDATE dispatches SET verdict_json=? WHERE job_id=?",
+            (json.dumps({"summary": "s", "nextAction": "implement", "confidence": "high",
+                         "recommendation": "patch the host threshold and reload"}),
+             "investigate-job"),
+        )
+        conn.commit()
+        DISPATCH_POLICY["body"] = {"rules": {"capped-repo": {"ceiling": "investigate"}}, "overrides": []}
+
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert calls == [], "a repo the gateway caps below implement must never be submitted to"
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["implement_job"] is None, dict(item)
+        assert item["note"] == ("capped-repo is investigate-only for agents — apply by hand: "
+                                "patch the host threshold and reload"), item["note"]
+
+
+def test_maybe_auto_implement_still_submits_when_the_ceiling_read_fails():
+    """agent-gateway unreachable for its dispatch policy must not block an implement: the policy
+    read is a best-effort pre-check and the submit's own 4xx stays the boundary."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-policy-unreadable", repo="demo-repo")
+        DISPATCH_POLICY["body"] = None   # the fake raises RemoteError
+
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+
+        assert len(calls) == 1, "an unreadable dispatch policy must not stop a legitimate implement"
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["implement_job"] is not None, dict(item)
+
+
 def test_implement_success_joins_the_merge_train_at_update():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-impl-ok")
@@ -7813,7 +7857,11 @@ def test_strike_limit_lands_infra_with_a_recipe_and_a_backoff_and_a_caller_may_o
 
 def test_end_on_refusal_lands_policy_with_the_state_it_came_from_and_the_policy_hash():
     with _triage_env() as (conn, _ctx):
-        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
+        # demo-repo allows implement, so the local pre-check (work._repo_ceiling_exceeded) passes and
+        # the submit is made: this exercises agent-gateway's own 4xx on submit, not a ceiling the
+        # loop could see. The unrelated capped repo is what makes the policy hash non-trivial.
+        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "implement"},
+                                             "other-repo": {"ceiling": "investigate"}}, "overrides": []}
         expected = _agent_gateway.policy_hash(DISPATCH_POLICY["body"])
         eid = _seed_verdict_item(conn, external_id="sig-fc-refusal")
         _agent_gateway.submit = _refusing_submit([])
@@ -7949,7 +7997,9 @@ def test_a_backfilled_infra_failure_with_no_retry_at_is_due_at_once():
 
 def test_policy_failures_are_redriven_when_the_policy_hash_changes_and_not_when_it_is_unreadable():
     with _triage_env() as (conn, ctx):
-        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "investigate"}}, "overrides": []}
+        # demo-repo allows implement here, so the submit is made and agent-gateway's own 4xx is the
+        # policy failure under test; the local pre-check cannot see this refusal.
+        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "implement"}}, "overrides": []}
         eid = _seed_verdict_item(conn, external_id="sig-fc-policy")
         calls: list[dict[str, Any]] = []
         _agent_gateway.submit = _refusing_submit(calls)
@@ -7967,7 +8017,8 @@ def test_policy_failures_are_redriven_when_the_policy_hash_changes_and_not_when_
         assert core.get_item(conn, eid)["state"] == core.STATE_FAILED
 
         # Policy changed: re-driven once, back where it came from, no infra limit or backoff involved.
-        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "implement"}}, "overrides": []}
+        DISPATCH_POLICY["body"] = {"rules": {"demo-repo": {"ceiling": "implement"},
+                                             "extra-repo": {"ceiling": "author"}}, "overrides": []}
         work.redrive_failed(conn, NOW, dry_run=True)
         assert core.get_item(conn, eid)["state"] == core.STATE_FAILED, "a dry run writes nothing"
         work.redrive_failed(conn, NOW, dry_run=False)

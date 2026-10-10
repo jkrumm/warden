@@ -1772,6 +1772,24 @@ def hold_ambiguous_submit(item: sqlite3.Row, exc: RemoteError) -> None:
           f"agent-gateway ({exc}) — claim and operation left open for reconcile_operations()", file=sys.stderr)
 
 
+def _repo_ceiling_exceeded(policy_doc: dict[str, Any], repo: str, tier: str) -> str | None:
+    """agent-gateway's per-repo tier ceiling for `repo` when `tier` outranks it, else None.
+
+    Reads `rules[<repo>].ceiling` — the shape `GET /api/dispatch-policy` answers and the test
+    fixture mirrors. A repo absent from `rules`, or a missing/unknown ceiling, means "no
+    restriction" and agent-gateway stays the boundary, answering its own 4xx. VALID_TIERS is the
+    one ordering: `investigate` < `author` < `implement`. Returns the ceiling so the caller can
+    name it in the owner's note."""
+    rules = policy_doc.get("rules")
+    entry = rules.get(repo) if isinstance(rules, dict) else None
+    ceiling = entry.get("ceiling") if isinstance(entry, dict) else None
+    if ceiling not in _policy.VALID_TIERS or tier not in _policy.VALID_TIERS:
+        return None
+    if _policy.VALID_TIERS.index(tier) > _policy.VALID_TIERS.index(ceiling):
+        return ceiling
+    return None
+
+
 def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
                           *, dry_run: bool) -> None:
     """Step 6. A `working` item is eligible once, the moment its folded investigate verdict
@@ -1784,6 +1802,12 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     own) never reaches this loop: fold_dispatch_verdict() already closed it with its answer, so the
     clause is defence in depth, mirroring `lifecycle/policy.py`'s `require_auto_from_item()` refusal
     on the same column.
+
+    That `max_tier` is the item's OWN ceiling. agent-gateway's per-REPO ceiling is checked too,
+    because a re-route (`_reroute_repo()`) moves an item whose `max_tier` stays `implement` into a
+    repo agent-gateway caps below it. Above that ceiling the submit would be refused and the item
+    would end `failed(policy)` with the verdict's recommendation buried in a note the owner never
+    sees, so it lands `needs_decision` naming the ceiling and the recommendation instead.
 
     `require_auto_from_item()`/`check_repo_not_in_flight()` are checked BEFORE the claim, not after:
     both read the item's OWN current state off the ledger, so checking them against a row this call
@@ -1804,6 +1828,9 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         f"AND max_tier = 'implement' AND revert_json IS NULL AND {ready_sql} ORDER BY event_id",
         (core.STATE_WORKING, *ready_params)
     ).fetchall()
+    # agent-gateway's per-repo ceiling, read lazily and once per pass (the first candidate that
+    # needs it). A read that fails is not fatal: the submit's own 4xx stays the boundary.
+    ceiling_doc: dict[str, Any] | None = None
     for item in candidates:
         if item["repo"] is None:
             continue
@@ -1813,6 +1840,30 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         verdict = core.safe_json(d["verdict_json"])
         if (verdict.get("nextAction") or "").strip().lower() not in ("implement", "issue"):
             continue
+
+        if ceiling_doc is None:
+            try:
+                ceiling_doc = _agent_gateway.dispatch_policy()
+            except WardenError as e:
+                print(f"triage: could not read agent-gateway's dispatch policy for a tier ceiling: {e}",
+                      file=sys.stderr)
+                ceiling_doc = {}
+        ceiling = _repo_ceiling_exceeded(ceiling_doc, item["repo"], "implement")
+        if ceiling is not None:
+            # The item's OWN `max_tier` is `implement`, but the repo it was re-routed into is capped
+            # below it: the submit would be refused and the recommendation buried in a `failed(policy)`
+            # note. Surface it to the owner instead (JOURNAL 1503).
+            if dry_run:
+                print(f"[dry-run] would leave {item['signature']} for the owner — {item['repo']} is "
+                      f"{ceiling}-only for agents (event {item['event_id']})")
+                continue
+            by_hand = str(verdict.get("recommendation") or verdict.get("summary") or "").strip()
+            note = _truncate(f"{item['repo']} is {ceiling}-only for agents — apply by hand: "
+                             f"{by_hand or 'no recommendation'}", _items.NOTE_MAX)
+            core.set_state(conn, item["event_id"], core.STATE_NEEDS_DECISION, now, note=note)
+            conn.commit()
+            continue
+
         if dry_run:
             print(f"[dry-run] would auto-implement {item['signature']} in {item['repo']} "
                   f"(event {item['event_id']})")
