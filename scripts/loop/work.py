@@ -1008,7 +1008,7 @@ DECIDED_NOTE_PREFIX = "decided without the owner"
 UNCATEGORIZED_TAG = "[no category]"
 
 
-def _escalation_category(result: dict[str, Any]) -> str | None:
+def escalation_category(result: dict[str, Any]) -> str | None:
     category = str(result.get("escalationCategory") or "").strip().lower()
     return category if category in ESCALATION_CATEGORIES else None
 
@@ -1224,7 +1224,7 @@ def fold_dispatch_verdict(conn: sqlite3.Connection, *, origin_event_id: int, job
             if reroute is not None:
                 note = f"{REROUTE_NOTE_PREFIX} {m['repo']} to {reroute}"
                 return core.STATE_TRIAGED, f"{note}: {answer}" if answer else note, None, reroute
-            category = _escalation_category(result)
+            category = escalation_category(result)
             if category is not None:
                 return core.STATE_NEEDS_DECISION, _decision_note(result, category), None, None
             if d["tier"] == "investigate":
@@ -2286,7 +2286,7 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
 
         if result.get("nextAction") == "human":
             core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now,
-                           note=_decision_note(result, _escalation_category(result)))
+                           note=_decision_note(result, escalation_category(result)))
         elif outcome in ("pr_opened", "pr_updated") and artifact_url:
             # The pull request joins its repo's merge train at `update` (advance_merge_trains()). A
             # compare-and-set on the `working` item this pass read (same implement job, no review yet): the

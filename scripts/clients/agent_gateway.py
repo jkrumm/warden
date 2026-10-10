@@ -49,11 +49,13 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 # answers with v4. v6 adds the optional `fallbackWithheld` field (additive); v7 the optional
 # `escalationCategory` (additive, `human` verdicts only).
 # DISPATCH_SCHEMA_VERSIONS is what assert_result_schema()
-# enforces; a version outside the window is refused as loudly as ever. Review
-# has a single live version.
+# enforces; a version outside the window is refused as loudly as ever. Review keeps
+# the same kind of window: v2 adds the optional `escalationCategory` (additive,
+# `needs-human` verdicts only); an agent-gateway not yet restarted still answers v1.
 DISPATCH_SCHEMA_VERSIONS: frozenset[int] = frozenset({5, 6, 7})
 DISPATCH_SCHEMA_VERSION = max(DISPATCH_SCHEMA_VERSIONS)  # the current version, derived so the two cannot drift
-REVIEW_SCHEMA_VERSION = 1
+REVIEW_SCHEMA_VERSIONS: frozenset[int] = frozenset({1, 2})
+REVIEW_SCHEMA_VERSION = max(REVIEW_SCHEMA_VERSIONS)
 
 # server/jobs/handlers/dispatch.ts DISPATCH_OUTCOMES. `pr_updated` (a `revisionOf`
 # episode pushed to the same branch and updated the existing PR) and `conflict`
@@ -80,7 +82,7 @@ DISPATCH_OUTCOMES: tuple[str, ...] = (
     "withheld",
 )
 
-# server/jobs/handlers/review.ts REVIEW_OUTCOMES at schema version 1.
+# server/jobs/handlers/review.ts REVIEW_OUTCOMES (unchanged across schema versions 1 and 2).
 REVIEW_OUTCOMES: tuple[str, ...] = ("clean", "actionable", "needs-human")
 
 # server/jobs/handlers/update-pr.ts UPDATE_PR_OUTPUT `status`. The update_pr result carries
@@ -430,9 +432,8 @@ def assert_result_schema(job: dict[str, Any], expected: int | Collection[int], t
     expected to treat it as an infrastructure failure (a strike) carrying the exact
     message this raises, per DESIGN.md's "deferral must be visible".
 
-    `expected` is a single version (review, `REVIEW_SCHEMA_VERSION`) or a
-    collection of them (dispatch, `DISPATCH_SCHEMA_VERSIONS` — the acceptance
-    window that spans a rolling agent-gateway restart). Only checked on
+    `expected` is a single version or a collection of them (`DISPATCH_SCHEMA_VERSIONS`,
+    `REVIEW_SCHEMA_VERSIONS` — the acceptance windows that span a rolling agent-gateway restart). Only checked on
     `status == "done"`: a failed/interrupted/cancelled job carries no `result`
     worth pinning a shape to."""
     if job.get("status") != "done":

@@ -460,7 +460,8 @@ def _fake_submit_review(calls: list[dict[str, Any]], *, ok: bool = True):
 
 
 def _review_result(outcome: str, *, blocking: list[dict[str, Any]] | None = None,
-                    summary: str = "looks right.", schema_version: int = 1) -> dict[str, Any]:
+                    summary: str = "looks right.", schema_version: int = 1,
+                    escalation_category: str | None = None) -> dict[str, Any]:
     """A literal agent-gateway `review` job result (server/jobs/handlers/
     review.ts SYNTHESIS_OUTPUT) — replaces the old VALIDATION_CONFIRM/
     DISAGREE marker-in-prose fixtures the step-7 poll used to substring-match."""
@@ -472,6 +473,7 @@ def _review_result(outcome: str, *, blocking: list[dict[str, Any]] | None = None
         "testGaps": [],
         "summary": summary,
         "schemaVersion": schema_version,
+        **({"escalationCategory": escalation_category} if escalation_category else {}),
     }
 
 
@@ -3972,6 +3974,74 @@ def test_validation_needs_decision_with_blocking_goes_to_the_owner_and_is_never_
         assert calls == [], "a needs-human review is never a revisable finding"
         assert core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
         assert core.get_item(conn, eid)["revision_count"] == 0
+
+
+def _seed_review_item(conn, name: str, pr: int) -> int:
+    eid = _seed_verdict_item(conn, external_id=f"sig-{name}")
+    conn.execute(
+        "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=? WHERE event_id=?",
+        (core.STATE_MERGING, f"implement-{name}", f"validation-{name}", f"https://github.com/jkrumm/demo-repo/pull/{pr}", eid))
+    conn.commit()
+    _seed_implement_dispatch(conn, f"implement-{name}")
+    return eid
+
+
+def test_review_needs_human_with_a_category_goes_to_the_owner_tagged():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "rv-cat", 31)
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result(
+            "needs-human", schema_version=2, escalation_category="security", summary="widens the token scope")}
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["note"].startswith("[security] "), item["note"]
+
+
+def test_review_needs_human_without_a_category_is_re_reviewed_once_then_decided():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "rv-nocat", 32)
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result(
+            "needs-human", schema_version=2, summary="accept the descope or not?")}
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit_review = _fake_submit_review(calls)
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["validation_job"] is not None, dict(item)
+        assert len(calls) == 1 and "PRIOR ESCALATION" in (calls[0].get("context") or ""), calls
+        assert item["note"].startswith("reviewing"), item["note"]
+
+        # The second uncategorized needs-human is read as a decision: no blocking findings confirms.
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result(
+            "needs-human", schema_version=2, summary="still unsure")}
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["train_stage"] != "review" and item["reviewed_sha"] == "a" * 40, dict(item)
+        assert len(calls) == 1, "no third review"
+
+
+def test_second_uncategorized_needs_human_with_blocking_findings_goes_back_for_a_revision():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "rv-nocat-block", 33)
+        conn.execute("UPDATE dispatches SET validation_status='redriven' WHERE job_id='implement-rv-nocat-block'")
+        conn.commit()
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result(
+            "needs-human", schema_version=2, summary="unsure",
+            blocking=[{"file": "a.py", "line": 3, "message": "off by one"}])}
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and "off by one" in item["note"], dict(item)
+
+
+def test_schema_one_needs_human_review_still_goes_to_the_owner_untouched():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "rv-v1", 34)
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result("needs-human")}
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION and not item["note"].startswith("["), dict(item)
+
 
 
 def test_validation_actionable_with_empty_blocking_confirms():
