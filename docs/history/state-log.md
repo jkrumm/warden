@@ -10066,3 +10066,21 @@ own default is the top); an unreadable policy skips the check and submits as bef
 The check runs against the tier actually submitted, diverts only that item, writes no `verdict_json` and touches no
 sibling; `--dry-run` reports the diversion and writes nothing. `lifecycle/policy.py` grows `dispatch_ceiling()` and
 `tier_over_ceiling()`. `test_triage.py` 539 → 543, `test_lifecycle.py` 55 → 57. The apply-by-hand note strips the recommendation before falling back, so a whitespace-only recommendation yields the summary.
+
+## 146. A revision's `no_changes` on a moved PR head rejoins the merge train (2026-10-10)
+
+Item 1464 (weatherorb PR #60): the step-7 review blocked at `34fd019`, `b35b86e` fixing both findings landed
+after, the next revision found nothing left to do (`no_changes`) and the loop still paged the owner. The head a
+blocking review refused was never persisted — `reviewed_sha` records only a CONFIRMED head and `train_sha` is
+cleared the moment the item leaves `merging` — so `poll_implement_jobs()` could not tell a PR that had moved
+under the review from one frozen at the refused head; it sent every revision `no_changes` with an open PR to
+`needs_decision`.
+
+`train._fold_review()` now writes the refused head to a new `blocked_sha` column (migration 18), which survives
+leaving `merging` like `reviewed_sha`. `work.poll_implement_jobs()`'s `no_changes` branch reads the PR's current
+head from GitHub and, when it differs from `blocked_sha`, rejoins the merge train (the `pr_updated` shape:
+`train.TRAIN_START` at `update`); a missing `blocked_sha`, an unchanged head, or a GitHub read that cannot confirm
+the move still routes to `needs_decision`. `TRAIN_START`, the redriven-train start and `core.reinvestigate()`
+clear `blocked_sha`, so a stale head never steers it. `test_ledger.py` 41 → 42, `test_triage.py` 543 → 547,
+`make check` green. Not covered by an end-to-end test: the rejoin is unit-tested through `poll_implement_jobs()`
+and `advance_merge_trains()`, not against a live pull request.

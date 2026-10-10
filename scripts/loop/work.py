@@ -2127,6 +2127,24 @@ def _close_superseded_pr(old_pr: str, new_pr: str) -> None:
                                       f"branch, so warden re-derived the fix from the latest base.")
 
 
+def _current_pr_head(pr_url: str | None) -> str | None:
+    """The head commit of `pr_url`, read from GitHub now, or None when the URL is not a pull request
+    or the read failed. Read-only and side-effect free: poll_implement_jobs()'s `no_changes` branch
+    falls back to the owner when it cannot confirm the head moved, and strikes nowhere, so a GitHub
+    hiccup never silently rejoins the merge train."""
+    ref = _github.parse_pr_url(pr_url or "")
+    if ref is None:
+        return None
+    owner, name, number = ref
+    try:
+        pr = _github.read_pr(owner, name, number)
+    except RemoteError:
+        return None
+    head = pr.get("head")
+    sha = head.get("sha") if isinstance(head, dict) else None
+    return sha if isinstance(sha, str) and sha else None
+
+
 def _attempt_rewind_columns(conn: sqlite3.Connection, item: sqlite3.Row, job_id: str) -> dict[str, Any]:
     """The columns that hand the implement attempt `job_id` back, so the next pass submits it again
     (a lease refusal, a strike):
@@ -2245,9 +2263,11 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
                                                   An attempt with nothing on record closes
                                                   `closed(resolved)` with the summary; a REVISION
                                                   (revision_count>0) or a PR already on record
-                                                  declines to touch it, which only the owner can
-                                                  decide about, so it goes to needs_decision with
-                                                  the PR named in the note
+                                                  declines to touch it. That is the owner's call —
+                                                  needs_decision with the PR named — EXCEPT when the
+                                                  PR head moved since the review that blocked it
+                                                  (`blocked_sha`): the head nobody has reviewed
+                                                  rejoins the merge train instead.
       everything else: diff_refused, branch_no_pr, pr_failed, withheld,
         salvaged, a wrong tier's outcome, a missing/unrecognized outcome, a failed/
         interrupted/cancelled job, a job agent-gateway no longer knows, a schemaVersion
@@ -2397,18 +2417,39 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
             # investigation, and a stale `implement_job` on a re-opened item would be polled again
             # (poll_implement_jobs()) or block maybe_auto_implement() entirely. A REVISION that comes
             # back no_changes declines to address the finding on a pull request that is already open;
-            # only the owner can decide what happens to it, so it goes to needs_decision rather than
-            # striking and spinning the episode again. An attempt with a PR on record but no revision
-            # yet is the same case: whatever is open must not be silently closed, so either fact
-            # (revision_count>0 OR a pr_url) routes to needs_decision. The note names the open PR
-            # (the suffix kept whole, as hand_back_for_revision() does) so the owner's one Slack line
-            # shows what is in question.
+            # only the owner can decide what happens to it — UNLESS the PR head moved since the
+            # review that blocked it (`blocked_sha`, set by _fold_review()): then the revision's
+            # "nothing to change" is about a head nobody has reviewed, and the right move is a fresh
+            # review, not a page. So a head that differs from `blocked_sha` rejoins the merge train
+            # exactly as a `pr_updated` outcome would; a missing `blocked_sha`, an unchanged head, or
+            # a GitHub read that cannot confirm the move still routes to needs_decision, the
+            # conservative path. Either fact (revision_count>0 OR a pr_url) keeps it out of
+            # closed(resolved). The note names the open PR (the suffix kept whole, as
+            # hand_back_for_revision() does) so the owner's one Slack line shows what is in question.
             if item["revision_count"] > 0 or item["pr_url"]:
-                note = _decision_text(result)
-                if item["pr_url"]:
-                    suffix = f" — PR: {item['pr_url']}"
-                    note = note[: _items.NOTE_MAX - len(suffix)] + suffix
-                core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, note=note)
+                head = _current_pr_head(item["pr_url"]) if item["blocked_sha"] else None
+                if head is not None and head != item["blocked_sha"]:
+                    # A compare-and-set on the row this pass read, the same shape as the
+                    # pr_opened/pr_updated handoff above: the loop and the sweep both reach this
+                    # fold, and the loser skips.
+                    claimed = core.set_state(
+                        conn, event_id, core.STATE_MERGING, now, expect_state=core.STATE_WORKING,
+                        expect_eq={"implement_job": job_id, "validation_job": None},
+                        pr_url=item["pr_url"], strikes=0, retry_at=None, **train.TRAIN_START,
+                        revert_json=item["revert_json"] if core.is_revert(item) else None,
+                        note=f"no_changes: the PR head moved to {head[:12]} since the blocking review "
+                             f"— {item['pr_url']} rejoins the merge train")
+                    conn.commit()
+                    if not claimed:
+                        print(f"triage: {item['signature']} (event {event_id}) was already handed to the "
+                              f"merge train by another pass — skipped", file=sys.stderr)
+                        continue
+                else:
+                    note = _decision_text(result)
+                    if item["pr_url"]:
+                        suffix = f" — PR: {item['pr_url']}"
+                        note = note[: _items.NOTE_MAX - len(suffix)] + suffix
+                    core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, note=note)
             else:
                 core.set_state(conn, event_id, core.STATE_CLOSED, now, close_reason=core.CLOSE_RESOLVED,
                                note=summary, implement_job=None, validation_job=None)
