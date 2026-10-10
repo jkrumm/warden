@@ -293,7 +293,8 @@ def test_advance_implement_chain_runs_after_the_per_row_fold_in_the_same_pass():
         job = {
             "id": "job-fold-then-chain",
             "status": "done",
-            "result": {"nextAction": "human", "confidence": "low", "summary": "needs the owner"},
+            "result": {"nextAction": "human", "escalationCategory": "product", "confidence": "low",
+                       "summary": "needs the owner"},
         }
         seen_states: list[str] = []
 

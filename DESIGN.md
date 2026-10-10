@@ -33,7 +33,11 @@ quiet · closed(duplicate | fixed_by | ignored | resolved)      terminal
 ```
 
 `needs_decision` is the only human exit, reached by a `nextAction=human` verdict
-(its `decisionQuestion` is the Slack line) — unless that verdict's optional
+(its `decisionQuestion` is the Slack line, led by a `[category]` tag) that names an owner-only
+`escalationCategory` (product, data_loss, spend, other_people, security, blocker). An investigate
+verdict that names none is sent back once to `triaged` ("re-driven to decide", the brief quotes its
+own question and says decide it yourself); a second one takes its `recommendation` (implement, or
+close with the answer on an investigate-only item) — unless that verdict's optional
 `owningRepo` names a different known repo, which re-routes the item to `triaged`
 in that repo instead (once per item; the re-route's transition note is the
 ping-pong guard). `needs_decision` and `failed` never expire. Every

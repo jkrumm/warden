@@ -9996,3 +9996,27 @@ limit)`; the note is capped with it at `NOTE_MAX`. Seven cases join `tests/test_
 (`_truncate`, the dated brief render, the latest-note-wins gather, substantive-beats-later-silence,
 silence-only-returns-None, blank-note skip, and the two-member cluster-fold safeguard);
 `test_triage.py` 519 → 526. `make check` green.
+
+## 143. warden decides its own reversible questions (2026-10-10, agent-platform Wave 12)
+
+Measured on the ledger: of the 14 `needs_decision` items, 11 were investigate `human` verdicts
+(`working` → `needs_decision`) and 3 step-7 review `needs-human` verdicts. Every investigate question was a
+reversible A-or-B (strict vs dampened heartbeat, route now vs wait a night, re-pin vs retire, local patch vs
+upstream, which of two PRs). The worker prompt already said "`human` is the exception", but the schema
+gave a question field and no reason, so nothing made a model justify the escalation.
+
+agent-gateway `64e4ed5`: `escalationCategory` (`product | data_loss | spend | other_people | security |
+blocker`), optional at the schema level (no `DISPATCH_SCHEMA_VERSION` bump), allowed only with
+`nextAction=human`, normalized (case, separators, unknown values dropped). `_common.md` lists the six as the
+only reasons to stop for the owner.
+
+warden: `work.ESCALATION_CATEGORIES`. A `human` verdict with a category → `needs_decision`, the note led by
+`[category]` (Argo's reason and the Slack line both render the note, so no column, migration or Argo
+release). Without one, an investigate verdict goes back to `triaged` once (note `re-driven to decide: <question>`
+is the guard; `dispatch_job` cleared so no cooldown) and the next brief carries a `PRIOR ESCALATION`
+paragraph; the second uncategorized verdict takes its `recommendation`: `closed(resolved)` on an
+investigate-only item, else `working` with the stored verdict rewritten to `nextAction=implement`. An
+implement-episode `human` is tagged (`[category]` or `[no category]`), not re-driven. A `reroute` still wins.
+
+Not covered: step-7 review `needs-human` (a `review` job outcome, no category in its schema). `test_triage.py`
+526 → 534.

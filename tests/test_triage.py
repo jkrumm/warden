@@ -1634,7 +1634,8 @@ def test_fold_dispatch_verdict_next_action_to_state_table():
     none|issue|implement|human):
 
       implement | issue -> working (waiting for its implement dispatch)
-      human             -> needs_decision, note = decisionQuestion, else summary, else recommendation
+      human             -> needs_decision with an escalationCategory, note = "[category] " + decisionQuestion,
+                           else summary, else recommendation (no category: see the redrive tests)
       none              -> closed(resolved), note = summary
       artifactUrl       -> closed(resolved), note = "filed <url>"
     """
@@ -1651,8 +1652,9 @@ def test_fold_dispatch_verdict_next_action_to_state_table():
         assert item["note"] == "nothing to do", item["note"]
 
         item = _fold_alert_verdict(conn, "sig-tbl-human", verdict={
-            "summary": "needs the owner", "recommendation": "do X", "nextAction": "human"})
-        assert item["state"] == core.STATE_NEEDS_DECISION and item["note"] == "needs the owner", dict(item)
+            "summary": "needs the owner", "recommendation": "do X", "nextAction": "human",
+            "escalationCategory": "product"})
+        assert item["state"] == core.STATE_NEEDS_DECISION and item["note"] == "[product] needs the owner", dict(item)
 
         item = _fold_alert_verdict(conn, "sig-tbl-artifact", tier="author", artifact_url="https://github.com/o/r/issues/3",
                                    verdict={"summary": "filed an issue", "nextAction": "issue"})
@@ -1664,17 +1666,19 @@ def test_fold_dispatch_verdict_next_action_to_state_table():
 def test_fold_needs_decision_note_prefers_decision_question_then_summary_then_recommendation():
     with _triage_env() as (conn, ctx):
         item = _fold_alert_verdict(conn, "sig-dq-1", verdict={
-            "nextAction": "human", "decisionQuestion": "Drop the legacy table or keep it? (a) drop (b) keep",
+            "nextAction": "human", "escalationCategory": "data_loss",
+            "decisionQuestion": "Drop the legacy table or keep it? (a) drop (b) keep",
             "summary": "the summary", "recommendation": "the recommendation"})
-        assert item["note"] == "Drop the legacy table or keep it? (a) drop (b) keep", item["note"]
+        assert item["note"] == "[data_loss] Drop the legacy table or keep it? (a) drop (b) keep", item["note"]
 
         item = _fold_alert_verdict(conn, "sig-dq-2", verdict={
-            "nextAction": "human", "summary": "the summary", "recommendation": "the recommendation"})
-        assert item["note"] == "the summary", item["note"]
+            "nextAction": "human", "escalationCategory": "spend",
+            "summary": "the summary", "recommendation": "the recommendation"})
+        assert item["note"] == "[spend] the summary", item["note"]
 
         item = _fold_alert_verdict(conn, "sig-dq-3", verdict={
-            "nextAction": "human", "recommendation": "the recommendation"})
-        assert item["note"] == "the recommendation", item["note"]
+            "nextAction": "human", "escalationCategory": "product", "recommendation": "the recommendation"})
+        assert item["note"] == "[product] the recommendation", item["note"]
         assert item["state"] == core.STATE_NEEDS_DECISION
 
 
@@ -1685,7 +1689,8 @@ def _fold_human_verdict(conn, ext: str, *, item_repo: str, owning_repo: Any) -> 
     intake.ingest(conn, NOW)
     job_id = f"job-{ext}"
     verdict: dict[str, Any] = {"summary": "the fix lives elsewhere", "nextAction": "human",
-                               "decisionQuestion": "where should this live?"}
+                               "decisionQuestion": "where should this live?",
+                               "escalationCategory": "product"}
     if owning_repo is not None:
         verdict["owningRepo"] = owning_repo
     conn.execute(
@@ -1723,7 +1728,7 @@ def test_fold_a_human_verdict_owning_its_own_repo_still_pages():
     with _triage_env() as (conn, ctx):
         item = _fold_human_verdict(conn, "sig-reroute-self", item_repo="demo-repo", owning_repo="demo-repo")
         assert item["state"] == core.STATE_NEEDS_DECISION and item["repo"] == "demo-repo", dict(item)
-        assert item["note"] == "where should this live?", item["note"]
+        assert item["note"] == "[product] where should this live?", item["note"]
 
 
 def test_fold_a_human_verdict_naming_an_unknown_repo_still_pages():
@@ -1753,7 +1758,8 @@ def test_a_rerouted_item_is_never_rerouted_a_second_time():
             "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
             "VALUES(?,?,?,?,?,?,?,?)",
             (job_id, "investigate", "other-repo", "b", eid, "done",
-             json.dumps({"summary": "back again", "nextAction": "human", "owningRepo": "demo-repo"}),
+             json.dumps({"summary": "back again", "nextAction": "human", "owningRepo": "demo-repo",
+                         "escalationCategory": "product"}),
              NOW.isoformat()),
         )
         core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
@@ -1761,6 +1767,119 @@ def test_a_rerouted_item_is_never_rerouted_a_second_time():
         work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
         again = core.get_item(conn, eid)
         assert again["state"] == core.STATE_NEEDS_DECISION and again["repo"] == "other-repo", dict(again)
+
+
+def _fold_again(conn, eid: int, ext: str, verdict: dict[str, Any]):
+    job_id = f"job-{ext}-2"
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (job_id, "investigate", "demo-repo", "b", eid, "done", json.dumps(verdict), NOW.isoformat()),
+    )
+    core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job_id)
+    conn.commit()
+    work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+    return core.get_item(conn, eid)
+
+
+_UNCATEGORIZED_HUMAN = {"nextAction": "human", "decisionQuestion": "Keep it strict, or dampen it?",
+                        "summary": "a reversible tuning choice", "recommendation": "Dampen it: one transient miss must not page."}
+
+
+def test_every_owner_only_category_pages_and_is_tagged_on_the_note():
+    with _triage_env() as (conn, ctx):
+        for cat in work.ESCALATION_CATEGORIES:
+            item = _fold_alert_verdict(conn, f"sig-cat-{cat}", verdict={**_UNCATEGORIZED_HUMAN, "escalationCategory": cat})
+            assert item["state"] == core.STATE_NEEDS_DECISION, (cat, dict(item))
+            assert item["note"] == f"[{cat}] Keep it strict, or dampen it?", item["note"]
+
+
+def test_a_human_verdict_without_a_category_is_sent_back_once_to_decide_itself():
+    """The over-escalation cause (Wave 12): an investigate `human` verdict that names no owner-only
+    reason returns to `triaged` in the SAME repo, dispatch pointer cleared, the question on the
+    transition note; the next brief carries the "decide it yourself" paragraph."""
+    with _triage_env() as (conn, ctx):
+        item = _fold_alert_verdict(conn, "sig-nocat", verdict=_UNCATEGORIZED_HUMAN)
+        assert item["state"] == core.STATE_TRIAGED, dict(item)
+        assert item["dispatch_job"] is None, dict(item)
+        assert item["note"] == "re-driven to decide: Keep it strict, or dampen it?", item["note"]
+        paragraph = work._decide_brief_paragraph(conn, item["event_id"])
+        assert "Keep it strict, or dampen it?" in paragraph and "escalationCategory" in paragraph, paragraph
+        assert work._decide_brief_paragraph(conn, item["event_id"] + 99) == ""
+
+
+def test_an_unknown_category_value_counts_as_no_category():
+    with _triage_env() as (conn, ctx):
+        item = _fold_alert_verdict(conn, "sig-badcat", verdict={**_UNCATEGORIZED_HUMAN, "escalationCategory": "operational"})
+        assert item["state"] == core.STATE_TRIAGED and item["note"].startswith(work.DECIDE_NOTE_PREFIX), dict(item)
+
+
+def test_a_second_uncategorized_human_verdict_takes_the_recommendation_and_implements():
+    with _triage_env() as (conn, ctx):
+        first = _fold_alert_verdict(conn, "sig-nocat-twice", verdict=_UNCATEGORIZED_HUMAN)
+        assert first["state"] == core.STATE_TRIAGED, dict(first)
+        item = _fold_again(conn, first["event_id"], "sig-nocat-twice", _UNCATEGORIZED_HUMAN)
+        assert item["state"] == core.STATE_WORKING, dict(item)
+        assert item["note"].startswith(work.DECIDED_NOTE_PREFIX) and "Dampen it" in item["note"], item["note"]
+        stored = json.loads(conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
+                                          (item["dispatch_job"],)).fetchone()["verdict_json"])
+        assert stored["nextAction"] == "implement", stored
+
+
+def test_a_second_uncategorized_human_verdict_on_an_investigate_only_item_closes_with_the_answer():
+    with _triage_env() as (conn, ctx):
+        first = _fold_alert_verdict(conn, "sig-nocat-inv", verdict=_UNCATEGORIZED_HUMAN)
+        conn.execute("UPDATE triage_items SET max_tier='investigate' WHERE event_id=?", (first["event_id"],))
+        conn.commit()
+        item = _fold_again(conn, first["event_id"], "sig-nocat-inv", _UNCATEGORIZED_HUMAN)
+        assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED, dict(item)
+        assert "Dampen it" in item["note"], item["note"]
+
+
+def test_a_second_verdict_that_names_a_category_still_pages_after_a_redrive():
+    with _triage_env() as (conn, ctx):
+        first = _fold_alert_verdict(conn, "sig-nocat-then-cat", verdict=_UNCATEGORIZED_HUMAN)
+        item = _fold_again(conn, first["event_id"], "sig-nocat-then-cat",
+                           {**_UNCATEGORIZED_HUMAN, "escalationCategory": "other_people"})
+        assert item["state"] == core.STATE_NEEDS_DECISION and item["note"].startswith("[other_people] "), dict(item)
+
+
+def test_a_redriven_human_item_is_dispatched_again_with_the_decide_it_yourself_brief():
+    with _triage_env() as (conn, ctx):
+        eid = intake.open_origin_item(
+            conn, origin="human", repo="demo-repo", brief="tune the alert", max_tier="implement",
+            external_id="human:redrive-1", title="tune the alert", now=NOW,
+        )
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        _triage_pass(conn)
+        work.escalate_origin_items(conn, NOW)
+        assert "PRIOR ESCALATION" not in calls[0]["brief"], calls[0]["brief"]
+        job_id = core.get_item(conn, eid)["dispatch_job"]
+        conn.execute("UPDATE dispatches SET status='done', verdict_json=? WHERE job_id=?",
+                     (json.dumps(_UNCATEGORIZED_HUMAN), job_id))
+        conn.commit()
+        work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id=job_id, now=NOW, dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
+
+        work.escalate_origin_items(conn, NOW)
+        assert len(calls) == 2, calls
+        assert calls[1]["brief"].endswith("tune the alert"), calls[1]["brief"]
+        assert "PRIOR ESCALATION" in calls[1]["brief"] and "Keep it strict, or dampen it?" in calls[1]["brief"]
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
+
+
+def test_implement_human_verdict_note_carries_its_category_or_the_no_category_tag():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-impl-cat", job_id="impl-cat")
+        _agent_gateway.get = lambda job_id: {
+            "status": "done",
+            "result": _dispatch_result("no_changes", next_action="human", summary="touches CI",
+                                        escalation_category="security"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert core.get_item(conn, eid)["note"] == "[security] touches CI", core.get_item(conn, eid)["note"]
+        assert work._decision_note({"summary": "x"}) == "[no category] x"
 
 
 def test_fold_an_unrecognized_next_action_fails_loudly_instead_of_guessing():
@@ -3170,7 +3289,8 @@ def _seed_implementing_item(conn, *, external_id: str, job_id: str) -> int:
 
 def _dispatch_result(outcome: str, *, next_action: str | None = None, summary: str = "s",
                       artifact_url: str | None = None, branch: str | None = None,
-                      schema_version: int | None = None) -> dict[str, Any]:
+                      schema_version: int | None = None,
+                      escalation_category: str | None = None) -> dict[str, Any]:
     """A literal implement-job `result` shaped per DISPATCH_OUTPUT — every
     field the outcome table (poll_implement_jobs()'s own docstring) branches
     on, none of the tier's other VERDICT_FIELDS (this suite never asserts on
@@ -3181,6 +3301,8 @@ def _dispatch_result(outcome: str, *, next_action: str | None = None, summary: s
     }
     if next_action is not None:
         out["nextAction"] = next_action
+    if escalation_category is not None:
+        out["escalationCategory"] = escalation_category
     if artifact_url is not None:
         out["artifactUrl"] = artifact_url
     if branch is not None:
