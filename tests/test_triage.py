@@ -7065,6 +7065,58 @@ def test_escalate_clusters_fresh_triaged_items_by_repo_and_keeps_split_items_sin
         assert _rows(conn, a)["dispatch_job"] == _rows(conn, b)["dispatch_job"]
 
 
+def test_truncate_is_a_no_op_under_the_limit_and_ellipsizes_over_it():
+    """`_truncate()` is the one truncation shape `_cap_brief()` and the prior-resolution note
+    share: short text passes through untouched, over-limit text ends in an ellipsis and never
+    exceeds the limit."""
+    assert work._truncate("short", 10) == "short"
+    assert work._truncate("exactly10c", 10) == "exactly10c"
+    capped = work._truncate("abcdefghij", 5)
+    assert capped == "abcd…", capped
+    assert len(capped) <= 5
+
+
+def test_cluster_brief_renders_a_reopened_members_prior_resolution_note():
+    """A member whose signature closed before carries its prior close note into the brief, with
+    the instruction not to re-ask what it already answered."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="b-prior", title="Recurring", repo="demo-repo",
+                        state=core.STATE_TRIAGED, occurrences=5)
+        brief = work._build_cluster_brief(
+            repo="demo-repo", members=[_rows(conn, eid)],
+            event_rows_by_id={eid: core.get_event(conn, eid)}, sibling_events=[],
+            prior_notes={eid: "signal quiet since 2026-01-01 00:00 UTC"},
+        )
+        assert "PRIOR RESOLUTION" in brief, brief
+        assert "signal quiet since 2026-01-01 00:00 UTC" in brief, brief
+        assert "re-ask the owner" in brief, brief
+
+
+def test_escalate_cluster_carries_the_latest_prior_resolution_note_into_the_brief():
+    """The latest terminal transition's note is what a reopened item's fresh investigation sees —
+    an older close note must not shadow it."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="b-reopen", title="Recurring", repo="demo-repo",
+                        state=core.STATE_TRIAGED, occurrences=5)
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_WORKING, core.STATE_QUIET, OLD.isoformat(), "older note"),
+        )
+        conn.execute(
+            "INSERT INTO item_transitions(event_id, from_state, to_state, at, note) VALUES (?,?,?,?,?)",
+            (eid, core.STATE_WORKING, core.STATE_CLOSED, NOW.isoformat(),
+             "owner answered: already fixed by the config change"),
+        )
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1, calls
+        brief = calls[0]["brief"]
+        assert "owner answered: already fixed by the config change" in brief, brief
+        assert "older note" not in brief, brief
+
+
 def test_escalate_never_clusters_an_origin_item_into_an_alert_brief():
     with _triage_env() as (conn, ctx):
         _seed_row(conn, external_id="o/r#5", title="Issue", origin="github_issue", source="github_go",
