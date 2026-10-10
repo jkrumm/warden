@@ -2,11 +2,11 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§146).
+build log (§1–§147).
 
 | | |
 |-|-|
-| Last updated | 2026-10-11 (§146 — link/render-plists/agents/setup refuse from a git worktree; venv stays usable) |
+| Last updated | 2026-10-11 (§147 — `warden adopt <id> --pr <n>` puts an item on an open warden PR's merge train) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 17 |
@@ -50,6 +50,12 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 - **Reinvestigate** (`warden reinvestigate` / Argo) sends an item back to `triaged` for a fresh
   investigation and closes the pull request it clears (best-effort GitHub call), keeping its URL in
   the note as `superseded PR <url>`.
+- **Adopt** (`warden adopt <event-id> --pr <n>`) points an item at a pull request warden itself
+  opened for it — a `dispatches` row, still open and unmerged — restores its
+  `implement_job`/`pr_url` and puts it back on its repo's merge train, which re-reviews the current
+  head and lands it. The owner's alternative to hand-merging on GitHub (which leaves the ledger
+  blind and the superseded draft open); a prior `pr_url` is closed best-effort. A PR warden did not
+  open is refused — the merge gate only ever lands a `dispatch/…` branch warden cut.
 - **Re-route.** A `human` verdict whose optional `owningRepo` names a different known repo moves the
   item back to `triaged` in that repo (once per item; the re-route's transition note is the
   ping-pong guard) instead of paging the owner — a misrouted finding re-investigates where it
