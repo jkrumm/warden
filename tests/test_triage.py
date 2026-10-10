@@ -3578,7 +3578,7 @@ def test_implement_result_schema_mismatch_is_a_loud_strike():
         _agent_gateway.get = lambda job_id: {
             "status": "done",
             "result": _dispatch_result("pr_opened", artifact_url="https://github.com/jkrumm/demo-repo/pull/51",
-                                        schema_version=_agent_gateway.DISPATCH_SCHEMA_VERSION - 2),
+                                        schema_version=min(_agent_gateway.DISPATCH_SCHEMA_VERSIONS) - 1),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item = core.get_item(conn, eid)
