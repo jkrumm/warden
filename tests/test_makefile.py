@@ -91,6 +91,12 @@ def test_venv_is_not_gated_from_a_linked_worktree():
         assert "no-such-python-for-test not found" in out, out
         assert "worktree" not in out, out
 
+def test_link_refuses_from_a_worktree_even_with_ignore_errors():
+    # `make -i` skips a failed prerequisite; the write must still not happen.
+    with Fixture() as f:
+        f.make(f.worktree, "-i", "link")
+        assert not f.wrapper().exists(), "-i must not let link write the global wrapper"
+
 def test_link_refuses_when_git_cannot_read_the_checkout():
     # Fail closed: with no git repo here, both rev-parse substitutions are empty and a bare
     # `[ "" = "" ]` would treat the unknown checkout as the main one. The guard must refuse

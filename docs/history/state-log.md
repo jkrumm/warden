@@ -10075,4 +10075,6 @@ rewrote `~/.local/bin/warden` to that worktree, which was deleted when the episo
 inherited `GIT_*` overrides cleared, fail closed when git cannot read the checkout) now gates
 `link`, `render-plists` and `agents`. `setup` runs the gate first and only then the rest in a
 sub-make, so `make -j setup` from a worktree starts nothing. `venv` is not gated — it writes only the
-checkout's own `.venv`, and `make check` in a worktree needs it. `tests/test_makefile.py` (new, 7).
+checkout's own `.venv`, and `make check` in a worktree needs it. `link` also chains the check and
+the write on one recipe line, so `make -i` (which skips a failed prerequisite) still cannot write
+the wrapper, and writes it via a temp file + `mv`. `tests/test_makefile.py` (new, 8).

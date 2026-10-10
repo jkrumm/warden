@@ -66,25 +66,32 @@ BIN_LINK := $(HOME)/.local/bin/warden
 # metadata is already gone) both substitutions are empty and `[ "" = "" ]` would be true,
 # treating an unknown checkout as the main one and overwriting the wrapper anyway. Require
 # both answers to be non-empty before the equality test can pass.
-.PHONY: assert-main-checkout
-assert-main-checkout:
-	@unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE; \
+# The check is a variable, not only a target: a prerequisite that fails is skipped by
+# `make -i` (or an inherited MAKEFLAGS=-i) and the recipe runs anyway, so `link` chains the
+# check and the write on ONE recipe line with `&&` — under -i the line still fails as a whole
+# and the write never runs. The wrapper is written to a temp file and moved into place, so a
+# kill mid-write cannot leave a truncated wrapper either.
+ASSERT_MAIN_CHECKOUT = { unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE; \
 	 dir="$$(git -C "$(WARDEN_REPO)" rev-parse --git-dir 2>/dev/null)"; \
 	 common="$$(git -C "$(WARDEN_REPO)" rev-parse --git-common-dir 2>/dev/null)"; \
 	[ -n "$$dir" ] && [ "$$dir" = "$$common" ] || { \
 		echo "warden: refusing — cannot confirm $(WARDEN_REPO) is the main checkout."; \
 		echo "        git reports a worktree, or cannot read the checkout at all."; \
-		echo "        The wrapper would point every shell at a checkout deleted with the worktree."; \
-		echo "        Run 'make link' from the live checkout ($(HOME)/SourceRoot/warden) instead."; \
+		echo "        Run this target from the live checkout instead."; \
 		exit 1; \
-	}
+	}; }
+
+.PHONY: assert-main-checkout
+assert-main-checkout:
+	@$(ASSERT_MAIN_CHECKOUT)
 
 .PHONY: link
 link: assert-main-checkout
-	@mkdir -p "$(dir $(BIN_LINK))"
-	@printf '#!/bin/sh\nexec "%s/scripts/warden" "$$@"\n' "$(WARDEN_REPO)" > "$(BIN_LINK)"
-	@chmod +x "$(BIN_LINK)"
-	@echo "  ✓ $(BIN_LINK) -> $(WARDEN_REPO)/scripts/warden"
+	@$(ASSERT_MAIN_CHECKOUT) && mkdir -p "$(dir $(BIN_LINK))" && \
+	 tmp="$$(mktemp "$(BIN_LINK).XXXXXX")" && \
+	 printf '#!/bin/sh\nexec "%s/scripts/warden" "$$@"\n' "$(WARDEN_REPO)" > "$$tmp" && \
+	 chmod +x "$$tmp" && mv -f "$$tmp" "$(BIN_LINK)" && \
+	 echo "  ✓ $(BIN_LINK) -> $(WARDEN_REPO)/scripts/warden"
 
 # ---------------------------------------------------------------------------
 # venv
