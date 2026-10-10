@@ -10030,3 +10030,23 @@ redaction. One test changed target, not strength: the schema-mismatch case now u
 Replay on the deployed pair (standalone `agw` investigate episodes, no ledger item): the homelab Kuma-push
 question (item 1496's shape) came back `nextAction=implement`, the hermes-agent stale cron pin (item 1497's shape)
 `none`; neither asked the owner. Both deployed (`make deploy` green on both sides); warden 534/534.
+
+## 144. A review's `needs-human` names its escalation too (2026-10-10, agent-platform Wave 13)
+
+Wave 12 left step-7 review `needs-human` (items 1370, 1390, 1456) uncovered: the review schema had no category, so a
+reversible call still paged. agent-gateway `60d0c51`, `70f7728`: `REVIEW_SCHEMA_VERSION` 2, optional
+`escalationCategory` (same six values) on `needs-human` only; the field is coerced (case, separators, unknown
+dropped) BEFORE validation so one bad enum cannot fail a synthesis into the salvage path; a failed reviewer forces
+`blocker`; the synthesis prompt lists the owner-only reasons and the usual false positives (accept a descope, which of
+two PRs, a fixable defect is a blocking finding).
+
+warden `72c1d6d`, `37fd11e`: `REVIEW_SCHEMA_VERSIONS` {1, 2} (widened and deployed first), `train._fold_review` as in
+STATE.md. Review fixes worth keeping: the latch is scoped to the train SHA (a rewound train reviewing a new head is
+asked again) and survives an infra failure; the decide paragraph and the reviewed-SHA delta share one context
+truncation so the base gives way, never an instruction; reverts are not re-driven (their context is
+`revert_review_context`), they page as before. `test_triage.py` 534 → 539.
+
+Replay on the deployed pair (agent-gateway review of open warden PR #25, schemaVersion 2): outcome `actionable` with
+one concrete blocking finding, `needs-human` not raised, nothing paged. Caveat: shows "decides when it can", not
+"never asks"; the three old items were not re-run. Not covered by an end-to-end test: the gateway's forced-blocker
+paths (only the coercion/normalizer/enum are unit-tested).
