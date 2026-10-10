@@ -15,6 +15,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+from clients import kuma  # noqa: E402
 from loop import core, intake, notify, triaging, verify, work  # noqa: E402
 
 
@@ -70,6 +71,9 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     # No timestamp argument, on purpose: see record_heartbeat().
     record_heartbeat(conn, dry_run=dry_run)
+
+    if not dry_run:
+        kuma.ping_loop()
 
     # Pulls the owner's queued Argo actions before this tick's snapshot reflects their outcome.
     notify.apply_argo_actions(conn, now, dry_run=dry_run)
