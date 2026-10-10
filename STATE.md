@@ -6,7 +6,7 @@ build log (§1–§142).
 
 | | |
 |-|-|
-| Last updated | 2026-10-10 (§142 — a reopened item's prior close note reaches the fresh investigation) |
+| Last updated | 2026-10-10 (§143 — an over-ceiling repo's implement verdict reaches the owner, not `failed(policy)`) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 17 |
@@ -54,6 +54,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   item back to `triaged` in that repo (once per item; the re-route's transition note is the
   ping-pong guard) instead of paging the owner — a misrouted finding re-investigates where it
   belongs (`work._reroute_repo()`).
+- **Over-ceiling repos.** Before an implement submit, `maybe_auto_implement()` reads agent-gateway's
+  `GET /api/dispatch-policy` once per pass and, when it caps the repo below `implement`, hands the
+  item to the owner as `needs_decision` (`apply by hand: <recommendation>`) instead of submitting
+  into a 4xx that lands `failed(policy)` and buries the recommendation (item 1503). An unreadable
+  policy is no opinion: the submit stays the boundary and answers its own refusal.
 - **Prior resolution in the brief.** A reopened item's most recent SUBSTANTIVE close note and its
   date (`item_transitions`, terminal state; a later silence close or a blank row never shadows a
   real answer, and a pure-silence close on its own yields no `PRIOR RESOLUTION` line at all) ride

@@ -9996,3 +9996,23 @@ limit)`; the note is capped with it at `NOTE_MAX`. Seven cases join `tests/test_
 (`_truncate`, the dated brief render, the latest-note-wins gather, substantive-beats-later-silence,
 silence-only-returns-None, blank-note skip, and the two-member cluster-fold safeguard);
 `test_triage.py` 519 → 526. `make check` green.
+
+## 143. An over-ceiling repo's implement verdict reaches the owner, not `failed(policy)` (2026-10-10)
+
+`maybe_auto_implement()` gated only the item's OWN `max_tier`, never the repo's agent-gateway ceiling.
+A re-routed alert item keeps `max_tier='implement'` when `_reroute_repo()` moves it to an
+investigate-only repo (items 1000/1002: the 1489 re-route sent them to an investigate-only repo), so
+a `nextAction=implement` verdict was submitted and agent-gateway answered 400; `end_on_refusal()`
+landed the item `failed(policy)` carrying only the refusal, and the investigation's recommendation
+fell off the queue until the policy hash changed. `maybe_auto_implement()` now reads
+`clients.agent_gateway.dispatch_policy()` once per pass and, before the claim, routes an over-ceiling
+item to `needs_decision` with the note `apply by hand: <recommendation>` (`work._repo_above_ceiling()`,
+`work._apply_by_hand_note()`); the ceiling lookup mirrors agent-gateway's `lookupRule()`
+(`clients.agent_gateway.dispatch_ceiling()`: lowercase keys, `implement` for a repo with no rule).
+An unreadable policy is no opinion — the submit stays the boundary and answers its own refusal, so
+`failed(policy)` + its re-drive still covers every non-ceiling refusal.
+`test_end_on_refusal_lands_policy…` and `test_policy_failures_are_redriven…` move their cap to
+another repo so they exercise that non-ceiling refusal path;
+`test_maybe_auto_implement_routes_an_over_ceiling_repo_to_needs_decision` covers the new route.
+`test_triage.py` 526 → 527. `make check` green.
+

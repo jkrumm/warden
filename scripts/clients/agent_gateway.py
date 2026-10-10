@@ -343,6 +343,18 @@ def dispatch_policy() -> dict[str, Any]:
     return parsed
 
 
+def dispatch_ceiling(policy: dict[str, Any], repo: str) -> str:
+    """The dispatch tier ceiling `policy` applies to `repo`, mirroring agent-gateway's own
+    `lookupRule()` (server/lib/dispatch-policy.ts): the `rules` table is keyed lowercase and looked
+    up case-insensitively, and a repo with no rule falls back to `implement`. A malformed rule
+    reads as `implement` rather than raising — this only feeds an early, best-effort ceiling check,
+    and the submit itself is still the boundary that answers a real refusal."""
+    rules = policy.get("rules")
+    rule = rules.get(repo.lower()) if isinstance(rules, dict) else None
+    ceiling = rule.get("ceiling") if isinstance(rule, dict) else None
+    return ceiling if isinstance(ceiling, str) else "implement"
+
+
 def policy_hash(policy: dict[str, Any]) -> str:
     """sha256 of the canonical JSON of a dispatch policy: equal policies, equal hash."""
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
