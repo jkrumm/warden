@@ -77,14 +77,14 @@ Every non-terminal `triage_items` row plus counts.
     "implement_job": null, "validation_job": null, "occurrences": 3,
     "revision_count": 0, "train_stage": null, "created_at": "...", "updated_at": "...",
     "origin_channel": null, "origin_thread_ts": null,
-    "availableActions": ["implement", "dismiss", "reinvestigate", "note"],
+    "availableActions": ["implement", "adopt", "dismiss", "reinvestigate", "note"],
     "issue": null
   }],
   "terminal_24h": 4,
   "awaiting_owner": [{
     "kind": "item", "event_id": 42, "repo": "warden", "title": "...",
     "state": "needs_decision", "pr_url": null, "age_days": 1.5, "reason": null,
-    "revision_count": 0, "availableActions": ["implement", "dismiss", "reinvestigate", "note"]
+    "revision_count": 0, "availableActions": ["implement", "adopt", "dismiss", "reinvestigate", "note"]
   }],
   "truncated": true
 }
@@ -103,10 +103,12 @@ Every non-terminal `triage_items` row plus counts.
   status; `apply_argo_actions()` re-validates when an action is applied. `implement`:
   `needs_decision`, `failed`. `merge`: the same, plus a PR on the item — the handler lands
   it when a review confirmed the head, else rejoins the merge train, so a prior review is
-  not required to offer it. Neither is offered once `revert_pr` is set. `dismiss`:
-  `new`, `triaged`, `needs_decision`, `failed`, `quiet`. `reinvestigate`: `needs_decision`,
-  `failed`, `quiet`. `retry`: a `failed` item with a stage to re-enter. `note`: any
-  non-terminal state.
+  not required to offer it. `adopt`: `needs_decision`, `failed` — the owner supplies a pull
+  request number (free-text, like dismiss's `reason`); it is adopted only if warden itself
+  opened that PR for the item. Implement/merge/adopt are never offered once `revert_pr` is
+  set. `dismiss`: `new`, `triaged`, `needs_decision`, `failed`, `quiet`. `reinvestigate`:
+  `needs_decision`, `failed`, `quiet`. `retry`: a `failed` item with a stage to re-enter.
+  `note`: any non-terminal state.
 - `failure_class` is `infra`, `policy` or `work` on a `failed` item and `null` on every other
   state; `redrives` counts the automatic INFRA re-drives (3 at most, on a 60/180/480 minute
   backoff after `retry_at`); a policy re-drive (once per change of agent-gateway's dispatch policy) is

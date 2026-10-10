@@ -604,11 +604,12 @@ def test_board_item_available_actions_and_issue_shape():
 
 def test_available_actions_follow_the_new_state_machine():
     """The owner's verbs per state — needs_decision and failed are the two states an
-    owner acts on; merge is offered for an owner-state item carrying a PR."""
+    owner acts on; merge is offered for an owner-state item carrying a PR, adopt for
+    any owner-state item (the PR number is supplied by the owner at apply time)."""
     a = api._available_actions
-    assert set(a("needs_decision")) == {"implement", "dismiss", "reinvestigate", "note"}
-    assert set(a("needs_decision", mergeable=True)) == {"implement", "merge", "dismiss", "reinvestigate", "note"}
-    assert set(a("failed", mergeable=True)) == {"implement", "merge", "dismiss", "reinvestigate", "note"}
+    assert set(a("needs_decision")) == {"implement", "adopt", "dismiss", "reinvestigate", "note"}
+    assert set(a("needs_decision", mergeable=True)) == {"implement", "adopt", "merge", "dismiss", "reinvestigate", "note"}
+    assert set(a("failed", mergeable=True)) == {"implement", "adopt", "merge", "dismiss", "reinvestigate", "note"}
     assert set(a("new")) == {"dismiss", "note"} and set(a("triaged")) == {"dismiss", "note"}
     assert set(a("quiet")) == {"dismiss", "reinvestigate"}
     for in_flight in ("working", "merging", "verifying"):
