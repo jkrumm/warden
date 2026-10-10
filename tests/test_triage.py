@@ -52,7 +52,7 @@ TRIAGE_PATH = REPO_ROOT / "scripts" / "triage.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from clients import argo as _argo, github as _github, agent_gateway as _agent_gateway, kuma as _kuma  # noqa: E402
 KUMA_PINGS: list[int] = []
-from clients.errors import HeadMoved, PolicyError, RemoteError, SubmitRefused  # noqa: E402
+from clients.errors import HeadMoved, PolicyError, PreconditionError, RemoteError, SubmitRefused  # noqa: E402
 from lifecycle import dispatch as _dispatch, intake as _intake, items as _items  # noqa: E402
 from lifecycle import merge as _merge, rollout as _rollout  # noqa: E402
 from loop import core, intake, notify, train, triaging, verify, work  # noqa: E402
@@ -5218,6 +5218,64 @@ def test_reinvestigate_lost_compare_and_set_closes_nothing():
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_FAILED, dict(item)
         assert item["pr_url"] == pr and item["note"] == "retries exhausted", dict(item)
+
+
+def _seed_adoptable_item(conn, *, external_id: str, pr_number: int, state: str = core.STATE_NEEDS_DECISION,
+                         old_pr: str | None = None, repo: str = "demo-repo",
+                         owner: str = "jkrumm", merged_at: str | None = None) -> int:
+    eid = _seed_verdict_item(conn, external_id=external_id, repo=repo,
+                             investigate_job=f"inv-{external_id}")
+    job = f"impl-{external_id}"
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,artifact_url,origin_event_id,created_at,merged_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (job, "implement", repo, "b", "done",
+         f"https://github.com/{owner}/{repo}/pull/{pr_number}", eid, NOW.isoformat(), merged_at),
+    )
+    conn.execute("UPDATE triage_items SET state=?, implement_job=NULL, validation_job=NULL, pr_url=?, "
+                 "revision_count=0 WHERE event_id=?", (state, old_pr, eid))
+    conn.commit()
+    return eid
+
+
+def test_adopt_own_pr_rejoins_the_merge_train_and_closes_the_prior_pr():
+    with _triage_env() as (conn, ctx):
+        old = "https://github.com/jkrumm/demo-repo/pull/7"
+        eid = _seed_adoptable_item(conn, external_id="sig-adopt", pr_number=9, old_pr=old)
+        rowcount, cleared = work.adopt_own_pr(
+            conn, eid, 9, NOW, expect_state=core.STATE_NEEDS_DECISION, note="adopted by owner: PR #9")
+        conn.commit()
+        core.close_pr_best_effort(cleared, "Superseded")
+        assert rowcount == 1 and cleared == old, (rowcount, cleared)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING, dict(item)
+        assert item["implement_job"] == "impl-sig-adopt", dict(item)
+        assert item["pr_url"].endswith("/pull/9"), dict(item)
+        assert item["train_stage"] == train.TRAIN_UPDATE and item["train_sha"] is None, dict(item)
+        assert item["reviewed_sha"] is None and item["revision_count"] == 0, dict(item)
+        assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
+
+
+def test_adopt_own_pr_refuses_a_pr_warden_never_opened_and_writes_nothing():
+    """Only a PR warden itself opened for this item is adoptable — the merge gate merges nothing
+    else. A foreign owner and a dispatch already merged both refuse, leaving the item untouched."""
+    with _triage_env() as (conn, ctx):
+        foreign = _seed_adoptable_item(conn, external_id="sig-adopt-foreign", pr_number=9, owner="someone")
+        merged = _seed_adoptable_item(conn, external_id="sig-adopt-merged", pr_number=9,
+                                      merged_at=NOW.isoformat())
+        for eid in (foreign, merged):
+            try:
+                work.adopt_own_pr(conn, eid, 9, NOW, expect_state=core.STATE_NEEDS_DECISION, note="x")
+            except PreconditionError:
+                pass
+            else:
+                raise AssertionError(f"event {eid}: a non-adoptable PR must be refused")
+        conn.commit()
+        assert CLOSED_PRS == [], CLOSED_PRS
+        for eid in (foreign, merged):
+            item = core.get_item(conn, eid)
+            assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+            assert item["implement_job"] is None and item["pr_url"] is None, dict(item)
 
 
 def test_apply_argo_actions_one_bad_action_does_not_stop_the_rest():

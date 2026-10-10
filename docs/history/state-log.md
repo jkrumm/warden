@@ -10050,3 +10050,27 @@ Replay on the deployed pair (agent-gateway review of open warden PR #25, schemaV
 one concrete blocking finding, `needs-human` not raised, nothing paged. Caveat: shows "decides when it can", not
 "never asks"; the three old items were not re-run. Not covered by an end-to-end test: the gateway's forced-blocker
 paths (only the coercion/normalizer/enum are unit-tested).
+
+## 145. `warden adopt` — an item takes over a pull request it already opened (2026-10-10)
+
+An alert triage investigation found no route for an item whose fix is an already-open PR: `merge`
+needs `pr_url` (notify.py) and `implement_job` (the gate reads that dispatch row), `reinvestigate`
+nulls both, `api.py` offers `merge` only when `pr_url` is set, and `_close_superseded_pr` fires only
+from a fresh implement handoff — so an owner could only hand-merge on GitHub, which leaves the ledger
+blind and the superseded draft open.
+
+`warden adopt <event-id> --pr <number>` adopts a pull request WARDEN ITSELF opened for the item:
+`work._find_adoptable_dispatch()` resolves the `implement` dispatch behind `#<number>` for this event
+(owner `jkrumm`, the item's repo, `status='done'`, `merged_at IS NULL`), and `work.adopt_own_pr()`
+restores `implement_job`/`pr_url`, clears `reviewed_sha` and `revision_count`, and enters `merging`
+on `TRAIN_START` — so the repo's merge train re-reviews the current head and lands it. The adopted
+dispatch's own `done` row is what `plan_or_land()` reads, so the `dispatch/…`-branch, PR-open and
+review-confirmed preconditions all still hold; adopt is not a second merge authority. A prior
+`pr_url` is closed best-effort (`core.close_pr_best_effort()`), and a PR warden did not open — or one
+already merged — is refused before any state write. Allowed from `needs_decision`/`failed`
+(`work.ADOPT_ALLOWED_STATES`, mirrored by the CLI), never an in-flight state; a reverted item
+(`revert_pr`) is refused. CLI-only for now: `adopt` needs a PR number the Argo board cannot know, so
+`api.py`'s `availableActions` deliberately does not list it (a form/CLI is its door). No schema
+change, no migration. Tests: two in `tests/test_triage.py` (rejoin + close prior, refuse a foreign/
+merged PR) and four in `tests/test_warden_cli.py` (adopt, refuse, dry-run, usage/state); 539 → 541,
+CLI 83 → 87. `make check` green.

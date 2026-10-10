@@ -2065,6 +2065,75 @@ def _close_superseded_pr(old_pr: str, new_pr: str) -> None:
                                       f"branch, so warden re-derived the fix from the latest base.")
 
 
+# The states an owner may adopt a pull request from: the same two owner states every other owner
+# action acts on, never an in-flight one (`working`/`merging`/`verifying` have an episode or a train
+# of their own). scripts/api.py's `availableActions` does not list `adopt` by hand — it needs a PR
+# number the board cannot know, so a form/CLI is its door, not a one-click button.
+ADOPT_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED)
+
+
+def _find_adoptable_dispatch(conn: sqlite3.Connection, item: sqlite3.Row,
+                             pr_number: int) -> tuple[str, str] | None:
+    """The `(implement_job, pr_url)` of the dispatch behind pull request `pr_number` when warden
+    itself opened that PR for THIS item — else None.
+
+    Only a PR warden cut (`tier='implement'`) and opened for this event is adoptable. merge's gate
+    (`lifecycle.merge.plan_or_land()`) merges only a `dispatch/…` branch it holds a `done` dispatch
+    row for, so a foreign PR — or another item's — is refused by the gate anyway; resolving it here
+    turns that into a clear refusal before any state is written. A dispatch already merged
+    (`merged_at` set) is skipped: re-adopting it would ask for a second merge of the same change."""
+    rows = conn.execute(
+        "SELECT job_id, artifact_url FROM dispatches "
+        "WHERE origin_event_id=? AND tier='implement' AND status='done' "
+        "AND artifact_url IS NOT NULL AND merged_at IS NULL ORDER BY id DESC",
+        (item["event_id"],),
+    ).fetchall()
+    for row in rows:
+        parsed = _github.parse_pr_url(row["artifact_url"] or "")
+        if parsed is not None and parsed[0] == _github.GH_OWNER and parsed[1] == item["repo"] \
+                and parsed[2] == pr_number:
+            return row["job_id"], row["artifact_url"]
+    return None
+
+
+def adopt_own_pr(conn: sqlite3.Connection, event_id: int, pr_number: int, now: dt.datetime, *,
+                  expect_state: str, note: str) -> tuple[int, str | None]:
+    """Point item `event_id` at pull request `pr_number` — one warden itself opened for it — and put
+    it back on its repo's merge train (`advance_merge_trains()`), which re-reviews the current head
+    and lands it once the checks settle. The owner's alternative to hand-merging on GitHub, which
+    leaves the ledger blind: the item never learns the fix landed and the stale draft it superseded
+    is never closed.
+
+    The adopted dispatch's own `done` row is what the merge gate reads, so the `dispatch/…`-branch,
+    PR-open and review-confirmed preconditions still hold — this is not a second merge authority.
+    It restores the item's handles (`implement_job`, `pr_url`) and starts the train over
+    (`reviewed_sha=None`, TRAIN_START) rather than trusting a review of a head the item no longer
+    carries.
+
+    Returns `(rowcount, old_pr)`: `old_pr` is the item's previous `pr_url` when it differs from the
+    adopted one, for the caller to close best-effort AFTER its own commit (None on a lost
+    compare-and-set, where nothing was written). Raises `PreconditionError` when no such dispatch PR
+    exists."""
+    item = core.get_item(conn, event_id)
+    if item is None:
+        raise PreconditionError(f"no triage_items row for event_id {event_id}")
+    match = _find_adoptable_dispatch(conn, item, pr_number)
+    if match is None:
+        raise PreconditionError(
+            f"no pull request warden opened for this item matches #{pr_number} — adopt takes over "
+            "only a pull request this item's own implement episode opened, still open and unmerged; "
+            "a PR from anywhere else is not mergeable by warden's gate"
+        )
+    job_id, pr_url = match
+    old_pr = item["pr_url"] if item["pr_url"] and item["pr_url"] != pr_url else None
+    rowcount = core.set_state(
+        conn, event_id, core.STATE_MERGING, now, expect_state=expect_state,
+        implement_job=job_id, validation_job=None, pr_url=pr_url,
+        revision_count=0, strikes=0, retry_at=None, **train.TRAIN_START, note=note,
+    )
+    return rowcount, (old_pr if rowcount else None)
+
+
 def _attempt_rewind_columns(conn: sqlite3.Connection, item: sqlite3.Row, job_id: str) -> dict[str, Any]:
     """The columns that hand the implement attempt `job_id` back, so the next pass submits it again
     (a lease refusal, a strike):
