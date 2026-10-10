@@ -156,14 +156,14 @@ def _connect(db: Path):
 
 def _seed_dispatch(db: Path, job_id: str, *, tier="investigate", repo="alpha", status="done",
                     artifact_url=None, verdict_json=None, created_at=None, merged_at=None,
-                    validation_status=None) -> None:
+                    validation_status=None, origin_event_id=None) -> None:
     conn, _ = _connect(db)
     now = created_at or dt.datetime.now(dt.timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,artifact_url,created_at,"
-        "finished_at,merged_at,validation_status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "finished_at,merged_at,validation_status,origin_event_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (job_id, tier, repo, "some brief", status, verdict_json, artifact_url, now, now, merged_at,
-         validation_status),
+         validation_status, origin_event_id),
     )
     conn.commit()
     conn.close()
@@ -1324,6 +1324,91 @@ def test_reinvestigate_refuses_states_outside_the_allowlist_and_requires_why():
     assert _row(conn, "SELECT state FROM triage_items WHERE event_id=53")["state"] == "needs_decision"
     count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id IN (52,53)")["n"]
     assert count == 0, count
+    conn.close()
+
+
+# --- adopt ---------------------------------------------------------------------
+
+
+def test_adopt_points_an_item_at_a_warden_pr_and_joins_the_merge_train():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 60, state="needs_decision", repo="alpha")
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET pr_url=? WHERE event_id=60",
+                 ("https://github.com/jkrumm/alpha/pull/7",))
+    conn.commit()
+    conn.close()
+    _seed_dispatch(db, "impl-9", tier="implement", repo="alpha", status="done",
+                   artifact_url="https://github.com/jkrumm/alpha/pull/9", origin_event_id=60)
+    gh = stubs.StubServer({
+        ("POST", "/repos/jkrumm/alpha/issues/7/comments"): (201, {"id": 1}),
+        ("PATCH", "/repos/jkrumm/alpha/pulls/7"): (200, {"state": "closed"}),
+    })
+    try:
+        proc = h.run(["adopt", "60", "--pr", "9", "--json"], env=h.base_env(db=db, gh=gh.base))
+    finally:
+        gh.stop()
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["verb"] == "adopt" and out["ok"] is True, out
+    assert out["eventId"] == 60 and out["fromState"] == "needs_decision" and out["state"] == "merging", out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT * FROM triage_items WHERE event_id=60")
+    assert row["state"] == "merging" and row["implement_job"] == "impl-9", dict(row)
+    assert row["pr_url"].endswith("/pull/9") and row["train_stage"] == "update", dict(row)
+    assert row["reviewed_sha"] is None and row["revision_count"] == 0, dict(row)
+    trans = _row(conn, "SELECT from_state, to_state FROM item_transitions WHERE event_id=60 ORDER BY id DESC LIMIT 1")
+    assert trans["from_state"] == "needs_decision" and trans["to_state"] == "merging", dict(trans)
+    conn.close()
+    # The prior PR is retired as superseded: a comment saying why, then the PATCH.
+    assert [r["method"] for r in gh.requests] == ["POST", "PATCH"], gh.requests
+    assert gh.requests[1]["path"] == "/repos/jkrumm/alpha/pulls/7" and gh.requests[1]["body"] == {"state": "closed"}, gh.requests
+
+
+def test_adopt_refuses_a_pr_warden_did_not_open():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 61, state="needs_decision", repo="alpha")
+    _seed_dispatch(db, "impl-9", tier="implement", repo="alpha", status="done",
+                   artifact_url="https://github.com/jkrumm/alpha/pull/9", origin_event_id=61)
+    proc = h.run(["adopt", "61", "--pr", "12", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 2 and out["ok"] is False, out
+    assert "no pull request warden opened" in out["error"], out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, implement_job, pr_url FROM triage_items WHERE event_id=61")
+    assert row["state"] == "needs_decision" and row["implement_job"] is None and row["pr_url"] is None, dict(row)
+    conn.close()
+
+
+def test_adopt_dry_run_writes_nothing():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 62, state="failed", repo="alpha")
+    _seed_dispatch(db, "impl-9", tier="implement", repo="alpha", status="done",
+                   artifact_url="https://github.com/jkrumm/alpha/pull/9", origin_event_id=62)
+    proc = h.run(["adopt", "62", "--pr", "9", "--dry-run", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["dryRun"] is True and out["state"] == "merging", out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, implement_job, train_stage FROM triage_items WHERE event_id=62")
+    assert row["state"] == "failed" and row["implement_job"] is None and row["train_stage"] is None, dict(row)
+    count = _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id=62")["n"]
+    assert count == 0, count
+    conn.close()
+
+
+def test_adopt_requires_pr_and_refuses_other_states():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 63, state="working", repo="alpha", implement_job="job-x")
+    _seed_item(db, 64, state="needs_decision", repo="alpha")
+    assert h.run(["adopt", "64", "--json"], env=h.base_env(db=db)).returncode == 64, "pr is required"
+    proc = h.run(["adopt", "63", "--pr", "9", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 2 and out["ok"] is False, out
+    conn, _ = _connect(db)
+    assert _row(conn, "SELECT state FROM triage_items WHERE event_id=63")["state"] == "working"
     conn.close()
 
 
