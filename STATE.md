@@ -6,7 +6,7 @@ build log (§1–§142).
 
 | | |
 |-|-|
-| Last updated | 2026-10-10 (§143 — a `human` verdict must name an owner-only category; otherwise warden decides) |
+| Last updated | 2026-10-10 (§144 — an over-ceiling repo's implement verdict reaches the owner, not `failed(policy)`) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 17 |
@@ -54,6 +54,13 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   item back to `triaged` in that repo (once per item; the re-route's transition note is the
   ping-pong guard) instead of paging the owner — a misrouted finding re-investigates where it
   belongs (`work._reroute_repo()`).
+- **Over-ceiling repos.** Before an implement submit, `maybe_auto_implement()` reads agent-gateway's
+  `GET /api/dispatch-policy` once per pass and, when it caps the repo below `implement`, hands the
+  item to the owner as `needs_decision` (`apply by hand: <recommendation>`, capped at `NOTE_MAX`)
+  instead of submitting into a 4xx that lands `failed(policy)` and buries the recommendation (item
+  1503). The read and the `--dry-run` preview sit before the submit, so a dry pass reports the same
+  route a live one takes. An unreadable policy is no opinion: the submit stays the boundary and
+  answers its own refusal.
 - **Owner-only escalation.** A `human` verdict reaches `needs_decision` only with an
   `escalationCategory` (product, data_loss, spend, other_people, security, blocker); the note carries
   it as `[category]`. An investigate verdict without one is re-driven once ("decide it yourself"), then

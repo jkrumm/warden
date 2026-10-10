@@ -46,7 +46,13 @@ the third strike is `failed` carrying the error. An agent-gateway 4xx on submit 
 refusal, not a strike: the item ends `failed` with agent-gateway's message — except a
 refused escalation `model` (resubmitted once without it), a lease refusal (retry
 in 10 minutes, no strike) and a refused triage submit (strikes; never the item's
-fault).
+fault). A repo its agent-gateway dispatch policy caps below `implement` never reaches
+that 4xx: `maybe_auto_implement()` reads the policy once per pass and sends an
+over-ceiling implement verdict to `needs_decision` (note `apply by hand:
+<recommendation>`) instead, so the investigation's fix is not buried in a `failed
+(policy)` row (item 1503). The check runs before the `--dry-run` branch too, so a dry
+pass reports the same route a live one takes. `failed(policy)` therefore covers only
+the refusals the pre-check cannot see — a repo outside the allowlist, a bad model.
 An implement whose repo check TOOL failed to run (agent-gateway's `checks_tool_failed`,
 dispatch schema v5) is an infrastructure failure too: it strikes and never spends a
 revision — only a red suite (`checks_failed`) goes back to the implementer.

@@ -419,14 +419,36 @@ def redrive_failed(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool)
             print(f"triage: {why}: {item['signature'][:60]} (event {item['event_id']}) -> {stage}", file=sys.stderr)
 
 
-def current_policy_hash() -> str | None:
-    """The hash of agent-gateway's dispatch policy as it answers now, or None when it cannot be read:
-    a policy refusal's re-drive never depends on, and never fails because of, this call."""
+def current_dispatch_policy() -> dict[str, Any] | None:
+    """agent-gateway's dispatch policy as it answers now, or None when it cannot be read. A caller
+    that only reads it early (a re-drive, an over-ceiling pre-check) must treat an unreadable policy
+    as "no opinion" and let the submit itself be the boundary, so this never raises."""
     try:
-        return _agent_gateway.policy_hash(_agent_gateway.dispatch_policy())
+        return _agent_gateway.dispatch_policy()
     except WardenError as e:
         print(f"triage: could not read agent-gateway's dispatch policy: {e}", file=sys.stderr)
         return None
+
+
+def current_policy_hash() -> str | None:
+    """The hash of agent-gateway's dispatch policy as it answers now, or None when it cannot be read:
+    a policy refusal's re-drive never depends on, and never fails because of, this call."""
+    policy = current_dispatch_policy()
+    return _agent_gateway.policy_hash(policy) if policy is not None else None
+
+
+# agent-gateway ranks dispatch tiers investigate < author < implement (server/lib/dispatch-policy.ts);
+# an unrecognized tier fails closed above every real ceiling. Sourced from policy.VALID_TIERS so the
+# tier list stays single-sourced.
+_TIER_RANK = {tier: rank for rank, tier in enumerate(_policy.VALID_TIERS)}
+
+
+def _repo_above_ceiling(policy: dict[str, Any], repo: str, tier: str) -> bool:
+    """True when `tier` sits above `repo`'s agent-gateway dispatch ceiling — the same submit a
+    `end_on_refusal()` would answer with a 4xx, read one step earlier so the item can go to the owner
+    instead of being submitted only to land `failed(policy)`."""
+    ceiling = _agent_gateway.dispatch_ceiling(policy, repo)
+    return _TIER_RANK.get(tier, 99) > _TIER_RANK.get(ceiling, 99)
 
 
 def end_on_refusal(conn: sqlite3.Connection, members: list[sqlite3.Row], exc: SubmitRefused, *,
@@ -1030,6 +1052,18 @@ def _decision_note(result: dict[str, Any], category: str | None = None) -> str:
     it is never mistaken for a vetted escalation."""
     tag = f"[{category}]" if category else UNCATEGORIZED_TAG
     return _truncate(f"{tag} {_decision_text(result)}", _items.NOTE_MAX)
+
+
+def _apply_by_hand_note(verdict: dict[str, Any]) -> str:
+    """What an over-ceiling item shows the owner: agent-gateway caps this repo below `implement`, so
+    the investigation's own recommendation is what must be applied by hand instead of dispatched.
+    Capped to one note line here (set_state() caps again) so a verdict recommendation longer than
+    NOTE_MAX never becomes an oversized owner-action note."""
+    for key in ("recommendation", "summary"):
+        text = str(verdict.get(key) or "").strip()
+        if text:
+            return _truncate(f"apply by hand: {text}", _items.NOTE_MAX)
+    return "apply by hand: the investigation recommended implement, but agent-gateway caps this repo below it"
 
 
 def _uncategorized_human_outcome(conn: sqlite3.Connection, m: sqlite3.Row, result: dict[str, Any],
@@ -1797,13 +1831,23 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     first resubmitted once without it, open_implement_episode()). A submit that MAY have reached
     agent-gateway (a timeout) is never retried blind: the claim and the open operation stay put for
     reconcile_operations() (hold_ambiguous_submit()), which strikes the item back to `working` once
-    the grace window has passed."""
+    the grace window has passed.
+
+    Before submitting — and before the `dry_run` preview, so a dry pass reports the same route — a
+    pass reads agent-gateway's dispatch policy once: an item whose repo it caps below `implement` is
+    handed to the owner as `needs_decision` ("apply by hand: …") rather than submitted into a 4xx
+    that would bury the investigation's recommendation in a `failed(policy)` row (item 1503).
+    `_policy.require_auto_from_item()` gates the item's OWN `max_tier`; this gates the REPO's
+    ceiling, which the two can disagree on after a re-route. An unreadable policy is no opinion: the
+    submit remains the boundary and answers its own refusal."""
     ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND dispatch_job IS NOT NULL AND implement_job IS NULL "
         f"AND max_tier = 'implement' AND revert_json IS NULL AND {ready_sql} ORDER BY event_id",
         (core.STATE_WORKING, *ready_params)
     ).fetchall()
+    policy_text: dict[str, Any] | None = None
+    policy_read = False
     for item in candidates:
         if item["repo"] is None:
             continue
@@ -1813,9 +1857,25 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         verdict = core.safe_json(d["verdict_json"])
         if (verdict.get("nextAction") or "").strip().lower() not in ("implement", "issue"):
             continue
+
+        # agent-gateway is the ceiling boundary, but a submit it will refuse costs a job row and
+        # lands the item `failed(policy)` carrying only the refusal — the investigation's fix falls
+        # off the queue (item 1503). Read its policy once per pass, BEFORE the dry-run branch (a
+        # read-only GET, like the other probes a pass already makes), and hand an over-ceiling item
+        # to the owner as `needs_decision`. An unreadable policy is no opinion: the submit below
+        # remains the boundary and answers its own refusal.
+        if not policy_read:
+            policy_text = current_dispatch_policy()
+            policy_read = True
+        over_ceiling = policy_text is not None and _repo_above_ceiling(policy_text, item["repo"], "implement")
+
         if dry_run:
-            print(f"[dry-run] would auto-implement {item['signature']} in {item['repo']} "
-                  f"(event {item['event_id']})")
+            if over_ceiling:
+                print(f"[dry-run] would send {item['signature']} in {item['repo']} to needs_decision "
+                      f"(apply by hand: agent-gateway caps the repo below implement) (event {item['event_id']})")
+            else:
+                print(f"[dry-run] would auto-implement {item['signature']} in {item['repo']} "
+                      f"(event {item['event_id']})")
             continue
 
         try:
@@ -1823,6 +1883,12 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
             _policy.check_repo_not_in_flight(conn, repo=item["repo"])
         except (PolicyError, PreconditionError, UsageError) as e:
             core.set_state(conn, item["event_id"], core.STATE_WORKING, now, note=f"deferred: {e}")
+            conn.commit()
+            continue
+
+        if over_ceiling:
+            core.set_state(conn, item["event_id"], core.STATE_NEEDS_DECISION, now,
+                           note=_apply_by_hand_note(verdict))
             conn.commit()
             continue
 

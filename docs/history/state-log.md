@@ -10020,3 +10020,26 @@ implement-episode `human` is tagged (`[category]` or `[no category]`), not re-dr
 
 Not covered: step-7 review `needs-human` (a `review` job outcome, no category in its schema). `test_triage.py`
 526 → 534.
+
+## 144. An over-ceiling repo's implement verdict reaches the owner, not `failed(policy)` (2026-10-10)
+
+`maybe_auto_implement()` gated only the item's OWN `max_tier`, never the repo's agent-gateway ceiling.
+A re-routed alert item keeps `max_tier='implement'` when `_reroute_repo()` moves it to an
+investigate-only repo (items 1000/1002: the 1489 re-route sent them to an investigate-only repo), so
+a `nextAction=implement` verdict was submitted and agent-gateway answered 400; `end_on_refusal()`
+landed the item `failed(policy)` carrying only the refusal, and the investigation's recommendation
+fell off the queue until the policy hash changed. `maybe_auto_implement()` now reads
+`clients.agent_gateway.dispatch_policy()` once per pass and, before the claim, routes an over-ceiling
+item to `needs_decision` with the note `apply by hand: <recommendation>` (`work._repo_above_ceiling()`,
+`work._apply_by_hand_note()`); the ceiling lookup mirrors agent-gateway's `lookupRule()`
+(`clients.agent_gateway.dispatch_ceiling()`: lowercase keys, `implement` for a repo with no rule).
+An unreadable policy is no opinion — the submit stays the boundary and answers its own refusal, so
+`failed(policy)` + its re-drive still covers every non-ceiling refusal. The ceiling read sits before
+the `--dry-run` branch (a read-only GET), so a dry pass prints `would send … to needs_decision`
+rather than the `would auto-implement` a live pass no longer does; `_apply_by_hand_note()` caps its
+note at `NOTE_MAX` at construction (`set_state()` caps again); and DESIGN.md's state-machine prose
+now names the pre-submit branch beside the 4xx refusal path.
+`test_end_on_refusal_lands_policy…` and `test_policy_failures_are_redriven…` move their cap to
+another repo so they exercise that non-ceiling refusal path;
+`test_maybe_auto_implement_routes_an_over_ceiling_repo_to_needs_decision` covers the new route and
+its dry-run preview. `test_triage.py` 534 → 535. `make check` green.
