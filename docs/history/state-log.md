@@ -10065,4 +10065,4 @@ of submitting — no episode, no operation, nothing to re-drive. A repo absent f
 own default is the top); an unreadable policy skips the check and submits as before, leaving agent-gateway to refuse.
 The check runs against the tier actually submitted, diverts only that item, writes no `verdict_json` and touches no
 sibling; `--dry-run` reports the diversion and writes nothing. `lifecycle/policy.py` grows `dispatch_ceiling()` and
-`tier_over_ceiling()`. `test_triage.py` 539 → 542, `test_lifecycle.py` 55 → 57.
+`tier_over_ceiling()`. `test_triage.py` 539 → 543, `test_lifecycle.py` 55 → 57. The apply-by-hand note strips the recommendation before falling back, so a whitespace-only recommendation yields the summary.

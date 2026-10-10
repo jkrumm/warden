@@ -1788,7 +1788,8 @@ def _apply_by_hand_note(repo: str, ceiling: str, verdict: dict[str, Any]) -> str
     (`<repo> is <ceiling>-only for agents` — agent-gateway's ceiling for the repo) and the
     investigation's own recommendation, so the owner has the change to make by hand
     (`apply by hand: <recommendation>`, falling back to the summary when the verdict carried none)."""
-    recommendation = str(verdict.get("recommendation") or verdict.get("summary") or "").strip()
+    recommendation = (str(verdict.get("recommendation") or "").strip()
+                      or str(verdict.get("summary") or "").strip())
     note = f"{repo} is {ceiling}-only for agents"
     note = f"{note} — apply by hand: {recommendation}" if recommendation else f"{note} — apply by hand"
     return _truncate(note, _items.NOTE_MAX)

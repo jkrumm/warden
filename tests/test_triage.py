@@ -3144,6 +3144,16 @@ def test_auto_implement_over_the_repo_ceiling_parks_for_the_owner_instead_of_sub
         assert calls == [] and core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
 
 
+def test_apply_by_hand_note_skips_a_blank_recommendation_for_the_summary():
+    """A whitespace-only recommendation is no recommendation: the note falls back to the summary
+    instead of ending in a bare "apply by hand"."""
+    note = work._apply_by_hand_note("demo-repo", "investigate",
+                                    {"recommendation": "   ", "summary": "bump the pinned route"})
+    assert note == "demo-repo is investigate-only for agents — apply by hand: bump the pinned route", note
+    bare = work._apply_by_hand_note("demo-repo", "investigate", {"recommendation": " ", "summary": " "})
+    assert bare == "demo-repo is investigate-only for agents — apply by hand", bare
+
+
 def test_auto_implement_ceiling_diversion_writes_nothing_under_dry_run():
     """The dry-run contract (DESIGN.md § What must not be lost): a --dry-run pass must not move an
     over-ceiling item, only report that it would."""
