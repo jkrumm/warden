@@ -9971,5 +9971,6 @@ pinned to ids, repo and the clock's own note, with a transition row. `clients/ku
 `scripts/improve-trigger.py` makes the improve loop outcome-triggered. The 1h deadline code itself was
 already gone; log rotation was already declared (dotfiles `log-rotate.sh`). agent-gateway dispatch
 schema v6's synchronous 400s were already `SubmitRefused` → `failed(policy)`; a test pins the shape.
-`test_triage.py` 513 → 517 (+4: park, deploy park, brief overlap, 400 shape), `test_ledger.py` +1.
+`test_triage.py` 513 → 519 (+6: merge park, deploy park, herdr park, herdr listing, brief overlap, 400 shape), `test_ledger.py` +1.
+`/review` of the wave: 3 blocking (deploy skipped `checkout_in_use`; Kuma pinged before the trailing steps; bare `herdr` off the widened PATH) and 6 of 7 improvements fixed; not done: a shared git-state predicate for `checkout_in_use`/`_sync_checkout` (the two can drift).
 Existing tests that spelled "Attempt N of 4" now read the constant.

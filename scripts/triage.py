@@ -72,14 +72,15 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # No timestamp argument, on purpose: see record_heartbeat().
     record_heartbeat(conn, dry_run=dry_run)
 
-    if not dry_run:
-        kuma.ping_loop()
-
     # Pulls the owner's queued Argo actions before this tick's snapshot reflects their outcome.
     notify.apply_argo_actions(conn, now, dry_run=dry_run)
 
     # Last step of every pass: the Argo snapshot.
     notify.push_argo_snapshot(conn, now, dry_run=dry_run)
+
+    # After the last step: a pass that dies before here must stay silent for Kuma to page on.
+    if not dry_run:
+        kuma.ping_loop()
     return 0
 
 

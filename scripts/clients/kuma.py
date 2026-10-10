@@ -26,7 +26,7 @@ def ping_loop() -> bool:
     or the ping failed (the latter is logged)."""
     try:
         url = _push_file().read_text().strip()
-    except OSError:
+    except (OSError, ValueError):
         return False
     if not url.startswith("https://"):
         return False

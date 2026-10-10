@@ -25,6 +25,9 @@ Three questions live here and nowhere else:
                 silently skip a deploy).
   deploy()      `make deploy`.
   verify()      `make verify`.
+  checkout_in_use()  is the checkout somebody else's right now (a herdr agent working in it, or
+                the local git states sync_checkout() would defer on)? Read-only, no fetch; the
+                loop parks the repo's merge and deploy on it (core.park) instead of striking.
 
 One lock, `deploy_lock()` (~/.warden/deploy.lock, override WARDEN_DEPLOY_LOCK), serialises
 scripts/deploy.sh's deploy/verify (which re-execs itself under `exec_locked`) with
@@ -292,16 +295,25 @@ HERDR_TIMEOUT_S = 10
 
 def _herdr_agent_working(cwd: Path) -> str | None:
     """The name (or pane id) of a herdr agent that is `working` inside `cwd`, else None. Any failure to
-    ask (no herdr, no socket, bad JSON) answers None: coexistence is a courtesy, never a gate that
-    a broken herdr can close."""
+    ask (no herdr, no socket, bad JSON) answers None with one stderr line: coexistence is a courtesy,
+    never a gate that a broken herdr can close. Runs under the widened host PATH, because
+    launchd's minimal one cannot find a Homebrew binary."""
     try:
-        out = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True,
-                             timeout=HERDR_TIMEOUT_S, check=False).stdout
-        agents = json.loads(out)["result"]["agents"]
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        # Not _run(): its output is a 2000-char tail, and the agent list is far longer JSON.
+        proc = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True, timeout=HERDR_TIMEOUT_S,
+                              env={**os.environ, "PATH": host_path()}, check=False)
+        if proc.returncode != 0:
+            raise ValueError((proc.stderr or "").strip()[-120:] or f"exit {proc.returncode}")
+        agents = json.loads(proc.stdout)["result"]["agents"]
+        if not isinstance(agents, list):
+            raise ValueError("agents is not a list")
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
+        print(f"rollout: cannot ask herdr who is working in {cwd.name} ({exc}); assuming nobody", file=sys.stderr)
         return None
     root = str(cwd.resolve())
     for agent in agents:
+        if not isinstance(agent, dict):
+            continue
         where = str(agent.get("cwd") or "")
         if agent.get("agent_status") == "working" and (where == root or where.startswith(root + os.sep)):
             return str(agent.get("name") or agent.get("pane_id") or "an agent")

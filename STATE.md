@@ -87,6 +87,7 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   ignore later. A `checks_failed` revision loses earlier review findings. Policy
   `rules` stay a label tier until the `## Verify & Monitor` sections cover the
   fleet and a replay routes at least as well.
+- `rollout.checkout_in_use()` and `_sync_checkout()` classify the busy checkout twice (the latter after a fetch); a shared predicate would stop them drifting.
 - **Review** is not delta-only (agent-gateway has no PR delta scope or reviewed SHA).
 - **Metrics:** auto-reverts are missing from `/metrics`' revert count.
 - **Backup** is `VACUUM INTO` → homelab → restic → B2; restoring from B2 has never

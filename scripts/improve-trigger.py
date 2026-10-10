@@ -10,7 +10,6 @@ Read-only on the ledger.
 
 from __future__ import annotations
 
-import datetime as dt
 import os
 import sqlite3
 import sys

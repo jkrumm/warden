@@ -124,6 +124,10 @@ def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) 
     if cwd is None:
         _start_verify(conn, item, now, note="no checkout to deploy; verifying")
         return core.get_item(conn, event_id)
+    busy = _rollout.checkout_in_use(cwd)
+    if busy is not None:
+        core.park(conn, event_id, now, f"deploy waits: {busy}", state=core.STATE_VERIFYING)
+        return None
     synced = _rollout.sync_checkout(cwd)
     if isinstance(synced, _rollout.Deferred):
         if synced.parked:

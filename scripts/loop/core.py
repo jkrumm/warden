@@ -150,9 +150,10 @@ NOT_OPEN_STATES = (*TERMINAL_STATES, STATE_FAILED)
 STRIKE_LIMIT = 3
 STRIKE_BACKOFF_MINUTES = (10, 30)   # after strike 1, after strike 2
 
-# How long a parked item (park()) waits before the next look. Waiting on somebody else's work in the
+# How long a parked item (park()) waits before the next look — well past the loop's 10-minute tick,
+# so a long park is one note line, not one per pass. Waiting on somebody else's work in the
 # checkout is not a failure, so it neither strikes nor ends.
-PARK_MINUTES = 10
+PARK_MINUTES = 25
 
 # implement_job values that mean "claimed, not yet (or no longer) an agent-gateway job".
 # The claim is a compare-and-set on `implement_job IS NULL`, written BEFORE the

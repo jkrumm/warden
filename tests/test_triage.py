@@ -12291,5 +12291,44 @@ def test_a_400_refusal_with_the_v6_wording_is_a_submit_refusal_not_an_infra_fail
     except RemoteError:
         pass
 
+def test_a_working_herdr_agent_parks_the_deploy_too():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="sig-deploy-herdr", title="t", repo="demo-repo", state=core.STATE_VERIFYING)
+        conn.execute("UPDATE triage_items SET merged_sha=? WHERE event_id=?", ("c" * 40, eid))
+        conn.commit()
+        _rollout.checkout_in_use = lambda cwd, **kw: "herdr agent wave-2 is working in demo-repo"
+        assert verify._deploy_item(conn, core.get_item(conn, eid), NOW) is None
+        item = core.get_item(conn, eid)
+        assert item["strikes"] == 0 and item["note"] == "parked: deploy waits: herdr agent wave-2 is working in demo-repo"
+        assert not any(c[0] == "sync_checkout" for c in ROLLOUT_CALLS), ROLLOUT_CALLS
+
+
+def test_herdr_agent_listing_finds_a_working_agent_inside_the_checkout_and_degrades_to_nobody():
+    import subprocess
+    real = _rollout.subprocess.run
+    root = Path(tempfile.mkdtemp())
+    inside = str(root.resolve() / "sub")
+
+    def fake(payload, code=0):
+        return lambda argv, **kw: types.SimpleNamespace(returncode=code, stdout=payload, stderr="boom")
+    try:
+        listing = json.dumps({"result": {"agents": [
+            {"cwd": inside, "agent_status": "idle", "name": "idle-one"},
+            "not-an-object",
+            {"cwd": str(root.resolve()) + "-other", "agent_status": "working", "name": "elsewhere"},
+            {"cwd": inside, "agent_status": "working", "name": "wave-9"}]}})
+        _rollout.subprocess.run = fake(listing)
+        assert _rollout._herdr_agent_working(root) == "wave-9"
+        for bad in (fake("not json"), fake(json.dumps({"result": {"agents": None}})), fake("", code=1)):
+            _rollout.subprocess.run = bad
+            assert _rollout._herdr_agent_working(root) is None
+        def missing(argv, **kw):
+            raise FileNotFoundError("herdr")
+        _rollout.subprocess.run = missing
+        assert _rollout._herdr_agent_working(root) is None
+    finally:
+        _rollout.subprocess.run = real
+        shutil.rmtree(root, ignore_errors=True)
+
 if __name__ == "__main__":
     sys.exit(main())

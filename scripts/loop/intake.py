@@ -127,6 +127,13 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
         "SELECT * FROM events WHERE source=? AND external_id=?", (source, external_id)
     ).fetchone()
     if event_row is None:
+        twin = (overlapping_open_item(conn, repo=repo, origin=origin, brief=brief, thread_ts=origin_thread_ts)
+                if origin == "human" else None)
+        if twin is not None:
+            print(f"triage: {origin} request for {repo} overlaps open item #{twin}, not opening a second one",
+                  file=sys.stderr)
+            return twin
+
         conn.execute(
             "INSERT INTO events(source, external_id, title, url, payload_json, first_seen) "
             "VALUES (?,?,?,?,?,?)",
@@ -143,13 +150,6 @@ def open_origin_item(conn: sqlite3.Connection, *, origin: str, repo: str, brief:
         if existing_item["state"] in core.TERMINAL_STATES:
             return None
         return event_id
-
-    twin = (overlapping_open_item(conn, repo=repo, origin=origin, brief=brief, thread_ts=origin_thread_ts)
-            if origin == "human" else None)
-    if twin is not None:
-        print(f"triage: {origin} request for {repo} overlaps open item #{twin}, not opening a second one",
-              file=sys.stderr)
-        return twin
 
     conn.execute(
         "INSERT INTO triage_items(event_id, signature, repo, state, origin, max_tier, brief, "
