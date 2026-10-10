@@ -52,10 +52,18 @@ BIN_LINK := $(HOME)/.local/bin/warden
 # ~/.local/bin/warden at a checkout that is deleted when the worktree goes — an episode
 # once left the CLI dangling that way. Refuse unless this is the main checkout: a linked
 # worktree reports a per-worktree --git-dir but shares the main --git-common-dir.
+#
+# Fail closed: if git cannot answer at all (not on PATH, not a git repo, or the worktree
+# metadata is already gone) both substitutions are empty and `[ "" = "" ]` would be true,
+# treating an unknown checkout as the main one and overwriting the wrapper anyway. Require
+# both answers to be non-empty before the equality test can pass.
 .PHONY: assert-main-checkout
 assert-main-checkout:
-	@[ "$$(git -C "$(WARDEN_REPO)" rev-parse --git-dir 2>/dev/null)" = "$$(git -C "$(WARDEN_REPO)" rev-parse --git-common-dir 2>/dev/null)" ] || { \
-		echo "warden: refusing — $(WARDEN_REPO) is a git worktree, not the live checkout."; \
+	@dir="$$(git -C "$(WARDEN_REPO)" rev-parse --git-dir 2>/dev/null)"; \
+	 common="$$(git -C "$(WARDEN_REPO)" rev-parse --git-common-dir 2>/dev/null)"; \
+	[ -n "$$dir" ] && [ "$$dir" = "$$common" ] || { \
+		echo "warden: refusing — cannot confirm $(WARDEN_REPO) is the main checkout."; \
+		echo "        git reports a worktree, or cannot read the checkout at all."; \
 		echo "        The wrapper would point every shell at a checkout deleted with the worktree."; \
 		echo "        Run 'make link' from the live checkout ($(HOME)/SourceRoot/warden) instead."; \
 		exit 1; \

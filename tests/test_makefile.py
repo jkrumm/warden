@@ -81,6 +81,24 @@ def test_setup_refuses_from_a_linked_worktree_before_any_other_target_runs():
         assert not (f.worktree / ".venv").exists(), "the guard must fail before venv/render/agents run"
 
 
+def test_link_refuses_when_git_cannot_read_the_checkout():
+    # Fail closed: with no git repo here, both rev-parse substitutions are empty and a bare
+    # `[ "" = "" ]` would treat the unknown checkout as the main one. The guard must refuse
+    # and must not touch the global wrapper.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        home = root / "home"
+        home.mkdir()
+        plain = root / "plain"
+        plain.mkdir()
+        env = {**os.environ, "HOME": str(home), **_GIT_ENV}
+        res = subprocess.run(["make", "-C", str(plain), "-f", str(MAKEFILE), "link"],
+                             capture_output=True, text=True, env=env, timeout=60)
+        assert res.returncode != 0, (res.stdout, res.stderr)
+        assert not (home / ".local" / "bin" / "warden").exists(), \
+            "an unreadable checkout must fail closed, not overwrite the wrapper"
+
+
 def test_link_writes_the_wrapper_from_the_main_checkout():
     with Fixture() as f:
         res = f.make(f.main, "link")
