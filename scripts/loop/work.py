@@ -85,10 +85,17 @@ def _recent_raw_texts(event_row: sqlite3.Row) -> list[str]:
     return out[:3]
 
 
-def _cap_brief(text: str) -> str:
-    if len(text) <= core.MAX_BRIEF_CHARS:
+def _truncate(text: str, limit: int) -> str:
+    """`text` unchanged when it fits `limit`, else cut to `limit` ending in an ellipsis. The one
+    truncation shape `_cap_brief()` and the prior-resolution note share, so a cap and the cap's
+    own ellipsis can never drift apart."""
+    if len(text) <= limit:
         return text
-    return text[: core.MAX_BRIEF_CHARS - 1].rstrip() + "…"
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _cap_brief(text: str) -> str:
+    return _truncate(text, core.MAX_BRIEF_CHARS)
 
 
 def run_bounded(fn: Any, *args: Any, timeout: int = core.EVIDENCE_TIMEOUT) -> tuple[bool, str]:
@@ -218,10 +225,29 @@ def kuma_monitor_title(event_row: sqlite3.Row | None) -> str | None:
     return None
 
 
+def _latest_terminal_note(conn: sqlite3.Connection, event_id: int) -> str | None:
+    """The note recorded on this event's most recent transition INTO a terminal state
+    (fixed/quiet/closed), or None if it has never closed. A reopened item reuses the same event_id,
+    so its prior close note — the answer a `closed(resolved)` carried, or the quiet-resolve
+    explanation — survives in `item_transitions` but is otherwise invisible to the fresh
+    investigation, which would re-ask the owner a question its own prior episode already answered.
+    `ORDER BY id DESC` picks the LATEST close, not an earlier one."""
+    placeholders = ",".join("?" * len(core.TERMINAL_STATES))
+    row = conn.execute(
+        f"SELECT note FROM item_transitions WHERE event_id=? AND to_state IN ({placeholders}) "
+        f"AND note IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (event_id, *core.TERMINAL_STATES),
+    ).fetchone()
+    note = (row["note"] or "").strip() if row else ""
+    return note or None
+
+
 def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by_id: dict[int, sqlite3.Row],
                           sibling_events: list[dict[str, str]],
-                          chronic: dict[int, int] | None = None, chronic_window_days: float = 0.0) -> str:
+                          chronic: dict[int, int] | None = None, chronic_window_days: float = 0.0,
+                          prior_notes: dict[int, str] | None = None) -> str:
     chronic = chronic or {}
+    prior_notes = prior_notes or {}
     lines = [f"Repo: {repo}"]
     if len(members) == 1:
         lines.append("Alert:")
@@ -236,6 +262,12 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
         if m["event_id"] in chronic:
             lines.append(f"    CHRONIC: cleared on its own and came back {chronic[m['event_id']]} times "
                           f"in the last {chronic_window_days:g} days")
+        if m["event_id"] in prior_notes:
+            lines.append(
+                f"    PRIOR RESOLUTION (this signature closed before and has now recurred — do NOT "
+                f"re-ask the owner what this note already answered unless the new occurrence changes "
+                f"the picture): {_truncate(prior_notes[m['event_id']], _items.NOTE_MAX)}"
+            )
         if m["artifact_url"]:
             lines.append(f"    already-linked artifact from a prior investigation of this EXACT "
                           f"signature: {m['artifact_url']} — check whether it already fixes this "
@@ -473,9 +505,15 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
     recurrences = {m["event_id"]: intake.chronic_recurrences(conn, m["event_id"], m["repo"], policy, now)
                    for m in members}
     chronic = {eid: n for eid, n in recurrences.items() if n}
+    prior_notes: dict[int, str] = {}
+    for m in members:
+        note = _latest_terminal_note(conn, m["event_id"])
+        if note:
+            prior_notes[m["event_id"]] = note
     brief = _build_cluster_brief(repo=repo, members=members, event_rows_by_id=event_rows_by_id,
                                   sibling_events=sibling_events,
-                                  chronic=chronic, chronic_window_days=window)
+                                  chronic=chronic, chronic_window_days=window,
+                                  prior_notes=prior_notes)
     return _dispatch_investigate_and_advance(conn, repo=repo, brief=brief, members=members, now=now,
                                               policy=policy, dry_run=False)
 

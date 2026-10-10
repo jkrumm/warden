@@ -9974,3 +9974,18 @@ schema v6's synchronous 400s were already `SubmitRefused` → `failed(policy)`; 
 `test_triage.py` 513 → 519 (+6: merge park, deploy park, herdr park, herdr listing, brief overlap, 400 shape), `test_ledger.py` +1.
 `/review` of the wave: 3 blocking (deploy skipped `checkout_in_use`; Kuma pinged before the trailing steps; bare `herdr` off the widened PATH) and 6 of 7 improvements fixed; not done: a shared git-state predicate for `checkout_in_use`/`_sync_checkout` (the two can drift).
 Existing tests that spelled "Attempt N of 4" now read the constant.
+
+## 142. A reopened item's prior close note reaches the fresh investigation (2026-10-10)
+
+A signature that self-clears (quiet-resolved) or is answered (`closed(resolved)`) reuses the SAME
+`events.id` when `reopen_if_needed()` sends it back to `new`, so its prior close note survives in
+`item_transitions` — but `_build_cluster_brief()` built the investigate brief only from
+`triage_items` columns and `events`, so the note was invisible and the fresh episode re-asked the
+owner a question its own prior investigation had already answered. `work._latest_terminal_note()`
+now reads the note on the most recent transition INTO a terminal state (`fixed`/`quiet`/`closed`,
+`ORDER BY id DESC`), `escalate_cluster()` gathers it per member beside `chronic`, and
+`_build_cluster_brief()` renders a `PRIOR RESOLUTION` line with the instruction not to re-ask unless
+the recurrence changes the picture. The truncation `_cap_brief()` already carried was extracted into
+a shared `work._truncate(text, limit)`; the note is capped with it at `NOTE_MAX`. Three cases join
+`tests/test_triage.py` (`_truncate`, the brief render, and the latest-note-wins gather);
+`test_triage.py` 519 → 522. `make check` green.
