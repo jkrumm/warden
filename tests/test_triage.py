@@ -50,7 +50,8 @@ TRIAGE_PATH = REPO_ROOT / "scripts" / "triage.py"
 # The loop modules are imported as real packages, so the module objects patched here are
 # the very ones scripts/triage.py (loaded by path below) and its stages read at call time.
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-from clients import argo as _argo, github as _github, agent_gateway as _agent_gateway  # noqa: E402
+from clients import argo as _argo, github as _github, agent_gateway as _agent_gateway, kuma as _kuma  # noqa: E402
+KUMA_PINGS: list[int] = []
 from clients.errors import HeadMoved, PolicyError, RemoteError, SubmitRefused  # noqa: E402
 from lifecycle import dispatch as _dispatch, intake as _intake, items as _items  # noqa: E402
 from lifecycle import merge as _merge, rollout as _rollout  # noqa: E402
@@ -257,6 +258,8 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_merge", "plan_or_land"): _merge.plan_or_land,
         ("_rollout", "has_target"): _rollout.has_target,
         ("_rollout", "sync_checkout"): _rollout.sync_checkout,
+        ("_rollout", "checkout_in_use"): _rollout.checkout_in_use,
+        ("_kuma", "ping_loop"): _kuma.ping_loop,
         ("_rollout", "deploy"): _rollout.deploy,
         ("_rollout", "verify"): _rollout.verify,
         ("_argo", "push_snapshot"): _argo.push_snapshot,
@@ -300,6 +303,8 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         _rollout.has_target = lambda cwd, target, **kw: ROLLOUT_CALLS.append(("has_target", target)) or False
         # The checkout sync before the deploy stage: synced, unless a test says otherwise.
         _rollout.sync_checkout = lambda cwd, **kw: ROLLOUT_CALLS.append(("sync_checkout", cwd.name)) or _SYNCED
+        _rollout.checkout_in_use = lambda cwd, **kw: None   # nobody else is in the checkout
+        _kuma.ping_loop = lambda: KUMA_PINGS.append(1) or True   # no real heartbeat from a test
         _rollout.deploy = lambda cwd, **kw: (_ for _ in ()).throw(
             AssertionError("test: no fake rollout.deploy registered"))
         _rollout.verify = lambda cwd, **kw: (_ for _ in ()).throw(
@@ -8838,7 +8843,7 @@ def test_blocked_implementation_goes_back_to_the_implementer_with_findings():
         brief = calls[0]["brief"]
         assert "scripts/check.sh:808" in brief and "fails open on crash loops" in brief
         assert calls[0]["revision_of"] == "dispatch/prior-branch", calls[0]
-        assert "Attempt 2 of 4" in brief, brief
+        assert f"Attempt 2 of {core.MAX_IMPLEMENT_ATTEMPTS}" in brief, brief
         assert calls[0]["model"] is None, "attempt 2 runs on agent-gateway's default model"
         assert CLOSED_PRS == [], "a revision updates the same PR; the superseded-PR close is gone"
 
@@ -9047,7 +9052,7 @@ def test_conflict_is_an_attempt_that_redispatches_from_the_new_base_with_the_bun
         item = core.get_item(conn, eid)
         assert item["revision_count"] == 2 and item["implement_job"] not in (None, "impl-conflict"), dict(item)
         assert len(calls) == 1 and calls[0]["revision_of"] is None, calls
-        assert "Attempt 3 of 4" in calls[0]["brief"], calls[0]["brief"]
+        assert f"Attempt 3 of {core.MAX_IMPLEMENT_ATTEMPTS}" in calls[0]["brief"], calls[0]["brief"]
         assert "/tmp/bundles/dispatch-x.bundle" in calls[0]["context"], calls[0]["context"]
         assert "git fetch /tmp/bundles/dispatch-x.bundle" in calls[0]["context"], calls[0]["context"]
         assert "Rebase onto main conflicted" in calls[0]["context"], calls[0]["context"]
@@ -9161,7 +9166,7 @@ def test_attempt_three_escalates_the_model_when_agent_gateway_routes_one_and_sen
             _agent_gateway.submit = _fake_submit(calls)
             work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
             assert len(calls) == 1 and calls[0]["model"] == want, calls
-            assert "Attempt 3 of 4" in calls[0]["brief"], calls[0]["brief"]
+            assert f"Attempt 3 of {core.MAX_IMPLEMENT_ATTEMPTS}" in calls[0]["brief"], calls[0]["brief"]
 
 
 def test_attempt_two_sends_no_model_even_when_agent_gateway_routes_an_escalation_model():
@@ -9189,13 +9194,13 @@ def test_a_third_attempt_after_a_strike_retry_also_escalates():
         assert len(calls) == 1 and calls[0]["model"] == "escalation-model-x", calls
 
 
-def test_four_attempts_in_total_then_the_pollers_fail_the_item():
+def test_the_attempt_cap_in_total_then_the_pollers_fail_the_item():
     with _triage_env() as (conn, ctx):
         eid = _seed_blocked_item(conn, external_id="sig-four", revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 2)
         calls: list[dict[str, Any]] = []
         _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
-        assert len(calls) == 1 and "Attempt 4 of 4" in calls[0]["brief"], calls
+        assert len(calls) == 1 and f"Attempt {core.MAX_IMPLEMENT_ATTEMPTS} of {core.MAX_IMPLEMENT_ATTEMPTS}" in calls[0]["brief"], calls
         assert core.get_item(conn, eid)["revision_count"] == core.MAX_IMPLEMENT_ATTEMPTS - 1
         assert not _loop_defines("DEFAULT_REVISION_MAX_ATTEMPTS")
         assert "revisionMaxAttempts" not in core.load_policy()
@@ -10358,7 +10363,7 @@ def test_a_conflict_on_a_revision_keeps_the_original_review_findings():
         brief = calls[0]["brief"]
         assert "could not be rebased" in brief and "rebase conflict" in brief, brief
         assert "scripts/check.sh:808" in brief and "fails open on crash loops" in brief, brief
-        assert "Attempt 3 of 4" in brief, brief
+        assert f"Attempt 3 of {core.MAX_IMPLEMENT_ATTEMPTS}" in brief, brief
 
 
 def test_a_conflict_on_a_first_attempt_carries_no_review_findings():
@@ -12214,6 +12219,77 @@ def test_no_check_runs_right_after_update_pr_pushed_is_pending_not_green():
         _train_pass(conn, 3)
         assert len(reviews) == 1, "past the grace, no check runs means none exist"
         assert core.get_item(conn, eid)["train_stage"] == train.TRAIN_REVIEW
+
+def test_a_busy_checkout_parks_the_merge_without_a_strike_and_writes_the_line_once():
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-parked", job="update-job-parked")
+        _rollout.checkout_in_use = lambda cwd, **kw: "herdr agent wave-1 is working in demo-repo"
+        item = core.get_item(conn, eid)
+        conn.execute("UPDATE triage_items SET train_stage=?, train_sha=?, reviewed_sha=? WHERE event_id=?",
+                     (train.TRAIN_MERGE, TRAIN_SHA, TRAIN_SHA, eid))
+        conn.commit()
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
+        assert item["note"] == "parked: merge waits: herdr agent wave-1 is working in demo-repo", item["note"]
+        assert core.parse_ts(item["retry_at"]) > NOW
+        notes = conn.execute("SELECT COUNT(*) FROM item_transitions WHERE event_id=?", (eid,)).fetchone()[0]
+        _train_pass(conn, 11)
+        assert core.get_item(conn, eid)["strikes"] == 0
+        # the same park again is not a new line
+        again = conn.execute("SELECT COUNT(*) FROM item_transitions WHERE event_id=?", (eid,)).fetchone()[0]
+        assert again <= notes + 1, (notes, again)
+
+
+def test_a_deferred_checkout_that_is_somebody_elses_work_parks_the_deploy_and_a_failed_fetch_strikes():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="sig-deploy-park", title="t", repo="demo-repo",
+                        state=core.STATE_VERIFYING)
+        conn.execute("UPDATE triage_items SET merged_sha=? WHERE event_id=?", ("c" * 40, eid))
+        conn.commit()
+        _rollout.sync_checkout = lambda cwd, **kw: _rollout.Deferred("checkout not clean/on master: demo-repo has uncommitted changes", parked=True)
+        verify._deploy_item(conn, core.get_item(conn, eid), NOW)
+        item = core.get_item(conn, eid)
+        assert item["strikes"] == 0 and item["note"].startswith("parked: deploy waits:"), dict(item)
+        _rollout.sync_checkout = lambda cwd, **kw: _rollout.Deferred("git fetch failed in demo-repo: boom")
+        verify._deploy_item(conn, core.get_item(conn, eid), NOW + dt.timedelta(hours=1))
+        assert core.get_item(conn, eid)["strikes"] == 1
+
+
+def test_a_second_warden_run_with_the_same_words_reuses_the_open_item():
+    with _triage_env() as (conn, ctx):
+        first = intake.open_origin_item(conn, origin="human", repo="demo-repo", max_tier="implement",
+                                         brief="Add a retry with backoff to the sync client when GitHub answers 502",
+                                         external_id="human:one", title="one", now=NOW)
+        twin = intake.open_origin_item(conn, origin="human", repo="demo-repo", max_tier="implement",
+                                        brief="add a retry with backoff to the sync client when GitHub answers 502 ",
+                                        external_id="human:two", title="two", now=NOW)
+        other = intake.open_origin_item(conn, origin="human", repo="demo-repo", max_tier="implement",
+                                         brief="Rotate the warden-api error log when it grows past ten megabytes",
+                                         external_id="human:three", title="three", now=NOW)
+        threaded = intake.open_origin_item(conn, origin="human", repo="demo-repo", max_tier="implement",
+                                            brief="Add a retry with backoff to the sync client when GitHub answers 502",
+                                            external_id="human:four", title="four", now=NOW,
+                                            origin_channel="C1", origin_thread_ts="1.1")
+        assert twin == first and other not in (first, None) and threaded not in (first, None), (first, twin, other, threaded)
+
+
+def test_a_400_refusal_with_the_v6_wording_is_a_submit_refusal_not_an_infra_failure():
+    for text in ('{"error":"dispatch refused: branch dispatch/x is already taken on origin"}',
+                 '{"error":"dispatch refused: in-place episode in a repo with its own opencode config"}',
+                 'plain text refusal'):
+        try:
+            _agent_gateway._raise_for_submit_status(400, text)
+        except SubmitRefused as exc:
+            assert exc.status == 400 and "HTTP 400" in str(exc) and not exc.maybe_mutated
+        else:
+            raise AssertionError("a 400 must raise SubmitRefused")
+    try:
+        _agent_gateway._raise_for_submit_status(503, "x")
+    except SubmitRefused:
+        raise AssertionError("a 5xx is not a refusal")
+    except RemoteError:
+        pass
 
 if __name__ == "__main__":
     sys.exit(main())

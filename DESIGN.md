@@ -94,8 +94,9 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    different known repo re-routes the item to `triaged` in that repo instead of
    paging (`_reroute_repo()`, once per item). A matching `rootCause` on another
    open item merges them (older survives, the other `closed(duplicate)`). A
-   blocked review is a revision on the same item and PR (`revisionOf`), up to 4
-   attempts; attempt 3+ asks for agent-gateway's escalation model. `conflict`
+   blocked review is a revision on the same item and PR (`revisionOf`), up to 3
+   attempts (the first plus two revisions); the last one asks for agent-gateway's
+   escalation model, and a third block ends the item for the owner. `conflict`
    re-dispatches from the new base with the old diff as context. Confident host
    restarts run through `HOST_VERB_ALLOWLIST` and verify on
    `HOST_VERB_LIVENESS_MONITOR`.

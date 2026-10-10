@@ -9953,3 +9953,23 @@ it in the repo that owns it) instead of `needs_decision`. Once per item: the fir
 naming the repo the item was just moved from lands as `needs_decision`. An equal repo, an unknown
 repo and a non-string `owningRepo` all keep the old behaviour. Five cases join `tests/test_triage.py`
 (a)-(e); `test_triage.py` 507/507 → 512/512 (+5). `make check` green.
+
+## 141. Wave 6 — ship on every repo, stop feeding itself (2026-10-10)
+
+The 2026-10-09 review found weatherorb at "0/26 fixed" and traced it to four causes that were not the
+token: five merged PRs closed `resolved` by the 1h `merged` deadline (bookkeeping), a live checkout
+diverged by the owner's own unpushed wave commits (ff-only deploys failed), carriers superseded while
+waves reshaped master, and step-7 review blocking twice after three revisions.
+
+Changes. `rollout.checkout_in_use()` + `core.park()`: a dirty / off-default / ahead-of-origin checkout
+or a herdr agent working in it parks that repo's merge and deploy without a strike, one note line, retry
+in 10 min (a failed fetch still strikes; `Deferred.parked` carries the distinction). `MAX_IMPLEMENT_ATTEMPTS`
+4 → 3. `intake.overlapping_open_item()` reuses an open `human` item with a ≥ 0.8 word-overlap brief.
+Schema 17 (data only) backfills items 1281, 1290, 1314, 1317, 1321 from `closed(resolved)` to `fixed`,
+pinned to ids, repo and the clock's own note, with a transition row. `clients/kuma.py` pings the new
+`Warden Loop - Push` monitor (homelab `4721ee2`) at the end of each completed pass.
+`scripts/improve-trigger.py` makes the improve loop outcome-triggered. The 1h deadline code itself was
+already gone; log rotation was already declared (dotfiles `log-rotate.sh`). agent-gateway dispatch
+schema v6's synchronous 400s were already `SubmitRefused` → `failed(policy)`; a test pins the shape.
+`test_triage.py` 513 → 517 (+4: park, deploy park, brief overlap, 400 shape), `test_ledger.py` +1.
+Existing tests that spelled "Attempt N of 4" now read the constant.

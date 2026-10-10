@@ -19,9 +19,10 @@ item moves.
 | `scripts/triage.py` | the loop's entry point: `run()` (one pass), CLI flags, heartbeat |
 | `scripts/loop/` | the loop by stage: `core` (paths, states, `set_state`, strikes, policy), `intake`, `triaging`, `work`, `train`, `verify`, `notify` |
 | `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate (check runs, falling back to Actions workflow runs when the token cannot read checks), rollout (`make deploy`/`verify`), dispatch, operations |
-| `scripts/clients/` | the only HTTP/CLI boundaries: agent-gateway, GitHub, Argo, Slack, secrets |
+| `scripts/clients/` | the only HTTP/CLI boundaries: agent-gateway, GitHub, Argo, Slack, Kuma (the loop heartbeat), secrets |
 | `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`, `reinvestigate`) |
 | `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents |
+| `scripts/improve-trigger.py` | read-only: outcomes (`failed` / `needs_decision`) since the improve loop's cursor, or `quiet` |
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
 | `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns |
 
@@ -41,7 +42,7 @@ whether to touch production.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**512/512** — any other number is a finding to report, not a count to edit.
+**517/517** — any other number is a finding to report, not a count to edit.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary, so nothing reaches Slack, agent-gateway, GitHub or Argo.
 Patch a name on the module that defines it (`loop.core.DB_PATH`, `loop.core.post_line`) —
@@ -79,11 +80,13 @@ tool even though launchd hands the loop a minimal PATH.
   and agents are `make status`'s business.
 - `make status` — agents, last exits, API, ledger file. `make logs` — tail of
   `~/Library/Logs/warden-{loop,poll,sweep,backup,api}.{log,err}`.
-- Kuma monitor: `warden-backup` push (the daily backup pings it on success); the
-  loop itself has no Kuma monitor — its staleness shows on `/health`.
+- Kuma monitors: `Warden Backup - Push` (the daily backup pings it on success) and
+  `Warden Loop - Push` (the loop pings it at the end of every completed pass, from
+  `clients/kuma.py`; URL in `~/.config/uptime-kuma/warden-loop-push-url`, mode 600; ~40 min of
+  silence pages). Declared in `homelab/uptime-kuma/monitors.yaml`.
 - OTel `service.name`: none — warden does not export telemetry.
 - The queue: Argo `/warden`. Slack #agents: one line per `fixed` / `needs_decision`.
-- Continuous improvement: a herdr tab `improve` in this workspace runs `/loop` on `docs/improve/LOOP.md`; one line per iteration in `docs/improve/JOURNAL.md`. Steer it with `rd say`.
+- Continuous improvement: a herdr tab `improve` in this workspace runs `/loop` on `docs/improve/LOOP.md`, **outcome-triggered** (`scripts/improve-trigger.py`; a quiet wakeup writes and commits nothing); one line per acted-on iteration in `docs/improve/JOURNAL.md`. Steer it with `rd say`.
 
 ## Gotchas
 
@@ -96,9 +99,12 @@ tool even though launchd hands the loop a minimal PATH.
   a session — copy it (`cp ~/.warden/warden.db /tmp/`) and test there. Read-only
   means `sqlite3.connect(f"file:{p}?mode=ro", uri=True)`. Backup is `VACUUM INTO`,
   never `cp`/`rsync` of the open file.
-- **A dirty or diverged checkout of any repo blocks its deploys**: the loop
-  fast-forwards only a clean default-branch checkout that ends at origin, else it
-  strikes (third → `failed`). That includes this one.
+- **A busy checkout parks, it does not strike.** The loop fast-forwards only a clean
+  default-branch checkout that ends at origin. A dirty, off-default or ahead-of-origin checkout,
+  or a herdr agent `working` inside it (`rollout.checkout_in_use`), **parks** that repo's merge and
+  deploy (`core.park`: same state, `retry_at` +10 min, note `parked: …`, no strike). A failed fetch
+  still strikes. That includes this checkout: an agent working in `~/SourceRoot/warden` holds warden's
+  own merges.
 - **`scripts/triage.py` has no `--help`**: any flag it does not know runs a full live
   pass against the real ledger. Run the loop by hand only with `--dry-run` and `env -u CLAUDECODE …` (agent-gateway's
   recursion guard refuses dispatches from inside a Claude session).

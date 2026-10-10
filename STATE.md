@@ -6,17 +6,17 @@ build log (§1–§139).
 
 | | |
 |-|-|
-| Last updated | 2026-10-09 (§140 — a misrouted verdict re-routes to the owning repo) |
+| Last updated | 2026-10-10 (§141 — Wave 6: ship on every repo, stop feeding itself) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 16 |
+| Ledger | `~/.warden/warden.db`, schema 17 |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
 
 ## What is live
 
 The whole loop in `DESIGN.md` § The loop runs: one intake pool → single-shot agent-gateway
 triage (`attach | new | fixed_by | ignore`) → investigate → implement at any
-confidence, revisions on the same PR up to 4 attempts → one merge train per repo
+confidence, revisions on the same PR up to 3 attempts → one merge train per repo
 (`update_pr` → checks → review → squash, all on one SHA) → `make deploy` / `make
 verify` + the item's own signal quiet → automatic revert on failure → fixed-by sweep
 after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a daily
@@ -59,14 +59,15 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 
 ## Open — owner actions
 
-- The fine-grained PAT (`op://mini/github/token`) lacks `Checks: Read` (and
-  `Actions: Read`) on private repos: weatherorb's check runs read 403, so the train
-  refuses its merges (`failed`). It also lacks `Issues: Read` on `dispatch-scratch`
-  and `Issues: Write` repo-wide (issue comment-back 403s).
-- Repo contract gaps the train hits: `free-planning-poker`, `homelab-private`,
-  `basalt-ui` have no `make deploy`. (`vps`'s `make deploy` without `APP=` deploys
-  the affected apps, forwarded to the VPS; `homelab` master has `check`/`verify` and
-  the contract sections, 9bc1b5d.)
+- The fine-grained PAT (`op://mini/github/token`) has no Checks permission (fine-grained
+  PATs cannot have one); the merge gate already falls back to Actions workflow runs, which
+  it can read — that is **not** what stalled weatherorb. It lacks `Issues: Read` on
+  `dispatch-scratch` and `Issues: Write` repo-wide (issue comment-back 403s).
+- Repo contract: every repo in scope now has `check`/`deploy`/`verify`/`logs`
+  (`free-planning-poker` and `basalt-ui` already had them on master; `homelab-private`, 681a836).
+  `homelab-private` stays investigate-only in agent-gateway's dispatch policy.
+- **herdr is not under launchd yet.** The plist is ready (`make herdr-launchd-status` in
+  dotfiles); the cutover is `make herdr-restart YES=1`, which kills every pane — owner-timed.
 - agent-gateway serves `dispatch_implement_escalation`; attempt 3+ escalates to it.
 - hermes-agent's agent-gateway ceiling is `investigate`: its 6 policy-failed items
   (1114, 1420–1424) re-drive once after the deploy, are refused again, and wait for
@@ -100,6 +101,23 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 - Deferred by the orchestrator: a further `work.py` split and breaking the loop
   modules' import cycle (`tests/test_loop_imports.py` guards the function-body-only
   rule meanwhile).
+
+## Wave 6 (2026-10-10)
+
+- **Parking.** A repo whose checkout is dirty, off-default or ahead of origin, or has a herdr agent
+  working in it, parks its merge (`train._train_merge`) and deploy (`verify._deploy_item`): same state,
+  note `parked: …`, `retry_at` +10 min, no strike (`core.park`, `rollout.checkout_in_use`).
+- **Revision cap 2.** `MAX_IMPLEMENT_ATTEMPTS` 4 → 3; the last attempt is the one escalation.
+- **Duplicates at the door.** A `warden run` whose brief overlaps (Jaccard ≥ 0.8) an open item of the
+  same repo reuses that item (`intake.overlapping_open_item`); alert duplicates were already merged by
+  `rootCause`.
+- **The 1h `merged` deadline** is gone from the code; migration 17 backfilled the five weatherorb
+  items it had closed as `resolved` (1281, 1290, 1314, 1317, 1321) to `fixed`.
+- **Kuma** `Warden Loop - Push`; log rotation was already declared in dotfiles `log-rotate.sh`
+  (16 MB cap, `warden-*.err` included).
+- **improve loop** is outcome-triggered (`scripts/improve-trigger.py`).
+- **v6 refusals.** agent-gateway's synchronous 400s already arrive as `SubmitRefused` →
+  `failed(policy)`; `pending`/`queuedBehind` is just a non-terminal job. A test now pins the shape.
 
 ## Next action
 
