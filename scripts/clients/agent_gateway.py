@@ -46,11 +46,12 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 # rolling agent-gateway restart cannot strike every in-flight episode: v5 adds the
 # `checks_tool_failed` outcome (a check-tool infrastructure failure, distinct
 # from the repo's own red suite), while an agent-gateway not yet restarted still
-# answers with v4. v6 adds the optional `fallbackWithheld` field (additive).
+# answers with v4. v6 adds the optional `fallbackWithheld` field (additive); v7 the optional
+# `escalationCategory` (additive, `human` verdicts only).
 # DISPATCH_SCHEMA_VERSIONS is what assert_result_schema()
 # enforces; a version outside the window is refused as loudly as ever. Review
 # has a single live version.
-DISPATCH_SCHEMA_VERSIONS: frozenset[int] = frozenset({5, 6})
+DISPATCH_SCHEMA_VERSIONS: frozenset[int] = frozenset({5, 6, 7})
 DISPATCH_SCHEMA_VERSION = max(DISPATCH_SCHEMA_VERSIONS)  # the current version, derived so the two cannot drift
 REVIEW_SCHEMA_VERSION = 1
 
