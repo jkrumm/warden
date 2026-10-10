@@ -126,6 +126,9 @@ def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) 
         return core.get_item(conn, event_id)
     synced = _rollout.sync_checkout(cwd)
     if isinstance(synced, _rollout.Deferred):
+        if synced.parked:
+            core.park(conn, event_id, now, f"deploy waits: {synced.reason}", state=core.STATE_VERIFYING)
+            return None
         core.strike(conn, event_id, now, f"deploy deferred: {synced.reason}",
                      retry_state=core.STATE_VERIFYING, expect_state=core.STATE_VERIFYING)
         conn.commit()

@@ -150,6 +150,10 @@ NOT_OPEN_STATES = (*TERMINAL_STATES, STATE_FAILED)
 STRIKE_LIMIT = 3
 STRIKE_BACKOFF_MINUTES = (10, 30)   # after strike 1, after strike 2
 
+# How long a parked item (park()) waits before the next look. Waiting on somebody else's work in the
+# checkout is not a failure, so it neither strikes nor ends.
+PARK_MINUTES = 10
+
 # implement_job values that mean "claimed, not yet (or no longer) an agent-gateway job".
 # The claim is a compare-and-set on `implement_job IS NULL`, written BEFORE the
 # external call, so two processes (the loop and the sweep) never submit twice.
@@ -212,11 +216,13 @@ DEFAULT_QUIET_RESOLVE_HOURS = 2.0
 DEFAULT_CHRONIC_RECURRENCES = 3
 DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 
-# Implement attempts per item: the first, plus up to three revisions or re-dispatches (a blocked
-# review, failed checks, a base that moved; see maybe_revise_blocked()).
+# Implement attempts per item: the first, plus up to two revisions or re-dispatches (a blocked
+# review, failed checks, a base that moved; see maybe_revise_blocked()). The second revision is the
+# one escalation (ESCALATION_ATTEMPT); a third blocked review ends the item for the owner instead
+# of burning a fourth attempt on text no episode converges on (weatherorb #57, #58).
 # `triage_items.revision_count` counts the attempts after the first. An attempt count per item,
 # never a turn or time limit on the episode itself.
-MAX_IMPLEMENT_ATTEMPTS = 4
+MAX_IMPLEMENT_ATTEMPTS = 3
 
 # Attempt N >= this one runs on agent-gateway's escalation implement model (GET /api/routing), when
 # it has one; see implement_model().
@@ -973,6 +979,24 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
                          dispatch_job=None, implement_job=None, validation_job=None,
                          pr_url=None, reviewed_sha=None, revision_count=0)
     return rowcount, (old_pr if rowcount else None)
+
+
+def park(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *, state: str,
+          expect_eq: dict[str, Any] | None = None, minutes: int = PARK_MINUTES) -> bool:
+    """Wait on somebody else's work in the item's repo: same `state`, `retry_at` pushed out, a note that
+    says why (the line Argo shows), and no strike. The write is skipped when the note already says the
+    same, so a long park is one line, not one per tick. Returns True when it wrote."""
+    note = f"parked: {reason}"
+    row = get_item(conn, event_id)
+    retry_at = parse_ts(row["retry_at"]) if row is not None else None
+    if row is None or (row["note"] == note and retry_at is not None and retry_at > now):
+        return False
+    won = set_state(conn, event_id, state, now, expect_state=state, expect_eq=expect_eq,
+                    retry_at=now_iso(now + dt.timedelta(minutes=minutes)), note=note)
+    conn.commit()
+    if won:
+        print(f"triage: {note} (event {event_id})", file=sys.stderr)
+    return bool(won)
 
 
 def strike(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *,

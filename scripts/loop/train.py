@@ -7,11 +7,12 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 import sys
+from pathlib import Path
 from typing import Any
 
 from clients import github as _github, agent_gateway as _agent_gateway
 from clients.errors import HeadMoved, PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError
-from lifecycle import dispatch as _dispatch, merge as _merge, policy as _policy
+from lifecycle import dispatch as _dispatch, merge as _merge, policy as _policy, rollout as _rollout
 from loop import core, work, verify
 
 
@@ -487,6 +488,11 @@ def _train_merge(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
                           note=f"no confirmed review of {sha[:12]} on record")
     if work.already_merged(conn, item["implement_job"]):
         work.land_already_merged_item(conn, policy, item, now)
+        return False
+    busy = _rollout.checkout_in_use(Path(_policy.repo_cwd(item["repo"])))
+    if busy is not None:
+        core.park(conn, item["event_id"], now, f"merge waits: {busy}", state=core.STATE_MERGING,
+                  expect_eq=_train_expect(item))
         return False
     claim_until = work.review_claim_until(now)
     if not _train_hop(conn, item, now, retry_at=claim_until):

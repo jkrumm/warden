@@ -43,6 +43,7 @@ do and never calls into this module.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import signal
@@ -90,8 +91,11 @@ class Ran(NamedTuple):
 
 
 class Deferred(NamedTuple):
-    """The checkout is not in a state a deploy may start from — nothing ran."""
+    """The checkout is not in a state a deploy may start from — nothing ran. `parked` marks the
+    reasons that are somebody else's work in the checkout (uncommitted changes, another branch,
+    commits origin lacks): waiting is right and no strike is owed, unlike a failed fetch."""
     reason: str
+    parked: bool = False
 
 
 class Synced(NamedTuple):
@@ -267,10 +271,10 @@ def _sync_checkout(cwd: Path, runner: Runner) -> Synced | Deferred:
         return Deferred(f"cannot determine {cwd.name}'s default branch")
     branch = _git(cwd, runner, "rev-parse", "--abbrev-ref", "HEAD").tail.strip()
     if branch != default:
-        return Deferred(f"checkout not clean/on {default}: {cwd.name} is on {branch or '(unknown)'}")
+        return Deferred(f"checkout not clean/on {default}: {cwd.name} is on {branch or '(unknown)'}", parked=True)
     dirty = _git(cwd, runner, "status", "--porcelain", "--untracked-files=no")
     if not dirty.ok or dirty.tail.strip():
-        return Deferred(f"checkout not clean/on {default}: {cwd.name} has uncommitted changes")
+        return Deferred(f"checkout not clean/on {default}: {cwd.name} has uncommitted changes", parked=True)
     before = _git(cwd, runner, "rev-parse", "HEAD").tail.strip()
     merged = _git(cwd, runner, "merge", "--ff-only", f"origin/{default}")
     if not merged.ok:
@@ -279,8 +283,52 @@ def _sync_checkout(cwd: Path, runner: Runner) -> Synced | Deferred:
     shas = heads.tail.split()
     if not heads.ok or len(shas) != 2 or shas[0] != shas[1]:
         return Deferred(f"checkout not at origin/{default}: {cwd.name} has commits origin does not "
-                        f"({' vs '.join(s[:12] for s in shas) or 'unreadable'})")
+                        f"({' vs '.join(s[:12] for s in shas) or 'unreadable'})", parked=True)
     return Synced(before or shas[0], shas[0])
+
+
+HERDR_TIMEOUT_S = 10
+
+
+def _herdr_agent_working(cwd: Path) -> str | None:
+    """The name (or pane id) of a herdr agent that is `working` inside `cwd`, else None. Any failure to
+    ask (no herdr, no socket, bad JSON) answers None: coexistence is a courtesy, never a gate that
+    a broken herdr can close."""
+    try:
+        out = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True,
+                             timeout=HERDR_TIMEOUT_S, check=False).stdout
+        agents = json.loads(out)["result"]["agents"]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return None
+    root = str(cwd.resolve())
+    for agent in agents:
+        where = str(agent.get("cwd") or "")
+        if agent.get("agent_status") == "working" and (where == root or where.startswith(root + os.sep)):
+            return str(agent.get("name") or agent.get("pane_id") or "an agent")
+    return None
+
+
+def checkout_in_use(cwd: Path, *, runner: Runner = _run_in_group) -> str | None:
+    """Why `cwd` is somebody else's right now, else None: a herdr agent working in it, or local git
+    state that would stop a fast-forward (a branch other than the default, uncommitted tracked
+    changes, commits origin lacks). Reads local refs only. The loop parks its merge and deploy
+    for that repo (core.park) instead of racing the work or striking out against it."""
+    name = _herdr_agent_working(cwd)
+    if name is not None:
+        return f"herdr agent {name} is working in {cwd.name}"
+    default = _default_branch(cwd, runner)
+    branch = _git(cwd, runner, "rev-parse", "--abbrev-ref", "HEAD").tail.strip()
+    if default is None or not branch:
+        return None
+    if branch != default:
+        return f"{cwd.name} is checked out on {branch}, not {default}"
+    dirty = _git(cwd, runner, "status", "--porcelain", "--untracked-files=no")
+    if dirty.ok and dirty.tail.strip():
+        return f"{cwd.name} has uncommitted changes"
+    ahead = _git(cwd, runner, "rev-list", "--count", f"origin/{default}..HEAD")
+    if ahead.ok and ahead.tail.strip() not in ("", "0"):
+        return f"{cwd.name} has {ahead.tail.strip()} commit(s) origin does not"
+    return None
 
 
 def deploy(cwd: Path, *, prev_sha: str | None = None, head_sha: str | None = None,
