@@ -33,7 +33,9 @@ def dispatch_ceiling(dispatch_policy: dict[str, Any], repo: str) -> str | None:
     (`rules[<repo>].ceiling`), or None when the policy names no rule for it: a repo absent
     from `rules` has no ceiling below the top (agent-gateway's own default). A malformed rule
     (no string `ceiling`, or one outside `VALID_TIERS`) is also no ceiling here — it stays
-    agent-gateway's to enforce on submit."""
+    agent-gateway's to enforce on submit, and so is a policy that is not a JSON object at all."""
+    if not isinstance(dispatch_policy, dict):
+        return None
     rules = dispatch_policy.get("rules")
     rule = rules.get(repo) if isinstance(rules, dict) else None
     ceiling = rule.get("ceiling") if isinstance(rule, dict) else None

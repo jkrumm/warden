@@ -322,6 +322,7 @@ def test_dispatch_ceiling_reads_the_repo_rule_and_is_none_without_one():
     assert policy.dispatch_ceiling(body, "malformed") is None, "no string ceiling is no ceiling"
     assert policy.dispatch_ceiling(body, "unknown") is None, "a tier outside VALID_TIERS is no ceiling"
     assert policy.dispatch_ceiling(body, "absent") is None, "no rule for the repo is no ceiling"
+    assert policy.dispatch_ceiling([], "capped") is None, "a policy that is not an object is no ceiling"
     assert policy.dispatch_ceiling({"rules": []}, "capped") is None, "a non-dict rules is no ceiling"
     assert policy.dispatch_ceiling({}, "capped") is None
 
