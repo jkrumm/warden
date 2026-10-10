@@ -10066,3 +10066,13 @@ own default is the top); an unreadable policy skips the check and submits as bef
 The check runs against the tier actually submitted, diverts only that item, writes no `verdict_json` and touches no
 sibling; `--dry-run` reports the diversion and writes nothing. `lifecycle/policy.py` grows `dispatch_ceiling()` and
 `tier_over_ceiling()`. `test_triage.py` 539 → 543, `test_lifecycle.py` 55 → 57. The apply-by-hand note strips the recommendation before falling back, so a whitespace-only recommendation yields the summary.
+
+## 146. Machine-global make targets refuse from a git worktree (2026-10-11)
+
+An implement episode ran `make link` inside its throwaway worktree; `WARDEN_REPO := $(shell pwd)`
+rewrote `~/.local/bin/warden` to that worktree, which was deleted when the episode ended, and the
+`warden` CLI was dead for about an hour. `assert-main-checkout` (git `--git-dir` vs `--git-common-dir`,
+inherited `GIT_*` overrides cleared, fail closed when git cannot read the checkout) now gates
+`link`, `render-plists` and `agents`. `setup` runs the gate first and only then the rest in a
+sub-make, so `make -j setup` from a worktree starts nothing. `venv` is not gated — it writes only the
+checkout's own `.venv`, and `make check` in a worktree needs it. `tests/test_makefile.py` (new, 7).

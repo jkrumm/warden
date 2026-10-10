@@ -41,12 +41,13 @@ help:
 	@echo "  make slack-app-create SLACK_CONFIG_TOKEN=xoxe-...           create the Warden Slack app"
 	@echo "  make slack-app-update SLACK_CONFIG_TOKEN=xoxe-... APP_ID=... update it — see slack/README.md"
 
-# `assert-main-checkout` is a prerequisite of every side-effecting target, not a sibling of
-# them: under `make -j setup` a sibling assertion can still be running while venv/render/
-# agents — which touch machine-global LaunchAgent state — are scheduled. Gate each of them
-# instead, so the assertion completes (or fails) before any side effect starts.
+# `assert-main-checkout` gates every target that writes machine-global state (render-plists,
+# agents, link). `venv` writes only this checkout's .venv, so it stays usable from a worktree
+# (`make check` there needs it). `setup` runs the gate first and only then the rest in a
+# sub-make, so under `make -j setup` nothing — not even venv — starts before the gate fails.
 .PHONY: setup
-setup: venv render-plists agents link
+setup: assert-main-checkout
+	@$(MAKE) --no-print-directory -f $(firstword $(MAKEFILE_LIST)) venv render-plists agents link
 	@echo "warden: setup complete — run 'make status'"
 
 # A wrapper, not a symlink: scripts/warden resolves the venv relative to its own path.
@@ -90,7 +91,7 @@ link: assert-main-checkout
 # ---------------------------------------------------------------------------
 
 .PHONY: venv
-venv: assert-main-checkout
+venv:
 	@command -v $(BASE_PY) >/dev/null 2>&1 || { \
 		echo "warden: $(BASE_PY) not found. It is pinned on purpose — see BASE_PY above."; \
 		echo "        install it (uv python install 3.11) rather than switching interpreters here."; \

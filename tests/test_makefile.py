@@ -81,6 +81,16 @@ def test_setup_refuses_from_a_linked_worktree_before_any_other_target_runs():
         assert not (f.worktree / ".venv").exists(), "the guard must fail before venv/render/agents run"
 
 
+def test_venv_is_not_gated_from_a_linked_worktree():
+    # venv writes only the checkout's own .venv; `make check` in a worktree needs it. With a
+    # missing BASE_PY the recipe fails on its own "not found" line — proof the worktree gate
+    # did not refuse first.
+    with Fixture() as f:
+        res = f.make(f.worktree, "venv", "BASE_PY=no-such-python-for-test")
+        out = res.stdout + res.stderr
+        assert "no-such-python-for-test not found" in out, out
+        assert "worktree" not in out, out
+
 def test_link_refuses_when_git_cannot_read_the_checkout():
     # Fail closed: with no git repo here, both rev-parse substitutions are empty and a bare
     # `[ "" = "" ]` would treat the unknown checkout as the main one. The guard must refuse
