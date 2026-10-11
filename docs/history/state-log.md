@@ -10120,6 +10120,6 @@ leaving `merging` like `reviewed_sha`. `work.poll_implement_jobs()`'s `no_change
 head from GitHub and, when it differs from `blocked_sha`, rejoins the merge train (the `pr_updated` shape:
 `train.TRAIN_START` at `update`); a missing `blocked_sha`, an unchanged head, or a GitHub read that cannot confirm
 the move still routes to `needs_decision`. `TRAIN_START`, the redriven-train start and `core.reinvestigate()`
-clear `blocked_sha`, so a stale head never steers it. `test_ledger.py` 41 → 42, `test_triage.py` 543 → 547,
+clear `blocked_sha`, so a stale head never steers it. `test_ledger.py` 41 → 42, `test_triage.py` 549 → 554,
 `make check` green. Not covered by an end-to-end test: the rejoin is unit-tested through `poll_implement_jobs()`
 and `advance_merge_trains()`, not against a live pull request.
