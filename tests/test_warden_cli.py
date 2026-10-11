@@ -1342,6 +1342,7 @@ def test_adopt_points_an_item_at_a_warden_pr_and_joins_the_merge_train():
     _seed_dispatch(db, "impl-9", tier="implement", repo="alpha", status="done",
                    artifact_url="https://github.com/jkrumm/alpha/pull/9", origin_event_id=60)
     gh = stubs.StubServer({
+        ("GET", "/repos/jkrumm/alpha/pulls/9"): (200, {"state": "open", "merged": False}),
         ("POST", "/repos/jkrumm/alpha/issues/7/comments"): (201, {"id": 1}),
         ("PATCH", "/repos/jkrumm/alpha/pulls/7"): (200, {"state": "closed"}),
     })
@@ -1361,8 +1362,8 @@ def test_adopt_points_an_item_at_a_warden_pr_and_joins_the_merge_train():
     assert trans["from_state"] == "needs_decision" and trans["to_state"] == "merging", dict(trans)
     conn.close()
     # The prior PR is retired as superseded: a comment saying why, then the PATCH.
-    assert [r["method"] for r in gh.requests] == ["POST", "PATCH"], gh.requests
-    assert gh.requests[1]["path"] == "/repos/jkrumm/alpha/pulls/7" and gh.requests[1]["body"] == {"state": "closed"}, gh.requests
+    assert [r["method"] for r in gh.requests] == ["GET", "POST", "PATCH"], gh.requests
+    assert gh.requests[2]["path"] == "/repos/jkrumm/alpha/pulls/7" and gh.requests[2]["body"] == {"state": "closed"}, gh.requests
 
 
 def test_adopt_refuses_a_pr_warden_did_not_open():

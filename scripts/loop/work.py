@@ -2151,9 +2151,8 @@ def _find_adoptable_dispatch(conn: sqlite3.Connection, item: sqlite3.Row,
         (item["event_id"],),
     ).fetchall()
     for row in rows:
-        parsed = _github.parse_pr_url(row["artifact_url"] or "")
-        if parsed is not None and parsed[0] == _github.GH_OWNER and parsed[1] == item["repo"] \
-                and parsed[2] == pr_number:
+        parsed = _parse_pr_url(row["artifact_url"])
+        if parsed is not None and parsed == (_github.GH_OWNER, item["repo"], pr_number):
             return row["job_id"], row["artifact_url"]
     return None
 
