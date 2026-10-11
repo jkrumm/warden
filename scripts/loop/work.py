@@ -2208,7 +2208,7 @@ def adopt_own_pr(conn: sqlite3.Connection, event_id: int, pr_number: int, now: d
 
 def _current_pr_head(pr_url: str | None) -> str | None:
     """The head commit of `pr_url`, read from GitHub now, or None when the URL is not a pull request
-    or the read failed. Read-only and side-effect free: poll_implement_jobs()'s `no_changes` branch
+    the PR is not open, or the read failed. Read-only and side-effect free: poll_implement_jobs()'s `no_changes` branch
     falls back to the owner when it cannot confirm the head moved, and strikes nowhere, so a GitHub
     hiccup never silently rejoins the merge train."""
     ref = _parse_pr_url(pr_url)
@@ -2221,6 +2221,8 @@ def _current_pr_head(pr_url: str | None) -> str | None:
         # RemoteError (GitHub) or PreconditionError (no token): never fatal to the pass.
         print(f"triage: could not read the head of {pr_url}: {exc}", file=sys.stderr)
         return None
+    if pr.get("merged") or pr.get("state") != "open":
+        return None  # a closed or merged PR is the owner's call, not a train entry
     head = pr.get("head")
     sha = head.get("sha") if isinstance(head, dict) else None
     return sha if isinstance(sha, str) and sha else None
