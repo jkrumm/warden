@@ -2191,7 +2191,8 @@ def adopt_own_pr(conn: sqlite3.Connection, event_id: int, pr_number: int, now: d
     rowcount = core.set_state(
         conn, event_id, core.STATE_MERGING, now, expect_state=expect_state,
         implement_job=job_id, validation_job=None, pr_url=pr_url,
-        revision_count=0, strikes=0, retry_at=None, **train.TRAIN_START, note=note,
+        revision_count=0, strikes=0, retry_at=None, note=note,
+        **{**train.TRAIN_START, "train_pushed_at": core.now_iso(now)},
     )
     return rowcount, (old_pr if rowcount else None)
 
