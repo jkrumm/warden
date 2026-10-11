@@ -5326,6 +5326,7 @@ def test_adopt_own_pr_rejoins_the_merge_train_and_closes_the_prior_pr():
         assert item["pr_url"].endswith("/pull/9"), dict(item)
         assert item["train_stage"] == train.TRAIN_UPDATE and item["train_sha"] is None, dict(item)
         assert item["reviewed_sha"] is None and item["revision_count"] == 0, dict(item)
+        assert item["train_pushed_at"] == NOW.isoformat(), dict(item)
         assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
 
 
@@ -5365,6 +5366,7 @@ def test_apply_argo_adopt_rejoins_the_merge_train_and_closes_the_prior_pr():
         assert item["implement_job"] == "impl-sig-argo-adopt", dict(item)
         assert item["pr_url"].endswith("/pull/9"), dict(item)
         assert item["reviewed_sha"] is None and item["revision_count"] == 0, dict(item)
+        assert item["train_pushed_at"] == NOW.isoformat(), dict(item)
         assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 7)], CLOSED_PRS
         assert len(ctx.argo_acks) == 1 and ctx.argo_acks[0]["status"] == "applied", ctx.argo_acks
         assert ctx.argo_acks[0]["result"] == {"pullRequest": 9}, ctx.argo_acks[0]
