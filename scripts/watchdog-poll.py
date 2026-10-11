@@ -339,8 +339,8 @@ def poll_github(env: dict[str, str]) -> dict[str, list[dict[str, Any]] | None]:
     directly, which supersedes this stale-issue governance digest entirely —
     a `github_issue` item carries a real investigate/implement verdict,
     while this poll only ever produced an age-gated "still open" line.
-    `github_pr` is unaffected: it stays exactly as it was, the review-without-
-    CodeRabbit path (FLOWS.md flow 4) has nothing to do with issue intake."""
+    `github_pr` is unaffected: it stays exactly as it was, the PR-review
+    path (docs/history/flows.md flow 4) has nothing to do with issue intake."""
     out: dict[str, list[dict[str, Any]] | None] = {"github_pr": None}
     gh_env = os.environ.copy()
     if env.get("GITHUB_TOKEN"):
