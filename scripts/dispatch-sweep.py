@@ -710,7 +710,7 @@ def process_dispatch(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: boo
         # GitHub projection is a column read, not a JSON parse — the briefing and the
         # watchdog both want "what did this dispatch produce" without unpacking a blob.
         conn.execute(
-            "UPDATE dispatches SET status=?, verdict_json=?, artifact_url=?, finished_at=?, error=? "
+            "UPDATE dispatches SET status=?, verdict_json=?, artifact_url=COALESCE(?, artifact_url), finished_at=?, error=? "
             "WHERE job_id=?",
             (
                 status,
