@@ -928,9 +928,7 @@ def cmd_adopt(conn, flags: Flags, positional: list[str], state: _State) -> dict[
     opened (a `dispatches` row): merge's gate only ever lands a `dispatch/…` branch warden cut, so a
     foreign PR is refused, not guessed at. Writes the local ledger; any prior `pr_url` is closed
     best-effort, and agent-gateway is never reached."""
-    # No require_backend(): the transition is local and the PR close is best-effort — a token that
-    # cannot be resolved is logged by close_pr_best_effort(), and must not block the owner's
-    # command, the same reasoning `reinvestigate` carries.
+    require_backend()  # adopt reads the pull request's live state on GitHub before any write
     if not positional:
         raise UsageError('usage: warden adopt <event-id> --pr <number> [--why "<reason>"] [--json]')
     event_id = _parse_int(positional[0], "event-id")
