@@ -2,14 +2,14 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§147).
+build log (§1–§148).
 
 | | |
 |-|-|
-| Last updated | 2026-10-11 (§147 — `warden adopt <id> --pr <n>` / Argo puts an item on an open warden PR's merge train) |
+| Last updated | 2026-10-11 (§148 — a revision `no_changes` on a moved PR head rejoins the train instead of paging) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 17 |
+| Ledger | `~/.warden/warden.db`, schema 18 |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
 
 ## What is live
@@ -74,6 +74,13 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `needs_decision`, `[category]`-led; a schema-2 one without is re-reviewed once per head (latch
   `dispatches.validation_status = 'redriven:<sha>'`, a `PRIOR ESCALATION` paragraph in the review context), then
   read as the decision: blocking findings revise, none confirms. Schema-1 and revert reviews keep the old path.
+- **Revision rejoin.** A step-7 review that blocks records the refused head in `blocked_sha`
+  (migration 18), which survives leaving `merging`. A revision `no_changes` on an open PR then
+  compares the PR's current head (read from GitHub) to it: a head that moved rejoins the merge
+  train for a fresh review instead of paging the owner (item 1464: weatherorb #60 blocked at
+  `34fd019`, `b35b86e` landed after); an unchanged head, a missing `blocked_sha`, or an
+  unreadable PR still goes to `needs_decision`. `TRAIN_START`, a redriven train and
+  `core.reinvestigate()` all clear it.
 - **Prior resolution in the brief.** A reopened item's most recent SUBSTANTIVE close note and its
   date (`item_transitions`, terminal state; a later silence close or a blank row never shadows a
   real answer, and a pure-silence close on its own yields no `PRIOR RESOLUTION` line at all) ride

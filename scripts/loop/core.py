@@ -639,7 +639,7 @@ _SET_STATE_COLUMNS = (
     "revert_pr", "close_reason", "strikes", "retry_at", "revision_count",
     "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
     "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
-    "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
+    "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json", "blocked_sha",
     "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
     "failure_class", "redrive_json", "redrives",
 )
@@ -655,8 +655,8 @@ _REDRIVE_STAGES = (STATE_NEW, STATE_TRIAGED, STATE_WORKING, STATE_MERGING, STATE
 REINVESTIGATE_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED, STATE_QUIET)
 
 # The merge train's position, meaningful only while the item is `merging`: leaving it clears
-# them (set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha` and
-# `train_evidence` are not among them; see advance_merge_trains().
+# them (set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha`,
+# `blocked_sha` and `train_evidence` are not among them; see advance_merge_trains().
 _TRAIN_POSITION = ("train_stage", "train_sha", "train_job", "train_pushed_at")
 
 # An item entering `verifying` starts with no verification history: no deploy yet
@@ -959,8 +959,9 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
     fresh investigation. Every handle the old run left is cleared so the new `working` phase starts
     clean: `dispatch_job` (the investigation, which would otherwise hold the cooldown anchor against
     the re-run just asked for), `implement_job` and `validation_job` (the implement and step-7
-    review dispatches), `pr_url` with `reviewed_sha` (the PR and the head a review confirmed for
-    it), and `revision_count` — the attempts it counted were against that cleared PR, so a fresh
+    review dispatches), `pr_url` with `reviewed_sha` and `blocked_sha` (the PR and the heads a review
+    confirmed and refused for it), and `revision_count` — the attempts it counted were against that
+    cleared PR, so a fresh
     run that inherited them could fail "revisions exhausted" after a single review (item 1390). The PR is cleared deliberately: `set_state()`'s `work`-failure recipe routes back to
     `merging` whenever `pr_url` is set, so a stale URL would mis-route a later failure of the fresh
     re-run, and a review of that stale head means nothing. The cleared PR is worth CLOSING, and its
@@ -978,7 +979,7 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
         note = _items.append_to_note(note, f"superseded PR {old_pr}")
     rowcount = set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
                          dispatch_job=None, implement_job=None, validation_job=None,
-                         pr_url=None, reviewed_sha=None, revision_count=0)
+                         pr_url=None, reviewed_sha=None, blocked_sha=None, revision_count=0)
     return rowcount, (old_pr if rowcount else None)
 
 

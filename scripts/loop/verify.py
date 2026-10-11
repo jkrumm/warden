@@ -83,7 +83,7 @@ def _on_verify_failure(conn: sqlite3.Connection, item: sqlite3.Row, evidence: st
     core.set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_VERIFYING, expect_eq={"merged_sha": sha},
                     note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence} — reverting {sha[:12]}",
                     reverting_sha=sha, revert_json=json.dumps(record), implement_job=None, validation_job=None,
-                    pr_url=None, reviewed_sha=None, strikes=0, retry_at=None, **core.VERIFY_RESET)
+                    pr_url=None, reviewed_sha=None, blocked_sha=None, strikes=0, retry_at=None, **core.VERIFY_RESET)
     conn.commit()
 
 
@@ -746,5 +746,5 @@ def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
     core.set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_VERIFYING, expect_eq={"reverting_sha": sha},
                     note=f"reverted {sha[:12]} ({verify_note}); attempt {attempt}/{core.MAX_IMPLEMENT_ATTEMPTS} next",
                     reverting_sha=None, revision_count=item["revision_count"] + 1, implement_job=None,
-                    validation_job=None, pr_url=None, reviewed_sha=None, strikes=0, retry_at=None, **core.VERIFY_RESET)
+                    validation_job=None, pr_url=None, reviewed_sha=None, blocked_sha=None, strikes=0, retry_at=None, **core.VERIFY_RESET)
     conn.commit()
