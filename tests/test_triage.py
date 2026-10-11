@@ -3523,6 +3523,22 @@ def test_implement_outcome_no_changes_on_a_revision_rejoins_the_train_when_the_h
             "the merge gate reads the PR from the dispatch row, which a no_changes verdict leaves empty"
 
 
+def test_implement_outcome_no_changes_pages_when_the_blocked_pr_is_no_longer_open():
+    """A PR closed or merged under the review has a different head too, but it is not a train entry."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-no-changes-closed", job_id="impl-no-changes-closed")
+        conn.execute("UPDATE triage_items SET revision_count=1, pr_url=?, blocked_sha=? WHERE event_id=?",
+                     ("https://github.com/jkrumm/demo-repo/pull/7", TRAIN_SHA, eid))
+        conn.commit()
+        PR_HEAD.update(sha=REBASED_SHA, state="closed")
+        _agent_gateway.get = lambda job_id: {
+            "status": "done", "result": _dispatch_result("no_changes", summary="unknown"),
+        }
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+
+
 def test_implement_outcome_no_changes_pages_when_the_pr_token_cannot_be_resolved():
     """An unresolvable GitHub token (PreconditionError, not RemoteError) must not crash the pass."""
     with _triage_env() as (conn, ctx):

@@ -246,7 +246,7 @@ def sync_record(conn: sqlite3.Connection, job: dict, *, reported: bool, now: dt.
     artifact = (result.get("artifactUrl") or None) if isinstance(result, dict) else None
     reported_at = now_iso if reported else None
     conn.execute(
-        "UPDATE dispatches SET status=?, verdict_json=?, artifact_url=?, finished_at=?, "
+        "UPDATE dispatches SET status=?, verdict_json=?, artifact_url=COALESCE(?, artifact_url), finished_at=?, "
         "reported_at=COALESCE(reported_at, ?), "
         "delivery_status=COALESCE(delivery_status, CASE WHEN ? IS NOT NULL THEN ? END) "
         "WHERE job_id=?",
