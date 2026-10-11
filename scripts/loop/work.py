@@ -2187,6 +2187,16 @@ def adopt_own_pr(conn: sqlite3.Connection, event_id: int, pr_number: int, now: d
             "a PR from anywhere else is not mergeable by warden's gate"
         )
     job_id, pr_url = match
+    # The ledger row survives a PR that was closed unmerged (including one warden closed as
+    # superseded); adopting it would close the item's valid PR and strand the item. Read GitHub first.
+    try:
+        live = _github.read_pr(_github.GH_OWNER, item["repo"], pr_number)
+    except RemoteError as exc:
+        raise PreconditionError(f"could not confirm #{pr_number} is open on GitHub: {exc}") from exc
+    if live.get("merged") or live.get("state") != "open":
+        raise PreconditionError(
+            f"#{pr_number} is {'merged' if live.get('merged') else live.get('state')}, not open — "
+            "adopt takes over only a pull request that is still open")
     old_pr = item["pr_url"] if item["pr_url"] and item["pr_url"] != pr_url else None
     rowcount = core.set_state(
         conn, event_id, core.STATE_MERGING, now, expect_state=expect_state,
