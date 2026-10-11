@@ -10102,6 +10102,6 @@ reverted item (`revert_pr`) is refused. Both doors share `work.adopt_own_pr()`: 
 (`payload.pr`, like dismiss's `reason`/note's `text`/retry's `why` — a PR number is no different),
 and `api.py`'s `availableActions` lists `adopt` beside `implement` for an owner-state item, so the
 board offers it and the owner no longer has to drop to the CLI. No schema change, no migration.
-Tests: five in `tests/test_triage.py` (rejoin + close prior, refuse a foreign/merged PR, and the
+Tests: six in `tests/test_triage.py` (rejoin + close prior, refuse a foreign/merged PR, and the
 three Argo-handler cases) and four in `tests/test_warden_cli.py` (adopt, refuse, dry-run, usage/
 state); 543 → 549, CLI 83 → 87. `make check` green.
