@@ -177,9 +177,9 @@ _ARGO_IMPLEMENT_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED)
 _ARGO_MERGE_ALLOWED_STATES = (core.STATE_NEEDS_DECISION, core.STATE_FAILED)
 # `retry` re-enters the stage a `failed` item stored (core.redrive()); api.py offers it only when one is.
 _ARGO_RETRY_ALLOWED_STATES = (core.STATE_FAILED,)
-# An item with `revert_pr` set was merged and rolled back by hand: implementing or merging it
+# An item with `revert_pr` set was merged and rolled back by hand: implementing, merging or adopting it
 # again would redo the reverted change. api.py's `availableActions` offers neither.
-_ARGO_REVERTED_REFUSAL = "this item was reverted (revert_pr is set) — implement/merge would redo the reverted change"
+_ARGO_REVERTED_REFUSAL = "this item was reverted (revert_pr is set) — implement, merge or adopt would redo the reverted change"
 
 
 def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
