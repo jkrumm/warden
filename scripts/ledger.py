@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 17
+LEDGER_SCHEMA_VERSION = 18
 
 
 class LedgerBehind(RuntimeError):
@@ -634,6 +634,14 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #     NULL otherwise.
 #   reviewed_sha    the last PR head a step-7 review confirmed. Survives leaving `merging` (an
 #     owner merge of the same head need not re-review); a new implement attempt clears it.
+#   blocked_sha     the PR head a step-7 review last REFUSED (validation_status='blocked': a
+#     non-empty code `blocking` list). `reviewed_sha` records only a confirmation and `train_sha`
+#     is cleared the moment the item leaves `merging`, so without this the head a blocking review
+#     ran against was gone: a revision that later came back `no_changes` could not tell whether the
+#     pull request had moved under it (a fix landing after the block) or was frozen at the refused
+#     head, and paged the owner in both cases. Survives leaving `merging` like `reviewed_sha`;
+#     cleared when a fresh attempt's PR joins the train (TRAIN_START), when a `failed` item is
+#     re-driven onto the train, and by `core.reinvestigate()`.
 #   train_evidence  what ended a train in a revision (the rebase conflict, the failed checks),
 #     read by the revision brief — the update_pr job that said so is not a dispatch row.
 #   train_rewinds   times the train went back to update (the PR head moved off its SHA) since the
@@ -772,6 +780,16 @@ UPDATE triage_items SET state = 'fixed', close_reason = NULL,
     AND close_reason = 'resolved' AND note LIKE 'deadline expired: sat in `merged`%';
 """
 
+# Version 18 — `blocked_sha` (one column, no backfill). A revision's `no_changes` outcome used to
+# page the owner whenever a pull request was open, even when the PR head had moved since the review
+# that blocked it (item 1464: weatherorb PR #60 blocked at 34fd019, b35b86e landed after, the next
+# revision found nothing to do and paged anyway). `reviewed_sha` records only a CONFIRMED head and
+# `train_sha` is cleared on leaving `merging`, so the head the blocking review refused was not
+# persisted. See the `blocked_sha` note in the merge-train block above.
+_MIGRATION_18 = """
+ALTER TABLE triage_items ADD COLUMN blocked_sha TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -790,6 +808,7 @@ MIGRATIONS: dict[int, str] = {
     15: _MIGRATION_15,
     16: _MIGRATION_16,
     17: _MIGRATION_17,
+    18: _MIGRATION_18,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live
