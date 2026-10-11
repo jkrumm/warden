@@ -5352,6 +5352,25 @@ def test_adopt_own_pr_refuses_a_pr_warden_never_opened_and_writes_nothing():
             assert item["implement_job"] is None and item["pr_url"] is None, dict(item)
 
 
+def test_adopt_own_pr_refuses_a_pr_that_is_no_longer_open_and_keeps_the_prior_pr():
+    """A done dispatch row outlives its PR: one closed unmerged on GitHub must not be adopted, and the
+    item's current PR must not be closed on its behalf."""
+    with _triage_env() as (conn, ctx):
+        old = "https://github.com/jkrumm/demo-repo/pull/7"
+        eid = _seed_adoptable_item(conn, external_id="sig-adopt-closed", pr_number=9, old_pr=old)
+        PR_HEAD["state"] = "closed"
+        try:
+            work.adopt_own_pr(conn, eid, 9, NOW, expect_state=core.STATE_NEEDS_DECISION, note="x")
+        except PreconditionError as exc:
+            assert "not open" in str(exc), exc
+        else:
+            raise AssertionError("a closed PR must be refused")
+        conn.commit()
+        assert CLOSED_PRS == [], CLOSED_PRS
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION and item["pr_url"] == old, dict(item)
+
+
 def test_apply_argo_adopt_rejoins_the_merge_train_and_closes_the_prior_pr():
     with _triage_env() as (conn, ctx):
         old = "https://github.com/jkrumm/demo-repo/pull/7"
