@@ -93,20 +93,12 @@
       "repo": "audio-gateway"
     },
     {
-      "match": "docker_*:unhealthy:image-gen*",
-      "repo": "image-gen"
+      "match": "docker_*:unhealthy:image-gateway*",
+      "repo": "image-gateway"
     },
     {
-      "match": "docker_*:restart:image-gen*",
-      "repo": "image-gen"
-    },
-    {
-      "match": "docker_*:unhealthy:image-share*",
-      "repo": "image-share"
-    },
-    {
-      "match": "docker_*:restart:image-share*",
-      "repo": "image-share"
+      "match": "docker_*:restart:image-gateway*",
+      "repo": "image-gateway"
     },
     {
       "match": "docker_*:unhealthy:rollhook*",
@@ -280,13 +272,6 @@
       "reason": "The MacMini Dev Host is a local homelab infrastructure dependency."
     },
     {
-      "match": "slack_alert:new-incident-for-http-photos-jkrumm-com-photos-jkrumm-com",
-      "repo": "image-share",
-      "proposedAt": "2026-09-11T23:19:27.263532+00:00",
-      "proposedBy": "triage-auto",
-      "reason": "The incident targets the photos.jkrumm.com image-sharing service."
-    },
-    {
       "match": "uk:95",
       "repo": "vps",
       "proposedAt": "2026-09-11T23:19:27.263532+00:00",
@@ -411,13 +396,6 @@
       "proposedAt": "2026-09-20T23:56:20.115447+00:00",
       "proposedBy": "triage-auto",
       "reason": "Torrent app container is part of homelab Docker stack."
-    },
-    {
-      "match": "slack_alert:photos-http-red-circle-down-read-econnreset",
-      "repo": "image-share",
-      "proposedAt": "2026-09-20T23:56:20.115447+00:00",
-      "proposedBy": "triage-auto",
-      "reason": "Photos HTTP service corresponds to image-share."
     },
     {
       "match": "slack_alert:weatherorb-http-red-circle-down-read-econnreset",

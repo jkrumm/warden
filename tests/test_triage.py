@@ -7822,10 +7822,10 @@ def test_a_reopened_item_is_triaged_again():
 
 def test_the_shipped_policy_keeps_the_label_rules_without_evidence():
     policy = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())
-    assert len(policy["rules"]) == 77 and len(policy["ignore"]) == 15
+    assert len(policy["rules"]) == 73 and len(policy["ignore"]) == 15
     assert not any("evidence" in r for r in policy["rules"]), "the evidence machinery is deleted"
     loaded = core.load_policy()
-    assert len(loaded["rules"]) == 77 and len(loaded["ignore"]) == 15 and loaded["hostVerbs"]
+    assert len(loaded["rules"]) == 73 and len(loaded["ignore"]) == 15 and loaded["hostVerbs"]
 
 
 # -- rules are the label tier --
