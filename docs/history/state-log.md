@@ -10197,3 +10197,30 @@ tail it already lost).
 
 `test_triage.py` 564 -> 565 (the alert brief carries the instruction verbatim and "NOT a blocker"); `make
 check` green.
+
+## 152. §151's instruction survives the cap, and `blocker` reads the same on both paths (2026-10-13)
+
+§151 placed `work.LIVE_STATE_INSTRUCTION` as the last line of the alert brief and left it there. Independent
+review blocked the change on three counts, all real:
+
+- **The tail was the first thing `_cap_brief()` dropped.** `_build_cluster_brief()` joined the variable
+  member/sibling text and the instruction into one string and capped the whole thing; `_truncate()` cuts from
+  the tail, so a cluster whose signatures, raw text, chronic and prior-resolution context overflowed
+  `MAX_BRIEF_CHARS` lost the instruction silently — for exactly the busiest clusters most likely to need it.
+  `escalate_cluster()` re-capped a second time after prepending `_decide_brief_paragraph()`, shrinking the
+  budget again. Both now reserve the FIXED closing block (plus the decide-paragraph) before the variable body
+  spends budget, the shape `_origin_item_brief()` uses for its epilogue; `escalate_cluster()` passes the
+  decide-paragraph into `_build_cluster_brief()` rather than re-capping from the tail.
+- **The instruction named two of the owner's three elements.** It said what NOT to call a blocker but not how
+  to close a benign one-off. Item 121 is exactly that case, so the instruction now also says: when live state
+  shows nothing abnormal, say so in `verdict` with the evidence read and answer `nextAction=none` — or
+  `nextAction=implement` when the monitor itself is miscalibrated in a repo that owns its config.
+- **The `blocker` definition drifted between paths.** The `ESCALATION_CATEGORIES` comment and
+  `_decide_brief_paragraph()` still read `blocker` as "a reported obstacle … not a choice" / "a blocker you
+  cannot get past, such as an unreadable repo", while `LIVE_STATE_INSTRUCTION` demanded the exact command run
+  and the error returned. `_decide_brief_paragraph()` is appended to re-driven items — already sent back once
+  — so that was a second live route to item 121. Both now state the stricter definition.
+
+`test_triage.py` 565 -> 567 (a brief over the cap, and a decide-paragraph plus overflow, both keep the
+instruction at the tail; the decide-paragraph names the command/error; the live-state brief names the
+`nextAction=none` / `miscalibrated` close). `make check` green.

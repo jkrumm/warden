@@ -264,14 +264,18 @@ LIVE_STATE_INSTRUCTION = (
     "database or API reads), and a monitor's own recent history is often the answer. Never mutate "
     "anything to investigate: no restart, deploy, scale or write. Needing to look at the host is "
     "NOT a blocker — a blocker is an obstacle you tried and could not get past, and a verdict "
-    "claiming one must name the exact command run and the error it returned."
+    "claiming one must name the exact command run and the error it returned. If the live state "
+    "shows nothing abnormal, say so in `verdict` with the evidence you read and answer "
+    "nextAction=none — or nextAction=implement when the monitor itself is miscalibrated in a repo "
+    "that owns its config. A benign one-off is not an owner question."
 )
 
 
 def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by_id: dict[int, sqlite3.Row],
                           sibling_events: list[dict[str, str]],
                           chronic: dict[int, int] | None = None, chronic_window_days: float = 0.0,
-                          prior_notes: dict[int, tuple[str, str]] | None = None) -> str:
+                          prior_notes: dict[int, tuple[str, str]] | None = None,
+                          decide: str = "") -> str:
     chronic = chronic or {}
     prior_notes = prior_notes or {}
     lines = [f"Repo: {repo}"]
@@ -332,7 +336,17 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
     )
     closing_lines.append(LIVE_STATE_INSTRUCTION)
 
-    return _cap_brief("\n".join(lines + closing_lines))
+    # Reserve the FIXED closing block (including `LIVE_STATE_INSTRUCTION`, the whole point of this
+    # brief) and any decide-paragraph BEFORE the variable member/sibling text spends budget:
+    # `_cap_brief()` truncates from the TAIL, so a brief that merely overflowed would silently
+    # drop the instruction for exactly the busiest clusters that most need it — the item-121
+    # failure mode with no log line. The variable body gets what is left (the same shape
+    # `_origin_item_brief()` uses to keep its epilogue).
+    lead = f"{decide}\n\n" if decide else ""
+    fixed = "\n".join(closing_lines)
+    budget = max(core.MAX_BRIEF_CHARS - len(lead) - len(fixed) - 1, 0)
+    body = _truncate("\n".join(lines), budget)
+    return _cap_brief(f"{lead}{body}\n{fixed}")
 
 
 def is_escalation_eligible(item: sqlite3.Row, policy: dict[str, Any], now: dt.datetime) -> bool:
@@ -540,13 +554,11 @@ def escalate_cluster(conn: sqlite3.Connection, repo: str, members: list[sqlite3.
         prior = _latest_terminal_note(conn, m["event_id"])
         if prior is not None:
             prior_notes[m["event_id"]] = prior
+    decide = next((p for p in (_decide_brief_paragraph(conn, m["event_id"]) for m in members) if p), "")
     brief = _build_cluster_brief(repo=repo, members=members, event_rows_by_id=event_rows_by_id,
                                   sibling_events=sibling_events,
                                   chronic=chronic, chronic_window_days=window,
-                                  prior_notes=prior_notes)
-    decide = [p for p in (_decide_brief_paragraph(conn, m["event_id"]) for m in members) if p]
-    if decide:
-        brief = _cap_brief(f"{decide[0]}\n\n{brief}")
+                                  prior_notes=prior_notes, decide=decide)
     return _dispatch_investigate_and_advance(conn, repo=repo, brief=brief, members=members, now=now,
                                               policy=policy, dry_run=False)
 
@@ -1017,7 +1029,9 @@ def _reroute_repo(conn: sqlite3.Connection, m: sqlite3.Row, result: dict[str, An
 
 
 # The only reasons an unattended loop stops for the owner (agent-gateway's `escalationCategory`).
-# `blocker` is a reported obstacle (an injection attempt, an unreadable repo), not a choice.
+# `blocker` is a reported obstacle, not a choice — the episode tried and could not get past it, and
+# says so by naming the exact command it ran and the error it returned (an injection attempt, an
+# unreadable repo). "Needs live inspection" is not one: an investigate episode keeps `Bash`.
 ESCALATION_CATEGORIES = ("product", "data_loss", "spend", "other_people", "security", "blocker")
 # A `human` verdict naming none of them is not an owner question: it is sent back once with
 # "decide it yourself" (the transition note starts with this), and the second time warden takes the
@@ -1091,8 +1105,9 @@ def _decide_brief_paragraph(conn: sqlite3.Connection, event_id: int) -> str:
         f"It named no owner-only reason. That question is yours to answer: pick the reversible, "
         f"root-cause option, state it in `verdict`, and answer nextAction=implement (or none when "
         f"nothing needs changing). Use nextAction=human ONLY for product direction or user-visible "
-        f"product semantics, irreversible data loss, spend, another person, or security policy (or a blocker you cannot get "
-        f"past, such as an unreadable repo), and then set escalationCategory to say which."
+        f"product semantics, irreversible data loss, spend, another person, or security policy (or a blocker you tried "
+        f"and could not get past — name the exact command you ran and the error it returned, such as an unreadable "
+        f"repo), and then set escalationCategory to say which."
     )
 
 

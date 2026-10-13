@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-13 (§151 — the alert brief tells the episode the live host is reachable read-only) |
+| Last updated | 2026-10-13 (§152 — the alert brief's live-state instruction survives the cap, and `blocker` reads the same on every path) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 19 |
@@ -101,7 +101,13 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `work.LIVE_STATE_INSTRUCTION`: the answer usually sits on the host, so read it READ-ONLY through
   the repo's own `AGENTS.md` commands (`make logs`/`status`, monitor history) before concluding, and
   "needs live inspection" is never a `blocker` — a blocker must name the command tried and the error
-  it returned (item 121 paged the owner with `[blocker] inspect the host or dismiss?`).
+  it returned (item 121 paged the owner with `[blocker] inspect the host or dismiss?`). It also says
+  how to close a benign one-off: `nextAction=none` with the evidence read, or `implement` when the
+  monitor itself is miscalibrated in a repo that owns its config. The fixed closing block (and any
+  decide-paragraph) is reserved BEFORE the variable member/sibling text spends budget, so a cluster
+  over `MAX_BRIEF_CHARS` cannot lose the instruction to `_cap_brief()`'s tail truncation; the
+  re-driven `_decide_brief_paragraph()` carries the same stricter `blocker` wording, so both live
+  paths to item 121 read it the same way.
 - **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
   superseded/fixed), 2 `needs_decision`.
 

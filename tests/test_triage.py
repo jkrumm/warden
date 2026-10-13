@@ -1231,7 +1231,47 @@ def test_alert_brief_tells_the_episode_to_read_live_state_read_only():
         assert "NOT a blocker" in brief, (
             "the brief must say plainly that needing to look at the host is not a blocker"
         )
+        assert "nextAction=none" in brief and "miscalibrated" in brief, (
+            "the brief must also say how to close a benign one-off when live state shows nothing "
+            "abnormal (nextAction=none, or implement when the monitor itself is miscalibrated) — "
+            "without it the episode still falls back to a human verdict"
+        )
         assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
+
+
+def test_alert_brief_keeps_the_live_state_instruction_when_it_is_capped():
+    """`_cap_brief()` truncates from the TAIL, so a cluster whose member/sibling text overflows
+    MAX_BRIEF_CHARS must still carry the closing live-state instruction: the busiest clusters are
+    the ones that most need it, and silently dropping it would reproduce item 121 with no log
+    line flagging the drop."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="b-overflow", title="B" * 9000, repo="demo-repo",
+                        state=core.STATE_TRIAGED, occurrences=5)
+        brief = work._build_cluster_brief(
+            repo="demo-repo", members=[_rows(conn, eid)],
+            event_rows_by_id={eid: core.get_event(conn, eid)}, sibling_events=[],
+        )
+        assert len(brief) <= core.MAX_BRIEF_CHARS, len(brief)
+        assert work.LIVE_STATE_INSTRUCTION in brief, brief[-400:]
+        assert brief.endswith("A benign one-off is not an owner question."), brief[-200:]
+
+
+def test_decide_paragraph_never_displaces_the_live_state_instruction():
+    """A re-driven item's brief carries the decide-paragraph AND the closing live-state instruction.
+    Reserving both before the variable body spends budget (rather than re-capping from the tail,
+    which would chop the instruction) is what keeps that true for an oversized cluster."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="b-decide-overflow", title="C" * 9000, repo="demo-repo",
+                        state=core.STATE_TRIAGED, occurrences=5)
+        decide = "D" * 1200
+        brief = work._build_cluster_brief(
+            repo="demo-repo", members=[_rows(conn, eid)],
+            event_rows_by_id={eid: core.get_event(conn, eid)}, sibling_events=[], decide=decide,
+        )
+        assert len(brief) <= core.MAX_BRIEF_CHARS, len(brief)
+        assert brief.startswith(f"{decide}\n\n"), brief[:120]
+        assert work.LIVE_STATE_INSTRUCTION in brief, brief[-400:]
+        assert brief.endswith("A benign one-off is not an owner question."), brief[-200:]
 
 
 def test_quiet_resolution_never_posts():
@@ -1835,6 +1875,11 @@ def test_a_human_verdict_without_a_category_is_sent_back_once_to_decide_itself()
         assert item["note"] == "re-driven to decide: Keep it strict, or dampen it?", item["note"]
         paragraph = work._decide_brief_paragraph(conn, item["event_id"])
         assert "Keep it strict, or dampen it?" in paragraph and "escalationCategory" in paragraph, paragraph
+        assert "name the exact command you ran and the error it returned" in paragraph, (
+            "the decide-paragraph must carry the SAME stricter blocker definition as "
+            "LIVE_STATE_INSTRUCTION, or a re-driven item can still page the owner with "
+            "'needs live inspection' tagged as a blocker"
+        )
         assert work._decide_brief_paragraph(conn, item["event_id"] + 99) == ""
 
 
