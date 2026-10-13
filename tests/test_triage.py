@@ -13021,8 +13021,10 @@ def _blocked_review_round(conn, eid: int, n: int, blocking: list[dict[str, Any]]
     review stage and the review BLOCKS with `blocking`. The earlier rounds' dispatch rows (and the
     review verdicts the next round's context quotes) are the ones earlier calls left behind."""
     impl, val = f"impl-chain-{eid}-{n}", f"val-chain-{eid}-{n}"
-    conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_event_id,validation_job_id) "
-                 "VALUES (?,?,?,?,?,?,?,?)", (impl, "implement", "demo-repo", "b", "done", NOW.isoformat(), eid, val))
+    conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_event_id,validation_job_id,"
+                 "artifact_url) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (impl, "implement", "demo-repo", "b", "done", NOW.isoformat(), eid, val,
+                  "https://github.com/jkrumm/demo-repo/pull/10"))
     conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,verdict_json) VALUES (?,?,?,?,?,?,?)",
                  (val, "review", "demo-repo", "review", "done", NOW.isoformat(),
                   json.dumps({"outcome": "actionable", "blocking": blocking})))
@@ -13104,9 +13106,9 @@ def test_the_review_context_of_a_revision_quotes_the_prior_findings_within_the_c
         conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?", ("b" * 30000, eid))
         conn.commit()
         # Round 2's implement job exists; its review context quotes round 1.
-        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_event_id) "
-                     "VALUES (?,?,?,?,?,?,?)", ("impl-chain-ctx-2", "implement", "demo-repo", "b", "done",
-                                                NOW.isoformat(), eid))
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_event_id,artifact_url) "
+                     "VALUES (?,?,?,?,?,?,?,?)", ("impl-chain-ctx-2", "implement", "demo-repo", "b", "done",
+                                                  NOW.isoformat(), eid, "https://github.com/jkrumm/demo-repo/pull/10"))
         conn.execute("UPDATE triage_items SET implement_job='impl-chain-ctx-2' WHERE event_id=?", (eid,))
         conn.commit()
         text = train._review_context(conn, core.get_item(conn, eid))
