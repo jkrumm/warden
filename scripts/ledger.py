@@ -734,6 +734,8 @@ ALTER TABLE triage_items ADD COLUMN fixed_by_pr TEXT;
 #   | exceeds the ceiling / episode not started — sideclaw (pre-rename) or agent-gateway refused | policy | working (note starts with `implement`), merging (`review`/`update_pr`), else triaged |
 #   | is merge-approval gated (the deleted gate)          | policy | merging, the train restarts at update |
 #   | anything else                                       | work   | never automatically; `warden retry` re-enters merging (has a PR) or triaged; none when `revert_pr` is set |
+# The `sideclaw refused` LIKE below is deliberate: agent-gateway was named sideclaw until
+# 2026-10-09, and `failed` rows written before the rename still carry that wording in `note`.
 _MIGRATION_16 = """
 ALTER TABLE triage_items ADD COLUMN failure_class TEXT;
 ALTER TABLE triage_items ADD COLUMN redrive_json TEXT;

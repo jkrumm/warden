@@ -1,6 +1,5 @@
-"""The agent-gateway job-server transport — the Python port of the retired bash CLI's
-`sideclaw_submit` (1219-1251), `sideclaw_get` (1253-1263) and `wait_for`
-(1439-1462).
+"""The agent-gateway job-server transport: submit a job, fetch its state, and poll
+until it is terminal (`wait_for`), plus the typed result shapes the loop validates.
 
 Always `urllib.request`, never `curl`/`subprocess` — the whole point of this
 port is that a Python process can talk HTTP directly. Base URL is read at
@@ -93,7 +92,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _base() -> str:
-    return os.environ.get("WARDEN_AGENT_GATEWAY_BASE") or os.environ.get("WARDEN_SIDECLAW_BASE", _DEFAULT_BASE)
+    return os.environ.get("WARDEN_AGENT_GATEWAY_BASE") or _DEFAULT_BASE
 
 
 def valid_job_id(job_id: str) -> bool:
