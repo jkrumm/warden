@@ -86,9 +86,13 @@ def _recent_raw_texts(event_row: sqlite3.Row) -> list[str]:
 
 
 def _truncate(text: str, limit: int) -> str:
-    """`text` unchanged when it fits `limit`, else cut to `limit` ending in an ellipsis. The one
+    """`text` unchanged when it fits `limit`, else cut to `limit` ending in an ellipsis; a
+    non-positive `limit` returns "" (a budget that is already spent yields nothing, never the
+    nearly-full text — the near-zero budget overrun `_build_cluster_brief()` once hit). The one
     truncation shape `_cap_brief()` and the prior-resolution note share, so a cap and the cap's
     own ellipsis can never drift apart."""
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
@@ -340,10 +344,13 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
     # brief) and any decide-paragraph BEFORE the variable member/sibling text spends budget:
     # `_cap_brief()` truncates from the TAIL, so a brief that merely overflowed would silently
     # drop the instruction for exactly the busiest clusters that most need it — the item-121
-    # failure mode with no log line. The variable body gets what is left (the same shape
+    # failure mode with no log line. The decide-paragraph is capped first: it is the one piece
+    # that arrives unbounded (a re-driven item's stored decision question), so it must never be
+    # allowed to crowd the closing block out. The variable body gets what is left (the same shape
     # `_origin_item_brief()` uses to keep its epilogue).
     lead = f"{decide}\n\n" if decide else ""
     fixed = "\n".join(closing_lines)
+    lead = _truncate(lead, core.MAX_BRIEF_CHARS - len(fixed) - 1)
     budget = max(core.MAX_BRIEF_CHARS - len(lead) - len(fixed) - 1, 0)
     body = _truncate("\n".join(lines), budget)
     return _cap_brief(f"{lead}{body}\n{fixed}")
