@@ -2712,12 +2712,15 @@ PRIOR_FINDINGS_QUOTED = 5
 PRIOR_FINDING_MESSAGE_MAX = 400
 
 
-def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> list[dict[str, Any]]:
+def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
+                            same_pr: bool = True) -> list[dict[str, Any]]:
     """The code-blocking findings of the most recent review that BLOCKED an attempt before the one on
-    record (the previous round), or [] when there is none."""
+    record (the previous round) on the same pull request, or [] when there is none. `same_pr=False`
+    drops that match: a conflicting attempt pushed nothing, so it names no pull request, yet the
+    findings an earlier attempt was blocked on still apply to it."""
     current = conn.execute("SELECT id, artifact_url FROM dispatches WHERE job_id=?",
                            (item["implement_job"],)).fetchone()
-    if current is None or not current["artifact_url"]:
+    if current is None or (same_pr and not current["artifact_url"]):
         return []   # a pull request nobody can name has no prior round to compare with
     # Rows of an earlier cycle (before a reinvestigate) are not this chain: the chain starts at the
     # investigation on record, and a round on another pull request (an adopted one, a conflict's
@@ -2727,8 +2730,9 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> list
     blocked = conn.execute(
         "SELECT validation_job_id FROM dispatches WHERE origin_event_id=? AND tier='implement' AND id < ? AND id > ? "
         "AND validation_status='blocked' AND validation_job_id IS NOT NULL "
-        "AND artifact_url = ? ORDER BY id DESC LIMIT 1",
-        (item["event_id"], current["id"], floor["id"] if floor else 0, current["artifact_url"])).fetchone()
+        "AND (? = 0 OR artifact_url = ?) ORDER BY id DESC LIMIT 1",
+        (item["event_id"], current["id"], floor["id"] if floor else 0,
+         int(same_pr), current["artifact_url"])).fetchone()
     if blocked is None:
         return []
     rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
@@ -2773,7 +2777,7 @@ def _earlier_blocked_review_findings(conn: sqlite3.Connection, item: sqlite3.Row
     """The findings of the most recent review that BLOCKED an attempt before the one on record: a
     conflicting revision's own dispatch row says only that the rebase failed, and the findings it
     was written to address would otherwise be lost to the attempt that re-derives it."""
-    return _review_findings_text({"blocking": prior_blocking_findings(conn, item)})
+    return _review_findings_text({"blocking": prior_blocking_findings(conn, item, same_pr=False)})
 
 
 def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | None:
