@@ -7920,6 +7920,33 @@ def test_a_reopened_item_is_triaged_again():
         assert item["state"] == core.STATE_NEW and item["triage_job"] is None
 
 
+def test_a_reopened_item_starts_a_fresh_attempt_sequence():
+    """Item 543: a closed item's implement handles rode into the reopen, so the new occurrence
+    resumed the old attempt — the stale `implement_job` was re-polled and, with `revision_count>0`,
+    its `no_changes` verdict paged the owner instead of the fresh investigation a recurrence must
+    get. reopen_if_needed() now clears the same set core.reinvestigate() does; `dispatch_job` stays
+    as the escalation/cooldown anchor and `artifact_url` as the brief's "a PR already exists"."""
+    pr = "https://github.com/jkrumm/demo-repo/pull/9"
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="stale-reopen", title="Stale",
+                            first_seen=OLD)
+        intake.ingest(conn, NOW)
+        conn.execute(
+            "UPDATE triage_items SET dispatch_job=?, artifact_url=?, implement_job=?, validation_job=?, "
+            "pr_url=?, reviewed_sha=?, blocked_sha=?, revision_count=4, stalled_rounds=2 WHERE event_id=?",
+            ("investigate-old", pr, "impl-old", "val-old", pr, "a" * 40, "b" * 40, eid))
+        core.set_state(conn, eid, core.STATE_FIXED, NOW)
+        _recur_ts(conn, eid, "1788850795.862159")
+        intake.reopen_if_needed(conn, NOW)
+        item = _rows(conn, eid)
+        assert item["state"] == core.STATE_NEW, dict(item)
+        assert item["implement_job"] is None and item["validation_job"] is None, dict(item)
+        assert item["pr_url"] is None and item["reviewed_sha"] is None and item["blocked_sha"] is None, dict(item)
+        assert item["revision_count"] == 0 and item["stalled_rounds"] == 0, dict(item)
+        assert item["dispatch_job"] == "investigate-old", "kept as the escalation cooldown anchor"
+        assert item["artifact_url"] == pr, "the brief still names the existing PR"
+
+
 def test_the_shipped_policy_keeps_the_label_rules_without_evidence():
     policy = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())
     assert len(policy["rules"]) == 73 and len(policy["ignore"]) == 15

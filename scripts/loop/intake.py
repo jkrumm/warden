@@ -235,7 +235,12 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
     (UNIQUE(source, external_id)), so a row closed for an event that has since produced a new
     occurrence would sit invisible forever. Reopening to `new` (never clearing
     artifact_url/dispatch_job) lets the next escalation's brief say "a PR already exists for this
-    signature" instead of rediscovering it.
+    signature" instead of rediscovering it. Every implement handle the closed attempt left is
+    cleared, exactly as reinvestigate() clears them: a stale `implement_job` would be re-polled and
+    `revision_count`/`pr_url` would route the new occurrence's `no_changes` to `needs_decision` — a
+    page with no question — instead of the fresh investigation a recurrence must get (item 543).
+    `dispatch_job` stays as the escalation cooldown anchor (cooldown_ok()), which also makes the
+    reopened item escalate as a singleton (escalate()).
 
     The predicate is "the event's occurrence_mark() changed since this row's last transition", NOT
     `events.resolved_at IS NULL`: for a GROUPED source (slack_alert, hermes_log) resolved_at stays
@@ -295,7 +300,9 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
                 conn.execute("UPDATE triage_items SET occurrence_mark=? WHERE event_id=?",
                              (current_mark, row["event_id"]))
                 continue
-            core.set_state(conn, row["event_id"], core.STATE_NEW, now)
+            core.set_state(conn, row["event_id"], core.STATE_NEW, now,
+                           implement_job=None, validation_job=None, pr_url=None, reviewed_sha=None,
+                           blocked_sha=None, revision_count=0, stalled_rounds=0)
     conn.commit()
 
 
