@@ -10240,3 +10240,21 @@ yields nothing instead of the nearly-full body.
 
 `test_triage.py` 567 -> 569 (`_truncate` returns "" for a non-positive limit; a decide-paragraph longer than
 `MAX_BRIEF_CHARS` is itself truncated and the instruction still ends the brief). `make check` green.
+
+## 154. A reopened item starts a fresh attempt sequence (2026-10-14)
+
+Item 543. The MacMini push went DOWN on a NEW cause, but `reopen_if_needed()` reopened the closed row with a
+bare `set_state(..., STATE_NEW)`, which clears `triage_job` and the train/revert/strike state but leaves the
+implement handles. So the new occurrence resumed the OLD attempt: the stale `implement_job` was re-polled
+(`poll_implement_jobs()`) and, with `revision_count` still > 0, its `no_changes` verdict routed to
+`needs_decision` — a page with no question — instead of the fresh investigation a recurrence must get.
+
+`core.reinvestigate()` already clears exactly that set. `reopen_if_needed()` now passes the same columns with
+`STATE_NEW`: `implement_job`, `validation_job`, `pr_url`, `reviewed_sha`, `blocked_sha`, `revision_count=0`,
+`stalled_rounds=0`. `dispatch_job` stays (the escalation cooldown anchor, `cooldown_ok()`, which also makes
+the reopened item escalate as a singleton) and so does `artifact_url`, so the fresh brief can still say "a PR
+already exists for this signature". A stale `pr_url` left behind would also mis-route a later `work`-failure
+back to `merging` (`set_state()`'s recipe).
+
+`test_triage.py` 569 -> 570 (a reopened item clears the stale attempt handles, keeps `dispatch_job` and
+`artifact_url`). `make check` green.

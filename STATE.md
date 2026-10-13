@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-13 (§153 — a long stored decision question can no longer crowd the live-state instruction out) |
+| Last updated | 2026-10-14 (§154 — a reopened item starts a fresh attempt sequence) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 19 |
@@ -50,6 +50,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 - **Reinvestigate** (`warden reinvestigate` / Argo) sends an item back to `triaged` for a fresh
   investigation and closes the pull request it clears (best-effort GitHub call), keeping its URL in
   the note as `superseded PR <url>`.
+- **Reopen.** A recurrence reopens a closed item to `new`, keeping `artifact_url` (the brief's "a PR
+  already exists") and `dispatch_job` (the escalation cooldown anchor), and clearing every implement
+  handle the closed attempt left — `implement_job`, `validation_job`, `pr_url`, `reviewed_sha`,
+  `blocked_sha`, `revision_count`, `stalled_rounds` — exactly as reinvestigate does, so the new
+  occurrence starts a fresh investigation instead of resuming the old attempt (item 543).
 - **Adopt** (`warden adopt <event-id> --pr <n>` / Argo's Adopt action) points an item at a pull
   request warden itself opened for it — a `dispatches` row, still open and unmerged — restores its
   `implement_job`/`pr_url` and puts it back on its repo's merge train, which re-reviews the current
