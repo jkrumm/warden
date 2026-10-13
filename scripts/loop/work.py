@@ -250,6 +250,24 @@ def _latest_terminal_note(conn: sqlite3.Connection, event_id: int) -> tuple[str,
     return (row["note"].strip(), row["at"])
 
 
+# The live-state instruction every alert brief closes with. An alert's answer usually sits on the
+# HOST, not in the checkout — load, a container's memory, a monitor's own recent heartbeats — and an
+# investigate episode keeps `Bash` (DESIGN.md § Boundaries: the episode is not contained). Without
+# this line an episode that cannot see the answer in the repo concludes "needs live inspection" and
+# pages the owner with `escalationCategory=blocker`, an obstacle it could have read past itself
+# (item 121: a homelab CPU alert the episode could have measured read-only from the host's own
+# commands). `blocker` stays what ESCALATION_CATEGORIES calls it: a reported obstacle, not a choice.
+LIVE_STATE_INSTRUCTION = (
+    "The answer to an alert like this usually sits on the host, not in this checkout, and you keep "
+    "`Bash`: read the live state READ-ONLY before concluding anything — the repo's own `AGENTS.md` "
+    "names its read-only commands (`make logs`/`status`, health and monitor checks, read-only "
+    "database or API reads), and a monitor's own recent history is often the answer. Never mutate "
+    "anything to investigate: no restart, deploy, scale or write. Needing to look at the host is "
+    "NOT a blocker — a blocker is an obstacle you tried and could not get past, and a verdict "
+    "claiming one must name the exact command run and the error it returned."
+)
+
+
 def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by_id: dict[int, sqlite3.Row],
                           sibling_events: list[dict[str, str]],
                           chronic: dict[int, int] | None = None, chronic_window_days: float = 0.0,
@@ -312,6 +330,7 @@ def _build_cluster_brief(*, repo: str, members: list[sqlite3.Row], event_rows_by
         "long enough) and the triage step routed it to this repo. Investigate the root cause and "
         "report a verdict."
     )
+    closing_lines.append(LIVE_STATE_INSTRUCTION)
 
     return _cap_brief("\n".join(lines + closing_lines))
 

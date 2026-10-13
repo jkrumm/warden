@@ -1206,6 +1206,34 @@ def test_dispatch_brief_on_stdin_and_capped():
         assert item["dispatch_job"] is not None
 
 
+def test_alert_brief_tells_the_episode_to_read_live_state_read_only():
+    """An alert's answer often sits on the host, not in the checkout, and an
+    investigate episode keeps `Bash` (DESIGN.md § Boundaries: the episode is not
+    contained). The brief must say so, or an episode that cannot see the answer in
+    the repo pages the owner with `escalationCategory=blocker` for "needs live
+    inspection" — an obstacle it could have read past (item 121: a homelab CPU
+    alert). The instruction also has to bound the read: read-only, never a
+    mutation."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="sig-live-state",
+                            title="CPU above threshold", first_seen=OLD)
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+
+        triage.run(conn, dry_run=False)
+
+        assert len(calls) == 1, f"expected exactly one dispatch, got {len(calls)}"
+        brief = calls[0]["brief"]
+        assert work.LIVE_STATE_INSTRUCTION in brief, (
+            "the alert brief must carry the live-state instruction verbatim, so an episode "
+            f"whose answer is on the host reads it instead of paging the owner: {brief!r}"
+        )
+        assert "NOT a blocker" in brief, (
+            "the brief must say plainly that needing to look at the host is not a blocker"
+        )
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
+
+
 def test_quiet_resolution_never_posts():
     """An escalated item returned to `new` and then silence-resolved lands `quiet`,
     which Slack never hears about — on that pass or any later one."""

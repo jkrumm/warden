@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-13 (§150 — the revision cap counts only stalled rounds; a converging chain keeps revising) |
+| Last updated | 2026-10-13 (§151 — the alert brief tells the episode the live host is reachable read-only) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 19 |
@@ -97,6 +97,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   The line states the note explains ONLY its own signature, and that `nextAction=none` closes the
   whole cluster only if every member is independently explained, so the episode does not re-ask the
   owner what a prior one answered nor silently close an unexplained sibling.
+- **Live state in the alert brief.** Every alert cluster brief closes with
+  `work.LIVE_STATE_INSTRUCTION`: the answer usually sits on the host, so read it READ-ONLY through
+  the repo's own `AGENTS.md` commands (`make logs`/`status`, monitor history) before concluding, and
+  "needs live inspection" is never a `blocker` — a blocker must name the command tried and the error
+  it returned (item 121 paged the owner with `[blocker] inspect the host or dismiss?`).
 - **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
   superseded/fixed), 2 `needs_decision`.
 
