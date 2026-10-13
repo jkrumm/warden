@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-13 (§152 — the alert brief's live-state instruction survives the cap, and `blocker` reads the same on every path) |
+| Last updated | 2026-10-13 (§153 — a long stored decision question can no longer crowd the live-state instruction out) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 19 |
@@ -104,10 +104,12 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   it returned (item 121 paged the owner with `[blocker] inspect the host or dismiss?`). It also says
   how to close a benign one-off: `nextAction=none` with the evidence read, or `implement` when the
   monitor itself is miscalibrated in a repo that owns its config. The fixed closing block (and any
-  decide-paragraph) is reserved BEFORE the variable member/sibling text spends budget, so a cluster
-  over `MAX_BRIEF_CHARS` cannot lose the instruction to `_cap_brief()`'s tail truncation; the
-  re-driven `_decide_brief_paragraph()` carries the same stricter `blocker` wording, so both live
-  paths to item 121 read it the same way.
+  decide-paragraph) is reserved BEFORE the variable member/sibling text spends budget, and the
+  decide-paragraph — the one unbounded input, it quotes a re-driven item's stored decision question —
+  is itself capped first, so a cluster over `MAX_BRIEF_CHARS` cannot lose the instruction to
+  `_cap_brief()`'s tail truncation (`_truncate()` returns "" for a spent budget, never the
+  nearly-full text); the re-driven `_decide_brief_paragraph()` carries the same stricter `blocker`
+  wording, so both live paths to item 121 read it the same way.
 - **Board after the W7 backlog pass:** 12 `failed` before the deploy (9 closed as
   superseded/fixed), 2 `needs_decision`.
 

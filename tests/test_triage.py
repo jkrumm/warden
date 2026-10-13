@@ -1274,6 +1274,24 @@ def test_decide_paragraph_never_displaces_the_live_state_instruction():
         assert brief.endswith("A benign one-off is not an owner question."), brief[-200:]
 
 
+def test_a_long_decide_paragraph_never_crowds_out_the_live_state_instruction():
+    """A re-driven item's stored decision question is the one unbounded input to the brief. A
+    decide-paragraph longer than MAX_BRIEF_CHARS must itself be truncated so `lead + fixed` can
+    never exceed the cap and `_cap_brief()` can never strip the closing instruction from the
+    tail."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_row(conn, external_id="b-decide-huge", title="Recurring", repo="demo-repo",
+                        state=core.STATE_TRIAGED, occurrences=5)
+        decide = "Q" * 9000
+        brief = work._build_cluster_brief(
+            repo="demo-repo", members=[_rows(conn, eid)],
+            event_rows_by_id={eid: core.get_event(conn, eid)}, sibling_events=[], decide=decide,
+        )
+        assert len(brief) <= core.MAX_BRIEF_CHARS, len(brief)
+        assert work.LIVE_STATE_INSTRUCTION in brief, brief[-400:]
+        assert brief.endswith("A benign one-off is not an owner question."), brief[-200:]
+
+
 def test_quiet_resolution_never_posts():
     """An escalated item returned to `new` and then silence-resolved lands `quiet`,
     which Slack never hears about — on that pass or any later one."""
@@ -7688,6 +7706,15 @@ def test_truncate_is_a_no_op_under_the_limit_and_ellipsizes_over_it():
     capped = work._truncate("abcdefghij", 5)
     assert capped == "abcd…", capped
     assert len(capped) <= 5
+
+
+def test_truncate_returns_empty_for_a_nonpositive_limit():
+    """A budget that is already spent yields nothing: `_truncate()` must return "" for a 0 or
+    negative limit, never the nearly-full text the old slice `text[: limit - 1]` produced — the
+    overrun that let a long decide-paragraph crowd the closing instruction out of the brief."""
+    assert work._truncate("abc", 0) == ""
+    assert work._truncate("abc", -1) == ""
+    assert work._truncate("", 0) == ""
 
 
 def test_cluster_brief_renders_a_reopened_members_prior_resolution_note():

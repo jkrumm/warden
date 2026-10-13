@@ -10224,3 +10224,19 @@ review blocked the change on three counts, all real:
 `test_triage.py` 565 -> 567 (a brief over the cap, and a decide-paragraph plus overflow, both keep the
 instruction at the tail; the decide-paragraph names the command/error; the live-state brief names the
 `nextAction=none` / `miscalibrated` close). `make check` green.
+
+## 153. A long stored decision question can no longer crowd the live-state instruction out (2026-10-13)
+
+§152 reserved the fixed closing block and the decide-paragraph before the variable body spent budget, but the
+decide-paragraph was the one piece still unbounded: it quotes a re-driven item's stored decision question, and a
+long enough one made `lead + fixed` exceed `MAX_BRIEF_CHARS`, so the final `_cap_brief()` truncated the tail and
+stripped `LIVE_STATE_INSTRUCTION` — the item-121 failure mode again. The shared root cause sat in `_truncate()`:
+`text[: limit - 1]` on a 0/negative limit returns nearly the full text, so the near-zero budget the guard clamped
+to silently overran instead of yielding nothing.
+
+`_build_cluster_brief()` now caps the decide-paragraph first (`_truncate(lead, MAX_BRIEF_CHARS - len(fixed) - 1)`),
+so `lead + fixed` can never exceed the cap, and `_truncate()` returns "" when `limit <= 0`, so a spent budget
+yields nothing instead of the nearly-full body.
+
+`test_triage.py` 567 -> 569 (`_truncate` returns "" for a non-positive limit; a decide-paragraph longer than
+`MAX_BRIEF_CHARS` is itself truncated and the instruction still ends the brief). `make check` green.
