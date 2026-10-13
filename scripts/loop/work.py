@@ -2718,10 +2718,14 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> list
     current = conn.execute("SELECT id FROM dispatches WHERE job_id=?", (item["implement_job"],)).fetchone()
     if current is None:
         return []
+    # Rows of an earlier cycle (before a reinvestigate) are not this chain: the chain starts at the
+    # investigation on record.
+    floor = conn.execute("SELECT id FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone() \
+        if item["dispatch_job"] else None
     blocked = conn.execute(
-        "SELECT validation_job_id FROM dispatches WHERE origin_event_id=? AND tier='implement' AND id < ? "
+        "SELECT validation_job_id FROM dispatches WHERE origin_event_id=? AND tier='implement' AND id < ? AND id > ? "
         "AND validation_status='blocked' AND validation_job_id IS NOT NULL ORDER BY id DESC LIMIT 1",
-        (item["event_id"], current["id"])).fetchone()
+        (item["event_id"], current["id"], floor["id"] if floor else 0)).fetchone()
     if blocked is None:
         return []
     rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",

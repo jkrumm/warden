@@ -13129,5 +13129,19 @@ def test_a_reinvestigated_item_starts_with_a_fresh_stalled_count():
         assert item["revision_count"] == 0 and item["stalled_rounds"] == 0, dict(item)
 
 
+
+def test_a_blocked_round_of_an_earlier_investigation_is_not_the_previous_round():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-cycle")
+        _blocked_review_round(conn, eid, 1, [_finding("old cycle problem")])
+        # Reinvestigated: a newer investigation dispatch, then a fresh implement attempt.
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at) VALUES (?,?,?,?,?,?)",
+                     ("inv-cycle-2", "investigate", "demo-repo", "b", "done", NOW.isoformat()))
+        conn.execute("UPDATE triage_items SET dispatch_job='inv-cycle-2', stalled_rounds=0 WHERE event_id=?", (eid,))
+        conn.commit()
+        item = _blocked_review_round(conn, eid, 2, [_finding("a new cycle problem")])
+        assert item["stalled_rounds"] == 1, "the first review of the new cycle has nothing to compare with"
+
+
 if __name__ == "__main__":
     sys.exit(main())

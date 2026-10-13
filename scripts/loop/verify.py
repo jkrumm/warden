@@ -739,7 +739,7 @@ def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
     if not work.revisions_left(item, stalled):
         core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
                         expect_eq={"reverting_sha": sha}, reverting_sha=None, verify_failures=0, verify_result=verify_note,
-                        failure_class=core.FAILURE_WORK,
+                        failure_class=core.FAILURE_WORK, stalled_rounds=stalled,
                         note=f"reverted {sha[:12]} ({verify_note}); no implement attempt left — "
                              f"verification failure: {record['evidence']}")
         conn.commit()
