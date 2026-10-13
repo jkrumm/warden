@@ -10154,7 +10154,7 @@ New `triage_items.stalled_rounds` (migration 19, schema 19). `train._fold_review
 STALLED when a code-blocking finding's message starts (after whitespace, case-insensitively) with
 `work.UNRESOLVED_PRIOR_MARKER` (`UNRESOLVED PRIOR FINDING:`), or when there is no earlier blocked round on the
 item's dispatches to compare with; otherwise converging. `train._review_context()` asks for the marker: a
-paragraph (`work.prior_findings_paragraph()`, at most 5 findings of 400 chars, so it fits
+paragraph (`work.prior_findings_paragraph()`, at most 10 findings of 300 chars, with a count of the unlisted ones, so it fits
 `MAX_CONTEXT_CHARS` beside the base) quotes the previous blocked review's findings as data. The signal is text,
 as `_PROCESS_FINDING_CLOSING_RE` already classifies findings by message; agent-gateway's review schema is
 untouched. `revisions_left()`/`revisable()` and the candidate SQL of `maybe_revise_blocked()` now gate on

@@ -285,7 +285,8 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     if prior is not None:
         extras.append(_decide_review_paragraph(prior))
     reviewed, sha = item["reviewed_sha"], item["train_sha"]
-    prior_findings = work.prior_blocking_findings(conn, item)
+    # Not after a confirmation: a review that confirmed this PR settled those findings.
+    prior_findings = [] if item["reviewed_sha"] else work.prior_blocking_findings(conn, item)
     if prior_findings:
         extras.append(work.prior_findings_paragraph(prior_findings))
     if reviewed and reviewed != sha:
@@ -547,7 +548,7 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         # frozen at the refused head (poll_implement_jobs()).
         # Only a round that made no progress counts against the cap (work.round_stalled()); a block
         # whose findings are all new means the previous ones were fixed, and the chain is converging.
-        stalled_now = work.round_stalled(conn, item, code_blocking)
+        stalled_now = core.is_revert(item) or work.round_stalled(conn, item, code_blocking)
         stalled = item["stalled_rounds"] + (1 if stalled_now else 0)
         revise = work.revisable(item, stalled)
         if not revise and stalled_now and stalled >= core.MAX_IMPLEMENT_ATTEMPTS and not core.is_revert(item):
