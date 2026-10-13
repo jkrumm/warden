@@ -272,6 +272,9 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     Text only: agent-gateway's `review` job reviews the PR's whole head and has no delta/range scope, so
     "focus on what changed" is a request to the reviewer, not a narrower diff.
 
+    A revision (an earlier blocked review of this PR on record) also carries the previous round's
+    findings and the request to mark any still unresolved (work.prior_findings_paragraph()).
+
     A revert (is_revert()) is judged as one: the exact inverse of the reverted commit, nothing
     else, not whether the change it undoes was right."""
     if core.is_revert(item):
