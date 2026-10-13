@@ -13143,5 +13143,22 @@ def test_a_blocked_round_of_an_earlier_investigation_is_not_the_previous_round()
         assert item["stalled_rounds"] == 1, "the first review of the new cycle has nothing to compare with"
 
 
+
+def test_a_blocked_round_on_another_pull_request_is_not_the_previous_round():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-otherpr")
+        _blocked_review_round(conn, eid, 1, [_finding("other pr problem")])
+        conn.execute("UPDATE dispatches SET artifact_url='https://github.com/jkrumm/demo-repo/pull/7' "
+                     "WHERE job_id=?", (f"impl-chain-{eid}-1",))
+        # An adopted pull request: another artifact, the counts reset.
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_event_id,"
+                     "validation_job_id,artifact_url) VALUES (?,?,?,?,?,?,?,?,?)",
+                     ("impl-adopted", "implement", "demo-repo", "b", "done", NOW.isoformat(), eid, "val-adopted",
+                      "https://github.com/jkrumm/demo-repo/pull/9"))
+        conn.execute("UPDATE triage_items SET implement_job='impl-adopted' WHERE event_id=?", (eid,))
+        conn.commit()
+        assert work.prior_blocking_findings(conn, core.get_item(conn, eid)) == []
+
+
 if __name__ == "__main__":
     sys.exit(main())

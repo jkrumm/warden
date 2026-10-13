@@ -2715,17 +2715,21 @@ PRIOR_FINDING_MESSAGE_MAX = 400
 def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> list[dict[str, Any]]:
     """The code-blocking findings of the most recent review that BLOCKED an attempt before the one on
     record (the previous round), or [] when there is none."""
-    current = conn.execute("SELECT id FROM dispatches WHERE job_id=?", (item["implement_job"],)).fetchone()
+    current = conn.execute("SELECT id, artifact_url FROM dispatches WHERE job_id=?",
+                           (item["implement_job"],)).fetchone()
     if current is None:
         return []
     # Rows of an earlier cycle (before a reinvestigate) are not this chain: the chain starts at the
-    # investigation on record.
+    # investigation on record, and a round on another pull request (an adopted one, a conflict's
+    # replacement) is no prior round of this one.
     floor = conn.execute("SELECT id FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone() \
         if item["dispatch_job"] else None
     blocked = conn.execute(
         "SELECT validation_job_id FROM dispatches WHERE origin_event_id=? AND tier='implement' AND id < ? AND id > ? "
-        "AND validation_status='blocked' AND validation_job_id IS NOT NULL ORDER BY id DESC LIMIT 1",
-        (item["event_id"], current["id"], floor["id"] if floor else 0)).fetchone()
+        "AND validation_status='blocked' AND validation_job_id IS NOT NULL "
+        "AND (artifact_url IS NULL OR ? IS NULL OR artifact_url = ?) ORDER BY id DESC LIMIT 1",
+        (item["event_id"], current["id"], floor["id"] if floor else 0,
+         current["artifact_url"], current["artifact_url"])).fetchone()
     if blocked is None:
         return []
     rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
@@ -2759,7 +2763,7 @@ def finding_is_unresolved_prior(finding: dict[str, Any]) -> bool:
 
 def round_stalled(conn: sqlite3.Connection, item: sqlite3.Row, blocking: list[dict[str, Any]]) -> bool:
     """Whether a blocked review `blocking` made no progress on the round before it: some finding
-    carries UNRESOLVED_PRIOR_MARKER, or there is no earlier blocked round to compare with. Otherwise
+    carries UNRESOLVED_PRIOR_MARKER, or there is no earlier blocked REVIEW round of this pull request to compare with. Otherwise
     every earlier finding is resolved and the new ones are consequences: the chain is converging."""
     if not prior_blocking_findings(conn, item):
         return True
