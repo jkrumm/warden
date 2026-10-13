@@ -7870,10 +7870,11 @@ def test_the_shipped_policy_routes_every_research_gateway_alert_to_its_repo():
         "research-gateway LLM provider failures >= 3 (15m)",
         "research-gateway memory pressure >= 1 (15m)",
         "research-gateway drain cut live jobs >= 1 (1h)",
-        "research-gateway partial rate too high (>30% over 24h, n>=5)",
+        "research-gateway partial rate too high (>30% over 24h, n>=10)",
         "research-gateway synthesis/consistency failures >= 3 (1h)",
         "research-gateway cost spike >= 1 (1h)",
         "research-gateway crash-loop guard >= 1 (15m)",
+        "research-gateway solver spawn errors >= 1 (1h)",
     ]
     for title in titles:
         row = {"source": "slack_alert", "external_id": core.fingerprint(title), "title": title}
