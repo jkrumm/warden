@@ -13102,7 +13102,7 @@ def test_the_review_context_of_a_revision_quotes_the_prior_findings_within_the_c
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-ctx")
         # Round 1 is the first review: nothing to quote yet.
-        _blocked_review_round(conn, eid, 1, [_finding("x" * 5000, n) for n in range(1, 9)])
+        _blocked_review_round(conn, eid, 1, [_finding("x" * 5000, n) for n in range(1, 13)])
         conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?", ("b" * 30000, eid))
         conn.commit()
         # Round 2's implement job exists; its review context quotes round 1.
@@ -13115,6 +13115,7 @@ def test_the_review_context_of_a_revision_quotes_the_prior_findings_within_the_c
         assert len(text) <= _dispatch.MAX_CONTEXT_CHARS, len(text)
         assert "PRIOR REVIEW" in text and _MARK in text and "scripts/x.py:1 — xxx" in text, text[-3000:]
         assert text.count("scripts/x.py:") == work.PRIOR_FINDINGS_QUOTED, "capped at the quoted findings"
+        assert "and 2 more blocking findings" in text, "the reviewer is told how many are not listed"
 
         # The first review of an item carries no such paragraph.
         fresh = _seed_verdict_item(conn, external_id="sig-ctx-first", investigate_job="inv-ctx-first")
