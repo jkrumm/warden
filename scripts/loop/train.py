@@ -285,8 +285,9 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     if prior is not None:
         extras.append(_decide_review_paragraph(prior))
     reviewed, sha = item["reviewed_sha"], item["train_sha"]
-    # Not after a confirmation: a review that confirmed this PR settled those findings.
-    prior_findings = [] if item["reviewed_sha"] else work.prior_blocking_findings(conn, item)
+    # Not after a confirmation: a review that confirmed this attempt settled those findings. Every new
+    # attempt enters the train with `reviewed_sha` cleared (TRAIN_START), so a set one is this attempt's.
+    prior_findings = [] if reviewed else work.prior_blocking_findings(conn, item)
     if prior_findings:
         extras.append(work.prior_findings_paragraph(prior_findings))
     if reviewed and reviewed != sha:
@@ -546,12 +547,14 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         # item leaves `merging` below, and a revision that comes back `no_changes` needs it to tell
         # whether the pull request moved under the review (a fix that landed after the block) or is
         # frozen at the refused head (poll_implement_jobs()).
-        # Only a round that made no progress counts against the cap (work.round_stalled()); a block
+        # A round counts against the cap when it made no progress (work.round_stalled()): a block
         # whose findings are all new means the previous ones were fixed, and the chain is converging.
-        stalled_now = core.is_revert(item) or work.round_stalled(conn, item, code_blocking)
-        stalled = item["stalled_rounds"] + (1 if stalled_now else 0)
+        # A revert always counts — nothing in a revert round shows a fix converging.
+        revert = core.is_revert(item)
+        round_counted = revert or work.round_stalled(conn, item, code_blocking)
+        stalled = item["stalled_rounds"] + (1 if round_counted else 0)
         revise = work.revisable(item, stalled)
-        if not revise and stalled_now and stalled >= core.MAX_IMPLEMENT_ATTEMPTS and not core.is_revert(item):
+        if not revise and round_counted and stalled >= core.MAX_IMPLEMENT_ATTEMPTS and not revert:
             note = (f"stalled: {stalled} revisions did not resolve the previous review's findings — "
                     f"no revision left; {note}")
         core.set_state(conn, event_id, core.STATE_WORKING if revise else core.STATE_FAILED, now, strikes=0,
