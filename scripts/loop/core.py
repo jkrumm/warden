@@ -217,12 +217,16 @@ DEFAULT_QUIET_RESOLVE_HOURS = 2.0
 DEFAULT_CHRONIC_RECURRENCES = 3
 DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 
-# Implement attempts per item: the first, plus up to two revisions or re-dispatches (a blocked
-# review, failed checks, a base that moved; see maybe_revise_blocked()). The second revision is the
-# one escalation (ESCALATION_ATTEMPT); a third blocked review ends the item for the owner instead
-# of burning a fourth attempt on text no episode converges on (weatherorb #57, #58).
-# `triage_items.revision_count` counts the attempts after the first. An attempt count per item,
-# never a turn or time limit on the episode itself.
+# Stalled rounds an item may spend (the first attempt included) before it ends for the owner. A
+# round is a blocked review, failed checks or a base that moved (see maybe_revise_blocked()); it is stalled when the review still blocks on a finding of the round before (the reviewer marks it,
+# work.UNRESOLVED_PRIOR_MARKER), when there is no earlier round to compare, or when it is not a
+# review at all (red checks, a conflict, a revert). A blocked review whose findings are all NEW
+# (the previous round's narrow fix had a consequence) is converging and costs nothing against this
+# cap: the third stalled round ends the item for the owner instead of burning attempts on text no
+# episode converges on (weatherorb #57, #58), while a chain that keeps resolving its findings keeps
+# revising (items 1010, 1506, 1509, 1511, 1513 were cut off while converging).
+# `triage_items.stalled_rounds` counts them; `revision_count` is only the attempt ordinal (model
+# escalation, rewind). An attempt count per item, never a turn or time limit on the episode itself.
 MAX_IMPLEMENT_ATTEMPTS = 3
 
 # Attempt N >= this one runs on agent-gateway's escalation implement model (GET /api/routing), when
@@ -636,7 +640,7 @@ _SET_STATE_COLUMNS = (
     "note", "dispatch_job", "card_channel", "card_ts", "card_hash", "artifact_url",
     "pr_url", "implement_job", "validation_job", "deploy_expect_json",
     "verify_started_at", "verify_mark", "verify_failures", "verify_result",
-    "revert_pr", "close_reason", "strikes", "retry_at", "revision_count",
+    "revert_pr", "close_reason", "strikes", "retry_at", "revision_count", "stalled_rounds",
     "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
     "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
     "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json", "blocked_sha",
@@ -979,7 +983,7 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
         note = _items.append_to_note(note, f"superseded PR {old_pr}")
     rowcount = set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state, note=note,
                          dispatch_job=None, implement_job=None, validation_job=None,
-                         pr_url=None, reviewed_sha=None, blocked_sha=None, revision_count=0)
+                         pr_url=None, reviewed_sha=None, blocked_sha=None, revision_count=0, stalled_rounds=0)
     return rowcount, (old_pr if rowcount else None)
 
 

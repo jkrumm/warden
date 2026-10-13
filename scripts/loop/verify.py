@@ -734,7 +734,9 @@ def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
         verify_note = "make verify passed"
 
     record = _revert_record(item)
-    if not work.revisions_left(item):
+    # A revert is an attempt that did not land: it counts as a stalled round.
+    stalled = item["stalled_rounds"] + 1
+    if not work.revisions_left(item, stalled):
         core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
                         expect_eq={"reverting_sha": sha}, reverting_sha=None, verify_failures=0, verify_result=verify_note,
                         failure_class=core.FAILURE_WORK,
@@ -745,6 +747,6 @@ def _verify_revert(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
     attempt = item["revision_count"] + 2
     core.set_state(conn, event_id, core.STATE_WORKING, now, expect_state=core.STATE_VERIFYING, expect_eq={"reverting_sha": sha},
                     note=f"reverted {sha[:12]} ({verify_note}); attempt {attempt}/{core.MAX_IMPLEMENT_ATTEMPTS} next",
-                    reverting_sha=None, revision_count=item["revision_count"] + 1, implement_job=None,
+                    reverting_sha=None, revision_count=item["revision_count"] + 1, stalled_rounds=stalled, implement_job=None,
                     validation_job=None, pr_url=None, reviewed_sha=None, blocked_sha=None, strikes=0, retry_at=None, **core.VERIFY_RESET)
     conn.commit()

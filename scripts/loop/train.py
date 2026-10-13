@@ -282,6 +282,9 @@ def _review_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     if prior is not None:
         extras.append(_decide_review_paragraph(prior))
     reviewed, sha = item["reviewed_sha"], item["train_sha"]
+    prior_findings = work.prior_blocking_findings(conn, item)
+    if prior_findings:
+        extras.append(work.prior_findings_paragraph(prior_findings))
     if reviewed and reviewed != sha:
         extras.append(f"A review already confirmed this pull request at {reviewed}; the branch was since rebased "
                       f"onto a newer base and is now {sha}. Focus on what changed since that review.")
@@ -539,8 +542,16 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         # item leaves `merging` below, and a revision that comes back `no_changes` needs it to tell
         # whether the pull request moved under the review (a fix that landed after the block) or is
         # frozen at the refused head (poll_implement_jobs()).
-        core.set_state(conn, event_id, core.STATE_WORKING if work.revisable(item) else core.STATE_FAILED, now, strikes=0,
-                        failure_class=core.FAILURE_WORK, note=note, blocked_sha=sha)
+        # Only a round that made no progress counts against the cap (work.round_stalled()); a block
+        # whose findings are all new means the previous ones were fixed, and the chain is converging.
+        stalled_now = work.round_stalled(conn, item, code_blocking)
+        stalled = item["stalled_rounds"] + (1 if stalled_now else 0)
+        revise = work.revisable(item, stalled)
+        if not revise and stalled_now and not core.is_revert(item):
+            note = (f"stalled: {stalled} revisions did not resolve the previous review's findings — "
+                    f"no revision left; {note}")
+        core.set_state(conn, event_id, core.STATE_WORKING if revise else core.STATE_FAILED, now, strikes=0,
+                        failure_class=core.FAILURE_WORK, note=note, blocked_sha=sha, stalled_rounds=stalled)
     conn.commit()
     _release_review_claim(conn, event_id, claim_until)
     return False
