@@ -10169,7 +10169,7 @@ column), which differs from the brief's assumption and is unchanged. The `MAX_IM
 `core.py` is rewritten. The failed note leads with `stalled: N revisions did not resolve the previous review's
 findings`.
 
-`test_triage.py` 555 -> 562 (converging chain of 6 blocked rounds keeps revising and stays selectable; marker
+`test_triage.py` 555 -> 563 (converging chain of 6 blocked rounds keeps revising and stays selectable; marker
 rounds count, case-insensitive; a mid-message marker does not; first review counts; all-stalled still stops at
 3; the context quotes prior findings within the cap; reinvestigate resets) and the seeds that built the cap
 through `revision_count` now set `stalled_rounds` too; `test_ledger.py` 42 -> 43. `make check` green.

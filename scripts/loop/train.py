@@ -547,7 +547,7 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         stalled_now = work.round_stalled(conn, item, code_blocking)
         stalled = item["stalled_rounds"] + (1 if stalled_now else 0)
         revise = work.revisable(item, stalled)
-        if not revise and stalled_now and not core.is_revert(item):
+        if not revise and stalled >= core.MAX_IMPLEMENT_ATTEMPTS and not core.is_revert(item):
             note = (f"stalled: {stalled} revisions did not resolve the previous review's findings — "
                     f"no revision left; {note}")
         core.set_state(conn, event_id, core.STATE_WORKING if revise else core.STATE_FAILED, now, strikes=0,
