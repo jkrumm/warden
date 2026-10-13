@@ -10175,3 +10175,25 @@ rounds count, case-insensitive; a mid-message marker does not; first review coun
 through `revision_count` now set `stalled_rounds` too; `test_ledger.py` 42 -> 43. `make check` green.
 Behaviour not measured: whether the reviewer reliably applies the marker. `dotfiles/docs/agent-platform.md`
 might want a line that the revision cap counts stalled rounds.
+
+## 151. The alert brief says the live host is reachable read-only (2026-10-13)
+
+Item 121 (homelab CPU above threshold) paged the owner with `[blocker] inspect the host or dismiss?` — not a
+decision. The brief warden builds for an alert cluster (`work._build_cluster_brief()`) named the signatures,
+the chronic and prior-resolution context and the escalation sentence, and stopped there; an episode whose
+answer was the host's own load and container memory read the checkout, found nothing, and answered
+`nextAction=human` with `escalationCategory=blocker`. `blocker` is a reported obstacle (`work.ESCALATION_CATEGORIES`:
+an injection attempt, an unreadable repo), and "needs live inspection" is not one: the episode keeps `Bash`
+(DESIGN.md § Boundaries) and the repo contract gives its `AGENTS.md` the read-only commands.
+
+`work.LIVE_STATE_INSTRUCTION` is the alert brief's last closing line: read the live state READ-ONLY (the
+repo's own `AGENTS.md` commands, `make logs`/`status`, monitor history), never mutate anything to investigate,
+and treat "needs to look at the host" as the finding it is rather than a blocker — a blocker must name the
+command run and the error returned. The other brief builders are unchanged: `_origin_item_brief()` carries the
+human's or the issue's own text, and the re-driven `_decide_brief_paragraph()` already reads `blocker` as "a
+blocker you cannot get past, such as an unreadable repo". Placement follows the existing closing lines, so
+`_cap_brief()`'s tail truncation behaves exactly as before (a brief already over `MAX_BRIEF_CHARS` loses the
+tail it already lost).
+
+`test_triage.py` 564 -> 565 (the alert brief carries the instruction verbatim and "NOT a blocker"); `make
+check` green.
