@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§154 — a reopened item starts a fresh attempt sequence) |
+| Last updated | 2026-10-14 (§155 — a reopen's cleared PR is closed and noted, not orphaned) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 19 |
@@ -54,7 +54,9 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   already exists") and `dispatch_job` (the escalation cooldown anchor), and clearing every implement
   handle the closed attempt left — `implement_job`, `validation_job`, `pr_url`, `reviewed_sha`,
   `blocked_sha`, `revision_count`, `stalled_rounds` — exactly as reinvestigate does, so the new
-  occurrence starts a fresh investigation instead of resuming the old attempt (item 543).
+  occurrence starts a fresh investigation instead of resuming the old attempt (item 543). The PR the
+  cleared `pr_url` named is closed best-effort (after the commit) and its URL kept in the note as
+  `superseded PR <url>`, as reinvestigate does, so it is never orphaned beside the fresh run's own.
 - **Adopt** (`warden adopt <event-id> --pr <n>` / Argo's Adopt action) points an item at a pull
   request warden itself opened for it — a `dispatches` row, still open and unmerged — restores its
   `implement_job`/`pr_url` and puts it back on its repo's merge train, which re-reviews the current

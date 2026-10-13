@@ -957,6 +957,17 @@ def close_reinvestigated_pr(old_pr: str | None) -> None:
                                      "this pull request is closed rather than reused.")
 
 
+def close_reopened_pr(old_pr: str | None) -> None:
+    """Close the pull request a recurrence's reopen cleared, with the standard pointer. Same
+    contract as close_reinvestigated_pr(): the caller runs it AFTER its own `conn.commit()` (the
+    transition's write lock must not be held across a network call) and `None` closes nothing. A
+    separate wrapper, not a reuse, because close_reinvestigated_pr()'s comment says the OWNER asked
+    for the fresh investigation — not true of a signature that recurred on its own."""
+    if old_pr:
+        close_pr_best_effort(old_pr, "Superseded: this signature recurred, so a fresh investigation "
+                                     "supersedes this pull request rather than reusing it.")
+
+
 def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
                   expect_state: str, note: str) -> tuple[int, str | None]:
     """Send an item back to `triaged`, whose pollers (escalate()/escalate_origin_items()) open the

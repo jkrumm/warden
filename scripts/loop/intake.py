@@ -14,6 +14,7 @@ from typing import Any
 from clients import github as _github
 from clients.errors import RemoteError
 from lifecycle import intake as _intake
+from lifecycle import items as _items
 from loop import core, triaging
 
 
@@ -239,8 +240,11 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
     cleared, exactly as reinvestigate() clears them: a stale `implement_job` would be re-polled and
     `revision_count`/`pr_url` would route the new occurrence's `no_changes` to `needs_decision` — a
     page with no question — instead of the fresh investigation a recurrence must get (item 543).
-    `dispatch_job` stays as the escalation cooldown anchor (cooldown_ok()), which also makes the
-    reopened item escalate as a singleton (escalate()).
+    The cleared `pr_url` names a pull request that is CLOSED best-effort after the commit and kept in
+    the note as `superseded PR <url>`, exactly as reinvestigate() does: leaving it open would make
+    the fresh run's own PR a second one beside it, and a stale URL would mis-route a later
+    `work`-failure back to `merging` (item 1480). `dispatch_job` stays as the escalation cooldown
+    anchor (cooldown_ok()), which also makes the reopened item escalate as a singleton (escalate()).
 
     The predicate is "the event's occurrence_mark() changed since this row's last transition", NOT
     `events.resolved_at IS NULL`: for a GROUPED source (slack_alert, hermes_log) resolved_at stays
@@ -274,11 +278,13 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
     cooldown = dt.timedelta(hours=(policy or {}).get("cooldownHours") or core.DEFAULT_COOLDOWN_HOURS)
     rows = conn.execute(
         "SELECT ti.event_id AS event_id, ti.occurrence_mark AS stored_mark, ti.state AS item_state, "
-        "ti.close_reason AS close_reason, ti.duplicate_of AS duplicate_of, ti.triage_job AS triage_job, e.* "
+        "ti.close_reason AS close_reason, ti.duplicate_of AS duplicate_of, ti.triage_job AS triage_job, "
+        "ti.pr_url AS pr_url, ti.note AS note, e.* "
         "FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         "WHERE ti.state IN (?, ?, ?)",
         (core.STATE_FIXED, core.STATE_QUIET, core.STATE_CLOSED),
     ).fetchall()
+    superseded_prs: list[str] = []
     for row in rows:
         stored_mark = row["stored_mark"]
         current_mark = core.occurrence_mark(row)
@@ -300,10 +306,20 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
                 conn.execute("UPDATE triage_items SET occurrence_mark=? WHERE event_id=?",
                              (current_mark, row["event_id"]))
                 continue
-            core.set_state(conn, row["event_id"], core.STATE_NEW, now,
-                           implement_job=None, validation_job=None, pr_url=None, reviewed_sha=None,
-                           blocked_sha=None, revision_count=0, stalled_rounds=0)
+            old_pr = row["pr_url"]
+            columns: dict[str, Any] = {
+                "implement_job": None, "validation_job": None, "pr_url": None, "reviewed_sha": None,
+                "blocked_sha": None, "revision_count": 0, "stalled_rounds": 0,
+            }
+            if old_pr:
+                # Keep the URL in the note and CLOSE the PR after the commit (never holding the write
+                # lock across the network call), exactly as reinvestigate() does.
+                columns["note"] = _items.append_to_note(row["note"], f"superseded PR {old_pr}")
+                superseded_prs.append(old_pr)
+            core.set_state(conn, row["event_id"], core.STATE_NEW, now, **columns)
     conn.commit()
+    for old_pr in superseded_prs:
+        core.close_reopened_pr(old_pr)
 
 
 def _ignored_for(conn: sqlite3.Connection, event_id: int, now: dt.datetime) -> dt.timedelta:

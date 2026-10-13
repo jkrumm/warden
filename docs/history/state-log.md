@@ -10258,3 +10258,21 @@ back to `merging` (`set_state()`'s recipe).
 
 `test_triage.py` 569 -> 570 (a reopened item clears the stale attempt handles, keeps `dispatch_job` and
 `artifact_url`). `make check` green.
+
+## 155. A reopen's cleared PR is closed and noted, not orphaned (2026-10-14)
+
+Review of §154. Clearing `pr_url` on the reopen without closing the pull request it named disconnects an
+open, unmerged PR from the ledger forever: `artifact_url` still carries the URL for brief text, but
+`poll_implement_jobs()`'s supersede check (work.py, `if item["pr_url"] and item["pr_url"] != artifact_url`)
+is keyed on `triage_items.pr_url`, now NULL, so it never fires. That is the exact hazard `core.reinvestigate()`
+already documents (item 1480) and guards against: it captures the old URL, closes it, and appends
+`superseded PR <url>` to the note.
+
+`reopen_if_needed()` now does the same: it reads `pr_url`/`note` in its row query, appends `superseded PR
+<url>` to the note, commits, and only then closes the PR best-effort through the new `core.close_reopened_pr()`
+— a separate wrapper from `close_reinvestigated_pr()` only because that one's GitHub comment says the OWNER
+asked for a fresh investigation, which is not true of a recurrence. The write lock is never held across the
+network call.
+
+`test_triage.py` stays 570/570: the §154 regression test now also asserts the note carries `superseded PR
+<url>` and that the fake GitHub boundary saw the PR closed. `make check` green.

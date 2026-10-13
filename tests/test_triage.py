@@ -7925,7 +7925,9 @@ def test_a_reopened_item_starts_a_fresh_attempt_sequence():
     resumed the old attempt — the stale `implement_job` was re-polled and, with `revision_count>0`,
     its `no_changes` verdict paged the owner instead of the fresh investigation a recurrence must
     get. reopen_if_needed() now clears the same set core.reinvestigate() does; `dispatch_job` stays
-    as the escalation/cooldown anchor and `artifact_url` as the brief's "a PR already exists"."""
+    as the escalation/cooldown anchor and `artifact_url` as the brief's "a PR already exists". The
+    cleared PR is CLOSED best-effort, not silently orphaned (its URL kept in the note), so a stale
+    open PR cannot sit beside the fresh run's own."""
     pr = "https://github.com/jkrumm/demo-repo/pull/9"
     with _triage_env() as (conn, ctx):
         eid = _insert_event(conn, source="slack_alert", external_id="stale-reopen", title="Stale",
@@ -7945,6 +7947,10 @@ def test_a_reopened_item_starts_a_fresh_attempt_sequence():
         assert item["revision_count"] == 0 and item["stalled_rounds"] == 0, dict(item)
         assert item["dispatch_job"] == "investigate-old", "kept as the escalation cooldown anchor"
         assert item["artifact_url"] == pr, "the brief still names the existing PR"
+        assert item["note"] == f"superseded PR {pr}", "the cleared PR is kept in the note"
+        closed = CLOSED_PRS[-1]
+        assert closed[:3] == ("jkrumm", "demo-repo", 9), "the cleared PR is closed, not orphaned"
+        assert "recurred" in (closed[3] or ""), "the close comment names the recurrence"
 
 
 def test_the_shipped_policy_keeps_the_label_rules_without_evidence():
