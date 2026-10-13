@@ -6,8 +6,9 @@
 # main db and its -wal can be captured at different instants, and the result restores
 # as either stale or corrupt with nothing announcing which. `VACUUM INTO` takes a
 # transactionally consistent copy through SQLite itself, so what ships is restorable.
-# The live file rides along too — it costs nothing and a torn copy is still better
-# than no copy if the snapshot step is what failed.
+# Only the ledger snapshot ships (plus the repo bundle): the live `warden.db` and its -wal/-shm are excluded, so no
+# torn copy can reach the destination. If the snapshot step fails the run exits
+# non-zero and withholds the heartbeat; the destination keeps the previous snapshots.
 #
 # WHERE IT ENDS UP. homelab:/mnt/hdd/backups/warden/. That whole /mnt/hdd/backups
 # directory is already mounted read-only into the restic container (homelab's
@@ -21,10 +22,10 @@ set -u
 
 REPO="${WARDEN_REPO:-${0:A:h:h}}"   # this script lives in <repo>/scripts/
 PY="$REPO/.venv/bin/python3"
-SRC_DIR="$HOME/.warden"
+SRC_DIR="${WARDEN_BACKUP_SRC_DIR:-$HOME/.warden}"
 DB="$SRC_DIR/warden.db"
 SNAP_DIR="$SRC_DIR/backups"
-DEST="homelab:/mnt/hdd/backups/warden/"
+DEST="${WARDEN_BACKUP_DEST:-homelab:/mnt/hdd/backups/warden/}"
 KEEP=7
 
 SECRETS_RUN="$HOME/.local/bin/secrets-run"
@@ -73,16 +74,21 @@ printf '%s' "$$" >"$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 # --- snapshot ---------------------------------------------------------------------
-# A failed snapshot does NOT abort the run: shipping the live file is still worth more
-# than shipping nothing, and the missing snapshot is visible in the destination.
+# A failed snapshot does not skip the bundle or the shipping step, but it does set a
+# non-zero exit and withhold the heartbeat.
 SNAP_RC=0
 if [[ -f "$DB" ]]; then
   mkdir -p "$SNAP_DIR"
+  # A snapshot is built under a `.partial` name and renamed only once complete, so a
+  # run killed mid-VACUUM can never leave a half-written `warden-*.db` to be shipped.
+  rm -f "$SNAP_DIR"/*.partial(N) "$SNAP_DIR"/*.tmp(N)
   STAMP=$(date -u +%Y%m%dT%H%M%SZ)
   OUT="$SNAP_DIR/warden-$STAMP.db"
-  # VACUUM INTO refuses to overwrite, so a colliding name is an error, not a silent
-  # clobber. The quoting is safe by construction: $OUT is built from a fixed directory
-  # and a date -u format string, neither of which can contain a quote.
+  PARTIAL="$OUT.partial"
+  # VACUUM INTO refuses to overwrite $PARTIAL, and the rename is guarded by
+  # `[[ ! -e $OUT ]]`, so a colliding name is an error, not a silent clobber. The
+  # quoting holds because $OUT is built from SRC_DIR (never user input) and
+  # a date -u format string, neither of which carries a quote.
   # Through warden's own venv and scripts/ledger.py, NOT the `sqlite3` CLI. Measured
   # 2026-09-09: macOS ships /usr/bin/sqlite3 3.51 with no `-uri` flag, so
   # `sqlite3 "file:$DB?mode=ro" ...` opens that whole URI as a LITERAL FILENAME and
@@ -97,13 +103,13 @@ spec = importlib.util.spec_from_file_location('ledger', '$REPO/scripts/ledger.py
 led = importlib.util.module_from_spec(spec); spec.loader.exec_module(led)
 import sqlite3
 conn = sqlite3.connect('file:$DB?mode=ro', uri=True)
-led.snapshot(conn, '$OUT')
+led.snapshot(conn, '$PARTIAL')
 conn.close()
-"; then
+" && [[ ! -e "$OUT" ]] && mv "$PARTIAL" "$OUT"; then
     echo "snapshot $OUT ($(du -h "$OUT" | cut -f1))"
   else
-    echo "snapshot FAILED for $DB — shipping the live file only" >&2
-    rm -f "$OUT"
+    echo "snapshot FAILED for $DB — nothing new to ship" >&2
+    rm -f "$PARTIAL"
     SNAP_RC=1
   fi
   # Rotate: keep the newest $KEEP. restic holds the long tail, so this is only about
@@ -162,10 +168,27 @@ PUSH_URL=""
 [[ -x "$SECRETS_RUN" ]] && PUSH_URL=$(timeout 10 "$SECRETS_RUN" read "$PUSH_REF" 2>/dev/null)
 [[ -z "$PUSH_URL" && -r "$PUSH_FILE" ]] && PUSH_URL=$(<"$PUSH_FILE")
 
-/usr/bin/rsync -az --delete \
+# The live `warden.db` and its -wal/-shm are excluded: the loop writes them while rsync
+# walks the directory, so a copy is torn at best and the -wal can vanish mid-run (exit 23,
+# 2026-10-11). The snapshot is the backup. `--delete-excluded` removes whatever an earlier
+# run already shipped under those names — plain `--delete` never touches a receiver file
+# an `--exclude` matches — so a stale `warden.db` + `-wal` pair cannot linger beside the
+# snapshots. Every excluded pattern is transient or live local state that must not exist
+# on the backup. `*.partial` / `*.tmp` are a snapshot / bundle still being written.
+#
+# After a failed snapshot the sync is additive only: `--delete` would let an empty or
+# recreated source `backups/` wipe every snapshot already on the destination, which is
+# exactly what must survive a failed run. Stale receiver files go on the next good run.
+DELETE_FLAGS=(--delete --delete-excluded)
+(( SNAP_RC != 0 || BUNDLE_RC != 0 )) && DELETE_FLAGS=()
+"${WARDEN_BACKUP_RSYNC:-/usr/bin/rsync}" -az "${DELETE_FLAGS[@]}" \
+  --exclude='/warden.db' \
   --exclude='*.lock' \
   --exclude='*.pid' \
   --exclude='*-shm' \
+  --exclude='*-wal' \
+  --exclude='*.partial' \
+  --exclude='*.tmp' \
   "$SRC_DIR/" "$DEST"
 
 RC=$?
@@ -181,4 +204,7 @@ if [[ $RC -eq 0 && $SNAP_RC -eq 0 && $BUNDLE_RC -eq 0 && -n "${PUSH_URL:-}" ]]; 
   /usr/bin/curl -fsS --max-time 10 "$PUSH_URL" >/dev/null
 fi
 
-exit $RC
+# A missing snapshot or bundle is a failed backup, whatever rsync said about the rest.
+(( RC != 0 )) && exit $RC
+(( SNAP_RC != 0 || BUNDLE_RC != 0 )) && exit 1
+exit 0

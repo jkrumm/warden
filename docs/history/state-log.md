@@ -10123,3 +10123,22 @@ the move still routes to `needs_decision`. `TRAIN_START`, the redriven-train sta
 clear `blocked_sha`, so a stale head never steers it. `test_ledger.py` 41 → 42, `test_triage.py` 549 → 555,
 `make check` green. Not covered by an end-to-end test: the rejoin is unit-tested through `poll_implement_jobs()`
 and `advance_merge_trains()`, not against a live pull request.
+
+## 149. The ledger backup ships only the VACUUM INTO snapshot (2026-10-13)
+
+Item 1010: `warden-backup.sh` exited 23 when the loop checkpointed and unlinked `warden.db-wal` between rsync's
+directory walk and its open, withholding the heartbeat. Three review rounds on the unattended fix each found a
+consequence of the last narrow patch: `--delete` leaves an excluded receiver file in place (needs
+`--delete-excluded`); excluding `*-wal` strips the WAL from the live `warden.db` fallback copy; a
+`wal_checkpoint(TRUNCATE)` before shipping reports a busy checkpoint as a successful statement.
+
+All three come from shipping the live file at all. The `VACUUM INTO` snapshot is self-contained (it folds the WAL
+in), so the live `warden.db`, `-wal` and `-shm` are now excluded from the rsync and the fallback copy and the
+checkpoint are gone. `--delete-excluded` removes the pair an earlier run shipped. The snapshot is written as
+`*.partial` and renamed on success (a killed run cannot ship a half-written `warden-*.db`; `*.partial` is
+excluded). A failed snapshot, or a missing ledger, now exits non-zero as well as withholding the heartbeat; the
+destination keeps the previous snapshots. The script's source dir, destination and rsync binary are
+overridable via `WARDEN_BACKUP_SRC_DIR`/`_DEST`/`_RSYNC`. New `tests/test_backup_sh.py` (5) runs the script against
+a throwaway WAL-mode ledger with WAL-only rows and a local destination: only a consistent snapshot ships, stale
+receiver live files are removed, a corrupt or missing ledger exits non-zero, and after a failed snapshot the sync is additive only (no `--delete`, so a recreated empty `backups/` cannot wipe the destination's snapshots). A failed repo bundle now fails the run too, and `*.tmp` (the bundle in flight) is excluded. `test_triage.py` unchanged
+at 555, `make check` green.
