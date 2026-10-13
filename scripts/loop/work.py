@@ -2717,8 +2717,8 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> list
     record (the previous round), or [] when there is none."""
     current = conn.execute("SELECT id, artifact_url FROM dispatches WHERE job_id=?",
                            (item["implement_job"],)).fetchone()
-    if current is None:
-        return []
+    if current is None or not current["artifact_url"]:
+        return []   # a pull request nobody can name has no prior round to compare with
     # Rows of an earlier cycle (before a reinvestigate) are not this chain: the chain starts at the
     # investigation on record, and a round on another pull request (an adopted one, a conflict's
     # replacement) is no prior round of this one.
@@ -2727,9 +2727,8 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> list
     blocked = conn.execute(
         "SELECT validation_job_id FROM dispatches WHERE origin_event_id=? AND tier='implement' AND id < ? AND id > ? "
         "AND validation_status='blocked' AND validation_job_id IS NOT NULL "
-        "AND (artifact_url IS NULL OR ? IS NULL OR artifact_url = ?) ORDER BY id DESC LIMIT 1",
-        (item["event_id"], current["id"], floor["id"] if floor else 0,
-         current["artifact_url"], current["artifact_url"])).fetchone()
+        "AND artifact_url = ? ORDER BY id DESC LIMIT 1",
+        (item["event_id"], current["id"], floor["id"] if floor else 0, current["artifact_url"])).fetchone()
     if blocked is None:
         return []
     rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
