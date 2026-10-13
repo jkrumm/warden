@@ -3402,8 +3402,8 @@ def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_no
 
         # Revisions exhausted -> failed, carrying the finding.
         eid2 = _seed_implementing_item(conn, external_id="sig-outcome-checks-failed-2", job_id="impl-checks-failed-2")
-        conn.execute("UPDATE triage_items SET revision_count=? WHERE event_id=?",
-                     (core.MAX_IMPLEMENT_ATTEMPTS - 1, eid2))
+        conn.execute("UPDATE triage_items SET revision_count=?, stalled_rounds=? WHERE event_id=?",
+                     (core.MAX_IMPLEMENT_ATTEMPTS - 1, core.MAX_IMPLEMENT_ATTEMPTS - 1, eid2))
         conn.commit()
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
         item2 = core.get_item(conn, eid2)
@@ -3846,10 +3846,10 @@ def test_blocking_validation_blocks_the_merge_and_sends_the_findings_back_for_a_
         with _triage_env() as (conn, ctx):
             eid = _seed_verdict_item(conn, external_id="sig-val-disagree")
             conn.execute(
-                "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=?, revision_count=? "
+                "UPDATE triage_items SET train_stage='review', train_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', state=?, implement_job=?, validation_job=?, pr_url=?, revision_count=?, stalled_rounds=? "
                 "WHERE event_id=?",
                 (core.STATE_MERGING, "implement-job-004", "validation-job-004",
-                 "https://github.com/jkrumm/demo-repo/pull/10", revision_count, eid),
+                 "https://github.com/jkrumm/demo-repo/pull/10", revision_count, revision_count, eid),
             )
             conn.commit()
             _seed_implement_dispatch(conn, "implement-job-004")
@@ -9480,13 +9480,15 @@ def test_quiet_anchor_takes_the_latest_iso_clock():
 # --- revision of a blocked implementation (§92) -------------------------------
 
 def _seed_blocked_item(conn, *, external_id: str, blocking: list[dict[str, Any]] | None = None,
-                       revision_count: int = 0) -> int:
+                       revision_count: int = 0, stalled_rounds: int | None = None) -> int:
+    """`stalled_rounds` defaults to `revision_count`: a chain of revisions that each stalled."""
     eid = _seed_verdict_item(conn, external_id=external_id, investigate_job=f"inv-{external_id}")
     conn.execute(
-        "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=?, revision_count=? "
-        "WHERE event_id=?",
+        "UPDATE triage_items SET state=?, implement_job=?, validation_job=?, pr_url=?, revision_count=?, "
+        "stalled_rounds=? WHERE event_id=?",
         (core.STATE_WORKING, f"impl-{external_id}", f"val-{external_id}",
-         "https://github.com/jkrumm/demo-repo/pull/7", revision_count, eid),
+         "https://github.com/jkrumm/demo-repo/pull/7", revision_count,
+         revision_count if stalled_rounds is None else stalled_rounds, eid),
     )
     _seed_implement_dispatch(conn, f"impl-{external_id}")
     conn.execute("UPDATE dispatches SET validation_status='blocked', verdict_json=? WHERE job_id=?",
@@ -9527,8 +9529,8 @@ def test_blocked_implementation_goes_back_to_the_implementer_with_findings():
 
 def test_revision_stops_at_the_attempt_cap():
     with _triage_env() as (conn, ctx):
-        eid = _seed_blocked_item(conn, external_id="sig-capped",
-                                 revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1)
+        eid = _seed_blocked_item(conn, external_id="sig-capped", revision_count=core.MAX_IMPLEMENT_ATTEMPTS - 1,
+                                 stalled_rounds=core.MAX_IMPLEMENT_ATTEMPTS)
         calls: list[dict[str, Any]] = []
         _agent_gateway.submit = _fake_submit(calls)
         work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
@@ -9648,7 +9650,8 @@ def test_argo_implement_refused_by_agent_gateway_ends_the_item_and_reports_faile
 
 def _outcome_item_with_pr(conn, *, external_id: str, job_id: str, pr: str | None, revision_count: int = 0) -> int:
     eid = _seed_implementing_item(conn, external_id=external_id, job_id=job_id)
-    conn.execute("UPDATE triage_items SET pr_url=?, revision_count=? WHERE event_id=?", (pr, revision_count, eid))
+    conn.execute("UPDATE triage_items SET pr_url=?, revision_count=?, stalled_rounds=? WHERE event_id=?",
+                 (pr, revision_count, revision_count, eid))
     conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id=?", (eid, job_id))
     conn.commit()
     return eid
@@ -11462,8 +11465,8 @@ def _train_item(conn, ext: str, *, stage: str = "update", sha: str | None = None
         (impl, "implement", repo, "b", "done",
          json.dumps(_dispatch_result("pr_opened", artifact_url=_TRAIN_PR, branch="dispatch/demo-repo-10")),
          _TRAIN_PR, eid, NOW.isoformat()))
-    conn.execute("UPDATE triage_items SET state=?, implement_job=?, pr_url=?, revision_count=? WHERE event_id=?",
-                 (core.STATE_MERGING, impl, _TRAIN_PR, revision_count, eid))
+    conn.execute("UPDATE triage_items SET state=?, implement_job=?, pr_url=?, revision_count=?, stalled_rounds=? WHERE event_id=?",
+                 (core.STATE_MERGING, impl, _TRAIN_PR, revision_count, revision_count, eid))
     conn.commit()
     _on_train(conn, eid, stage, sha=sha, reviewed=reviewed, job=job)
     return eid
@@ -11943,7 +11946,7 @@ def _reverting(conn, ext: str, *, state: str, revision_count: int = 0, **columns
     """An item on its revert of MERGED_SHA, in `state`."""
     record = {"sha": MERGED_SHA, "pr": _FIX_PR, "title": "Loosen the watchdog threshold", "evidence": _EVIDENCE}
     return _seed_item(conn, external_id=ext, state=state, reverting_sha=MERGED_SHA, revert_json=json.dumps(record),
-                      revision_count=revision_count, max_tier="implement", **columns)
+                      revision_count=revision_count, stalled_rounds=revision_count, max_tier="implement", **columns)
 
 
 def test_a_verify_failure_reverts_the_merged_commit_through_an_implement_episode():
@@ -13006,6 +13009,125 @@ def test_herdr_agent_listing_finds_a_working_agent_inside_the_checkout_and_degra
     finally:
         _rollout.subprocess.run = real
         shutil.rmtree(root, ignore_errors=True)
+
+
+# --- converging revisions: only a round that made no progress counts against the cap ---------------
+
+_MARK = work.UNRESOLVED_PRIOR_MARKER
+
+
+def _blocked_review_round(conn, eid: int, n: int, blocking: list[dict[str, Any]]) -> sqlite3.Row:
+    """Round `n` of an item's revision chain: attempt `n`'s implement job is reviewed at the train's
+    review stage and the review BLOCKS with `blocking`. The earlier rounds' dispatch rows (and the
+    review verdicts the next round's context quotes) are the ones earlier calls left behind."""
+    impl, val = f"impl-chain-{eid}-{n}", f"val-chain-{eid}-{n}"
+    conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_event_id,validation_job_id) "
+                 "VALUES (?,?,?,?,?,?,?,?)", (impl, "implement", "demo-repo", "b", "done", NOW.isoformat(), eid, val))
+    conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,verdict_json) VALUES (?,?,?,?,?,?,?)",
+                 (val, "review", "demo-repo", "review", "done", NOW.isoformat(),
+                  json.dumps({"outcome": "actionable", "blocking": blocking})))
+    conn.execute("UPDATE triage_items SET state=?, train_stage='review', train_sha=?, implement_job=?, "
+                 "validation_job=?, pr_url=?, revision_count=? WHERE event_id=?",
+                 (core.STATE_MERGING, "a" * 40, impl, val, "https://github.com/jkrumm/demo-repo/pull/10", n - 1, eid))
+    conn.commit()
+    _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result("actionable", blocking=blocking)}
+    _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("a blocked review must not merge"))
+    train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+    return core.get_item(conn, eid)
+
+
+def _finding(message: str, line: int = 1) -> dict[str, Any]:
+    return {"file": "scripts/x.py", "line": line, "message": message, "angle": "senior-dev"}
+
+
+def test_a_converging_chain_of_blocked_rounds_keeps_revising_past_the_attempt_cap():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-converging")
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        rounds = core.MAX_IMPLEMENT_ATTEMPTS + 3
+        for n in range(1, rounds + 1):
+            item = _blocked_review_round(conn, eid, n, [_finding(f"consequence number {n} of the narrow fix", n)])
+            assert item["state"] == core.STATE_WORKING, (n, dict(item))
+            assert item["stalled_rounds"] == 1, "only the first review has no earlier round to compare with"
+            work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+            assert len(calls) == n, f"round {n}: the candidate query must still select the item"
+        assert core.get_item(conn, eid)["revision_count"] == rounds, "revision_count stays the attempt ordinal"
+
+
+def test_a_round_carrying_the_unresolved_marker_counts_and_the_cap_lands_failed_with_the_stalled_note():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-stalled")
+        item = _blocked_review_round(conn, eid, 1, [_finding("first problem")])
+        assert item["stalled_rounds"] == 1 and item["state"] == core.STATE_WORKING
+        item = _blocked_review_round(conn, eid, 2, [_finding("a new problem")])
+        assert item["stalled_rounds"] == 1 and item["state"] == core.STATE_WORKING, "converging: not counted"
+        # Case-insensitive, after leading whitespace, on any one of the blocking findings.
+        item = _blocked_review_round(conn, eid, 3, [_finding("a new problem"),
+                                                    _finding(f"  {_MARK.lower()} first problem still there", 2)])
+        assert item["stalled_rounds"] == 2 and item["state"] == core.STATE_WORKING, dict(item)
+        item = _blocked_review_round(conn, eid, 4, [_finding(f"{_MARK} first problem still there")])
+        assert item["stalled_rounds"] == core.MAX_IMPLEMENT_ATTEMPTS, dict(item)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_WORK, dict(item)
+        assert item["note"].startswith(f"stalled: {core.MAX_IMPLEMENT_ATTEMPTS} revisions did not resolve"), item["note"]
+        assert "first problem still there" in item["note"]
+
+
+def test_a_marker_in_the_middle_of_a_message_is_not_the_marker():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-midmarker")
+        _blocked_review_round(conn, eid, 1, [_finding("first problem")])
+        item = _blocked_review_round(conn, eid, 2, [_finding(f"new problem; not an {_MARK} one")])
+        assert item["stalled_rounds"] == 1, dict(item)
+
+
+def test_the_first_review_block_counts_as_stalled():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-first-block")
+        item = _blocked_review_round(conn, eid, 1, [_finding("a new problem")])
+        assert item["stalled_rounds"] == 1 and item["state"] == core.STATE_WORKING, dict(item)
+
+
+def test_all_stalled_rounds_still_stop_at_the_old_attempt_count():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-all-stalled")
+        states = [_blocked_review_round(conn, eid, n, [_finding(f"{_MARK} same problem")])["state"]
+                  for n in range(1, core.MAX_IMPLEMENT_ATTEMPTS + 1)]
+        assert states == [core.STATE_WORKING] * (core.MAX_IMPLEMENT_ATTEMPTS - 1) + [core.STATE_FAILED], states
+
+
+def test_the_review_context_of_a_revision_quotes_the_prior_findings_within_the_context_cap():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-ctx")
+        # Round 1 is the first review: nothing to quote yet.
+        _blocked_review_round(conn, eid, 1, [_finding("x" * 5000, n) for n in range(1, 9)])
+        conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?", ("b" * 30000, eid))
+        conn.commit()
+        # Round 2's implement job exists; its review context quotes round 1.
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,created_at,origin_event_id) "
+                     "VALUES (?,?,?,?,?,?,?)", ("impl-chain-ctx-2", "implement", "demo-repo", "b", "done",
+                                                NOW.isoformat(), eid))
+        conn.execute("UPDATE triage_items SET implement_job='impl-chain-ctx-2' WHERE event_id=?", (eid,))
+        conn.commit()
+        text = train._review_context(conn, core.get_item(conn, eid))
+        assert len(text) <= _dispatch.MAX_CONTEXT_CHARS, len(text)
+        assert "PRIOR REVIEW" in text and _MARK in text and "scripts/x.py:1 — xxx" in text, text[-3000:]
+        assert text.count("scripts/x.py:") == work.PRIOR_FINDINGS_QUOTED, "capped at the quoted findings"
+
+        # The first review of an item carries no such paragraph.
+        fresh = _seed_verdict_item(conn, external_id="sig-ctx-first", investigate_job="inv-ctx-first")
+        conn.execute("UPDATE triage_items SET implement_job='impl-ctx-first' WHERE event_id=?", (fresh,))
+        _seed_implement_dispatch(conn, "impl-ctx-first")
+        assert "PRIOR REVIEW" not in train._review_context(conn, core.get_item(conn, fresh))
+
+
+def test_a_reinvestigated_item_starts_with_a_fresh_stalled_count():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-reinv", revision_count=2, stalled_rounds=2)
+        core.reinvestigate(conn, eid, NOW, expect_state=core.STATE_WORKING, note="again")
+        item = core.get_item(conn, eid)
+        assert item["revision_count"] == 0 and item["stalled_rounds"] == 0, dict(item)
+
 
 if __name__ == "__main__":
     sys.exit(main())

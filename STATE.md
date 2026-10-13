@@ -2,21 +2,21 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§149).
+build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-13 (§149 — the ledger backup ships only the VACUUM INTO snapshot, fails non-zero without one) |
+| Last updated | 2026-10-13 (§150 — the revision cap counts only stalled rounds; a converging chain keeps revising) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 18 |
+| Ledger | `~/.warden/warden.db`, schema 19 |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
 
 ## What is live
 
 The whole loop in `DESIGN.md` § The loop runs: one intake pool → single-shot agent-gateway
 triage (`attach | new | fixed_by | ignore`) → investigate → implement at any
-confidence, revisions on the same PR up to 3 attempts → one merge train per repo
+confidence, revisions on the same PR (capped at 3 STALLED rounds, §150) → one merge train per repo
 (`update_pr` → checks → review → squash, all on one SHA) → `make deploy` / `make
 verify` + the item's own signal quiet → automatic revert on failure → fixed-by sweep
 after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a daily
@@ -81,6 +81,15 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `34fd019`, `b35b86e` landed after); an unchanged head, a missing `blocked_sha`, or an
   unreadable PR still goes to `needs_decision`. `TRAIN_START`, a redriven train and
   `core.reinvestigate()` all clear it.
+- **Converging revisions (§150).** The revision cap counts STALLED rounds (`stalled_rounds`, migration 19),
+  not attempts. A revision's review context quotes the previous round's blocking findings and asks the
+  reviewer to start any still-unresolved one with `UNRESOLVED PRIOR FINDING:`; a blocked round without it
+  is converging and uncapped, one with it (or a first review, red checks, a conflict, a revert) is stalled,
+  and the third stalled round lands `failed` with a `stalled: N revisions did not resolve …` note.
+  `revision_count` still means the attempt ordinal. `warden retry` keeps both counts (as it always kept
+  `revision_count`); reinvestigate and adopt reset both. Not live-validated: the reviewer following the
+  marker instruction is measured on the next converging chain — if it never marks, every chain is
+  "converging" and uncapped, if it marks everything the old cap returns.
 - **Prior resolution in the brief.** A reopened item's most recent SUBSTANTIVE close note and its
   date (`item_transitions`, terminal state; a later silence close or a blank row never shadows a
   real answer, and a pure-silence close on its own yields no `PRIOR RESOLUTION` line at all) ride

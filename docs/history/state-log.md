@@ -10142,3 +10142,36 @@ overridable via `WARDEN_BACKUP_SRC_DIR`/`_DEST`/`_RSYNC`. New `tests/test_backup
 a throwaway WAL-mode ledger with WAL-only rows and a local destination: only a consistent snapshot ships, stale
 receiver live files are removed, a corrupt or missing ledger exits non-zero, and after a failed snapshot the sync is additive only (no `--delete`, so a recreated empty `backups/` cannot wipe the destination's snapshots). A failed repo bundle now fails the run too, and `*.tmp` (the bundle in flight) is excluded. `test_triage.py` unchanged
 at 555, `make check` green.
+
+## 150. The revision cap counts stalled rounds, not attempts (2026-10-13)
+
+Items 1010, 1506, 1509, 1511, 1513 all landed `failed/work` at `MAX_IMPLEMENT_ATTEMPTS` while converging: each
+round's one or two blocking findings were new consequences of the previous round's narrow fix, every earlier
+finding was resolved, and the owner hand-finished them. Three attempts is a good cap for a chain that repeats
+itself and a wrong one for a chain that makes progress.
+
+New `triage_items.stalled_rounds` (migration 19, schema 19). `train._fold_review()` classifies a blocked review:
+STALLED when a code-blocking finding's message starts (after whitespace, case-insensitively) with
+`work.UNRESOLVED_PRIOR_MARKER` (`UNRESOLVED PRIOR FINDING:`), or when there is no earlier blocked round on the
+item's dispatches to compare with; otherwise converging. `train._review_context()` asks for the marker: a
+paragraph (`work.prior_findings_paragraph()`, at most 5 findings of 400 chars, so it fits
+`MAX_CONTEXT_CHARS` beside the base) quotes the previous blocked review's findings as data. The signal is text,
+as `_PROCESS_FINDING_CLOSING_RE` already classifies findings by message; agent-gateway's review schema is
+untouched. `revisions_left()`/`revisable()` and the candidate SQL of `maybe_revise_blocked()` now gate on
+`stalled_rounds < MAX_IMPLEMENT_ATTEMPTS` (the round on record included, so an all-stalled chain still stops
+after 3 attempts, as before). `hand_back_for_revision()` (red checks, conflict) and the after-revert path in
+`verify.py` always count their round as stalled: nothing there says a fix converges, and leaving them
+uncounted would have made them uncapped. `revision_count` is unchanged (attempt ordinal, model escalation,
+`_attempt_rewind_columns()`, the no_changes fold). The stalled count is written when a round is judged, never
+when a revision is claimed, so a lease-refusal rewind hands back nothing. `core.reinvestigate()` and
+`work.adopt_own_pr()` reset it with `revision_count`; `warden retry` resets neither (redrive keeps every
+column), which differs from the brief's assumption and is unchanged. The `MAX_IMPLEMENT_ATTEMPTS` comment in
+`core.py` is rewritten. The failed note leads with `stalled: N revisions did not resolve the previous review's
+findings`.
+
+`test_triage.py` 555 -> 562 (converging chain of 6 blocked rounds keeps revising and stays selectable; marker
+rounds count, case-insensitive; a mid-message marker does not; first review counts; all-stalled still stops at
+3; the context quotes prior findings within the cap; reinvestigate resets) and the seeds that built the cap
+through `revision_count` now set `stalled_rounds` too; `test_ledger.py` 42 -> 43. `make check` green.
+Behaviour not measured: whether the reviewer reliably applies the marker. `dotfiles/docs/agent-platform.md`
+might want a line that the revision cap counts stalled rounds.

@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 18
+LEDGER_SCHEMA_VERSION = 19
 
 
 class LedgerBehind(RuntimeError):
@@ -792,6 +792,17 @@ _MIGRATION_18 = """
 ALTER TABLE triage_items ADD COLUMN blocked_sha TEXT;
 """
 
+# Version 19 — `stalled_rounds` (one column, no backfill). The revision cap counts only the rounds
+# that did not make progress: a blocked review none of whose findings is a prior one still unresolved
+# is converging (every earlier finding fixed, the new one a consequence of the narrow fix), and a
+# converging item keeps revising (items 1010, 1506, 1509, 1511, 1513 were cut off at the cap while
+# converging). 0 on every existing row is right: an item already `failed` is never re-evaluated, and
+# a live one starts its stalled count now. `revision_count` keeps its meaning (the attempt ordinal).
+# See work.revisable() and train._fold_review().
+_MIGRATION_19 = """
+ALTER TABLE triage_items ADD COLUMN stalled_rounds INTEGER NOT NULL DEFAULT 0;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -811,6 +822,7 @@ MIGRATIONS: dict[int, str] = {
     16: _MIGRATION_16,
     17: _MIGRATION_17,
     18: _MIGRATION_18,
+    19: _MIGRATION_19,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live

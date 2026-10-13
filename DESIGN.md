@@ -103,9 +103,18 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    different known repo re-routes the item to `triaged` in that repo instead of
    paging (`_reroute_repo()`, once per item). A matching `rootCause` on another
    open item merges them (older survives, the other `closed(duplicate)`). A
-   blocked review is a revision on the same item and PR (`revisionOf`), up to 3
-   attempts (the first plus two revisions); the last one asks for agent-gateway's
-   escalation model, and a third block ends the item for the owner. `conflict`
+   blocked review is a revision on the same item and PR (`revisionOf`). The cap counts
+   only STALLED rounds (`triage_items.stalled_rounds`, `MAX_IMPLEMENT_ATTEMPTS` = 3): a
+   revision's review context quotes the previous round's blocking findings and asks the
+   reviewer to begin any of them still unresolved with `UNRESOLVED PRIOR FINDING:`
+   (`work.UNRESOLVED_PRIOR_MARKER`, matched case-insensitively at the start of the message).
+   A blocked round with no such finding is converging (the earlier findings are fixed, the
+   new ones consequences of the narrow fix) and keeps revising without limit; a round with
+   the marker, a first review (nothing to compare with), red checks, a conflict or a revert
+   is stalled, and the third stalled round ends the item for the owner (`stalled: N
+   revisions did not resolve …`). `revision_count` stays the attempt ordinal: the
+   escalation model starts at attempt 3 (`implement_model()`). warden-only: agent-gateway's
+   review schema is unchanged, the marker is text in the finding's message. `conflict`
    re-dispatches from the new base with the old diff as context. Confident host
    restarts run through `HOST_VERB_ALLOWLIST` and verify on
    `HOST_VERB_LIVENESS_MONITOR`.
