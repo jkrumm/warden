@@ -224,6 +224,54 @@ def _train_update(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
                       note=f"{moved} at {head[:12]}; waiting for checks", **_stage_success(item))
 
 
+def _pr_base_sha(owner: str, name: str, number: int) -> str | None:
+    """The head commit of the pull request's base branch (`base.sha`), read from GitHub now. None
+    when the read fails or GitHub reports no base sha: an unknowable base is never "the repo is red
+    too" — the caller falls back to the revision path.
+
+    The train has no other read of the base: `_open_pr_head()` keeps only the head, and the update
+    stage's `baseSha` is not persisted."""
+    try:
+        pr = _github.read_pr(owner, name, number)
+    except RemoteError as e:
+        print(f"triage: could not read the base of {owner}/{name}#{number} to tell a repo-wide red "
+              f"from the pull request's own: {e}", file=sys.stderr)
+        return None
+    base = pr.get("base")
+    base_sha = base.get("sha") if isinstance(base, dict) else None
+    return base_sha if isinstance(base_sha, str) and base_sha else None
+
+
+def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
+                             owner: str, name: str, number: int, runs: list[dict[str, Any]]) -> bool:
+    """A failing check on the train's SHA that fails on the PR's base head too is the BASE's red,
+    not the pull request's: no revision of the branch can clear it, so the item PARKS (core.park:
+    same stage, `retry_at` +25 min, no strike) until the base goes green, instead of spending a
+    stalled round on a fix that cannot land.
+
+    The revision path is kept whenever the base is green on that check, any failing check is the
+    branch's own (including one ABSENT from the base), or the base cannot be read at all — only a
+    base that is READ and fails every failing check parks. Returns whether it parked."""
+    base_sha = _pr_base_sha(owner, name, number)
+    if base_sha is None or base_sha == item["train_sha"]:
+        return False
+    try:
+        base_runs = _merge.read_check_runs(owner, name, base_sha)
+    except (PreconditionError, PolicyError, RemoteError) as e:
+        print(f"triage: could not read the check runs on the base {base_sha[:12]} of "
+              f"{owner}/{name}#{number} to tell a repo-wide red from the pull request's own: {e}",
+              file=sys.stderr)
+        return False
+    if not _merge.repo_wide_red(head_runs=runs, base_runs=base_runs):
+        return False
+    failing = ", ".join(sorted(_merge.failing_check_names(runs)))
+    core.park(conn, item["event_id"], now,
+              f"CI is red on the base commit too ({failing}) — a revision cannot fix it, "
+              f"waiting for the base to go green",
+              state=core.STATE_MERGING, expect_eq=_train_expect(item))
+    return True
+
+
 def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                   now: dt.datetime) -> bool:
     sha = item["train_sha"]
@@ -234,7 +282,7 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         return False
     if head != sha:
         return _back_to_update(conn, item, now, f"the PR head is {head[:12]}, not the train's {sha[:12]}")
-    owner, name, _ = _github.parse_pr_url(item["pr_url"])
+    owner, name, number = _github.parse_pr_url(item["pr_url"])
     try:
         runs = _merge.read_check_runs(owner, name, sha)
         pushed = core.parse_ts(item["train_pushed_at"])
@@ -246,6 +294,8 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         _train_hop(conn, item, now, note=f"{MERGE_PENDING_NOTE_PREFIX}{e}")
         return False
     except _merge.ChecksFailed as e:
+        if _park_on_a_repo_wide_red(conn, item, now, owner, name, number, runs):
+            return False
         work.hand_back_for_revision(conn, item, now, outcome="checks_failed", expect_eq=_train_expect(item),
                                      train_evidence=f"GitHub check runs on {sha}: {e}",
                                      note=f"CI failed on {sha[:12]}: {e}")

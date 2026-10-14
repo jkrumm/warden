@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§158 — a reopen is an atomic claim on state + occurrence mark) |
+| Last updated | 2026-10-14 (§159 — a base-red CI failure is parked, not charged to the PR) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 19 |
@@ -39,6 +39,14 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   fallback waits (no timeout) — a private repo with no workflows and an unreadable
   checks API never merges until the PAT can read checks. A PR merged by hand
   without a review at its head verifies by signal only.
+- **Base-red baseline.** The train's checks stage compares a failing check on the
+  train SHA with the pull request's base commit (`base.sha`): when every failing
+  check also fails on the base, the red is the base's, so the item parks
+  (`core.park`, no strike, no revision) until the base goes green rather than
+  spending a stalled round on a fix that cannot land. A base green on that check,
+  a check absent from the base, no `base.sha`, or an unreadable base keeps the
+  `checks_failed` revision path. `update_pr`'s own `checks.passed == false` result
+  is not baselined (carried debt).
 - **Ledger:** every pending migration first writes
   `~/.warden/backups/pre-migration-v<from>-to-<to>-<stamp>-<pid>.db` (never pruned).
 - **`failed` is classified.** Every `failed` row carries `failure_class` (`infra` |
