@@ -260,7 +260,10 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
     Per closed row, the event's CURRENT mark against the one `set_state()` stamped at this row's
     last transition:
 
-    - differs -> a genuine new occurrence since the row closed: reopen via set_state().
+    - differs -> a genuine new occurrence since the row closed: reopen via set_state(), as an atomic
+      conditional transition (expect_state=the closed state read here, expect_mark=the stored mark):
+      a concurrent triage pass that claimed this same recurrence first has already moved the row, so
+      only one caller's transition succeeds, and only that caller closes the superseded PR.
     - same -> still quiet: leave it alone.
     - stored mark IS NULL -> the row closed without a stamp. Do not reopen and do not guess a
       history it does not have: write the current mark as a baseline with a plain UPDATE (not
@@ -316,11 +319,18 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
                 "blocked_sha": None, "revision_count": 0, "stalled_rounds": 0,
             }
             if old_pr:
-                # Keep the URL in the note and CLOSE the PR after the commit (never holding the write
-                # lock across the network call), exactly as reinvestigate() does.
+                # Keep the URL in the note; the PR itself is CLOSED after the commit (never holding
+                # the write lock across the network call), exactly as reinvestigate() does.
                 columns["note"] = _items.append_to_note(row["note"], f"superseded PR {old_pr}")
+            # Atomic conditional transition: the reopen wins only if the row is still in the closed
+            # state this SELECT read AND still carries the occurrence mark it was read with. A
+            # concurrent triage pass that claimed this same recurrence first has already moved the
+            # row out of that state (and stamped a fresh mark), so this UPDATE matches nothing, the
+            # rowcount is 0, and the loser closes nothing.
+            rowcount = core.set_state(conn, row["event_id"], core.STATE_NEW, now,
+                                      expect_state=row["item_state"], expect_mark=stored_mark, **columns)
+            if old_pr and rowcount:
                 superseded_prs.append(old_pr)
-            core.set_state(conn, row["event_id"], core.STATE_NEW, now, **columns)
     conn.commit()
     if dry_run:
         # --dry-run makes NO outbound call, the PR close included: a preview against a throwaway DB

@@ -698,7 +698,8 @@ class Coalesce(NamedTuple):
 
 def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datetime, *,
                 expect_state: str | None = None, expect_null: tuple[str, ...] = (),
-                expect_eq: dict[str, Any] | None = None, **columns: Any) -> int:
+                expect_eq: dict[str, Any] | None = None, expect_mark: str | None = None,
+                **columns: Any) -> int:
     """The ONLY place triage_items.state is written. Returns rowcount.
 
     `closed` must carry its reason: a `close_reason` in CLOSE_REASONS is required, and every other
@@ -724,9 +725,14 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
     leaves it where it is) never resets its own counter; a caller whose success does not change
     state (a verdict folded onto a `working` row) resets it explicitly.
 
-    `expect_state`/`expect_null`/`expect_eq` turn the UPDATE into a compare-and-swap;
+    `expect_state`/`expect_null`/`expect_eq`/`expect_mark` turn the UPDATE into a compare-and-swap;
     maybe_auto_implement() claims an item that way, and the returned rowcount is how it learns
-    whether it won.
+    whether it won. `expect_mark` is the compare-and-swap on `occurrence_mark` alone: that column is
+    the helper's own (computed from the event, written on every transition), so it is not in
+    `_SET_STATE_COLUMNS` and needs its own parameter rather than riding `expect_eq`. It is
+    reopen_if_needed()'s recurrence claim: the reopen wins only if the row is still in the closed
+    state it was read in AND still carries the occurrence mark it was read with, so two concurrent
+    triage passes cannot both claim the same recurrence.
 
     `note` is capped to one short line (lifecycle/items.py `cap_note()`): whitespace collapsed, at
     most 200 characters, the last of them an ellipsis when cut.
@@ -848,6 +854,9 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
     if expect_state is not None:
         sql += " AND state=?"
         params.append(expect_state)
+    if expect_mark is not None:
+        sql += " AND occurrence_mark=?"
+        params.append(expect_mark)
     for col in expect_null:
         sql += f" AND {col} IS NULL"
     for col, value in expect_eq.items():
