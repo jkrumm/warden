@@ -4373,6 +4373,24 @@ def test_needs_human_with_a_category_and_code_findings_revises_before_paging_the
         assert item["revision_count"] == 1 and len(calls) == 1, (dict(item), calls)
 
 
+def test_needs_human_security_with_code_findings_still_goes_to_the_owner():
+    """Revise-first covers only `product` and `blocker`: a `security` (or data_loss, spend,
+    other_people) needs-human is owner-only by its nature, code findings or not."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "rv-cat-sec", 38)
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result(
+            "needs-human", schema_version=2, escalation_category="security",
+            blocking=[{"file": "scripts/loop/train.py", "line": 1, "message": "widens a trust boundary",
+                       "angle": "security"}],
+            summary="the change widens who can trigger a merge")}
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
+
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["note"].startswith("[security] "), item["note"]
+
+
 def test_needs_human_with_a_category_and_only_a_process_finding_still_goes_to_the_owner():
     """The boundary of shape 2: a process-only finding is not fixable by any implement episode, so
     the owner is still the reader."""

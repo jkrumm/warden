@@ -378,6 +378,10 @@ REVIEW_CATEGORY_SCHEMA = 2
 # `discussions` entry per failed angle, whose `file` is exactly this string.
 REVIEW_PIPELINE_MARKER = "(review pipeline)"
 
+# The needs-human categories whose fixable code findings revise before the owner is asked: the two
+# a review reaches for when it mislabels a work order. The other four always reach the owner.
+REVISE_FIRST_CATEGORIES = ("product", "blocker")
+
 
 def _review_pipeline_failed(verdict: dict[str, Any]) -> bool:
     """Whether the review's own pipeline broke: a reviewer session failed and did not examine the
@@ -601,11 +605,13 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         validation_status = "confirmed"
     elif outcome == "actionable" and not code_blocking and not process_blocking:
         validation_status = "confirmed"
-    elif outcome == "needs-human" and code_blocking and category and not core.is_revert(item):
-        # A needs-human carrying an owner-only reason AND fixable code findings (item 1535): the
-        # findings are a work order, not the decision, so they go back for a revision exactly as an
-        # `actionable` block does (a stalled round under the ordinary rules). The owner is paged only
-        # once no fixable finding is left — a process-only finding or an empty list still needs them.
+    elif (outcome == "needs-human" and code_blocking and category in REVISE_FIRST_CATEGORIES
+          and not core.is_revert(item)):
+        # A needs-human labelled `product` or `blocker` that carries fixable code findings (items 1531,
+        # 1533, 1535): the findings are a work order, not the decision, so they go back for a revision
+        # exactly as an `actionable` block does (a stalled round under the ordinary rules). The owner
+        # is paged only once no fixable finding is left. `security`, `data_loss`, `spend` and
+        # `other_people` are owner-only by their nature and still go straight to the owner.
         validation_status = "blocked"
     elif outcome == "needs-human":
         # The remaining needs-human shapes stay a question: a category with no fixable code finding
