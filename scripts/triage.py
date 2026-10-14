@@ -33,7 +33,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     intake.ingest(conn, now)
     intake.ingest_github_issues(conn, now)
-    intake.reopen_if_needed(conn, now, policy)
+    intake.reopen_if_needed(conn, now, policy, dry_run=dry_run)
     intake.classify(conn, policy, now)
     intake.apply_resolutions(conn, now, policy)
     intake.resolve_recovery_paired(conn, policy, now, dry_run=dry_run)

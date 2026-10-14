@@ -57,6 +57,8 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   occurrence starts a fresh investigation instead of resuming the old attempt (item 543). The PR the
   cleared `pr_url` named is closed best-effort (after the commit) and its URL kept in the note as
   `superseded PR <url>`, as reinvestigate does, so it is never orphaned beside the fresh run's own.
+  Under `--dry-run` the transition (and its note) still run locally, but the PR close is skipped —
+  no outbound call.
 - **Adopt** (`warden adopt <event-id> --pr <n>` / Argo's Adopt action) points an item at a pull
   request warden itself opened for it — a `dispatches` row, still open and unmerged — restores its
   `implement_job`/`pr_url` and puts it back on its repo's merge train, which re-reviews the current
