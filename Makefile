@@ -132,7 +132,7 @@ venv:
 # files stay valid pytest input if that ever changes.
 .PHONY: test
 test:
-	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
+	@[ -x "$(PY)" ] || $(BASE_PY) -m venv "$(VENV)"
 	@fail=0; ran=0; \
 	for t in $(WARDEN_REPO)/tests/test_*.py; do \
 		[ -e "$$t" ] || continue; \
@@ -151,11 +151,13 @@ test:
 # line naming $(MAKE) even under -n, and the loop probes this target with `make -n check`.
 .PHONY: compile
 compile:
-	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
+	@[ -x "$(PY)" ] || $(BASE_PY) -m venv "$(VENV)"
 	@"$(PY)" -m compileall -q "$(WARDEN_REPO)/scripts" "$(WARDEN_REPO)/tests" >/dev/null
 	@echo "  ✓ compileall"
 
 .PHONY: check
+# A fresh checkout (a dispatch worktree) gets a bare stdlib venv from `compile`/`test` — the loop
+# has no dependencies, so `check` needs no network and no `make venv` first.
 check: compile test
 
 # `check` runs its prerequisites in order even under `make -j`: `compile` is the gate that

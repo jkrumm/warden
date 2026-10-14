@@ -29,7 +29,7 @@ item moves.
 ## Validate
 
 ```bash
-make check     # compileall + every tests/*.py
+make check     # compileall + every tests/*.py (creates a bare stdlib .venv if missing)
 make test      # the suites only
 .venv/bin/python3 tests/test_triage.py     # one suite
 ```
