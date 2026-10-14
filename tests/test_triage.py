@@ -186,7 +186,7 @@ DISPATCH_POLICY: dict[str, Any] = {}
 
 
 def _default_fake_read_pr(owner, repo, number):
-    pr = _fake_pr(number=number, head_sha=PR_HEAD["sha"], repo=repo)
+    pr = _fake_pr(number=number, head_sha=PR_HEAD["sha"], repo=repo, base_sha=PR_HEAD["base_sha"])
     pr["state"] = PR_HEAD["state"]
     return pr
 
@@ -319,7 +319,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         _github.delete_branch = lambda owner, repo, branch: (_ for _ in ()).throw(
             RemoteError("test: no fake delete_branch registered"))
         PR_HEAD.clear()
-        PR_HEAD.update(sha=TRAIN_SHA, state="open")
+        PR_HEAD.update(sha=TRAIN_SHA, state="open", base_sha=None)
         CHECK_RUNS.clear()
         CHECK_RUNS.update(runs=None, asked=[])
         _github.read_pr = _default_fake_read_pr
@@ -3059,13 +3059,14 @@ def _seed_mergeable_dispatch(conn, job_id: str, *, repo: str, pr_number: int, or
     conn.commit()
 
 
-def _fake_pr(*, number: int, head_sha: str, repo: str, base="master") -> dict[str, Any]:
+def _fake_pr(*, number: int, head_sha: str, repo: str, base="master",
+             base_sha: str | None = None) -> dict[str, Any]:
     return {
         "state": "open", "merged": False, "title": "t", "node_id": f"PR_{number}",
         "changed_files": 1, "additions": 1, "deletions": 0,
         "mergeable": True, "mergeable_state": "clean",
-        "base": {"ref": base}, "head": {"ref": f"dispatch/{repo}-{number}", "sha": head_sha,
-                                          "repo": {"full_name": f"jkrumm/{repo}"}},
+        "base": {"ref": base, "sha": base_sha}, "head": {"ref": f"dispatch/{repo}-{number}", "sha": head_sha,
+                                                         "repo": {"full_name": f"jkrumm/{repo}"}},
     }
 
 
@@ -11960,6 +11961,107 @@ def test_train_failed_ci_on_the_train_sha_is_a_checks_failed_revision():
         assert item["state"] == core.STATE_WORKING and "CI failed" in item["note"], dict(item)
         assert "e2e" in item["train_evidence"] and TRAIN_SHA in item["train_evidence"], item["train_evidence"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-ci-red'").fetchone()
+        assert d["validation_status"] == "checks_failed"
+
+
+# A head with one green check and one failing `e2e` — the shape a repo-wide red presents on the
+# train's SHA too. The base-baseline tests below vary only what the base commit answers.
+_HEAD_RED = [{"name": "build", "status": "completed", "conclusion": "success"},
+             {"name": "e2e", "status": "completed", "conclusion": "failure"}]
+
+
+def _red_checks_item(conn, ext: str, *, base_sha: str | None = REBASED_SHA) -> int:
+    """A `merging` item on its checks stage whose train SHA has a failing `e2e` check; `base_sha` is
+    what its pull request reports as the base commit (None = GitHub reports none)."""
+    eid = _train_item(conn, ext, stage="checks", sha=TRAIN_SHA)
+    PR_HEAD["base_sha"] = base_sha
+    _agent_gateway.submit_review = _no_review
+    return eid
+
+
+def _checks_per_sha(head, base):
+    """`_github.check_runs` answering per commit: the base is REBASED_SHA, anything else the head."""
+    return lambda owner, repo, sha: base if sha == REBASED_SHA else head
+
+
+def test_train_a_red_check_red_on_the_base_too_parks_without_a_revision():
+    """A check failing on the train's SHA that fails on the base commit too is the BASE's red: the
+    item parks (same stage, no strike, no stalled round, no revision) until the base goes green,
+    instead of spending an attempt on a fix that cannot land."""
+    with _triage_env() as (conn, ctx):
+        eid = _red_checks_item(conn, "sig-train-base-red")
+        _github.check_runs = _checks_per_sha(
+            _HEAD_RED, [{"name": "e2e", "status": "completed", "conclusion": "failure"}])
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_CHECKS, dict(item)
+        assert item["strikes"] == 0 and item["stalled_rounds"] == 0, dict(item)
+        assert item["retry_at"] == (NOW + dt.timedelta(minutes=core.PARK_MINUTES)).isoformat(), dict(item)
+        assert item["note"].startswith("parked:") and "e2e" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-base-red'").fetchone()
+        assert d["validation_status"] is None, "a parked base red is not a checks_failed revision"
+
+
+def test_train_a_red_check_only_on_the_pr_revises_when_the_base_is_green():
+    """The same failing `e2e` on the head, green on the base: the pull request caused it, so the
+    revision path is unchanged — one stalled round, `checks_failed` on the dispatch row."""
+    with _triage_env() as (conn, ctx):
+        eid = _red_checks_item(conn, "sig-train-base-green")
+        _github.check_runs = _checks_per_sha(
+            _HEAD_RED, [{"name": "build", "status": "completed", "conclusion": "success"},
+                        {"name": "e2e", "status": "completed", "conclusion": "success"}])
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and "CI failed" in item["note"], dict(item)
+        assert item["stalled_rounds"] == 1 and item["strikes"] == 0, dict(item)
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-base-green'").fetchone()
+        assert d["validation_status"] == "checks_failed"
+
+
+def test_train_a_red_check_absent_from_the_base_is_the_prs_own_revision():
+    """A check `e2e` the base does not run at all is not "the base fails it too": the branch's own
+    red, the revision path as before."""
+    with _triage_env() as (conn, ctx):
+        eid = _red_checks_item(conn, "sig-train-base-absent")
+        _github.check_runs = _checks_per_sha(
+            _HEAD_RED, [{"name": "build", "status": "completed", "conclusion": "success"}])
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING, dict(item)
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-base-absent'").fetchone()
+        assert d["validation_status"] == "checks_failed"
+
+
+def test_train_a_base_that_cannot_be_read_still_revises():
+    """An unreadable base is an unknown baseline, never "the repo is red too": the train keeps the
+    revision path and does not strike on the extra read."""
+    with _triage_env() as (conn, ctx):
+        eid = _red_checks_item(conn, "sig-train-base-unreadable")
+
+        def _check_runs(owner, repo, sha):
+            if sha == REBASED_SHA:
+                raise RemoteError("HTTP 500 reading the base's check runs")
+            return _HEAD_RED
+
+        _github.check_runs = _check_runs
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["strikes"] == 0, dict(item)
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-base-unreadable'").fetchone()
+        assert d["validation_status"] == "checks_failed"
+
+
+def test_train_with_no_base_sha_on_the_pr_still_revises():
+    """GitHub reporting no `base.sha` cannot establish a baseline: the head's failing check is read
+    as the branch's own, the revision path as before."""
+    with _triage_env() as (conn, ctx):
+        eid = _red_checks_item(conn, "sig-train-base-unknown", base_sha=None)
+        CHECK_RUNS["runs"] = _HEAD_RED
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING, dict(item)
+        assert CHECK_RUNS["asked"] == [TRAIN_SHA], "no base sha: the base is never read"
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-base-unknown'").fetchone()
         assert d["validation_status"] == "checks_failed"
 
 

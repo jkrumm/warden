@@ -204,6 +204,30 @@ def check_runs_gate(*, repo: str, check_runs: list[dict[str, Any]]) -> None:
         raise ChecksFailed(f"{repo}'s CI has not passed cleanly on the head commit: {names}.")
 
 
+def failing_check_names(check_runs: list[dict[str, Any]]) -> set[str]:
+    """The names of the runs `check_runs_gate()` refuses on: completed and not passing. Asked of
+    the head and the base commit, so the merge train can tell a red the BASE carries (no revision
+    of the pull request can clear it) from one this branch caused. The predicate is the gate's own
+    — a still-running run is never a failure here, exactly as `check_runs_gate()` reads it."""
+    return {
+        str(r.get("name"))
+        for r in check_runs
+        if r.get("status") == "completed"
+        and r.get("conclusion") not in ("success", "neutral", "skipped")
+    }
+
+
+def repo_wide_red(*, head_runs: list[dict[str, Any]], base_runs: list[dict[str, Any]]) -> bool:
+    """True when EVERY check that failed on the head also failed on the base commit: the red
+    belongs to the base branch, not the pull request, so a revision of the branch cannot clear it.
+    A check that failed only on the head — including one ABSENT from the base, which is not the
+    same as "the base fails it too" — makes this False, the branch's own red as before."""
+    failing = failing_check_names(head_runs)
+    if not failing:
+        return False
+    return failing <= failing_check_names(base_runs)
+
+
 def merge_gate_check(*, repo: str, check_runs: list[dict[str, Any]], validation: str | None) -> None:
     """Checks green — or none exist, which passes — and the step-7 review
     `confirmed`. "PR open" is read off the pull request by `plan_or_land()`."""

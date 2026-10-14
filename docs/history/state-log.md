@@ -10329,3 +10329,25 @@ read>`, and it records the superseded PR for closing only when the transition's 
 
 `test_triage.py` 572 -> 574 (`test_set_state_expect_mark_is_a_compare_and_swap`,
 `test_a_stale_reopen_does_not_clobber_a_concurrent_fresh_attempt`). `make check` green.
+
+## 159. A red check the base carries is parked, not charged to the PR (2026-10-14)
+
+The merge train's checks stage (`train._train_checks`) gated only the train SHA's check runs
+(`merge.read_check_runs`) and read any `ChecksFailed` as `work.hand_back_for_revision(outcome=
+"checks_failed")`, which increments `stalled_rounds` unconditionally. A repo-wide red — the base
+branch's own CI broken, as weatherorb's master was — therefore landed on the pull request as a stalled
+round and spent an attempt on a revision that cannot fix the base (the case that stopped item 1528).
+`check_runs_gate()` is name-agnostic and the train never read the base at all.
+
+`train._park_on_a_repo_wide_red()` now reads the pull request's base commit (`base.sha`, via a new
+`_pr_base_sha()`) and its check runs through the same `read_check_runs()` fallback, then compares the
+failing check NAMES (`merge.failing_check_names()`, the gate's own predicate). When every failing check
+also fails on the base (`merge.repo_wide_red()`), `core.park()` keeps the item on the checks stage with
+`retry_at` +25 min, no strike and no revision — the item waits for the base to go green. Every other
+case keeps the old path: the base green on that check, a failing check absent from the base, no
+`base.sha`, or a base that cannot be read is still a `checks_failed` revision. Nothing was changed on
+the `update_pr` branch, whose own `checks.passed == false` result is un-baselined in the same way —
+left as a finding, not fixed here.
+
+`test_triage.py` 574 -> 579 (the park, and the four fallbacks: base green, check absent, unreadable
+base, no `base.sha`). `make check` green.
