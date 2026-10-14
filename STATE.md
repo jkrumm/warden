@@ -6,10 +6,10 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§160 — `make check` provisions the venv a fresh worktree lacks) |
+| Last updated | 2026-10-14 (§161 — the base-red park baselines on the base the train SHA was built on) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 19 |
+| Ledger | `~/.warden/warden.db`, schema 20 |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
 
 ## What is live
@@ -46,11 +46,13 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   checks API never merges until the PAT can read checks. A PR merged by hand
   without a review at its head verifies by signal only.
 - **Base-red baseline.** The train's checks stage compares a failing check on the
-  train SHA with the pull request's base commit (`base.sha`): when every failing
-  check also fails on the base, the red is the base's, so the item parks
+  train SHA with `train_base_sha` — the base commit the SHA was rebased onto,
+  captured from `update_pr`'s result when the train SHA was BUILT, never the PR's
+  current `base.sha` (which may have advanced past it). When every failing check
+  also fails on that base, the red is the base's, so the item parks
   (`core.park`, no strike, no revision) until the base goes green rather than
   spending a stalled round on a fix that cannot land. A base green on that check,
-  a check absent from the base, no `base.sha`, or an unreadable base keeps the
+  a check absent from the base, no recorded base, or an unreadable base keeps the
   `checks_failed` revision path. `update_pr`'s own `checks.passed == false` result
   is not baselined (carried debt).
 - **Ledger:** every pending migration first writes

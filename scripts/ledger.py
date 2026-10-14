@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 19
+LEDGER_SCHEMA_VERSION = 20
 
 
 class LedgerBehind(RuntimeError):
@@ -630,6 +630,10 @@ ALTER TABLE triage_items ADD COLUMN triage_job_at TEXT;
 #   train_stage     the stage the item is on; NULL outside `merging`.
 #   train_sha       the PR head the train is checking, reviewing and will merge — set by the
 #     update stage from agent-gateway's `update_pr` result; NULL outside `merging`.
+#   train_base_sha  the base commit `train_sha` was rebased onto, from the same `update_pr`
+#     result (`baseSha`). Captured at update time, NOT re-read from the PR's `base.sha` at
+#     check time: the base branch may have advanced since (A -> B) and the train SHA still
+#     carries A, so only A's check runs say whether a failing check is the base's own.
 #   train_job       the in-flight `update_pr` job (or the `claiming` sentinel during its submit);
 #     NULL otherwise.
 #   reviewed_sha    the last PR head a step-7 review confirmed. Survives leaving `merging` (an
@@ -803,6 +807,20 @@ _MIGRATION_19 = """
 ALTER TABLE triage_items ADD COLUMN stalled_rounds INTEGER NOT NULL DEFAULT 0;
 """
 
+# Version 20 — `train_base_sha` (one column, no backfill). The train's checks stage parks a red
+# that is the BASE's rather than the pull request's (train._park_on_a_repo_wide_red) by comparing
+# the failing check names on the train SHA against those on the base commit. Reading the PR's
+# `base.sha` at CHECK time is wrong: if the base advances between training and checking (A -> B)
+# while the branch's own check failed, the train SHA still carries A, and comparing against B can
+# mask B's unrelated red as "the base fails it too" and park a revision that could have fixed the
+# branch. The base is therefore captured WHEN THE TRAIN SHA IS BUILT — from the `update_pr`
+# result's `baseSha`, the commit the branch now sits on — and persisted here. NULL outside
+# `merging`, and NULL on any row that entered the train before this version (no baseline, so the
+# revision path is kept, never a park).
+_MIGRATION_20 = """
+ALTER TABLE triage_items ADD COLUMN train_base_sha TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -823,6 +841,7 @@ MIGRATIONS: dict[int, str] = {
     17: _MIGRATION_17,
     18: _MIGRATION_18,
     19: _MIGRATION_19,
+    20: _MIGRATION_20,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live

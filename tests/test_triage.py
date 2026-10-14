@@ -11802,6 +11802,8 @@ def test_train_updated_branch_waits_for_pending_checks_without_a_deadline():
         PR_HEAD["sha"] = REBASED_SHA
         CHECK_RUNS["runs"] = [{"name": "ci", "status": "in_progress", "conclusion": None}]
         _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["train_base_sha"] == "c" * 40, "the base the train SHA was rebuilt on is persisted"
         for hours in (1, 24, 72):   # no deadline: still waiting, never a strike
             _train_pass(conn, hours * 60)
             item = core.get_item(conn, eid)
@@ -11972,16 +11974,22 @@ _HEAD_RED = [{"name": "build", "status": "completed", "conclusion": "success"},
 
 def _red_checks_item(conn, ext: str, *, base_sha: str | None = REBASED_SHA) -> int:
     """A `merging` item on its checks stage whose train SHA has a failing `e2e` check; `base_sha` is
-    what its pull request reports as the base commit (None = GitHub reports none)."""
+    the base the train SHA was captured on (`train_base_sha`, what `update_pr` reported; None = no
+    base was recorded)."""
     eid = _train_item(conn, ext, stage="checks", sha=TRAIN_SHA)
-    PR_HEAD["base_sha"] = base_sha
+    conn.execute("UPDATE triage_items SET train_base_sha=? WHERE event_id=?", (base_sha, eid))
+    conn.commit()
     _agent_gateway.submit_review = _no_review
     return eid
 
 
 def _checks_per_sha(head, base):
-    """`_github.check_runs` answering per commit: the base is REBASED_SHA, anything else the head."""
-    return lambda owner, repo, sha: base if sha == REBASED_SHA else head
+    """`_github.check_runs` answering per commit: the base is REBASED_SHA, anything else the head;
+    every sha asked is recorded in CHECK_RUNS["asked"] exactly as the env's own fake does."""
+    def _check_runs(owner, repo, sha):
+        CHECK_RUNS["asked"].append(sha)
+        return base if sha == REBASED_SHA else head
+    return _check_runs
 
 
 def test_train_a_red_check_red_on_the_base_too_parks_without_a_revision():
@@ -12032,6 +12040,27 @@ def test_train_a_red_check_absent_from_the_base_is_the_prs_own_revision():
         assert d["validation_status"] == "checks_failed"
 
 
+def test_train_the_base_advanced_since_the_train_sha_is_not_the_baseline():
+    """The baseline is the base the train SHA was BUILT on (`train_base_sha`, captured at update
+    time), not the PR's current `base.sha`. Were the base to advance A -> B between training and
+    checking while the branch's own `e2e` failed, comparing against B would see B's unrelated red
+    and park a revision that could have fixed the branch. The train compares against A, sees it
+    green, keeps the revision path, and never reads B."""
+    with _triage_env() as (conn, ctx):
+        eid = _red_checks_item(conn, "sig-train-base-advanced")   # train_base_sha = REBASED_SHA (A)
+        PR_HEAD["base_sha"] = "e" * 40                            # the PR's base has since moved to B
+        _github.check_runs = _checks_per_sha(
+            _HEAD_RED, [{"name": "build", "status": "completed", "conclusion": "success"},
+                        {"name": "e2e", "status": "completed", "conclusion": "success"}])
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["stalled_rounds"] == 1, dict(item)
+        assert set(CHECK_RUNS["asked"]) == {TRAIN_SHA, REBASED_SHA} and "e" * 40 not in CHECK_RUNS["asked"], \
+            CHECK_RUNS["asked"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-base-advanced'").fetchone()
+        assert d["validation_status"] == "checks_failed"
+
+
 def test_train_a_base_that_cannot_be_read_still_revises():
     """An unreadable base is an unknown baseline, never "the repo is red too": the train keeps the
     revision path and does not strike on the extra read."""
@@ -12051,16 +12080,16 @@ def test_train_a_base_that_cannot_be_read_still_revises():
         assert d["validation_status"] == "checks_failed"
 
 
-def test_train_with_no_base_sha_on_the_pr_still_revises():
-    """GitHub reporting no `base.sha` cannot establish a baseline: the head's failing check is read
-    as the branch's own, the revision path as before."""
+def test_train_with_no_base_sha_recorded_still_revises():
+    """No base captured at update time cannot establish a baseline: the head's failing check is
+    read as the branch's own, the revision path as before, and no base is ever read."""
     with _triage_env() as (conn, ctx):
         eid = _red_checks_item(conn, "sig-train-base-unknown", base_sha=None)
         CHECK_RUNS["runs"] = _HEAD_RED
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING, dict(item)
-        assert CHECK_RUNS["asked"] == [TRAIN_SHA], "no base sha: the base is never read"
+        assert CHECK_RUNS["asked"] == [TRAIN_SHA], "no base recorded: the base is never read"
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-base-unknown'").fetchone()
         assert d["validation_status"] == "checks_failed"
 
