@@ -231,7 +231,8 @@ def ingest_github_issues(conn: sqlite3.Connection, now: dt.datetime) -> None:
     conn.commit()
 
 
-def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[str, Any] | None = None) -> None:
+def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[str, Any] | None = None,
+                     *, dry_run: bool = False) -> None:
     """A grouped or state source reuses the SAME events.id across a resolve -> recur cycle
     (UNIQUE(source, external_id)), so a row closed for an event that has since produced a new
     occurrence would sit invisible forever. Reopening to `new` (never clearing
@@ -318,6 +319,12 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
                 superseded_prs.append(old_pr)
             core.set_state(conn, row["event_id"], core.STATE_NEW, now, **columns)
     conn.commit()
+    if dry_run:
+        # --dry-run makes NO outbound call, the PR close included: a preview against a throwaway DB
+        # copy must never reach GitHub. The local reopen (set_state() above, including the note's
+        # `superseded PR <url>`) still runs so the preview shows the transition; only the close loop
+        # is skipped, leaving the superseded PR open in the discarded copy.
+        return
     for old_pr in superseded_prs:
         core.close_reopened_pr(old_pr)
 

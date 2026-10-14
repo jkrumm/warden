@@ -10276,3 +10276,21 @@ network call.
 
 `test_triage.py` stays 570/570: the §154 regression test now also asserts the note carries `superseded PR
 <url>` and that the fake GitHub boundary saw the PR closed. `make check` green.
+
+## 156. A reopen under `--dry-run` closes nothing (2026-10-14)
+
+Review of §155. `reopen_if_needed()` runs unconditionally on every pass (`triage.py:36`), including under
+`--dry-run`, the only hand-run mode AGENTS.md permits. Its §155 addition closes the superseded PR through
+`core.close_reopened_pr()` → `close_pr_best_effort()` → a live GitHub PATCH/comment — so a hand-run
+`--dry-run` against a throwaway DB copy still reached GitHub, breaking the dry-run contract the test suite
+pins (`test_recovery_pairing_skipped_under_dry_run`: zero outbound calls). Unlike
+`close_reinvestigated_pr()`, whose only caller (`notify.apply_argo_actions`) returns early on `dry_run`,
+this call had no such guard.
+
+`dry_run` is now threaded into `reopen_if_needed()` (`triage.py` passes it) and the close loop is skipped
+when it is set. The local transition still runs — the reopen, the cleared handles and the
+`superseded PR <url>` note — so a dry-run preview shows the full state change; only the outbound close is
+omitted, matching `resolve_quiet_grouped()`'s "pure local bookkeeping runs for real even under --dry-run;
+only the eventual notification respects `dry_run`".
+
+`test_triage.py` 570 -> 571 (`test_a_reopen_under_dry_run_makes_no_outbound_close`). `make check` green.

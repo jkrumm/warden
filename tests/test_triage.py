@@ -7953,6 +7953,30 @@ def test_a_reopened_item_starts_a_fresh_attempt_sequence():
         assert "recurred" in (closed[3] or ""), "the close comment names the recurrence"
 
 
+def test_a_reopen_under_dry_run_makes_no_outbound_close():
+    """The dry-run contract: `--dry-run` must make zero outbound calls, the superseded-PR close
+    (a live GitHub PATCH/comment) included. reopen_if_needed() still performs the local transition
+    — the reopen, the cleared handles and the note — so a preview against a throwaway DB copy shows
+    it, but it skips core.close_reopened_pr(), leaving the superseded PR open in the discarded copy."""
+    pr = "https://github.com/jkrumm/demo-repo/pull/9"
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="dryrun-reopen", title="Dry-run",
+                            first_seen=OLD)
+        intake.ingest(conn, NOW)
+        conn.execute(
+            "UPDATE triage_items SET dispatch_job=?, artifact_url=?, implement_job=?, validation_job=?, "
+            "pr_url=?, reviewed_sha=?, blocked_sha=?, revision_count=4, stalled_rounds=2 WHERE event_id=?",
+            ("investigate-old", pr, "impl-old", "val-old", pr, "a" * 40, "b" * 40, eid))
+        core.set_state(conn, eid, core.STATE_FIXED, NOW)
+        _recur_ts(conn, eid, "1788850795.862159")
+        intake.reopen_if_needed(conn, NOW, dry_run=True)
+        item = _rows(conn, eid)
+        assert item["state"] == core.STATE_NEW, dict(item)
+        assert item["pr_url"] is None and item["revision_count"] == 0, dict(item)
+        assert item["note"] == f"superseded PR {pr}", "the local note still records the superseded PR"
+        assert CLOSED_PRS == [], "dry-run must not close the superseded PR on GitHub"
+
+
 def test_the_shipped_policy_keeps_the_label_rules_without_evidence():
     policy = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())
     assert len(policy["rules"]) == 73 and len(policy["ignore"]) == 15
