@@ -350,6 +350,32 @@ def test_cancel_409_raises_policy_error():
         srv.stop()
 
 
+def test_steer_posts_the_text_and_returns_the_session():
+    srv = _StubServer({("POST", "/api/jobs/j1/steer"): (200, {"ok": True, "jobId": "j1", "sessionId": "ses_a"})})
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
+    try:
+        assert agent_gateway.steer("j1", "CI is red") == "ses_a"
+        assert srv.requests[0]["body"] == {"text": "CI is red"}
+    finally:
+        srv.stop()
+
+
+def test_steer_409_is_a_policy_error_and_404_a_remote_error():
+    srv = _StubServer({("POST", "/api/jobs/j1/steer"): (409, {"error": "job is done, not running"}),
+                       ("POST", "/api/jobs/j2/steer"): (404, {"error": "job not found"})})
+    os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base
+    try:
+        for job_id, exc in (("j1", PolicyError), ("j2", RemoteError)):
+            try:
+                agent_gateway.steer(job_id, "x")
+            except exc:
+                pass
+            else:
+                raise AssertionError(f"expected {exc.__name__}")
+    finally:
+        srv.stop()
+
+
 def test_submit_review_body_shape():
     srv = _StubServer({("POST", "/api/jobs"): (200, {"ok": True, "job": {"id": "r1", "status": "running"}})})
     os.environ["WARDEN_AGENT_GATEWAY_BASE"] = srv.base

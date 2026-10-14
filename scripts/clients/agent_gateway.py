@@ -430,6 +430,37 @@ def cancel(job_id: str) -> dict[str, Any]:
     return job
 
 
+def steer(job_id: str, text: str) -> str:
+    """Post new facts into a RUNNING dispatch episode's live OpenCode session (`POST
+    /api/jobs/:id/steer`, `delivery: steer`) instead of killing and restarting it. Returns the
+    session id. A PolicyError means nothing live to steer (not running, between turns, claude
+    harness, no session yet): the caller falls back to its ordinary path (a revision after the
+    episode ends). Anything else is a RemoteError."""
+    try:
+        status, text_body = _request("POST", f"/api/jobs/{job_id}/steer", {"text": text})
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise RemoteError(f"agent-gateway job steer failed for {job_id} (is the LaunchAgent up?)")
+    if status in (400, 409):
+        try:
+            parsed = json.loads(text_body)
+            message = parsed.get("error") if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            message = None
+        raise PolicyError(message or f"job {job_id} cannot be steered")
+    if status == 404:
+        raise RemoteError(f"agent-gateway has no job {job_id}")
+    if status != 200:
+        raise RemoteError(f"agent-gateway returned HTTP {status} steering job {job_id}: {text_body[:300]}")
+    try:
+        parsed = json.loads(text_body)
+    except json.JSONDecodeError:
+        raise RemoteError(f"agent-gateway returned an unparseable body steering {job_id}: {text_body[:300]}")
+    session_id = parsed.get("sessionId") if isinstance(parsed, dict) else None
+    if not isinstance(session_id, str):
+        raise RemoteError(f"agent-gateway returned no session steering {job_id}")
+    return session_id
+
+
 def assert_result_schema(job: dict[str, Any], expected: int | Collection[int], tool: str) -> None:
     """Raise a LOUD refusal when a terminal `done` job's `result.schemaVersion`
     is not one of `expected` — the failure this exists to design out is a

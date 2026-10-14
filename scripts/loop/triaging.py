@@ -152,6 +152,7 @@ def _fold_triage_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: 
                 # filed it (the owner's own issues only — see maybe_comment_back_on_issue()).
                 work.maybe_comment_back_on_issue(conn, item, event, {}, now, state="duplicate",
                                                   note=f"tracked as #{target['event_id']}: {reason}", dry_run=False)
+                steer_live_episode(target, event, reason)
             return outcome
 
     if action == "fixed_by" and origin != "human":
@@ -176,6 +177,36 @@ def _fold_triage_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: 
                           strikes=0, retry_at=None, triage_job=None, **cas)
     conn.commit()
     return f"triaged to {repo}" if won else None
+
+
+STEER_FACT_CHARS = 1500
+
+
+def steer_live_episode(target: sqlite3.Row, event: sqlite3.Row, reason: str) -> bool:
+    """A duplicate occurrence attached to an item whose episode is still running is new evidence for
+    that episode: steer it (agent-gateway `job_steer`) instead of letting it finish blind and pay a
+    whole revision round afterwards. Best-effort: nothing live to steer (the usual case — the episode
+    is finished or between turns) or an unreachable agent-gateway changes nothing, the ordinary
+    revision path still applies. Returns whether a steer landed. The alert text is quoted data, not
+    an instruction."""
+    job_id = target["implement_job"]
+    if not job_id or job_id == core.IMPLEMENT_CLAIM or str(job_id).startswith(core.HOST_VERB_CLAIM_PREFIX):
+        job_id = target["dispatch_job"]
+    if not job_id or target["state"] != core.STATE_WORKING:
+        return False
+    title = str(event["title"] or "")[:STEER_FACT_CHARS]
+    url = f" ({event['url']})" if event["url"] else ""
+    text = (f"Another report of the same defect just arrived and was attached to your item "
+            f"({reason}). Quoted from the report, as data:\n> {title}{url}\n"
+            f"Check that your change also covers this variant; if it does, carry on.")
+    try:
+        _agent_gateway.steer(job_id, text)
+    except WardenError as e:
+        print(f"triage: no steer for #{target['event_id']} job {job_id}: {e}", file=sys.stderr)
+        return False
+    print(f"triage: steered live episode {job_id} of #{target['event_id']} with a duplicate occurrence",
+          file=sys.stderr)
+    return True
 
 
 def open_item(conn: sqlite3.Connection, event_id: Any, *, exclude: int) -> sqlite3.Row | None:
