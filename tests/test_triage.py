@@ -8066,10 +8066,10 @@ def test_a_stale_reopen_does_not_clobber_a_concurrent_fresh_attempt():
 
 def test_the_shipped_policy_keeps_the_label_rules_without_evidence():
     policy = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())
-    assert len(policy["rules"]) == 73 and len(policy["ignore"]) == 15
+    assert len(policy["rules"]) == 74 and len(policy["ignore"]) == 15
     assert not any("evidence" in r for r in policy["rules"]), "the evidence machinery is deleted"
     loaded = core.load_policy()
-    assert len(loaded["rules"]) == 73 and len(loaded["ignore"]) == 15 and loaded["hostVerbs"]
+    assert len(loaded["rules"]) == 74 and len(loaded["ignore"]) == 15 and loaded["hostVerbs"]
 
 
 # -- rules are the label tier --
@@ -8124,6 +8124,24 @@ def test_the_shipped_policy_routes_every_research_gateway_alert_to_its_repo():
         row = {"source": "slack_alert", "external_id": core.fingerprint(title), "title": title}
         matched = core.match_rule(core.match_targets(row), rules)
         assert matched is not None and matched["repo"] == "research-gateway", (title, matched)
+
+
+def test_the_shipped_policy_routes_every_email_gateway_alert_to_its_repo():
+    """One `slack_alert:email-gateway-*` wildcard covers every HyperDX alert on the
+    email-gateway dashboard. Real alert titles through the real match path."""
+    rules = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())["rules"]
+    titles = [
+        "email-gateway send failed >= 1 (15m)",
+        "email-gateway bounced or complained >= 1 (1h)",
+        "email-gateway job failed >= 1 (15m)",
+        "email-gateway sync stalled (0 ok ticks) < 1 (1h)",
+        "email-gateway SES sending paused >= 1 (1h)",
+        "email-gateway LLM lane erroring >= 3 (15m)",
+    ]
+    for title in titles:
+        row = {"source": "slack_alert", "external_id": core.fingerprint(title), "title": title}
+        matched = core.match_rule(core.match_targets(row), rules)
+        assert matched is not None and matched["repo"] == "email-gateway", (title, matched)
 
 
 def test_a_rule_match_is_a_label_route_and_the_item_still_goes_through_triage():
