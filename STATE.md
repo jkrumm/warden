@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§155 — a reopen's cleared PR is closed and noted, not orphaned) |
+| Last updated | 2026-10-14 (§157 — a reopen leaves an already-merged PR alone) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 19 |
@@ -56,7 +56,9 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `blocked_sha`, `revision_count`, `stalled_rounds` — exactly as reinvestigate does, so the new
   occurrence starts a fresh investigation instead of resuming the old attempt (item 543). The PR the
   cleared `pr_url` named is closed best-effort (after the commit) and its URL kept in the note as
-  `superseded PR <url>`, as reinvestigate does, so it is never orphaned beside the fresh run's own.
+  `superseded PR <url>`, as reinvestigate does, so it is never orphaned beside the fresh run's own —
+  but only when it is still open: a `fixed` item's PR is already merged (the `fixed` transition keeps
+  `pr_url`), so a merged one is left alone rather than posted a false 'Superseded' comment.
   Under `--dry-run` the transition (and its note) still run locally, but the PR close is skipped —
   no outbound call.
 - **Adopt** (`warden adopt <event-id> --pr <n>` / Argo's Adopt action) points an item at a pull

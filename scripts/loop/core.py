@@ -962,10 +962,27 @@ def close_reopened_pr(old_pr: str | None) -> None:
     contract as close_reinvestigated_pr(): the caller runs it AFTER its own `conn.commit()` (the
     transition's write lock must not be held across a network call) and `None` closes nothing. A
     separate wrapper, not a reuse, because close_reinvestigated_pr()'s comment says the OWNER asked
-    for the fresh investigation — not true of a signature that recurred on its own."""
-    if old_pr:
-        close_pr_best_effort(old_pr, "Superseded: this signature recurred, so a fresh investigation "
-                                     "supersedes this pull request rather than reusing it.")
+    for the fresh investigation — not true of a signature that recurred on its own.
+
+    Only a still-open PR is commented and closed. `reopen_if_needed()` also reopens `fixed` items,
+    whose `pr_url` the `fixed` transition keeps (the fix merged), so posting 'Superseded: …' on that
+    PR would be a false claim with a no-op close. The state read fails closed: an unreadable state
+    leaves the PR alone rather than risk annotating a merged one."""
+    if not old_pr:
+        return
+    parsed = _github.parse_pr_url(old_pr)
+    if parsed is None:
+        return
+    owner, repo_name, number = parsed
+    try:
+        pr = _github.read_pr(owner, repo_name, number)
+    except WardenError as e:
+        print(f"triage: could not read superseded {old_pr}: {e}", file=sys.stderr)
+        return
+    if pr.get("state") != "open":
+        return
+    close_pr_best_effort(old_pr, "Superseded: this signature recurred, so a fresh investigation "
+                                 "supersedes this pull request rather than reusing it.")
 
 
 def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
