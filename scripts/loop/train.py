@@ -374,6 +374,19 @@ REVIEW_DECIDE_NOTE_PREFIX = "re-reviewed to decide"
 REVIEW_REDRIVEN = "redriven"  # validation_status prefix, followed by ":<train sha>"
 # The first review schema whose verdict can carry `escalationCategory`.
 REVIEW_CATEGORY_SCHEMA = 2
+# agent-gateway's `review` job marks a reviewer session that failed to examine the diff with one
+# `discussions` entry per failed angle, whose `file` is exactly this string.
+REVIEW_PIPELINE_MARKER = "(review pipeline)"
+
+
+def _review_pipeline_failed(verdict: dict[str, Any]) -> bool:
+    """Whether the review's own pipeline broke: a reviewer session failed and did not examine the
+    diff. agent-gateway still answers `needs-human` (with `escalationCategory: "blocker"`), but the
+    review is incomplete — a security change reviewed by everything except the security angle is not
+    a reviewed security change — so it is an infrastructure failure: re-run it, never page the owner.
+    The marker is the `file` of a `discussions` entry, never the summary's prose."""
+    discussions = verdict.get("discussions") or []
+    return any(isinstance(d, dict) and d.get("file") == REVIEW_PIPELINE_MARKER for d in discussions)
 
 
 def _review_decide_note(conn: sqlite3.Connection, item: sqlite3.Row) -> str | None:
@@ -456,14 +469,22 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     records the SHA and the train moves to merge.
 
     A non-empty `blocking` list refuses the merge outright, never read as a pass, with ONE
-    precedence above it: `"needs-human"` with an `escalationCategory` (or a schema-1 or revert verdict,
-    which cannot be re-driven) goes to the owner (`needs_decision`, note led by `[category]`) even when
-    it carries findings; a schema-2 one with no category is re-reviewed once per head, then read as the
-    decision (blocking findings revise, none confirms), because that outcome says the REVIEW is incomplete and a revision would be spent on
-    findings its own reviewer would not stand behind. A finding about the PR's own *wrapper* never
+    precedence above it: `"needs-human"` with an `escalationCategory` AND a fixable code finding goes
+    back for a revision (`blocked`) — the findings are a work order, and the owner is paged only once
+    none is left; the rest of that shape (no code finding, a process-only finding only, a schema-1 or
+    revert verdict, which cannot name a category) goes to the owner (`needs_decision`, note led by
+    `[category]`) even when it carries findings. A schema-2 needs-human with no category is
+    re-reviewed once per head, then read as the decision (blocking findings revise, none confirms),
+    because that outcome says the REVIEW is incomplete and a revision would be spent on findings its
+    own reviewer would not stand behind. A finding about the PR's own *wrapper* never
     blocks-and-revises either, since no episode can satisfy it; it also goes to the owner with the
     finding on the card. A `blocked` review goes back to `working` for a revision attempt
     (maybe_revise_blocked()) while any are left, else `failed` carrying the blocking findings.
+
+    A review whose OWN pipeline broke — a `discussions` entry marked `REVIEW_PIPELINE_MARKER`, one per
+    reviewer session that failed without examining the diff — is an infrastructure failure even though
+    agent-gateway answers `needs-human`: the review is incomplete, so it can neither confirm the merge
+    nor be read as an owner question, and is re-run on the same SHA.
 
     A review job that ends with NO verdict (failed/interrupted/cancelled, or `done` with an empty
     result, a schemaVersion mismatch, a job agent-gateway no longer knows) is an infrastructure failure
@@ -472,7 +493,8 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     needs_decision | error`.
 
     Fail-closed: `"clean"` confirms; `"actionable"` with nothing in `blocking` confirms;
-    `"needs-human"` goes to the owner whatever it carries once it names a category (or cannot be re-driven); any other non-empty `blocking` blocks,
+    `"needs-human"` with a category and no fixable code finding goes to the owner (or revises when one
+    is there); any other non-empty `blocking` blocks,
     regardless of `outcome`; anything else (missing, or an outcome this switch does not recognise)
     is `failed`, never a silent confirm. `assert_outcome()` is the first line of defence (a value
     outside `REVIEW_OUTCOMES` is a loud `RemoteError` before this switch runs); this switch's own
@@ -520,6 +542,16 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         _review_failed(str(e))
         return False
 
+    # Same nested envelope as poll_implement_jobs(): the verdict lives in `result`.
+    verdict = resp.get("result") if isinstance(resp.get("result"), dict) else {}
+    # A review whose own pipeline broke is not a verdict at all: the missing angle never examined the
+    # diff, so this review can neither confirm the merge nor be read as an owner question. Re-run it
+    # on the same SHA — the strike/backoff path an errored review job already takes (three strikes
+    # land `failed` on the Argo queue, never a page).
+    if _review_pipeline_failed(verdict):
+        _review_failed("the review's own pipeline failed: a reviewer did not examine the diff")
+        return False
+
     # The CLAIM on acting on this result: the loser skips, and the winner's `retry_at` (the claim's
     # expiry) keeps a third pass off until the claim is released below. It does not end the strike
     # streak: a GitHub read below that keeps failing must reach STRIKE_LIMIT; the verdict acted on
@@ -536,8 +568,6 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     if head != sha:
         return _back_to_update(conn, item, now, f"the PR head moved to {head[:12]} while {sha[:12]} was reviewed")
 
-    # Same nested envelope as poll_implement_jobs(): the verdict lives in `result`.
-    verdict = resp.get("result") if isinstance(resp.get("result"), dict) else {}
     outcome = verdict.get("outcome")
     blocking = verdict.get("blocking") or []
     # The wrapper class is not the implementer's (see is_process_only_finding()). It must not
@@ -571,10 +601,16 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         validation_status = "confirmed"
     elif outcome == "actionable" and not code_blocking and not process_blocking:
         validation_status = "confirmed"
+    elif outcome == "needs-human" and code_blocking and category and not core.is_revert(item):
+        # A needs-human carrying an owner-only reason AND fixable code findings (item 1535): the
+        # findings are a work order, not the decision, so they go back for a revision exactly as an
+        # `actionable` block does (a stalled round under the ordinary rules). The owner is paged only
+        # once no fixable finding is left — a process-only finding or an empty list still needs them.
+        validation_status = "blocked"
     elif outcome == "needs-human":
-        # A needs-human review is a question, not a finding. Checked BEFORE `code_blocking`: the
-        # findings still reach the card, a human is the reader now. Reaches here with a category
-        # (schema 2) or on a schema-1 verdict, which cannot carry one.
+        # The remaining needs-human shapes stay a question: a category with no fixable code finding
+        # (or a process-only finding only), a schema-1 verdict, or a revert — none of which an
+        # implementer can act on. The findings still reach the card, a human is the reader now.
         validation_status = "needs_decision"
         if code_blocking:
             human_question_note = work.format_blocking_findings(code_blocking)

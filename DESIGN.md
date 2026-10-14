@@ -130,6 +130,12 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    GitHub's own rules (`lifecycle.merge`); `warden merge --confirm` uses the same
    gate and additionally requires a reviewed pin — the train's SHA while merging,
    else the item's last review-confirmed head — and refuses without one (intended).
+   A `needs-human` review that names an owner-only `escalationCategory` AND carries a
+   fixable code finding goes back for a revision first (`blocked`) — the owner is paged
+   only once no code finding is left, or the listing is process-only; one whose own
+   pipeline failed (a reviewer session that did not examine the diff, marked by a
+   `(review pipeline)` entry in the verdict's `discussions`) is an infrastructure failure
+   and the review re-runs on the same SHA, never `needs_decision`.
    A PR found already merged is landed from the ledger only when its head is the
    pinned one and a review confirmed that head; merged by hand otherwise, the item
    verifies by signal only (no deploy, no `make verify`).
