@@ -130,9 +130,10 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    GitHub's own rules (`lifecycle.merge`); `warden merge --confirm` uses the same
    gate and additionally requires a reviewed pin — the train's SHA while merging,
    else the item's last review-confirmed head — and refuses without one (intended).
-   A `needs-human` review that names an owner-only `escalationCategory` AND carries a
-   fixable code finding goes back for a revision first (`blocked`) — the owner is paged
-   only once no code finding is left, or the listing is process-only; one whose own
+   A `needs-human` review labelled `product` or `blocker` that carries a fixable code
+   finding goes back for a revision first (`blocked`) — the owner is paged only once no
+   code finding is left, or the listing is process-only; `security`, `data_loss`, `spend`
+   and `other_people` always reach the owner; one whose own
    pipeline failed (a reviewer session that did not examine the diff, marked by a
    `(review pipeline)` entry in the verdict's `discussions`) is an infrastructure failure
    and the review re-runs on the same SHA, never `needs_decision`.
