@@ -10351,3 +10351,21 @@ left as a finding, not fixed here.
 
 `test_triage.py` 574 -> 579 (the park, and the four fallbacks: base green, check absent, unreadable
 base, no `base.sha`). `make check` green.
+
+## 160. `make check` provisions the venv a fresh worktree lacks (2026-10-14)
+
+The repo contract's check is a bare `make check`, and agent-gateway's check job (item 1531) now runs
+it in a fresh linked worktree of the repo. warden's `check` died there on `compile`'s `[ -x $(PY) ]`
+guard: `.venv` is gitignored, so a fresh worktree has none and nothing had run `make venv`. Running
+the suites on `python3.11` instead (no venv) is not enough — `scripts/warden`, `deploy.sh` and
+`warden-backup.sh` all hardcode `.venv/bin/python3` and several suites exercise those entry points,
+so `check` genuinely needs a venv.
+
+`check` now depends on a new `ensure-venv`: it creates a BARE venv from the pinned `python3.11` when
+`.venv/bin/python3` is missing — no pip, no network, which is all a pure-stdlib repo needs. `make venv`
+keeps its contract exactly (it gained the same prerequisite, `venv: ensure-venv`, so it still installs
+`requirements.txt` into an existing venv), and `make test` on its own still refuses without one.
+
+`test_makefile.py` 9 -> 10 (`test_ensure_venv_creates_the_missing_venv_the_check_job_needs`).
+`make check` green (579/579), proven from a worktree with `.venv` removed: `check` created the venv
+and every suite passed.

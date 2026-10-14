@@ -91,6 +91,20 @@ def test_venv_is_not_gated_from_a_linked_worktree():
         assert "no-such-python-for-test not found" in out, out
         assert "worktree" not in out, out
 
+
+def test_ensure_venv_creates_the_missing_venv_the_check_job_needs():
+    # The repo contract's `make check` runs a bare `make check` in a FRESH linked worktree
+    # (agent-gateway's check job, a dispatch episode) where nothing ran `make venv`; every
+    # entry point resolves .venv/bin/python3, so `check` first calls `ensure-venv`. It must
+    # create a usable interpreter there (a worktree is not the gate's business).
+    with Fixture() as f:
+        target = f.root / "venv-under-test"
+        res = f.make(f.worktree, "ensure-venv", f"VENV={target}")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        assert (target / "bin" / "python3").exists(), (res.stdout, res.stderr)
+        assert "worktree" not in res.stdout + res.stderr, res.stdout + res.stderr
+
+
 def test_link_refuses_from_a_worktree_even_with_ignore_errors():
     # `make -i` skips a failed prerequisite; the write must still not happen.
     with Fixture() as f:
