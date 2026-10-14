@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§161 — the base-red park baselines on the base the train SHA was built on) |
+| Last updated | 2026-10-14 (§162 — the base-red park re-enters `update` to re-derive the base) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 20 |
@@ -49,12 +49,16 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   train SHA with `train_base_sha` — the base commit the SHA was rebased onto,
   captured from `update_pr`'s result when the train SHA was BUILT, never the PR's
   current `base.sha` (which may have advanced past it). When every failing check
-  also fails on that base, the red is the base's, so the item parks
-  (`core.park`, no strike, no revision) until the base goes green rather than
-  spending a stalled round on a fix that cannot land. A base green on that check,
-  a check absent from the base, no recorded base, or an unreadable base keeps the
-  `checks_failed` revision path. `update_pr`'s own `checks.passed == false` result
-  is not baselined (carried debt).
+  also fails on that base, the red is the base's, so the item parks (no strike, no
+  revision) until the base goes green rather than spending a stalled round on a fix
+  that cannot land — but not on the frozen base commit forever: the park sends the
+  item back to `update` (`retry_at` +PARK_MINUTES, no `train_rewinds` bump, since the
+  head did not move), so the next pass re-runs `update_pr` and re-derives
+  `train_base_sha`/`train_sha` against the live base tip, and a base fix landing as a
+  later commit is observed. A base green on that check, a check absent from the
+  base, no recorded base, or an unreadable base keeps the `checks_failed` revision
+  path. `update_pr`'s own `checks.passed == false` result is not baselined (carried
+  debt).
 - **Ledger:** every pending migration first writes
   `~/.warden/backups/pre-migration-v<from>-to-<to>-<stamp>-<pid>.db` (never pruned).
 - **`failed` is classified.** Every `failed` row carries `failure_class` (`infra` |

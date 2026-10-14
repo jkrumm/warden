@@ -124,7 +124,9 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    and none there is still pending) on that SHA → review `confirmed` on that SHA → squash merge pinned to it. A head
    that moves goes back to `update`. A red check that also fails on the base the SHA was rebased onto
    (`train_base_sha`, captured at `update`) is the
-   base's, not the PR's: the item parks (no strike, no revision) until the base goes green. The gate is exactly those four facts plus
+   base's, not the PR's: the item parks (no strike, no revision) until the base goes green, re-entering
+   `update` each park so it re-derives that base against the live branch tip rather than a frozen
+   red commit. The gate is exactly those four facts plus
    GitHub's own rules (`lifecycle.merge`); `warden merge --confirm` uses the same
    gate and additionally requires a reviewed pin — the train's SHA while merging,
    else the item's last review-confirmed head — and refuses without one (intended).

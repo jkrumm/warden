@@ -11994,20 +11994,44 @@ def _checks_per_sha(head, base):
 
 def test_train_a_red_check_red_on_the_base_too_parks_without_a_revision():
     """A check failing on the train's SHA that fails on the base commit too is the BASE's red: the
-    item parks (same stage, no strike, no stalled round, no revision) until the base goes green,
-    instead of spending an attempt on a fix that cannot land."""
+    item parks (back to `update` to re-derive the base, no strike, no stalled round, no revision)
+    until the base goes green, instead of spending an attempt on a fix that cannot land."""
     with _triage_env() as (conn, ctx):
         eid = _red_checks_item(conn, "sig-train-base-red")
         _github.check_runs = _checks_per_sha(
             _HEAD_RED, [{"name": "e2e", "status": "completed", "conclusion": "failure"}])
         _train_pass(conn)
         item = core.get_item(conn, eid)
-        assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_CHECKS, dict(item)
-        assert item["strikes"] == 0 and item["stalled_rounds"] == 0, dict(item)
+        assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_UPDATE, dict(item)
+        assert item["train_sha"] is None and item["train_base_sha"] is None, dict(item)
+        assert item["strikes"] == 0 and item["stalled_rounds"] == 0 and item["train_rewinds"] == 0, dict(item)
         assert item["retry_at"] == (NOW + dt.timedelta(minutes=core.PARK_MINUTES)).isoformat(), dict(item)
         assert item["note"].startswith("parked:") and "e2e" in item["note"], item["note"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-base-red'").fetchone()
         assert d["validation_status"] is None, "a parked base red is not a checks_failed revision"
+
+
+def test_train_a_repo_wide_red_park_re_triggers_update_to_re_derive_the_base():
+    """Parking on a repo-wide red does not re-read the frozen base commit forever: the item is sent
+    back to `update`, so the next pass after the park re-runs `update_pr` and re-derives
+    `train_base_sha` against the live base tip (a fix landing as a later commit, not a force-push to
+    the red SHA)."""
+    with _triage_env() as (conn, ctx):
+        eid = _red_checks_item(conn, "sig-train-base-red-retrigger")
+        _github.check_runs = _checks_per_sha(
+            _HEAD_RED, [{"name": "e2e", "status": "completed", "conclusion": "failure"}])
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["train_stage"] == train.TRAIN_UPDATE and item["train_sha"] is None, dict(item)
+        assert item["train_rewinds"] == 0 and item["strikes"] == 0, dict(item)
+        # The re-trigger is a rebase, not a head-moved rewind: once the park elapses the train
+        # submits a fresh update_pr, and the frozen base is never re-read on the checks stage again.
+        updates: list[dict[str, Any]] = []
+        _agent_gateway.submit_update_pr = _fake_update_pr(updates)
+        _train_pass(conn, core.PARK_MINUTES)
+        assert updates == [{"cwd": updates[0]["cwd"], "pr": 10}], updates
+        item = core.get_item(conn, eid)
+        assert item["train_stage"] == train.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
 
 
 def test_train_a_red_check_only_on_the_pr_revises_when_the_base_is_green():
