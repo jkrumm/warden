@@ -10311,3 +10311,21 @@ still recorded in the note as `superseded PR <url>`, so the ledger keeps the poi
 'Superseded' comment lands on the PR itself.
 
 `test_triage.py` 571 -> 572 (`test_a_reopen_does_not_close_an_already_merged_pr`). `make check` green.
+
+## 158. A reopen is an atomic claim on state + occurrence mark (2026-10-14)
+
+Review of §154–§157. `reopen_if_needed()` still SELECTed the still-closed rows and then reopened
+each with an unconditional `set_state(..., STATE_NEW)`, so two concurrent triage passes could both
+claim the same recurrence: if the first pass reached `working` before the second applied its stale
+read, the second reset the item to `new` and cleared the fresh attempt's `implement_job`/`pr_url`.
+The SELECT-then-update was not atomic.
+
+`set_state()` gained `expect_mark`, a compare-and-set on `occurrence_mark` mirroring `expect_state`:
+that column is the helper's own (computed from the event, written on every transition), so it is not
+in `_SET_STATE_COLUMNS` and needs its own parameter rather than riding `expect_eq`. `reopen_if_needed()`
+now reopens with `expect_state=<the closed state it read>` and `expect_mark=<the stored mark it
+read>`, and it records the superseded PR for closing only when the transition's rowcount is non-zero
+— so only the caller whose claim actually succeeded closes/annotates the superseded PR.
+
+`test_triage.py` 572 -> 574 (`test_set_state_expect_mark_is_a_compare_and_swap`,
+`test_a_stale_reopen_does_not_clobber_a_concurrent_fresh_attempt`). `make check` green.

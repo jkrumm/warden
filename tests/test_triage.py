@@ -8002,6 +8002,68 @@ def test_a_reopen_does_not_close_an_already_merged_pr():
         assert CLOSED_PRS == [], "a merged PR must not be commented 'Superseded' nor PATCH-closed"
 
 
+def test_set_state_expect_mark_is_a_compare_and_swap():
+    """`set_state`'s `expect_mark` is a compare-and-set on `occurrence_mark`, the helper-owned column
+    that is therefore outside `_SET_STATE_COLUMNS` (it is written on every transition, computed from
+    the event, so it gets its own CAS parameter rather than riding `expect_eq`). reopen_if_needed()
+    uses it so a concurrent triage pass that already re-stamped the mark makes the stale claim lose."""
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="mark-cas", title="x", first_seen=OLD)
+        intake.ingest(conn, NOW)
+        core.set_state(conn, eid, core.STATE_QUIET, NOW)   # closed; stamps the current mark
+        stored = _rows(conn, eid)["occurrence_mark"]
+        assert stored is not None
+        # A concurrent pass re-stamps the mark alone (the plain-UPDATE path reopen_if_needed() uses
+        # for a NULL baseline is the only non-set_state writer of the mark).
+        conn.execute("UPDATE triage_items SET occurrence_mark=? WHERE event_id=?", ("re-stamped", eid))
+        conn.commit()
+        # State still `quiet`, but the mark moved: the stale claim loses.
+        assert core.set_state(conn, eid, core.STATE_NEW, NOW,
+                              expect_state=core.STATE_QUIET, expect_mark=stored) == 0
+        assert _rows(conn, eid)["state"] == core.STATE_QUIET, "a lost claim must not move the row"
+        # A claim that read the CURRENT mark wins.
+        assert core.set_state(conn, eid, core.STATE_NEW, NOW,
+                              expect_state=core.STATE_QUIET, expect_mark="re-stamped") == 1
+
+
+def test_a_stale_reopen_does_not_clobber_a_concurrent_fresh_attempt():
+    """The concurrency finding on reopen_if_needed(): two triage passes both SELECT a still-closed
+    row and both try to reopen it. The first wins and proceeds to `working`; the second, applying its
+    stale read, must not reset the item to `new` and clear the fresh attempt's job/PR fields. The
+    reopen is now a compare-and-set on both the closed state and the stored occurrence mark, so the
+    loser's UPDATE matches nothing and closes nothing."""
+    pr = "https://github.com/jkrumm/demo-repo/pull/9"
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="race-reopen", title="Race",
+                            first_seen=OLD)
+        intake.ingest(conn, NOW)
+        conn.execute(
+            "UPDATE triage_items SET dispatch_job=?, artifact_url=?, implement_job=?, validation_job=?, "
+            "pr_url=?, reviewed_sha=?, blocked_sha=?, revision_count=4, stalled_rounds=2 WHERE event_id=?",
+            ("investigate-old", pr, "impl-old", "val-old", pr, "a" * 40, "b" * 40, eid))
+        core.set_state(conn, eid, core.STATE_FIXED, NOW)
+        stored_mark = _rows(conn, eid)["occurrence_mark"]
+        _recur_ts(conn, eid, "1788850795.862159")
+        # The winning pass: reopen_if_needed() reopens to `new` and closes the cleared PR once.
+        intake.reopen_if_needed(conn, NOW)
+        assert _rows(conn, eid)["state"] == core.STATE_NEW
+        assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 9)], CLOSED_PRS
+        # The winner proceeds to `working` with a fresh attempt.
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, implement_job="impl-fresh",
+                       pr_url=pr, revision_count=1)
+        # The losing pass's stale read: the row it saw was `fixed` with `stored_mark`. Its reopen
+        # compare-and-set matches nothing now, so it must leave the fresh attempt alone.
+        lost = core.set_state(conn, eid, core.STATE_NEW, NOW,
+                              expect_state=core.STATE_FIXED, expect_mark=stored_mark,
+                              implement_job=None, validation_job=None, pr_url=None,
+                              reviewed_sha=None, blocked_sha=None, revision_count=0, stalled_rounds=0)
+        assert lost == 0, "the stale reopen must lose its compare-and-set"
+        item = _rows(conn, eid)
+        assert item["state"] == core.STATE_WORKING, dict(item)
+        assert item["implement_job"] == "impl-fresh" and item["pr_url"] == pr and item["revision_count"] == 1, dict(item)
+        assert [c[:3] for c in CLOSED_PRS] == [("jkrumm", "demo-repo", 9)], "the loser closes nothing extra"
+
+
 def test_the_shipped_policy_keeps_the_label_rules_without_evidence():
     policy = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())
     assert len(policy["rules"]) == 73 and len(policy["ignore"]) == 15
