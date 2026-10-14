@@ -253,7 +253,7 @@ def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: d
     branch's own (including one ABSENT from the base), or the base cannot be read at all — only a
     base that is READ and fails every failing check parks. Returns whether it parked."""
     base_sha = _pr_base_sha(owner, name, number)
-    if base_sha is None or base_sha == item["train_sha"]:
+    if base_sha is None:
         return False
     try:
         base_runs = _merge.read_check_runs(owner, name, base_sha)
