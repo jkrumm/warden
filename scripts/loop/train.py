@@ -27,9 +27,10 @@ from loop import core, work, verify
 #   checks  GitHub's check runs on `train_sha`, read every pass, no deadline: green or none ->
 #           review (none read within CHECKS_REGISTER_GRACE of update's push is still pending);
 #           any completed failure -> park when every failing check also fails on the base the SHA
-#           was built on (train_base_sha), else a `checks_failed` revision; unreadable -> `failed`;
-#           the PR head moved off `train_sha` -> update (past TRAIN_REWIND_LIMIT rewinds, each
-#           strikes).
+#           was built on (train_base_sha), which re-triggers `update` so the parked item re-derives
+#           that base against the live branch tip instead of a frozen commit, else a `checks_failed`
+#           revision; unreadable -> `failed`; the PR head moved off `train_sha` -> update (past
+#           TRAIN_REWIND_LIMIT rewinds, each strikes).
 #   review  the step-7 review of exactly `train_sha`, skipped when a review already confirmed
 #           that SHA (`reviewed_sha`). The PR head is checked before the submit and after the
 #           fold (the review reports no SHA of its own); a move sends the train to update.
@@ -240,8 +241,7 @@ def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: d
                              owner: str, name: str, runs: list[dict[str, Any]]) -> bool:
     """A failing check on the train's SHA that fails on the BASE the SHA was built on too is the
     BASE's red, not the pull request's: no revision of the branch can clear it, so the item PARKS
-    (core.park: same stage, `retry_at` +25 min, no strike) until the base goes green, instead of
-    spending a stalled round on a fix that cannot land.
+    until the base goes green, instead of spending a stalled round on a fix that cannot land.
 
     The baseline is `train_base_sha`, the base captured when the train SHA was BUILT (the update
     stage's `update_pr` result), never the PR's `base.sha` read now: the base may have advanced
@@ -249,7 +249,15 @@ def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: d
     failing check is the base's own. The revision path is kept whenever the base is green on that
     check, any failing check is the branch's own (including one ABSENT from the base), or no base
     was captured / it cannot be read — only a base that is KNOWN and fails every failing check
-    parks. Returns whether it parked."""
+    parks.
+
+    The park is not a re-check of the same frozen commit forever: `train_base_sha` pins the base to
+    the SHA that was red when the item parked, and that commit's check runs never change, so a base
+    fix that lands as a LATER commit (not a force-push to the same SHA) is invisible to a
+    checks-stage re-read and the item would never un-park. The item is therefore sent back to
+    `update` (a rebase trigger) parked the same way — `retry_at` +PARK_MINUTES, no strike, no
+    `train_rewinds` bump, since the PR head did not move — so the next pass re-runs `update_pr` and
+    re-derives `train_sha`/`train_base_sha` against the current base tip. Returns whether it parked."""
     base_sha = item["train_base_sha"]
     if base_sha is None:
         return False
@@ -263,11 +271,12 @@ def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: d
     if not _merge.repo_wide_red(head_runs=runs, base_runs=base_runs):
         return False
     failing = ", ".join(sorted(_merge.failing_check_names(runs)))
-    core.park(conn, item["event_id"], now,
-              f"{owner}/{name} base {base_sha[:12]} CI red ({failing}) — not this PR's; "
-              f"a revision cannot fix it, waiting for the base to go green",
-              state=core.STATE_MERGING, expect_eq=_train_expect(item))
-    return True
+    reason = (f"{owner}/{name} base {base_sha[:12]} CI red ({failing}) — not this PR's; "
+              f"a revision cannot fix it, waiting for the base to go green")
+    return _train_hop(conn, item, now, train_stage=TRAIN_UPDATE, train_sha=None, train_base_sha=None,
+                      train_job=None, validation_job=None,
+                      retry_at=core.now_iso(now + dt.timedelta(minutes=core.PARK_MINUTES)),
+                      note=f"parked: {reason}")
 
 
 def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,

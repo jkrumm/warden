@@ -10389,3 +10389,26 @@ itself (`merge.repo_wide_red` / `failing_check_names`) is unchanged. `update_pr`
 
 `test_triage.py` 579 -> 580 (the base advancing A -> B between training and checking now keeps the
 revision path and never reads B); `test_ledger.py` gains migration 20. `make check` green (580/580).
+
+## 162. The base-red park re-enters `update` to re-derive the base (2026-10-14)
+
+Review of §161. `_park_on_a_repo_wide_red` baselined on the captured `train_base_sha` — correct —
+but it parked with `core.park`, which keeps the item on the checks stage, so the item re-read the
+SAME frozen `train_base_sha` every pass and could never un-park: `train_base_sha` is the SHA that
+was red when the item parked, its check runs never change, and a base fix that lands as a LATER
+commit (not a force-push to the same SHA) is invisible to that re-read. The other `core.park()`
+call sites (train.py's merge, verify.py's deploy) each re-check a live condition (the checkout)
+every tick; this one re-checked a frozen historical fact, contradicting the documented "parks until
+the base goes green".
+
+The park now sends the item back to `update` instead of staying on `checks`: `_park_on_a_repo_wide_red`
+writes `train_stage=TRAIN_UPDATE` (clearing `train_sha`/`train_base_sha`/`train_job`) with
+`retry_at` +PARK_MINUTES and the `parked:` note — a rebase trigger, not a head-moved rewind, so no
+`train_rewinds` bump and no strike. The next pass re-runs `update_pr`, which re-derives
+`train_sha`/`train_base_sha` against the live base tip; a green base lets the item proceed, a still-red
+one re-parks. The baseline comparison itself is unchanged (`merge.repo_wide_red` /
+`failing_check_names`).
+
+`test_triage.py` 580 -> 581 (the park now asserts `train_stage == update` with cleared SHAs, and a
+new test proves the elapsing park submits a fresh `update_pr` rather than re-reading the frozen base).
+`make check` green (581/581).
