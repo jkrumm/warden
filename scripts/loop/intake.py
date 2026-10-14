@@ -244,7 +244,10 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
     The cleared `pr_url` names a pull request that is CLOSED best-effort after the commit and kept in
     the note as `superseded PR <url>`, exactly as reinvestigate() does: leaving it open would make
     the fresh run's own PR a second one beside it, and a stale URL would mis-route a later
-    `work`-failure back to `merging` (item 1480). `dispatch_job` stays as the escalation cooldown
+    `work`-failure back to `merging` (item 1480). Only a still-open PR is closed: a `fixed` item's
+    PR is already merged (the `fixed` transition keeps `pr_url`), so close_reopened_pr() checks its
+    state and leaves a merged one alone rather than posting a false 'Superseded' comment on it.
+    `dispatch_job` stays as the escalation cooldown
     anchor (cooldown_ok()), which also makes the reopened item escalate as a singleton (escalate()).
 
     The predicate is "the event's occurrence_mark() changed since this row's last transition", NOT

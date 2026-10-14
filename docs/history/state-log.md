@@ -10294,3 +10294,20 @@ omitted, matching `resolve_quiet_grouped()`'s "pure local bookkeeping runs for r
 only the eventual notification respects `dry_run`".
 
 `test_triage.py` 570 -> 571 (`test_a_reopen_under_dry_run_makes_no_outbound_close`). `make check` green.
+
+## 157. A reopen leaves an already-merged PR alone (2026-10-14)
+
+Review of §155/§156. `reopen_if_needed()` closes and comments the `pr_url` it clears for every
+reopened row, but it also reopens `fixed` items — and `verify.py`'s `fixed` transition does not clear
+`pr_url`, so a `fixed` item's PR is the fix that already MERGED. Posting the 'Superseded: this
+signature recurred…' comment on it before the close is a false claim (nothing superseded it), and the
+closed-state PATCH is a no-op on a merged PR. `reinvestigate()` never hit this because
+`REINVESTIGATE_ALLOWED_STATES` excludes `fixed`; the reopen's recurrence predicate does not.
+
+`core.close_reopened_pr()` now reads the PR's state first (`read_pr`) and only comments/closes when it
+is still `open`; a merged (or otherwise closed) one is left alone, and an unreadable state fails
+closed the same way. The local transition is unchanged: `pr_url` is still cleared and the cleared URL
+still recorded in the note as `superseded PR <url>`, so the ledger keeps the pointer even though no
+'Superseded' comment lands on the PR itself.
+
+`test_triage.py` 571 -> 572 (`test_a_reopen_does_not_close_an_already_merged_pr`). `make check` green.

@@ -7977,6 +7977,31 @@ def test_a_reopen_under_dry_run_makes_no_outbound_close():
         assert CLOSED_PRS == [], "dry-run must not close the superseded PR on GitHub"
 
 
+def test_a_reopen_does_not_close_an_already_merged_pr():
+    """A `fixed` item's PR is already merged (verify.py's `fixed` transition keeps `pr_url`), so a
+    recurrence must not post 'Superseded: …' on it or PATCH it closed — the comment would be a false
+    claim (nothing superseded it) and the close a no-op. reopen_if_needed() still clears the handle
+    and records the cleared URL in the note, but close_reopened_pr() reads the PR state first and
+    leaves a non-open one alone."""
+    pr = "https://github.com/jkrumm/demo-repo/pull/9"
+    with _triage_env() as (conn, ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="merged-reopen", title="Merged",
+                            first_seen=OLD)
+        intake.ingest(conn, NOW)
+        conn.execute(
+            "UPDATE triage_items SET dispatch_job=?, artifact_url=?, implement_job=?, validation_job=?, "
+            "pr_url=?, reviewed_sha=?, blocked_sha=?, revision_count=4, stalled_rounds=2 WHERE event_id=?",
+            ("investigate-old", pr, "impl-old", "val-old", pr, "a" * 40, "b" * 40, eid))
+        core.set_state(conn, eid, core.STATE_FIXED, NOW)
+        PR_HEAD["state"] = "closed"   # the fix's PR merged, so GitHub reports it closed
+        _recur_ts(conn, eid, "1788850795.862159")
+        intake.reopen_if_needed(conn, NOW)
+        item = _rows(conn, eid)
+        assert item["state"] == core.STATE_NEW and item["pr_url"] is None, dict(item)
+        assert item["note"] == f"superseded PR {pr}", "the cleared URL is still recorded in the note"
+        assert CLOSED_PRS == [], "a merged PR must not be commented 'Superseded' nor PATCH-closed"
+
+
 def test_the_shipped_policy_keeps_the_label_rules_without_evidence():
     policy = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())
     assert len(policy["rules"]) == 73 and len(policy["ignore"]) == 15
