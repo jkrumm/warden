@@ -10412,3 +10412,26 @@ one re-parks. The baseline comparison itself is unchanged (`merge.repo_wide_red`
 `test_triage.py` 580 -> 581 (the park now asserts `train_stage == update` with cleared SHAs, and a
 new test proves the elapsing park submits a fresh `update_pr` rather than re-reading the frozen base).
 `make check` green (581/581).
+
+## 163. The update stage's own red is baselined against the base (2026-10-14)
+
+Review of §162 blocked it: `_park_on_a_repo_wide_red` fixed the CHECKS stage, but the
+update stage's own `checks.passed == false` result was still un-baselined. Reachable:
+the item parks on a red base A; the default branch advances to B and stays red (weatherorb —
+four consecutive red commits); 25 min later the parked item resubmits `update_pr`, which
+rebases onto B, re-runs checks, they fail, and `hand_back_for_revision(outcome="checks_failed")`
+fired — a revision for a red the branch cannot fix, the exact outcome the park exists to
+prevent, and contradicting "parks until the base goes green".
+
+`_train_update` now reads the head's check runs and calls `_park_on_a_repo_wide_red` with the
+result's own `baseSha` before revising, so a red that is the base's parks again instead. The
+baseline is the base the branch was JUST rebased onto (the result's `baseSha`), not the stored
+`train_base_sha` (which the park cleared), and never a live `base.sha`. An unreadable head falls
+back to the revision path as before.
+
+`baseSha` is also pinned as required in `update_pr_result()` for `updated`/`up_to_date` (a
+`conflict` carries none and stays exempt): a successful result missing it is now a loud
+`RemoteError` strike, not a silent NULL `train_base_sha` that quietly reverted the feature.
+
+`test_triage.py` 581 -> 582 (the update-stage red on a red base parks); `test_clients.py` gains a
+missing-`baseSha` refusal case. `make check` green (582/582).

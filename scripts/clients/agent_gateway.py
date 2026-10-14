@@ -239,9 +239,11 @@ def submit_update_pr(*, cwd: str | Path, pr: int) -> dict[str, Any]:
 def update_pr_result(job: dict[str, Any]) -> dict[str, Any]:
     """The validated result of a `done` update_pr job (server/jobs/handlers/update-pr.ts
     UPDATE_PR_OUTPUT): `status` one of UPDATE_PR_STATUSES, `headSha`/`previousHeadSha` 40-hex
-    commits, `prUrl` a string, and `checks{passed, summary}` present whenever the branch was
-    `updated` (the train decides from it). Any other shape raises a loud `RemoteError` — never a
-    best-effort read: a train that guessed would merge a SHA nobody checked."""
+    commits, `baseSha` a 40-hex commit whenever the branch was not a `conflict` (the base the
+    train SHA now sits on — the checks stage baselines a red against it), `prUrl` a string, and
+    `checks{passed, summary}` present whenever the branch was `updated` (the train decides from
+    it). Any other shape raises a loud `RemoteError` — never a best-effort read: a train that
+    guessed would merge a SHA nobody checked."""
     result = job.get("result")
     if job.get("status") != "done" or not isinstance(result, dict):
         raise RemoteError(f"agent-gateway update_pr job {job.get('id')} ended '{job.get('status')}' with no result")
@@ -255,6 +257,12 @@ def update_pr_result(job: dict[str, Any]) -> dict[str, Any]:
         value = result.get(key)
         if not isinstance(value, str) or not _SHA_RE.match(value):
             raise RemoteError(f"agent-gateway update_pr result {key} {value!r} is not a 40-hex commit — refusing to parse")
+    if status != "conflict":
+        base_sha = result.get("baseSha")
+        if not isinstance(base_sha, str) or not _SHA_RE.match(base_sha):
+            raise RemoteError(
+                f"agent-gateway update_pr result baseSha {base_sha!r} is not a 40-hex commit — refusing to parse"
+            )
     if not isinstance(result.get("prUrl"), str):
         raise RemoteError("agent-gateway update_pr result carries no prUrl — refusing to parse")
     checks = result.get("checks")
