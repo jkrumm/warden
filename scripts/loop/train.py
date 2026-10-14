@@ -266,8 +266,8 @@ def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: d
         return False
     failing = ", ".join(sorted(_merge.failing_check_names(runs)))
     core.park(conn, item["event_id"], now,
-              f"CI is red on the base commit too ({failing}) — a revision cannot fix it, "
-              f"waiting for the base to go green",
+              f"{owner}/{name} base {base_sha[:12]} CI red ({failing}) — not this PR's; "
+              f"a revision cannot fix it, waiting for the base to go green",
               state=core.STATE_MERGING, expect_eq=_train_expect(item))
     return True
 
