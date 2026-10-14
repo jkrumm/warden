@@ -292,8 +292,8 @@ def test_migrate_adopts_pre_versioned_database():
         "origin_channel", "origin_thread_ts", "revision_count", "close_reason", "strikes", "retry_at",
         "root_cause", "duplicate_of", "triage_job", "triage_job_at",
         "verify_started_at", "verify_mark", "verify_failures", "verify_result",
-        "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
-        "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
+        "train_stage", "train_sha", "train_base_sha", "train_job", "reviewed_sha", "train_evidence",
+        "train_rewinds", "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
         "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
         "failure_class", "redrive_json", "redrives", "blocked_sha", "stalled_rounds",
     }, (
@@ -1057,7 +1057,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     conn = ledger.connect(path, migrate=True)
     after = dt.datetime.now(dt.timezone.utc)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 19 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 20 == ledger.LEDGER_SCHEMA_VERSION
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
     assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
@@ -1135,7 +1135,7 @@ def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_r
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 19 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 20 == ledger.LEDGER_SCHEMA_VERSION
     assert {"failure_class", "redrive_json", "redrives"} <= _table_columns(conn, "triage_items")
     rows = {r["event_id"]: r for r in conn.execute("SELECT * FROM triage_items")}
 
@@ -1292,6 +1292,30 @@ def test_migration_19_adds_stalled_rounds_defaulting_to_zero():
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
     row = conn.execute("SELECT * FROM triage_items WHERE event_id=1").fetchone()
     assert row["stalled_rounds"] == 0 and row["revision_count"] == 2 and row["note"] == "a note", dict(row)
+    conn.close()
+
+
+def test_migration_20_adds_train_base_sha_without_touching_rows():
+    path = _tmp_path()
+    old = sqlite3.connect(path)
+    old.executescript(ledger.BASE_SCHEMA)
+    for version in range(2, 20):
+        old.executescript(ledger.MIGRATIONS[version])
+    old.execute(ledger._SCHEMA_VERSION_TABLE)
+    old.execute("INSERT INTO schema_version (version, applied_at) VALUES (19, 'test')")
+    old.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (1, 's', 'e1', 't', 'now')")
+    old.execute("INSERT INTO triage_items(event_id, signature, state, note, created_at, updated_at) "
+                "VALUES (1, 's:e1', 'merging', 'a note', 'now', 'now')")
+    old.commit()
+    assert "train_base_sha" not in _table_columns(old, "triage_items"), "the v19 fixture predates the column"
+    old.close()
+
+    conn = ledger.connect(path, migrate=True)
+    conn.row_factory = sqlite3.Row
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
+    assert "train_base_sha" in _table_columns(conn, "triage_items")
+    row = conn.execute("SELECT * FROM triage_items WHERE event_id=1").fetchone()
+    assert row["train_base_sha"] is None and row["note"] == "a note", "adding the column touches no row"
     conn.close()
 
 

@@ -10369,3 +10369,23 @@ keeps its contract exactly (it gained the same prerequisite, `venv: ensure-venv`
 `test_makefile.py` 9 -> 10 (`test_ensure_venv_creates_the_missing_venv_the_check_job_needs`).
 `make check` green (579/579), proven from a worktree with `.venv` removed: `check` created the venv
 and every suite passed.
+
+## 161. The base-red park baselines on the base the train SHA was built on (2026-10-14)
+
+§159's park compared the train SHA's failing checks with the pull request's `base.sha` read AT CHECK
+TIME. An independent review found that wrong: the base is dynamic, and `update_pr` rebased the branch
+onto the base as it stood when the train SHA was BUILT. If the base advances between training and
+checking (A -> B) while the branch's own check (`e2e`) genuinely failed, the code compared against B,
+saw B's unrelated red under the same check name, called it repo-wide and PARKED a revision that could
+have fixed the branch — the mirror of the bug the park exists to prevent.
+
+The base is now captured where it is known: `_train_update` persists `update_pr`'s `baseSha` (the
+commit the branch now sits on) into a new `triage_items.train_base_sha` (migration 20, schema 20),
+cleared with the rest of the train position. `_park_on_a_repo_wide_red` baselines on that stored
+commit, never a live read; a row with no recorded base (pre-migration, or a result that carried none)
+keeps the revision path. `_pr_base_sha()` and the live `read_pr` base read are gone. The comparison
+itself (`merge.repo_wide_red` / `failing_check_names`) is unchanged. `update_pr`'s own
+`checks.passed == false` result is still un-baselined (carried debt).
+
+`test_triage.py` 579 -> 580 (the base advancing A -> B between training and checking now keeps the
+revision path and never reads B); `test_ledger.py` gains migration 20. `make check` green (580/580).

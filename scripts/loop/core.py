@@ -642,8 +642,9 @@ _SET_STATE_COLUMNS = (
     "verify_started_at", "verify_mark", "verify_failures", "verify_result",
     "revert_pr", "close_reason", "strikes", "retry_at", "revision_count", "stalled_rounds",
     "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
-    "train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
-    "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json", "blocked_sha",
+    "train_stage", "train_sha", "train_base_sha", "train_job", "reviewed_sha", "train_evidence",
+    "train_rewinds", "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
+    "blocked_sha",
     "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
     "failure_class", "redrive_json", "redrives",
 )
@@ -661,7 +662,7 @@ REINVESTIGATE_ALLOWED_STATES = (STATE_NEEDS_DECISION, STATE_FAILED, STATE_QUIET)
 # The merge train's position, meaningful only while the item is `merging`: leaving it clears
 # them (set_state()), so a train never resumes from a stale stage or SHA. `reviewed_sha`,
 # `blocked_sha` and `train_evidence` are not among them; see advance_merge_trains().
-_TRAIN_POSITION = ("train_stage", "train_sha", "train_job", "train_pushed_at")
+_TRAIN_POSITION = ("train_stage", "train_sha", "train_base_sha", "train_job", "train_pushed_at")
 
 # An item entering `verifying` starts with no verification history: no deploy yet
 # (`verify_started_at` NULL), no baseline, no failures. `deploy_expect_json` is the host verb's

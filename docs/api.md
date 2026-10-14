@@ -66,7 +66,7 @@ Every non-terminal `triage_items` row plus counts.
 ```json
 {
   "generated_at": "...",
-  "schema_version": 19,
+  "schema_version": 20,
   "counts": {"new": 0, "triaged": 0, "working": 1, "merging": 0,
              "verifying": 0, "needs_decision": 2, "failed": 0},
   "items": [{

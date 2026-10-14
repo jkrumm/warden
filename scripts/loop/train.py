@@ -26,8 +26,10 @@ from loop import core, work, verify
 #           in LEASE_RETRY_MINUTES; otherwise the head it reports is the train's SHA (`train_sha`).
 #   checks  GitHub's check runs on `train_sha`, read every pass, no deadline: green or none ->
 #           review (none read within CHECKS_REGISTER_GRACE of update's push is still pending);
-#           any completed failure -> a `checks_failed` revision; unreadable -> `failed`; the PR
-#           head moved off `train_sha` -> update (past TRAIN_REWIND_LIMIT rewinds, each strikes).
+#           any completed failure -> park when every failing check also fails on the base the SHA
+#           was built on (train_base_sha), else a `checks_failed` revision; unreadable -> `failed`;
+#           the PR head moved off `train_sha` -> update (past TRAIN_REWIND_LIMIT rewinds, each
+#           strikes).
 #   review  the step-7 review of exactly `train_sha`, skipped when a review already confirmed
 #           that SHA (`reviewed_sha`). The PR head is checked before the submit and after the
 #           fold (the review reports no SHA of its own); a move sends the train to update.
@@ -60,7 +62,8 @@ CHECKS_REGISTER_GRACE = dt.timedelta(minutes=2)
 # the episode just pushed, so an `up_to_date` update must not read an empty run list as green.
 # `blocked_sha` is reset too: it names the head a PREVIOUS step-7 review refused, and this attempt's
 # head has not been reviewed.
-TRAIN_START: dict[str, Any] = {"train_stage": TRAIN_UPDATE, "train_sha": None, "train_job": None,
+TRAIN_START: dict[str, Any] = {"train_stage": TRAIN_UPDATE, "train_sha": None, "train_base_sha": None,
+                                "train_job": None,
                                 "reviewed_sha": None, "train_evidence": None, "train_rewinds": 0,
                                 "train_pushed_at": None, "blocked_sha": None}
 
@@ -98,8 +101,8 @@ def _back_to_update(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetim
     `merging` stay; from then on every rewind strikes (backoff, third strike `failed`), so a branch
     that never holds still cannot spin the train forever."""
     rewinds = item["train_rewinds"] + 1
-    rewind = {"train_stage": TRAIN_UPDATE, "train_sha": None, "train_job": None, "validation_job": None,
-              "train_rewinds": rewinds}
+    rewind = {"train_stage": TRAIN_UPDATE, "train_sha": None, "train_base_sha": None, "train_job": None,
+              "validation_job": None, "train_rewinds": rewinds}
     if rewinds < TRAIN_REWIND_LIMIT:
         return _train_hop(conn, item, now, retry_at=None, note=f"back to update: {why}", **rewind)
     _train_strike(conn, item, now, f"back to update {rewinds} times since entering the merge train: {why}",
@@ -219,47 +222,42 @@ def _train_update(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
     head = result["headSha"]
     pushed = result["status"] == "updated"
     moved = "rebased and pushed" if pushed else "already on the latest base"
-    return _train_hop(conn, item, now, train_stage=TRAIN_CHECKS, train_sha=head, train_job=None,
+    return _train_hop(conn, item, now, train_stage=TRAIN_CHECKS, train_sha=head,
+                      train_base_sha=_base_sha(result), train_job=None,
                       retry_at=None, train_pushed_at=core.now_iso(now) if pushed else item["train_pushed_at"],
                       note=f"{moved} at {head[:12]}; waiting for checks", **_stage_success(item))
 
 
-def _pr_base_sha(owner: str, name: str, number: int) -> str | None:
-    """The head commit of the pull request's base branch (`base.sha`), read from GitHub now. None
-    when the read fails or GitHub reports no base sha: an unknowable base is never "the repo is red
-    too" — the caller falls back to the revision path.
-
-    The train has no other read of the base: `_open_pr_head()` keeps only the head, and the update
-    stage's `baseSha` is not persisted."""
-    try:
-        pr = _github.read_pr(owner, name, number)
-    except RemoteError as e:
-        print(f"triage: could not read the base of {owner}/{name}#{number} to tell a repo-wide red "
-              f"from the pull request's own: {e}", file=sys.stderr)
-        return None
-    base = pr.get("base")
-    base_sha = base.get("sha") if isinstance(base, dict) else None
+def _base_sha(result: dict[str, Any]) -> str | None:
+    """The base commit the `update_pr` result says the train SHA now sits on (`baseSha`). It is
+    optional in agent-gateway's schema: an absent or empty value persists NULL, and a row with no
+    base keeps the revision path rather than parking on a guessed baseline."""
+    base_sha = result.get("baseSha")
     return base_sha if isinstance(base_sha, str) and base_sha else None
 
 
 def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
-                             owner: str, name: str, number: int, runs: list[dict[str, Any]]) -> bool:
-    """A failing check on the train's SHA that fails on the PR's base head too is the BASE's red,
-    not the pull request's: no revision of the branch can clear it, so the item PARKS (core.park:
-    same stage, `retry_at` +25 min, no strike) until the base goes green, instead of spending a
-    stalled round on a fix that cannot land.
+                             owner: str, name: str, runs: list[dict[str, Any]]) -> bool:
+    """A failing check on the train's SHA that fails on the BASE the SHA was built on too is the
+    BASE's red, not the pull request's: no revision of the branch can clear it, so the item PARKS
+    (core.park: same stage, `retry_at` +25 min, no strike) until the base goes green, instead of
+    spending a stalled round on a fix that cannot land.
 
-    The revision path is kept whenever the base is green on that check, any failing check is the
-    branch's own (including one ABSENT from the base), or the base cannot be read at all — only a
-    base that is READ and fails every failing check parks. Returns whether it parked."""
-    base_sha = _pr_base_sha(owner, name, number)
+    The baseline is `train_base_sha`, the base captured when the train SHA was BUILT (the update
+    stage's `update_pr` result), never the PR's `base.sha` read now: the base may have advanced
+    since (A -> B) while the train SHA still carries A, so B's checks cannot say whether the
+    failing check is the base's own. The revision path is kept whenever the base is green on that
+    check, any failing check is the branch's own (including one ABSENT from the base), or no base
+    was captured / it cannot be read — only a base that is KNOWN and fails every failing check
+    parks. Returns whether it parked."""
+    base_sha = item["train_base_sha"]
     if base_sha is None:
         return False
     try:
         base_runs = _merge.read_check_runs(owner, name, base_sha)
     except (PreconditionError, PolicyError, RemoteError) as e:
         print(f"triage: could not read the check runs on the base {base_sha[:12]} of "
-              f"{owner}/{name}#{number} to tell a repo-wide red from the pull request's own: {e}",
+              f"{owner}/{name} to tell a repo-wide red from the pull request's own: {e}",
               file=sys.stderr)
         return False
     if not _merge.repo_wide_red(head_runs=runs, base_runs=base_runs):
@@ -282,7 +280,7 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         return False
     if head != sha:
         return _back_to_update(conn, item, now, f"the PR head is {head[:12]}, not the train's {sha[:12]}")
-    owner, name, number = _github.parse_pr_url(item["pr_url"])
+    owner, name, _ = _github.parse_pr_url(item["pr_url"])
     try:
         runs = _merge.read_check_runs(owner, name, sha)
         pushed = core.parse_ts(item["train_pushed_at"])
@@ -294,7 +292,7 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         _train_hop(conn, item, now, note=f"{MERGE_PENDING_NOTE_PREFIX}{e}")
         return False
     except _merge.ChecksFailed as e:
-        if _park_on_a_repo_wide_red(conn, item, now, owner, name, number, runs):
+        if _park_on_a_repo_wide_red(conn, item, now, owner, name, runs):
             return False
         work.hand_back_for_revision(conn, item, now, outcome="checks_failed", expect_eq=_train_expect(item),
                                      train_evidence=f"GitHub check runs on {sha}: {e}",
