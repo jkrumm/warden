@@ -107,17 +107,31 @@ link: assert-main-checkout
 # venv
 # ---------------------------------------------------------------------------
 
-.PHONY: venv
-venv:
-	@command -v $(BASE_PY) >/dev/null 2>&1 || { \
-		echo "warden: $(BASE_PY) not found. It is pinned on purpose — see BASE_PY above."; \
-		echo "        install it (uv python install 3.11) rather than switching interpreters here."; \
-		exit 1; \
+# `compile`/`test` resolve `.venv/bin/python3` and `scripts/warden`, `deploy.sh` and
+# `warden-backup.sh` all hardcode it, so a venv has to exist. `ensure-venv` creates a BARE
+# one — no pip, no network — which is all a pure-stdlib repo needs; `make venv` is the one
+# that additionally installs `requirements.txt`. `check` runs it first because it is the
+# repo contract's entry point and agent-gateway's check job runs a bare `make check` in a
+# FRESH linked worktree (a dispatch episode) where nothing ran `make venv` — the check used
+# to die on `[ -x $(PY) ]`. The worktree gate does not apply: a venv is this checkout's own.
+# The pinned interpreter may be off PATH under launchd's minimal environment, so fall back to
+# where uv installs it — the same ~/.local/bin entry rollout.HOST_TOOL_DIRS carries.
+.PHONY: ensure-venv
+ensure-venv:
+	@[ -x "$(PY)" ] || { \
+		py=$(BASE_PY); \
+		command -v "$$py" >/dev/null 2>&1 || py="$(HOME)/.local/bin/$(BASE_PY)"; \
+		command -v "$$py" >/dev/null 2>&1 || { \
+			echo "warden: $(BASE_PY) not found. It is pinned on purpose — see BASE_PY above."; \
+			echo "        install it (uv python install 3.11) rather than switching interpreters here."; \
+			exit 1; \
+		}; \
+		echo "  creating $(VENV) from $$("$$py" -V)"; \
+		"$$py" -m venv "$(VENV)"; \
 	}
-	@if [ ! -x "$(PY)" ]; then \
-		echo "  creating $(VENV) from $$($(BASE_PY) -V)"; \
-		$(BASE_PY) -m venv "$(VENV)"; \
-	fi
+
+.PHONY: venv
+venv: ensure-venv
 	@"$(PY)" -m pip install --quiet --upgrade pip
 	@"$(PY)" -m pip install --quiet -r "$(WARDEN_REPO)/requirements.txt"
 	@echo "  ✓ venv ($$("$(PY)" -V))"
@@ -132,7 +146,7 @@ venv:
 # files stay valid pytest input if that ever changes.
 .PHONY: test
 test:
-	@[ -x "$(PY)" ] || $(BASE_PY) -m venv "$(VENV)"
+	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
 	@fail=0; ran=0; \
 	for t in $(WARDEN_REPO)/tests/test_*.py; do \
 		[ -e "$$t" ] || continue; \
@@ -151,18 +165,17 @@ test:
 # line naming $(MAKE) even under -n, and the loop probes this target with `make -n check`.
 .PHONY: compile
 compile:
-	@[ -x "$(PY)" ] || $(BASE_PY) -m venv "$(VENV)"
+	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
 	@"$(PY)" -m compileall -q "$(WARDEN_REPO)/scripts" "$(WARDEN_REPO)/tests" >/dev/null
 	@echo "  ✓ compileall"
 
 .PHONY: check
-# A fresh checkout (a dispatch worktree) gets a bare stdlib venv from `compile`/`test` — the loop
-# has no dependencies, so `check` needs no network and no `make venv` first.
-check: compile test
+check: ensure-venv compile test
 
-# `check` runs its prerequisites in order even under `make -j`: `compile` is the gate that
-# says the scripts import before the suites start. (GNU make 4.4+ scopes this to `check`'s
-# prerequisites; make 3.81, the macOS default, applies it to the whole run.)
+# `check` runs its prerequisites in order even under `make -j`: `ensure-venv` provisions the
+# interpreter the suites need, then `compile` is the gate that says the scripts import before the
+# suites start. (GNU make 4.4+ scopes this to `check`'s prerequisites; make 3.81, the macOS
+# default, applies it to the whole run.)
 .NOTPARALLEL: check
 
 # ---------------------------------------------------------------------------

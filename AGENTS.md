@@ -37,7 +37,11 @@ make test      # the suites only
 Python is pinned to **3.11.15** via `python3.11` (uv-managed); the box's default
 `python3` is 3.14 — do not use it. **The loop is pure stdlib**: `requirements.txt`
 stays empty, because a dependency here is a dependency in the thing that decides
-whether to touch production.
+whether to touch production. `make check` provisions the venv it needs: it runs
+`ensure-venv` first, which creates a bare `.venv` from `python3.11` when one is
+missing — no pip, no network — so it passes in a fresh linked worktree where
+`make venv` never ran (the repo contract's check job). `make venv` additionally
+installs `requirements.txt`; `make test` on its own still needs a venv.
 
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails

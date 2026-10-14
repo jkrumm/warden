@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§159 — a base-red CI failure is parked, not charged to the PR) |
+| Last updated | 2026-10-14 (§160 — `make check` provisions the venv a fresh worktree lacks) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 19 |
@@ -27,6 +27,12 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `make deploy` (kickstart `warden-api`, health check, roll back to the
   pre-merge commit under a lock shared with the loop's sync), `make verify` (schema + loop heartbeat), `make logs`; `make setup` writes
   `~/.local/bin/warden`.
+- **`make check` is self-contained.** The repo contract's check is a bare `make check`,
+  run in a FRESH linked worktree (agent-gateway's check job, a dispatch episode) with no
+  `.venv`; `check` runs `ensure-venv` first, which creates a bare venv from the pinned
+  `python3.11` (no pip, no network) so the suites that hardcode `.venv/bin/python3`
+  (`scripts/warden`, `deploy.sh`, `warden-backup.sh`) have one. `make venv` still installs
+  `requirements.txt`; `make test` alone still needs a venv.
 - **Self-deploy.** A merged warden PR is fast-forwarded into the live checkout by
   the loop and deployed by `make deploy`; Hermes's `warden-live-sync` cron is gone.
 - **Rollout PATH.** `lifecycle/rollout.py` widens PATH for every `make`/`git`
