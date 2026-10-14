@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§163 — the update stage's own red is baselined against the base) |
+| Last updated | 2026-10-14 (§164 — a broken review pipeline re-runs; a needs-human with fixable findings revises) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 20 |
@@ -106,10 +106,14 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `escalationCategory` (product, data_loss, spend, other_people, security, blocker); the note carries
   it as `[category]`. An investigate verdict without one is re-driven once ("decide it yourself"), then
   warden takes its `recommendation` (`work._member_outcome`).
-  The step-7 review does the same (`train._fold_review`, review schema {1, 2}): `needs-human` with a category →
-  `needs_decision`, `[category]`-led; a schema-2 one without is re-reviewed once per head (latch
+  The step-7 review does the same (`train._fold_review`, review schema {1, 2}): `needs-human` with a category and NO fixable code finding (or a process-only finding only) →
+  `needs_decision`, `[category]`-led; the same shape carrying a fixable code finding is a revision
+  first (`blocked` — the findings are a work order, the owner is paged only once none is left); a schema-2 one without a category is re-reviewed once per head (latch
   `dispatches.validation_status = 'redriven:<sha>'`, a `PRIOR ESCALATION` paragraph in the review context), then
   read as the decision: blocking findings revise, none confirms. Schema-1 and revert reviews keep the old path.
+  A review whose own pipeline failed — a reviewer session that never examined the diff, which
+  agent-gateway still answers `needs-human`/`blocker` and marks with a `(review pipeline)` `discussions`
+  entry — is an infrastructure failure: it strikes and re-runs on the same SHA, never `needs_decision`.
 - **Revision rejoin.** A step-7 review that blocks records the refused head in `blocked_sha`
   (migration 18), which survives leaving `merging`. A revision `no_changes` on an open PR then
   compares the PR's current head (read from GitHub) to it: a head that moved rejoins the merge

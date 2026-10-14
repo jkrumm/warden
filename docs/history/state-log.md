@@ -10435,3 +10435,31 @@ back to the revision path as before.
 
 `test_triage.py` 581 -> 582 (the update-stage red on a red base parks); `test_clients.py` gains a
 missing-`baseSha` refusal case. `make check` green (582/582).
+
+## 164. A broken review pipeline re-runs; a needs-human with fixable findings revises (2026-10-14)
+
+Item 1535 (filed by the improve loop; the investigate job agreed). Two non-owner shapes reached
+`needs_decision` from `train._fold_review`.
+
+**Shape 1 — a reviewer session failed.** agent-gateway still answers `needs-human` with
+`escalationCategory: "blocker"`, and marks each failed angle with a `discussions` entry whose `file`
+is exactly `(review pipeline)`. `_review_pipeline_failed()` now reads that structural marker (the
+`file`, never the summary's prose — a marker in prose would not be one) and, before the claim, takes
+the same `_review_failed()` strike path an errored review job already takes: the review re-runs on
+the same SHA after the backoff, and the third strike lands `failed` on the Argo queue. It can neither
+confirm a merge on an incomplete review nor page the owner. Item 1528 was paged twice this way
+("Partial review: 2/6 reviewers failed", then "1/6"). The marker string was confirmed against
+agent-gateway's own producer (`server/jobs/handlers/review.ts`, the all-angles-failed, salvaged and
+partial-review paths; `server/skills/review/synthesis.md`), not the brief.
+
+**Shape 2 — a needs-human that names an owner-only category AND carries fixable code findings.** The
+fold sent every categorized needs-human to the owner even when `code_blocking` was non-empty, so
+1531 and 1533 (three times) were each paged and then fixed by hand in minutes. A new branch above the
+plain needs-human one routes that exact shape to `blocked` — a revision with the findings, a stalled
+round under the ordinary rules; the owner is paged only when no fixable finding is left (an empty
+list, or process-only findings only), and a revert keeps the old path.
+
+`test_triage.py` 583 -> 586: the pipeline failure is a strike (re-run after the backoff, third
+strike `failed`, never `needs_decision`); the categorized needs-human with a code finding revises
+(`revision_count` 1, no page); one with only a process finding still pages the owner. AGENTS.md's
+gate line now reads 586. `make check` green (586/586).

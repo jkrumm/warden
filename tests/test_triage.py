@@ -461,7 +461,8 @@ def _fake_submit_review(calls: list[dict[str, Any]], *, ok: bool = True):
 
 def _review_result(outcome: str, *, blocking: list[dict[str, Any]] | None = None,
                     summary: str = "looks right.", schema_version: int = 1,
-                    escalation_category: str | None = None) -> dict[str, Any]:
+                    escalation_category: str | None = None,
+                    discussions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """A literal agent-gateway `review` job result (server/jobs/handlers/
     review.ts SYNTHESIS_OUTPUT) — replaces the old VALIDATION_CONFIRM/
     DISAGREE marker-in-prose fixtures the step-7 poll used to substring-match."""
@@ -469,7 +470,7 @@ def _review_result(outcome: str, *, blocking: list[dict[str, Any]] | None = None
         "outcome": outcome,
         "blocking": blocking or [],
         "improvements": [],
-        "discussions": [],
+        "discussions": discussions or [],
         "testGaps": [],
         "summary": summary,
         "schemaVersion": schema_version,
@@ -4214,11 +4215,11 @@ def test_validation_outcome_needs_decision_routes_to_needs_decision():
 
 
 def test_validation_needs_decision_with_blocking_goes_to_the_owner_and_is_never_revised():
-    """A `needs-human` review is a question, not a finding (§92): even when it
-    carries a NON-empty `blocking` list it must land `needs_decision`, never the
-    revisable `blocked` the findings alone would produce, and it must be
-    ineligible for a revision dispatch — the findings are the reasons a human
-    must look, not a work order for the implementer. The findings stay on the
+    """A `needs-human` review naming NO owner-only category is a question, not a finding: even when it
+    carries a NON-empty `blocking` list it must land `needs_decision`, never the revisable `blocked`
+    the findings alone would produce, and it must be ineligible for a revision dispatch — the findings
+    are the reasons a human must look, not a work order for the implementer. (A categorised needs-human
+    WITH a fixable finding does revise — item 1535, see the test below.) The findings stay on the
     card, because the human is now the one who has to read them."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-needs-human-blocking")
@@ -4286,6 +4287,106 @@ def test_review_needs_human_with_a_category_goes_to_the_owner_tagged():
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
         assert item["note"].startswith("[security] "), item["note"]
+
+
+def _pipeline_review(outcome: str = "needs-human") -> dict[str, Any]:
+    """A review whose OWN pipeline broke — the shape agent-gateway returns when a reviewer session
+    failed (item 1528): `needs-human` with `escalationCategory: "blocker"` and one `discussions`
+    entry per failed angle, whose `file` is the structural marker, never the summary's prose."""
+    return _review_result(
+        outcome, schema_version=2, escalation_category="blocker",
+        summary="Partial review: 1/6 reviewers failed (frontend)",
+        discussions=[{"file": "(review pipeline)", "angle": "frontend",
+                      "message": "frontend session failed: timed out — this reviewer did not examine "
+                                 "the diff."}],
+    )
+
+
+def test_review_pipeline_failure_is_an_infra_strike_and_never_a_verdict():
+    """Item 1535 shape 1: a review whose own pipeline broke (a reviewer session failed without
+    examining the diff) is an infrastructure failure — re-run it on the same SHA, strike after
+    strike, never a needs_decision page and never a merge."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-pipeline", implement_job="impl-rv-pipeline",
+                                    review_job="review-job-pipeline")
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": _pipeline_review()}
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit_review = _fake_submit_review(calls)
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("a review with a broken pipeline must never call merge"))
+
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
+        assert item["validation_job"] is None and item["retry_at"] == (NOW + dt.timedelta(minutes=10)).isoformat()
+        assert calls == [], "the resubmission waits out the backoff"
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-rv-pipeline'").fetchone()
+        assert d["validation_status"] == "error", d["validation_status"]
+
+        t1 = NOW + dt.timedelta(minutes=11)
+        train.advance_merge_trains(conn, DEFAULT_POLICY, t1, dry_run=False)
+        assert len(calls) == 1, "the review is re-run on the same SHA after the backoff"
+        train.advance_merge_trains(conn, DEFAULT_POLICY, t1, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["strikes"] == 2 and item["retry_at"] == (t1 + dt.timedelta(minutes=30)).isoformat(), dict(item)
+
+        t2 = t1 + dt.timedelta(minutes=31)
+        train.advance_merge_trains(conn, DEFAULT_POLICY, t2, dry_run=False)   # resubmit
+        assert len(calls) == 2
+        train.advance_merge_trains(conn, DEFAULT_POLICY, t2, dry_run=False)   # third strike
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED and item["strikes"] == 3, dict(item)
+        assert "pipeline" in item["note"], item["note"]
+        assert len(calls) == 2, "the third strike must not submit a third review"
+
+
+def test_needs_human_with_a_category_and_code_findings_revises_before_paging_the_owner():
+    """Item 1535 shape 2: a needs-human that names an owner-only reason AND carries fixable code
+    findings is a revision first — the findings are a work order, not the decision. Only once no code
+    finding is left does the category page the owner."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_validating_item(conn, external_id="sig-rv-cat-block", implement_job="impl-rv-cat-block",
+                                    review_job="review-job-cat-block")
+        verdict = _review_result(
+            "needs-human", schema_version=2, escalation_category="product",
+            blocking=[{"file": "AGENTS.md", "line": 48, "message": "the gate count is stale",
+                       "angle": "architect"}],
+            summary="the brief's gate count contradicts the repo")
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id='review-job-cat-block'",
+                     (json.dumps(verdict),))
+        conn.commit()
+        _agent_gateway.get = lambda job_id: {"id": job_id, "status": "done", "result": verdict}
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("a needs-human with a fixable finding must not merge"))
+
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING, dict(item)
+        assert "AGENTS.md:48" in item["note"] and "the gate count is stale" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-rv-cat-block'").fetchone()
+        assert d["validation_status"] == "blocked", d["validation_status"]
+
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_revise_blocked(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["revision_count"] == 1 and len(calls) == 1, (dict(item), calls)
+
+
+def test_needs_human_with_a_category_and_only_a_process_finding_still_goes_to_the_owner():
+    """The boundary of shape 2: a process-only finding is not fixable by any implement episode, so
+    the owner is still the reader."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "rv-cat-po", 37)
+        _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result(
+            "needs-human", schema_version=2, escalation_category="product",
+            blocking=[_PROCESS_ONLY_FINDING], summary="the PR body must close the issue")}
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not merge"))
+
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["note"].startswith("[product] "), item["note"]
 
 
 def test_review_needs_human_without_a_category_is_re_reviewed_once_then_decided():
