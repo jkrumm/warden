@@ -214,6 +214,18 @@ def _train_update(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
         return False
     checks = result.get("checks") or {}
     if result["status"] == "updated" and not checks["passed"]:
+        owner, name, _ = _github.parse_pr_url(item["pr_url"])
+        try:
+            runs = _merge.read_check_runs(owner, name, result["headSha"])
+        except (PreconditionError, PolicyError, RemoteError) as e:
+            print(f"triage: could not read the check runs on {result['headSha'][:12]} of {owner}/{name} "
+                  f"to tell a repo-wide red from the pull request's own: {e}", file=sys.stderr)
+            runs = []
+        # The re-entry after a park: the base may have advanced (A -> B) and STILL be red, and this
+        # `updated` result is the first look at B. Baseline it like the checks stage does, so a red
+        # that is the base's own parks instead of spending a revision on a fix that cannot land.
+        if _park_on_a_repo_wide_red(conn, item, now, owner, name, runs, base_sha=_base_sha(result)):
+            return False
         work.hand_back_for_revision(
             conn, item, now, outcome="checks_failed", expect_eq=_train_expect(item),
             train_evidence="\n".join(filter(None, (checks["summary"], checks.get("failed")))),
@@ -230,15 +242,17 @@ def _train_update(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
 
 
 def _base_sha(result: dict[str, Any]) -> str | None:
-    """The base commit the `update_pr` result says the train SHA now sits on (`baseSha`). It is
-    optional in agent-gateway's schema: an absent or empty value persists NULL, and a row with no
-    base keeps the revision path rather than parking on a guessed baseline."""
+    """The base commit the `update_pr` result says the train SHA now sits on (`baseSha`).
+    `update_pr_result()` requires it for a `updated`/`up_to_date` result, so it is always present
+    on the successful paths; the None branch is defensive against a shape the validation missed,
+    and a row with no base keeps the revision path rather than parking on a guessed baseline."""
     base_sha = result.get("baseSha")
     return base_sha if isinstance(base_sha, str) and base_sha else None
 
 
 def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
-                             owner: str, name: str, runs: list[dict[str, Any]]) -> bool:
+                             owner: str, name: str, runs: list[dict[str, Any]],
+                             *, base_sha: str | None = None) -> bool:
     """A failing check on the train's SHA that fails on the BASE the SHA was built on too is the
     BASE's red, not the pull request's: no revision of the branch can clear it, so the item PARKS
     until the base goes green, instead of spending a stalled round on a fix that cannot land.
@@ -246,10 +260,11 @@ def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: d
     The baseline is `train_base_sha`, the base captured when the train SHA was BUILT (the update
     stage's `update_pr` result), never the PR's `base.sha` read now: the base may have advanced
     since (A -> B) while the train SHA still carries A, so B's checks cannot say whether the
-    failing check is the base's own. The revision path is kept whenever the base is green on that
-    check, any failing check is the branch's own (including one ABSENT from the base), or no base
-    was captured / it cannot be read — only a base that is KNOWN and fails every failing check
-    parks.
+    failing check is the base's own. The update stage's own checks-failed result holds that base
+    in hand before it is persisted, and passes it as `base_sha`. The revision path is kept whenever
+    the base is green on that check, any failing check is the branch's own (including one ABSENT
+    from the base), or no base was captured / it cannot be read — only a base that is KNOWN and
+    fails every failing check parks.
 
     The park is not a re-check of the same frozen commit forever: `train_base_sha` pins the base to
     the SHA that was red when the item parked, and that commit's check runs never change, so a base
@@ -258,7 +273,7 @@ def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: d
     `update` (a rebase trigger) parked the same way — `retry_at` +PARK_MINUTES, no strike, no
     `train_rewinds` bump, since the PR head did not move — so the next pass re-runs `update_pr` and
     re-derives `train_sha`/`train_base_sha` against the current base tip. Returns whether it parked."""
-    base_sha = item["train_base_sha"]
+    base_sha = item["train_base_sha"] if base_sha is None else base_sha
     if base_sha is None:
         return False
     try:

@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§162 — the base-red park re-enters `update` to re-derive the base) |
+| Last updated | 2026-10-14 (§163 — the update stage's own red is baselined against the base) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 20 |
@@ -57,8 +57,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `train_base_sha`/`train_sha` against the live base tip, and a base fix landing as a
   later commit is observed. A base green on that check, a check absent from the
   base, no recorded base, or an unreadable base keeps the `checks_failed` revision
-  path. `update_pr`'s own `checks.passed == false` result is not baselined (carried
-  debt).
+  path. `update_pr`'s own `checks.passed == false` result is baselined the same way
+  (its `baseSha` is the base just rebased onto), so a park's re-entry on a base that
+  advanced (A -> B) and stayed red parks again instead of becoming a revision that
+  cannot fix it. `baseSha` is now required in `update_pr_result()`: a `updated` or
+  `up_to_date` result missing it is a loud refusal, never a silent no-op.
 - **Ledger:** every pending migration first writes
   `~/.warden/backups/pre-migration-v<from>-to-<to>-<stamp>-<pid>.db` (never pruned).
 - **`failed` is classified.** Every `failed` row carries `failure_class` (`infra` |

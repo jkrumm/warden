@@ -483,12 +483,15 @@ def test_update_pr_result_accepts_every_published_status():
 def test_update_pr_result_refuses_any_shape_it_does_not_know():
     no_checks = _update_pr_job()
     no_checks["result"].pop("checks")
+    no_base_sha = _update_pr_job()
+    no_base_sha["result"].pop("baseSha")
     bad = [
         ("unknown status", _update_pr_job(status="rebased")),
         ("short sha", _update_pr_job(headSha="abc123")),
         ("missing previous", _update_pr_job(previousHeadSha=None)),
         ("no prUrl", _update_pr_job(prUrl=None)),
         ("updated without checks", no_checks),
+        ("updated without baseSha", no_base_sha),
         ("checks.passed not a bool", _update_pr_job(checks={"passed": "yes", "summary": "s"})),
         ("not done", {"id": "u1", "status": "failed", "error": "boom"}),
         ("no result", {"id": "u1", "status": "done", "result": None}),

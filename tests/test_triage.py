@@ -11938,6 +11938,18 @@ def test_train_failed_checks_after_the_update_is_a_checks_failed_revision_of_the
     with _triage_env() as (conn, ctx):
         eid = _train_item(conn, "sig-train-red", job="update-job-red")
         _agent_gateway.get = _jobs({"update-job-red": _update_pr_job("updated", head=REBASED_SHA, passed=False)})
+
+        # The base (baseSha = "c"*40) is green on the failing check, so the red is the PR's own and
+        # the baseline read keeps the revision path.
+        def _check_runs(owner, repo, sha):
+            CHECK_RUNS["asked"].append(sha)
+            if sha == "c" * 40:
+                return [{"name": "build", "status": "completed", "conclusion": "success"},
+                        {"name": "e2e", "status": "completed", "conclusion": "success"}]
+            return [{"name": "build", "status": "completed", "conclusion": "success"},
+                    {"name": "e2e", "status": "completed", "conclusion": "failure"}]
+
+        _github.check_runs = _check_runs
         _train_pass(conn)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_WORKING and "checks failed" in item["note"], dict(item)
@@ -12032,6 +12044,37 @@ def test_train_a_repo_wide_red_park_re_triggers_update_to_re_derive_the_base():
         assert updates == [{"cwd": updates[0]["cwd"], "pr": 10}], updates
         item = core.get_item(conn, eid)
         assert item["train_stage"] == train.TRAIN_UPDATE and item["train_job"] == "update-job-000001", dict(item)
+
+
+def test_train_an_update_red_that_is_the_base_red_parks_too():
+    """The update stage's own `checks.passed == false` result is baselined like the checks stage: a
+    head whose failing check also fails on the base the result names is the base's red, so the item
+    parks back to `update` instead of a revision it cannot fix — the re-entry after a park on a base
+    that advanced (A -> B) and stayed red must not become a `checks_failed` revision."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-update-base-red", job="update-job-base-red")
+        job = _update_pr_job("updated", head="e" * 40, passed=False)
+        job["result"]["baseSha"] = "f" * 40   # the base the branch was just rebased onto
+        _agent_gateway.get = _jobs({"update-job-base-red": job})
+        _agent_gateway.submit_review = _no_review
+
+        def _check_runs(owner, repo, sha):
+            CHECK_RUNS["asked"].append(sha)
+            if sha == "f" * 40:
+                return [{"name": "e2e", "status": "completed", "conclusion": "failure"}]
+            return [{"name": "build", "status": "completed", "conclusion": "success"},
+                    {"name": "e2e", "status": "completed", "conclusion": "failure"}]
+
+        _github.check_runs = _check_runs
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_UPDATE, dict(item)
+        assert item["train_sha"] is None and item["train_base_sha"] is None, dict(item)
+        assert item["stalled_rounds"] == 0 and item["strikes"] == 0 and item["train_rewinds"] == 0, dict(item)
+        assert item["retry_at"] == (NOW + dt.timedelta(minutes=core.PARK_MINUTES)).isoformat(), dict(item)
+        assert item["note"].startswith("parked:") and "e2e" in item["note"], item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-update-base-red'").fetchone()
+        assert d["validation_status"] is None, "a parked base red is not a checks_failed revision"
 
 
 def test_train_a_red_check_only_on_the_pr_revises_when_the_base_is_green():
