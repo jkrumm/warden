@@ -13899,12 +13899,13 @@ def _finding(message: str, line: int = 1) -> dict[str, Any]:
     return {"file": "scripts/x.py", "line": line, "message": message, "angle": "senior-dev"}
 
 
-def test_a_converging_chain_of_blocked_rounds_keeps_revising_past_the_attempt_cap():
+def test_a_converging_chain_of_blocked_rounds_keeps_revising_past_the_attempt_cap_up_to_the_ceiling():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-converging")
         calls: list[dict[str, Any]] = []
         _agent_gateway.submit = _fake_submit(calls)
-        rounds = core.MAX_IMPLEMENT_ATTEMPTS + 3
+        rounds = core.MAX_REVISIONS - 1
+        assert rounds > core.MAX_IMPLEMENT_ATTEMPTS, "the ceiling must sit above the stalled-round cap"
         for n in range(1, rounds + 1):
             item = _blocked_review_round(conn, eid, n, [_finding(f"consequence number {n} of the narrow fix", n)])
             assert item["state"] == core.STATE_WORKING, (n, dict(item))

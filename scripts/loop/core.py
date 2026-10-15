@@ -235,7 +235,7 @@ MAX_IMPLEMENT_ATTEMPTS = 3
 # otherwise revise without bound (item 1565: 5 revisions, 2.5 h, for a 71-line prune; 1478/1480 the
 # same). At the ceiling a review that blocks lands `needs_decision` with its findings (a review that
 # does not block already goes to the merge train; the ceiling never loosens what blocks a merge).
-MAX_REVISIONS = 6
+MAX_REVISIONS = 5
 
 # Attempt N >= this one runs on agent-gateway's escalation implement model (GET /api/routing), when
 # it has one; see implement_model().
