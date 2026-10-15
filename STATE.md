@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-15 (§166 — absolute revision ceiling: review drift ends in `needs_decision`) |
+| Last updated | 2026-10-15 (§167 — waiting revisions queue oldest-first; a judged item never blocks an older revision) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 22 (live ledger migrates on the loop's next boot after the deploy) |
@@ -135,6 +135,12 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 - **Revision ceiling (§166).** `core.MAX_REVISIONS` = 5 caps `revision_count` whatever the rounds did
   (`work.revisions_left`); a converging chain that reaches it with a review that still blocks lands
   `needs_decision` listing the findings (train `_fold_review`). Not-blocking reviews are untouched.
+- **Waiting revisions queue oldest-first (§167).** `check_repo_not_in_flight(as_revision=True)` — set by
+  `maybe_revise_blocked()` and threaded through `open_episode()` — passes over a YOUNGER `working` item whose
+  implement dispatch is judged (`validation_status IS NOT NULL`): a waiting revision holds no episode, only a
+  claim on the next one. Without it, two waiting revisions in one repo each count the other as in flight and
+  neither is ever revised (the weatherorb deadlock). A younger item with an open episode, a claim sentinel, or
+  a `merging` train still defers the revision.
 - **Converging revisions (§150).** The revision cap counts STALLED rounds (`stalled_rounds`, migration 19),
   not attempts. A revision's review context quotes the previous round's blocking findings and asks the
   reviewer to start any still-unresolved one with `UNRESOLVED PRIOR FINDING:`; a blocked round without it

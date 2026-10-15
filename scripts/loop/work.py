@@ -2950,7 +2950,8 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                   f"(attempt {attempt}/{core.MAX_IMPLEMENT_ATTEMPTS})")
             continue
         try:
-            _policy.check_repo_not_in_flight(conn, repo=item["repo"], exclude_event_id=item["event_id"])
+            _policy.check_repo_not_in_flight(conn, repo=item["repo"], exclude_event_id=item["event_id"],
+                                             as_revision=True)
         except (PolicyError, PreconditionError, UsageError) as e:
             print(f"triage: revision of {item['signature']} deferred: {e}", file=sys.stderr)
             continue
@@ -3012,7 +3013,7 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
                 why=f"{REVISION_WHY_PREFIX}{attempt}: the previous attempt could not land",
                 origin=_dispatch.Origin(event_id=item["event_id"]),
                 authorized_by="auto-from-item",
-                model=implement_model(attempt), revision_of=revision_of,
+                model=implement_model(attempt), revision_of=revision_of, as_revision=True,
             )
         except SubmitRefused as exc:
             # Refused for good: end the item.
