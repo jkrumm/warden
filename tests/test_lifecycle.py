@@ -502,6 +502,19 @@ def test_as_revision_still_refuses_behind_a_claim_sentinel():
             exclude_event_id=1, as_revision=True)
 
 
+def test_as_revision_still_refuses_behind_a_host_verb_claim_sentinel():
+    from loop import core
+
+    conn, _ = _fresh_ledger()
+    _seed_waiting_revision(conn, 1)
+    _seed_triage_item(conn, 2, repo="warden", state="working")
+    conn.execute("UPDATE triage_items SET implement_job=? WHERE event_id=2",
+                 (f"{core.HOST_VERB_CLAIM_PREFIX}restart-hermes-gateway",))
+    conn.commit()
+    _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden",
+            exclude_event_id=1, as_revision=True)
+
+
 def test_as_revision_needs_its_own_event_id():
     conn, _ = _fresh_ledger()
     _expect(ValueError, policy.check_repo_not_in_flight, conn, repo="warden", as_revision=True)

@@ -197,10 +197,15 @@ def _waiting_revision_sql() -> str:
     """A `working` item whose implement episode is judged (any `validation_status`: blocked, checks_failed,
     conflict, or a value a revision never reads): no episode runs, it holds the repo only as a claim on
     the next one. An enumerated list would count a judged item the enum forgot as in flight, and an older
-    waiting revision would defer behind it."""
+    waiting revision would defer behind it. A claim sentinel (`IMPLEMENT_CLAIM`, or a
+    `HOST_VERB_CLAIM_PREFIX` value) is being submitted or executed right now, not waiting: it is rejected
+    explicitly, so an active claim can never be read as a waiting revision."""
     from loop import core
 
-    return (f"(state='{core.STATE_WORKING}' AND implement_job IN (SELECT job_id FROM dispatches "
+    return (f"(state='{core.STATE_WORKING}' "
+            f"AND implement_job != '{core.IMPLEMENT_CLAIM}' "
+            f"AND implement_job NOT LIKE '{core.HOST_VERB_CLAIM_PREFIX}%' "
+            f"AND implement_job IN (SELECT job_id FROM dispatches "
             "WHERE validation_status IS NOT NULL))")
 
 
