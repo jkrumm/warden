@@ -229,9 +229,11 @@ def test_signals_show_only_outcomes_known_at_the_instant_and_never_private_repos
     early = dt.datetime(2026, 10, 5, tzinfo=dt.timezone.utc)
     text = "\n".join(shadow._signals(conn, core.get_item(conn, 4), core.get_event(conn, 4), early))
     assert "#1 2026-10-01: closed (ignored) | why: matched the policy ignore list" in text
-    assert "#3 2026-10-03: still open" in text and "closed only later" not in text.split("ignored as noise")[-1]
+    ignored_block = text.split("ignored as noise")[-1]
+    assert "#3 2026-10-03: still open" in text
+    assert "closed only later" not in ignored_block
     assert "private peer" not in text and "#2" not in text
-    assert "ignored 2" in text and "- Up recovery" in text  # counts include the private peer, titles never
+    assert "ignored 1" in text and "- Up recovery" in text  # the private peer is in no count either
     first = shadow._signals(conn, core.get_item(conn, 1), core.get_event(conn, 1),
                             dt.datetime(2026, 9, 30, tzinfo=dt.timezone.utc))
     assert "(first time)" in "\n".join(first)

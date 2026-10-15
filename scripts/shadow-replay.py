@@ -38,7 +38,7 @@ SMALL_BUDGET = {"clef": 5000, "clef-eu": 5000, "clef-flash": 5000}
 NEW_STATES = ("triaged", "working", "merging", "verifying", "needs_decision", "failed", "fixed")
 
 
-PREFILTER_NOTE = "matched the policy%"
+PREFILTER_NOTE_LIKE = "matched the policy%"  # intake's close note for the policy ignore list
 
 
 def labelled(conn, new_sample: int, *, legacy: bool = False):
@@ -68,7 +68,7 @@ def labelled(conn, new_sample: int, *, legacy: bool = False):
         "WHEN ti.close_reason='ignored' AND ti.note LIKE ? THEN 'ignore*' "
         "WHEN ti.close_reason='ignored' THEN 'ignore' END AS truth "
         "FROM triage_items ti WHERE ti.state='closed' AND ti.close_reason IN ('duplicate','fixed_by','ignored') "
-        "AND NOT (ti.close_reason='ignored' AND ti.origin='human')", (PREFILTER_NOTE,)).fetchall()
+        "AND NOT (ti.close_reason='ignored' AND ti.origin='human')", (PREFILTER_NOTE_LIKE,)).fetchall()
     news = conn.execute(
         f"SELECT ti.*, 'new' AS truth FROM triage_items ti WHERE ti.repo IS NOT NULL "
         f"AND (ti.state IN ({','.join('?' * len(NEW_STATES))}) OR (ti.state='closed' AND ti.close_reason='resolved')) "
@@ -84,13 +84,13 @@ def candidates_for(item, event, legacy: bool) -> list[str]:
     return [label] if label else shadow._intake.known_repos()
 
 
-def one(conn, item, model: str, legacy: bool = False, signals: bool = True):
+def one(conn, item, model: str, *, legacy: bool = False, signals: bool = True):
     event = core.get_event(conn, item["event_id"])
     when = core.parse_ts(item["created_at"])
     if event is None or when is None:
         return None
     built = shadow.build_triage(conn, item, event, candidates_for(item, event, legacy), when, as_of=True,
-                                budget=SMALL_BUDGET.get(model), **({} if signals else {"signals": False}))
+                                budget=SMALL_BUDGET.get(model), signals=signals)
     if built is None:
         return None
     state, questions, _shown, _info = built
@@ -103,13 +103,13 @@ def one(conn, item, model: str, legacy: bool = False, signals: bool = True):
     return {"dec": dec, "cost": (result.get("usage") or {}).get("costUsd") or 0, "ms": result.get("latencyMs") or 0}
 
 
-def run_model(items, model: str, legacy: bool = False, signals: bool = True):
+def run_model(items, model: str, *, legacy: bool = False, signals: bool = True):
     # one connection per thread (sqlite3 objects are not shareable)
     conn = ledger.connect(migrate=False)
     stats = {"model": model, "n": 0, "errors": 0, "action": 0, "attach_n": 0, "attach_target": 0, "cost": 0.0, "ms": 0,
              "byConfidence": {}, "confusion": {}, "errorReasons": [], "misses": []}
     for item in items:
-        out = one(conn, item, model, legacy, signals)
+        out = one(conn, item, model, legacy=legacy, signals=signals)
         if out is None:
             continue
         if "error" in out:
@@ -121,7 +121,8 @@ def run_model(items, model: str, legacy: bool = False, signals: bool = True):
         hit = dec.get("action") == truth.rstrip("*")
         stats["action"] += int(hit)
         if not hit:
-            stats["misses"].append({"event": item["event_id"], "truth": truth, "got": dec.get("action"), "conf": dec.get("confidence")})
+            miss = {"event": item["event_id"], "truth": truth, "got": dec.get("action"), "conf": dec.get("confidence")}
+            stats["misses"].append(miss)
         key = f"{truth}->{dec.get('action')}"
         stats["confusion"][key] = stats["confusion"].get(key, 0) + 1
         if truth == "attach":
@@ -150,7 +151,7 @@ def main() -> int:
         counts[i["truth"]] = counts.get(i["truth"], 0) + 1
     models = args.models.split(",")
     with ThreadPoolExecutor(max_workers=len(models)) as pool:
-        results = list(pool.map(lambda m: run_model(items, m, args.legacy, not args.no_signals), models))
+        results = list(pool.map(lambda m: run_model(items, m, legacy=args.legacy, signals=not args.no_signals), models))
     out = {"labels": counts, "models": results, "at": dt.datetime.now(dt.timezone.utc).isoformat()}
     if args.json:
         print(json.dumps(out, indent=2))
