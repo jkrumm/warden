@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 20
+LEDGER_SCHEMA_VERSION = 21
 
 
 class LedgerBehind(RuntimeError):
@@ -821,6 +821,35 @@ _MIGRATION_20 = """
 ALTER TABLE triage_items ADD COLUMN train_base_sha TEXT;
 """
 
+# Version 21 — `decision_shadow` (Wave 6 of the OpenCode v2 plan). One row per triage question put
+# to an IU decision model NEXT TO the LLM triage job: the LLM's answer and the decision model's
+# answers (with calibrated confidence) side by side, so agreement is measurable before the decision
+# model decides anything. `kind` is `triage` (event_id = the incoming item, llm_job = its triage job)
+# or `sweep` (event_id = the merged item, llm_job = its sweep job). Nothing reads this table to make
+# a decision; it is evidence. `shown_json` holds the ids the decision model could choose between
+# (`{"open": [...], "fixed": [...]}` / `{"items": [...]}`), `context_json` what the budget cut.
+_MIGRATION_21 = """
+CREATE TABLE decision_shadow (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          TEXT NOT NULL,
+  event_id      INTEGER NOT NULL,
+  llm_job       TEXT NOT NULL,
+  decision_job  TEXT,
+  model         TEXT,
+  status        TEXT NOT NULL,
+  shown_json    TEXT,
+  context_json  TEXT,
+  llm_json      TEXT,
+  decision_json TEXT,
+  usage_json    TEXT,
+  error         TEXT,
+  created_at    TEXT NOT NULL,
+  settled_at    TEXT,
+  UNIQUE(kind, event_id, llm_job)
+);
+CREATE INDEX idx_decision_shadow_status ON decision_shadow(status);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -842,6 +871,7 @@ MIGRATIONS: dict[int, str] = {
     18: _MIGRATION_18,
     19: _MIGRATION_19,
     20: _MIGRATION_20,
+    21: _MIGRATION_21,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live
@@ -863,7 +893,7 @@ _ADOPTABLE_TABLES = ("events", "cursors", "dispatches", "triage_items")
 # table silently stops being checked. This closes docs/history/state-log.md §41 known-open item
 # 5: item_transitions' shape was created by migration 4 but never asserted by
 # _verify_columns(), because it only ever walked _ADOPTABLE_TABLES.
-_VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations")
+_VERSIONED_TABLES = _ADOPTABLE_TABLES + ("item_transitions", "operations", "decision_shadow")
 
 # triage_items.state vocabulary, mirrored from scripts/loop/core.py's own STATE_*
 # constants. ledger.py is the schema owner, so it is the home for the state names

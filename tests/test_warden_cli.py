@@ -545,7 +545,7 @@ def test_run_triages_first_then_dispatches_on_new():
     assert proc.returncode == 0, out
     assert out["triage"] == "triaged to alpha" and out["state"] == "working" and out["jobId"] == "job-run-t", out
     tools = [r["body"]["tool"] for r in srv.requests if r["method"] == "POST"]
-    assert tools == ["triage", "dispatch"], tools
+    assert tools == ["triage", "decide", "dispatch"], tools  # decide = the shadow lane
 
 
 def test_run_never_attaches_the_owners_own_request_to_another_item():
@@ -564,7 +564,7 @@ def test_run_never_attaches_the_owners_own_request_to_another_item():
     assert proc.returncode == 0, proc
     assert "triage: attached" not in proc.stdout, proc.stdout
     tools = [r["body"]["tool"] for r in srv.requests if r["method"] == "POST"]
-    assert tools == ["triage", "dispatch"], tools
+    assert tools == ["triage", "decide", "dispatch"], tools  # decide = the shadow lane
     conn, _ = _connect(db)
     row = _row(conn, "SELECT state, close_reason, duplicate_of, dispatch_job FROM triage_items WHERE event_id != 50")
     conn.close()

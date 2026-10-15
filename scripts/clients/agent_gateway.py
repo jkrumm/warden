@@ -227,6 +227,17 @@ def submit_triage(*, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     return _submit_job("triage", {"prompt": prompt, "schema": schema})
 
 
+def submit_decide(*, state: str, questions: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    """The decision-model `decide` job: `POST /api/jobs {"tool":"decide","params":{state,questions}}`.
+    One call to an IU decision model (typed answers + calibrated confidence, no text); it cannot search,
+    so `state` is its whole world. A `done` job's `result.answers` holds one entry per question id.
+    Same transport and error handling as `submit_triage()`."""
+    params: dict[str, Any] = {"state": state, "questions": questions}
+    if model:
+        params["model"] = model
+    return _submit_job("decide", params)
+
+
 def submit_update_pr(*, cwd: str | Path, pr: int) -> dict[str, Any]:
     """The merge train's `update_pr` job: `POST /api/jobs {"tool":"update_pr","params":{cwd,pr}}`
     — rebase one `dispatch/*` PR onto the latest default branch, re-run the repo's checks,

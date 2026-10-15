@@ -12,7 +12,7 @@ from typing import Any
 
 from clients import agent_gateway as _agent_gateway
 from clients.errors import RemoteError, WardenError
-from lifecycle import intake as _intake
+from lifecycle import intake as _intake, shadow as _shadow
 from loop import core, intake, work
 
 
@@ -85,7 +85,19 @@ def _submit_triage(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime
         print(f"triage: triage job {job['id']} for {item['signature']} lost its claim (released as stale "
               f"while submitting) — its answer is dropped", file=sys.stderr)
         return None
+    _shadow_submit(conn, item, event, job["id"], now)
     return job
+
+
+def _shadow_submit(conn: sqlite3.Connection, item: sqlite3.Row, event: sqlite3.Row, job_id: str,
+                   now: dt.datetime) -> None:
+    """Put the same question to a decision model, in shadow (lifecycle/shadow.py). Nothing here may
+    fail the triage: any error is a stderr line."""
+    try:
+        built = _shadow.build_triage(conn, item, event, _triage_candidates(item, event), now)
+        _shadow.submit(conn, _shadow.KIND_TRIAGE, item["event_id"], job_id, built, now)
+    except Exception as e:  # noqa: BLE001 — the shadow lane must never touch the real one
+        print(f"shadow: triage context for #{item['event_id']} failed: {e}", file=sys.stderr)
 
 
 def _fold_triage_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: dict[str, Any],
@@ -137,6 +149,8 @@ def _fold_triage_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: 
         return strike(f"triage job {job_id} returned no usable answer")
     reason = str(answer.get("reason") or "").strip()
     origin = item["origin"]
+    _shadow.record_llm(conn, _shadow.KIND_TRIAGE, event_id, job_id,
+                       {k: answer.get(k) for k in ("action", "item", "pr", "repo") if answer.get(k) is not None})
 
     if action == "attach" and origin != "human":
         target = open_item(conn, answer.get("item"), exclude=event_id)
@@ -240,6 +254,7 @@ def poll_triage_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: boo
     (`triage_job_at`): cancelled best-effort first, so a job that is merely slow cannot also fold."""
     if dry_run:
         return
+    _shadow.settle(conn, now)
     stale_before = now - dt.timedelta(minutes=TRIAGE_CLAIM_STALE_MINUTES)
     rows = conn.execute(
         "SELECT event_id, signature, triage_job, triage_job_at FROM triage_items "

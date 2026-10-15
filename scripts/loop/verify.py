@@ -12,7 +12,7 @@ from typing import Any
 
 from clients import github as _github, agent_gateway as _agent_gateway
 from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError, WardenError
-from lifecycle import dispatch as _dispatch, intake as _intake, policy as _policy, rollout as _rollout
+from lifecycle import dispatch as _dispatch, intake as _intake, policy as _policy, rollout as _rollout, shadow as _shadow
 from loop import core, triaging, work
 
 
@@ -376,6 +376,12 @@ def _submit_sweep(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) 
         print(f"triage: fixed-by sweep job {job['id']} for {pr_url} lost its claim (released as stale "
               f"while submitting) — its answer is dropped", file=sys.stderr)
         return None
+    try:
+        _shadow.submit(conn, _shadow.KIND_SWEEP, event_id, job["id"],
+                       _shadow.build_sweep(repo=row["repo"], pr_title=str(pr.get("title") or ""),
+                                           pr_body=str(pr.get("body") or ""), diff=diff, candidates=candidates), now)
+    except Exception as e:  # noqa: BLE001 — the shadow lane must never touch the real one
+        print(f"shadow: sweep context for {pr_url} failed: {e}", file=sys.stderr)
     return job
 
 
@@ -396,6 +402,8 @@ def _fold_sweep_job(conn: sqlite3.Connection, event_id: int, job_id: str, job: d
                       f"{job.get('error') or 'no usable answer'}")
         return None
     pr_url = row["sweep_pr"]
+    _shadow.record_llm(conn, _shadow.KIND_SWEEP, event_id, job_id,
+                       [m["item"] for m in matches if isinstance(m, dict) and isinstance(m.get("item"), int)])
     shown = core.safe_json(row["sweep_candidates"])
     if not _sweep_cas(conn, event_id, job_id, **_SWEEP_DONE):
         return None
