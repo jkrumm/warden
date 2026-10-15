@@ -654,7 +654,7 @@ _SET_STATE_COLUMNS = (
     "train_rewinds", "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
     "blocked_sha",
     "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
-    "failure_class", "redrive_json", "redrives", "verify_baseline",
+    "failure_class", "redrive_json", "redrives", "verify_baseline", "ci_rerun_sha",
 )
 
 # The states an item can be re-driven INTO: a stage of the pipeline that has a poller.

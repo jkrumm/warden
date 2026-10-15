@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 22
+LEDGER_SCHEMA_VERSION = 23
 
 
 class LedgerBehind(RuntimeError):
@@ -864,6 +864,14 @@ _MIGRATION_22 = """
 ALTER TABLE triage_items ADD COLUMN verify_baseline TEXT;
 """
 
+# Version 23 — `ci_rerun_sha` (one column, no backfill). The merge train's checks stage re-runs the
+# failed GitHub Actions jobs once on a train SHA whose red is not the base's (train._rerun_once())
+# before it hands the pull request back for a revision, and records that SHA here: a second red on
+# the same SHA revises. Keyed by SHA, so it is never cleared — a new train SHA gets its own re-run.
+_MIGRATION_23 = """
+ALTER TABLE triage_items ADD COLUMN ci_rerun_sha TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -887,6 +895,7 @@ MIGRATIONS: dict[int, str] = {
     20: _MIGRATION_20,
     21: _MIGRATION_21,
     22: _MIGRATION_22,
+    23: _MIGRATION_23,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live

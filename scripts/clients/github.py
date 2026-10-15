@@ -210,6 +210,14 @@ def workflow_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     or a second trigger of one workflow for one commit must not let a stale green
     run mask the current one. A non-200 here raises a plain `RemoteError`: with no
     check-runs to fall back to, an unreadable CI state still refuses."""
+    return [
+        {"name": r.get("name") or "workflow", "status": r.get("status"), "conclusion": r.get("conclusion")}
+        for r in _latest_workflow_runs(owner, repo, sha)
+    ]
+
+
+def _latest_workflow_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
+    """The raw latest Actions run per workflow on `sha` (see workflow_runs())."""
     if not _SHA_RE.match(sha):
         raise PreconditionError(f"{sha!r} is not a 40-hex commit sha — refusing before the request")
     path = f"/repos/{owner}/{repo}/actions/runs?head_sha={sha}&per_page=100"
@@ -225,10 +233,38 @@ def workflow_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
         current = latest.get(key)
         if current is None or _workflow_run_recency(run) > _workflow_run_recency(current):
             latest[key] = run
-    return [
-        {"name": r.get("name") or "workflow", "status": r.get("status"), "conclusion": r.get("conclusion")}
-        for r in latest.values()
-    ]
+    return list(latest.values())
+
+
+def rerun_failed_workflow_runs(owner: str, repo: str, sha: str) -> tuple[list[str], str | None]:
+    """Re-run the failed jobs of every latest Actions run on `sha` that completed without passing.
+    Returns `(names re-run, first refusal or None)`: `([], None)` = nothing re-runnable (e.g. the red
+    check is not an Actions run). A refusal does not stop the others, and the names already accepted
+    are returned with it — a partly accepted re-run is still in flight on GitHub.
+
+    A re-run is a new ATTEMPT of the same run id (verified 2026-10-15: `run_attempt` 2, status
+    `in_progress`), so workflow_runs() reads it as pending, and the check-runs listing returns only
+    the latest check run per name by default (`filter=latest`) — the superseded red is not re-read."""
+    try:
+        runs = _latest_workflow_runs(owner, repo, sha)
+    except (PreconditionError, RemoteError) as e:
+        return [], str(e)
+    names: list[str] = []
+    refusal: str | None = None
+    for run in runs:
+        if run.get("status") != "completed" or run.get("conclusion") in ("success", "neutral", "skipped"):
+            continue
+        try:
+            status, body = api("POST", f"/repos/{owner}/{repo}/actions/runs/{run.get('id')}/rerun-failed-jobs")
+        except RemoteError as e:
+            refusal = refusal or str(e)
+            continue
+        if status != 201:
+            message = body.get("message") if isinstance(body, dict) else body
+            refusal = refusal or f"GitHub returned HTTP {status} re-running run {run.get('id')}: {message}"
+            continue
+        names.append(str(run.get("name") or "workflow"))
+    return names, refusal
 
 
 def mark_ready_for_review(node_id: str) -> None:

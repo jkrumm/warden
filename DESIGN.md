@@ -141,7 +141,9 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    (`train_base_sha`, captured at `update`) is the
    base's, not the PR's: the item parks (no strike, no revision) until the base goes green, re-entering
    `update` each park so it re-derives that base against the live branch tip rather than a frozen
-   red commit. The gate is exactly those four facts plus
+   red commit. A red the base does not share first re-runs the failed Actions jobs once on that
+   same SHA (`ci_rerun_sha`, `_rerun_once()`): a flaky test is not the PR's defect. Only a second
+   red on the SHA, nothing re-runnable, or a refused re-run request goes back for a revision. The gate is exactly those four facts plus
    GitHub's own rules (`lifecycle.merge`); `warden merge --confirm` uses the same
    gate and additionally requires a reviewed pin — the train's SHA while merging,
    else the item's last review-confirmed head — and refuses without one (intended).

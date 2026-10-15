@@ -294,6 +294,35 @@ def _park_on_a_repo_wide_red(conn: sqlite3.Connection, item: sqlite3.Row, now: d
                       note=f"parked: {reason}")
 
 
+def _hold_for_rerun(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime, owner: str, name: str,
+                    sha: str) -> tuple[bool, sqlite3.Row, str | None]:
+    """A red on the train's SHA that is not the base's re-runs its failed Actions jobs ONCE on that
+    same SHA before it costs a revision: a flaky test is not the pull request's defect, and a worker
+    sent to fix one edits code outside its brief (item 1559).
+
+    `ci_rerun_sha` is written FIRST, as the claim (compare-and-set, `retry_at` = the grace): of two
+    passes on one snapshot only the winner POSTs, and a crash after the POST cannot re-run the SHA
+    twice — at most once per SHA. Returns `(held, item, why_not)`: held = the item waits on `checks`
+    (a re-run is in flight, or another pass won the claim); otherwise `item` is the row as now
+    written, for the caller's revision, and `why_not` says why no re-run happened (a refusal),
+    None when there was nothing to re-run or this SHA already had its re-run."""
+    if item["ci_rerun_sha"] == sha:
+        return False, item, None
+    grace = core.now_iso(now + CHECKS_REGISTER_GRACE)
+    if not _train_hop(conn, item, now, ci_rerun_sha=sha, retry_at=grace):
+        return True, item, None
+    item = core.get_item(conn, item["event_id"])
+    names, refusal = _github.rerun_failed_workflow_runs(owner, name, sha)
+    if refusal:
+        print(f"triage: re-running the failed CI on {owner}/{name}@{sha[:12]}: {refusal}", file=sys.stderr)
+    if not names:
+        return False, item, refusal
+    refused = f"; refused: {refusal}" if refusal else ""
+    _train_hop(conn, item, now, note=f"{MERGE_PENDING_NOTE_PREFIX}re-running the failed CI once on "
+                                     f"{sha[:12]}: {', '.join(names)}{refused}")
+    return True, item, None
+
+
 def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                   now: dt.datetime) -> bool:
     sha = item["train_sha"]
@@ -318,9 +347,13 @@ def _train_checks(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
     except _merge.ChecksFailed as e:
         if _park_on_a_repo_wide_red(conn, item, now, owner, name, runs):
             return False
+        held, item, why_not = _hold_for_rerun(conn, item, now, owner, name, sha)
+        if held:
+            return False
+        no_rerun = f" (no CI re-run: {why_not})" if why_not else ""
         work.hand_back_for_revision(conn, item, now, outcome="checks_failed", expect_eq=_train_expect(item),
                                      train_evidence=f"GitHub check runs on {sha}: {e}",
-                                     note=f"CI failed on {sha[:12]}: {e}")
+                                     note=f"CI failed on {sha[:12]}: {e}{no_rerun}", retry_at=None)
         return False
     except (PolicyError, PreconditionError) as e:
         # Unreadable check runs: an unknown CI state never passes, and waiting does not fix a token. A

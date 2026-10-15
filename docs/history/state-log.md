@@ -10548,3 +10548,33 @@ still refuses behind a `merging` item, a claim sentinel, and a host-verb claim s
 waiting revisions go oldest-first; a waiting revision defers behind a running episode, a `merging` item,
 and a claim sentinel in its repo). AGENTS.md's gate line now reads 613. DESIGN.md § The loop gained the
 per-repo in-flight lock paragraph this change was missing. `make check` green.
+
+## 168. A head-only CI red re-runs once on the same SHA before a revision (2026-10-15)
+
+Item 1559 (weatherorb PR #104, a frontend timeline fix) went red once in CI on a pre-existing flake
+(`tests/spots` "tuple concurrently updated", run 38786726162) that master did not show. The checks stage
+handed it straight back for a revision; the worker chased the flake into `src/weatherorb/spots/db.py`,
+review blocked that out-of-scope change, and the item hit the revision ceiling and paged the owner.
+Spec: agent-platform.md "The loop" step 5 (dotfiles 05ed135).
+
+`train._rerun_once()` runs in `_train_checks()` after the repo-wide-red park and before the revision: it
+calls `clients.github.rerun_failed_workflow_runs()` (POST `actions/runs/{id}/rerun-failed-jobs` for each
+latest Actions run on the SHA that completed without passing), records the SHA in `ci_rerun_sha`
+(ledger v23, never cleared — keyed by SHA, so a new train SHA gets its own re-run) and holds the item on
+`checks` for `CHECKS_REGISTER_GRACE` (`retry_at`), no strike, no revision. `ci_rerun_sha` is written
+BEFORE the POST, as the claim (compare-and-set): of two passes on one snapshot only the winner POSTs,
+and a crash after the POST cannot re-run twice — at most once per SHA. A partly refused re-run (one run
+accepted) still holds. A second red on the same SHA, nothing re-runnable (a non-Actions check), or a
+fully refused request keeps the revision path, the refusal named in the revision note. A transient
+GitHub error on the request spends that SHA's re-run and revises — accepted, as before this change.
+The 2-minute hold assumes GitHub reflects the re-run quickly; measured: 5 s after the POST the run read
+`in_progress` at attempt 2. Rollback after the first v23 boot is forward-only, like every migration.
+
+The investigate/implement episodes on 1569 stopped on "the gate would read the superseded failed run as
+red". Measured instead: a re-run is a new attempt of the SAME run id (`run_attempt` 2, `in_progress`,
+verified on weatherorb run 38786726162), so `workflow_runs()`'s latest-per-workflow reads it pending, and
+the check-runs listing defaults to `filter=latest` (GitHub REST docs), so the superseded check run is not
+returned. No dedupe was needed. Implemented in-session.
+
+`test_triage.py` 613 -> 618 (re-run once then revise; refused re-run revises with the reason; a
+partly refused re-run holds; a lost claim does not POST; a new SHA gets its own re-run). `test_ledger.py` gained the v23 migration test. AGENTS.md's gate line reads 618.

@@ -242,6 +242,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_agent_gateway", "submit_update_pr"): _agent_gateway.submit_update_pr,
         ("_github", "check_runs"): _github.check_runs,
         ("_github", "workflow_runs"): _github.workflow_runs,
+        ("_github", "rerun_failed_workflow_runs"): _github.rerun_failed_workflow_runs,
         ("_agent_gateway", "get"): _agent_gateway.get,
         ("_agent_gateway", "wait"): _agent_gateway.wait,
         ("_agent_gateway", "cancel"): _agent_gateway.cancel,
@@ -338,6 +339,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         # test registers it, the same shape as every other write-ish client boundary.
         _github.workflow_runs = lambda owner, repo, sha: (_ for _ in ()).throw(
             RemoteError("test: no fake workflow_runs registered"))
+        # The merge train's once-per-SHA CI re-run: nothing re-runnable unless a test registers one,
+        # so a red check keeps the plain revision path.
+        _github.rerun_failed_workflow_runs = lambda owner, repo, sha: ([], None)
         CLOSED_PRS.clear()
         _github.close_pr = lambda owner, repo, number, *, comment=None: CLOSED_PRS.append(
             (owner, repo, number, comment))
@@ -12182,6 +12186,97 @@ def test_train_failed_ci_on_the_train_sha_is_a_checks_failed_revision():
         assert "e2e" in item["train_evidence"] and TRAIN_SHA in item["train_evidence"], item["train_evidence"]
         d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-ci-red'").fetchone()
         assert d["validation_status"] == "checks_failed"
+
+
+def test_train_a_head_only_red_re_runs_the_failed_ci_once_before_a_revision():
+    """Item 1559: a red on the train's SHA that the base does not share first re-runs the failed
+    Actions jobs on that same SHA — the item stays on `checks`, no revision, no strike — and only a
+    second red on the same SHA goes back for a revision."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-ci-flake", stage="checks", sha=TRAIN_SHA)
+        _agent_gateway.submit_review = _no_review
+        reruns: list[str] = []
+        _github.rerun_failed_workflow_runs = lambda owner, repo, sha: reruns.append(sha) or (["CI"], None)
+        CHECK_RUNS["runs"] = [{"name": "CI", "status": "completed", "conclusion": "failure"}]
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert reruns == [TRAIN_SHA], reruns
+        assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_CHECKS, dict(item)
+        assert item["ci_rerun_sha"] == TRAIN_SHA and item["revision_count"] == 0 and item["strikes"] == 0, dict(item)
+        assert "re-running the failed CI once" in item["note"], item["note"]
+        assert item["retry_at"] == (NOW + train.CHECKS_REGISTER_GRACE).isoformat(), dict(item)
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-sig-train-ci-flake'").fetchone()
+        assert d["validation_status"] is None, "a re-run is not a checks_failed revision"
+
+        _train_pass(conn, 1)   # inside the grace: the re-run has not registered yet, nothing is read
+        assert core.get_item(conn, eid)["state"] == core.STATE_MERGING and reruns == [TRAIN_SHA]
+
+        _train_pass(conn, 5)   # the re-run went red again on the same SHA: now it is the PR's
+        item = core.get_item(conn, eid)
+        assert reruns == [TRAIN_SHA], "one re-run per SHA"
+        assert item["state"] == core.STATE_WORKING and "CI failed" in item["note"], dict(item)
+
+
+def test_train_a_refused_ci_re_run_falls_back_to_the_revision():
+    """A re-run request GitHub refuses is neither a strike nor a page: the red revises as before."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-rerun-refused", stage="checks", sha=TRAIN_SHA)
+        _agent_gateway.submit_review = _no_review
+        _github.rerun_failed_workflow_runs = lambda owner, repo, sha: (
+            [], "GitHub returned HTTP 403 re-running run 1: Resource not accessible")
+        CHECK_RUNS["runs"] = [{"name": "CI", "status": "completed", "conclusion": "failure"}]
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and "CI failed" in item["note"], dict(item)
+        assert item["strikes"] == 0 and "no CI re-run: GitHub returned HTTP 403" in item["note"], dict(item)
+        assert item["retry_at"] is None, "no re-run in flight: the revision must not wait out the grace"
+
+
+def test_train_a_new_sha_gets_its_own_ci_re_run():
+    """`ci_rerun_sha` is keyed by SHA: a re-run spent on an older train SHA does not use up the
+    current one's."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-rerun-new-sha", stage="checks", sha=TRAIN_SHA)
+        conn.execute("UPDATE triage_items SET ci_rerun_sha=? WHERE event_id=?", ("f" * 40, eid))
+        conn.commit()
+        _agent_gateway.submit_review = _no_review
+        _github.rerun_failed_workflow_runs = lambda owner, repo, sha: (["CI"], None)
+        CHECK_RUNS["runs"] = [{"name": "CI", "status": "completed", "conclusion": "failure"}]
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["ci_rerun_sha"] == TRAIN_SHA, dict(item)
+
+
+def test_train_a_partly_refused_ci_re_run_still_holds_the_item():
+    """One run re-ran and another was refused: a re-run IS in flight, so the item waits on it
+    instead of revising against a result that is still coming."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-rerun-partial", stage="checks", sha=TRAIN_SHA)
+        _agent_gateway.submit_review = _no_review
+        _github.rerun_failed_workflow_runs = lambda owner, repo, sha: (["CI"], "GitHub returned HTTP 422")
+        CHECK_RUNS["runs"] = [{"name": "CI", "status": "completed", "conclusion": "failure"},
+                              {"name": "e2e", "status": "completed", "conclusion": "failure"}]
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["revision_count"] == 0, dict(item)
+        assert item["ci_rerun_sha"] == TRAIN_SHA and "re-running the failed CI" in item["note"], dict(item)
+        assert "refused: GitHub returned HTTP 422" in item["note"], item["note"]
+
+
+def test_train_a_ci_re_run_claim_lost_to_another_pass_does_not_post():
+    """Two passes on one snapshot: `ci_rerun_sha` is the claim, so the one that loses the
+    compare-and-set neither POSTs a second re-run nor revises."""
+    with _triage_env() as (conn, ctx):
+        eid = _train_item(conn, "sig-train-rerun-race", stage="checks", sha=TRAIN_SHA)
+        stale = core.get_item(conn, eid)
+        conn.execute("UPDATE triage_items SET ci_rerun_sha=?, retry_at=? WHERE event_id=?",
+                     (TRAIN_SHA, (NOW + train.CHECKS_REGISTER_GRACE).isoformat(), eid))
+        conn.commit()
+        posts: list[str] = []
+        _github.rerun_failed_workflow_runs = lambda owner, repo, sha: posts.append(sha) or (["CI"], None)
+        held, _, _ = train._hold_for_rerun(conn, stale, NOW, "jkrumm", "demo-repo", TRAIN_SHA)
+        assert held and posts == [], posts
+        assert core.get_item(conn, eid)["revision_count"] == 0
 
 
 # A head with one green check and one failing `e2e` — the shape a repo-wide red presents on the

@@ -6,10 +6,10 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-15 (§167 — waiting revisions queue oldest-first; a judged item never blocks an older revision) |
+| Last updated | 2026-10-15 (§168 — a head-only CI red re-runs once on the same SHA before a revision) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 22 (live ledger migrates on the loop's next boot after the deploy) |
+| Ledger | `~/.warden/warden.db`, schema 23 (live ledger migrates on the loop's next boot after the deploy) |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
 
 ## What is live
