@@ -109,10 +109,16 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    reviewer to begin any of them still unresolved with `UNRESOLVED PRIOR FINDING:`
    (`work.UNRESOLVED_PRIOR_MARKER`, matched case-insensitively at the start of the message).
    A blocked round with no such finding is converging (the earlier findings are fixed, the
-   new ones consequences of the narrow fix) and keeps revising without limit; a round with
+   new ones consequences of the narrow fix) and keeps revising up to the absolute ceiling
+   `core.MAX_REVISIONS` = 6 on `revision_count`; a round with
    the marker, a first review (nothing to compare with), red checks, a conflict or a revert
    is stalled, and the third stalled round ends the item for the owner (`stalled: N
-   revisions did not resolve …`). `revision_count` stays the attempt ordinal: the
+   revisions did not resolve …`). The ceiling stops a reviewer that drifts to a new narrower
+   finding every round (items 1478, 1480, 1565): a review that still blocks at `revision_count`
+   6 lands `needs_decision` with its findings (`revision ceiling (6), review still blocks: …`),
+   while a review that does not block is `confirmed` and goes to the merge train as always —
+   the ceiling never loosens what blocks a merge. Red checks and a conflict at the ceiling stay
+   `failed` (PR left open). `revision_count` is otherwise the attempt ordinal: the
    escalation model starts at attempt 3 (`implement_model()`). warden-only: agent-gateway's
    review schema is unchanged, the marker is text in the finding's message. `conflict`
    re-dispatches from the new base with the old diff as context. Confident host

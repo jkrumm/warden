@@ -13867,7 +13867,8 @@ def test_herdr_agent_listing_finds_a_working_agent_inside_the_checkout_and_degra
 _MARK = work.UNRESOLVED_PRIOR_MARKER
 
 
-def _blocked_review_round(conn, eid: int, n: int, blocking: list[dict[str, Any]]) -> sqlite3.Row:
+def _blocked_review_round(conn, eid: int, n: int, blocking: list[dict[str, Any]],
+                          merges: list[dict[str, Any]] | None = None) -> sqlite3.Row:
     """Round `n` of an item's revision chain: attempt `n`'s implement job is reviewed at the train's
     review stage and the review BLOCKS with `blocking`. The earlier rounds' dispatch rows (and the
     review verdicts the next round's context quotes) are the ones earlier calls left behind."""
@@ -13884,7 +13885,12 @@ def _blocked_review_round(conn, eid: int, n: int, blocking: list[dict[str, Any]]
                  (core.STATE_MERGING, "a" * 40, impl, val, "https://github.com/jkrumm/demo-repo/pull/10", n - 1, eid))
     conn.commit()
     _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result("actionable", blocking=blocking)}
-    _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("a blocked review must not merge"))
+    if merges is None:
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("a blocked review must not merge"))
+    else:   # a review that does not block: the round may merge
+        CHECK_RUNS["runs"] = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+        _merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
+            merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="d" * 40)
     train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
     return core.get_item(conn, eid)
 
@@ -14012,6 +14018,100 @@ def test_a_blocked_round_on_another_pull_request_is_not_the_previous_round():
         conn.execute("UPDATE triage_items SET implement_job='impl-adopted' WHERE event_id=?", (eid,))
         conn.commit()
         assert work.prior_blocking_findings(conn, core.get_item(conn, eid)) == []
+
+
+# --- the absolute revision ceiling: converging rounds are free, but not without bound -----------------
+
+
+def _set_revision_state(conn, eid: int, revision_count: int, stalled_rounds: int) -> None:
+    conn.execute("UPDATE triage_items SET revision_count=?, stalled_rounds=? WHERE event_id=?",
+                 (revision_count, stalled_rounds, eid))
+    conn.commit()
+
+
+def test_revisions_left_stops_at_the_ceiling_and_the_stalled_rule_is_unchanged():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-ceiling-unit")
+        for revision_count, stalled, want in (
+                (core.MAX_REVISIONS - 1, 0, True),                          # below both
+                (core.MAX_REVISIONS - 1, core.MAX_IMPLEMENT_ATTEMPTS - 1, True),
+                (core.MAX_REVISIONS - 1, core.MAX_IMPLEMENT_ATTEMPTS, False),   # stalled rule, as before
+                (core.MAX_REVISIONS, 0, False),                              # the ceiling alone
+                (core.MAX_REVISIONS + 1, 0, False)):
+            _set_revision_state(conn, eid, revision_count, 0)
+            item = core.get_item(conn, eid)
+            assert work.revisions_left(item, stalled) is want, (revision_count, stalled)
+            assert work.revisable(item, stalled) is want, (revision_count, stalled)
+
+
+def test_below_the_ceiling_a_converging_round_still_continues():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-below-ceiling")
+        _blocked_review_round(conn, eid, 1, [_finding("first problem")])
+        # Revision count MAX_REVISIONS - 1 on record, a new finding: converging, one revision left.
+        item = _blocked_review_round(conn, eid, core.MAX_REVISIONS, [_finding("a consequence of the fix", 2)])
+        assert item["revision_count"] == core.MAX_REVISIONS - 1
+        assert item["state"] == core.STATE_WORKING and item["stalled_rounds"] == 1, dict(item)
+
+
+def test_at_the_ceiling_a_review_that_still_blocks_lands_needs_decision_with_its_findings():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-at-ceiling")
+        _blocked_review_round(conn, eid, 1, [_finding("first problem")])
+        item = _blocked_review_round(conn, eid, core.MAX_REVISIONS + 1,
+                                     [_finding("a brand new narrower problem", 7)])
+        assert item["revision_count"] == core.MAX_REVISIONS
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["stalled_rounds"] == 1 and item["blocked_sha"] == "a" * 40, dict(item)
+        assert "revision ceiling" in item["note"] and "scripts/x.py:7 — a brand new narrower problem" in item["note"], item["note"]
+
+
+def test_at_the_ceiling_a_review_that_does_not_block_goes_to_the_merge_train():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-ceiling-green")
+        merges: list[dict[str, Any]] = []
+        item = _blocked_review_round(conn, eid, core.MAX_REVISIONS + 1, [], merges=merges)
+        assert item["revision_count"] == core.MAX_REVISIONS
+        assert len(merges) == 1 and item["state"] != core.STATE_NEEDS_DECISION, (merges, dict(item))
+        assert item["reviewed_sha"] == "a" * 40, dict(item)
+
+
+def test_the_stalled_cap_still_lands_failed_even_at_the_ceiling():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-ceiling-stalled")
+        _blocked_review_round(conn, eid, 1, [_finding("same problem")])
+        _set_revision_state(conn, eid, core.MAX_REVISIONS, core.MAX_IMPLEMENT_ATTEMPTS - 1)
+        item = _blocked_review_round(conn, eid, core.MAX_REVISIONS + 1, [_finding(f"{_MARK} same problem")])
+        assert item["state"] == core.STATE_FAILED and item["note"].startswith("stalled:"), dict(item)
+
+
+# Ledger replay: the (revision_count, stalled_rounds) shapes the live ledger holds for items 1478, 1480
+# and 1565 when they were stopped by hand (read-only, 2026-10-15), each continued as the drift it was:
+# a NEW narrower finding every round, never the marker. Without the ceiling every one of them revises
+# on for as long as the reviewer keeps finding something; with it, each ends at MAX_REVISIONS.
+_LEDGER_SHAPES = {"1478": (3, 0), "1480": (3, 0), "1565": (5, 2)}
+
+
+def test_the_drifting_chains_of_1478_1480_and_1565_stop_at_the_ceiling():
+    for ledger_id, (observed_revisions, observed_stalled) in _LEDGER_SHAPES.items():
+        with _triage_env() as (conn, ctx):
+            eid = _seed_verdict_item(conn, external_id=f"sig-replay-{ledger_id}")
+            calls: list[dict[str, Any]] = []
+            _agent_gateway.submit = _fake_submit(calls)
+            n, item = 0, None
+            while n < 3 * core.MAX_REVISIONS:
+                n += 1
+                item = _blocked_review_round(conn, eid, n, [_finding(f"{ledger_id} narrower finding {n}", n)])
+                if item["state"] != core.STATE_WORKING:
+                    break
+                if n == observed_revisions:   # the chain as the ledger recorded it when it was stopped
+                    assert item["revision_count"] == observed_revisions - 1 and work.revisable(item)
+                    _set_revision_state(conn, eid, item["revision_count"], observed_stalled)
+                work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+            assert item["state"] == core.STATE_NEEDS_DECISION, (ledger_id, dict(item))
+            assert item["revision_count"] == core.MAX_REVISIONS and n == core.MAX_REVISIONS + 1, (ledger_id, n)
+            assert max(item["stalled_rounds"], 1) < core.MAX_IMPLEMENT_ATTEMPTS, "the stalled cap never fired"
+            assert f"{ledger_id} narrower finding {n}" in item["note"], item["note"]
 
 
 if __name__ == "__main__":

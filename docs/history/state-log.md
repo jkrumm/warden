@@ -10505,3 +10505,24 @@ a retried merge takes a fresh one; a timeout and an exception are stored without
 the tail is capped; no verify target stores none; `VERIFY_RESET`/`merged_entry` contract.
 `test_ledger.py` 44 -> 45 (migration 22; the two `== 21` pins and the adoption column set moved).
 AGENTS.md's gate line now reads 603. `make check` green.
+
+## 166. Absolute revision ceiling (2026-10-15)
+
+**Why.** `revisions_left` counted only STALLED rounds, so a converging round (every blocking finding
+new) was free and a reviewer drifting to a new narrower finding each round revised without bound:
+1565 (warden#42, a 71-line prune) reached `revision_count` 5 / `stalled_rounds` 2 in 2.5 h and was landed by
+hand; 1478/1480 showed the same pattern (3/0 in the ledger, before the converging cap existed).
+
+**Change.** `core.MAX_REVISIONS` = 6; `work.revision_ceiling_hit()` and `revisions_left()` refuse a revision
+at it (so `revisable`, `hand_back_for_revision`, the verify revert path all inherit it). In
+`train._fold_review` a blocked review at the ceiling (stalled cap not hit, not a revert, `max_tier`
+implement) lands `needs_decision` with `format_blocking_findings` in the note instead of `working`; the stalled
+cap keeps its own `failed` + `stalled:` note. A review that does not block is `confirmed` and goes to the
+merge train regardless of `revision_count`, so the review gate (JOURNAL 1481: blocking = a concrete
+reachable defect, scope beyond the request never blocks) is untouched. Red checks / a conflict at the ceiling
+still land `failed` with the PR left open.
+
+`test_triage.py` 603 -> 609: ceiling arithmetic and the unchanged stalled rule, a converging round below the
+ceiling continues, at the ceiling a blocking review is `needs_decision` with its findings, a non-blocking one
+merges, the stalled cap still wins, and a replay of the 1478/1480/1565 ledger shapes ending at the ceiling.
+AGENTS.md gate line now 609. `make check` green.

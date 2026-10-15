@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-15 (§165 — `make verify` baseline at merge; a red already present before the merge is not the merge's) |
+| Last updated | 2026-10-15 (§166 — absolute revision ceiling: review drift ends in `needs_decision`) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 22 (live ledger migrates on the loop's next boot after the deploy) |
@@ -16,7 +16,7 @@ build log (§1–§150).
 
 The whole loop in `DESIGN.md` § The loop runs: one intake pool → single-shot agent-gateway
 triage (`attach | new | fixed_by | ignore`) → investigate → implement at any
-confidence, revisions on the same PR (capped at 3 STALLED rounds, §150) → one merge train per repo
+confidence, revisions on the same PR (capped at 3 STALLED rounds, §150, and at 6 revisions absolute, §166) → one merge train per repo
 (`update_pr` → checks → review → squash, all on one SHA) → `make deploy` / `make
 verify` + the item's own signal quiet → automatic revert on failure → fixed-by sweep
 after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a daily
@@ -132,6 +132,9 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `34fd019`, `b35b86e` landed after); an unchanged head, a missing `blocked_sha`, or an
   unreadable PR still goes to `needs_decision`. `TRAIN_START`, a redriven train and
   `core.reinvestigate()` all clear it.
+- **Revision ceiling (§166).** `core.MAX_REVISIONS` = 6 caps `revision_count` whatever the rounds did
+  (`work.revisions_left`); a converging chain that reaches it with a review that still blocks lands
+  `needs_decision` listing the findings (train `_fold_review`). Not-blocking reviews are untouched.
 - **Converging revisions (§150).** The revision cap counts STALLED rounds (`stalled_rounds`, migration 19),
   not attempts. A revision's review context quotes the previous round's blocking findings and asks the
   reviewer to start any still-unresolved one with `UNRESOLVED PRIOR FINDING:`; a blocked round without it

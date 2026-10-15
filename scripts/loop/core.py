@@ -229,6 +229,14 @@ DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 # escalation, rewind). An attempt count per item, never a turn or time limit on the episode itself.
 MAX_IMPLEMENT_ATTEMPTS = 3
 
+# The absolute ceiling on revisions, converging or not: `revision_count` at this value ends the chain
+# (work.revisions_left()). A converging round (every blocking finding new) is free against
+# MAX_IMPLEMENT_ATTEMPTS, so a reviewer that drifts to a new narrower finding each round would
+# otherwise revise without bound (item 1565: 5 revisions, 2.5 h, for a 71-line prune; 1478/1480 the
+# same). At the ceiling a review that blocks lands `needs_decision` with its findings (a review that
+# does not block already goes to the merge train; the ceiling never loosens what blocks a merge).
+MAX_REVISIONS = 6
+
 # Attempt N >= this one runs on agent-gateway's escalation implement model (GET /api/routing), when
 # it has one; see implement_model().
 ESCALATION_ATTEMPT = 3

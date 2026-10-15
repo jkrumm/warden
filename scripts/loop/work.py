@@ -2125,15 +2125,22 @@ def review_claim_until(now: dt.datetime) -> str:
     return core.now_iso(now + dt.timedelta(minutes=REVIEW_CLAIM_MINUTES))
 
 
+def revision_ceiling_hit(item: sqlite3.Row) -> bool:
+    """The item has spent core.MAX_REVISIONS revisions, whatever its rounds did (see the constant)."""
+    return item["revision_count"] >= core.MAX_REVISIONS
+
+
 def revisions_left(item: sqlite3.Row, stalled: int | None = None) -> bool:
     """Another implement attempt may follow the one on record: fewer than MAX_IMPLEMENT_ATTEMPTS
-    rounds have STALLED (`triage_items.stalled_rounds`, the round on record included). A converging
-    round (its blocking findings all new) is not counted, so a chain that keeps resolving findings
-    keeps revising; `revision_count` is only the attempt ordinal. `stalled` is the count the caller
-    is about to persist, when the round on record is not in the column yet."""
+    rounds have STALLED (`triage_items.stalled_rounds`, the round on record included) AND the absolute
+    ceiling core.MAX_REVISIONS on `revision_count` is not reached. A converging round (its blocking
+    findings all new) is not counted as stalled, so a chain that keeps resolving findings keeps
+    revising, up to the ceiling; below it `revision_count` is only the attempt ordinal. `stalled` is
+    the count the caller is about to persist, when the round on record is not in the column yet."""
     if stalled is None:
         stalled = item["stalled_rounds"]
-    return item["max_tier"] == "implement" and stalled < core.MAX_IMPLEMENT_ATTEMPTS
+    return (item["max_tier"] == "implement" and stalled < core.MAX_IMPLEMENT_ATTEMPTS
+            and not revision_ceiling_hit(item))
 
 
 def revisable(item: sqlite3.Row, stalled: int | None = None) -> bool:

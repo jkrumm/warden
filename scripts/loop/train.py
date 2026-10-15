@@ -671,8 +671,17 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         if not revise and round_counted and stalled >= core.MAX_IMPLEMENT_ATTEMPTS and not revert:
             note = (f"stalled: {stalled} revisions did not resolve the previous review's findings — "
                     f"no revision left; {note}")
-        core.set_state(conn, event_id, core.STATE_WORKING if revise else core.STATE_FAILED, now, strikes=0,
-                        failure_class=core.FAILURE_WORK, note=note, blocked_sha=sha, stalled_rounds=stalled)
+        if (not revise and not revert and item["max_tier"] == "implement" and work.revision_ceiling_hit(item)
+                and stalled < core.MAX_IMPLEMENT_ATTEMPTS):
+            # The absolute ceiling, reached by a chain that kept converging: the review still blocks, so
+            # the findings go to the owner (a non-blocking review never gets here: it is `confirmed`).
+            core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, strikes=0, blocked_sha=sha,
+                            stalled_rounds=stalled,
+                            note=f"revision ceiling ({item['revision_count']}), review still blocks: "
+                                 f"{work.format_blocking_findings(blocking)}")
+        else:
+            core.set_state(conn, event_id, core.STATE_WORKING if revise else core.STATE_FAILED, now, strikes=0,
+                            failure_class=core.FAILURE_WORK, note=note, blocked_sha=sha, stalled_rounds=stalled)
     conn.commit()
     _release_review_claim(conn, event_id, claim_until)
     return False
