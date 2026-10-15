@@ -26,6 +26,26 @@ since the cursor (`~/.warden/improve.cursor`), or `quiet`.
      time new → fixed, merge-train refusals, auto-reverts.
    - agent-gateway: `curl -s localhost:7705/api/jobs/health`, `job.fail` events in
      `~/Library/Logs/agent-gateway.jsonl` since the last entry, degraded routes.
+   - OpenCode episodes (agw; evidence in `docs/opencode-v2.md`), since the last entry:
+     - server health: `curl -s localhost:7705/api/jobs/health | jq .opencodeServer` (`ok`, `version`
+       == pinned); restarts = `launchctl print gui/$UID/com.jkrumm.agent-gateway-opencode | grep -E 'pid|runs'`.
+       Any `ok:false` is a page-worthy friction.
+     - transport errors: `jq 'select(.event=="session.opencode_error" or .event=="session.opencode_poll_slow")'`
+       on the jsonl. The message names `[METHOD path after Nms]`; a recurring route is the item to file.
+     - re-attach after agw restarts: `session.opencode_detached` vs `session.opencode_reattach` counts
+       (+ `job.recover`). Detached without a matching reattach = a lost episode.
+     - steers: `job.steer` events per dispatch job; compare the steered job's outcome with the median.
+       Fewer than ~5 steers total is no signal — say so, don't conclude.
+   - Per-route cost and pass rate: pass rate from `sqlite3 -readonly ~/.local/share/agent-gateway/jobs.db
+     "select tool,model,status,count(*) from job_stats where finished_at > <ms> group by 1,2,3"`;
+     cost from `~/.local/share/usage-tracker/agent-gateway-sessions.jsonl` (`costUsd` by `tool`, `model`,
+     `outcome`). `job_stats.model` is often empty — join on tool, not model. A route whose pass rate
+     drops or whose $/pass doubles is a friction candidate; `GET /api/routing` names the route's model.
+   - Decision-model shadow: `python3 scripts/lifecycle/shadow.py report` (agreement by confidence
+     bucket, rows by status, cost). **Promotion check each iteration:** if the rule in
+     `docs/decision-shadow.md` holds (≥ 50 settled rows, ≥ 95% action / ≥ 90% target agreement at
+     confidence ≥ 0.95, no new→ignore), file the promotion as a normal `warden run` item. Until then
+     report only "N/50 rows" in the journal line — never promote on the replay.
    - Hermes: replies in #agents / #hermes since the last entry and their length
      (`~/.hermes/state.db`, read-only); any reply over 3 lines is friction.
    - Argo `/warden`: every few iterations, have `@verifier` screenshot it and confirm
