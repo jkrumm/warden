@@ -188,7 +188,7 @@ def test_settled_rows_past_retention_are_pruned() -> None:
     assert left == ["recorded", "submitted"], left
 
 
-def test_prune_deletes_in_batches_until_none_remain() -> None:
+def test_prune_deletes_one_batch_per_settle() -> None:
     conn = fresh()
     orig = agent_gateway.get
     agent_gateway.get = lambda job_id: {"id": job_id, "status": "running"}  # type: ignore
@@ -196,18 +196,22 @@ def test_prune_deletes_in_batches_until_none_remain() -> None:
     shadow.PRUNE_BATCH_SIZE = 2
     try:
         add(conn, 1, state="new")
-        # Five old settled rows force three DELETE batches (2+2+1) before the loop stops.
+        # Five old settled rows: one settle() deletes at most one batch (2), so the backlog drains
+        # across passes instead of in one open transaction holding SQLite's single-writer lock.
         for i in range(5):
             conn.execute("INSERT INTO decision_shadow(kind,event_id,llm_job,decision_job,status,created_at,settled_at) "
                          "VALUES ('triage',1,?,?,?,?,?)",
                          (f"l{i}", f"d{i}", "recorded", "2026-10-15T06:00:00+00:00", "2026-06-01T00:00:00+00:00"))
         conn.commit()
         shadow.settle(conn, NOW)
+        assert conn.execute("SELECT count(*) FROM decision_shadow").fetchone()[0] == 3
+        shadow.settle(conn, NOW)
+        assert conn.execute("SELECT count(*) FROM decision_shadow").fetchone()[0] == 1
+        shadow.settle(conn, NOW)
+        assert conn.execute("SELECT count(*) FROM decision_shadow").fetchone()[0] == 0
     finally:
         agent_gateway.get = orig
         shadow.PRUNE_BATCH_SIZE = orig_batch
-    left = [r[0] for r in conn.execute("SELECT status FROM decision_shadow ORDER BY id").fetchall()]
-    assert left == [], left
 
 
 def test_non_numeric_target_choice_is_no_target() -> None:

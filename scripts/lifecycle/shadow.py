@@ -269,7 +269,8 @@ PRUNE_BATCH_SIZE = 1000
 def settle(conn: sqlite3.Connection, now: dt.datetime) -> None:
     """Fold every finished `decide` job onto its row; a job that failed, vanished or stayed
     non-terminal SETTLE_GIVE_UP_HOURS marks the row `failed` with the reason. A job still running
-    is left for the next pass. Settled rows older than SETTLED_RETENTION_DAYS are pruned.
+    is left for the next pass. Settled rows older than SETTLED_RETENTION_DAYS are pruned one
+    bounded batch per call, so the backlog drains across passes instead of in one open transaction.
     Never raises: a shadow failure is a stderr line."""
     try:
         rows = conn.execute("SELECT id, decision_job, created_at FROM decision_shadow WHERE status='submitted'").fetchall()
@@ -281,20 +282,20 @@ def settle(conn: sqlite3.Connection, now: dt.datetime) -> None:
 
 
 def _prune_settled(conn: sqlite3.Connection, now: dt.datetime) -> None:
-    # No commit here: the DELETE rides in the caller's transaction. Retention code must not make
-    # uncommitted real-lane writes on the shared loop connection durable (the loop commits the pass
-    # at its own boundaries); if the pass dies first, the delete rolls back and retries next tick.
-    # Batched: a first deploy against an already-large table must not delete every eligible row in
-    # one statement and hold SQLite's write lock through the shared lifecycle transaction.
+    # One bounded batch per settle(): a first deploy against an already-large table must not delete
+    # every eligible row in one transaction. SQLite (WAL) holds its single-writer lock for the full
+    # span of an open transaction, so a DELETE loop with no commit between batches would still stall
+    # a concurrent writer (dispatch-sweep, watchdog-poll, api) past busy_timeout — batching without
+    # committing is just one unbounded DELETE split into more round trips. The backlog drains across
+    # passes instead. No commit here either: the DELETE rides in the caller's transaction, so a pass
+    # that dies before its next commit rolls the batch back and retries next tick, and retention must
+    # not make an uncommitted real-lane write on the shared loop connection durable.
     cutoff = core.now_iso(now - dt.timedelta(days=SETTLED_RETENTION_DAYS))
-    while True:
-        deleted = conn.execute(
-            "DELETE FROM decision_shadow WHERE id IN "
-            "(SELECT id FROM decision_shadow WHERE status IN ('recorded','failed') AND settled_at < ? LIMIT ?)",
-            (cutoff, PRUNE_BATCH_SIZE),
-        ).rowcount
-        if deleted < PRUNE_BATCH_SIZE:
-            return
+    conn.execute(
+        "DELETE FROM decision_shadow WHERE id IN "
+        "(SELECT id FROM decision_shadow WHERE status IN ('recorded','failed') AND settled_at < ? LIMIT ?)",
+        (cutoff, PRUNE_BATCH_SIZE),
+    )
 
 
 def _settle_row(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) -> None:
