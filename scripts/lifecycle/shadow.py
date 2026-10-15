@@ -275,18 +275,14 @@ def settle(conn: sqlite3.Connection, now: dt.datetime) -> None:
         for row in rows:
             _settle_row(conn, row, now)
         _prune_settled(conn, now)
-        conn.commit()
     except Exception as e:  # noqa: BLE001 — the shadow lane must never touch the real one
-        try:
-            conn.rollback()
-        except Exception:  # noqa: BLE001 — a closed connection has nothing to roll back
-            pass
         print(f"shadow: settle failed: {e}", file=sys.stderr)
 
 
 def _prune_settled(conn: sqlite3.Connection, now: dt.datetime) -> None:
     cutoff = core.now_iso(now - dt.timedelta(days=SETTLED_RETENTION_DAYS))
     conn.execute("DELETE FROM decision_shadow WHERE status IN ('recorded', 'failed') AND settled_at < ?", (cutoff,))
+    conn.commit()
 
 
 def _settle_row(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) -> None:
@@ -312,6 +308,7 @@ def _settle_row(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) ->
         why = (job.get("error") if job else None) or "job missing or without answers"
         conn.execute("UPDATE decision_shadow SET status='failed', error=?, settled_at=? WHERE id=?",
                      (str(why)[:300], core.now_iso(now), row["id"]))
+    conn.commit()
 
 
 # ── agreement ─────────────────────────────────────────────────────────────────────────────────
