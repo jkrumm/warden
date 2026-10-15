@@ -176,8 +176,10 @@ the loop's 10-minute tick.
   choice; agent-gateway enforces its allowlist and routes each tier
   (`GET /api/routing`). The verdict schema is agent-gateway's; a version mismatch is a
   loud refusal, never a best-effort parse.
-- **The episode is not contained.** `readOnly` is three tool names on a CLI flag
-  under `--dangerously-skip-permissions`; `Bash` is unrestricted and the brief is
+- **The episode is not contained.** On a `claude` route `readOnly` is three tool names on a CLI
+  flag and `Bash` is unrestricted; on an OpenCode route (the dispatch default) it is the
+  `agw-readonly` agent, an allow-listed shell that is a cost-raising deny list, not a boundary.
+  Either way the brief is
   attacker-influenceable (issues, alert text, log lines). A token on this host is
   not an authorization boundary against an episode.
 - **The tailnet is the trust boundary.** Argo is reachable only over the owner's
