@@ -10526,3 +10526,24 @@ still land `failed` with the PR left open.
 ceiling continues, at the ceiling a blocking review is `needs_decision` with its findings, a non-blocking one
 merges, the stalled cap still wins, and a replay of the 1478/1480/1565 ledger shapes ending at the ceiling.
 AGENTS.md gate line now 609. `make check` green.
+
+## 167. Waiting revisions queue oldest-first; a judged item never blocks an older revision (2026-10-15)
+
+The weatherorb deadlock: two `working` items in one repo, each with a blocked or checks-failed implement
+judged, each saw the other as an in-flight implement episode (`_in_flight_sql()` counts every `working`
+item with an `implement_job`), so `maybe_revise_blocked()` deferred both and neither was ever revised.
+The fix is a revision-only exemption: `check_repo_not_in_flight(as_revision=True)` (threaded through
+`open_episode()`) passes over a YOUNGER item whose implement dispatch is judged
+(`validation_status IS NOT NULL`, `policy._waiting_revision_sql()`). An older waiting revision therefore
+goes first; its new episode then holds the repo, and the younger one defers as it should. The exemption
+never passes a `merging` item, an open episode, or a claim sentinel (`core.IMPLEMENT_CLAIM`).
+
+The first draft enumerated the judged statuses (`blocked`, `checks_failed`, `conflict`), which left an
+item judged with any other status (`passed`, `error`, `redriven:…`) counted as in flight. `IS NOT NULL`
+is the predicate: a judged item holds no episode whatever its status.
+
+`test_lifecycle.py` 57 -> 66 (policy: a younger item judged with any status passes; a waiting revision
+still refuses behind a `merging` item and behind a claim sentinel). `test_triage.py` 609 -> 613 (two
+waiting revisions go oldest-first; a waiting revision defers behind a running episode, a `merging` item,
+and a claim sentinel in its repo). AGENTS.md's gate line now reads 613. DESIGN.md § The loop gained the
+per-repo in-flight lock paragraph this change was missing. `make check` green.

@@ -9951,6 +9951,62 @@ def test_revision_stops_at_the_attempt_cap():
         assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
 
 
+def test_two_waiting_revisions_in_one_repo_are_revised_oldest_first():
+    with _triage_env() as (conn, ctx):
+        old = _seed_blocked_item(conn, external_id="sig-rev-old")
+        young = _seed_blocked_item(conn, external_id="sig-rev-young")
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+
+        work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+
+        assert len(calls) == 1, "the oldest revision goes; the younger waits for it"
+        assert core.get_item(conn, old)["revision_count"] == 1
+        young_item = core.get_item(conn, young)
+        assert young_item["revision_count"] == 0 and young_item["implement_job"] == "impl-sig-rev-young"
+
+
+def test_a_waiting_revision_defers_behind_a_running_episode_in_its_repo():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-rev-behind-run")
+        _seed_implementing_item(conn, external_id="sig-rev-running", job_id="impl-rev-running")
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+
+        work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+
+        assert calls == []
+        assert core.get_item(conn, eid)["revision_count"] == 0
+
+
+def test_a_waiting_revision_defers_behind_a_merging_item_in_its_repo():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-rev-behind-merge")
+        _seed_item(conn, external_id="sig-rev-merging", state=core.STATE_MERGING)
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+
+        work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+
+        assert calls == []
+        assert core.get_item(conn, eid)["revision_count"] == 0
+
+
+def test_a_waiting_revision_defers_behind_a_claimed_implement_slot_in_its_repo():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-rev-behind-claim")
+        claim = _seed_item(conn, external_id="sig-rev-claimed", state=core.STATE_WORKING)
+        conn.execute("UPDATE triage_items SET implement_job=? WHERE event_id=?", (core.IMPLEMENT_CLAIM, claim))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+
+        work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+
+        assert calls == []
+        assert core.get_item(conn, eid)["revision_count"] == 0
+
+
 def test_non_finding_blocks_are_not_revised():
     """A merge-gate refusal or a needs-human review is a question, not a
     finding — it is never revised."""
