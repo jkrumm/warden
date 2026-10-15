@@ -23,6 +23,7 @@ item moves.
 | `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`, `reinvestigate`) |
 | `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents |
 | `scripts/improve-trigger.py` | read-only: outcomes (`failed` / `needs_decision`) since the improve loop's cursor, or `quiet` |
+| `scripts/lifecycle/shadow.py`, `scripts/shadow-replay.py` | the decision-model shadow lane next to the LLM triage (`decision_shadow`, ledger v21; nothing decides from it) and its replay over labelled history; measured table + promotion rule: `docs/decision-shadow.md`; report: `python3 scripts/lifecycle/shadow.py report` |
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
 | `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns |
 

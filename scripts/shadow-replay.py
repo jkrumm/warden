@@ -74,18 +74,21 @@ def run_model(items, model: str):
     # one connection per thread (sqlite3 objects are not shareable)
     conn = ledger.connect(migrate=False)
     stats = {"model": model, "n": 0, "errors": 0, "action": 0, "attach_n": 0, "attach_target": 0, "cost": 0.0, "ms": 0,
-             "byConfidence": {}}
+             "byConfidence": {}, "confusion": {}, "errorReasons": []}
     for item in items:
         out = one(conn, item, model)
         if out is None:
             continue
         if "error" in out:
             stats["errors"] += 1
+            stats["errorReasons"].append(str(out["error"])[:120])
             continue
         dec, truth = out["dec"], item["truth"]
         stats["n"] += 1
         hit = dec.get("action") == truth
         stats["action"] += int(hit)
+        key = f"{truth}->{dec.get('action')}"
+        stats["confusion"][key] = stats["confusion"].get(key, 0) + 1
         if truth == "attach":
             stats["attach_n"] += 1
             stats["attach_target"] += int(hit and dec.get("item") == item["duplicate_of"])
@@ -121,6 +124,9 @@ def main() -> int:
         print(f"{r['model']:<22} n={r['n']:<4} err={r['errors']:<3} action={r['action'] / n:.0%} "
               f"attach-target={r['attach_target']}/{r['attach_n']} cost=${r['cost']:.5f} avg={r['ms'] / n:.0f}ms "
               f"byConf={ {k: f'{v[1]}/{v[0]}' for k, v in sorted(r['byConfidence'].items())} }")
+        print(f"  confusion (truth->decision): {dict(sorted(r['confusion'].items()))}")
+        if r["errorReasons"]:
+            print(f"  errors: {sorted(set(r['errorReasons']))}")
     return 0
 
 
