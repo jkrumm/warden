@@ -188,6 +188,28 @@ def test_settled_rows_past_retention_are_pruned() -> None:
     assert left == ["recorded", "submitted"], left
 
 
+def test_prune_deletes_in_batches_until_none_remain() -> None:
+    conn = fresh()
+    orig = agent_gateway.get
+    agent_gateway.get = lambda job_id: {"id": job_id, "status": "running"}  # type: ignore
+    orig_batch = shadow.PRUNE_BATCH_SIZE
+    shadow.PRUNE_BATCH_SIZE = 2
+    try:
+        add(conn, 1, state="new")
+        # Five old settled rows force three DELETE batches (2+2+1) before the loop stops.
+        for i in range(5):
+            conn.execute("INSERT INTO decision_shadow(kind,event_id,llm_job,decision_job,status,created_at,settled_at) "
+                         "VALUES ('triage',1,?,?,?,?,?)",
+                         (f"l{i}", f"d{i}", "recorded", "2026-10-15T06:00:00+00:00", "2026-06-01T00:00:00+00:00"))
+        conn.commit()
+        shadow.settle(conn, NOW)
+    finally:
+        agent_gateway.get = orig
+        shadow.PRUNE_BATCH_SIZE = orig_batch
+    left = [r[0] for r in conn.execute("SELECT status FROM decision_shadow ORDER BY id").fetchall()]
+    assert left == [], left
+
+
 def test_non_numeric_target_choice_is_no_target() -> None:
     dec = shadow.decision_triage({"action": {"choice": "attach", "confidence": 0.9},
                                   "attach_target": {"choice": "weird", "confidence": 0.9}})

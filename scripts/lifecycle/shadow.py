@@ -263,6 +263,7 @@ def record_llm(conn: sqlite3.Connection, kind: str, event_id: int, llm_job: str,
 
 SETTLE_GIVE_UP_HOURS = 24
 SETTLED_RETENTION_DAYS = 90
+PRUNE_BATCH_SIZE = 1000
 
 
 def settle(conn: sqlite3.Connection, now: dt.datetime) -> None:
@@ -283,8 +284,17 @@ def _prune_settled(conn: sqlite3.Connection, now: dt.datetime) -> None:
     # No commit here: the DELETE rides in the caller's transaction. Retention code must not make
     # uncommitted real-lane writes on the shared loop connection durable (the loop commits the pass
     # at its own boundaries); if the pass dies first, the delete rolls back and retries next tick.
+    # Batched: a first deploy against an already-large table must not delete every eligible row in
+    # one statement and hold SQLite's write lock through the shared lifecycle transaction.
     cutoff = core.now_iso(now - dt.timedelta(days=SETTLED_RETENTION_DAYS))
-    conn.execute("DELETE FROM decision_shadow WHERE status IN ('recorded', 'failed') AND settled_at < ?", (cutoff,))
+    while True:
+        deleted = conn.execute(
+            "DELETE FROM decision_shadow WHERE id IN "
+            "(SELECT id FROM decision_shadow WHERE status IN ('recorded','failed') AND settled_at < ? LIMIT ?)",
+            (cutoff, PRUNE_BATCH_SIZE),
+        ).rowcount
+        if deleted < PRUNE_BATCH_SIZE:
+            return
 
 
 def _settle_row(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) -> None:
