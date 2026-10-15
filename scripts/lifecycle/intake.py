@@ -200,6 +200,12 @@ def is_private(repo: str | None) -> bool:
 
 
 
+def may_reach_model(item: sqlite3.Row, candidates: list[str]) -> bool:
+    """False when the item, or the one repo its label routes it to, is `-private`: nothing about it
+    may reach an external model. The single gate for the triage prompt and the shadow lane."""
+    return not (is_private(item["repo"]) or (len(candidates) == 1 and is_private(candidates[0])))
+
+
 def _open_items(conn: sqlite3.Connection, repos: list[str], exclude: int) -> list[str]:
     """Open items of the candidate repos, newest CREATED first (`updated_at` is rewritten by every
     ingest tick, so it orders by recency of the signal, not of the item). A `-private` repo
@@ -272,8 +278,7 @@ def build_triage_prompt(conn: sqlite3.Connection, item: sqlite3.Row, event: sqli
     is fenced between UNTRUSTED markers with one line saying it is data. When the item is in a
     `-private` repo (its own, or the one repo its label routes it to) that text is withheld
     entirely: the prompt goes to an external model."""
-    private = is_private(item["repo"]) or (len(candidates) == 1 and is_private(candidates[0]))
-    if private:
+    if not may_reach_model(item, candidates):
         content = WITHHELD
     else:
         excerpt = item["brief"] or json.dumps(_payload(event["payload_json"]), ensure_ascii=False, sort_keys=True)

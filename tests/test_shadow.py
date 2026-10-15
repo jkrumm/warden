@@ -145,6 +145,36 @@ def test_submit_failure_is_swallowed() -> None:
     assert conn.execute("SELECT count(*) FROM decision_shadow").fetchone()[0] == 0
 
 
+def test_sweep_of_a_private_repo_builds_nothing() -> None:
+    assert shadow.build_sweep(repo="vps-private", pr_title="t", pr_body="b", diff="d", candidates=[]) is None
+    assert shadow.build_sweep(repo="argo", pr_title="t", pr_body="b", diff="d",
+                              candidates=[{"id": 1, "state": "triaged", "title": "x"}]) is not None
+
+
+def test_settle_and_record_never_raise_and_stale_rows_give_up() -> None:
+    conn = fresh()
+    orig = agent_gateway.get
+    agent_gateway.get = lambda job_id: {"id": job_id, "status": "running"}  # type: ignore
+    try:
+        add(conn, 1, state="new")
+        conn.execute("INSERT INTO decision_shadow(kind,event_id,llm_job,decision_job,status,created_at) "
+                     "VALUES ('triage',1,'l','d','submitted',?)", ("2026-10-10T00:00:00+00:00",))
+        conn.commit()
+        shadow.settle(conn, NOW)  # running for days -> failed, no raise
+        assert conn.execute("SELECT status FROM decision_shadow").fetchone()[0] == "failed"
+        conn.close()
+        shadow.settle(conn, NOW)  # closed connection: swallowed
+        shadow.record_llm(conn, shadow.KIND_TRIAGE, 1, "l", {"action": "new"})
+    finally:
+        agent_gateway.get = orig
+
+
+def test_non_numeric_target_choice_is_no_target() -> None:
+    dec = shadow.decision_triage({"action": {"choice": "attach", "confidence": 0.9},
+                                  "attach_target": {"choice": "weird", "confidence": 0.9}})
+    assert "item" not in dec
+
+
 def main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failures = []

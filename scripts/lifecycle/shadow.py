@@ -22,15 +22,19 @@ import json
 import os
 import sqlite3
 import sys
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # `python3 scripts/lifecycle/shadow.py report`
 
 from clients import agent_gateway as _agent_gateway
 from clients.errors import WardenError
 from lifecycle import intake as _intake
 from loop import core
 
-# Cut order when the state is over budget: the event and the instructions are never cut; repo
-# purposes shrink first, then the oldest fixed items, then the oldest open items.
+# Cut order when the state is over budget: the event, the instructions and the repo purposes
+# (PURPOSE_CHARS each) are fixed cost and never cut; the oldest fixed items go first, then the
+# oldest open items.
 STATE_BUDGET_CHARS = int(os.environ.get("WARDEN_SHADOW_BUDGET_CHARS", "24000"))
 PURPOSE_CHARS = 300
 MAX_TARGET_OPTIONS = 30
@@ -147,7 +151,7 @@ def build_triage(conn: sqlite3.Connection, item: sqlite3.Row, event: sqlite3.Row
     """(state text, questions, shown ids, context info) for one incoming item, or None when the item
     must not reach a model at all (it, or its only candidate repo, is private). `as_of` rebuilds the
     candidate lists as they stood at `now` (the replay); `budget` overrides STATE_BUDGET_CHARS."""
-    if _intake.is_private(item["repo"]) or (len(candidates) == 1 and _intake.is_private(candidates[0])):
+    if not _intake.may_reach_model(item, candidates):
         return None
     excerpt = item["brief"] or json.dumps(_intake._payload(event["payload_json"]), ensure_ascii=False, sort_keys=True)
     head = "\n".join([
@@ -192,9 +196,12 @@ def build_triage(conn: sqlite3.Connection, item: sqlite3.Row, event: sqlite3.Row
 
 
 def build_sweep(*, repo: str, pr_title: str, pr_body: str, diff: str,
-                candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+                candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]] | None:
     """(state text, questions, shown ids, context info) for one fixed-by sweep: the merged PR and one
-    boolean per waiting item (does the change fix this item?)."""
+    boolean per waiting item (does the change fix this item?). None for a `-private` repo: the guard
+    lives here, not at the call site, so no caller can send a private diff to a model."""
+    if _intake.is_private(repo):
+        return None
     shown_candidates = candidates[:MAX_SWEEP_ITEMS]
     lines = []
     for c in shown_candidates:
@@ -239,7 +246,7 @@ def submit(conn: sqlite3.Connection, kind: str, event_id: int, llm_job: str, bui
             (kind, event_id, llm_job, job["id"], "submitted", json.dumps(shown), json.dumps(info), core.now_iso(now)),
         )
         conn.commit()
-    except (WardenError, sqlite3.Error) as e:
+    except Exception as e:  # noqa: BLE001 — the shadow lane must never touch the real one
         print(f"shadow: {kind} decide submit failed for #{event_id}: {e}", file=sys.stderr)
 
 
@@ -250,34 +257,49 @@ def record_llm(conn: sqlite3.Connection, kind: str, event_id: int, llm_job: str,
         conn.execute("UPDATE decision_shadow SET llm_json=? WHERE kind=? AND event_id=? AND llm_job=?",
                      (json.dumps(answer), kind, event_id, llm_job))
         conn.commit()
-    except sqlite3.Error as e:
+    except Exception as e:  # noqa: BLE001 — the shadow lane must never touch the real one
         print(f"shadow: could not record the LLM answer for #{event_id}: {e}", file=sys.stderr)
 
 
+SETTLE_GIVE_UP_HOURS = 24
+
+
 def settle(conn: sqlite3.Connection, now: dt.datetime) -> None:
-    """Fold every finished `decide` job onto its row; a job that failed or vanished marks the row
-    `failed` with the reason. A job still running is left for the next pass."""
-    rows = conn.execute("SELECT id, decision_job, created_at FROM decision_shadow WHERE status='submitted'").fetchall()
-    for row in rows:
-        try:
-            job = _agent_gateway.get(row["decision_job"])
-        except WardenError as e:
-            print(f"shadow: could not poll decide job {row['decision_job']}: {e}", file=sys.stderr)
-            continue
-        if job is not None and job.get("status") not in _agent_gateway.TERMINAL:
-            continue
-        result = job.get("result") if job else None
-        if job is not None and job.get("status") == "done" and isinstance(result, dict) and "answers" in result:
-            usage = {"model": result.get("model"), "latencyMs": result.get("latencyMs"),
-                     "truncatedChars": result.get("truncatedChars"), **(result.get("usage") or {})}
-            conn.execute("UPDATE decision_shadow SET status='recorded', decision_json=?, usage_json=?, model=?, "
-                         "settled_at=? WHERE id=?",
-                         (json.dumps(result["answers"]), json.dumps(usage), result.get("model"), core.now_iso(now), row["id"]))
-        else:
-            why = (job.get("error") if job else None) or "job missing or without answers"
-            conn.execute("UPDATE decision_shadow SET status='failed', error=?, settled_at=? WHERE id=?",
-                         (str(why)[:300], core.now_iso(now), row["id"]))
-        conn.commit()
+    """Fold every finished `decide` job onto its row; a job that failed, vanished or stayed
+    non-terminal SETTLE_GIVE_UP_HOURS marks the row `failed` with the reason. A job still running
+    is left for the next pass. Never raises: a shadow failure is a stderr line."""
+    try:
+        rows = conn.execute("SELECT id, decision_job, created_at FROM decision_shadow WHERE status='submitted'").fetchall()
+        for row in rows:
+            _settle_row(conn, row, now)
+    except Exception as e:  # noqa: BLE001 — the shadow lane must never touch the real one
+        print(f"shadow: settle failed: {e}", file=sys.stderr)
+
+
+def _settle_row(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) -> None:
+    try:
+        job = _agent_gateway.get(row["decision_job"])
+    except WardenError as e:
+        print(f"shadow: could not poll decide job {row['decision_job']}: {e}", file=sys.stderr)
+        return
+    result = job.get("result") if job else None
+    if job is not None and job.get("status") == "done" and isinstance(result, dict) and "answers" in result:
+        usage = {"model": result.get("model"), "latencyMs": result.get("latencyMs"),
+                 "truncatedChars": result.get("truncatedChars"), **(result.get("usage") or {})}
+        conn.execute("UPDATE decision_shadow SET status='recorded', decision_json=?, usage_json=?, model=?, "
+                     "settled_at=? WHERE id=?",
+                     (json.dumps(result["answers"]), json.dumps(usage), result.get("model"), core.now_iso(now), row["id"]))
+    elif job is not None and job.get("status") not in _agent_gateway.TERMINAL:
+        created = core.parse_ts(row["created_at"])
+        if created is None or now - created < dt.timedelta(hours=SETTLE_GIVE_UP_HOURS):
+            return
+        conn.execute("UPDATE decision_shadow SET status='failed', error=?, settled_at=? WHERE id=?",
+                     (f"still {job.get('status')} after {SETTLE_GIVE_UP_HOURS}h", core.now_iso(now), row["id"]))
+    else:
+        why = (job.get("error") if job else None) or "job missing or without answers"
+        conn.execute("UPDATE decision_shadow SET status='failed', error=?, settled_at=? WHERE id=?",
+                     (str(why)[:300], core.now_iso(now), row["id"]))
+    conn.commit()
 
 
 # ── agreement ─────────────────────────────────────────────────────────────────────────────────
@@ -290,7 +312,7 @@ def decision_triage(answers: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"action": action, "confidence": action_answer.get("confidence")}
     qid = {"attach": "attach_target", "fixed_by": "fixed_by_target"}.get(action)
     target = answers.get(qid) if qid else None
-    if target and target.get("choice") not in (None, NONE_OPTION):
+    if target and str(target.get("choice")).isdigit():
         out["item"] = int(target["choice"])
         out["target_confidence"] = target.get("confidence")
     return out
@@ -357,7 +379,6 @@ def report(conn: sqlite3.Connection) -> dict[str, Any]:
 
 def main(argv: list[str]) -> int:
     """`python3 scripts/lifecycle/shadow.py report` — the agreement report as JSON (read-only)."""
-    from clients import errors  # noqa: F401 — keeps the import path identical to the loop's
     import ledger
     if argv[:1] != ["report"]:
         print("usage: shadow.py report", file=sys.stderr)

@@ -70,7 +70,7 @@ def one(conn, item, model: str):
     return {"dec": dec, "cost": (result.get("usage") or {}).get("costUsd") or 0, "ms": result.get("latencyMs") or 0}
 
 
-def run_model(db_path, items, model: str):
+def run_model(items, model: str):
     # one connection per thread (sqlite3 objects are not shareable)
     conn = ledger.connect(migrate=False)
     stats = {"model": model, "n": 0, "errors": 0, "action": 0, "attach_n": 0, "attach_target": 0, "cost": 0.0, "ms": 0,
@@ -110,7 +110,7 @@ def main() -> int:
         counts[i["truth"]] = counts.get(i["truth"], 0) + 1
     models = args.models.split(",")
     with ThreadPoolExecutor(max_workers=len(models)) as pool:
-        results = list(pool.map(lambda m: run_model(None, items, m), models))
+        results = list(pool.map(lambda m: run_model(items, m), models))
     out = {"labels": counts, "models": results, "at": dt.datetime.now(dt.timezone.utc).isoformat()}
     if args.json:
         print(json.dumps(out, indent=2))
