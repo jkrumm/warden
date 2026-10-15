@@ -214,6 +214,29 @@ def test_prune_deletes_one_batch_per_settle() -> None:
         shadow.PRUNE_BATCH_SIZE = orig_batch
 
 
+def test_signals_show_only_outcomes_known_at_the_instant_and_never_private_repos() -> None:
+    conn = fresh()
+    add(conn, 1, repo=None, state="closed", title="Up recovery", note="matched the policy ignore list",
+        created="2026-10-01T00:00:00+00:00")
+    add(conn, 2, repo="homelab-private", state="closed", title="private peer", created="2026-10-02T00:00:00+00:00")
+    add(conn, 3, repo=None, state="closed", title="closed only later", created="2026-10-03T00:00:00+00:00")
+    add(conn, 4, repo=None, state="new", title="incoming", created="2026-10-05T00:00:00+00:00")
+    conn.execute("UPDATE triage_items SET signature='s', close_reason='ignored' WHERE event_id IN (1, 2, 3)")
+    conn.execute("UPDATE triage_items SET signature='s' WHERE event_id = 4")
+    conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (1,'new','closed','2026-10-01T00:01:00+00:00')")
+    conn.execute("INSERT INTO item_transitions(event_id, from_state, to_state, at) VALUES (3,'new','closed','2026-10-09T00:00:00+00:00')")
+    conn.commit()
+    early = dt.datetime(2026, 10, 5, tzinfo=dt.timezone.utc)
+    text = "\n".join(shadow._signals(conn, core.get_item(conn, 4), core.get_event(conn, 4), early))
+    assert "#1 2026-10-01: closed (ignored) | why: matched the policy ignore list" in text
+    assert "#3 2026-10-03: still open" in text and "closed only later" not in text.split("ignored as noise")[-1]
+    assert "private peer" not in text and "#2" not in text
+    assert "ignored 2" in text and "- Up recovery" in text  # counts include the private peer, titles never
+    first = shadow._signals(conn, core.get_item(conn, 1), core.get_event(conn, 1),
+                            dt.datetime(2026, 9, 30, tzinfo=dt.timezone.utc))
+    assert "(first time)" in "\n".join(first)
+
+
 def test_non_numeric_target_choice_is_no_target() -> None:
     dec = shadow.decision_triage({"action": {"choice": "attach", "confidence": 0.9},
                                   "attach_target": {"choice": "weird", "confidence": 0.9}})

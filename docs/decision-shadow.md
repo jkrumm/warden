@@ -43,6 +43,42 @@ biased (labels are the LLM's and the owner's past calls, not an independent trut
 direction, not a verdict. The default stays `pplx-decider-v1-27b` (best action agreement, still
 under $0.001 a call).
 
+## Wave 11: context iteration on a faithful 101-item set (2026-10-15)
+
+**The Wave 6 set was skewed.** It required `repo IS NOT NULL`, which dropped 26 of the 29 alerts closed
+as noise (they are repo-less), kept the human-aborted tasks as "ignore" truth, and offered only the
+item's true repo as candidates. The new default set (`scripts/shadow-replay.py`, `--legacy` keeps the old
+one) uses the live candidate rule (label route, else every known repo), drops human-origin ignores and
+takes `new` truth from alert/issue items that were worked to a fix: 101 items = 60 new, 28 ignore, 3
+ignore* (closed by the policy ignore list before triage, so never seen live), 10 attach, 2 fixed_by.
+A truth that is only 10 attaches and 2 fixed_by is far too thin to tune on; read the attach and fixed_by
+columns as anecdotes.
+
+**Signals added** (`shadow._signals`, `build_triage(signals=True)`), all as-of-safe (an outcome counts
+only when it was known at the item's creation) and never from a `-private` repo: the same alert
+signature's earlier items with their outcome and close note; how items from the source ended in the last
+90 days; the last six alerts of the source that were ignored as noise. The action options now carry the
+LLM triage's own rules (a recovery notice is noise, a topical match is not fixed_by, "prefer attach"),
+and target options carry the root cause.
+
+| model | before action | after action | attach target before / after | acc. at conf ≥ 0.95 before / after | cost / 101 |
+|-|-|-|-|-|-|
+| pplx-decider-v1-27b | 76/101 = 75% | 78/101 = 77% | 5/10 / 5/10 | 47/51 = 92% / 53/61 = 87% | $0.055 |
+| decision-1-eu | 70/101 = 69% | 70/101 = 69% | 2/10 / 2/10 | 52/69 = 75% / 46/65 = 71% | $0.023 |
+| decision-1 | 72/101 = 71% | 71/101 = 70% | 2/10 / 2/10 | 52/69 = 75% / 46/63 = 73% | $0.023 |
+| clef-eu (5k-char budget) | 83/101 = 82% | 83/101 = 82% | 0/10 / 1/10 | 22/23 / 26/26 | free |
+
+**Reading.** The signals did not move the lane: +2 points for the default model, nothing for the
+others, and the confidence ≥ 0.95 slice got no more reliable (87% right, the promotion rule needs
+≥ 95%). The 23 misses of `pplx-decider-v1-27b` split into (a) 10 repeated `hermes_log` WARNING lines
+(`tools.checkpoint_manager`, `agent.tool_executor`) labelled `new` because each was worked, which the
+model reads as duplicates of each other, a defensible call and a label artifact; (b) 6 noise alerts
+(watchdog pushes, a MAM session notice) the model calls `new` at confidence ≥ 0.95; (c) attach and
+fixed_by items it calls `new`. Fix (b) belongs in the policy ignore list, not in the model. clef-eu's
+82% is mostly "everything is new" (60/60 new, 1/10 attach). **Verdict: lane stays shadow; no promotion
+by hand.** The live rows (`shadow.py report`) remain the only evidence the promotion rule reads; this
+replay just bounds what context can buy: little, on this ledger.
+
 ## Promotion rule
 
 The decision model decides nothing until ALL hold, measured by `python3 scripts/lifecycle/shadow.py

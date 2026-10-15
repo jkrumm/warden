@@ -49,10 +49,10 @@ TRIAGE_QUESTIONS_BASE: dict[str, Any] = {
         "type": "choice",
         "instructions": "What should happen to the incoming event?",
         "options": {
-            "attach": "it is the same defect as one of the OPEN items listed",
-            "fixed_by": "one of the RECENTLY FIXED items or merged PRs listed already fixes it",
+            "attach": "it is the same defect as one of the OPEN items listed, even if worded differently; prefer this over new whenever one fits",
+            "fixed_by": "one of the RECENTLY FIXED items or merged PRs listed plausibly already fixes it (not a vague topical match)",
             "new": "a real defect that none of the listed items covers",
-            "ignore": "noise: a recovery notice, a test or canary message",
+            "ignore": "clear noise only: a recovery notice (a leading check mark, an Up status, back to normal), a test or canary message; when in doubt it is not noise",
         },
     },
 }
@@ -116,6 +116,56 @@ def _fixed_rows(conn: sqlite3.Connection, repos: list[str], exclude: int, now: d
     ).fetchall()
 
 
+SIGNAL_PEERS = 6
+SIGNAL_IGNORED_EXAMPLES = 6
+SIGNAL_WINDOW_DAYS = 90
+_CLOSED_AT = ("COALESCE((SELECT MAX(t.at) FROM item_transitions t WHERE t.event_id = ti.event_id "
+              "AND t.to_state = 'closed'), ti.updated_at)")
+
+
+def _signals(conn: sqlite3.Connection, item: sqlite3.Row, event: sqlite3.Row, now: dt.datetime) -> list[str]:
+    """What the ledger already knows about THIS kind of signal: how the same alert signature ended
+    before, how this source's items end in general, and what past noise from it looked like. Only
+    outcomes known at `now` count (a peer still open then shows as open), and a `-private` repo's
+    items are never listed. Returns ready-made prompt lines (empty when there is no history)."""
+    at = core.now_iso(now)
+    since = core.now_iso(now - dt.timedelta(days=SIGNAL_WINDOW_DAYS))
+    closed = (f"(ti.state = 'closed' AND {_CLOSED_AT} <= ?)")
+    lines: list[str] = []
+    peers = conn.execute(
+        f"SELECT ti.event_id, ti.repo, ti.state, ti.close_reason, ti.note, ti.created_at, {_CLOSED_AT} AS closed_at, "
+        f"e.title FROM triage_items ti JOIN events e ON e.id = ti.event_id WHERE ti.signature = ? "
+        f"AND ti.event_id != ? AND ti.created_at <= ? ORDER BY ti.created_at DESC, ti.event_id DESC LIMIT ?",
+        (item["signature"], item["event_id"], at, SIGNAL_PEERS)).fetchall()
+    for r in peers:
+        if _intake.is_private(r["repo"]):
+            continue
+        known_closed = r["state"] == "closed" and (r["closed_at"] or "") <= at
+        outcome = (f"closed ({r['close_reason']})" if known_closed else "still open")
+        line = f"#{r['event_id']} {str(r['created_at'])[:10]}: {outcome}"
+        if known_closed and r["note"]:
+            line += f" | why: {_intake._clip(r['note'], 100)}"
+        lines.append(line)
+    out = ["# Same alert signature seen before (newest first)\n" + ("\n".join(lines) or "(first time)")]
+    mix = conn.execute(
+        f"SELECT ti.close_reason AS reason, COUNT(*) AS n FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"WHERE e.source = ? AND ti.event_id != ? AND ti.created_at >= ? AND {closed} AND ti.close_reason IS NOT NULL "
+        f"GROUP BY ti.close_reason ORDER BY n DESC",
+        (event["source"], item["event_id"], since, at)).fetchall()
+    if mix:
+        out.append(f"# How items from source {event['source']} ended (last {SIGNAL_WINDOW_DAYS} days)\n"
+                   + ", ".join(f"{r['reason']} {r['n']}" for r in mix))
+    ignored = conn.execute(
+        f"SELECT ti.event_id, ti.repo, ti.note, e.title FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"WHERE e.source = ? AND ti.event_id != ? AND ti.close_reason = 'ignored' AND ti.created_at >= ? AND {closed} "
+        f"AND ti.origin = 'alert' ORDER BY ti.created_at DESC LIMIT ?",
+        (event["source"], item["event_id"], since, at, SIGNAL_IGNORED_EXAMPLES)).fetchall()
+    shown = [f"- {_intake._clip(r['title'], 110)}" for r in ignored if not _intake.is_private(r["repo"])]
+    if shown:
+        out.append("# Past items from this source that were ignored as noise\n" + "\n".join(shown))
+    return out
+
+
 def _item_line(row: sqlite3.Row, *, fixed: bool) -> str:
     title = _intake._clip(row["title"], _intake.MAX_TITLE_CHARS)
     line = f"#{row['event_id']} [{row['repo']}] {'fixed' if fixed else row['state']}: {title}"
@@ -145,9 +195,16 @@ def _fit(blocks: list[tuple[str, list[str]]], fixed_chars: int, budget: int) -> 
     return kept, cut
 
 
+def _option_text(row: sqlite3.Row) -> str:
+    text = _intake._clip(row["title"], 100)
+    if row["root_cause"]:
+        text += f" (root cause: {_intake._clip(row['root_cause'], 60)})"
+    return text
+
+
 def build_triage(conn: sqlite3.Connection, item: sqlite3.Row, event: sqlite3.Row, candidates: list[str],
                  now: dt.datetime, *, as_of: bool = False, budget: int | None = None,
-                 ) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+                 signals: bool = True) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]] | None:
     """(state text, questions, shown ids, context info) for one incoming item, or None when the item
     must not reach a model at all (it, or its only candidate repo, is private). `as_of` rebuilds the
     candidate lists as they stood at `now` (the replay); `budget` overrides STATE_BUDGET_CHARS."""
@@ -165,17 +222,19 @@ def build_triage(conn: sqlite3.Connection, item: sqlite3.Row, event: sqlite3.Row
     opens = _open_rows(conn, candidates, item["event_id"], now if as_of else None)
     fixed = _fixed_rows(conn, candidates, item["event_id"], now, as_of)
     purposes = [f"{name}: {_purpose(name)}" for name in candidates if not _intake.is_private(name)]
+    history = _signals(conn, item, event, now) if signals else []
     blocks = [
         ("fixed", [_item_line(r, fixed=True) for r in fixed]),
         ("open", [_item_line(r, fixed=False) for r in opens]),
     ]
-    blocks, cut = _fit(blocks, len(head) + sum(len(p) + 1 for p in purposes) + 200,
+    blocks, cut = _fit(blocks, len(head) + sum(len(p) + 1 for p in purposes) + sum(len(h) + 2 for h in history) + 200,
                       budget or STATE_BUDGET_CHARS)
     kept = dict(blocks)
     kept_open = opens[: len(kept["open"])]
     kept_fixed = fixed[: len(kept["fixed"])]
     state = "\n\n".join([
         head,
+        *history,
         "# Candidate repos (one line each)\n" + ("\n".join(purposes) or "(none)"),
         "# Open items\n" + ("\n".join(kept["open"]) or "(none)"),
         f"# Recently fixed (last {_intake.FIXED_WINDOW_DAYS} days)\n" + ("\n".join(kept["fixed"]) or "(none)"),
@@ -186,7 +245,7 @@ def build_triage(conn: sqlite3.Connection, item: sqlite3.Row, event: sqlite3.Row
                                   ("fixed_by_target", kept_fixed[:MAX_TARGET_OPTIONS], "RECENTLY FIXED item", "fixed")):
         if not rows:
             continue
-        options = {str(r["event_id"]): _intake._clip(r["title"], 100) for r in rows}
+        options = {str(r["event_id"]): _option_text(r) for r in rows}
         options[NONE_OPTION] = f"none of the listed {label}s"
         questions[qid] = {"type": "choice", "options": options,
                           "instructions": f"If the event relates to one of the listed {label}s, which one?"}
