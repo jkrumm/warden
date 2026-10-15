@@ -425,6 +425,61 @@ def test_check_repo_not_in_flight_ignores_completed_operation():
     policy.check_repo_not_in_flight(conn, repo="warden")
 
 
+def _seed_waiting_revision(conn, event_id, *, status="blocked"):
+    _seed_triage_item(conn, event_id, repo="warden", state="working")
+    job = f"job-impl-{event_id}"
+    conn.execute("UPDATE triage_items SET implement_job=? WHERE event_id=?", (job, event_id))
+    _seed_dispatch_row(conn, job)
+    conn.execute("UPDATE dispatches SET validation_status=? WHERE job_id=?", (status, job))
+    conn.commit()
+
+
+def test_as_revision_passes_over_a_younger_waiting_revision():
+    conn, _ = _fresh_ledger()
+    _seed_waiting_revision(conn, 1)
+    _seed_waiting_revision(conn, 2)
+    policy.check_repo_not_in_flight(conn, repo="warden", exclude_event_id=1, as_revision=True)
+
+
+def test_as_revision_does_not_pass_an_older_waiting_revision():
+    conn, _ = _fresh_ledger()
+    _seed_waiting_revision(conn, 1)
+    _seed_waiting_revision(conn, 2)
+    _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden",
+            exclude_event_id=2, as_revision=True)
+
+
+def test_plain_check_still_refuses_a_younger_waiting_revision():
+    conn, _ = _fresh_ledger()
+    _seed_waiting_revision(conn, 1)
+    _seed_waiting_revision(conn, 2)
+    _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden", exclude_event_id=1)
+
+
+def test_as_revision_refuses_a_younger_item_with_a_running_episode():
+    conn, _ = _fresh_ledger()
+    _seed_waiting_revision(conn, 1)
+    _seed_triage_item(conn, 2, repo="warden", state="working")
+    conn.execute("UPDATE triage_items SET implement_job='job-running' WHERE event_id=2")
+    conn.commit()
+    _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden",
+            exclude_event_id=1, as_revision=True)
+
+
+def test_as_revision_refuses_an_older_running_episode():
+    conn, _ = _fresh_ledger()
+    _seed_triage_item(conn, 1, repo="warden", state="working")
+    conn.execute("UPDATE triage_items SET implement_job='job-running' WHERE event_id=1")
+    _seed_waiting_revision(conn, 2)
+    _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden",
+            exclude_event_id=2, as_revision=True)
+
+
+def test_as_revision_needs_its_own_event_id():
+    conn, _ = _fresh_ledger()
+    _expect(ValueError, policy.check_repo_not_in_flight, conn, repo="warden", as_revision=True)
+
+
 # --- dispatch: normalize_brief() / check_context() ------------------------------
 
 def test_normalize_brief_strips_trailing_whitespace():

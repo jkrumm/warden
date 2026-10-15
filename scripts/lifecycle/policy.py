@@ -193,8 +193,19 @@ def _in_flight_sql(count_merging: bool) -> str:
     return f"((state='{core.STATE_MERGING}' AND train_job IS NOT NULL) OR {working})"
 
 
+def _waiting_revision_sql() -> str:
+    """A `working` item whose implement episode is judged and waiting for its revision (the review
+    blocked it, its checks failed, or its rebase conflicted): no episode runs, it holds the repo only
+    as a claim on the next one. Mirrors the shapes _revision_findings() revises."""
+    from loop import core
+
+    return (f"(state='{core.STATE_WORKING}' AND implement_job IN (SELECT job_id FROM dispatches "
+            "WHERE validation_status IN ('blocked', 'checks_failed', 'conflict')))")
+
+
 def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
-                              exclude_event_id: int | None = None, count_merging: bool = True) -> None:
+                              exclude_event_id: int | None = None, count_merging: bool = True,
+                              as_revision: bool = False) -> None:
     """DESIGN.md § per-repo in-flight lock. One implement episode per repo at
     a time, checked two ways: the triage item driving it (if any) and the
     operations ledger (which also covers an episode that has no
@@ -206,11 +217,20 @@ def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
     would make the item refuse itself the moment open_episode() re-checks.
 
     `count_merging=False` (a revert): a `merging` item counts only while an `update_pr` episode
-    runs on its train, not while its PR waits."""
+    runs on its train, not while its PR waits.
+
+    `as_revision=True` (a revision caller, which holds `exclude_event_id`): a younger waiting revision
+    does not count. Waiting revisions are revised oldest-first; without this, two waiting revisions
+    each see the other and neither is ever revised."""
     query = f"SELECT event_id FROM triage_items WHERE repo=? AND {_in_flight_sql(count_merging)}"
     params: list[Any] = [repo]
     if exclude_event_id is not None:
         query += " AND event_id != ?"
+        params.append(exclude_event_id)
+    if as_revision:
+        if exclude_event_id is None:
+            raise ValueError("as_revision needs exclude_event_id: the revision's own item")
+        query += f" AND NOT (event_id > ? AND {_waiting_revision_sql()})"
         params.append(exclude_event_id)
     row = conn.execute(f"{query} LIMIT 1", params).fetchone()
     if row is not None:

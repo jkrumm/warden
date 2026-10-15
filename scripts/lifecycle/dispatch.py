@@ -108,10 +108,11 @@ def open_episode(
     revision_of: str | None = None,
     now: dt.datetime | None = None,
     count_merging: bool = True,
+    as_revision: bool = False,
 ) -> Opened:
     """Submit one agent-gateway episode and record it. `revision_of` (a prior episode's
     `dispatch/*` branch) makes it a revision agent-gateway applies to that branch's open PR.
-    `count_merging` is check_repo_not_in_flight()'s (False for a revert).
+    `count_merging` and `as_revision` are check_repo_not_in_flight()'s (False for a revert).
 
     A gated tier (`implement`) is covered by an `operations` row committed
     BEFORE the submit — DESIGN.md § Crash recovery. A submit that fails definitively
@@ -143,7 +144,7 @@ def open_episode(
             # from the caller, e.g. maybe_auto_implement()'s compare-and-set,
             # BEFORE it calls this function) must not refuse itself.
             policy.check_repo_not_in_flight(conn, repo=repo, exclude_event_id=origin.event_id,
-                                            count_merging=count_merging)
+                                            count_merging=count_merging, as_revision=as_revision)
             opened_op_id = operations.record(
                 conn,
                 event_id=origin.event_id,
