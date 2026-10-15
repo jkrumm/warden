@@ -10729,6 +10729,7 @@ def test_validation_review_gets_the_owners_brief_and_the_investigation_goal():
         assert "The owner's request: raise the push window to 10m" in ctx_text
         assert "Goal (from the investigation that led to this PR): cap the alert at 5m" in ctx_text
         assert "Loosening detection without that evidence is a blocking finding" in ctx_text
+        assert work.VALIDATION_BRIEF_WINS in ctx_text, "a brief/goal conflict is the brief's, not a page"
 
 
 def test_validation_review_without_an_investigation_gets_the_owners_brief():
@@ -10740,6 +10741,7 @@ def test_validation_review_without_an_investigation_gets_the_owners_brief():
         ctx_text = work.validation_context(conn, core.get_item(conn, eid))
         assert "The owner's request: fix the flaky backup job" in ctx_text
         assert "Loosening detection without that evidence is a blocking finding" in ctx_text
+        assert work.VALIDATION_BRIEF_WINS not in ctx_text, "nothing to rank without an investigation goal"
 
 
 def test_a_long_owners_brief_cannot_crowd_out_the_gate_questions_or_the_goal():

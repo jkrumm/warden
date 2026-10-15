@@ -2033,6 +2033,15 @@ def _truncate_with_marker(text: str, marker: str, budget: int) -> str:
     return (text[:keep] + marker) if keep > 0 else text[:budget]
 
 
+# Said only when both are present: the owner's request is the spec, the investigation's goal is a
+# worker's reading of it.
+VALIDATION_BRIEF_WINS = (
+    "Where the owner's request and the investigation's goal below disagree, the owner's request "
+    "wins: judge the PR against it. Such a disagreement is settled by the request, not a question "
+    "for the owner."
+)
+
+
 def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     """What the reviewer needs to judge the PR against its goal: the gate questions, the owner's
     own request when the item had one, and the investigation's conclusion.
@@ -2060,13 +2069,19 @@ def validation_context(conn: sqlite3.Connection, item: sqlite3.Row) -> str:
     # goal leaves no room for more than its marker — a cut brief is always marked, never a bare head.
     if goal_part and len(goal_part) > cap - len(head) - len(sep):
         goal_part = _truncate_with_marker(goal_part, VALIDATION_GOAL_TRUNCATED, cap - len(head) - len(sep))
+    # Item 1559: the investigation's goal drifted from the brief (build time vs round start), and every
+    # review escalated the gap as a [product] question the brief had already answered. The ranking is
+    # said only beside a brief that is actually present, and its room comes out of the brief's.
+    rank = VALIDATION_BRIEF_WINS if brief and goal_part else ""
     if brief:
-        seps = 2 if goal_part else 1
-        room = cap - len(head) - len(goal_part) - seps * len(sep)
+        seps = (2 if goal_part else 1) + (1 if rank else 0)
+        room = cap - len(head) - len(goal_part) - len(rank) - seps * len(sep)
         if len(brief) > room:
             fits = room > len(VALIDATION_BRIEF_TRUNCATED)
             brief = _truncate_with_marker(brief, VALIDATION_BRIEF_TRUNCATED, room) if fits else ""
-    return sep.join(p for p in (head, brief, goal_part) if p)
+    if not brief:
+        rank = ""
+    return sep.join(p for p in (head, rank, brief, goal_part) if p)
 
 
 def open_validation_dispatch(conn: sqlite3.Connection, *, repo: str, event_id: int,

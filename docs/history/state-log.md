@@ -10578,3 +10578,15 @@ returned. No dedupe was needed. Implemented in-session.
 
 `test_triage.py` 613 -> 618 (re-run once then revise; refused re-run revises with the reason; a
 partly refused re-run holds; a lost claim does not POST; a new SHA gets its own re-run). `test_ledger.py` gained the v23 migration test. AGENTS.md's gate line reads 618.
+
+## 169. The review ranks the owner's brief over the investigation's goal (2026-10-16)
+
+Item 1559 (weatherorb PR #104): the brief asked for the blend stale badge to age the round start
+(watchdog parity); the investigation's recommendation, which `work.validation_context()` hands the
+review as "Goal", said the variable build time. Every review saw both, read the disagreement as a
+user-visible product call and escalated `[product]` — three owner pages for a question the brief
+answered. `validation_context()` now adds `VALIDATION_BRIEF_WINS` between the gate questions and the brief
+whenever both a brief and a goal are present (its room comes out of the brief's; a brief dropped for
+room drops it too): the brief wins, and the disagreement is
+not a question for the owner. No new test count: the two existing context tests assert the sentence is
+present with both and absent with a brief alone. `test_triage.py` stays 618.

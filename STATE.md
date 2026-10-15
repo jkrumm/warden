@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-15 (§168 — a head-only CI red re-runs once on the same SHA before a revision) |
+| Last updated | 2026-10-16 (§169 — the review ranks the owner's brief over the investigation's goal) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 23 (live ledger migrates on the loop's next boot after the deploy) |

@@ -103,7 +103,10 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    different known repo re-routes the item to `triaged` in that repo instead of
    paging (`_reroute_repo()`, once per item). A matching `rootCause` on another
    open item merges them (older survives, the other `closed(duplicate)`). A
-   blocked review is a revision on the same item and PR (`revisionOf`). The cap counts
+   blocked review is a revision on the same item and PR (`revisionOf`). The review's context
+   (`work.validation_context()`) carries the owner's brief and the investigation's goal; when both
+   are present it says the brief wins where they disagree (`VALIDATION_BRIEF_WINS`), so a drift
+   between them is judged against the brief, never escalated as an owner question. The cap counts
    only STALLED rounds (`triage_items.stalled_rounds`, `MAX_IMPLEMENT_ATTEMPTS` = 3): a
    revision's review context quotes the previous round's blocking findings and asks the
    reviewer to begin any of them still unresolved with `UNRESOLVED PRIOR FINDING:`
