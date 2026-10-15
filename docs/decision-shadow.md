@@ -64,4 +64,6 @@ Then it decides **only** above confidence 0.95 and only for `attach`/`new`; ever
   so a shadow row can lag its triage by minutes; `settle` simply waits (rows older than 24 h fail).
 - `python3 scripts/lifecycle/shadow.py report` prints agreement by confidence bucket, the sweep
   totals, summed cost and rows by status.
-- `decision_shadow` has no retention yet; add one before it exceeds a few thousand rows.
+- `settle` prunes settled rows (`recorded` / `failed`) whose `settled_at` is older than
+  `SETTLED_RETENTION_DAYS` (90). `submitted` rows are never pruned. Rows older than 90 days
+  therefore drop out of `report` and out of the promotion rule's sample.

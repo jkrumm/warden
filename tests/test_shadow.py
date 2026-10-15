@@ -169,6 +169,25 @@ def test_settle_and_record_never_raise_and_stale_rows_give_up() -> None:
         agent_gateway.get = orig
 
 
+def test_settled_rows_past_retention_are_pruned() -> None:
+    conn = fresh()
+    orig = agent_gateway.get
+    agent_gateway.get = lambda job_id: {"id": job_id, "status": "running"}  # type: ignore
+    try:
+        add(conn, 1, state="new")
+        rows = [("recorded", "2026-06-01T00:00:00+00:00"), ("failed", "2026-06-01T00:00:00+00:00"),
+                ("recorded", "2026-10-01T00:00:00+00:00"), ("submitted", None)]
+        for i, (status, settled) in enumerate(rows, start=1):
+            conn.execute("INSERT INTO decision_shadow(kind,event_id,llm_job,decision_job,status,created_at,settled_at) "
+                         "VALUES ('triage',1,?,?,?,?,?)", (f"l{i}", f"d{i}", status, "2026-10-15T06:00:00+00:00", settled))
+        conn.commit()
+        shadow.settle(conn, NOW)
+    finally:
+        agent_gateway.get = orig
+    left = [r[0] for r in conn.execute("SELECT status FROM decision_shadow ORDER BY id").fetchall()]
+    assert left == ["recorded", "submitted"], left
+
+
 def test_non_numeric_target_choice_is_no_target() -> None:
     dec = shadow.decision_triage({"action": {"choice": "attach", "confidence": 0.9},
                                   "attach_target": {"choice": "weird", "confidence": 0.9}})

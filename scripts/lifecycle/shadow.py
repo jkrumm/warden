@@ -262,18 +262,31 @@ def record_llm(conn: sqlite3.Connection, kind: str, event_id: int, llm_job: str,
 
 
 SETTLE_GIVE_UP_HOURS = 24
+SETTLED_RETENTION_DAYS = 90
 
 
 def settle(conn: sqlite3.Connection, now: dt.datetime) -> None:
     """Fold every finished `decide` job onto its row; a job that failed, vanished or stayed
     non-terminal SETTLE_GIVE_UP_HOURS marks the row `failed` with the reason. A job still running
-    is left for the next pass. Never raises: a shadow failure is a stderr line."""
+    is left for the next pass. Settled rows older than SETTLED_RETENTION_DAYS are pruned.
+    Never raises: a shadow failure is a stderr line."""
     try:
         rows = conn.execute("SELECT id, decision_job, created_at FROM decision_shadow WHERE status='submitted'").fetchall()
         for row in rows:
             _settle_row(conn, row, now)
+        _prune_settled(conn, now)
+        conn.commit()
     except Exception as e:  # noqa: BLE001 — the shadow lane must never touch the real one
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 — a closed connection has nothing to roll back
+            pass
         print(f"shadow: settle failed: {e}", file=sys.stderr)
+
+
+def _prune_settled(conn: sqlite3.Connection, now: dt.datetime) -> None:
+    cutoff = core.now_iso(now - dt.timedelta(days=SETTLED_RETENTION_DAYS))
+    conn.execute("DELETE FROM decision_shadow WHERE status IN ('recorded', 'failed') AND settled_at < ?", (cutoff,))
 
 
 def _settle_row(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) -> None:
@@ -299,7 +312,6 @@ def _settle_row(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) ->
         why = (job.get("error") if job else None) or "job missing or without answers"
         conn.execute("UPDATE decision_shadow SET status='failed', error=?, settled_at=? WHERE id=?",
                      (str(why)[:300], core.now_iso(now), row["id"]))
-    conn.commit()
 
 
 # ── agreement ─────────────────────────────────────────────────────────────────────────────────
