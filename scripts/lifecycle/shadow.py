@@ -280,9 +280,11 @@ def settle(conn: sqlite3.Connection, now: dt.datetime) -> None:
 
 
 def _prune_settled(conn: sqlite3.Connection, now: dt.datetime) -> None:
+    # No commit here: the DELETE rides in the caller's transaction. Retention code must not make
+    # uncommitted real-lane writes on the shared loop connection durable (the loop commits the pass
+    # at its own boundaries); if the pass dies first, the delete rolls back and retries next tick.
     cutoff = core.now_iso(now - dt.timedelta(days=SETTLED_RETENTION_DAYS))
     conn.execute("DELETE FROM decision_shadow WHERE status IN ('recorded', 'failed') AND settled_at < ?", (cutoff,))
-    conn.commit()
 
 
 def _settle_row(conn: sqlite3.Connection, row: sqlite3.Row, now: dt.datetime) -> None:
