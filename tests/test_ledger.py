@@ -157,7 +157,7 @@ def test_fresh_migrate_creates_all_tables_and_indexes():
     conn = ledger.connect(_tmp_path(), migrate=True)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for t in ("events", "cursors", "dispatches", "triage_items", "schema_version",
-              "item_transitions", "operations"):
+              "item_transitions", "operations", "decision_shadow"):
         assert t in tables, f"missing table {t}"
     assert "dispatch_approvals" not in tables, "the signed-approval table is gone from the fresh schema"
     indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
@@ -170,6 +170,7 @@ def test_fresh_migrate_creates_all_tables_and_indexes():
         "idx_item_transitions_event",  # version 4
         "operations_open",             # version 5
         "operations_event",            # version 5
+        "idx_decision_shadow_status",  # version 21
     }
     assert indexes == expected, f"got {indexes}"
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION
@@ -1057,7 +1058,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     conn = ledger.connect(path, migrate=True)
     after = dt.datetime.now(dt.timezone.utc)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 20 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 21
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
     assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
@@ -1135,7 +1136,7 @@ def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_r
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 20 == ledger.LEDGER_SCHEMA_VERSION
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 21
     assert {"failure_class", "redrive_json", "redrives"} <= _table_columns(conn, "triage_items")
     rows = {r["event_id"]: r for r in conn.execute("SELECT * FROM triage_items")}
 

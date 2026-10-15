@@ -238,6 +238,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_agent_gateway", "submit"): _agent_gateway.submit,
         ("_agent_gateway", "submit_review"): _agent_gateway.submit_review,
         ("_agent_gateway", "submit_triage"): _agent_gateway.submit_triage,
+        ("_agent_gateway", "submit_decide"): _agent_gateway.submit_decide,
         ("_agent_gateway", "submit_update_pr"): _agent_gateway.submit_update_pr,
         ("_github", "check_runs"): _github.check_runs,
         ("_github", "workflow_runs"): _github.workflow_runs,
@@ -278,6 +279,9 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
 
         _agent_gateway.submit = _default_fake_submit
         _agent_gateway.submit_triage = _default_fake_submit_triage
+        # The shadow lane is off in these suites (a real submit would hit the live agent-gateway);
+        # tests/test_shadow.py owns its behaviour.
+        _agent_gateway.submit_decide = lambda **_kw: (_ for _ in ()).throw(RemoteError("shadow lane off in tests"))
         _agent_gateway.submit_review = _default_fake_submit_review
         _agent_gateway.submit_update_pr = _default_fake_submit_update_pr
         _agent_gateway.get = _default_fake_get
