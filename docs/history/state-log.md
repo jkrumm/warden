@@ -10536,14 +10536,15 @@ The fix is a revision-only exemption: `check_repo_not_in_flight(as_revision=True
 `open_episode()`) passes over a YOUNGER item whose implement dispatch is judged
 (`validation_status IS NOT NULL`, `policy._waiting_revision_sql()`). An older waiting revision therefore
 goes first; its new episode then holds the repo, and the younger one defers as it should. The exemption
-never passes a `merging` item, an open episode, or a claim sentinel (`core.IMPLEMENT_CLAIM`).
+never passes a `merging` item, an open episode, or a claim sentinel — `core.IMPLEMENT_CLAIM` or a
+`core.HOST_VERB_CLAIM_PREFIX` value, both now rejected explicitly in `_waiting_revision_sql()`.
 
 The first draft enumerated the judged statuses (`blocked`, `checks_failed`, `conflict`), which left an
 item judged with any other status (`passed`, `error`, `redriven:…`) counted as in flight. `IS NOT NULL`
 is the predicate: a judged item holds no episode whatever its status.
 
-`test_lifecycle.py` 57 -> 66 (policy: a younger item judged with any status passes; a waiting revision
-still refuses behind a `merging` item and behind a claim sentinel). `test_triage.py` 609 -> 613 (two
+`test_lifecycle.py` 57 -> 67 (policy: a younger item judged with any status passes; a waiting revision
+still refuses behind a `merging` item, a claim sentinel, and a host-verb claim sentinel). `test_triage.py` 609 -> 613 (two
 waiting revisions go oldest-first; a waiting revision defers behind a running episode, a `merging` item,
 and a claim sentinel in its repo). AGENTS.md's gate line now reads 613. DESIGN.md § The loop gained the
 per-repo in-flight lock paragraph this change was missing. `make check` green.
