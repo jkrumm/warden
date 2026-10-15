@@ -13546,6 +13546,247 @@ def test_a_deferred_checkout_that_is_somebody_elses_work_parks_the_deploy_and_a_
         assert core.get_item(conn, eid)["strikes"] == 1
 
 
+# --- the `make verify` baseline: a red production already had is not the merge's -------------------
+
+_RED_BASELINE = json.dumps({"ok": False, "exit": 2, "tail": "alert #94 is open", "at": NOW.isoformat()})
+_GREEN_BASELINE = json.dumps({"ok": True, "exit": 0, "tail": "ok", "at": NOW.isoformat()})
+
+
+def _seed_merged_firing_alert(conn, ext: str, **columns) -> int:
+    """A merged alert item in `verifying` whose own state-source event (docker unhealthy) is still
+    open, three hours into its window: the window is over and the signal is NOT quiet."""
+    eid = _insert_event(conn, source="docker_homelab", external_id=ext, title=f"{ext} unhealthy", first_seen=OLD)
+    cols = {"event_id": eid, "signature": f"docker_homelab:{ext}", "repo": "demo-repo", "state": core.STATE_VERIFYING,
+            "occurrences": 1, "first_seen": OLD.isoformat(), "last_seen": OLD.isoformat(),
+            "created_at": OLD.isoformat(), "updated_at": OLD.isoformat(), "merged_sha": MERGED_SHA,
+            "merge_method": "squash", "verify_started_at": (NOW - dt.timedelta(hours=3)).isoformat(), **columns}
+    conn.execute(f"INSERT INTO triage_items({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", tuple(cols.values()))
+    conn.commit()
+    return eid
+
+
+def _record_failure_seam() -> tuple[list[str], Any]:
+    seen: list[str] = []
+    real = verify._on_verify_failure
+
+    def _seam(conn, item, evidence, now):
+        seen.append(evidence)
+        return real(conn, item, evidence, now)
+
+    verify._on_verify_failure = _seam
+    return seen, real
+
+
+def test_baseline_red_and_after_red_is_no_failing_pass_and_an_alert_item_is_fixed_after_its_window():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-baseline-red", started=NOW - dt.timedelta(minutes=30),
+                              merged_sha=MERGED_SHA, merge_method="squash", verify_baseline=_RED_BASELINE)
+        _fake_rollout(targets=("verify",), verify=_ran(False, 2, "alert #94 is open"))
+        _agent_gateway.submit = lambda **kw: (_ for _ in ()).throw(AssertionError(f"no revert episode: {kw}"))
+        seen, real = _record_failure_seam()
+        try:
+            for n in range(4):   # more passes than VERIFY_FAILURE_LIMIT
+                verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10 * n), dry_run=False)
+                item = core.get_item(conn, eid)
+                assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == 0, (n, dict(item))
+                assert "red before the merge too (pre-existing" in item["verify_result"], item["verify_result"]
+                assert "alert #94 is open" in item["verify_result"] and "signal window open" in item["verify_result"]
+            later = NOW + dt.timedelta(hours=core.VERIFY_WINDOW_HOURS)
+            verify.maybe_verify(conn, DEFAULT_POLICY, later, dry_run=False)
+        finally:
+            verify._on_verify_failure = real
+        item = core.get_item(conn, eid)
+        assert seen == [], seen
+        assert item["state"] == core.STATE_FIXED and item["reverting_sha"] is None, dict(item)
+        assert "pre-existing" in item["note"] and "own signal quiet" in item["note"], item["note"]
+
+
+def test_baseline_red_and_after_red_still_fails_when_the_own_signal_fires_at_the_window_end():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_merged_firing_alert(conn, "unhealthy:baseline-red", verify_baseline=_RED_BASELINE)
+        _fake_rollout(targets=("verify",), verify=_ran(False, 2, "alert #94 is open"))
+        seen, real = _record_failure_seam()
+        try:
+            verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            item = core.get_item(conn, eid)
+            assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == 1, dict(item)
+            assert "still firing" in item["verify_result"] and "make verify failed" not in item["verify_result"], \
+                "the pre-existing red is not part of the evidence"
+            verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10), dry_run=False)
+            assert seen == [] and core.get_item(conn, eid)["verify_failures"] == 2
+            verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=20), dry_run=False)
+        finally:
+            verify._on_verify_failure = real
+        assert len(seen) == 1 and "3 consecutive failing passes" in seen[0] and "still firing" in seen[0], seen
+        assert "make verify failed" not in seen[0], seen
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING, "the merged change is reverted as today"
+
+
+def _three_red_passes(baseline: str | None) -> tuple[list[str], dict[str, Any]]:
+    """An alert item in the middle of its window, `make verify` red on every pass, with `baseline`
+    stored: the evidence of every failure-seam call, and the item after three passes."""
+    with _triage_env() as (conn, ctx):
+        columns = {} if baseline is None else {"verify_baseline": baseline}
+        eid = _seed_verifying(conn, "sig-baseline-matrix", started=NOW - dt.timedelta(minutes=30),
+                              merged_sha=MERGED_SHA, merge_method="squash", **columns)
+        _fake_rollout(targets=("verify",), verify=_ran(False, 1, "assertion failed: health"))
+        _agent_gateway.submit = _fake_submit([])
+        seen, real = _record_failure_seam()
+        try:
+            for n in range(3):
+                verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=10 * n), dry_run=False)
+        finally:
+            verify._on_verify_failure = real
+        return seen, dict(core.get_item(conn, eid))
+
+
+def test_baseline_green_and_after_red_fails_and_reverts_as_today():
+    seen, item = _three_red_passes(_GREEN_BASELINE)
+    assert len(seen) == 1 and "3 consecutive failing passes" in seen[0] and "assertion failed: health" in seen[0], seen
+    assert item["state"] == core.STATE_WORKING and item["reverting_sha"] == MERGED_SHA, item
+
+
+def test_no_baseline_and_after_red_fails_and_reverts_as_today():
+    seen, item = _three_red_passes(None)
+    assert len(seen) == 1 and "3 consecutive failing passes" in seen[0], seen
+    assert item["state"] == core.STATE_WORKING and item["reverting_sha"] == MERGED_SHA, item
+
+
+def test_an_unreadable_baseline_is_no_baseline():
+    seen, item = _three_red_passes("not json")
+    assert len(seen) == 1 and item["reverting_sha"] == MERGED_SHA, (seen, item)
+
+
+def test_baseline_red_and_no_own_signal_is_fixed_at_once_with_the_pre_existing_red_named():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-baseline-issue", started=NOW, origin="github_issue",
+                              merged_sha=MERGED_SHA, merge_method="squash", verify_baseline=_RED_BASELINE)
+        _fake_rollout(targets=("verify",), verify=_ran(False, 2, "alert #94 is open"))
+        verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FIXED and item["verify_failures"] == 0, dict(item)
+        assert item["note"].startswith(verify.VERIFIED_NOTE_PREFIX), item["note"]
+        assert "red before the merge too (pre-existing, exit 2): alert #94 is open" in item["note"], item["note"]
+
+
+def test_a_red_baseline_with_a_green_verify_after_is_a_plain_pass():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verifying(conn, "sig-baseline-healed", started=NOW, origin="github_issue",
+                              verify_baseline=_RED_BASELINE)
+        _fake_rollout(targets=("verify",), verify=_ran())
+        verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FIXED and "make verify passed" in item["note"], dict(item)
+        assert "pre-existing" not in item["note"], item["note"]
+
+
+def test_a_revert_s_own_verify_ignores_the_baseline():
+    with _triage_env() as (conn, ctx):
+        eid = _reverting(conn, "sig-baseline-revert", state=core.STATE_VERIFYING, verify_started_at=NOW.isoformat(),
+                         merged_sha=REVERT_SHA, verify_baseline=_RED_BASELINE)
+        _fake_rollout(targets=("verify",), verify=_ran(False, 2, "alert #94 is open"))
+        verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == 1, dict(item)
+        assert "make verify failed (exit 2)" in item["verify_result"], item["verify_result"]
+
+
+def _merge_stage_item(conn, ext: str) -> int:
+    """A `merging` item at the merge stage, review confirmed on TRAIN_SHA."""
+    return _train_item(conn, ext, stage="merge", sha=TRAIN_SHA, reviewed=TRAIN_SHA)
+
+
+def _landing_merge():
+    _merge.plan_or_land = lambda conn_, **kw: types.SimpleNamespace(
+        merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit=MERGED_SHA)
+
+
+def test_the_merge_stage_takes_a_verify_baseline_before_it_lands_and_the_item_keeps_it():
+    with _triage_env() as (conn, ctx):
+        eid = _merge_stage_item(conn, "sig-baseline-taken")
+        order: list[str] = []
+        _fake_rollout(targets=("verify",), verify=_ran(False, 2, "alert #94 is open"))
+        probe = _rollout.verify
+        _rollout.verify = lambda cwd, **kw: order.append("verify") or probe(cwd, **kw)
+        _merge.plan_or_land = lambda conn_, **kw: order.append("merge") or types.SimpleNamespace(
+            merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit=MERGED_SHA)
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert order == ["verify", "merge"], order
+        assert item["state"] == core.STATE_VERIFYING and item["merged_sha"] == MERGED_SHA, dict(item)
+        assert json.loads(item["verify_baseline"]) == {"ok": False, "exit": 2, "tail": "alert #94 is open",
+                                                       "at": NOW.isoformat()}, item["verify_baseline"]
+        # and the verify pass that follows reads it
+        verify.maybe_verify(conn, DEFAULT_POLICY, NOW + dt.timedelta(minutes=5), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_VERIFYING and item["verify_failures"] == 0, dict(item)
+        assert "pre-existing" in item["verify_result"], item["verify_result"]
+
+
+def test_a_retried_merge_takes_a_fresh_baseline():
+    with _triage_env() as (conn, ctx):
+        eid = _merge_stage_item(conn, "sig-baseline-retried")
+        _fake_rollout(targets=("verify",), verify=[_ran(False, 2, "stale red"), _ran()])
+        _merge.plan_or_land = lambda conn_, **kw: (_ for _ in ()).throw(_merge.ChecksPending("checks running"))
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and json.loads(item["verify_baseline"])["ok"] is False, dict(item)
+        conn.execute("UPDATE triage_items SET train_stage=?, retry_at=NULL WHERE event_id=?", (train.TRAIN_MERGE, eid))
+        conn.commit()
+        _landing_merge()
+        _train_pass(conn, 1)
+        item = core.get_item(conn, eid)
+        baseline = json.loads(item["verify_baseline"])
+        assert item["state"] == core.STATE_VERIFYING and baseline["ok"] is True, dict(item)
+        assert baseline["at"] == (NOW + dt.timedelta(minutes=1)).isoformat(), baseline
+
+
+def test_a_verify_timeout_or_error_is_stored_as_red_and_never_blocks_or_strikes_the_merge():
+    for result, want_exit, want_tail in ((_ran(False, 124, "timed out after 600s"), 124, "timed out after 600s"),
+                                         (RuntimeError("boom"), -1, "verify baseline error: boom")):
+        with _triage_env() as (conn, ctx):
+            eid = _merge_stage_item(conn, "sig-baseline-error")
+            _fake_rollout(targets=("verify",), verify=_ran())
+            if isinstance(result, Exception):
+                _rollout.verify = lambda cwd, **kw: (_ for _ in ()).throw(result)
+            else:
+                _rollout.verify = lambda cwd, **kw: result
+            _landing_merge()
+            _train_pass(conn)
+            item = core.get_item(conn, eid)
+            assert item["state"] == core.STATE_VERIFYING and item["strikes"] == 0, dict(item)
+            baseline = json.loads(item["verify_baseline"])
+            assert baseline["ok"] is False and baseline["exit"] == want_exit and baseline["tail"] == want_tail, baseline
+
+
+def test_the_stored_baseline_tail_is_capped():
+    with _triage_env() as (conn, ctx):
+        eid = _merge_stage_item(conn, "sig-baseline-tail")
+        _fake_rollout(targets=("verify",), verify=_ran(False, 1, "x" * 1000))
+        _landing_merge()
+        _train_pass(conn)
+        assert len(json.loads(core.get_item(conn, eid)["verify_baseline"])["tail"]) == verify.BASELINE_TAIL_MAX
+
+
+def test_a_repo_without_a_verify_target_takes_no_baseline():
+    with _triage_env() as (conn, ctx):
+        eid = _merge_stage_item(conn, "sig-baseline-no-target")
+        conn.execute("UPDATE triage_items SET verify_baseline=? WHERE event_id=?", (_RED_BASELINE, eid))
+        conn.commit()
+        ran = _fake_rollout(targets=())
+        _landing_merge()
+        _train_pass(conn)
+        item = core.get_item(conn, eid)
+        assert ran == [] and item["state"] == core.STATE_VERIFYING, (ran, dict(item))
+        assert item["verify_baseline"] is None, "an older attempt's probe does not survive"
+
+
+def test_every_other_entry_to_verifying_starts_without_a_baseline():
+    assert core.VERIFY_RESET["verify_baseline"] is None
+    item = {"pr_url": None, "reverting_sha": None}
+    assert "verify_baseline" not in core.merged_entry(item, MERGED_SHA, "squash"), "a merge keeps the train's probe"
+
+
 def test_a_second_warden_run_with_the_same_words_reuses_the_open_item():
     with _triage_env() as (conn, ctx):
         first = intake.open_origin_item(conn, origin="human", repo="demo-repo", max_tier="implement",

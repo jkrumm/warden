@@ -10463,3 +10463,45 @@ list, or process-only findings only), and a revert keeps the old path.
 strike `failed`, never `needs_decision`); the categorized needs-human with a code finding revises
 (`revision_count` 1, no page); one with only a process finding still pages the owner. AGENTS.md's
 gate line now reads 586. `make check` green (586/586).
+
+## 165. `make verify` baseline at merge; a red already present before the merge is not the merge's (2026-10-15)
+
+Item 1545 (weatherorb PR #93, merged 05:46Z; filed as 1560 by the improve loop). The PR healed the
+canary, but `make verify` stayed red on an unrelated alert (weatherorb #94, opened 05:15Z, before the
+merge). Three failing passes ended the item `failed` through `_on_verify_failure`. The CI twin was
+already handled by the base-red park (§161–§163); this is the verify twin, and the spec already says it
+(agent-platform.md § Warden step 6).
+
+**Baseline.** `train._train_merge`, after the busy-checkout park and the review claim and before
+`merge_and_rollout`, calls `verify.take_baseline()`: when the repo checkout has a verify target it runs
+`rollout.verify(cwd)` once and writes `triage_items.verify_baseline` (schema 22) as JSON
+`{"ok", "exit", "tail" (<=300 chars), "at"}`; with no target it clears the column. Every merge attempt
+takes a fresh one. It never blocks or strikes the merge: a timeout (exit 124) or any exception is stored
+as a red probe with its tail. It is a production probe — the checkout is fast-forwarded to the
+pre-merge default branch. `core.merged_entry()` leaves the column alone so it rides into `verifying`;
+`VERIFY_RESET` (every other entry: revert, host verb, sweep) clears it, and an unreviewed hand merge
+(`land_already_merged_item`) clears it too, since no train probed it.
+
+**Judgement.** `verify._verify_item`: `make verify` red AND a stored baseline with `ok` false is
+pre-existing — not added to `problems`, so no failing pass and no revert; `verify_note` names it
+("make verify red before the merge too (pre-existing, exit N): <tail>"). Alert items still wait their
+window and are judged by `_signal_not_quiet`; an item with no own signal goes `fixed` at once with the
+note. A green, missing or unreadable baseline keeps today's behaviour exactly. `_verify_revert` ignores
+the baseline on purpose (a revert must leave production healthy); `_verify_swept` never ran
+`make verify`, so it needed no change.
+
+**Residual.** While verify stays red, a second regression is not attributed to its merge — the baseline
+distinguishes red-before from red-after, not which red. The red is its own alert and alert items are
+still judged by their own signal. Also: the baseline probe can outlast the 5-minute review claim
+(`make verify` may run up to `WARDEN_VERIFY_TIMEOUT`, 600s); `plan_or_land`'s in-flight guard covers a
+second pass reaching the merge meanwhile.
+
+`test_triage.py` 589 -> 603 (AGENTS.md said 587; the shadow-lane commits had left it at 589): red/red
+alert item fixed after its window with no failing pass; red/red with the signal firing at window end
+fails and reverts; green/red and no baseline and an unreadable baseline fail as today; red/red with no
+signal fixed at once with the note; red baseline then green verify is a plain pass; a revert's verify
+ignores the baseline; the merge stage stores the baseline before the merge and the verify pass reads it;
+a retried merge takes a fresh one; a timeout and an exception are stored without blocking or striking;
+the tail is capped; no verify target stores none; `VERIFY_RESET`/`merged_entry` contract.
+`test_ledger.py` 44 -> 45 (migration 22; the two `== 21` pins and the adoption column set moved).
+AGENTS.md's gate line now reads 603. `make check` green.

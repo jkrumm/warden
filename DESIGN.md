@@ -144,12 +144,20 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    in `verifying`. If the checkout is clean, on the default branch and ends at
    origin, it is fast-forwarded and `make deploy` runs (else a strike); then
    `make verify` if defined; then, for an alert, its own signal quiet for
-   `VERIFY_WINDOW_HOURS`. No signal → `fixed` once `make verify` passes. Every
+   `VERIFY_WINDOW_HOURS`. No signal → `fixed` once `make verify` passes. A red
+   `make verify` that was already red before the merge is not the merge's: the
+   train probes `make verify` once just before it lands the pull request (on
+   every merge attempt; a timeout or error is stored as a red probe, never a
+   block or a strike) and keeps the result in `verify_baseline`. Red before and
+   red after is pre-existing — no failing pass, no revert, the item judged on its
+   own signal (or `fixed` at once with no signal), the red named in the note.
+   A green or missing baseline, and a revert's own verify, behave as before. Every
    `make`/`git` call runs under a PATH widened with the host tool dirs
    (`rollout.HOST_TOOL_DIRS`), so a repo's recipe can reach `op`, `brew` or a
    `~/.local/bin` tool under launchd's minimal environment; a caller's own PATH
    in `extra_env` still wins.
-6. **Revert.** Signal recurrence or three failing verify passes revert the merged
+6. **Revert.** Signal recurrence or three failing verify passes (a pre-existing
+   red is not one, step 5) revert the merged
    commit through an implement episode (`git revert --no-edit <sha>`, nothing
    else) whose PR rides the same train with no revisions. A passing revert gives
    the item a fresh attempt with the evidence and the reverted diff; the failed
@@ -242,6 +250,9 @@ every merge.
   fold.
 - Policy `rules` remain a label tier until the `## Verify & Monitor` sections
   cover the fleet and a triage replay routes at least as well without them.
+- While `make verify` stays red, a second regression is not attributed to its
+  merge: the baseline only tells "red before" from "red after", not which red.
+  The red is its own alert, and alert items are still judged by their own signal.
 - warden deploys itself: a merged warden fix is fast-forwarded into the live
   checkout and `make deploy` kickstarts `warden-api`; the periodic agents read the
   new code on their next tick. A migration in that code runs on the loop's next

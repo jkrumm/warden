@@ -646,7 +646,7 @@ _SET_STATE_COLUMNS = (
     "train_rewinds", "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
     "blocked_sha",
     "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
-    "failure_class", "redrive_json", "redrives",
+    "failure_class", "redrive_json", "redrives", "verify_baseline",
 )
 
 # The states an item can be re-driven INTO: a stage of the pipeline that has a poller.
@@ -670,9 +670,12 @@ _TRAIN_POSITION = ("train_stage", "train_sha", "train_base_sha", "train_job", "t
 # entry from a merge sets it over this reset (merged_entry()), together with how it merged
 # (`merge_method`); every other entry (a host verb) has nothing to revert. `fixed_by_pr` marks an
 # item a fixed-by sweep put in `verifying` (signal-only); any other entry starts without it.
+# `verify_baseline` is the merge train's `make verify` probe from just before the merge: a merge
+# entry keeps it (merged_entry()), every other entry starts without one.
 VERIFY_RESET: dict[str, Any] = {
     "verify_started_at": None, "verify_mark": None, "verify_failures": 0, "verify_result": None,
     "deploy_expect_json": None, "merged_sha": None, "merge_method": None, "fixed_by_pr": None,
+    "verify_baseline": None,
 }
 
 
@@ -682,6 +685,7 @@ def merged_entry(item: sqlite3.Row, sha: str | None, method: str | None) -> dict
     queues the fixed-by sweep of its pull request (advance_fixed_by_sweeps()), whatever becomes of
     this item afterwards."""
     entry = {**VERIFY_RESET, "merged_sha": sha, "merge_method": method or "unknown"}
+    del entry["verify_baseline"]   # taken by the train just before this merge: it rides into `verifying`
     if item["pr_url"] and not is_revert(item):
         entry.update(sweep_pr=item["pr_url"], sweep_job=None, sweep_job_at=None, sweep_attempts=0,
                      sweep_candidates=None)

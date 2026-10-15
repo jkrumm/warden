@@ -6,10 +6,10 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-14 (§164 — a broken review pipeline re-runs; a needs-human with fixable findings revises) |
+| Last updated | 2026-10-15 (§165 — `make verify` baseline at merge; a red already present before the merge is not the merge's) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 20 |
+| Ledger | `~/.warden/warden.db`, schema 22 (live ledger migrates on the loop's next boot after the deploy) |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
 
 ## What is live
@@ -62,6 +62,17 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   advanced (A -> B) and stayed red parks again instead of becoming a revision that
   cannot fix it. `baseSha` is now required in `update_pr_result()`: a `updated` or
   `up_to_date` result missing it is a loud refusal, never a silent no-op.
+- **Verify baseline (§165, schema 22).** The merge train takes `make verify` once before it lands a
+  pull request (`train._train_merge` → `verify.take_baseline`, only with a verify target, every merge
+  attempt) and stores `{ok, exit, tail, at}` in `triage_items.verify_baseline`; a timeout or error is
+  stored as a red probe and never blocks or strikes the merge. `verify._verify_item` reads it: a red
+  baseline AND a red `make verify` after the deploy is pre-existing — not a failing pass (no strike
+  toward the limit of 3, no revert), named in `verify_result` / the fixed note; alert items still wait
+  their window and are judged by their own signal. Green or missing baseline, `_verify_revert` and the
+  fixed-by sweep (which never runs `make verify`) are unchanged. Residual: while verify stays red, a
+  second regression is not attributed to its merge; the red is its own alert. The verify twin of the
+  base-red CI park below (item 1545: weatherorb #93 healed its canary, `make verify` stayed red on an
+  unrelated alert opened before the merge, three failing passes ended it `failed`). Not live-validated.
 - **Ledger:** every pending migration first writes
   `~/.warden/backups/pre-migration-v<from>-to-<to>-<stamp>-<pid>.db` (never pruned).
 - **`failed` is classified.** Every `failed` row carries `failure_class` (`infra` |
@@ -218,7 +229,9 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 
 ## Next action
 
-Watch the first live re-drives after the W7 deploy: 1398/1400 (infra → re-investigate),
+After the deploy: watch the first merge that rides the train in a repo with a `make verify` target
+store a baseline (`verify_baseline` non-NULL on the `verifying` item), and the first red-before-and-after
+item land `fixed` with "pre-existing" in its note. Also still: the first live re-drives after the W7 deploy: 1398/1400 (infra → re-investigate),
 1370 (dotfiles PR #12 → merge train), 1389/1390 (owner-retried into the train). Then
 the first warden PR that rides the train end to end and the first revert in the field;
 then the carried debt above, concurrency first.

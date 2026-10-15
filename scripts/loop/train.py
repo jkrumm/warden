@@ -698,6 +698,9 @@ def _train_merge(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     if not _train_hop(conn, item, now, retry_at=claim_until):
         return False
     item = core.get_item(conn, item["event_id"])
+    # The baseline: what production's `make verify` says before this change lands, taken on every
+    # attempt (a retried merge never keeps an older probe) and never a reason not to merge.
+    verify.take_baseline(conn, item["event_id"], Path(_policy.repo_cwd(item["repo"])), now)
     outcome = merge_and_rollout(conn, policy, item, now, expected_sha=sha)
     if outcome == "head_moved":
         _back_to_update(conn, item, now, f"GitHub refused the merge: the PR head moved off {sha[:12]}")

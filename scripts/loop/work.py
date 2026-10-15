@@ -2653,7 +2653,9 @@ def land_already_merged_item(conn: sqlite3.Connection, policy: dict[str, Any], i
         mark = core.occurrence_mark(event) if item["origin"] == "alert" and event is not None else None
         # Not a sweep's own: an unreviewed merge must not queue other items as fixed by it.
         entry = {k: v for k, v in entry.items() if not k.startswith("sweep_")}
-        entry.update(verify_started_at=core.now_iso(now), verify_mark=mark, fixed_by_pr=item["pr_url"])
+        # No train merged it, so no baseline probed production for this merge either.
+        entry.update(verify_started_at=core.now_iso(now), verify_mark=mark, fixed_by_pr=item["pr_url"],
+                     verify_baseline=None)
         note = UNREVIEWED_MERGE_NOTE
     moved = core.set_state(conn, item["event_id"], core.STATE_VERIFYING, now, expect_state=item["state"],
                             **entry, note=note)

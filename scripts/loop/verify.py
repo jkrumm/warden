@@ -34,10 +34,19 @@ from loop import core, triaging, work
 #      verb's monitor in `deploy_expect_json`.
 #   3. FAILURE: the signal recurred, or verification fails VERIFY_FAILURE_LIMIT passes in a row
 #      -> _on_verify_failure(): the merged change is reverted (see the revert block below).
+#
+# A `make verify` that was ALREADY red before the merge is not the merge's doing. The merge train
+# probes it once before it lands the pull request (take_baseline(), stored in `verify_baseline`);
+# when that probe was red and `make verify` is red again here, the red is pre-existing: it is not a
+# failing pass (no strike toward VERIFY_FAILURE_LIMIT, no revert), `verify_result` names it, and the
+# item is judged on its own signal as before (or goes `fixed` at once, with the red named in the note,
+# when it has none). A green or missing baseline keeps today's behaviour. The residual: while verify
+# stays red, a second regression is not attributed to this merge — the red is its own alert.
 
 VERIFIED_NOTE_PREFIX = "verified: "
 VERIFY_FAILED_NOTE_PREFIX = "verification failed: "
 VERIFY_RESULT_MAX = 300
+BASELINE_TAIL_MAX = 300
 
 
 def _repo_checkout(item: sqlite3.Row) -> Path | None:
@@ -50,6 +59,33 @@ def _repo_checkout(item: sqlite3.Row) -> Path | None:
 def _tail_for_note(text: str, limit: int = 120) -> str:
     collapsed = " ".join(text.split())
     return collapsed[-limit:] if collapsed else "(no output)"
+
+
+def take_baseline(conn: sqlite3.Connection, event_id: int, cwd: Path, now: dt.datetime) -> None:
+    """Probe `make verify` once, before the item's pull request merges, and store the result on the
+    item (`verify_baseline`, JSON `{ok, exit, tail, at}`) — or clear it when the repo has no verify
+    target. A timeout, a failure to start or any error is stored as a red probe with its tail: this
+    never raises and never blocks or strikes the merge. A production probe: it describes production
+    as it is before this change lands. Not a state transition, so a plain column write."""
+    baseline: dict[str, Any] | None = None
+    try:
+        if _rollout.has_target(cwd, "verify"):
+            res = _rollout.verify(cwd)
+            baseline = {"ok": bool(res.ok), "exit": res.exit_code, "tail": _tail_for_note(res.tail, BASELINE_TAIL_MAX),
+                        "at": core.now_iso(now)}
+    except Exception as e:  # noqa: BLE001 — a probe must never decide the merge
+        baseline = {"ok": False, "exit": -1, "tail": _tail_for_note(f"verify baseline error: {e}", BASELINE_TAIL_MAX),
+                    "at": core.now_iso(now)}
+    conn.execute("UPDATE triage_items SET verify_baseline=? WHERE event_id=?",
+                 (json.dumps(baseline) if baseline is not None else None, event_id))
+    conn.commit()
+
+
+def _red_baseline(item: sqlite3.Row) -> dict[str, Any] | None:
+    """The stored baseline when it says `make verify` was red before the merge, else None (green,
+    not taken, or unreadable — all of which keep the plain behaviour)."""
+    baseline = core.safe_json(item["verify_baseline"])
+    return baseline if baseline.get("ok") is False else None
 
 
 def _on_verify_failure(conn: sqlite3.Connection, item: sqlite3.Row, evidence: str, now: dt.datetime) -> None:
@@ -205,8 +241,12 @@ def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     cwd = _repo_checkout(item)
     if cwd is not None and _rollout.has_target(cwd, "verify"):
         res = _rollout.verify(cwd)
+        before = _red_baseline(item)
         if res.ok:
             verify_note = "make verify passed"
+        elif before is not None:
+            verify_note = (f"make verify red before the merge too (pre-existing, exit {before.get('exit')}): "
+                           f"{_tail_for_note(before.get('tail') or '')}")
         else:
             problems.append(f"make verify failed (exit {res.exit_code}): {_tail_for_note(res.tail)}")
     if signal and window_over:

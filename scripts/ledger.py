@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 21
+LEDGER_SCHEMA_VERSION = 22
 
 
 class LedgerBehind(RuntimeError):
@@ -850,6 +850,20 @@ CREATE TABLE decision_shadow (
 CREATE INDEX idx_decision_shadow_status ON decision_shadow(status);
 """
 
+# Version 22 — `verify_baseline` (one column, no backfill). The merge train's last stage runs
+# `make verify` once before it lands a pull request (train._train_merge, only when the repo has a
+# verify target) and stores the result here, so the verify pass after the deploy can tell a red the
+# merge caused from a red production already had. JSON `{"ok": bool, "exit": int, "tail": "<=300
+# chars>", "at": iso}`; NULL = no baseline taken (an old item, a repo without a verify target, a
+# merge that landed outside the train). Taken again on every merge attempt, so a retried merge never
+# carries an older probe. It survives the merge into `verifying` (core.merged_entry() leaves it
+# alone) and is cleared by every other entry to `verifying` (core.VERIFY_RESET). When it is red AND
+# `make verify` is red after the deploy, the red is pre-existing: it is not a failing verify pass
+# and no revert (loop/verify.py _verify_item()). A revert's own verify (_verify_revert) ignores it.
+_MIGRATION_22 = """
+ALTER TABLE triage_items ADD COLUMN verify_baseline TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -872,6 +886,7 @@ MIGRATIONS: dict[int, str] = {
     19: _MIGRATION_19,
     20: _MIGRATION_20,
     21: _MIGRATION_21,
+    22: _MIGRATION_22,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live
