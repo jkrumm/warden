@@ -10631,3 +10631,26 @@ the new one could be dropped. Fixed by hand: `_file_name()` now only drops `./`;
 `:<n>` suffix only when `n` equals the finding's own `line` (a reviewer's `x.py:12` beside `line: 12`), and
 the PR file list is never suffix-stripped. Tests: `test_triage.py` 629 -> 630 (a numeric suffix that is not
 the line stays part of the name, so the new finding blocks). AGENTS.md's gate line reads 630.
+
+## 175. The repeat drop is durable beside the raw verdict, and the `:line` match fails closed (2026-10-16)
+
+Independent review blocked PR #45 (the §170–§174 chain) on two points left in the last attempt.
+
+(1) The mixed-round fix folded the drop INTO the review row's `verdict_json` (`blocking` overwritten, raw
+list parked under a `droppedBlocking` key). That lost the dropped repeat from the record
+`work.prior_blocking_findings()` reads, so a later round that re-raised the dropped finding saw only the
+kept one and blocked again (the item 1559 outcome); and both `warden status <job>` (`dispatch.sync_record()`)
+and dispatch-sweep.py rewrite `verdict_json` from the raw agent-gateway job whenever they run after the
+fold, so a drop stored there was wiped before `_revision_findings()` read it. Fix: the raw `blocking` stays
+immutable in `verdict_json`, and the drop is recorded in a new `dispatches.dropped_blocking` column (ledger
+schema 24) that neither `sync_record` nor the sweep touches. `_review_findings_text()`/`_revision_findings()`
+subtract the drop from the brief; `prior_blocking_findings()` excludes the dropped findings (they do not
+block), and a new `prior_dropped_findings()` hands them back to `_repeats_resolved_by_diff()` so the next
+round still recognises the dropped file.
+
+(2) A repeat resolved only when `_finding_file()` (which strips a `:line` matching the finding's own line)
+was absent from `changed`, so a real file `src/report:3` reviewed at line 3 — or a blocker `{file: "pkg/a:3",
+line: 3}` while the PR changes `pkg/a:3` — normalised to a name not in `changed` and was dropped though the
+PR still changed it. A repeat now resolves only when NEITHER the raw `_file_name()` NOR `_finding_file()` is
+in `changed`, failing closed on an ambiguous name. Tests: `test_triage.py` 633 -> 636 (a re-raised dropped
+finding still drops; both colon-suffixed cases keep the block). AGENTS.md's gate line reads 636.

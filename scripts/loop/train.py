@@ -524,13 +524,21 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
     The spec's rule (dotfiles docs/agent-platform.md, § Revisions): such a repeat is not a block, the
     revision dropped that change, so the diff resolved it. A repeat is matched on the file alone (both
     sides read by _finding_file()); a finding with no file, or on a file the PR still changes
-    (renames count as changed), is never dropped. A PR URL that names no PR, or a file listing where
-    ANY entry yields no usable filename (an empty listing, an entry that is not a dict, or a name
-    `_file_name()` reads as None), is a strike and None: a repeat is never read as resolved on a
-    guess. One malformed entry beside a valid one still strikes, because the entry that yielded
-    nothing could be the very file the repeat names — a file left off the listing reads as no longer
-    changed. An unreadable listing drops nothing, so the verdict falls through to `blocked`."""
+    (renames count as changed), is never dropped. A repeat resolves only when neither its raw
+    `_file_name()` nor its `_finding_file()` names a changed file, so a `:<line>` suffix that
+    normalises one spelling away from a still-changed file fails closed (kept, not dropped). A PR URL
+    that names no PR, or a file listing where ANY entry yields no usable filename (an empty listing,
+    an entry that is not a dict, or a name `_file_name()` reads as None), is a strike and None: a
+    repeat is never read as resolved on a guess. One malformed entry beside a valid one still strikes,
+    because the entry that yielded nothing could be the very file the repeat names — a file left off
+    the listing reads as no longer changed. An unreadable listing drops nothing, so the verdict falls
+    through to `blocked`."""
     prior_files = {_finding_file(f) for f in work.prior_blocking_findings(conn, item)} - {None}
+    # A finding the previous round already dropped (resolved by the diff) is still a prior finding
+    # for the next round's comparison: a later round that re-raises it on the same still-absent file
+    # must drop it again, not read it as a fresh block (item 1559). prior_blocking_findings() excludes
+    # the dropped ones (they do not block), so read them back here.
+    prior_files |= {_finding_file(f) for f in work.prior_dropped_findings(conn, item)} - {None}
     repeats = [f for f in blocking if _finding_file(f) in prior_files]
     if not repeats:
         return []
@@ -560,7 +568,13 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
         _train_strike(conn, item, now, f"GitHub listed no files for {owner}/{name}#{number}; "
                                        "a repeat is not read as resolved on an empty listing")
         return None
-    return [f for f in repeats if _finding_file(f) not in changed]
+    # A repeat is resolved only when NEITHER of its two spellings names a file the PR still changes:
+    # the raw `_file_name()` (which keeps a `:<line>` suffix) AND `_finding_file()` (which strips one
+    # when it repeats the finding's own line). Stripping alone was one-sided — a real file named
+    # `src/report:3` reviewed at line 3 (or a blocker `{file: "pkg/a:3", line: 3}` while the PR
+    # changes `pkg/a:3`) normalised to `src/report`/`pkg/a`, missed `changed`, and was dropped though
+    # the PR still changed it. Requiring both to be absent fails closed on such ambiguous names.
+    return [f for f in repeats if _file_name(f.get("file")) not in changed and _finding_file(f) not in changed]
 
 
 def _dropped_note(resolved: list[dict[str, Any]]) -> str:
@@ -578,7 +592,9 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
 
     A non-empty `blocking` list refuses the merge outright, never read as a pass, with ONE
     exception: a finding that repeats a prior round's finding on a file the PR no longer changes is
-    dropped first (_repeats_resolved_by_diff()). Then, with ONE
+    dropped first (_repeats_resolved_by_diff()); the drop is recorded on `dispatches.dropped_blocking`
+    and the raw `blocking` is left intact, so the revision brief subtracts the drop while the next
+    round's comparison still sees the dropped file. Then, with ONE
     precedence above it: `"needs-human"` with an `escalationCategory` AND a fixable code finding goes
     back for a revision (`blocked`) — the findings are a work order, and the owner is paged only once
     none is left; the rest of that shape (no code finding, a process-only finding only, a schema-1 or
@@ -687,11 +703,14 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     dropped = {id(f) for f in resolved}
     blocking = [f for f in blocking if id(f) not in dropped]
     if resolved:
-        # The revision brief reads this row's `blocking` (work._review_findings_text()), so the dropped
-        # repeats are taken off it here, not only in memory: a mixed round must not send the revision
-        # to fix a finding on a file the PR no longer changes. The raw list stays under `droppedBlocking`.
-        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id=?",
-                     (json.dumps(dict(verdict, blocking=blocking, droppedBlocking=resolved)), item["validation_job"]))
+        # The dropped repeats are recorded on their own column, not folded into `verdict_json`:
+        # `verdict_json` is agent-gateway's raw result, and both `dispatch.sync_record()` (`warden status
+        # <job>`) and dispatch-sweep.py rewrite it from the raw job if either runs after this fold, so a
+        # drop stored there would be wiped and the revision brief would re-list a file the PR no longer
+        # changes. Keeping the raw `blocking` intact also leaves the dropped repeat for the next round's
+        # prior_blocking_findings()/prior_dropped_findings() comparison (item 1559).
+        conn.execute("UPDATE dispatches SET dropped_blocking=? WHERE job_id=?",
+                     (json.dumps(resolved), item["validation_job"]))
     # The wrapper class is not the implementer's (see is_process_only_finding()). It must not
     # read as `blocked` (that spends a revision); apart from a repeat already dropped above, it
     # is not dropped here either, so it goes to the owner with the finding on the card.

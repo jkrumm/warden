@@ -2752,13 +2752,18 @@ REVISION_NOTE_PREFIX = "revision "
 REVISION_WHY_PREFIX = "triage revision "
 
 
-def _review_findings_text(verdict: dict[str, Any]) -> str | None:
+def _review_findings_text(verdict: dict[str, Any], *,
+                          dropped: list[dict[str, Any]] | None = None) -> str | None:
     """The blocking findings of one review verdict as the bullet list a revision brief carries, or
     None when none are left. A wrapper-only round is a human's one-line edit, not a revision (see
     `is_process_only_finding()`). Filtering here as well as in the folding switch keeps an item
     parked `blocked` by an older round from spending its remaining attempt on text no episode can
-    write."""
-    blocking = [f for f in (verdict.get("blocking") or []) if not is_process_only_finding(f)]
+    write. `dropped` are the findings the fold dropped as resolved-by-the-diff (a repeat on a file
+    the PR no longer changes): they are taken off the brief, so a revision is never sent to fix a
+    file the PR no longer changes."""
+    dropped_files = {f.get("file") for f in (dropped or []) if isinstance(f, dict) and f.get("file")}
+    blocking = [f for f in (verdict.get("blocking") or [])
+                if not is_process_only_finding(f) and f.get("file") not in dropped_files]
     if not blocking:
         return None
     lines = []
@@ -2777,16 +2782,15 @@ PRIOR_FINDINGS_QUOTED = 10
 PRIOR_FINDING_MESSAGE_MAX = 300
 
 
-def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
-                            same_pr: bool = True) -> list[dict[str, Any]]:
-    """The code-blocking findings of the most recent review that BLOCKED an attempt before the one on
-    record (the previous round) on the same pull request, or [] when there is none. `same_pr=False`
-    drops that match: a conflicting attempt pushed nothing, so it names no pull request, yet the
-    findings an earlier attempt was blocked on still apply to it."""
+def _prior_blocked_review(conn: sqlite3.Connection, item: sqlite3.Row, *, same_pr: bool) -> str | None:
+    """The `validation_job_id` of the most recent review that BLOCKED an attempt before the one on
+    record (the previous round) on the same pull request, or None when there is none. `same_pr=False`
+    drops the pull-request match: a conflicting attempt pushed nothing, so it names no pull request,
+    yet the findings an earlier attempt was blocked on still apply to it."""
     current = conn.execute("SELECT id, artifact_url FROM dispatches WHERE job_id=?",
                            (item["implement_job"],)).fetchone()
     if current is None or (same_pr and not current["artifact_url"]):
-        return []   # a pull request nobody can name has no prior round to compare with
+        return None   # a pull request nobody can name has no prior round to compare with
     # Rows of an earlier cycle (before a reinvestigate) are not this chain: the chain starts at the
     # investigation on record, and a round on another pull request (an adopted one, a conflict's
     # replacement) is no prior round of this one.
@@ -2798,12 +2802,41 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
         "AND (? = 0 OR artifact_url = ?) ORDER BY id DESC LIMIT 1",
         (item["event_id"], current["id"], floor["id"] if floor else 0,
          int(same_pr), current["artifact_url"])).fetchone()
-    if blocked is None:
+    return blocked["validation_job_id"] if blocked is not None else None
+
+
+def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
+                            same_pr: bool = True) -> list[dict[str, Any]]:
+    """The code-blocking findings of the most recent review that BLOCKED an attempt before the one on
+    record (the previous round) on the same pull request, or [] when there is none. `same_pr=False`
+    drops that match: a conflicting attempt pushed nothing, so it names no pull request, yet the
+    findings an earlier attempt was blocked on still apply to it. Findings the fold dropped as
+    resolved-by-the-diff (`dispatches.dropped_blocking`) are excluded — they do not block, so neither
+    the revision brief nor the review context may quote them; the repeat-drop comparison reads them
+    back via prior_dropped_findings()."""
+    job_id = _prior_blocked_review(conn, item, same_pr=same_pr)
+    if job_id is None:
         return []
-    rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
-                       (blocked["validation_job_id"],)).fetchone()
+    rev = conn.execute("SELECT verdict_json, dropped_blocking FROM dispatches WHERE job_id=?",
+                       (job_id,)).fetchone()
     verdict = core.safe_json(rev["verdict_json"] if rev else None)
-    return [f for f in (verdict.get("blocking") or []) if isinstance(f, dict) and not is_process_only_finding(f)]
+    dropped = safe_json_list(rev["dropped_blocking"] if rev else None)
+    dropped_files = {f.get("file") for f in dropped if isinstance(f, dict) and f.get("file")}
+    return [f for f in (verdict.get("blocking") or [])
+            if isinstance(f, dict) and not is_process_only_finding(f) and f.get("file") not in dropped_files]
+
+
+def prior_dropped_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
+                           same_pr: bool = True) -> list[dict[str, Any]]:
+    """The findings the most recent BLOCKED review dropped as resolved-by-the-diff, or [] when there is
+    none. `_repeats_resolved_by_diff()` reads them back so a later round that re-raises one on the same
+    still-absent file is still dropped, even though `prior_blocking_findings()` no longer names it."""
+    job_id = _prior_blocked_review(conn, item, same_pr=same_pr)
+    if job_id is None:
+        return []
+    rev = conn.execute("SELECT dropped_blocking FROM dispatches WHERE job_id=?",
+                       (job_id,)).fetchone()
+    return safe_json_list(rev["dropped_blocking"] if rev else None)
 
 
 def prior_findings_paragraph(findings: list[dict[str, Any]]) -> str:
@@ -2862,9 +2895,10 @@ def _revision_findings(conn: sqlite3.Connection, item: sqlite3.Row) -> str | Non
     if impl is None:
         return None
     if impl["validation_status"] == "blocked" and item["validation_job"]:
-        rev = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id=?",
+        rev = conn.execute("SELECT verdict_json, dropped_blocking FROM dispatches WHERE job_id=?",
                            (item["validation_job"],)).fetchone()
-        text = _review_findings_text(core.safe_json(rev["verdict_json"] if rev else None))
+        text = _review_findings_text(core.safe_json(rev["verdict_json"] if rev else None),
+                                     dropped=safe_json_list(rev["dropped_blocking"] if rev else None))
         if text is None:
             return None
         return "The independent review BLOCKED the previous attempt:\n" + text

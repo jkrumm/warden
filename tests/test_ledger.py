@@ -1058,7 +1058,7 @@ def test_migration_15_adds_the_verify_columns_and_starts_the_window_of_verifying
     before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     conn = ledger.connect(path, migrate=True)
     after = dt.datetime.now(dt.timezone.utc)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 23
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 24
     cols = _table_columns(conn, "triage_items")
     assert {"verify_started_at", "verify_mark", "verify_failures", "verify_result"} <= cols, cols
     assert {"train_stage", "train_sha", "train_job", "reviewed_sha", "train_evidence", "train_rewinds",
@@ -1136,7 +1136,7 @@ def test_migration_16_classifies_the_failed_rows_from_their_notes_and_adds_the_r
     conn.close()
 
     conn = ledger.connect(path, migrate=True)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 23
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 24
     assert {"failure_class", "redrive_json", "redrives"} <= _table_columns(conn, "triage_items")
     rows = {r["event_id"]: r for r in conn.execute("SELECT * FROM triage_items")}
 
@@ -1337,7 +1337,7 @@ def test_migration_22_adds_verify_baseline_without_touching_rows():
 
     conn = ledger.connect(path, migrate=True)
     conn.row_factory = sqlite3.Row
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 23
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 24
     assert "verify_baseline" in _table_columns(conn, "triage_items")
     row = conn.execute("SELECT * FROM triage_items WHERE event_id=1").fetchone()
     assert row["verify_baseline"] is None and row["note"] == "a note", "adding the column touches no row"
@@ -1361,10 +1361,34 @@ def test_migration_23_adds_ci_rerun_sha_without_touching_rows():
 
     conn = ledger.connect(path, migrate=True)
     conn.row_factory = sqlite3.Row
-    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 23
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 24
     assert "ci_rerun_sha" in _table_columns(conn, "triage_items")
     row = conn.execute("SELECT * FROM triage_items WHERE event_id=1").fetchone()
     assert row["ci_rerun_sha"] is None and row["note"] == "a note", "adding the column touches no row"
+    conn.close()
+
+
+def test_migration_24_adds_dropped_blocking_without_touching_rows():
+    path = _tmp_path()
+    old = sqlite3.connect(path)
+    old.executescript(ledger.BASE_SCHEMA)
+    for version in range(2, 24):
+        old.executescript(ledger.MIGRATIONS[version])
+    old.execute(ledger._SCHEMA_VERSION_TABLE)
+    old.execute("INSERT INTO schema_version (version, applied_at) VALUES (23, 'test')")
+    old.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (1, 's', 'e1', 't', 'now')")
+    old.execute("INSERT INTO dispatches(job_id, tier, repo, brief, status, created_at) "
+                "VALUES ('j1', 'review', 'demo-repo', 'review PR #1', 'done', 'now')")
+    old.commit()
+    assert "dropped_blocking" not in _table_columns(old, "dispatches"), "the v23 fixture predates the column"
+    old.close()
+
+    conn = ledger.connect(path, migrate=True)
+    conn.row_factory = sqlite3.Row
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == ledger.LEDGER_SCHEMA_VERSION == 24
+    assert "dropped_blocking" in _table_columns(conn, "dispatches")
+    row = conn.execute("SELECT * FROM dispatches WHERE job_id='j1'").fetchone()
+    assert row["dropped_blocking"] is None and row["brief"] == "review PR #1", "adding the column touches no row"
     conn.close()
 
 

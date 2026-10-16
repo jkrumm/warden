@@ -4388,8 +4388,8 @@ def test_a_rename_counts_the_previous_filename_as_changed_so_a_repeat_on_it_is_s
 
 def test_a_mixed_round_persists_the_dropped_repeat_off_the_revision_brief():
     """One repeat dropped (its file the PR no longer changes) beside a new finding that stays: the
-    revision brief names only the finding that stays, because the review row's blocking list is
-    filtered at fold time (item 1559)."""
+    revision brief names only the finding that stays, the review row's raw `blocking` keeps the
+    dropped repeat, and the drop is recorded beside it (not folded into `verdict_json`) — item 1559."""
     kept = {"file": "scripts/kept.py", "line": 9, "message": "new defect", "angle": "senior-dev"}
     with _triage_env() as (conn, ctx):
         eid, pr_files_fn = _seed_repeat_round(
@@ -4402,8 +4402,29 @@ def test_a_mixed_round_persists_the_dropped_repeat_off_the_revision_brief():
         item = core.get_item(conn, eid)
         text = work._revision_findings(conn, item)
         assert text is not None and "scripts/kept.py:9" in text and "scripts/gone.py" not in text, text
-        review = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id='review-repeat'").fetchone()
-        assert [f["file"] for f in json.loads(review["verdict_json"])["blocking"]] == ["scripts/kept.py"]
+        review = conn.execute("SELECT verdict_json, dropped_blocking FROM dispatches WHERE job_id='review-repeat'").fetchone()
+        assert [f["file"] for f in json.loads(review["verdict_json"])["blocking"]] == ["scripts/gone.py", "scripts/kept.py"]
+        assert [f["file"] for f in json.loads(review["dropped_blocking"])] == ["scripts/gone.py"]
+
+
+def test_a_repeat_of_a_dropped_prior_finding_is_still_dropped():
+    """Round 2 blocked on [A (dropped: gone.py), B (kept.py)] and recorded its drop; round 3 re-raises
+    A. A is still a repeat of a prior finding on a file the PR no longer changes (the drop is read back
+    from `dispatches.dropped_blocking`), so it is dropped again, not a fresh block (item 1559)."""
+    kept = {"file": "scripts/kept.py", "line": 9, "message": "new defect", "angle": "senior-dev"}
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-redropped", prior_findings=[_GONE_FINDING, kept],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": "scripts/kept.py"}])
+        # Round 2's fold left its drop on the prior review row: the raw `blocking` still holds A and B,
+        # with the drop beside it. Round 3 re-raises only A.
+        conn.execute("UPDATE dispatches SET dropped_blocking=? WHERE job_id='review-prev'",
+                     (json.dumps([_GONE_FINDING]),))
+        conn.commit()
+        _fold_repeat_review(conn, eid, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "confirmed", dict(status)
 
 
 def test_a_repeat_whose_pr_url_names_no_pr_strikes_and_drops_nothing():
@@ -4451,6 +4472,36 @@ def test_a_numeric_suffix_that_is_not_the_line_is_part_of_the_file_name():
             conn, "sig-repeat-colon-name", prior_findings=[dict(_GONE_FINDING, file="scripts/report:2024")],
             current_findings=[dict(_GONE_FINDING, file="scripts/report", message="new defect")],
             pr_files=[{"filename": "scripts/other.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
+
+def test_a_repeat_on_a_colon_suffixed_file_the_pr_still_changes_is_still_a_block():
+    # The PR changes `pkg/a:3` and the reviewer re-raises `{file: "pkg/a:3", line: 3}`: `_finding_file()`
+    # strips the `:3` (the finding's own line) to `pkg/a`, which misses `changed`, but the raw
+    # `_file_name()` still names `pkg/a:3` — which the PR changes — so the repeat is not read as resolved.
+    finding = {"file": "pkg/a:3", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-colon-changed", prior_findings=[finding],
+            current_findings=[dict(finding, message="still wrong")],
+            pr_files=[{"filename": "pkg/a:3"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
+
+def test_a_real_file_named_with_a_numeric_suffix_matching_the_line_is_not_dropped():
+    # A real file `src/report:3` reviewed at line 3: `_finding_file()` strips the `:3`, but the raw
+    # `_file_name()` keeps `src/report:3`, which the PR still changes, so the blocker stays (the
+    # ambiguous name fails closed rather than read as resolved).
+    finding = {"file": "src/report:3", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-real-colon-name", prior_findings=[finding],
+            current_findings=[dict(finding, message="still wrong")],
+            pr_files=[{"filename": "src/report:3"}])
         _run_repeat_review(conn, pr_files_fn)
         status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
         assert status["validation_status"] == "blocked", dict(status)

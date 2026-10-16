@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 23
+LEDGER_SCHEMA_VERSION = 24
 
 
 class LedgerBehind(RuntimeError):
@@ -872,6 +872,18 @@ _MIGRATION_23 = """
 ALTER TABLE triage_items ADD COLUMN ci_rerun_sha TEXT;
 """
 
+# Version 24 — `dropped_blocking` (one column, no backfill). The merge train's review fold drops a
+# blocking finding that repeats a prior round's finding on a file the PR no longer changes, and
+# records the dropped findings here, on the review dispatch's own row. It is deliberately a COLUMN
+# beside `verdict_json`, not a field folded into it: `verdict_json` is agent-gateway's raw result,
+# which both `dispatch.sync_record()` (`warden status <job>`) and dispatch-sweep.py rewrite from the
+# raw job whenever either runs after the fold, so a drop stored there would be wiped. The raw
+# `blocking` list stays intact in `verdict_json` (the next round's repeat-drop comparison reads it),
+# and the revision brief / review context subtract this column instead. NULL = nothing was dropped.
+_MIGRATION_24 = """
+ALTER TABLE dispatches ADD COLUMN dropped_blocking TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -896,6 +908,7 @@ MIGRATIONS: dict[int, str] = {
     21: _MIGRATION_21,
     22: _MIGRATION_22,
     23: _MIGRATION_23,
+    24: _MIGRATION_24,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live
