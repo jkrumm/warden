@@ -2541,7 +2541,14 @@ def poll_implement_jobs(conn: sqlite3.Connection, policy: dict[str, Any], now: d
         summary = result.get("summary") or "no further detail"
         apply_root_cause(conn, [item], result, now)
 
-        if result.get("nextAction") == "human":
+        # Red checks with attempts left are the implementer's to fix, whatever nextAction says. An
+        # UNCATEGORISED `human` on `checks_failed` is the episode giving up on its own lint or test error
+        # (item 1577: a lint error in its own new test paged "[no category]" with revisions left), not an
+        # owner question; a valid escalationCategory still pages.
+        red_checks_revision = (outcome == "checks_failed" and result.get("nextAction") == "human"
+                               and escalation_category(result) is None
+                               and revisable(item, item["stalled_rounds"] + 1))
+        if result.get("nextAction") == "human" and not red_checks_revision:
             core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now,
                            note=_decision_note(result, escalation_category(result)))
         elif outcome in ("pr_opened", "pr_updated") and artifact_url:

@@ -3531,6 +3531,34 @@ def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_no
         assert "checks failed" in item2["note"] and "lint failed" in item2["note"], item2["note"]
 
 
+def test_checks_failed_with_an_uncategorised_human_verdict_is_a_revision_while_revisions_are_left():
+    """Item 1577: a revision episode's checks failed on its own lint error and the verdict said
+    nextAction=human with no escalationCategory. With revisions left that is another revision, never a
+    page; a valid category, or no revisions left, keeps the old routing."""
+    with _triage_env() as (conn, ctx):
+        def run(external_id, job_id, category=None, stalled=0):
+            eid = _seed_implementing_item(conn, external_id=external_id, job_id=job_id)
+            conn.execute("UPDATE triage_items SET revision_count=1, stalled_rounds=? WHERE event_id=?", (stalled, eid))
+            conn.commit()
+            _agent_gateway.get = lambda j: {"status": "done", "result": _dispatch_result(
+                "checks_failed", next_action="human", branch="dispatch/x-1", summary="fix the failures in a further revision",
+                escalation_category=category)}
+            work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            return core.get_item(conn, eid)
+
+        revised = run("sig-1577-a", "impl-1577-a")
+        assert revised["state"] == core.STATE_WORKING, dict(revised)
+        assert "checks failed" in revised["note"], revised["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-1577-a'").fetchone()
+        assert d["validation_status"] == "checks_failed"
+
+        categorised = run("sig-1577-b", "impl-1577-b", category="security")
+        assert categorised["state"] == core.STATE_NEEDS_DECISION, dict(categorised)
+
+        spent = run("sig-1577-c", "impl-1577-c", stalled=core.MAX_IMPLEMENT_ATTEMPTS - 1)
+        assert spent["state"] == core.STATE_NEEDS_DECISION, "no revisions left: the old routing stands"
+
+
 def test_implement_outcome_checks_tool_failed_is_an_infra_strike_never_a_revision():
     """agent-gateway's v5 `checks_tool_failed` — the check TOOL itself crashed — is an
     infrastructure failure: it strikes for a fresh attempt and never spends a

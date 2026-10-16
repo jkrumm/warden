@@ -10794,3 +10794,11 @@ Kuma UP webhook can reopen that row once, until Wave 10 retires the poll.
 - `com.jkrumm.warden-backup` runs under `jobrun --every 86400` (no `--kuma`: its push URL is a mode-600 file the
   `--kuma op-ref` cannot read, and the script already pushes only after a clean run).
 - Tests: `test_triage.py` 672/672 (one new brief test).
+
+## §176 — a `checks_failed` verdict with revisions left revises, it does not page (2026-10-16)
+
+Item 1577 paged `needs_decision` "[no category]" with no question: a revision episode's own checks failed on a lint error in
+its new test, and the verdict was `outcome=checks_failed`, `nextAction=human`, no `escalationCategory`, with revisions left
+(`poll_implement_jobs()` checked `nextAction == human` first). Now an uncategorised `human` on `checks_failed` while
+`revisable()` goes to `hand_back_for_revision()` like any red check; a valid category, or no revisions left, routes as before.
+Test: `test_checks_failed_with_an_uncategorised_human_verdict_is_a_revision_while_revisions_are_left` (673/673).
