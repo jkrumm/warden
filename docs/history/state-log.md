@@ -10623,6 +10623,8 @@ after-the-loop `not changed` guard. Tests: `test_triage.py` 628 -> 629 (a malfor
 one strikes and never confirms; the branch's no-usable-filenames test already covered the all-malformed
 case). AGENTS.md's gate line reads 629.
 
+## 174. A `:line` suffix is stripped only when it is the finding's own line (2026-10-16)
+
 Revision ceiling (5) on the last review finding: `_file_name()` stripped any numeric `:<digits>` suffix, so a
 prior finding on a real file `src/report:2024` and a new finding on `src/report` matched as one repeat and
 the new one could be dropped. Fixed by hand: `_file_name()` now only drops `./`; `_finding_file()` drops a
