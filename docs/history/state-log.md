@@ -10802,3 +10802,6 @@ its new test, and the verdict was `outcome=checks_failed`, `nextAction=human`, n
 (`poll_implement_jobs()` checked `nextAction == human` first). Now an uncategorised `human` on `checks_failed` while
 `revisable()` goes to `hand_back_for_revision()` like any red check; a valid category, or no revisions left, routes as before.
 Test: `test_checks_failed_with_an_uncategorised_human_verdict_is_a_revision_while_revisions_are_left` (673/673).
+
+Follow-up to §175 (2026-10-16): the one-shot `reconcile(conn, "hermes_cron", [])` resolved event #1119 on the 16:39Z poll
+and is deleted; no `hermes_cron` code remains.

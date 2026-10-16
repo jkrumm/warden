@@ -1091,12 +1091,6 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
         all_new += n; all_res += res
         conn.commit()
 
-    # `hermes_cron` is retired: jobs-grade grades Hermes cron jobs and the `job` source opens their items.
-    # Reconciling it against nothing resolves the events it left open; delete this line once none are.
-    n, res = reconcile(conn, "hermes_cron", [], now, 0, deliver=deliver)
-    all_new += n; all_res += res
-    conn.commit()
-
     n, res = reconcile(conn, "stray_skill", poll_stray_skills(), now, 0, deliver=deliver)
     all_new += n; all_res += res
     conn.commit()
