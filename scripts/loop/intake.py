@@ -388,6 +388,58 @@ def route_job_items(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.da
     conn.commit()
 
 
+def reinvestigate_stuck_job_items(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
+                                  *, dry_run: bool = False) -> None:
+    """A `job` item the loop closed (an investigation with nothing to change) whose job is still graded
+    bad `jobStillRedHours` later: the level-based source never re-arms it, so nothing would ever look
+    again. The first time it goes back to `triaged` for a fresh investigation (the note starts
+    core.STILL_RED_NOTE_PREFIX); when that one also closes with the job still red it is a
+    `needs_decision`, which is the true answer: two investigations could not move the job. An item the
+    owner closed by hand (core.HAND_CLOSE_NOTE_PREFIX) is the owner's call and is left alone."""
+    limit = dt.timedelta(hours=policy["jobStillRedHours"])
+    reopened_prs: list[str | None] = []
+    rows = conn.execute(
+        "SELECT ti.event_id AS event_id FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        "WHERE ti.origin=? AND ti.state=? AND e.resolved_at IS NULL", (core.JOB_ORIGIN, core.STATE_CLOSED),
+    ).fetchall()
+    for row in rows:
+        event_id = row["event_id"]
+        closed = conn.execute(
+            "SELECT at, note FROM item_transitions WHERE event_id=? AND to_state=? ORDER BY id DESC LIMIT 1",
+            (event_id, core.STATE_CLOSED)).fetchone()
+        closed_at = core.parse_ts(closed["at"]) if closed else None
+        if closed_at is None or now - closed_at < limit:
+            continue
+        if str(closed["note"] or "").startswith(core.HAND_CLOSE_NOTE_PREFIX):
+            continue
+        # Only this incident's marker counts: a recurrence re-enters `new`, which starts a fresh occurrence.
+        earlier = conn.execute(
+            "SELECT count(*) FROM item_transitions WHERE event_id=? AND to_state=? AND note LIKE ? AND id > "
+            "(SELECT coalesce(max(id), 0) FROM item_transitions WHERE event_id=? AND to_state=?)",
+            (event_id, core.STATE_TRIAGED, f"{core.STILL_RED_NOTE_PREFIX}%", event_id, core.STATE_NEW)).fetchone()[0]
+        event = core.get_event(conn, event_id)
+        if event is None:
+            continue
+        label = event["external_id"]
+        hours = (now - closed_at).total_seconds() / 3600
+        if dry_run:
+            print(f"[dry-run] would {'escalate' if earlier else 're-investigate'} job item {event_id} "
+                  f"(still red {hours:.1f} h after its investigation closed)")
+            continue
+        if earlier:
+            core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, expect_state=core.STATE_CLOSED,
+                           note=f"[blocker] {label} is still red {hours:.1f} h after a second investigation "
+                                f"closed without moving it")
+            continue
+        _, old_pr = core.reinvestigate(conn, event_id, now, expect_state=core.STATE_CLOSED,
+                                       note=f"{core.STILL_RED_NOTE_PREFIX}{label} stayed red {hours:.1f} h after "
+                                            f"its investigation closed; investigating again")
+        reopened_prs.append(old_pr)
+    conn.commit()
+    for pr in reopened_prs:
+        core.close_reinvestigated_pr(pr)
+
+
 def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[str, Any] | None = None,
                      *, dry_run: bool = False) -> None:
     """A grouped or state source reuses the SAME events.id across a resolve -> recur cycle

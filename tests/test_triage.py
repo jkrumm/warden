@@ -14686,6 +14686,85 @@ def test_a_job_that_fails_again_after_the_window_is_new_work_and_dispatches_agai
         assert len(calls) == 2
 
 
+def _job_closed_still_red(conn, calls, *, note: str = "nothing to change"):
+    """A job item investigated at JOB_BASE and closed by the loop ten minutes later with the job still red."""
+    _job_pass(conn, JOB_BASE)
+    item = _job_item(conn)
+    assert item["state"] == core.STATE_WORKING and len(calls) == 1, dict(item)
+    core.set_state(conn, item["event_id"], core.STATE_CLOSED, JOB_BASE + dt.timedelta(minutes=10), note=note,
+                   close_reason="resolved")
+    conn.commit()
+    return item["event_id"]
+
+
+def test_a_job_closed_by_an_investigation_but_still_red_is_investigated_again_after_the_window():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        eid = _job_closed_still_red(conn, calls)
+        policy = core.load_policy()
+        t_closed = JOB_BASE + dt.timedelta(minutes=10)
+        intake.reinvestigate_stuck_job_items(conn, policy, t_closed + dt.timedelta(hours=5), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_CLOSED, "inside the window nothing moves"
+        late = t_closed + dt.timedelta(hours=7)
+        intake.reinvestigate_stuck_job_items(conn, policy, late, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and item["note"].startswith(core.STILL_RED_NOTE_PREFIX), dict(item)
+        work.escalate_origin_items(conn, late)
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING and len(calls) == 2, "dispatched again"
+
+
+def test_a_job_still_red_after_its_second_investigation_is_a_decision_not_a_third_try():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        eid = _job_closed_still_red(conn, calls)
+        policy = core.load_policy()
+        t1 = JOB_BASE + dt.timedelta(hours=7)
+        intake.reinvestigate_stuck_job_items(conn, policy, t1, dry_run=False)
+        work.escalate_origin_items(conn, t1)
+        core.set_state(conn, eid, core.STATE_CLOSED, t1 + dt.timedelta(minutes=10), note="still nothing",
+                       close_reason="resolved")
+        conn.commit()
+        intake.reinvestigate_stuck_job_items(conn, policy, t1 + dt.timedelta(hours=7), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION and "second investigation" in item["note"], dict(item)
+        assert len(calls) == 2
+
+
+def test_a_still_red_marker_from_an_earlier_incident_does_not_skip_the_new_ones_reinvestigation():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        eid = _job_closed_still_red(conn, calls)
+        policy = core.load_policy()
+        t1 = JOB_BASE + dt.timedelta(hours=7)
+        intake.reinvestigate_stuck_job_items(conn, policy, t1, dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
+        # recovered and regressed: the item re-enters `new`, then is investigated and closed red again
+        core.set_state(conn, eid, core.STATE_NEW, t1 + dt.timedelta(days=9), note="new occurrence")
+        core.set_state(conn, eid, core.STATE_CLOSED, t1 + dt.timedelta(days=9, minutes=10), note="nothing",
+                       close_reason="resolved")
+        conn.commit()
+        intake.reinvestigate_stuck_job_items(conn, policy, t1 + dt.timedelta(days=9, hours=7), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and item["note"].startswith(core.STILL_RED_NOTE_PREFIX), dict(item)
+
+
+def test_a_job_closed_by_hand_or_recovered_is_not_reinvestigated():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        eid = _job_closed_still_red(conn, calls, note=f"{core.HAND_CLOSE_NOTE_PREFIX}owner says fine")
+        policy = core.load_policy()
+        intake.reinvestigate_stuck_job_items(conn, policy, JOB_BASE + dt.timedelta(days=1), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_CLOSED, "the owner's close stands"
+
+
 def test_a_job_that_healed_before_warden_acted_is_not_chronic_when_it_comes_back():
     """`quiet` with no dispatch on record: nothing was tried, so nothing failed to hold."""
     with _triage_env() as (conn, ctx), _job_machine():

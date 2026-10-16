@@ -10722,3 +10722,17 @@ needs_decision (the canary prints `canary unhealthy: … the fix is to set healt
 (a schema change for a count the transition history already holds), a per-origin closure strategy (one origin), caching the
 context per pass (bounded by `MAX_OPEN_INVESTIGATIONS`-sized bad-job counts), keeping the first deploy pass at `investigate`
 (the plan and the owner decide the implement tier from day one).
+
+## 173. Wave 8 of the background-jobs chain: review cycle 1 (2026-10-16)
+
+First run of the dotfiles `docs/waves/jobs-metrics.sql` and the `ops-signals.md` §9 checklist. One `job` item in
+the window (the Wave 7 canary, #1582, fixed, 2.4 h from the first item): too few for the rate rows, so only the
+defects found live were tuned. Added `reinvestigate_stuck_job_items()` (loop/intake.py, after `route_job_items()`):
+a `job` item the loop closed with the job still graded bad `jobStillRedHours` (6, `config/triage-policy.json`)
+later is re-investigated once (note prefix `still red: `); when that closes red too it is a `needs_decision`.
+A hand close is left alone. The count of earlier `still red:` markers is scoped to the current occurrence (after
+the last transition to `new`): found by review, a regressed job would otherwise skip its one re-investigation.
+Tests 667 -> 671. Review (agent-gateway, 1 round): 1 blocking fixed; the architect, senior-dev and resilience
+angles failed in the reviewer (shell denied), so they are unreviewed, not clean. LOOP.md step 1 (Measure) now
+runs the metrics query and the §9 checklist. Declined with numbers: per-pass `jobs-grade` caching (<1 s) and
+skipping `make verify` while a job closure is pending (16 s per verifying item per pass).

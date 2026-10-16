@@ -25,7 +25,7 @@ item moves.
 | `scripts/improve-trigger.py` | read-only: outcomes (`failed` / `needs_decision`) since the improve loop's cursor, or `quiet` |
 | `scripts/lifecycle/shadow.py`, `scripts/shadow-replay.py` | the decision-model shadow lane next to the LLM triage (`decision_shadow`, ledger v21; nothing decides from it) and its replay over labelled history; measured table + promotion rule: `docs/decision-shadow.md`; report: `python3 scripts/lifecycle/shadow.py report` |
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
-| `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns, the `job` source's chronic thresholds (`jobChronicRecurrences`, `jobChronicWindowDays`, `jobRegressionHours`) |
+| `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns, the `job` source's chronic thresholds (`jobChronicRecurrences`, `jobChronicWindowDays`, `jobRegressionHours`, `jobStillRedHours`) |
 
 ## Validate
 
@@ -47,7 +47,7 @@ installs `requirements.txt`; `make test` on its own still needs a venv.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**667/667** — any other number is a finding to report, not a count to edit.
+**670/670** — any other number is a finding to report, not a count to edit.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary (the `jobs-grade` client returns no jobs; the kill-switch flag is a file in
 its temp dir), so nothing reaches Slack, agent-gateway, GitHub, Argo or the host. `make test` runs every

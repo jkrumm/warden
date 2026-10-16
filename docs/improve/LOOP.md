@@ -24,6 +24,17 @@ since the cursor (`~/.warden/improve.cursor`), or `quiet`.
      the last journal entry (read-only sqlite, `?mode=ro`): items in, fixed, failed by
      `failure_class`, needs_decision, closed as duplicate/fixed_by, re-drives, median
      time new → fixed, merge-train refusals, auto-reverts.
+   - Background jobs (dotfiles `docs/ops-signals.md` §9, the owner of this duty after the wave chain):
+     `sqlite3 -header -column "file:$HOME/.warden/warden.db?immutable=1" < ~/SourceRoot/dotfiles/docs/waves/jobs-metrics.sql`
+     (per source over 14 days: opened, fixed, needs_decision, failed, quiet, false positives, duplicates,
+     hours to fix, redrives; then signatures opened more than once; then events vs items) plus
+     `jobs-grade --table`. Work the §9 checklist against it: one item per job failure (events ≈ items for
+     `job`); fixed ≥ 70 % for `job`/`uk`/`hyperdx`; median fix ≤ 2 h, max ≤ 24 h; 0 reopens within 7 days;
+     `needs_decision` ≤ 1/week; false positives trending to 0; Kuma DOWNs reaching #alerts while warden
+     was up = 0; no owned job at ladder level 0–1; why the kill-switch was used. Fewer than ~5 job items
+     in the window is no signal for the rate rows: say so, never tune a threshold on it. A miss is
+     tuned in `jobs-grade` (dotfiles `scripts/lib/jobs-grade.ts`), the brief (`lifecycle/intake.job_brief`)
+     or `config/triage-policy.json`, one commit per tuning with its evidence.
    - agent-gateway: `curl -s localhost:7705/api/jobs/health`, `job.fail` events in
      `~/Library/Logs/agent-gateway.jsonl` since the last entry, degraded routes.
    - OpenCode episodes (agw; evidence in `docs/opencode-v2.md`), since the last entry:

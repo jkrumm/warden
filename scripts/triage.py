@@ -49,6 +49,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # After the silence paths: a job item whose job recovered before it was routed goes `quiet`, not
     # to its owner repo.
     intake.route_job_items(conn, policy, now)
+    intake.reinvestigate_stuck_job_items(conn, policy, now, dry_run=dry_run)
     intake.resolve_recovery_paired(conn, policy, now, dry_run=dry_run)
     intake.resolve_quiet_grouped(conn, policy, now)
     work.maybe_dissolve_clusters(conn, now, dry_run=dry_run)

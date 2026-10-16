@@ -2,12 +2,12 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§171).
+build log (§1–§173).
 
 | | |
 |-|-|
-| Last updated | 2026-10-16 (§171 — Wave 6 of the background-jobs chain: the kill-switch and the `job` source) |
-| Current work | Background jobs → warden self-healing (dotfiles `docs/waves/PLAN.md`; spec `~/SourceRoot/dotfiles/docs/ops-signals.md`, its *Owner decisions* win): **Wave 6 built, not yet merged or deployed**; Wave 7 (job brief, verified closure, the canary end to end) is next. The agent-platform rewrite (`docs/waves/PLAN.md` here; spec `~/SourceRoot/dotfiles/docs/agent-platform.md`) is done |
+| Last updated | 2026-10-16 (§173 — Wave 8 of the background-jobs chain: review cycle 1; a still-red closed job item is re-investigated once) |
+| Current work | Background jobs → warden self-healing (dotfiles `docs/waves/PLAN.md`; spec `~/SourceRoot/dotfiles/docs/ops-signals.md`, its *Owner decisions* win): Waves 6-8 live (kill-switch, `job` source, brief and verified closure, review cycle 1); Wave 9 (warden-api ingest door) is next. The agent-platform rewrite (`docs/waves/PLAN.md` here; spec `~/SourceRoot/dotfiles/docs/agent-platform.md`) is done |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 23 (Wave 6 changed no schema: a `job` item reuses `origin`, `max_tier`, `brief` and the event cursor columns) |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |

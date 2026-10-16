@@ -249,6 +249,12 @@ DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
 DEFAULT_JOB_CHRONIC_RECURRENCES = 1
 DEFAULT_JOB_CHRONIC_WINDOW_DAYS = 7.0
 DEFAULT_JOB_REGRESSION_HOURS = 24.0
+# A `job` item the loop closed (an investigation answering "nothing to change") while its job is STILL
+# graded bad is silent forever: the source is level-based, so only a recovery re-arms it. After this many
+# hours warden re-investigates it once (intake.reinvestigate_stuck_job_items()); the second time it is a
+# `needs_decision`, because two investigations could not move the job.
+DEFAULT_JOB_STILL_RED_HOURS = 6.0
+STILL_RED_NOTE_PREFIX = "still red: "
 
 # Stalled rounds an item may spend (the first attempt included) before it ends for the owner. A
 # round is a blocked review, failed checks or a base that moved (see maybe_revise_blocked()); it is stalled when the review still blocks on a finding of the round before (the reviewer marks it,
@@ -538,6 +544,7 @@ def load_policy() -> dict[str, Any]:
         "jobChronicRecurrences": int(data.get("jobChronicRecurrences") or DEFAULT_JOB_CHRONIC_RECURRENCES),
         "jobChronicWindowDays": float(data.get("jobChronicWindowDays") or DEFAULT_JOB_CHRONIC_WINDOW_DAYS),
         "jobRegressionHours": float(data.get("jobRegressionHours") or DEFAULT_JOB_REGRESSION_HOURS),
+        "jobStillRedHours": float(data.get("jobStillRedHours") or DEFAULT_JOB_STILL_RED_HOURS),
         # Routing rules: a signature glob -> repo, the deterministic label tier (see label_route()).
         # Validated here, at load, like hostVerbs.
         "rules": [r for r in (data.get("rules") or []) if _valid_rule(r)],
