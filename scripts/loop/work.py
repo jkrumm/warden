@@ -2806,6 +2806,39 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
     return [f for f in (verdict.get("blocking") or []) if isinstance(f, dict) and not is_process_only_finding(f)]
 
 
+def earlier_blocked_files(conn: sqlite3.Connection, item: sqlite3.Row) -> set[str]:
+    """Every file a code-blocking finding named in ANY earlier blocked review round of this chain on the
+    same pull request (the rows prior_blocking_findings() reads, without its most-recent-only limit), as
+    spelled (`./` dropped). A finding on one of these files that the PR no longer changes repeats a
+    block the revision resolved by dropping the change (train._repeats_resolved_by_diff())."""
+    current = conn.execute("SELECT id, artifact_url FROM dispatches WHERE job_id=?",
+                           (item["implement_job"],)).fetchone()
+    if current is None or not current["artifact_url"]:
+        return set()
+    floor = conn.execute("SELECT id FROM dispatches WHERE job_id=?", (item["dispatch_job"],)).fetchone() \
+        if item["dispatch_job"] else None
+    files: set[str] = set()
+    for row in conn.execute(
+            "SELECT r.verdict_json FROM dispatches d JOIN dispatches r ON r.job_id = d.validation_job_id "
+            "WHERE d.origin_event_id=? AND d.tier='implement' AND d.id < ? AND d.id > ? "
+            "AND d.validation_status='blocked' AND d.artifact_url = ?",
+            (item["event_id"], current["id"], floor["id"] if floor else 0, current["artifact_url"])):
+        for f in core.safe_json(row["verdict_json"]).get("blocking") or []:
+            name = finding_file(f)
+            if name and not is_process_only_finding(f):
+                files.add(name)
+    return files
+
+
+def finding_file(finding: Any) -> str | None:
+    """A finding's file as GitHub's PR file list spells it: `./` dropped, nothing else normalised (a
+    spelling that does not match reads as no repeat, so the finding keeps blocking)."""
+    name = finding.get("file") if isinstance(finding, dict) else None
+    if not isinstance(name, str):
+        return None
+    return name.removeprefix("./") or None
+
+
 def prior_findings_paragraph(findings: list[dict[str, Any]]) -> str:
     """The review-context paragraph of a revision: the previous round's blocking findings, quoted as
     data, and the marker the reviewer puts on one that is still unresolved (see round_stalled())."""

@@ -766,7 +766,7 @@ def test_read_repo_ok():
 
 
 def test_pr_files_ok():
-    srv = _StubServer({("GET", "/repos/jkrumm/gamma/pulls/1/files?per_page=100"): (200, [{"filename": "a.py"}])})
+    srv = _StubServer({("GET", "/repos/jkrumm/gamma/pulls/1/files?per_page=100&page=1"): (200, [{"filename": "a.py"}])})
     _gh_env(srv)
     try:
         assert github.pr_files("jkrumm", "gamma", 1) == [{"filename": "a.py"}]
@@ -787,6 +787,40 @@ def test_check_runs_ok():
     finally:
         srv.stop()
         _gh_cleanup()
+
+
+def test_pr_files_reads_every_page_until_a_short_one():
+    """A pull request changing more than 100 files is read whole: a file past the first page is
+    still a file the PR changes, so a finding on it is not a repeat on a file no longer changed."""
+    pages = {1: [{"filename": f"f{i}.py"} for i in range(100)], 2: [{"filename": "last.py"}]}
+    seen: list[str] = []
+    saved = github.api
+
+    def _api(method, path, body=None):
+        seen.append(path)
+        return 200, pages[int(path.rsplit("page=", 1)[1])]
+
+    github.api = _api
+    try:
+        files = github.pr_files("jkrumm", "warden", 7)
+    finally:
+        github.api = saved
+    assert len(files) == 101 and files[-1]["filename"] == "last.py", len(files)
+    assert seen == ["/repos/jkrumm/warden/pulls/7/files?per_page=100&page=1",
+                    "/repos/jkrumm/warden/pulls/7/files?per_page=100&page=2"], seen
+
+
+def test_pr_files_refuses_a_listing_at_the_github_cap_rather_than_a_partial_one():
+    saved = github.api
+    github.api = lambda method, path, body=None: (200, [{"filename": "x.py"}] * 100)
+    try:
+        github.pr_files("jkrumm", "warden", 7)
+    except RemoteError as e:
+        assert "more than 3000 files" in str(e), e
+    else:
+        raise AssertionError("a listing past the 3000-file cap must refuse, not return a partial list")
+    finally:
+        github.api = saved
 
 
 def test_a_listing_without_total_count_is_an_unusable_body_not_one_page():

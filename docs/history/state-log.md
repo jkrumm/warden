@@ -10590,3 +10590,22 @@ whenever both a brief and a goal are present (its room comes out of the brief's;
 room drops it too): the brief wins, and the disagreement is
 not a question for the owner. No new test count: the two existing context tests assert the sentence is
 present with both and absent with a brief alone. `test_triage.py` stays 618.
+
+## 170. A repeated finding on a file the PR dropped is resolved, not a block (2026-10-16)
+
+Item 1559 (weatherorb PR #104): revision 3 dropped every `spots/db.py` change, yet the next review's
+adversary angle re-raised the prior `_ensure_role()` finding and the fold counted it as blocking; the
+revision worker then had nothing to change and the owner was paged. The spec (dotfiles
+`docs/agent-platform.md` § Revisions) now says such a repeat is not a block. `train._fold_review()` drops,
+before the verdict switch, every blocking finding whose file (`work.finding_file()`: `./` dropped, nothing
+else) an earlier blocked review round of this chain on the same PR named (`work.earlier_blocked_files()`,
+every such round, not only the last) and which the PR's current file list (`filename` and
+`previous_filename`) no longer contains. Any unreadable listing (unparsable URL, GitHub error, empty list,
+an entry with no filename) drops nothing. The drop is named on the hop note. `github.pr_files()` pages
+until a short page and refuses past GitHub's 3000-file cap.
+
+Item 1571 (PR #45) built this first and grew to 729 lines over ten review rounds (a ledger migration, a
+dropped-findings memory, `:line` suffix normalisation); it was closed for this minimal version, which
+reads every earlier round instead of storing drops and matches files exactly (a spelling mismatch reads
+as no repeat, so the finding keeps blocking). Tests: `test_triage.py` 618 -> 624, `test_clients.py`
+113 -> 115.

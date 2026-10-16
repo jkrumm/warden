@@ -137,11 +137,28 @@ def read_repo(owner: str, repo: str) -> dict[str, Any]:
     return body
 
 
+_FILES_PAGE_SIZE = 100
+_MAX_FILE_PAGES = 30   # GitHub lists at most 3000 files of a pull request
+
+
 def pr_files(owner: str, repo: str, number: int) -> list[dict[str, Any]]:
-    status, body = api("GET", f"/repos/{owner}/{repo}/pulls/{number}/files?per_page=100")
-    if status != 200:
-        raise RemoteError(f"GitHub returned HTTP {status} listing files on {owner}/{repo}#{number}")
-    return body
+    """Every file a pull request changes, page by page until a short page. Refuses a listing that
+    cannot be read whole: a file left off the list reads as no longer changed (see _fold_review)."""
+    files: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        status, body = api("GET", f"/repos/{owner}/{repo}/pulls/{number}/files"
+                                  f"?per_page={_FILES_PAGE_SIZE}&page={page}")
+        if status != 200:
+            raise RemoteError(f"GitHub returned HTTP {status} listing files on {owner}/{repo}#{number}")
+        if not isinstance(body, list):
+            raise RemoteError(f"GitHub returned an unusable body listing files on {owner}/{repo}#{number}")
+        files.extend(body)
+        if len(body) < _FILES_PAGE_SIZE:
+            return files
+        if page >= _MAX_FILE_PAGES:
+            raise RemoteError(f"{owner}/{repo}#{number} lists more than {len(files)} files; refusing a partial list")
+        page += 1
 
 
 def check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:

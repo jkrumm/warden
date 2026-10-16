@@ -498,6 +498,37 @@ def _train_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
     return False
 
 
+def _repeats_resolved_by_diff(item: sqlite3.Row, blocking: list[Any],
+                              earlier_files: set[str]) -> list[dict[str, Any]]:
+    """The blocking findings the spec reads as resolved (dotfiles docs/agent-platform.md, § Revisions):
+    a finding on a file an earlier blocked round of this PR also named, which the PR no longer changes
+    — the revision dropped that change. Matched on the exact file (work.finding_file()). Drops nothing
+    when the PR's file list cannot be read whole (unparsable URL, a GitHub error, an empty listing, an
+    entry with no filename): the verdict then stands as it is."""
+    repeats = [f for f in blocking if work.finding_file(f) in earlier_files]
+    if not repeats:
+        return []
+    ref = _github.parse_pr_url(item["pr_url"] or "")
+    if ref is None:
+        return []
+    try:
+        files = _github.pr_files(*ref)
+    except RemoteError as e:
+        print(f"triage: could not list the files of {item['pr_url']}: {e}", file=sys.stderr)
+        return []
+    changed: set[str] = set()
+    for entry in files:
+        name = entry.get("filename") if isinstance(entry, dict) else None
+        if not isinstance(name, str) or not name:
+            return []
+        changed.add(name)
+        if isinstance(entry.get("previous_filename"), str):
+            changed.add(entry["previous_filename"])
+    if not changed:
+        return []
+    return [f for f in repeats if work.finding_file(f) not in changed]
+
+
 def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                  now: dt.datetime) -> bool:
     """Act on the step-7 review of the train's SHA: agent-gateway's own `review` job on the PR's own
@@ -505,8 +536,9 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     `outcome == "clean"`, or `"actionable"` with an EMPTY `blocking` list, confirms: `reviewed_sha`
     records the SHA and the train moves to merge.
 
-    A non-empty `blocking` list refuses the merge outright, never read as a pass, with ONE
-    precedence above it: `"needs-human"` with an `escalationCategory` AND a fixable code finding goes
+    A non-empty `blocking` list refuses the merge outright, never read as a pass — after one filter:
+    a finding that repeats an earlier blocked round's file the PR no longer changes is dropped first
+    (_repeats_resolved_by_diff(), the spec's rule). Then, with ONE precedence above it: `"needs-human"` with an `escalationCategory` AND a fixable code finding goes
     back for a revision (`blocked`) — the findings are a work order, and the owner is paged only once
     none is left; the rest of that shape (no code finding, a process-only finding only, a schema-1 or
     revert verdict, which cannot name a category) goes to the owner (`needs_decision`, note led by
@@ -607,6 +639,11 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
 
     outcome = verdict.get("outcome")
     blocking = verdict.get("blocking") or []
+    resolved = _repeats_resolved_by_diff(item, blocking, work.earlier_blocked_files(conn, item))
+    if resolved:
+        blocking = [f for f in blocking if all(f is not r for r in resolved)]
+    resolved_note = (f"dropped {len(resolved)} prior finding(s) on files the PR no longer changes: "
+                     + ", ".join(sorted({work.finding_file(f) for f in resolved}))) if resolved else None
     # The wrapper class is not the implementer's (see is_process_only_finding()). It must not
     # read as `blocked` (that spends a revision) but must not be dropped either, so it goes to the
     # owner with the finding on the card.
@@ -670,8 +707,10 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     conn.commit()
 
     if validation_status == "confirmed":
+        confirmed_note = decided_note or f"review confirmed {sha[:12]}"
         return _train_hop(conn, item, now, train_stage=TRAIN_MERGE, reviewed_sha=sha, retry_at=None,
-                          note=decided_note or f"review confirmed {sha[:12]}", **_stage_success(item))
+                          note=f"{resolved_note}; {confirmed_note}" if resolved_note else confirmed_note,
+                          **_stage_success(item))
     if validation_status == "unknown":
         core.set_state(conn, event_id, core.STATE_FAILED, now, strikes=0, failure_class=core.FAILURE_INFRA,
                         note=f"step-7 validation: {unknown_outcome_note}")
@@ -685,6 +724,8 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
                         note=f"{tag}step-7 validation (needs-human): {detail}")
     else:
         note = f"step-7 validation (blocked): {work.format_blocking_findings(blocking)}"
+        if resolved_note:
+            note = f"{note}; {resolved_note}"
         if decided_note:
             note = f"{decided_note}; {note}"
         if core.is_revert(item):

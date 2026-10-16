@@ -120,7 +120,11 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    finding every round (items 1478, 1480, 1565): a review that still blocks at `revision_count`
    6 lands `needs_decision` with its findings (`revision ceiling (5), review still blocks: …`),
    while a review that does not block is `confirmed` and goes to the merge train as always —
-   the ceiling never loosens what blocks a merge. Red checks and a conflict at the ceiling stay
+   the ceiling never loosens what blocks a merge. One finding is read as resolved, not as a
+   block: a blocking finding on a file an earlier blocked round of the same PR named, which the
+   PR's current file list (`github.pr_files()`, every page) no longer contains — the revision
+   dropped that change (item 1559; `train._repeats_resolved_by_diff()`). Exact file match; any
+   unreadable listing drops nothing; the drop is named on the hop note. Red checks and a conflict at the ceiling stay
    `failed` (PR left open). `revision_count` is otherwise the attempt ordinal: the
    escalation model starts at attempt 3 (`implement_model()`). warden-only: agent-gateway's
    review schema is unchanged, the marker is text in the finding's message. `conflict`

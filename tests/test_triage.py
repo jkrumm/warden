@@ -4191,6 +4191,156 @@ def test_real_blocked_review_is_not_retried():
         assert item["strikes"] == 0, "a real finding is not an infrastructure failure"
 
 
+def _seed_repeat_round(conn, eid_external: str, *, prior_findings: list[dict[str, Any]], current_findings:
+                       list[dict[str, Any]], pr_files: list[dict[str, Any]] | Exception):
+    """A review round whose previous round blocked the same PR on `prior_findings`. The previous
+    implement row is inserted first so it sorts before the current one (prior_blocking_findings())."""
+    pr_url = "https://github.com/jkrumm/demo-repo/pull/10"
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,validation_status,validation_job_id,artifact_url,"
+        "created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("impl-prior", "implement", "demo-repo", "b", "done", "blocked", "review-prev", pr_url, NOW.isoformat()),
+    )
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("review-prev", "review", "demo-repo", "review PR #10", "done",
+         json.dumps(_review_result("actionable", blocking=prior_findings)), NOW.isoformat()),
+    )
+    eid = _seed_validating_item(conn, external_id=eid_external, implement_job="impl-repeat",
+                                review_job="review-repeat")
+    conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id='impl-prior'", (eid,))
+    conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id='impl-repeat'", (pr_url,))
+    conn.execute("UPDATE triage_items SET dispatch_job=NULL WHERE event_id=?", (eid,))
+    conn.commit()
+    _agent_gateway.get = lambda job_id: {
+        "id": job_id, "status": "done",
+        "result": _review_result("actionable", blocking=current_findings),
+    }
+    files = pr_files
+
+    def _pr_files(owner, repo, number):
+        if isinstance(files, Exception):
+            raise files
+        return files
+
+    return eid, _pr_files
+
+
+def _run_repeat_review(conn, pr_files_fn) -> None:
+    with _env(WARDEN_TRIAGE_POLICY=str(core.POLICY_PATH)):
+        with _patched(_github, pr_files=pr_files_fn):
+            train.advance_merge_trains(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
+
+
+def _fold_repeat_review(conn, eid, pr_files_fn) -> None:
+    """The review fold alone: the merge stage that follows a confirm overwrites the item's note."""
+    with _env(WARDEN_TRIAGE_POLICY=str(core.POLICY_PATH)):
+        with _patched(_github, pr_files=pr_files_fn):
+            train._fold_review(conn, _MERGE_FIXTURE_POLICY, core.get_item(conn, eid), NOW)
+
+
+_GONE_FINDING = {"file": "scripts/gone.py", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}
+
+
+def test_a_repeat_of_a_prior_finding_on_a_file_the_pr_no_longer_changes_is_not_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-dropped", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": "scripts/other.py"}])
+        _fold_repeat_review(conn, eid, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "confirmed", dict(status)
+        item = core.get_item(conn, eid)
+        assert item["train_stage"] == train.TRAIN_MERGE
+        assert item["note"].startswith("dropped 1 prior finding(s) on files the PR no longer changes: "
+                                       "scripts/gone.py; review confirmed "), item["note"]
+
+
+def test_a_process_only_repeat_on_a_file_the_pr_no_longer_changes_is_dropped_not_escalated():
+    """A wrapper (process-only) finding repeating a prior code finding on a file the PR no longer
+    changes is resolved by the diff exactly like a code repeat: dropped, confirming the merge, not
+    parked on the owner (item 1559)."""
+    with _triage_env() as (conn, ctx):
+        process_only = {
+            "file": "scripts/gone.py", "line": 3,
+            "message": "Add 'Closes #20' to the PR description or commit trailer.",
+            "angle": "adversary",
+        }
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-process-only", prior_findings=[_GONE_FINDING],
+            current_findings=[process_only],
+            pr_files=[{"filename": "scripts/other.py"}])
+        _fold_repeat_review(conn, eid, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "confirmed", dict(status)
+        item = core.get_item(conn, eid)
+        assert item["train_stage"] == train.TRAIN_MERGE
+        assert item["note"].startswith("dropped 1 prior finding(s) on files the PR no longer changes: "
+                                       "scripts/gone.py; review confirmed "), item["note"]
+
+
+def test_a_repeat_on_a_file_the_pr_still_changes_is_still_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-changed", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": "scripts/gone.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
+
+def test_a_new_finding_on_a_file_the_pr_no_longer_changes_is_still_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-new-dropped", prior_findings=[dict(_GONE_FINDING, file="scripts/old.py")],
+            current_findings=[_GONE_FINDING],
+            pr_files=[{"filename": "scripts/other.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
+
+def test_an_unreadable_file_list_drops_nothing():
+    """A GitHub error, an empty listing or an entry with no filename leaves the verdict as it is: a
+    file left off the list would read as no longer changed."""
+    for listing in (RemoteError("HTTP 502"), [], [{"filename": "scripts/other.py"}, {"sha": "x"}]):
+        with _triage_env() as (conn, ctx):
+            eid, pr_files_fn = _seed_repeat_round(
+                conn, "sig-repeat-unreadable", prior_findings=[_GONE_FINDING],
+                current_findings=[dict(_GONE_FINDING, message="still wrong")], pr_files=listing)
+            _run_repeat_review(conn, pr_files_fn)
+            status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+            assert status["validation_status"] == "blocked", (listing, dict(status))
+
+
+def test_a_repeat_of_a_finding_two_rounds_back_is_still_resolved():
+    """Round N blocked on gone.py, round N+1 on something else; N+2 re-raises gone.py, which the PR no
+    longer changes. Every earlier blocked round of the chain counts, not only the last one."""
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-two-back", prior_findings=[dict(_GONE_FINDING, file="scripts/other.py")],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": "scripts/other.py"}])
+        pr_url = "https://github.com/jkrumm/demo-repo/pull/10"
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,validation_status,validation_job_id,artifact_url,"
+            "origin_event_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("impl-older", "implement", "demo-repo", "b", "done", "blocked", "review-older", pr_url, eid,
+             NOW.isoformat()))
+        conn.execute(
+            "INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) VALUES(?,?,?,?,?,?,?)",
+            ("review-older", "review", "demo-repo", "review PR #10", "done",
+             json.dumps(_review_result("actionable", blocking=[_GONE_FINDING])), NOW.isoformat()))
+        # the older round must sort before the current attempt, as it would have in the live chain
+        conn.execute("UPDATE dispatches SET id=(SELECT MAX(id) FROM dispatches) + 1 WHERE job_id='impl-repeat'")
+        conn.commit()
+        _fold_repeat_review(conn, eid, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "confirmed", dict(status)
+
+
 def test_validation_outcome_needs_decision_routes_to_needs_decision():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-needs-human")
