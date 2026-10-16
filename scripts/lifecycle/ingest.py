@@ -122,14 +122,15 @@ def normalize_hyperdx(body: dict[str, Any]) -> IngestEvent:
     title fingerprint `slack_alert` uses, so one alert is one event across occurrences whatever numbers
     or timestamps its name carries."""
     alert = body.get("alert")
-    title = _text(alert, MAX_TITLE_CHARS) if isinstance(alert, str) else ""
-    if not title:
+    full_name = alert.strip() if isinstance(alert, str) else ""
+    if not full_name:
         raise IngestError("alert is required")
+    title = full_name[:MAX_TITLE_CHARS]
     state = body.get("state")
     state_key = state.strip().lower() if isinstance(state, str) else ""
     if state_key not in _HYPERDX_FIRING and state_key not in _HYPERDX_OK:
         raise IngestError("state must be ALERT, OK, firing or resolved")
-    external_id = _fingerprint(title)
+    external_id = _fingerprint(full_name)  # the whole name: two names sharing a 200-char prefix stay two events
     if not external_id:
         raise IngestError("alert has no identifying text")
     if state_key in _HYPERDX_OK:
@@ -143,7 +144,7 @@ def normalize_hyperdx(body: dict[str, Any]) -> IngestEvent:
         payload["service"] = service
     value = body.get("value")
     if value is not None:
-        payload["value"] = value if isinstance(value, (str, int, float, bool)) else _text(value, MAX_LABEL_CHARS)
+        payload["value"] = value if isinstance(value, (int, float, bool)) else _text(value, MAX_LABEL_CHARS)
     payload["via"] = "webhook"
     url = body.get("url")
     return IngestEvent(kind=KIND_DOWN, source=SOURCE_HYPERDX, external_id=external_id, title=title,

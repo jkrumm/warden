@@ -240,6 +240,8 @@ def test_missing_or_malformed_length_and_chunked_bodies_are_400():
         assert d.raw(b"POST /ingest/kuma HTTP/1.0\r\n" + auth + b"\r\n")[0] == 400
         assert d.raw(b"POST /ingest/kuma HTTP/1.0\r\n" + auth + b"Content-Length: abc\r\n\r\n{}")[0] == 400
         assert d.raw(b"POST /ingest/kuma HTTP/1.0\r\n" + auth + b"Content-Length: -5\r\n\r\n{}")[0] == 400
+        # More digits than int() will convert is a 400, not a dropped connection.
+        assert d.raw(b"POST /ingest/kuma HTTP/1.0\r\n" + auth + b"Content-Length: " + b"9" * 5000 + b"\r\n\r\n{}")[0] == 400
         chunked = (b"POST /ingest/kuma HTTP/1.1\r\n" + auth + b"Transfer-Encoding: chunked\r\n\r\n"
                    b"2\r\n{}\r\n0\r\n\r\n")
         assert d.raw(chunked)[0] == 400
@@ -389,6 +391,26 @@ def test_hyperdx_titles_differing_only_in_numbers_are_one_event():
         assert len(_rows(d.db)) == 1
         assert d.post("/ingest/hyperdx", hyperdx_body("A different alert", "ALERT"))[1]["action"] == "opened"
         assert len(_rows(d.db)) == 2
+
+
+def test_hyperdx_identity_is_the_fingerprint_of_the_whole_name_capped_like_slack_alert():
+    # normalize_title() caps every fingerprint at 120 chars (the slack_alert key too): names that differ
+    # inside it are two events, whatever follows; the stored title is clipped separately at 200.
+    with door() as d:
+        tail = "x" * 150
+        one = d.post("/ingest/hyperdx", hyperdx_body("alpha " + tail, "ALERT"))[1]
+        two = d.post("/ingest/hyperdx", hyperdx_body("beta " + tail, "ALERT"))[1]
+        assert one["event_id"] != two["event_id"], (one, two)
+        assert d.post("/ingest/hyperdx", hyperdx_body("alpha " + tail, "OK"))[1]["action"] == "resolved"
+        assert [r["id"] for r in _rows(d.db) if r["resolved_at"] is None] == [two["event_id"]]
+
+
+def test_a_query_string_still_routes_to_its_endpoint():
+    with door() as d:
+        raw = json.dumps(kuma_body()).encode()
+        req = (b"POST /ingest/kuma?x=1 HTTP/1.0\r\nAuthorization: Bearer " + TOKEN.encode()
+               + b"\r\nContent-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw)
+        assert d.raw(req)[0] == 202
 
 
 def test_hyperdx_same_payload_twice_is_one_row_and_reopens_after_ok():

@@ -10773,3 +10773,13 @@ reopen, the differential against `reconcile()`, HyperDX dedup, routing, the loop
 redaction proved by mutation). `tests/test_api.py`: the "POST is 405" test is renamed `test_post_to_a_non_ingest_path_is_405...`
 (same assertions plus `/board`; behaviour intentionally changed only for `/ingest/*`). `test_triage.py` stays at 671/671.
 `AGENTS.md` named 670 for that suite since §172; it is 671.
+
+Review round 1 (agent-gateway), fixed: a socket `timeout` on the handler (a stalled sender no longer pins a thread), a
+`Content-Length` longer than 12 digits is a 400 (int() would raise), `/ingest/*` routes on the path without the query string,
+an ignored (unrecognised-shape) body logs its key names, `poll_uk()`'s `reconcile()` INSERT is `ON CONFLICT DO NOTHING` (a
+webhook landing between its SELECT and INSERT no longer aborts the pass), a string HyperDX `value` is bounded. The HyperDX
+identity is the fingerprint of the whole name; `normalize_title()` caps every fingerprint at 120 chars, the `slack_alert` key too.
+Declined: sender text reaching triage as an injection risk (the event is already fenced as untrusted data, `intake._fence`,
+like every Slack and Kuma line before it; the bearer token is the control), per-source event caps, versioned hyperdx keys,
+extracting a shared identity/row module, a source descriptor table. Known race kept: a `poll_uk()` snapshot taken before a
+Kuma UP webhook can reopen that row once, until Wave 10 retires the poll.

@@ -761,9 +761,12 @@ def reconcile(conn: sqlite3.Connection, source: str, observed: list[dict[str, An
             (source, o["external_id"]),
         ).fetchone()
         if row is None:
+            # DO NOTHING: warden-api's ingest door writes the same (source, external_id) row, and a
+            # webhook can land between the SELECT above and this INSERT; losing that race must not
+            # abort the pass. The row is then simply the webhook's.
             cur.execute(
                 "INSERT INTO events(source, external_id, title, url, payload_json, first_seen) "
-                "VALUES(?,?,?,?,?,?)",
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(source, external_id) DO NOTHING",
                 (source, o["external_id"], o["title"], o.get("url", ""),
                  json.dumps(o.get("payload", {})), now.isoformat()),
             )

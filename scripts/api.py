@@ -953,6 +953,8 @@ def _is_ingest_path(path: str) -> bool:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "warden-api/1"
+    # A stalled sender must not pin a handler thread: the ingest door is reachable off-box.
+    timeout = 15
 
     def _write_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode()
@@ -1023,7 +1025,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """The request body as a JSON object, or None after answering 400 / 413. `Content-Length` is
         required (a chunked body has none) and capped before a single byte is read."""
         raw_length = self.headers.get("Content-Length", "")
-        if not (raw_length.isascii() and raw_length.isdigit()):
+        if not (raw_length.isascii() and raw_length.isdigit()) or len(raw_length) > 12:
             self._write_json(400, {"error": "a numeric Content-Length is required"})
             return None
         length = int(raw_length)
@@ -1067,9 +1069,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._write_json(202, result)
 
     def do_POST(self) -> None:
-        normalize = _INGEST_ROUTES.get(self.path)
+        # Routed on the path alone: a sender that appends a query string still reaches its endpoint.
+        route = self.path.partition("?")[0]
+        normalize = _INGEST_ROUTES.get(route)
         if normalize is None:
-            if _is_ingest_path(self.path):
+            if _is_ingest_path(route):
                 # The path is not echoed: a sender may have put a credential in its query string.
                 self._write_json(404, {"error": "no such ingest endpoint: POST /ingest/kuma or /ingest/hyperdx"})
             else:
@@ -1086,6 +1090,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._write_json(400, {"error": str(e)})
             return
         if event.kind == _ingest.KIND_IGNORE:
+            # Keys only, never values: a renamed sender schema must show up in the log, not vanish.
+            print(f"warden-api: ingest {route} ignored, body keys {sorted(body)[:10]}", file=sys.stderr)
             self._write_json(202, {"accepted": False, "action": _ingest.ACTION_IGNORED})
             return
         self._apply_ingest(event)
