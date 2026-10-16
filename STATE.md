@@ -10,7 +10,7 @@ build log (§1–§181).
 | Current work | Background jobs → warden self-healing (dotfiles `docs/waves/PLAN.md`; spec `~/SourceRoot/dotfiles/docs/ops-signals.md`, its *Owner decisions* win): Waves 6-8 live (kill-switch, `job` source, brief and verified closure, review cycle 1); Wave 9 (warden-api ingest door) is built on branch `wave9-ingest` and goes live with its merge and deploy, then needs the token seeded and the off-box door (done elsewhere); the `uk` poll is retired (§178: Kuma's DOWN/UP webhook is the only `uk` writer); HyperDX alerts arrive by webhook too (§179) and their #alerts lines are no longer polled. The agent-platform rewrite (`docs/waves/PLAN.md` here; spec `~/SourceRoot/dotfiles/docs/agent-platform.md`) is done |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 23 (Wave 6 changed no schema: a `job` item reuses `origin`, `max_tier`, `brief` and the event cursor columns) |
-| Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names (678); `tests/test_ingest.py` 39 |
+| Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names (679); `tests/test_ingest.py` 39 |
 
 ## What is live
 

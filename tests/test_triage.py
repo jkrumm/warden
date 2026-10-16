@@ -15411,23 +15411,43 @@ def test_a_grouped_source_reopen_keeps_the_items_first_seen():
 
 
 def test_a_recovered_level_event_does_not_stay_needs_decision():
+    # (name, source, resolved, has_pr, expected state)
+    cases = (("uk", "uk", True, False, core.STATE_QUIET), ("hyperdx", "hyperdx", True, False, core.STATE_QUIET),
+             ("uk-pr", "uk", True, True, core.STATE_NEEDS_DECISION),
+             ("uk-still-down", "uk", False, False, core.STATE_NEEDS_DECISION),
+             ("slack", "slack_alert", True, False, core.STATE_NEEDS_DECISION))
     with _triage_env() as (conn, _ctx):
-        keep = {}
-        for name, source, extra in (("plain", "uk", ""), ("hx", "hyperdx", ""), ("pr", "uk", "pr"),
-                                    ("open", "uk", "open"), ("slack", "slack_alert", "")):
+        event_ids = {}
+        for name, source, resolved, has_pr, _expected in cases:
             eid = _insert_event(conn, source=source, external_id=f"rec-{name}", title=name, first_seen=OLD)
             intake.ingest(conn, NOW)
-            if extra != "open":
+            if resolved:
                 conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
             core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="a question")
-            if extra == "pr":
+            if has_pr:
                 conn.execute("UPDATE triage_items SET pr_url='https://github.com/x/y/pull/1' WHERE event_id=?", (eid,))
-            keep[name] = eid
+            event_ids[name] = eid
         conn.commit()
         intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
-        states = {n: _rows(conn, e)["state"] for n, e in keep.items()}
-        assert states == {"plain": core.STATE_QUIET, "hx": core.STATE_QUIET, "pr": core.STATE_NEEDS_DECISION,
-                          "open": core.STATE_NEEDS_DECISION, "slack": core.STATE_NEEDS_DECISION}, states
+        states = {n: _rows(conn, e)["state"] for n, e in event_ids.items()}
+        assert states == {c[0]: c[4] for c in cases}, states
+
+
+def test_a_chronic_level_item_keeps_its_open_question_even_when_it_was_investigated():
+    """The investigation (dispatch_job) every needs_decision row has must not exempt it from the chronic
+    check: 'it recovered' is not a verdict for a signature that keeps coming back."""
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="uk", external_id="chronic-nd", title="Flappy", first_seen=OLD)
+        intake.ingest(conn, NOW)
+        conn.execute("UPDATE triage_items SET repo='demo-repo' WHERE event_id=?", (eid,))
+        for _ in range(3):
+            core.set_state(conn, eid, core.STATE_QUIET, NOW)
+            core.set_state(conn, eid, core.STATE_NEW, NOW)
+        core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="why does it flap?")
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
+        conn.commit()
+        intake.resolve_recovered_decisions(conn, {**DEFAULT_POLICY, "chronicRecurrences": 3}, NOW)
+        assert _rows(conn, eid)["state"] == core.STATE_NEEDS_DECISION
 
 
 def test_a_hermes_cron_job_brief_embeds_the_registry_entry():
@@ -15443,6 +15463,15 @@ def test_a_hermes_cron_job_brief_embeds_the_registry_entry():
         for needle in ("claude-haiku-5-5-eu", "anthropic", "0 9 * * 6", "HTTP 404", "which you cannot read"):
             assert needle in brief, needle
         assert "SECRETPROMPT" not in brief and len(brief) <= _intake.MAX_JOB_BRIEF_CHARS
+        fat = {"jobs": [{"id": "z", "name": "Fat", **{k: "x" * 5000 for k in _intake._REGISTRY_FIELDS}}]}
+        reg.write_text(json.dumps(fat))
+        fat_ctx = _REAL_GATHER({**row, "machine": "testbox", "label": "hermes-cron.fat"}, registry=reg,
+                               runner=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""))
+        fat_brief = _intake.job_brief({**row, "label": "hermes-cron.fat", "machine": "testbox"}, "testbox",
+                                      {**fat_ctx, "git_log": "y" * 20000})
+        assert len(fat_brief) <= _intake.MAX_JOB_BRIEF_CHARS and "Acceptance:" in fat_brief and "Forbidden:" in fat_brief
+        missing = _intake.job_brief({**row, "machine": "testbox"}, "testbox", {"registry": "(registry entry not readable)"})
+        assert "Acceptance:" in missing
         assert "(registry entry not readable)" in _intake.hermes_cron_entry("hermes-cron.nope", reg)
         assert "registry" not in _REAL_GATHER({**_job_row(), "machine": "testbox"}, registry=reg,
                                               runner=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""))

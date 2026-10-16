@@ -10885,4 +10885,4 @@ resets `first_seen`/`occurrences` to the new occurrence for `LEVEL_EVENT_SOURCES
 out `minOpenMinutes` instead of being 'open 30 min' at once; both columns joined `_SET_STATE_COLUMNS`. Grouped
 sources keep their item's `first_seen`. (3) `job_brief()` embeds the `~/.hermes/cron/jobs.json` entry (model,
 provider, schedule, last outcome; never the prompt) for `hermes-cron.*` labels, via `gather_job_context(registry=)`.
-Tests: `test_triage.py` 674 -> 678 (AGENTS.md said 673; the baseline before this change was 674).
+Tests: `test_triage.py` 674 -> 679 (AGENTS.md said 673; the baseline before this change was 674).

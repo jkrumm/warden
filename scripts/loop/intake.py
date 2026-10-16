@@ -627,8 +627,11 @@ def resolve_recovered_decisions(conn: sqlite3.Connection, policy: dict[str, Any]
         "AND ti.pr_url IS NULL AND ti.implement_job IS NULL",
         (core.STATE_NEEDS_DECISION, *LEVEL_EVENT_SOURCES),
     ).fetchall()
+    window, threshold = chronic_policy(policy)
     for row in rows:
-        if _is_chronic(conn, row["event_id"], row["repo"], policy, now):
+        # Not _is_chronic(): it exempts a row investigated inside the window, and every needs_decision
+        # row was. The recurrence count alone says whether the recurrence is the defect.
+        if row["repo"] and _recurrence_count(conn, row["event_id"], now, window) >= threshold:
             continue
         core.set_state(conn, row["event_id"], core.STATE_QUIET, now, expect_state=core.STATE_NEEDS_DECISION,
                        note="event recovered on its own; nothing left to decide")
