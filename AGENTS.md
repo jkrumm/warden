@@ -18,10 +18,10 @@ item moves.
 |-|-|
 | `scripts/triage.py` | the loop's entry point: `run()` (one pass; reads the kill-switch first), CLI flags, heartbeat |
 | `scripts/loop/` | the loop by stage: `core` (paths, states, `set_state`, strikes, policy), `intake` (alerts, issues, and the `job` source: `ingest_jobs`, `route_job_items`, `job_chronic_reason`), `triaging`, `work`, `train`, `verify`, `notify` |
-| `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate (check runs, falling back to Actions workflow runs when the token cannot read checks), rollout (`make deploy`/`verify`), dispatch, operations, `pause` (the kill-switch flag file) |
+| `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate (check runs, falling back to Actions workflow runs when the token cannot read checks), rollout (`make deploy`/`verify`), dispatch, operations, `pause` (the kill-switch flag file), `ingest` (the ingest door's logic: a pushed Kuma / HyperDX alert -> one `events` row) |
 | `scripts/clients/` | the only HTTP/CLI boundaries: agent-gateway, GitHub, Argo, Slack, Kuma (the loop heartbeat), secrets, `jobs_grade` (the local `~/.local/bin/jobs-grade` subprocess: timeout, failure = None, injectable) |
 | `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`, `reinvestigate`, `adopt`, and the kill-switch `pause [--reason]` / `resume`) |
-| `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents |
+| `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents; `api.py` is read-only GETs plus `POST /ingest/{kuma,hyperdx}` (bearer-gated, the one writable connection; `docs/api.md` § Ingest door) |
 | `scripts/improve-trigger.py` | read-only: outcomes (`failed` / `needs_decision`) since the improve loop's cursor, or `quiet` |
 | `scripts/lifecycle/shadow.py`, `scripts/shadow-replay.py` | the decision-model shadow lane next to the LLM triage (`decision_shadow`, ledger v21; nothing decides from it) and its replay over labelled history; measured table + promotion rule: `docs/decision-shadow.md`; report: `python3 scripts/lifecycle/shadow.py report` |
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
@@ -47,7 +47,7 @@ installs `requirements.txt`; `make test` on its own still needs a venv.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**670/670** — any other number is a finding to report, not a count to edit.
+**671/671** — any other number is a finding to report, not a count to edit. `tests/test_ingest.py` (the ingest door) is its own suite, 37/37.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary (the `jobs-grade` client returns no jobs; the kill-switch flag is a file in
 its temp dir), so nothing reaches Slack, agent-gateway, GitHub, Argo or the host. `make test` runs every
@@ -82,6 +82,7 @@ tool even though launchd hands the loop a minimal PATH.
 
 ## Verify & Monitor
 
+- Ingest door: `POST /ingest/kuma` and `/ingest/hyperdx` on the same loopback port, `Authorization: Bearer` from `WARDEN_INGEST_TOKEN` / `op://mini/warden-ingest/token` (resolved lazily; 503 until it is seeded, 401 on a wrong one); an off-box door forwards only `/ingest/*`. Contract: `docs/api.md`.
 - Health: `http://127.0.0.1:7735/health` (loopback only, no auth) — schema version
   and each poller's heartbeat age vs. 3× its interval, plus `paused` (`null`, or `{reason, since}`
   while the kill-switch is on; it never fails `ok`). `make verify` = `/health`

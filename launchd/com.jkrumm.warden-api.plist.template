@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.jkrumm.warden-api</string>
-  <!-- The read-only HTTP API. GET /metrics (the six funnel numbers, JSON) and
+  <!-- The HTTP API: read-only GETs plus the ingest door. GET /metrics (the six funnel numbers, JSON) and
        GET /health (schema version, per-poller heartbeat age, one `ok` boolean) —
        see docs/api.md and scripts/api.py's own module docstring for the full
        contract, including why `/metrics` is JSON and not Prometheus text, and
@@ -27,9 +27,11 @@
        can crash-loop at all.
 
        Binds 127.0.0.1:7735 only — see scripts/api.py's own docstring for why a
-       bearer token would be theatre on a host where an episode already runs
-       unrestricted Bash, and why no Caddy/tailnet door is added in this wave
-       (that is Wave 4, alongside Argo, the only intended remote consumer). -->
+       bearer token would be theatre on the GETs on a host where an episode
+       already runs unrestricted Bash. The one exception is POST /ingest/kuma and
+       POST /ingest/hyperdx (the alert-push door): they require a bearer token,
+       and a reverse-proxy door maintained outside this repo forwards ONLY
+       /ingest/* off-box. This template adds no listener; the bind is unchanged. -->
   <key>ProgramArguments</key>
   <array>
     <string>__HOME__/SourceRoot/warden/.venv/bin/python3</string>

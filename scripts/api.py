@@ -1,17 +1,33 @@
-"""warden HTTP API — GET /metrics, /health, /board, /items/<event_id>, read-only.
+"""warden HTTP API — GET /metrics, /health, /board, /items/<event_id>, read-only; and the one
+write-side exception, the ingest door: POST /ingest/kuma and POST /ingest/hyperdx.
 
 `/board` lists every non-terminal item; `/items/<event_id>` is the full detail
 behind one — dispatches, verdicts, operations, transition history. Owner actions are
 not served here: the loop pulls them from Argo (`loop/notify.apply_argo_actions()`).
 
-BIND AND AUTH. `127.0.0.1:7735`, loopback only, no bearer token. An episode on this
-host runs unrestricted `Bash` (DESIGN.md § Boundaries), so a token would be theatre:
-anything that can read a token file can query this socket directly. The protections
-are the loopback bind and the read-only handle.
+BIND AND AUTH. `127.0.0.1:7735`, loopback only. The GETs carry no bearer token: an episode
+on this host runs unrestricted `Bash` (DESIGN.md § Boundaries), so a token would be theatre:
+anything that can read a token file can query this socket directly. The protections are the
+loopback bind and the read-only handle. The ingest POSTs are the exception, because a Caddy
+door (set up outside this repo) proxies ONLY `/ingest/*` off-box: they require
+`Authorization: Bearer <WARDEN_INGEST_TOKEN>` (clients.secrets.resolve_secret: env, then
+`secrets-run read op://mini/warden-ingest/token`; resolved lazily, a non-empty value cached for
+the process, an empty one retried at most once a minute so seeding the secret after a deploy
+needs no restart). No token configured is a 503 (fail closed); a missing or wrong one is a 401,
+decided BEFORE the body is read; the token and the Authorization header are never logged.
 
-GET ONLY. Every other method is 405; an unknown path is 404. Both as JSON.
+GET ONLY, except `POST /ingest/{kuma,hyperdx}`. Every other method is 405 (a GET on `/ingest/*`
+too: POST only); an unknown path is 404. All as JSON. The ingest logic is lifecycle/ingest.py;
+this module is its HTTP shell: auth, the 64 KiB Content-Length cap (413 over, 400 missing or
+not a JSON object), 202 on success, 503 when the ledger cannot take the write so the sender
+retries.
 
-ONE FRESH READ-ONLY CONNECTION PER REQUEST, never a handle held across the
+THE ONLY WRITABLE CONNECTION is the ingest handlers': `ledger.connect(DB_PATH)` WITHOUT
+`migrate` (only the loop migrates), `assert_schema_version()` called here explicitly, a
+`busy_timeout` so a concurrent loop write waits instead of failing, committed and always
+closed. The GET path below is unchanged.
+
+ONE FRESH READ-ONLY CONNECTION PER GET REQUEST, never a handle held across the
 process lifetime. Two reasons:
   1. A WAL reader connection pinned at startup can keep serving a snapshot from
      the moment it was opened — SQLite's own read consistency model, not a bug —
@@ -44,13 +60,17 @@ Run: .venv/bin/python3 scripts/api.py --serve
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import http.server
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import statistics
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -80,6 +100,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from clients import github as _github  # noqa: E402
+from clients import secrets as _secrets  # noqa: E402
+from lifecycle import ingest as _ingest  # noqa: E402
 from lifecycle import pause as _pause  # noqa: E402
 
 BIND_HOST = "127.0.0.1"
@@ -854,6 +876,56 @@ def _parse_verdict(verdict_json: str | None) -> dict[str, Any] | None:
     }
 
 
+# --- The ingest door's auth ------------------------------------------------------
+
+INGEST_TOKEN_ENV = "WARDEN_INGEST_TOKEN"
+INGEST_TOKEN_REF = "op://mini/warden-ingest/token"
+INGEST_TOKEN_RETRY_S = 60.0
+INGEST_MAX_BODY_BYTES = 64 * 1024
+# What a 413 drains (never parses) so the sender reads the status instead of a reset.
+_INGEST_DRAIN_BYTES = 1024 * 1024
+
+_monotonic = time.monotonic
+_token_lock = threading.Lock()
+_token_cache = ""
+_token_tried_at: float | None = None
+
+
+def _fetch_ingest_token() -> str:
+    return _secrets.resolve_secret(INGEST_TOKEN_ENV, INGEST_TOKEN_REF)
+
+
+def ingest_token() -> str:
+    """The ingest bearer token, or "" while none is configured. A non-empty value is cached for the
+    process; an empty one is retried at most once per `INGEST_TOKEN_RETRY_S` (the secret may be seeded
+    after the deploy, and a restart must not be needed). The lock also keeps concurrent requests from
+    each spawning a `secrets-run`."""
+    global _token_cache, _token_tried_at
+    with _token_lock:
+        if _token_cache:
+            return _token_cache
+        now = _monotonic()
+        if _token_tried_at is not None and now - _token_tried_at < INGEST_TOKEN_RETRY_S:
+            return ""
+        _token_tried_at = now
+        _token_cache = (_fetch_ingest_token() or "").strip()
+        return _token_cache
+
+
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
+_QUERY_RE = re.compile(r"\?\S*")
+
+
+def _redact(text: str) -> str:
+    """A log line's text with everything credential-shaped removed: the cached token wherever it
+    appears, any `Bearer <x>`, and a request line's query string (a sender that puts the token in
+    the URL must not get it into the log)."""
+    token = _token_cache
+    if token:
+        text = text.replace(token, "<redacted>")
+    return _QUERY_RE.sub("?<redacted>", _BEARER_RE.sub("Bearer <redacted>", text))
+
+
 # --- HTTP handler ---------------------------------------------------------------
 
 _ROUTES: dict[str, Callable[[sqlite3.Connection], dict[str, Any]]] = {
@@ -866,6 +938,17 @@ _ROUTES: dict[str, Callable[[sqlite3.Connection], dict[str, Any]]] = {
 # _ROUTES (which do_GET still checks first for everything else) rather than
 # reshaping that dict into something route-pattern-aware for one path.
 _ITEMS_PREFIX = "/items/"
+
+# The ingest door: path -> the normalizer for that sender's body (lifecycle/ingest.py).
+_INGEST_PREFIX = "/ingest"
+_INGEST_ROUTES: dict[str, Callable[[dict[str, Any]], _ingest.IngestEvent]] = {
+    "/ingest/kuma": _ingest.normalize_kuma,
+    "/ingest/hyperdx": _ingest.normalize_hyperdx,
+}
+
+
+def _is_ingest_path(path: str) -> bool:
+    return path == _INGEST_PREFIX or path.startswith(_INGEST_PREFIX + "/")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -913,12 +996,100 @@ class Handler(http.server.BaseHTTPRequestHandler):
             event_id = int(raw_id)
             self._serve(lambda conn: item_payload(conn, event_id))
             return
+        if _is_ingest_path(self.path):
+            self._write_json(405, {"error": "GET not allowed on /ingest — POST only"})
+            return
         self._write_json(404, {"error": f"no such path: {self.path}"})
 
     def _method_not_allowed(self) -> None:
         self._write_json(405, {"error": f"{self.command} not allowed — GET only"})
 
-    do_POST = _method_not_allowed
+    # --- the ingest door ---
+
+    def _ingest_authorized(self) -> bool:
+        """Bearer check, answered (503 / 401) here. Runs before the body is touched. The comparison is
+        constant-time and on bytes (`compare_digest` on a non-ASCII `str` raises)."""
+        token = ingest_token()
+        if not token:
+            self._write_json(503, {"error": "ingest is not configured: no token resolved"})
+            return False
+        scheme, _, supplied = self.headers.get("Authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.strip().encode(), token.encode()):
+            self._write_json(401, {"error": "missing or invalid bearer token"})
+            return False
+        return True
+
+    def _read_json_object(self) -> dict[str, Any] | None:
+        """The request body as a JSON object, or None after answering 400 / 413. `Content-Length` is
+        required (a chunked body has none) and capped before a single byte is read."""
+        raw_length = self.headers.get("Content-Length", "")
+        if not (raw_length.isascii() and raw_length.isdigit()):
+            self._write_json(400, {"error": "a numeric Content-Length is required"})
+            return None
+        length = int(raw_length)
+        if length > INGEST_MAX_BODY_BYTES:
+            self.rfile.read(min(length, _INGEST_DRAIN_BYTES))
+            self._write_json(413, {"error": f"body over {INGEST_MAX_BODY_BYTES} bytes"})
+            return None
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw) if len(raw) == length else None
+        except (ValueError, RecursionError):
+            body = None
+        if not isinstance(body, dict):
+            self._write_json(400, {"error": "body must be a JSON object"})
+            return None
+        return body
+
+    def _apply_ingest(self, event: _ingest.IngestEvent) -> None:
+        """One writable connection for this request (see the module docstring), or a 503 so the sender
+        retries. Detail goes to the log; the body names only the class of failure."""
+        if not DB_PATH.exists():
+            self._write_json(503, {"error": "ledger unreachable"})
+            return
+        try:
+            conn = _ledger.connect(DB_PATH)
+        except (sqlite3.Error, RuntimeError) as e:
+            print(f"warden-api: ingest refused, ledger: {e}", file=sys.stderr)
+            self._write_json(503, {"error": "ledger unavailable or at the wrong schema version"})
+            return
+        try:
+            _ledger.assert_schema_version(conn)
+            if not conn.execute("PRAGMA busy_timeout").fetchone()[0]:
+                conn.execute("PRAGMA busy_timeout=5000")
+            result = _ingest.apply(conn, event)
+        except (sqlite3.Error, RuntimeError) as e:
+            print(f"warden-api: ingest refused, ledger: {e}", file=sys.stderr)
+            self._write_json(503, {"error": "ledger unavailable or at the wrong schema version"})
+            return
+        finally:
+            conn.close()
+        self._write_json(202, result)
+
+    def do_POST(self) -> None:
+        normalize = _INGEST_ROUTES.get(self.path)
+        if normalize is None:
+            if _is_ingest_path(self.path):
+                # The path is not echoed: a sender may have put a credential in its query string.
+                self._write_json(404, {"error": "no such ingest endpoint: POST /ingest/kuma or /ingest/hyperdx"})
+            else:
+                self._write_json(405, {"error": "POST not allowed — GET only, except POST /ingest/kuma and /ingest/hyperdx"})
+            return
+        if not self._ingest_authorized():
+            return
+        body = self._read_json_object()
+        if body is None:
+            return
+        try:
+            event = normalize(body)
+        except _ingest.IngestError as e:
+            self._write_json(400, {"error": str(e)})
+            return
+        if event.kind == _ingest.KIND_IGNORE:
+            self._write_json(202, {"accepted": False, "action": _ingest.ACTION_IGNORED})
+            return
+        self._apply_ingest(event)
+
     do_PUT = _method_not_allowed
     do_DELETE = _method_not_allowed
     do_PATCH = _method_not_allowed
@@ -928,8 +1099,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003 — stdlib's own name
         # Default BaseHTTPRequestHandler.log_message writes to stderr, which is
         # exactly where the LaunchAgent's StandardErrorPath sends it — kept
-        # as-is (not silenced) so a request log exists at all for this process.
-        super().log_message(fmt, *args)
+        # (not silenced) so a request log exists at all for this process, but
+        # redacted: every line the handler logs, including a malformed request's
+        # echo of its own request line, passes through here.
+        super().log_message("%s", _redact(fmt % args))
 
 
 def main(argv: list[str] | None = None) -> int:

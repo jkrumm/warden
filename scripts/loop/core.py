@@ -53,7 +53,11 @@ POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
 # Two more origins open a `triage_items` row without going through here: `human` (`warden run`,
 # via open_origin_item()) and `github_issue` (ingest_github_issues()). Neither belongs in this
 # tuple, which is `ingest()`'s alert-source door.
-INGEST_SOURCES = ("slack_alert", "uk", "docker_homelab", "docker_vps", "hermes_log",
+#
+# `uk` and `hyperdx` are state sources that warden-api's ingest door (`POST /ingest/{kuma,hyperdx}`,
+# lifecycle/ingest.py) also writes: a push opens, refreshes or resolves the same (source, external_id)
+# row the poll does, so the loop sees one event either way. `hyperdx` is webhook-only (no poll).
+INGEST_SOURCES = ("slack_alert", "uk", "hyperdx", "docker_homelab", "docker_vps", "hermes_log",
                    "op_refs_homelab", "op_refs_vps")
 
 # The `job` source. Each loop pass asks `jobs-grade` for this machine's graded background jobs
@@ -582,10 +586,11 @@ def card_channel(policy: dict[str, Any]) -> str:
     return policy["cardChannel"]
 
 
-# The sources whose identity is `fingerprint(title)` (watchdog-poll.py GROUPED_SOURCES): their
+# The sources whose identity is `fingerprint(title)` (watchdog-poll.py GROUPED_SOURCES, plus the
+# `hyperdx` state source, whose external_id is the fingerprint of its alert name): their
 # external_id and their title target are both digit-free, so a policy pattern for one never
 # contains a digit.
-_FINGERPRINTED_SOURCES = ("slack_alert", "slack_update", "hermes_log")
+_FINGERPRINTED_SOURCES = ("slack_alert", "slack_update", "hermes_log", "hyperdx")
 _BATCH_SUFFIX_RE = re.compile(r"\s*\(×\d+ in batch\)$")
 
 

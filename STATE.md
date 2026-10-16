@@ -2,15 +2,15 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§173).
+build log (§1–§174).
 
 | | |
 |-|-|
-| Last updated | 2026-10-16 (§173 — Wave 8 of the background-jobs chain: review cycle 1; a still-red closed job item is re-investigated once) |
-| Current work | Background jobs → warden self-healing (dotfiles `docs/waves/PLAN.md`; spec `~/SourceRoot/dotfiles/docs/ops-signals.md`, its *Owner decisions* win): Waves 6-8 live (kill-switch, `job` source, brief and verified closure, review cycle 1); Wave 9 (warden-api ingest door) is next. The agent-platform rewrite (`docs/waves/PLAN.md` here; spec `~/SourceRoot/dotfiles/docs/agent-platform.md`) is done |
+| Last updated | 2026-10-16 (§174 — Wave 9 of the background-jobs chain: the warden-api ingest door, `POST /ingest/kuma` and `/ingest/hyperdx`) |
+| Current work | Background jobs → warden self-healing (dotfiles `docs/waves/PLAN.md`; spec `~/SourceRoot/dotfiles/docs/ops-signals.md`, its *Owner decisions* win): Waves 6-8 live (kill-switch, `job` source, brief and verified closure, review cycle 1); Wave 9 (warden-api ingest door) is built on branch `wave9-ingest` and goes live with its merge and deploy, then needs the token seeded and the off-box door (done elsewhere); Wave 10 (retire the `uk` poll) is next. The agent-platform rewrite (`docs/waves/PLAN.md` here; spec `~/SourceRoot/dotfiles/docs/agent-platform.md`) is done |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 23 (Wave 6 changed no schema: a `job` item reuses `origin`, `max_tier`, `brief` and the event cursor columns) |
-| Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
+| Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names (671); `tests/test_ingest.py` 37 |
 
 ## What is live
 
@@ -45,6 +45,19 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   actions, acceptance), the `implement` tier, and **verified closure** — a `job` item reaches `fixed` only when `jobs-grade`
   shows a `last_ok` after the deploy (`verify._job_closure()`); no success within `max(30, 2×every+10)` min is a `work` strike
   back to `triaged`, the third ends it `failed`.
+- **The ingest door (§174, built, live after the deploy).** warden-api (`scripts/api.py`, still `127.0.0.1:7735`) has one
+  write-side exception to its GET-only surface: `POST /ingest/kuma` and `POST /ingest/hyperdx`, so Uptime Kuma and
+  HyperDX push alerts straight into `events` instead of warden polling Argo or reading #alerts. Bearer token
+  (`WARDEN_INGEST_TOKEN`, else `secrets-run read op://mini/warden-ingest/token`), resolved lazily, cached once non-empty,
+  an empty result retried at most once a minute (seed it after the deploy, no restart); no token = 503, wrong = 401 before
+  the body is read; 64 KiB cap; 202 `{accepted, action, event_id?}`; a ledger it cannot write = 503 so the sender retries.
+  The only writable connection in the process (`connect()` without migrate, `assert_schema_version()`, busy timeout,
+  `BEGIN IMMEDIATE`); the GETs are untouched. Logic in `lifecycle/ingest.py`: Kuma DOWN/UP -> source `uk` with
+  `reconcile()`'s open / reopen / refresh semantics (pending, maintenance, group and Kuma's test ping are `ignored`);
+  HyperDX `{alert, state, message?, url?, service?, value?}` (our contract) -> new state source `hyperdx`, keyed by
+  `fingerprint(alert)`, in `INGEST_SOURCES` (not grouped), routed by `payload.service` when it equals a known repo.
+  The `uk` poll and `slack_alert` are untouched (Waves 10-11): until the poll is retired it can resolve a webhook-opened
+  `uk` row by disappearance, which is accepted (one `(source, external_id)` row, one item). `docs/api.md` § Ingest door.
 - **Shape.** `scripts/triage.py` is the entry point; the loop lives in
   `scripts/loop/` by stage. warden meets the repo contract itself: `make check`,
   `make deploy` (kickstart `warden-api`, health check, roll back to the
@@ -198,6 +211,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 
 ## Open — owner actions
 
+- **Wave 9 (ingest door):** after the merge and `make deploy`, seed `op://mini/warden-ingest/token` into the mini's secrets
+  cache (or set `WARDEN_INGEST_TOKEN` for the API's LaunchAgent) — until then every ingest POST is a `503`, by design. The
+  Caddy door (only `/ingest/*`) and its ACL are separate work; the Kuma webhook notification and HyperDX's Wave 11 template
+  point at it. Live check: a Kuma "Test" notification answers 202 `ignored`; a DOWN opens one `uk` event, its UP resolves it.
+
 - **Before the Wave 6 deploy:** `jobs-grade` grades `com.jkrumm.drift-check` `failing` whenever a drift is open
   (all six jobs graded `ok` at the time of writing, so nothing would dispatch). The first pass after the deploy
   dispatches an investigation (tier investigate, owner repo) for every job then in a bad grade, up to 3 per pass;
@@ -267,6 +285,11 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   `failed(policy)`; `pending`/`queuedBehind` is just a non-terminal job. A test now pins the shape.
 
 ## Next action
+
+Wave 9 (this branch): merge `wave9-ingest`, `make deploy`, seed the token, then the live check under *Open — owner actions*.
+Then Wave 10 (retire the `uk` poll in favour of the webhook), Wave 11 (HyperDX webhook template, `slack_alert` retired).
+
+Earlier next actions, still open:
 
 Wave 6's live check (dotfiles `docs/waves/PLAN.md`), after merging and deploying this: the canary unhealthy locally
 (uncommitted `"healthy": false`) → exactly one `job` item for `job:mini:com.jkrumm.jobrun-canary` in `dotfiles`;

@@ -20,7 +20,7 @@ HTTP client under its own app identity, never the gateway's connection.
 | `com.jkrumm.warden-poll` | `scripts/watchdog-poll.py --post` — intake | 1800s |
 | `com.jkrumm.warden-sweep` | `scripts/dispatch-sweep.py` — folds finished episodes, then runs the implement chain | 300s |
 | `com.jkrumm.warden-backup` | `scripts/warden-backup.sh` | daily 03:10 |
-| `com.jkrumm.warden-api` | `scripts/api.py --serve` — `GET /health /metrics /board /items/<id>` on `127.0.0.1:7735` | KeepAlive |
+| `com.jkrumm.warden-api` | `scripts/api.py --serve` — `GET /health /metrics /board /items/<id>` and the token-gated ingest door `POST /ingest/kuma /ingest/hyperdx` on `127.0.0.1:7735` | KeepAlive |
 
 ## States
 
@@ -92,6 +92,10 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    own thresholds are the debounce). An owner warden cannot dispatch to
    (`?`, a repo outside the repos root) is `needs_decision`, not a guess. A pass
    in which `jobs-grade` cannot answer is blind: nothing opens, nothing resolves.
+   Uptime Kuma and HyperDX can also push: `POST /ingest/kuma` and `POST /ingest/hyperdx` on
+   warden-api (`lifecycle/ingest.py`, docs/api.md § Ingest door) write the same state-source
+   rows (`uk`, and the new `hyperdx`, keyed by the alert name's fingerprint) with `reconcile()`'s
+   open / reopen / refresh semantics, resolved by the sender's UP / OK.
    `classify()` closes `ignore`-list and chat-prose alerts `closed(ignored)` with
    no model call. A `new` alert whose signal goes quiet resolves `quiet`
    (recovery-paired first, `quietResolveHours` as the fallback); silence resolves

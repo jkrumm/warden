@@ -4,9 +4,9 @@
 Covers real arithmetic against a seeded ledger (not smoke tests), the honesty
 rules (`null` + a reason, never a fabricated `0`; `history_since` telling an
 empty-by-construction window apart from a measured zero), the 503-on-schema-
-mismatch contract, the GET-only method surface, and — structurally, via a
-filesystem that forbids writes entirely — that the handler never opens a
-writable connection.
+mismatch contract, the GET-only method surface (the ingest door's POSTs are
+tests/test_ingest.py), and — structurally, via a filesystem that forbids writes
+entirely — that the GET handlers never open a writable connection.
 
 Run: .venv/bin/python3 tests/test_api.py
 """
@@ -1044,12 +1044,14 @@ def test_schema_mismatch_returns_503_not_200():
         handle.stop()
 
 
-def test_post_is_405_and_unknown_path_is_404():
+def test_post_to_a_non_ingest_path_is_405_and_unknown_path_is_404():
+    """The only POSTs are `/ingest/{kuma,hyperdx}` (tests/test_ingest.py); every other POST keeps its 405."""
     conn, path = _fresh_conn()
     conn.close()
     handle = _ServerHandle(path)
     try:
         assert handle.request("POST", "/metrics") == 405
+        assert handle.request("POST", "/board") == 405
         assert handle.request("PUT", "/health") == 405
         status, body = handle.get("/nope")
         assert status == 404, (status, body)

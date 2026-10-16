@@ -10736,3 +10736,40 @@ Tests 667 -> 671. Review (agent-gateway, 1 round): 1 blocking fixed; the archite
 angles failed in the reviewer (shell denied), so they are unreviewed, not clean. LOOP.md step 1 (Measure) now
 runs the metrics query and the §9 checklist. Declined with numbers: per-pass `jobs-grade` caching (<1 s) and
 skipping `make verify` while a job closure is pending (16 s per verifying item per pass).
+
+## 174. Wave 9 of the background-jobs chain: the warden-api ingest door (2026-10-16)
+
+`scripts/api.py` kept its read-only GET surface and gained `POST /ingest/kuma` and `POST /ingest/hyperdx`, so Uptime Kuma
+and HyperDX push alerts straight into the `events` ledger. The shell (auth, body cap, status codes) is `api.py`; the logic
+is the new `lifecycle/ingest.py` (payload -> normalized event; one `BEGIN IMMEDIATE` upsert / resolve against a connection).
+
+- Auth: `Authorization: Bearer`, token from `resolve_secret("WARDEN_INGEST_TOKEN", "op://mini/warden-ingest/token")`,
+  resolved lazily under a lock, a non-empty value cached for the process, an empty one retried at most once per 60 s
+  (`api._monotonic` is the injectable clock). `hmac.compare_digest` on bytes. No token = 503 (fail closed), missing or wrong
+  = 401 before the body is touched. `log_message` redacts every line (cached token, any `Bearer x`, a request line's query
+  string); a 404 on an unknown `/ingest/*` does not echo the path (a sender might have put a credential in the query).
+- Body: `Content-Length` required, numeric, at most 64 KiB (413 over, and the over-cap body is drained, never parsed, so the
+  sender reads the status instead of a reset); invalid JSON, a non-object, a short body or a deeply nested one is 400.
+- Ledger: the only writable connection in the process, `ledger.connect(DB_PATH)` without migrate, `assert_schema_version()`
+  called again explicitly, `busy_timeout` checked, committed, always closed. A missing file (never created by the API), a
+  schema mismatch either way, a lock held past the busy timeout and any other `sqlite3.Error` are 503 with a body that names
+  the failure class, not the file.
+- Kuma: DOWN opens / reopens / refreshes exactly as `reconcile()` (`tests/test_ingest.py` runs both over one sequence and
+  compares the rows); UP resolves; pending, maintenance, group and a body with neither `heartbeat` nor `monitor` (Kuma's
+  notification "Test") are 202 `ignored`. Tags keep Kuma's `[{name, value}]` shape and route through `_tag_values` like the
+  poll's.
+- HyperDX: our contract `{alert, state, message?, url?, service?, value?}`; new state source `hyperdx`, `external_id` =
+  `loop.core.fingerprint(alert)` (imported in the function body: lifecycle/ stays importable without the loop). In
+  `INGEST_SOURCES`, not `GROUPED_TRIAGE_SOURCES`; `_SOURCE_NOTES` line; `route_by_label()` uses `payload.service` when it
+  equals a known repo; `_FINGERPRINTED_SOURCES` so a policy pattern's second match target is the digit-free fingerprint.
+  `work.kuma_monitor_title()` and `verify._signal_not_quiet()` needed no branch (no Kuma monitor; an unresolved event is
+  still firing).
+- Not touched: the `uk` poll and the `slack_alert` path (Waves 10-11). Until Wave 10 retires the poll it resolves a
+  webhook-opened `uk` row by disappearance, accepted: one `(source, external_id)` row, one item.
+
+Tests: new `tests/test_ingest.py` (37: auth, lazy token and its retry clock, cap, malformed bodies, idempotency, Kuma shapes,
+reopen, the differential against `reconcile()`, HyperDX dedup, routing, the loop picking the rows up and quiet-resolving on OK,
+503 on schema mismatch / missing ledger / no migration, lock wait and lock timeout, connection kwargs, the 405 surface, the log
+redaction proved by mutation). `tests/test_api.py`: the "POST is 405" test is renamed `test_post_to_a_non_ingest_path_is_405...`
+(same assertions plus `/board`; behaviour intentionally changed only for `/ingest/*`). `test_triage.py` stays at 671/671.
+`AGENTS.md` named 670 for that suite since §172; it is 671.

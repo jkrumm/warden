@@ -2,27 +2,121 @@
 
 `scripts/api.py`, run as `com.jkrumm.warden-api` (`launchd/com.jkrumm.warden-api.plist.template`,
 `api.py --serve`). Four read-only GET endpoints: `/health`, `/metrics`, `/board`,
-`/items/<event_id>`. Write-side actions are not here: Argo's owner actions are pulled by
-the loop (`apply_argo_actions()`), see § Argo push.
+`/items/<event_id>`, and one write-side exception, the ingest door: `POST /ingest/kuma` and
+`POST /ingest/hyperdx` (§ Ingest door). Owner actions are not here: Argo's owner actions are
+pulled by the loop (`apply_argo_actions()`), see § Argo push.
 
 ## Bind and auth
 
-`127.0.0.1:7735`, loopback only, no bearer token. An episode on this host runs
-unrestricted `Bash` (DESIGN.md § Boundaries), so a token would be theatre: anything that can
-read a token file can query the socket directly. The protections are the loopback bind
-(nothing off-box reaches it; no Caddy or tailnet door) and the read-only handle (nothing
-that does reach it can write).
+`127.0.0.1:7735`, loopback only. **The GETs are unchanged: no bearer token.** An episode on this
+host runs unrestricted `Bash` (DESIGN.md § Boundaries), so a token would be theatre: anything that
+can read a token file can query the socket directly. The protections are the loopback bind and the
+read-only handle (nothing that does reach it can write).
+
+**The ingest POSTs are the exception and carry a bearer token.** A reverse-proxy door in front of
+this process (set up outside this repo, with its own access list) forwards **only `/ingest/*`**
+off-box, so Uptime Kuma and HyperDX can push alerts here; `/health`, `/metrics`, `/board` and
+`/items/*` are never proxied. Because that path is reachable from beyond the loopback, it
+authenticates: `Authorization: Bearer <token>`, the token resolved with
+`clients.secrets.resolve_secret("WARDEN_INGEST_TOKEN", "op://mini/warden-ingest/token")` (the env
+var first, then `secrets-run read`). It is resolved on the first ingest request, not at start; a
+non-empty result is cached for the process, an empty one is retried at most once per 60 s, so
+seeding the secret after a deploy needs no restart. Comparison is `hmac.compare_digest`. The token
+and the `Authorization` header are never logged or echoed: every log line is redacted (the token
+wherever it appears, any `Bearer <x>`, a request line's query string).
 
 ## Contract
 
-- `GET` only. Any other method is `405`, an unknown path `404`; both as JSON.
+- `GET` only, except `POST /ingest/kuma` and `POST /ingest/hyperdx`. Any other method is `405`
+  (a `GET` on `/ingest/*` too: POST only), an unknown path `404`; both as JSON.
 - Every request opens a **fresh read-only connection** (`ledger.connect(DB_PATH,
   readonly=True)`) and calls `ledger.assert_schema_version()` itself (the readonly branch
   of `connect()` does not). A mismatch or an unreachable file is a **`503`** with the reason
   in the body, never a `200` on untrustworthy data. A held handle would pin a WAL snapshot,
   and a boot-time schema check says nothing about the ledger ten minutes later.
+- The ingest handlers are the **only** writable connection in the process: `ledger.connect(DB_PATH)`
+  **without** `migrate` (only the loop migrates), `assert_schema_version()` called explicitly, the
+  `busy_timeout` `connect()` sets (5 s, checked) so a concurrent loop write is waited for, one
+  `BEGIN IMMEDIATE` transaction, commit, always closed.
 - `/items/<event_id>`: a non-digit id is `400 {"error": "event_id must be an integer"}`, an
   id with no `triage_items` row is `404 {"error": "no item <id>"}`.
+
+## Ingest door
+
+`POST /ingest/kuma` and `POST /ingest/hyperdx` push an alert straight into the `events` ledger
+(logic: `scripts/lifecycle/ingest.py`; `api.py` is the shell), so warden need not poll Argo or read
+#alerts for it. Both feed **state sources**: one `events` row per `(source, external_id)`, open while
+the alert fires, resolved when the sender says it is over, re-armed (a new occurrence) the next time it
+fires. The loop sees the row on its next pass like any other (`INGEST_SOURCES`).
+
+**Common contract**
+
+| Case | Answer |
+|-|-|
+| no token resolved | `503 {"error": ...}` (fails closed; nothing is read) |
+| missing or wrong `Authorization: Bearer` | `401`, decided **before** the body is read or parsed |
+| `Content-Length` missing, not a number, or the body shorter than declared | `400` |
+| `Content-Length` over **64 KiB** | `413` (the body is not parsed) |
+| invalid JSON, or JSON that is not an object | `400` |
+| a recognised body that is malformed (below) | `400 {"error": ...}` |
+| written, or deliberately ignored | `202 {"accepted": true\|false, "action": "opened\|refreshed\|resolved\|ignored", "event_id"?: n}` |
+| ledger unreachable, schema mismatch (either direction), locked past the busy timeout | `503`, so the sender retries; the body names the class of failure, never the file |
+| `GET /ingest/*` | `405` (POST only) |
+| `POST` to any other path | `405` (`404` for an unknown `/ingest/*`) |
+
+`accepted` is whether the ledger changed. `opened` is a new row **or** a resolved row re-armed;
+`refreshed` is an open row whose title, url and payload were rewritten; `resolved` set `resolved_at`;
+`ignored` wrote nothing. The same payload twice is one row: the second is `refreshed`. An UP / `OK`
+for an alert with no open row is `accepted: false, ignored` and writes nothing.
+
+The open / reopen / refresh branches are `watchdog-poll.py reconcile()`'s, statement for statement
+(`tests/test_ingest.py` runs both over one sequence and compares the rows): insert; a resolved row is
+re-armed (`resolved_at` cleared, `first_seen` = now, `notified_at` / `last_reminder_at` cleared,
+`reminder_count` 0); an open row's title, url and payload are rewritten **without** touching
+`first_seen` or the notification stamps. Text from the sender is clipped (title 200, url 500, message
+2000, other labels 200 characters) on top of the body cap.
+
+### `POST /ingest/kuma` (source `uk`)
+
+Uptime Kuma's webhook body: `{"heartbeat": {"status", "msg", "time"}, "monitor": {"id", "name",
+"url", "type", "tags"}, "msg"}`. The event has the shape `poll_uk()` produces.
+
+| Body | Result |
+|-|-|
+| `heartbeat.status` 0 (DOWN) | open / reopen / refresh: `external_id = str(monitor.id)`, `title = monitor.name`, `url`, payload `{"type", "status": 0, "tags"?, "via": "webhook"}` |
+| status 1 (UP) | set `resolved_at` on the open row; `ignored` when there is none or it already resolved |
+| status 2 (pending), 3 (maintenance) | `202 ignored` |
+| `monitor.type == "group"` | `202 ignored`, as `poll_uk()` drops group parents |
+| neither `heartbeat` nor `monitor` (Kuma's notification "Test" button) | `202 ignored`, so the setup screen reads success |
+| `monitor.id` or `monitor.name` missing or empty; `status` not 0-3; one of `heartbeat` / `monitor` missing or not an object | `400` |
+
+`payload.tags` keeps Kuma's `[{name, value, ...}]` shape; `route_by_label()` reads a tag's `name` or
+`value` equal to a known repo (`lifecycle/intake._tag_values`), so a webhook-opened event routes exactly as
+one the poll opened (pinned in `tests/test_ingest.py`).
+
+**Coexistence until the `uk` poll is retired (Wave 10):** `poll_uk()` resolves any open `uk` row whose
+monitor is no longer DOWN in Argo's list, webhook-opened or not, and the poll's `reconcile()` also
+refreshes and re-arms the same row. That is accepted: the shared `(source, external_id)` row means one
+item whichever door touched it.
+
+### `POST /ingest/hyperdx` (new source `hyperdx`)
+
+The body is **warden's own contract** (the HyperDX webhook template is written to it, not the other way
+round): `{"alert": "<alert name>", "state": "ALERT" | "OK", "message"?, "url"?, "service"?, "value"?}`.
+`state` is case-insensitive and also accepts `firing` / `resolved`.
+
+- `external_id` is `fingerprint(alert)` (`loop/core.py`, the function `slack_alert` identity uses:
+  timestamps, hex ids, paths and numbers stripped), so one alert is one event across occurrences
+  whatever numbers its name carries; `title` is the alert name (refreshed to the latest rendering).
+- `ALERT` / `firing`: open / reopen / refresh, payload `{"state": "ALERT", "message"?, "service"?,
+  "value"?, "via": "webhook"}`.
+- `OK` / `resolved`: set `resolved_at` (same no-op rules as Kuma's UP).
+- `alert` missing, empty or not a string, or `state` missing or unknown: `400`.
+
+Loop treatment: `hyperdx` is in `INGEST_SOURCES` and an open event becomes an `alert` item like a `uk`
+one; it is **not** in `GROUPED_TRIAGE_SOURCES` (no silence-resolve: the webhook's `OK` resolves it, and
+verification treats an unresolved event as still firing). `route_by_label()` routes a payload `service`
+that equals a known repo exactly. Policy `rules` and `ignore` match `hyperdx:<fingerprint>`.
 
 ## `GET /health`
 

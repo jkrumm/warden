@@ -86,6 +86,7 @@ Answer with one JSON object: {"action", "item"?, "pr"?, "repo"?, "title"?, "reas
 # is DOWN, not "ok").
 _SOURCE_NOTES = {
     "uk": "an Uptime Kuma monitor that is DOWN right now (this source reports only down monitors; payload status 0 means down)",
+    "hyperdx": "a HyperDX alert that is firing right now (state source: resolved when the webhook reports OK)",
     "docker_homelab": "a container that is unhealthy or restart-looping, on the host named in the title",
     "docker_vps": "a container that is unhealthy or restart-looping, on the host named in the title",
     "hermes_log": "a WARNING or ERROR line from the Hermes agent's own logs",
@@ -302,8 +303,8 @@ _SERVICE_LABEL_RE = re.compile(r"""service(?:[._]name)?\s*[:=]\s*[`'"]?([A-Za-z0
 def route_by_label(item: sqlite3.Row, event: sqlite3.Row) -> str | None:
     """The repo the signal itself names, or None. No LLM, no rule table: a GitHub issue or
     `warden run` carries its repo; a Kuma tag, a container name or an OTel `service.name`
-    routes only when it equals a known repo exactly. A label naming no known repo falls
-    through to the triage job."""
+    routes only when it equals a known repo exactly (a HyperDX alert's `service` is the same
+    kind of label). A label naming no known repo falls through to the triage job."""
     if item["origin"] in ("github_issue", "human"):
         return item["repo"]
     source = event["source"]
@@ -311,6 +312,8 @@ def route_by_label(item: sqlite3.Row, event: sqlite3.Row) -> str | None:
     payload = _payload(event["payload_json"])
     if source == "uk":
         candidates = _tag_values(payload.get("tags"))
+    elif source == "hyperdx":
+        candidates = [str(payload["service"])] if payload.get("service") else []
     elif source.startswith("docker_"):
         _kind, _, container = (event["external_id"] or "").partition(":")
         candidates = [container]
