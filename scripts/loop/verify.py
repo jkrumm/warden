@@ -818,8 +818,7 @@ def maybe_submit_reverts(conn: sqlite3.Connection, policy: dict[str, Any], now: 
         try:
             opened = work.open_implement_episode(
                 conn, repo=item["repo"], tier="implement", brief=brief, context=context, why=why,
-                origin=_dispatch.Origin(event_id=event_id), authorized_by="auto-from-item", model=model,
-                count_merging=not core.is_revert(item))
+                origin=_dispatch.Origin(event_id=event_id), authorized_by="auto-from-item", model=model)
         except SubmitRefused as exc:
             work.end_on_refusal(conn, [item], exc, tier="implement", now=now, policy=policy, implement_job=None)
             continue

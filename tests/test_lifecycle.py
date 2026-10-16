@@ -400,11 +400,31 @@ def test_check_repo_not_in_flight_via_a_working_item_with_an_implement_job():
         raise AssertionError("expected PolicyError")
 
 
-def test_check_repo_not_in_flight_via_merging_state():
+def test_check_repo_not_in_flight_via_merging_state_while_update_pr_runs():
     conn, _ = _fresh_ledger()
     _seed_triage_item(conn, 1, repo="warden", state="merging")
+    conn.execute("UPDATE triage_items SET train_job='job-update-pr' WHERE event_id=1")
+    conn.commit()
     _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden")
     policy.check_repo_not_in_flight(conn, repo="warden", exclude_event_id=1)
+
+
+def test_check_repo_not_in_flight_via_merging_state_while_update_pr_is_submitted():
+    from loop import train
+
+    conn, _ = _fresh_ledger()
+    _seed_triage_item(conn, 1, repo="warden", state="merging")
+    conn.execute("UPDATE triage_items SET train_job=? WHERE event_id=1", (train.TRAIN_CLAIM,))
+    conn.commit()
+    _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden")
+
+
+def test_a_merging_item_without_a_train_job_holds_no_episode():
+    """A PR waiting on CI or review, or a parked merge (stage 'merge', no `update_pr`), runs no episode."""
+    conn, _ = _fresh_ledger()
+    _seed_triage_item(conn, 1, repo="warden", state="merging")
+    policy.check_repo_not_in_flight(conn, repo="warden")
+    policy.check_repo_not_in_flight(conn, repo="warden", exclude_event_id=2, as_revision=True)
 
 
 def test_check_repo_not_in_flight_via_open_operation():
@@ -482,10 +502,12 @@ def test_as_revision_passes_over_a_younger_item_judged_with_any_status():
     policy.check_repo_not_in_flight(conn, repo="warden", exclude_event_id=1, as_revision=True)
 
 
-def test_as_revision_still_refuses_behind_a_merging_item():
+def test_as_revision_still_refuses_behind_a_merging_item_with_a_running_update_pr():
     conn, _ = _fresh_ledger()
     _seed_waiting_revision(conn, 2)
     _seed_triage_item(conn, 1, repo="warden", state="merging")
+    conn.execute("UPDATE triage_items SET train_job='job-update-pr' WHERE event_id=1")
+    conn.commit()
     _expect(PolicyError, policy.check_repo_not_in_flight, conn, repo="warden",
             exclude_event_id=2, as_revision=True)
 

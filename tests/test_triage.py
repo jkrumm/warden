@@ -10194,7 +10194,9 @@ def test_a_waiting_revision_defers_behind_a_running_episode_in_its_repo():
 def test_a_waiting_revision_defers_behind_a_merging_item_in_its_repo():
     with _triage_env() as (conn, ctx):
         eid = _seed_blocked_item(conn, external_id="sig-rev-behind-merge")
-        _seed_item(conn, external_id="sig-rev-merging", state=core.STATE_MERGING)
+        merging = _seed_item(conn, external_id="sig-rev-merging", state=core.STATE_MERGING)
+        conn.execute("UPDATE triage_items SET train_job=? WHERE event_id=?", (train.TRAIN_CLAIM, merging))
+        conn.commit()
         calls: list[dict[str, Any]] = []
         _agent_gateway.submit = _fake_submit(calls)
 
@@ -10202,6 +10204,26 @@ def test_a_waiting_revision_defers_behind_a_merging_item_in_its_repo():
 
         assert calls == []
         assert core.get_item(conn, eid)["revision_count"] == 0
+
+
+def test_a_waiting_revision_is_revised_while_a_younger_items_merge_is_parked():
+    """A parked merge (`merging`, `train_job` NULL, stage 'merge') runs no episode: it must not hold
+    the repo's implement lane (item 1579 starved weatherorb's revisions for 2.5 h)."""
+    with _triage_env() as (conn, ctx):
+        eid = _seed_blocked_item(conn, external_id="sig-rev-parked-merge")
+        parked = _seed_item(conn, external_id="sig-parked-merge", state=core.STATE_MERGING)
+        conn.execute("UPDATE triage_items SET train_stage='merge', train_job=NULL, "
+                     "note='parked: merge waits: herdr agent demo-w1 is working in demo-repo' "
+                     "WHERE event_id=?", (parked,))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+
+        work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+
+        assert len(calls) == 1 and calls[0]["tier"] == "implement"
+        assert core.get_item(conn, eid)["revision_count"] == 1
+        assert core.get_item(conn, parked)["state"] == core.STATE_MERGING
 
 
 def test_a_waiting_revision_defers_behind_a_claimed_implement_slot_in_its_repo():
@@ -13570,7 +13592,8 @@ def test_a_migrated_merging_row_never_folds_its_pre_train_review():
 def test_a_revert_is_submitted_past_a_pr_waiting_on_its_train_but_waits_for_a_running_update_pr():
     """Finding 4: a PR waiting on CI holds no episode — the revert must not starve behind it. An
     `update_pr` running on the train does hold agent-gateway's lease, so the revert waits for it. The
-    fresh attempt after a revert is an ordinary implement and still waits behind the train."""
+    fresh attempt after a revert is an ordinary implement: it too waits behind a running `update_pr`
+    (and, like any implement, no longer behind a PR that merely waits)."""
     with _triage_env() as (conn, ctx):
         _train_item(conn, "sig-waiting-ci", stage="checks", sha=TRAIN_SHA)
         eid = _reverting(conn, "sig-revert-now", state=core.STATE_WORKING)
@@ -13590,7 +13613,7 @@ def test_a_revert_is_submitted_past_a_pr_waiting_on_its_train_but_waits_for_a_ru
         assert calls == [] and item["implement_job"] is None and "deferred" in item["note"], dict(item)
 
     with _triage_env() as (conn, ctx):
-        _train_item(conn, "sig-waiting-ci-2", stage="checks", sha=TRAIN_SHA)
+        _train_item(conn, "sig-updating-2", stage="update", job="update-job-running")
         record = {"sha": MERGED_SHA, "pr": _FIX_PR, "evidence": _EVIDENCE, "method": "squash"}
         eid = _seed_item(conn, external_id="sig-after-revert", state=core.STATE_WORKING,
                          revert_json=json.dumps(record), max_tier="implement")

@@ -173,23 +173,21 @@ def require_auto_from_item(conn: sqlite3.Connection, *, event_id: int | str, rep
     return job_id
 
 
-def _in_flight_sql(count_merging: bool) -> str:
-    """An implement episode is "already running against this repo": an item in `merging` (its PR
-    is being reviewed and merged), or a `working` item with an implement_job on record (a claim,
-    an episode, or a revision waiting for its next episode).
+def _in_flight_sql() -> str:
+    """An implement episode is "already running against this repo": a `merging` item while its
+    train's `update_pr` runs or is being submitted (`train_job` set, the TRAIN_CLAIM sentinel
+    included), or a `working` item with an implement_job on record (a claim, an episode, or a
+    revision waiting for its next episode).
 
-    `count_merging=False` (a revert): a `merging` item counts only while its train's `update_pr`
-    runs (or is being submitted) — a PR waiting on CI or review holds no episode, and a revert
-    must not starve behind it. agent-gateway's per-repo lease is the backstop for the race (a lease
-    retry).
+    A PR waiting on CI or review, or a parked merge, holds no episode: `train_job` is NULL
+    then, and the repo's revisions, new implements and reverts must not starve behind it.
+    agent-gateway's per-repo lease is the backstop for the race (a lease retry).
 
     The state names come from loop/core.py. It is imported here, in the function body, not at
     the top: lifecycle/ stays importable without the loop, and core imports lifecycle/items.py."""
     from loop import core
 
     working = f"(state='{core.STATE_WORKING}' AND implement_job IS NOT NULL)"
-    if count_merging:
-        return f"(state='{core.STATE_MERGING}' OR {working})"
     return f"((state='{core.STATE_MERGING}' AND train_job IS NOT NULL) OR {working})"
 
 
@@ -210,8 +208,7 @@ def _waiting_revision_sql() -> str:
 
 
 def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
-                              exclude_event_id: int | None = None, count_merging: bool = True,
-                              as_revision: bool = False) -> None:
+                              exclude_event_id: int | None = None, as_revision: bool = False) -> None:
     """DESIGN.md § per-repo in-flight lock. One implement episode per repo at
     a time, checked two ways: the triage item driving it (if any) and the
     operations ledger (which also covers an episode that has no
@@ -222,13 +219,13 @@ def check_repo_not_in_flight(conn: sqlite3.Connection, *, repo: str,
     open_episode(), which runs this check; without the exclusion, that claim
     would make the item refuse itself the moment open_episode() re-checks.
 
-    `count_merging=False` (a revert): a `merging` item counts only while an `update_pr` episode
-    runs on its train, not while its PR waits.
+    A `merging` item counts only while an `update_pr` episode runs (or is being submitted) on its
+    train (`train_job` set); a PR waiting on CI or review, or a parked merge, holds no episode.
 
     `as_revision=True` (a revision caller, which holds `exclude_event_id`): a younger waiting revision
     does not count. Waiting revisions are revised oldest-first; without this, two waiting revisions
     each see the other and neither is ever revised."""
-    query = f"SELECT event_id FROM triage_items WHERE repo=? AND {_in_flight_sql(count_merging)}"
+    query = f"SELECT event_id FROM triage_items WHERE repo=? AND {_in_flight_sql()}"
     params: list[Any] = [repo]
     if exclude_event_id is not None:
         query += " AND event_id != ?"

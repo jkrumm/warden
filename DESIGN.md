@@ -154,13 +154,13 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    `HOST_VERB_LIVENESS_MONITOR`.
 
    **Per-repo in-flight lock** (`policy.check_repo_not_in_flight()`). One implement episode per repo:
-   a `merging` item, a `working` item with an `implement_job` (a claim sentinel, an episode, or a
+   a `merging` item while its train's `update_pr` runs or is being submitted (`train_job` set; a PR waiting on CI, review, or a parked merge holds no episode), a `working` item with an `implement_job` (a claim sentinel, an episode, or a
    waiting revision), or the operations ledger. A waiting revision (`working`, its implement dispatch
    judged: `validation_status IS NOT NULL`) holds no episode, only a claim on the next one, so it
    does not block a revision of an OLDER item (`as_revision=True`, from `maybe_revise_blocked()`, and
    `open_episode()` threads it through): revisions go oldest first. Without that, two waiting revisions
    each count the other as in flight and neither is ever revised (the weatherorb deadlock, §167). A
-   younger item with an episode, a claim, or a `merging` train still defers the revision.
+   younger item with an episode, a claim, or a `merging` train running `update_pr` still defers the revision.
 4. **Merge train** (`train.py`). One per repo, oldest item first, single-flight:
    agent-gateway `update_pr` onto the latest base → GitHub checks green (or none — only
    a readable check-runs API may say so; unreadable — a fine-grained token has no Checks

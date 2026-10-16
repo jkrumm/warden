@@ -10805,3 +10805,22 @@ Test: `test_checks_failed_with_an_uncategorised_human_verdict_is_a_revision_whil
 
 Follow-up to §175 (2026-10-16): the one-shot `reconcile(conn, "hermes_cron", [])` resolved event #1119 on the 16:39Z poll
 and is deleted; no `hermes_cron` code remains.
+
+## §177 — a parked merge does not hold the repo's implement lane (2026-10-16)
+
+Measured live: item 1579 (`merging`, parked at train stage `merge`, `train_job` NULL: "merge waits: herdr agent
+weatherorb-w49 is working in weatherorb") sat behind the owner's back-to-back weatherorb waves for 2.5+ h. A parked merge
+runs no episode, but `policy._in_flight_sql(count_merging=True)` counted every `merging` row, so 1577's revision, 1584,
+1586 and weatherorb#111 all deferred ("repo 'weatherorb' already has an implement episode in flight (item 1579)").
+
+Rule: a `merging` item is the repo's in-flight implement episode only while its train's `update_pr` runs or is being
+submitted (`train_job` set, the `TRAIN_CLAIM` sentinel included; train.py clears it on every exit). The old
+`count_merging=False` form (previously revert-only) is now the only form: `count_merging` is gone from `_in_flight_sql`,
+`check_repo_not_in_flight`, `open_episode` and `maybe_submit_reverts`. agent-gateway's per-repo lease stays the backstop
+for the race. DESIGN.md § Per-repo in-flight lock and STATE.md updated.
+
+Tests: `test_lifecycle.py` merging cases now set `train_job` (job id and `TRAIN_CLAIM` block; NULL does not, also under
+`as_revision`); `test_triage.py` `test_a_waiting_revision_is_revised_while_a_younger_items_merge_is_parked` (new), the
+merging-defers revision test and the third block of the revert test set `train_job` (the behaviour they meant: a running
+`update_pr` blocks, an ordinary post-revert implement no longer waits behind a merely waiting PR). Gate: 674/674
+(`test_ingest.py` is 39/39; the doc said 37).
