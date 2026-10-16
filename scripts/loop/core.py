@@ -73,6 +73,9 @@ JOB_ORIGIN = "job"
 JOB_MAX_TIER = "implement"
 # How long a deployed job fix has to produce a success before the closure gives up: twice the job's
 # cadence plus a margin, never under JOB_VERIFY_MIN_MINUTES. A timeout is a `work` strike.
+# `warden close` writes this prefix on the note of the transition into `closed`: the owner's verdict that an item
+# needs nothing further, not warden's work. job_chronic_reason() does not count such a close as "warden acted".
+HAND_CLOSE_NOTE_PREFIX = "closed by hand: "
 JOB_VERIFY_MIN_MINUTES = 30.0
 JOB_VERIFY_MARGIN_MINUTES = 10.0
 

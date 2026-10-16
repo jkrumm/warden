@@ -1095,7 +1095,7 @@ def cmd_close(conn, flags: Flags, positional: list[str], state: _State) -> dict[
         )
 
     to_state = ledger.STATE_CLOSED
-    note = f"closed by hand: {flags.why}"
+    note = f"{core.HAND_CLOSE_NOTE_PREFIX}{flags.why}"
     reason = flags.reason or core.CLOSE_RESOLVED
     if reason not in _CLOSE_REASONS_BY_HAND:
         raise UsageError(f"--reason must be one of {'/'.join(_CLOSE_REASONS_BY_HAND)} (got: {reason})")

@@ -10698,9 +10698,14 @@ Verified closure: `_verify_item()` asks `_job_closure()` for a `job` item once `
 revert (nothing proves the change wrong). `strikes` is given back whenever an item re-advances to `merging`, so the cap is
 the count of earlier expiry transitions in `item_transitions`: the third ends it `failed(work)`.
 
-Tests: `test_triage.py` 655 -> 665 (brief content and cap, hostile/oversized fields and a tail that tries to close the
+Tests: `test_triage.py` 655 -> 666 (brief content and cap, hostile/oversized fields and a tail that tries to close the
 fence, the gatherer with a fake runner and Cellar and a failed `git log`, the tier raise, closure done / pending /
 expired / blind / daily window / succeeded-then-failed-again, the third expiry); `_triage_env()` stubs `gather_job_context`.
+
+The chronic rule skips an item the owner closed by hand (`warden close` writes `core.HAND_CLOSE_NOTE_PREFIX` on the
+transition): that close is the owner's answer that the failure needed nothing, so a recurrence is new work. Found by the live
+canary run: Wave 6's planted-failure item #1582 had been hand-closed after its investigation, and its next failure would
+otherwise have been a `[chronic]` page for a fix that never existed.
 
 Review (agent-gateway, 1 round): 4 blocking fixed — a failed `git log` no longer reads as "no commits"; every untrusted
 head field is capped and the rules reserve their space; the tail is trimmed by whole lines and its fence is built after the

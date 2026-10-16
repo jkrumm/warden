@@ -14929,6 +14929,24 @@ def test_a_job_that_succeeded_after_the_deploy_and_then_failed_again_is_not_fixe
         assert item["state"] == core.STATE_VERIFYING and "failed again" in item["verify_result"], dict(item)
 
 
+def test_a_job_the_owner_closed_by_hand_is_new_work_when_it_fails_again_not_chronic():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        _job_pass(conn, JOB_BASE)
+        eid = _job_item(conn)["event_id"]
+        core.set_state(conn, eid, core.STATE_CLOSED, JOB_BASE + dt.timedelta(minutes=30), close_reason=core.CLOSE_RESOLVED,
+                       note=f"{core.HAND_CLOSE_NOTE_PREFIX}planted failure, not real")
+        conn.commit()
+        box["rows"] = [_job_row(grade="ok", reason="ok")]
+        _job_pass(conn, JOB_BASE + dt.timedelta(hours=1))
+        box["rows"] = [_job_row()]
+        _job_pass(conn, JOB_BASE + dt.timedelta(hours=2))
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and len(calls) == 2, dict(item)
+
+
 # --- the kill-switch at every dispatch site ---
 
 

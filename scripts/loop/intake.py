@@ -313,7 +313,9 @@ def job_chronic_reason(conn: sqlite3.Connection, item: sqlite3.Row, policy: dict
     - CHRONIC: it reopened `jobChronicRecurrences` times within `jobChronicWindowDays` (default one
       reopen within 7 days of the terminal state it left).
 
-    A first-ever item has no reopen transition and is never chronic."""
+    A first-ever item has no reopen transition and is never chronic, and neither is one the owner closed
+    by hand (`warden close`, core.HAND_CLOSE_NOTE_PREFIX): that close is the owner's answer that the failure
+    was not real or needed nothing, so its recurrence is new work, not a fix that did not hold."""
     if not item["dispatch_job"]:
         return None
     states = (core.STATE_FIXED, core.STATE_QUIET, core.STATE_CLOSED)
@@ -326,9 +328,11 @@ def job_chronic_reason(conn: sqlite3.Connection, item: sqlite3.Row, policy: dict
         return None
     reopened_at = core.parse_ts(reopen["at"])
     left = conn.execute(
-        "SELECT at FROM item_transitions WHERE event_id=? AND to_state=? AND id < ? ORDER BY id DESC LIMIT 1",
+        "SELECT at, note FROM item_transitions WHERE event_id=? AND to_state=? AND id < ? ORDER BY id DESC LIMIT 1",
         (item["event_id"], reopen["from_state"], reopen["id"]),
     ).fetchone()
+    if left is not None and str(left["note"] or "").startswith(core.HAND_CLOSE_NOTE_PREFIX):
+        return None   # the owner closed it by hand: a verdict that it needed nothing, not a fix that failed to hold
     left_at = core.parse_ts(left["at"]) if left else None
     if reopened_at is None or left_at is None:
         return None

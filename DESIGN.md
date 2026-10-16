@@ -117,7 +117,7 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    `jobChronicWindowDays` (7) of the terminal state it left, `jobChronicRecurrences`
    (1) times; a `fixed` one that fails again within `jobRegressionHours` (24) is a
    fix that did not hold. Both go to `needs_decision` (`[chronic] …`) instead of
-   another dispatch (`job_chronic_reason()`; thresholds in `config/triage-policy.json`).
+   another dispatch (`job_chronic_reason()`; thresholds in `config/triage-policy.json`); an item the owner closed by hand (`warden close`) is not counted: that is the owner's answer, not a fix that failed to hold.
    An item that healed `quiet` before any dispatch is new work, not chronic. A matching `rootCause` on another
    open item merges them (older survives, the other `closed(duplicate)`). A
    blocked review is a revision on the same item and PR (`revisionOf`). The review's context
