@@ -921,6 +921,16 @@ def cmd_retry(conn, flags: Flags, positional: list[str], state: _State) -> dict[
 # --- reinvestigate ---------------------------------------------------------------
 
 
+def _closed_while_still_red(conn, item) -> bool:
+    """A `job` item the loop closed (an investigation's answer) whose job is STILL graded bad: the source is
+    level-based, so nothing reopens it until the job recovers and fails again, and that recurrence would be
+    chronic. The owner may send it back for a fresh investigation instead of waiting for that."""
+    if item["origin"] != core.JOB_ORIGIN or item["state"] != core.STATE_CLOSED:
+        return False
+    event = core.get_event(conn, item["event_id"])
+    return event is not None and event["resolved_at"] is None
+
+
 def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
     """Send an item the owner decided to re-open back to `triaged` for a fresh investigation — the
     CLI counterpart to Argo's reinvestigate action, through the same shared core.reinvestigate().
@@ -941,7 +951,7 @@ def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) 
     item = core.get_item(conn, event_id)
     if item is None:
         raise UsageError(f"no triage_items row for event_id {event_id}")
-    if item["state"] not in core.REINVESTIGATE_ALLOWED_STATES:
+    if item["state"] not in core.REINVESTIGATE_ALLOWED_STATES and not _closed_while_still_red(conn, item):
         raise PreconditionError(
             f"triage item {event_id} is in state '{item['state']}', not one of "
             f"{'/'.join(core.REINVESTIGATE_ALLOWED_STATES)} — nothing to re-investigate"

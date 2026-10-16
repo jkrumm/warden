@@ -10698,7 +10698,7 @@ Verified closure: `_verify_item()` asks `_job_closure()` for a `job` item once `
 revert (nothing proves the change wrong). `strikes` is given back whenever an item re-advances to `merging`, so the cap is
 the count of earlier expiry transitions in `item_transitions`: the third ends it `failed(work)`.
 
-Tests: `test_triage.py` 655 -> 666 (brief content and cap, hostile/oversized fields and a tail that tries to close the
+Tests: `test_triage.py` 655 -> 667 (brief content and cap, hostile/oversized fields and a tail that tries to close the
 fence, the gatherer with a fake runner and Cellar and a failed `git log`, the tier raise, closure done / pending /
 expired / blind / daily window / succeeded-then-failed-again, the third expiry); `_triage_env()` stubs `gather_job_context`.
 
@@ -10706,6 +10706,12 @@ The chronic rule skips an item the owner closed by hand (`warden close` writes `
 transition): that close is the owner's answer that the failure needed nothing, so a recurrence is new work. Found by the live
 canary run: Wave 6's planted-failure item #1582 had been hand-closed after its investigation, and its next failure would
 otherwise have been a `[chronic]` page for a fix that never existed.
+
+The live canary run's first attempt found two more gaps. `reopen_if_needed()` runs after `ingest_jobs()` in a pass, so a
+reopened Wave 6 item (tier `investigate`) was dispatched at the old tier and its investigation closed `resolved` with the
+canary still red: `route_job_items()` now sets the tier on the way to `triaged`. And a job item closed while its job is still
+bad had no way back (level-based source: no reopen until it recovers and fails again, which would then be chronic):
+`warden reinvestigate` accepts a `closed` job item whose event is unresolved.
 
 Review (agent-gateway, 1 round): 4 blocking fixed — a failed `git log` no longer reads as "no commits"; every untrusted
 head field is capped and the rules reserve their space; the tail is trimmed by whole lines and its fence is built after the

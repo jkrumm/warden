@@ -693,7 +693,7 @@ _SET_STATE_COLUMNS = (
     "pr_url", "implement_job", "validation_job", "deploy_expect_json",
     "verify_started_at", "verify_mark", "verify_failures", "verify_result",
     "revert_pr", "close_reason", "strikes", "retry_at", "revision_count", "stalled_rounds",
-    "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo",
+    "root_cause", "duplicate_of", "triage_job", "triage_job_at", "repo", "max_tier",
     "train_stage", "train_sha", "train_base_sha", "train_job", "reviewed_sha", "train_evidence",
     "train_rewinds", "train_pushed_at", "merged_sha", "merge_method", "reverting_sha", "revert_json",
     "blocked_sha",

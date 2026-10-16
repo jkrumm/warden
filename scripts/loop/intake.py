@@ -384,7 +384,7 @@ def route_job_items(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.da
             continue
         core.set_state(conn, item["event_id"], core.STATE_TRIAGED, now, expect_state=core.STATE_NEW, repo=owner,
                        note=str(payload.get("reason") or event["title"] or "")[:200], dispatch_job=None,
-                       strikes=0, retry_at=None)
+                       strikes=0, retry_at=None, max_tier=core.JOB_MAX_TIER)   # a reopen lands here AFTER ingest_jobs() ran
     conn.commit()
 
 

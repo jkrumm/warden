@@ -14808,6 +14808,25 @@ def test_a_reopened_job_item_opened_at_the_old_tier_is_raised_to_implement():
         assert _job_item(conn)["max_tier"] == "implement"
 
 
+def test_a_reopened_job_item_is_dispatched_at_the_implement_tier_in_the_same_pass():
+    """reopen_if_needed() runs after ingest_jobs() in a pass, so the tier must be raised on the way to `triaged`."""
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        _job_pass(conn, JOB_BASE)
+        eid = _job_item(conn)["event_id"]
+        core.set_state(conn, eid, core.STATE_CLOSED, JOB_BASE + dt.timedelta(minutes=30), close_reason=core.CLOSE_RESOLVED,
+                       note=f"{core.HAND_CLOSE_NOTE_PREFIX}old", max_tier="investigate")
+        conn.commit()
+        box["rows"] = [_job_row(grade="ok", reason="ok")]
+        _job_pass(conn, JOB_BASE + dt.timedelta(hours=1))
+        box["rows"] = [_job_row()]
+        _job_pass(conn, JOB_BASE + dt.timedelta(hours=2))
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["max_tier"] == "implement", dict(item)
+
+
 def _job_verifying(conn, box, *, started: dt.datetime, merged_sha: str = "abc123def456") -> int:
     """A job item whose fix merged and deployed at `started`, the window open (the canary's every = 300 s)."""
     box["rows"] = [_job_row()]

@@ -1327,6 +1327,26 @@ def test_reinvestigate_refuses_states_outside_the_allowlist_and_requires_why():
     conn.close()
 
 
+def test_reinvestigate_takes_a_closed_job_item_only_while_its_job_is_still_red():
+    h = Harness()
+    db = h.new_db()
+    for event_id in (70, 71, 72):
+        _seed_item(db, event_id, state="closed", repo="gamma", dispatch_job="old-investigate")
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET origin='job' WHERE event_id IN (70, 71)")
+    conn.execute("UPDATE events SET resolved_at='2026-10-16T12:00:00+00:00' WHERE id=71")
+    conn.commit()
+    conn.close()
+    ok = _json_or_fail(h.run(["reinvestigate", "70", "--why", "still red", "--json"], env=h.base_env(db=db)))
+    assert ok["ok"] is True and ok["fromState"] == "closed" and ok["state"] == "triaged", ok
+    for refused in ("71", "72"):   # the job recovered / not a job item
+        assert h.run(["reinvestigate", refused, "--why", "x", "--json"], env=h.base_env(db=db)).returncode == 2, refused
+    conn, _ = _connect(db)
+    assert [_row(conn, "SELECT state FROM triage_items WHERE event_id=?", (e,))["state"] for e in (70, 71, 72)] == \
+        ["triaged", "closed", "closed"]
+    conn.close()
+
+
 # --- adopt ---------------------------------------------------------------------
 
 
