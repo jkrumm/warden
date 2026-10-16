@@ -46,6 +46,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     intake.reopen_if_needed(conn, now, policy, dry_run=dry_run)
     intake.classify(conn, policy, now)
     intake.apply_resolutions(conn, now, policy)
+    intake.resolve_recovered_decisions(conn, policy, now)
     # After the silence paths: a job item whose job recovered before it was routed goes `quiet`, not
     # to its owner repo.
     intake.route_job_items(conn, policy, now)

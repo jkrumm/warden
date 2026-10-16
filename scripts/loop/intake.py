@@ -440,6 +440,10 @@ def reinvestigate_stuck_job_items(conn: sqlite3.Connection, policy: dict[str, An
         core.close_reinvestigated_pr(pr)
 
 
+# Sources whose event is a level (DOWN/firing until its own recovery) and restarts at each occurrence.
+LEVEL_EVENT_SOURCES = ("uk", "hyperdx")
+
+
 def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[str, Any] | None = None,
                      *, dry_run: bool = False) -> None:
     """A grouped or state source reuses the SAME events.id across a resolve -> recur cycle
@@ -527,6 +531,12 @@ def reopen_if_needed(conn: sqlite3.Connection, now: dt.datetime, policy: dict[st
                 "implement_job": None, "validation_job": None, "pr_url": None, "reviewed_sha": None,
                 "blocked_sha": None, "revision_count": 0, "stalled_rounds": 0,
             }
+            if row["source"] in LEVEL_EVENT_SOURCES:
+                # A level source's event restarts at every DOWN/firing; the item keeps its original
+                # first_seen, so without this a reopen is already "open 30 min" and skips the debounce
+                # (item 1543: reopened and triaged mid-blip, the event resolved a minute later).
+                columns["first_seen"] = row["first_seen"]
+                columns["occurrences"] = 1
             if old_pr:
                 # Keep the URL in the note; the PR itself is CLOSED after the commit (never holding
                 # the write lock across the network call), exactly as reinvestigate() does.
@@ -603,6 +613,25 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime,
         # note from an earlier quiet-resolve surviving a reopen -> genuine fix -> resolve cycle as if it
         # were current.
         core.set_state(conn, row["event_id"], core.STATE_QUIET, now, note=None)
+    conn.commit()
+
+
+def resolve_recovered_decisions(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> None:
+    """A `uk`/`hyperdx` item parked in `needs_decision` whose event has since RECOVERED (the source's own
+    UP/OK, not silence) has nothing left to decide: the question was asked about an outage that is over
+    (item 1543). Quiet, never fixed. An item holding a written fix (a PR or an implement job) keeps its
+    obligation, and a chronic signature keeps its needs_decision: the recurrence is the defect."""
+    rows = conn.execute(
+        "SELECT ti.event_id, ti.repo FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        "WHERE ti.state=? AND e.source IN (?, ?) AND e.resolved_at IS NOT NULL "
+        "AND ti.pr_url IS NULL AND ti.implement_job IS NULL",
+        (core.STATE_NEEDS_DECISION, *LEVEL_EVENT_SOURCES),
+    ).fetchall()
+    for row in rows:
+        if _is_chronic(conn, row["event_id"], row["repo"], policy, now):
+            continue
+        core.set_state(conn, row["event_id"], core.STATE_QUIET, now, expect_state=core.STATE_NEEDS_DECISION,
+                       note="event recovered on its own; nothing left to decide")
     conn.commit()
 
 

@@ -711,6 +711,7 @@ _SET_STATE_COLUMNS = (
     "blocked_sha",
     "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
     "failure_class", "redrive_json", "redrives", "verify_baseline", "ci_rerun_sha",
+    "first_seen", "occurrences",
 )
 
 # The states an item can be re-driven INTO: a stage of the pipeline that has a poller.

@@ -10874,3 +10874,15 @@ Rollout order: `make uk-sync` (deletes the `Hermes Watchdog - Push` monitor) bef
 for a healthy poller. Known: a poll pass skipped for `LedgerBehind` writes no heartbeat, so a migration window longer
 than 90 min reads as `watchdog_poll` stale. Dead-poller detection is now ~90 min plus the Warden Loop silence window
 (was one Kuma interval); the page names only `Warden Loop`, the cause is on the loop's stderr and `/health`.
+
+
+## §181 — level-source review fixes: recovered decisions, reopen debounce, hermes-cron registry in the brief (2026-10-17)
+
+Dotfiles plan Wave 18, from the Wave 17 findings (items 1543, 1585). (1) `intake.resolve_recovered_decisions()`: a
+`uk`/`hyperdx` item in `needs_decision` whose event has recovered (`resolved_at` set by the source's own UP/OK) goes
+`quiet`; an item holding a PR or implement job and a chronic signature keep their obligation. (2) `reopen_if_needed()`
+resets `first_seen`/`occurrences` to the new occurrence for `LEVEL_EVENT_SOURCES` (`uk`, `hyperdx`), so a reopen waits
+out `minOpenMinutes` instead of being 'open 30 min' at once; both columns joined `_SET_STATE_COLUMNS`. Grouped
+sources keep their item's `first_seen`. (3) `job_brief()` embeds the `~/.hermes/cron/jobs.json` entry (model,
+provider, schedule, last outcome; never the prompt) for `hermes-cron.*` labels, via `gather_job_context(registry=)`.
+Tests: `test_triage.py` 674 -> 678 (AGENTS.md said 673; the baseline before this change was 674).

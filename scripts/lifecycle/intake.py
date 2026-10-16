@@ -115,8 +115,33 @@ def _parse_utc(value: Any) -> dt.datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)   # a naive stamp is UTC
 
 
+HERMES_CRON_REGISTRY = Path.home() / ".hermes" / "cron" / "jobs.json"
+_REGISTRY_FIELDS = ("model", "provider", "schedule_display", "enabled", "state", "last_run_at", "last_status",
+                    "last_error", "failure_streak")
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def hermes_cron_entry(label: str, registry: Path | None = None) -> str:
+    """The registry entry of a `hermes-cron.<slug>` job (model, provider, schedule, last outcome), as
+    bullet lines. The worker's sandbox cannot read ~/.hermes/cron/jobs.json (item 1585), so the brief
+    carries it. The job's prompt is left out: large, and not what failed. Never raises."""
+    try:
+        data = json.loads((registry or HERMES_CRON_REGISTRY).read_text())
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        slug = label.removeprefix("hermes-cron.")
+        job = next(j for j in jobs if isinstance(j, dict)
+                   and slug in (_slug(str(j.get("name", ""))), str(j.get("id", ""))))
+    except (OSError, ValueError, TypeError, StopIteration):
+        return "(registry entry not readable)"
+    return "\n".join(f"- {k}: {_clean(job.get(k), JOB_FIELD_CHARS)}" for k in ("name", "id", *_REGISTRY_FIELDS)
+                     if k in job)
+
+
 def gather_job_context(payload: dict[str, Any], *, runner: Runner = subprocess.run,
-                       cellar: Path | None = None) -> dict[str, str]:
+                       cellar: Path | None = None, registry: Path | None = None) -> dict[str, str]:
     """The host facts a job's brief quotes beyond what jobs-grade says: the owner repo's `git log`
     since the job's last success and the Homebrew formulae installed since then (a silent-revert
     class: dotfiles docs/homebrew.md). Read-only, bounded, and never raises: a fact that cannot be
@@ -125,6 +150,9 @@ def gather_job_context(payload: dict[str, Any], *, runner: Runner = subprocess.r
     last_ok = _parse_utc(payload.get("last_ok"))
     since = last_ok.isoformat() if last_ok else None
     out = {"git_log": "(owner repo checkout not readable)", "brew": "(Homebrew Cellar not readable)"}
+    label = str(payload.get("label") or "")
+    if label.startswith("hermes-cron."):
+        out["registry"] = hermes_cron_entry(label, registry)
 
     try:
         cwd = policy.repo_cwd(owner)
@@ -197,8 +225,8 @@ def _job_where(label: str) -> list[str]:
     gateway runs it and ~/.hermes/cron/jobs.json holds its last outcome; there is no plist or jobrun record."""
     if label.startswith("hermes-cron."):
         return ["- scheduled by the Hermes gateway cron (a cron job, not a launchd job): its definition and last "
-                "outcome are in ~/.hermes/cron/jobs.json (runtime state: read-only for you); the job's prompt and "
-                "scripts are in the owner repo's cron/ and docs/scheduled-jobs.md",
+                "outcome are in ~/.hermes/cron/jobs.json, which you cannot read: its entry is embedded below; the "
+                "job's prompt and scripts are in the owner repo's cron/ and docs/scheduled-jobs.md",
                 "- the 'output tail' below is the job's recorded last_error"]
     return [f"- plist: ~/Library/LaunchAgents/{label}.plist (live: read it, never edit it)",
             f"- run record: ~/.local/state/jobs/{label}.json (written by jobrun; read-only for you)"]
@@ -254,7 +282,8 @@ def job_brief(payload: dict[str, Any], machine: str, context: dict[str, str] | N
     ])
     # The head and the rules are bounded (every untrusted head field is capped), so they always fit; the
     # variable sections share what is left: the git/brew facts a third of it, the tail the rest.
-    budget = MAX_JOB_BRIEF_CHARS - len(head) - len(rules) - JOB_FRAMING_CHARS
+    budget = MAX_JOB_BRIEF_CHARS - len(head) - len(rules) - JOB_FRAMING_CHARS - len(context.get('registry') or '') - 80
+    registry = f"\nHermes cron registry entry (model, provider, schedule, last outcome):\n{_clean_block(context['registry'])}\n" if context.get("registry") else ""
     since_text = "\n".join([f"\n`git log` of {field('owner')} since the last success:",
                             _clean_block(context.get("git_log") or "(not gathered)"),
                             "\nHomebrew formulae installed since then:",
@@ -272,7 +301,7 @@ def job_brief(payload: dict[str, Any], machine: str, context: dict[str, str] | N
     tail = "\n".join(["\nLast runs (newest last):", _bullets(runs) if runs else "(none recorded)",
                       f"\nOutput tail of the last run ({len(kept)} lines):",
                       "```", cut + ("\n".join(kept) or "(empty)"), "```"])
-    return (head + tail + since + rules)[:MAX_JOB_BRIEF_CHARS]
+    return (head + registry + tail + since + rules)[:MAX_JOB_BRIEF_CHARS]
 
 
 def known_repos() -> list[str]:

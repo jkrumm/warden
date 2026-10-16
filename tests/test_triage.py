@@ -15376,5 +15376,77 @@ def test_a_job_that_leaves_the_grader_output_is_resolved_with_one_stderr_line_an
         assert all(e["resolved_at"] for e in conn.execute("SELECT * FROM events WHERE source='job'"))
 
 
+def _recur_level_event(conn, eid):
+    """What watchdog-poll / the ingest door do to a level event that goes DOWN again."""
+    conn.execute("UPDATE events SET resolved_at=NULL, first_seen=?, notified_at=NULL, last_reminder_at=NULL, "
+                 "reminder_count=0 WHERE id=?", (NOW.isoformat(), eid))
+    conn.commit()
+
+
+def test_a_reopened_level_item_restarts_its_debounce_at_the_new_occurrence():
+    """Item 1543: the item kept its first_seen from days ago, so a reopen was 'open 30 min' at once and
+    was triaged mid-blip. The reopen takes the new occurrence's start and waits out the debounce."""
+    for source in ("uk", "hyperdx"):
+        with _triage_env() as (conn, _ctx):
+            eid = _insert_event(conn, source=source, external_id=f"lv-{source}", title="Level", first_seen=OLD)
+            intake.ingest(conn, NOW)
+            core.set_state(conn, eid, core.STATE_QUIET, NOW)
+            _recur_level_event(conn, eid)
+            intake.reopen_if_needed(conn, NOW)
+            item = _rows(conn, eid)
+            assert item["state"] == core.STATE_NEW and item["first_seen"] == NOW.isoformat(), dict(item)
+            live = {**DEFAULT_POLICY, "minOccurrences": 3}   # the shipped debounce, not the suite's 1
+            assert not work.is_escalation_eligible(item, live, NOW), source
+            assert work.is_escalation_eligible(item, live, NOW + dt.timedelta(minutes=31)), source
+
+
+def test_a_grouped_source_reopen_keeps_the_items_first_seen():
+    with _triage_env() as (conn, _ctx):
+        eid = _insert_event(conn, source="slack_alert", external_id="grp-keep", title="Grouped", first_seen=OLD)
+        intake.ingest(conn, NOW)
+        core.set_state(conn, eid, core.STATE_QUIET, NOW)
+        _recur_ts(conn, eid, "1788850795.862159")
+        intake.reopen_if_needed(conn, NOW)
+        assert _rows(conn, eid)["first_seen"] == OLD.isoformat()
+
+
+def test_a_recovered_level_event_does_not_stay_needs_decision():
+    with _triage_env() as (conn, _ctx):
+        keep = {}
+        for name, source, extra in (("plain", "uk", ""), ("hx", "hyperdx", ""), ("pr", "uk", "pr"),
+                                    ("open", "uk", "open"), ("slack", "slack_alert", "")):
+            eid = _insert_event(conn, source=source, external_id=f"rec-{name}", title=name, first_seen=OLD)
+            intake.ingest(conn, NOW)
+            if extra != "open":
+                conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
+            core.set_state(conn, eid, core.STATE_NEEDS_DECISION, NOW, note="a question")
+            if extra == "pr":
+                conn.execute("UPDATE triage_items SET pr_url='https://github.com/x/y/pull/1' WHERE event_id=?", (eid,))
+            keep[name] = eid
+        conn.commit()
+        intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
+        states = {n: _rows(conn, e)["state"] for n, e in keep.items()}
+        assert states == {"plain": core.STATE_QUIET, "hx": core.STATE_QUIET, "pr": core.STATE_NEEDS_DECISION,
+                          "open": core.STATE_NEEDS_DECISION, "slack": core.STATE_NEEDS_DECISION}, states
+
+
+def test_a_hermes_cron_job_brief_embeds_the_registry_entry():
+    with tempfile.TemporaryDirectory() as td:
+        reg = Path(td) / "jobs.json"
+        reg.write_text(json.dumps({"jobs": [
+            {"id": "aaa", "name": "Other", "model": "x"},
+            {"id": "8fe7be4985d9", "name": "Brain drift audit", "model": "claude-haiku-5-5-eu", "provider": "anthropic",
+             "schedule_display": "0 9 * * 6", "last_status": "error", "last_error": "HTTP 404", "prompt": "SECRETPROMPT"}]}))
+        row = _job_row(label="hermes-cron.brain-drift-audit", owner="hermes-agent", tail=["status=error"])
+        ctx = _REAL_GATHER({**row, "machine": "testbox"}, registry=reg, runner=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""))
+        brief = _intake.job_brief({**row, "machine": "testbox"}, "testbox", ctx)
+        for needle in ("claude-haiku-5-5-eu", "anthropic", "0 9 * * 6", "HTTP 404", "which you cannot read"):
+            assert needle in brief, needle
+        assert "SECRETPROMPT" not in brief and len(brief) <= _intake.MAX_JOB_BRIEF_CHARS
+        assert "(registry entry not readable)" in _intake.hermes_cron_entry("hermes-cron.nope", reg)
+        assert "registry" not in _REAL_GATHER({**_job_row(), "machine": "testbox"}, registry=reg,
+                                              runner=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""))
+
+
 if __name__ == "__main__":
     sys.exit(main())
