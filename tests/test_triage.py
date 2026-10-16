@@ -4280,6 +4280,20 @@ def test_a_process_only_repeat_on_a_file_the_pr_no_longer_changes_is_dropped_not
                                        "scripts/gone.py; review confirmed "), item["note"]
 
 
+def test_a_repeat_of_a_prior_process_only_finding_on_a_dropped_file_is_resolved():
+    """An earlier round's process-only finding names its file too: a later finding on that file,
+    which the PR no longer changes, repeats it."""
+    with _triage_env() as (conn, _):
+        prior = {"file": "scripts/gone.py", "line": 3,
+                 "message": "Add 'Closes #20' to the PR description or commit trailer.", "angle": "adversary"}
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-prior-process", prior_findings=[prior],
+            current_findings=[_GONE_FINDING], pr_files=[{"filename": "scripts/other.py"}])
+        _fold_repeat_review(conn, eid, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "confirmed", dict(status)
+
+
 def test_a_repeat_on_a_file_the_pr_still_changes_is_still_a_block():
     with _triage_env() as (conn, ctx):
         eid, pr_files_fn = _seed_repeat_round(

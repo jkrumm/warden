@@ -719,6 +719,8 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         if human_question_note:
             detail = (f"{detail} — findings the review leaves with you, reasons a human must "
                       f"look rather than a work order: {human_question_note}")
+        if resolved_note:
+            detail = f"{detail}; {resolved_note}"
         tag = f"[{category}] " if category else ""
         core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, strikes=0,
                         note=f"{tag}step-7 validation (needs-human): {detail}")

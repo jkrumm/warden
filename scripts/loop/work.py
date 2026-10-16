@@ -2807,7 +2807,7 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
 
 
 def earlier_blocked_files(conn: sqlite3.Connection, item: sqlite3.Row) -> set[str]:
-    """Every file a code-blocking finding named in ANY earlier blocked review round of this chain on the
+    """Every file a blocking finding (code or process-only) named in ANY earlier blocked review round of this chain on the
     same pull request (the rows prior_blocking_findings() reads, without its most-recent-only limit), as
     spelled (`./` dropped). A finding on one of these files that the PR no longer changes repeats a
     block the revision resolved by dropping the change (train._repeats_resolved_by_diff())."""
@@ -2825,7 +2825,7 @@ def earlier_blocked_files(conn: sqlite3.Connection, item: sqlite3.Row) -> set[st
             (item["event_id"], current["id"], floor["id"] if floor else 0, current["artifact_url"])):
         for f in core.safe_json(row["verdict_json"]).get("blocking") or []:
             name = finding_file(f)
-            if name and not is_process_only_finding(f):
+            if name:
                 files.add(name)
     return files
 

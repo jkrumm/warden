@@ -10607,5 +10607,6 @@ until a short page and refuses past GitHub's 3000-file cap.
 Item 1571 (PR #45) built this first and grew to 729 lines over ten review rounds (a ledger migration, a
 dropped-findings memory, `:line` suffix normalisation); it was closed for this minimal version, which
 reads every earlier round instead of storing drops and matches files exactly (a spelling mismatch reads
-as no repeat, so the finding keeps blocking). Tests: `test_triage.py` 618 -> 624, `test_clients.py`
-113 -> 115.
+as no repeat, so the finding keeps blocking). Tests: `test_triage.py` 618 -> 625, `test_clients.py`
+113 -> 115. Review: process-only findings of an earlier round name their file too; the drop is named on a
+needs-human note as well.
