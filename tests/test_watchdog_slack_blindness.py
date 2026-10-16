@@ -144,6 +144,21 @@ check("main() exits 0 once reads recover", wp.main([]), 0)
 conn.close()
 wp.http_get = original
 
+print("\n6. lines that also reach warden by webhook are not polled into a second item")
+original = with_http_get({"messages": [
+    {"ts": "1788000101.000000", "text": "\U0001F6A8 VPS error logs >= 20 (15m)"},
+    {"ts": "1788000102.000000", "text": "\u2705 VPS error logs >= 20 (15m)"},
+    {"ts": "1788000103.000000", "text": "[Brain Sync - Push] [:red_circle: Down] No heartbeat"},
+    {"ts": "1788000104.000000", "text": "*\U0001F6A8 MAM session dead*: seed monitoring is blind"},
+    {"ts": "1788000105.000000", "text": "HomeLab 5m load above threshold"},
+]})
+msgs, latest, ok = wp.poll_slack_messages(ENV, "C0AS1LAUQ3C", "1788000000.000000", skip_webhook_fed=True)
+check("only the non-webhook lines survive", [m["external_id"] for m in msgs], ["1788000104.000000", "1788000105.000000"])
+check("cursor still advances past filtered lines", latest, "1788000105.000000")
+msgs, _, _ = wp.poll_slack_messages(ENV, "C0AS1LAUQ3C", "1788000000.000000")
+check("unfiltered channels (#updates) keep every line", len(msgs), 5)
+wp.http_get = original
+
 print()
 if failures:
     print(f"{len(failures)} failure(s):")

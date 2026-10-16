@@ -2586,7 +2586,7 @@ def _fake_wp_module(messages=None, *, homelab_key: str = "test-homelab-key", fet
     no dependency on a real HOMELAB_API_KEY being resolvable in this venv."""
     return types.SimpleNamespace(
         resolve_secret=lambda key: homelab_key if key == "HOMELAB_API_KEY" else "",
-        poll_slack_messages=lambda env, channel_id, since_ts, skip_uk_push=False: (
+        poll_slack_messages=lambda env, channel_id, since_ts, skip_webhook_fed=False: (
             list(messages or []), None, fetch_ok
         ),
     )
@@ -3023,7 +3023,7 @@ def test_recovery_pairing_skipped_under_dry_run():
     with _triage_env(policy=policy) as (conn, ctx):
         calls = {"n": 0}
 
-        def _counting_poll(env, channel_id, since_ts, skip_uk_push=False):
+        def _counting_poll(env, channel_id, since_ts, skip_webhook_fed=False):
             calls["n"] += 1
             return [], None, True
 

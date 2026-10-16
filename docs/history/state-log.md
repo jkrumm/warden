@@ -10842,3 +10842,18 @@ suites no longer stub `poll_uk` (the locking suite's first writing source is now
 `lifecycle/ingest.py` docstrings, `watchdog-poll.py` docstring.
 
 Gate: `test_triage.py` 674 -> 673 (the deleted poll_uk test; AGENTS.md and STATE.md name 673). `make check` green.
+
+## §179 — HyperDX alerts reach warden by webhook; #alerts HyperDX lines are no longer polled (2026-10-17)
+
+The `vps` repo's 21 HyperDX alerts now list a second channel, the generic webhook `Warden ingest`, next to `Slack #alerts`
+(HyperDX takes up to 10 `channels` since 2.36). Proven live: a temporary threshold of 0 on `VPS error logs >= 20 (15m)`
+opened event #1600, source `hyperdx`, `via: webhook`, title `🚨 VPS error logs >= 20 (15m)`, within two minutes; the
+threshold was then restored and the OK webhook resolves the row. With that proven, `poll_slack_messages()` (its
+`skip_uk_push` argument is now `skip_webhook_fed`) drops, for `#alerts` only, the lines that also arrive by webhook: Kuma's
+`[… Push]` (as before) and HyperDX's `🚨 <alert>` / `✅ <alert>` (`HYPERDX_SLACK_RE`). Slack stays the human mirror and the
+fallback if the webhook dies. The cursor still advances past the dropped lines.
+
+Accepted: a different sender whose #alerts text starts with `🚨 ` or `✅ ` is no longer ingested (the one other such line
+today, the MAM monitor, starts with `*`). weatherorb's four alerts keep their own `ops.alert` webhook and are not in the
+`vps` directory. Test: `test_watchdog_slack_blindness.py` §6.
+

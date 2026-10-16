@@ -748,7 +748,7 @@ def resolve_recovery_paired(conn: sqlite3.Connection, policy: dict[str, Any], no
     if not token:
         return
     msgs, _latest, ok = wp.poll_slack_messages({"HOMELAB_API_KEY": token}, core.ALERTS_CHANNEL, None,
-                                                skip_uk_push=True)
+                                                skip_webhook_fed=True)
     if not ok or not msgs:
         return
     latest_by_key: dict[str, tuple[str, str]] = {}

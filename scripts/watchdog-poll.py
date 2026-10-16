@@ -76,6 +76,9 @@ SKILL_USAGE_PATH = SKILLS_DIR / ".usage.json"
 API_BASE = "https://argo.jkrumm.com/api"
 GH_OWNER = "jkrumm"
 CH_ALERTS = "C0AS1LAUQ3C"
+# #alerts lines that reach warden by webhook as well (Kuma `[name] [...Up|Down]`, HyperDX `🚨|✅ <alert name>`):
+# the Slack copy is the human mirror only, so it must not open a second, duplicate item.
+HYPERDX_SLACK_RE = re.compile(r"^(?:🚨|✅) \S")
 CH_UPDATES = "C0ARZJD824W"
 
 # Same env-first, absolute-default shape as loop/core.py's GH_BIN: launchd hands
@@ -348,7 +351,7 @@ def poll_github(env: dict[str, str]) -> dict[str, list[dict[str, Any]] | None]:
 
 
 def poll_slack_messages(env: dict[str, str], channel_id: str, since_ts: str | None,
-                        skip_uk_push: bool = False,
+                        skip_webhook_fed: bool = False,
                         ) -> tuple[list[dict[str, Any]], str | None, bool]:
     """Third element is ``ok``: False when the fetch itself failed.
 
@@ -379,7 +382,7 @@ def poll_slack_messages(env: dict[str, str], channel_id: str, since_ts: str | No
             continue
         if "ist dem Channel beigetreten" in text or "added an integration" in text:
             continue
-        if skip_uk_push and re.search(r"\[[^\]]+Push\]", text):
+        if skip_webhook_fed and (re.search(r"\[[^\]]+Push\]", text) or HYPERDX_SLACK_RE.match(text)):
             continue
         out.append({
             "external_id": ts,
@@ -1053,7 +1056,7 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
                                   flap_threshold=1, deliver=deliver)
     conn.commit()
 
-    for cur_key, ch_id, src, skip_uk in [
+    for cur_key, ch_id, src, skip_webhook_fed in [
         ("slack_alert_ts", CH_ALERTS, "slack_alert", True),
         ("slack_update_ts", CH_UPDATES, "slack_update", False),
     ]:
@@ -1063,7 +1066,7 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
         # placed at the end is skipped by exactly the paths that just wrote a
         # fail-streak cursor. tests/test_watchdog_locking.py caught this.
         conn.commit()
-        msgs, latest, ok = poll_slack_messages(env, ch_id, since, skip_uk_push=skip_uk)
+        msgs, latest, ok = poll_slack_messages(env, ch_id, since, skip_webhook_fed=skip_webhook_fed)
         streak_key = f"{src}_fail_streak"
         if ok:
             cursor_set(conn, streak_key, "0", now_iso)
