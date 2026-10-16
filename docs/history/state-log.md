@@ -10610,3 +10610,15 @@ the PR no longer names, and the `code_blocking`/`process_blocking` split that fo
 unchanged — a wrapper finding not dropped still goes to the owner, never `blocked`, and the comment on
 the split now says so. Tests: `test_triage.py` 626 -> 627 (a process-only repeat on a dropped file
 confirms, not escalates). AGENTS.md's gate line reads 627.
+
+## 173. The repeat drop strikes on any entry that yields no filename, not only an empty listing (2026-10-16)
+
+Independent review blocked PR #45 on one point: `_repeats_resolved_by_diff()` struck only when the whole
+usable-name set was empty (`if not changed`), so a listing with one malformed entry beside a valid one —
+`[{"filename": None}, {"filename": "b.ts"}]` while the PR also changes `a.py` — still dropped a blocking
+repeat on `a.py` and merged. The drop is now fail-closed per entry: every entry must yield at least one
+usable filename (`filename` or `previous_filename` that `_file_name()` keeps); a non-dict entry, or a
+name normalised to None, strikes and drops nothing. The empty-listing strike remains as the
+after-the-loop `not changed` guard. Tests: `test_triage.py` 628 -> 629 (a malformed entry beside a valid
+one strikes and never confirms; the branch's no-usable-filenames test already covered the all-malformed
+case). AGENTS.md's gate line reads 629.

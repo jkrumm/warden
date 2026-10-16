@@ -4343,6 +4343,22 @@ def test_a_non_empty_pr_file_listing_with_no_usable_filenames_strikes_and_never_
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
 
 
+def test_a_file_listing_with_a_malformed_entry_beside_a_valid_one_strikes_and_never_confirms():
+    """One entry that yields no usable filename beside a valid one still fails closed: the dropped
+    entry could be the very file the repeat names, so a partial listing is never read as resolved
+    (a repeat on `scripts/gone.py` would be dropped on `scripts/other.py` alone)."""
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-malformed-entry", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": None}, {"filename": "scripts/other.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] not in ("confirmed", "blocked"), dict(status)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
+
+
 def test_a_repeat_whose_pr_url_names_no_pr_strikes_and_drops_nothing():
     with _triage_env() as (conn, ctx):
         eid, _ = _seed_repeat_round(

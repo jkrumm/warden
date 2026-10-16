@@ -519,10 +519,12 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
     The spec's rule (dotfiles docs/agent-platform.md, § Revisions): such a repeat is not a block, the
     revision dropped that change, so the diff resolved it. A repeat is matched on the file alone (both
     sides normalized by _file_name()); a finding with no file, or on a file the PR still changes
-    (renames count as changed), is never dropped. A PR URL that names no PR, or a file listing with
-    no usable filenames (empty, or entries `_file_name()` reads as None), is a strike and None: a
-    repeat is never read as resolved on a guess. An unreadable listing drops nothing, so the verdict
-    falls through to `blocked`."""
+    (renames count as changed), is never dropped. A PR URL that names no PR, or a file listing where
+    ANY entry yields no usable filename (an empty listing, an entry that is not a dict, or a name
+    `_file_name()` reads as None), is a strike and None: a repeat is never read as resolved on a
+    guess. One malformed entry beside a valid one still strikes, because the entry that yielded
+    nothing could be the very file the repeat names — a file left off the listing reads as no longer
+    changed. An unreadable listing drops nothing, so the verdict falls through to `blocked`."""
     prior_files = {_finding_file(f) for f in work.prior_blocking_findings(conn, item)} - {None}
     repeats = [f for f in blocking if _finding_file(f) in prior_files]
     if not repeats:
@@ -537,8 +539,16 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
         files = _github.pr_files(owner, name, number)
     except RemoteError:
         return []
-    changed = {_file_name(f.get(key)) for f in files if isinstance(f, dict)
-               for key in ("filename", "previous_filename")} - {None}
+    changed: set[str] = set()
+    for entry in files:
+        names = ({_file_name(entry.get(key)) for key in ("filename", "previous_filename")}
+                 if isinstance(entry, dict) else set()) - {None}
+        if not names:
+            _train_strike(conn, item, now,
+                          f"GitHub's file listing for {owner}/{name}#{number} has an entry with no "
+                          "usable filename; a repeat is not read as resolved on a partial listing")
+            return None
+        changed |= names
     if not changed:
         _train_strike(conn, item, now, f"GitHub listed no files for {owner}/{name}#{number}; "
                                        "a repeat is not read as resolved on an empty listing")

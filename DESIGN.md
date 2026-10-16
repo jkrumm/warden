@@ -113,8 +113,8 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    (`work.UNRESOLVED_PRIOR_MARKER`, matched case-insensitively at the start of the message).
    A blocking finding that repeats a prior round's finding on a file the PR no longer changes is
    dropped, never a block (`_repeats_resolved_by_diff()`), and the drop is fail-closed — an
-   unreadable or empty file listing, or an unparsable PR URL, drops nothing rather than read a
-   repeat as resolved.
+   unreadable, empty, or partially unreadable file listing (an entry that yields no usable
+   filename), or an unparsable PR URL, drops nothing rather than read a repeat as resolved.
    A blocked round with no such finding is converging (the earlier findings are fixed, the
    new ones consequences of the narrow fix) and keeps revising up to the absolute ceiling
    `core.MAX_REVISIONS` = 5 on `revision_count`; a round with
