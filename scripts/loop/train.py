@@ -498,6 +498,31 @@ def _train_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
     return False
 
 
+def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
+                              blocking: list[Any]) -> list[dict[str, Any]] | None:
+    """The blocking findings that repeat a prior round's finding on a file this PR no longer changes.
+    The spec's rule (dotfiles docs/agent-platform.md, § Revisions): such a repeat is not a block, the
+    revision dropped that change, so the diff resolved it. A repeat is matched on the file alone; a
+    finding with no file, or on a file the PR still changes (renames count as changed), is never
+    dropped. None when the PR's file list cannot be read whole: a strike, never a guess."""
+    def _file(f: Any) -> str | None:
+        name = f.get("file") if isinstance(f, dict) else None
+        return name if isinstance(name, str) and name else None
+
+    prior_files = {_file(f) for f in work.prior_blocking_findings(conn, item)} - {None}
+    repeats = [f for f in blocking if _file(f) in prior_files and not work.is_process_only_finding(f)]
+    if not repeats:
+        return []
+    owner, name, number = _github.parse_pr_url(item["pr_url"] or "")
+    try:
+        files = _github.pr_files(owner, name, number)
+    except RemoteError as e:
+        _train_strike(conn, item, now, f"could not read the files of {owner}/{name}#{number}: {e}")
+        return None
+    changed = {f.get(key) for f in files if isinstance(f, dict) for key in ("filename", "previous_filename")}
+    return [f for f in repeats if _file(f) not in changed]
+
+
 def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
                  now: dt.datetime) -> bool:
     """Act on the step-7 review of the train's SHA: agent-gateway's own `review` job on the PR's own
@@ -506,6 +531,8 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     records the SHA and the train moves to merge.
 
     A non-empty `blocking` list refuses the merge outright, never read as a pass, with ONE
+    exception: a finding that repeats a prior round's finding on a file the PR no longer changes is
+    dropped first (_repeats_resolved_by_diff()). Then, with ONE
     precedence above it: `"needs-human"` with an `escalationCategory` AND a fixable code finding goes
     back for a revision (`blocked`) — the findings are a work order, and the owner is paged only once
     none is left; the rest of that shape (no code finding, a process-only finding only, a schema-1 or
@@ -607,6 +634,12 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
 
     outcome = verdict.get("outcome")
     blocking = verdict.get("blocking") or []
+    resolved = _repeats_resolved_by_diff(conn, item, now, blocking)
+    if resolved is None:
+        _release_review_claim(conn, event_id, claim_until)
+        return False
+    dropped = {id(f) for f in resolved}
+    blocking = [f for f in blocking if id(f) not in dropped]
     # The wrapper class is not the implementer's (see is_process_only_finding()). It must not
     # read as `blocked` (that spends a revision) but must not be dropped either, so it goes to the
     # owner with the finding on the card.

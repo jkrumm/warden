@@ -4191,6 +4191,97 @@ def test_real_blocked_review_is_not_retried():
         assert item["strikes"] == 0, "a real finding is not an infrastructure failure"
 
 
+def _seed_repeat_round(conn, eid_external: str, *, prior_findings: list[dict[str, Any]], current_findings:
+                       list[dict[str, Any]], pr_files: list[dict[str, Any]] | Exception):
+    """A review round whose previous round blocked the same PR on `prior_findings`. The previous
+    implement row is inserted first so it sorts before the current one (prior_blocking_findings())."""
+    pr_url = "https://github.com/jkrumm/demo-repo/pull/10"
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,validation_status,validation_job_id,artifact_url,"
+        "created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("impl-prior", "implement", "demo-repo", "b", "done", "blocked", "review-prev", pr_url, NOW.isoformat()),
+    )
+    conn.execute(
+        "INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("review-prev", "review", "demo-repo", "review PR #10", "done",
+         json.dumps(_review_result("actionable", blocking=prior_findings)), NOW.isoformat()),
+    )
+    eid = _seed_validating_item(conn, external_id=eid_external, implement_job="impl-repeat",
+                                review_job="review-repeat")
+    conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id='impl-prior'", (eid,))
+    conn.execute("UPDATE dispatches SET artifact_url=? WHERE job_id='impl-repeat'", (pr_url,))
+    conn.execute("UPDATE triage_items SET dispatch_job=NULL WHERE event_id=?", (eid,))
+    conn.commit()
+    _agent_gateway.get = lambda job_id: {
+        "id": job_id, "status": "done",
+        "result": _review_result("actionable", blocking=current_findings),
+    }
+    files = pr_files
+
+    def _pr_files(owner, repo, number):
+        if isinstance(files, Exception):
+            raise files
+        return files
+
+    return eid, _pr_files
+
+
+def _run_repeat_review(conn, pr_files_fn) -> None:
+    with _env(WARDEN_TRIAGE_POLICY=str(core.POLICY_PATH)):
+        with _patched(_github, pr_files=pr_files_fn):
+            train.advance_merge_trains(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
+
+
+_GONE_FINDING = {"file": "scripts/gone.py", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}
+
+
+def test_a_repeat_of_a_prior_finding_on_a_file_the_pr_no_longer_changes_is_not_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-dropped", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": "scripts/other.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "confirmed", dict(status)
+        assert core.get_item(conn, eid)["train_stage"] == train.TRAIN_MERGE
+
+
+def test_a_repeat_on_a_file_the_pr_still_changes_is_still_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-changed", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": "scripts/gone.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
+
+def test_a_new_finding_on_a_file_the_pr_no_longer_changes_is_still_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-new-dropped", prior_findings=[dict(_GONE_FINDING, file="scripts/old.py")],
+            current_findings=[_GONE_FINDING],
+            pr_files=[{"filename": "scripts/other.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
+
+def test_an_unreadable_pr_file_list_strikes_and_never_confirms_a_repeat():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-unreadable", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=RemoteError("GitHub returned HTTP 502"))
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] not in ("confirmed", "blocked"), dict(status)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
+
+
 def test_validation_outcome_needs_decision_routes_to_needs_decision():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-needs-human")
@@ -14038,6 +14129,8 @@ def _blocked_review_round(conn, eid: int, n: int, blocking: list[dict[str, Any]]
                  (core.STATE_MERGING, "a" * 40, impl, val, "https://github.com/jkrumm/demo-repo/pull/10", n - 1, eid))
     conn.commit()
     _agent_gateway.get = lambda job_id: {"status": "done", "result": _review_result("actionable", blocking=blocking)}
+    # The PR still changes every file these findings name, so no repeat is dropped as resolved.
+    _github.pr_files = lambda owner, repo, number: [{"filename": f["file"]} for f in blocking if f.get("file")]
     if merges is None:
         _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("a blocked review must not merge"))
     else:   # a review that does not block: the round may merge
