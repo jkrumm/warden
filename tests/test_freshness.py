@@ -74,17 +74,11 @@ def test_slack_blind_withholds_like_the_retired_hermes_watchdog_push():
     assert freshness.stale_pollers(conn, NOW) == ["slack_blind"]
 
 
-def test_an_unreadable_poll_cursor_value_is_not_a_crash():
+def test_an_unreadable_poll_cursor_value_withholds_the_push():
     conn = _db()
     _all_fresh(conn)
     _beat(conn, "watchdog_poll_last_run", 5, "not json")
-    assert freshness.stale_pollers(conn, NOW) == []
-
-
-def test_health_and_the_push_share_one_threshold_table():
-    import api
-    assert api.POLLERS is freshness.POLLERS
-    assert api.STALE_MULTIPLE == freshness.STALE_MULTIPLE
+    assert freshness.stale_pollers(conn, NOW) == ["slack_blind"]
 
 
 def main() -> int:

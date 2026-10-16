@@ -96,7 +96,7 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # push also requires the poll and the sweep to be fresh (the same test `/health` applies), so a
     # dead sweep or poller pages through Kuma and not only through an endpoint nobody watches.
     if not dry_run:
-        stale = freshness.stale_pollers(conn, dt.datetime.now(dt.timezone.utc))
+        stale = freshness.stale_pollers(conn, now)
         if stale:
             print(f"triage: Kuma loop heartbeat withheld, stale: {', '.join(stale)}", file=sys.stderr)
         else:

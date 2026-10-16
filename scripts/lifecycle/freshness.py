@@ -44,9 +44,11 @@ def stale_pollers(conn: sqlite3.Connection, now: dt.datetime) -> list[str]:
         if age is None or age > interval_s * STALE_MULTIPLE / 60:
             stale.append(name)
     row = conn.execute("SELECT value FROM cursors WHERE key=?", (POLLERS["watchdog_poll"][0],)).fetchone()
-    try:
-        if row is not None and json.loads(row["value"]).get("slack_blind"):
+    if row is not None:
+        try:
+            blind = bool(json.loads(row["value"]).get("slack_blind"))
+        except (ValueError, AttributeError):
+            blind = True   # an unreadable payload means blindness is unknown: withhold, like the retired push did
+        if blind:
             stale.append("slack_blind")
-    except (ValueError, AttributeError):
-        pass
     return stale

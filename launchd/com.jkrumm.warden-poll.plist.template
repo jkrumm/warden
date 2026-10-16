@@ -18,9 +18,10 @@
        2026-09-07 while the loop kept ticking against a ledger that had stopped
        receiving signals.
 
-       --post makes a clean run ping the UptimeKuma self-health heartbeat (the
-       one thing that notices this poller died); it is withheld while Slack
-       polling is blind and under --dry-run. -->
+       --post is inert since 2026-10-17 (the Hermes Watchdog Kuma push is retired).
+       This poller's liveness is its watchdog_poll_last_run cursor, which the
+       `Warden Loop` push requires fresh and not Slack-blind
+       (scripts/lifecycle/freshness.py). -->
   <key>ProgramArguments</key>
   <array>
     <string>__HOME__/SourceRoot/warden/.venv/bin/python3</string>

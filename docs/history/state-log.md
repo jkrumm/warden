@@ -10870,3 +10870,7 @@ through Kuma (~30 min) and not only through an endpoint nobody watches. `watchdo
 accepted and inert); that monitor is removed from `monitors.yaml`. The Slack-blind withholding it carried moved into
 the freshness test. Tests: `test_freshness.py` (7), `test_triage.py` push gating (673 -> 674),
 `test_watchdog_delivery.py` rewritten around the cursor.
+Rollout order: `make uk-sync` (deletes the `Hermes Watchdog - Push` monitor) before this deploy, or the monitor pages
+for a healthy poller. Known: a poll pass skipped for `LedgerBehind` writes no heartbeat, so a migration window longer
+than 90 min reads as `watchdog_poll` stale. Dead-poller detection is now ~90 min plus the Warden Loop silence window
+(was one Kuma interval); the page names only `Warden Loop`, the cause is on the loop's stderr and `/health`.

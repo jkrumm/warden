@@ -178,11 +178,6 @@ def _available_actions(state: str, mergeable: bool = False, reverted: bool = Fal
         actions.append("note")
     return actions
 
-POLLERS = _freshness.POLLERS
-STALE_MULTIPLE = _freshness.STALE_MULTIPLE
-_poller_age_minutes = _freshness.poller_age_minutes
-
-
 # --- The six funnel numbers ----------------------------------------------------
 #
 # Every metric below returns the same leaf shape: {"value": ..., "unavailable":
@@ -416,9 +411,9 @@ def _metric_poller_ages(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
     """# 5 — minutes with no poller running, per poller plus the worst case."""
     pollers: dict[str, Any] = {}
     ages: list[float] = []
-    for name, (key, interval_s) in POLLERS.items():
-        age_minutes, last_run = _poller_age_minutes(conn, now, key)
-        threshold_minutes = interval_s * STALE_MULTIPLE / 60
+    for name, (key, interval_s) in _freshness.POLLERS.items():
+        age_minutes, last_run = _freshness.poller_age_minutes(conn, now, key)
+        threshold_minutes = interval_s * _freshness.STALE_MULTIPLE / 60
         if age_minutes is None:
             pollers[name] = {
                 "age_minutes": None, "unavailable": "no heartbeat recorded yet",
@@ -534,9 +529,9 @@ def health_payload(conn: sqlite3.Connection) -> dict[str, Any]:
 
     pollers: dict[str, Any] = {}
     all_pollers_ok = True
-    for name, (key, interval_s) in POLLERS.items():
-        age_minutes, last_run = _poller_age_minutes(conn, now, key)
-        threshold_minutes = interval_s * STALE_MULTIPLE / 60
+    for name, (key, interval_s) in _freshness.POLLERS.items():
+        age_minutes, last_run = _freshness.poller_age_minutes(conn, now, key)
+        threshold_minutes = interval_s * _freshness.STALE_MULTIPLE / 60
         ok = age_minutes is not None and age_minutes <= threshold_minutes
         all_pollers_ok = all_pollers_ok and ok
         pollers[name] = {

@@ -10,9 +10,9 @@ later from silent heartbeats), and stray agent-created skills under
 (SQLite). Posts nothing to Slack: the New/Resolved raw-event digest is gone (a
 warden item reaches Slack only as `fixed`/`needs_decision`, loop/notify.py's
 notify_cluster(); everything else lives in Argo). What stays is the poller's own
-health: the blind-Slack-poll alarm on stderr and the exit code, and the UptimeKuma
-poller's own liveness cursor (read by `Warden Loop`'s Kuma push). Uptime Kuma monitors are not polled: Kuma pushes DOWN/UP to
-`POST /ingest/kuma` (lifecycle/ingest.py).
+health: the blind-Slack-poll alarm on stderr and the exit code, and the poller's own
+liveness cursor (read by `Warden Loop`'s Kuma push). Uptime Kuma monitors are not
+polled: Kuma pushes DOWN/UP to `POST /ingest/kuma` (lifecycle/ingest.py).
 
 Source of truth: ~/SourceRoot/warden/scripts/watchdog-poll.py
 ~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
