@@ -116,7 +116,6 @@ wp.cursor_set(conn, "slack_update_ts", "1788000000.000000", NOW_ISO)
 now = dt.datetime(2026, 9, 7, 10, 0, tzinfo=dt.timezone.utc)
 
 # Isolate the Slack leg: every other source is a live network/ssh call.
-wp.poll_uk = lambda *a, **k: []
 wp.poll_docker = lambda *a, **k: []
 wp.poll_op_refs = lambda *a, **k: ([], True)
 wp.poll_github = lambda *a, **k: {"github_pr": []}

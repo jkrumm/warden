@@ -10824,3 +10824,21 @@ Tests: `test_lifecycle.py` merging cases now set `train_job` (job id and `TRAIN_
 merging-defers revision test and the third block of the revert test set `train_job` (the behaviour they meant: a running
 `update_pr` blocks, an ordinary post-revert implement no longer waits behind a merely waiting PR). Gate: 674/674
 (`test_ingest.py` is 39/39; the doc said 37).
+
+## §178 — the `uk` snapshot poll retired, Kuma pushes by webhook (2026-10-17)
+
+Uptime Kuma now POSTs DOWN/UP to `/ingest/kuma` (proven live: a real Kuma DOWN opened an event with source `uk`, the
+UP webhook resolved it), so the 30-minute Argo snapshot of `/uptime-kuma/monitors` is redundant. Removed from
+`scripts/watchdog-poll.py`: `poll_uk()`, the `reconcile(conn, "uk", ...)` call and its commit in `_run_poll()`, and
+`UK_DOWN_GATE_MIN` (used only by that call; the webhook path has no down gate, it opens on the first DOWN). Kept: the
+`uk` source, `INGEST_SOURCES`, `HOMELAB_API_KEY` (docker / Slack pollers use it), `reconcile()` itself.
+
+Behaviour change, accepted: nothing resolves a `uk` row by disappearance any more, so a missed UP webhook leaves the
+row open until Kuma sends another. The pre-retirement down gate (30 min) is also gone: a Kuma DOWN is an event at once.
+
+Tests: `test_triage.py`'s poll_uk tag test is deleted, its assertions are covered by `test_ingest.py` (tags kept in
+the payload, absent when empty, label routing over every tag shape); the locking, Slack-blindness and GitHub-blindness
+suites no longer stub `poll_uk` (the locking suite's first writing source is now docker). Docs: `docs/api.md`,
+`lifecycle/ingest.py` docstrings, `watchdog-poll.py` docstring.
+
+Gate: `test_triage.py` 674 -> 673 (the deleted poll_uk test; AGENTS.md and STATE.md name 673). `make check` green.

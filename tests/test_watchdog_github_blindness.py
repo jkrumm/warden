@@ -83,7 +83,7 @@ stale = [{"external_id": "jkrumm/basalt-ui#51", "title": "t", "url": "",
 wp.reconcile(conn, "github_pr", stale, now, 0, deliver=False)
 conn.commit()
 
-for name in ("poll_uk", "poll_docker", "poll_stray_skills"):
+for name in ("poll_docker", "poll_stray_skills"):
     setattr(wp, name, lambda *a, **k: [])
 wp.poll_op_refs = lambda *a, **k: ([], False)
 wp.poll_hermes_logs = lambda *a, **k: []

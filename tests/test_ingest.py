@@ -260,7 +260,7 @@ def test_invalid_json_and_non_object_bodies_are_400():
 
 # --- /ingest/kuma ----------------------------------------------------------------------
 
-def test_kuma_down_opens_an_event_in_poll_uks_shape():
+def test_kuma_down_opens_an_event_in_the_poll_shape():
     with door() as d:
         tags = [{"name": "repo", "value": "weatherorb", "color": "#fff"}]
         status, body = d.post("/ingest/kuma", kuma_body(0, mid=204, tags=tags))
@@ -273,7 +273,7 @@ def test_kuma_down_opens_an_event_in_poll_uks_shape():
         assert json.loads(row["payload_json"]) == {"type": "push", "status": 0, "tags": tags, "via": "webhook"}
 
 
-def test_kuma_down_without_tags_has_no_tags_key_like_poll_uk():
+def test_kuma_down_without_tags_has_no_tags_key():
     with door() as d:
         d.post("/ingest/kuma", kuma_body(0, tags=[]))
         assert "tags" not in json.loads(_rows(d.db)[0]["payload_json"])
@@ -536,7 +536,7 @@ def test_kuma_webhook_tags_route_exactly_like_the_poll_shape():
             status, resp = d.post("/ingest/kuma", kuma_body(0, mid=500 + i, tags=tags))
             assert status == 202, resp
             assert _route(d.db, resp["event_id"]) == expected, (tags, expected)
-            # The same tags as poll_uk() stores them (no "via") route identically.
+            # The same tags without "via" route identically.
             conn = ledger.connect(d.db)
             poll_payload = json.loads(conn.execute("SELECT payload_json FROM events WHERE id=?",
                                                    (resp["event_id"],)).fetchone()[0])

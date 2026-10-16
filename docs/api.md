@@ -79,25 +79,23 @@ re-armed (`resolved_at` cleared, `first_seen` = now, `notified_at` / `last_remin
 ### `POST /ingest/kuma` (source `uk`)
 
 Uptime Kuma's webhook body: `{"heartbeat": {"status", "msg", "time"}, "monitor": {"id", "name",
-"url", "type", "tags"}, "msg"}`. The event has the shape `poll_uk()` produces.
+"url", "type", "tags"}, "msg"}`. The event has the shape the retired snapshot poll produced.
 
 | Body | Result |
 |-|-|
 | `heartbeat.status` 0 (DOWN) | open / reopen / refresh: `external_id = str(monitor.id)`, `title = monitor.name`, `url`, payload `{"type", "status": 0, "tags"?, "via": "webhook"}` |
 | status 1 (UP) | set `resolved_at` on the open row; `ignored` when there is none or it already resolved |
 | status 2 (pending), 3 (maintenance) | `202 ignored` |
-| `monitor.type == "group"` | `202 ignored`, as `poll_uk()` drops group parents |
+| `monitor.type == "group"` | `202 ignored`, group parents never alert (their children do) |
 | neither `heartbeat` nor `monitor` (Kuma's notification "Test" button) | `202 ignored`, so the setup screen reads success |
 | `monitor.id` or `monitor.name` missing or empty; `status` not 0-3; one of `heartbeat` / `monitor` missing or not an object | `400` |
 
 `payload.tags` keeps Kuma's `[{name, value, ...}]` shape; `route_by_label()` reads a tag's `name` or
 `value` equal to a known repo (`lifecycle/intake._tag_values`), so a webhook-opened event routes exactly as
-one the poll opened (pinned in `tests/test_ingest.py`).
+one the retired poll opened (pinned in `tests/test_ingest.py`).
 
-**Coexistence until the `uk` poll is retired (Wave 10):** `poll_uk()` resolves any open `uk` row whose
-monitor is no longer DOWN in Argo's list, webhook-opened or not, and the poll's `reconcile()` also
-refreshes and re-arms the same row. That is accepted: the shared `(source, external_id)` row means one
-item whichever door touched it.
+**The `uk` snapshot poll is retired.** Kuma's UP webhook is the only thing that resolves a `uk` row; nothing
+resolves one by disappearance any more, so a missed UP leaves the row open until Kuma sends one.
 
 ### `POST /ingest/hyperdx` (new source `hyperdx`)
 

@@ -68,7 +68,7 @@ def _stub_every_probe(conn: sqlite3.Connection, seen: list[tuple[str, bool]]) ->
     """Replace every network probe `_run_poll()` calls with a stub that records
     whether a write transaction was open at the moment it was entered.
 
-    `uk` and `hermes_log` return REAL rows so `reconcile()` and
+    `docker` and `hermes_log` return REAL rows so `reconcile()` and
     `upsert_grouped()` actually write. Without that this whole suite would pass
     vacuously: no writes means no transaction means nothing to hold, and the
     test would be green against the very bug it exists to catch.
@@ -80,7 +80,6 @@ def _stub_every_probe(conn: sqlite3.Connection, seen: list[tuple[str, bool]]) ->
             return result
         return _call
 
-    wp.poll_uk = probe("poll_uk", _observed("uk-1"))
     wp.poll_docker = probe("poll_docker", _observed("docker-1"))
     wp.poll_op_refs = probe("poll_op_refs", (_observed("opref-1"), True))
     wp.poll_github = probe("poll_github", {"github_pr": _observed("pr-1")})
@@ -123,9 +122,9 @@ def test_the_guard_is_not_vacuous():
     rows = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     assert rows > 0, "no rows written — the invariant test would pass vacuously"
     assert len(seen) >= 8, f"expected every probe to be exercised, saw {len(seen)}: {seen}"
-    # `uk` is the first source and it writes; everything after it is a probe
+    # `docker` is the first source and it writes; everything after it is a probe
     # that would have run inside its transaction under the old code.
-    assert seen[0][0] == "poll_uk", seen
+    assert seen[0][0] == "poll_docker", seen
     assert len(seen) > 1, "no probe ran after the first write — nothing to protect"
 
 

@@ -1,6 +1,6 @@
 """Watchdog poll — runs every 1800 s as the `com.jkrumm.warden-poll` LaunchAgent.
 
-Polls UptimeKuma, Docker (homelab + vps), GitHub, Slack #alerts/#updates,
+Polls Docker (homelab + vps), GitHub, Slack #alerts/#updates,
 Hermes self-state, 1Password ref health on homelab + vps (a no-op
 `op run -- true` over the shared .env.tpl — detects a dangling ref directly,
 the failure class behind the 2026-08-01 outage, instead of inferring it hours
@@ -11,7 +11,8 @@ later from silent heartbeats), and stray agent-created skills under
 warden item reaches Slack only as `fixed`/`needs_decision`, loop/notify.py's
 notify_cluster(); everything else lives in Argo). What stays is the poller's own
 health: the blind-Slack-poll alarm on stderr and the exit code, and the UptimeKuma
-heartbeat on a clean run.
+heartbeat on a clean run. Uptime Kuma monitors are not polled: Kuma pushes DOWN/UP to
+`POST /ingest/kuma` (lifecycle/ingest.py).
 
 Source of truth: ~/SourceRoot/warden/scripts/watchdog-poll.py
 ~/.hermes/scripts/ is a symlink to hermes-agent/scripts, NOT to this
@@ -82,7 +83,6 @@ CH_UPDATES = "C0ARZJD824W"
 _env_gh_bin = os.environ.get("GH_BIN")
 GH_BIN = Path(_env_gh_bin).expanduser() if _env_gh_bin else Path("/opt/homebrew/bin/gh")
 
-UK_DOWN_GATE_MIN = 30
 DOCKER_UNHEALTHY_GATE_MIN = 30
 GITHUB_STALE_DAYS = 3
 
@@ -228,50 +228,6 @@ def cursor_set(conn: sqlite3.Connection, key: str, value: str, now_iso: str) -> 
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         (key, value, now_iso),
     )
-
-
-def poll_uk(env: dict[str, str]) -> list[dict[str, Any]]:
-    headers = {"Authorization": f"Bearer {env.get('HOMELAB_API_KEY', '')}"}
-    data = http_get(f"{API_BASE}/uptime-kuma/monitors", headers)
-    if isinstance(data, dict) and "_error" in data:
-        return []
-    monitors: list[Any] = []
-    if isinstance(data, list):
-        monitors = data
-    elif isinstance(data, dict):
-        monitors = data.get("monitors", []) or []
-    out: list[dict[str, Any]] = []
-    for m in monitors:
-        if not isinstance(m, dict):
-            continue
-        # docs/history/state-log.md §49 / DESIGN.md § Open questions ("Resolved since v1"):
-        # group monitors (uk:95 "VPS", uk:179 "Services", uk:186 "Local") are
-        # group PARENTS whose children alert on their own — repo IS NULL, so
-        # escalate() can never dispatch on them, and they remind every 6h
-        # forever. Drop them at the source rather than teach every downstream
-        # consumer to special-case a monitor that can never resolve into
-        # anything actionable.
-        if m.get("type") == "group":
-            continue
-        status = m.get("status")
-        is_down = (isinstance(status, str) and status.lower() == "down") or status == 0 or status is False
-        if not is_down:
-            continue
-        mid = str(m.get("id") or m.get("monitorId") or m.get("name") or "")
-        if not mid:
-            continue
-        payload: dict[str, Any] = {"type": m.get("type"), "status": status}
-        # The monitor's own tags, when the endpoint carries them: triage's label routing
-        # (lifecycle/intake.py route_by_label()) reads a tag naming a repo.
-        if m.get("tags"):
-            payload["tags"] = m["tags"]
-        out.append({
-            "external_id": mid,
-            "title": m.get("name", "monitor") or "monitor",
-            "url": m.get("url") or "",
-            "payload": payload,
-        })
-    return out
 
 
 def poll_docker(env: dict[str, str], host: str) -> list[dict[str, Any]]:
@@ -1051,10 +1007,6 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
     now_iso = now.isoformat()
     all_new: list[dict] = []
     all_res: list[dict] = []
-
-    n, res = reconcile(conn, "uk", poll_uk(env), now, UK_DOWN_GATE_MIN, deliver=deliver)
-    all_new += n; all_res += res
-    conn.commit()
 
     for host in ("homelab", "vps"):
         src = f"docker_{host}"

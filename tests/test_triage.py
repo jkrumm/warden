@@ -11169,22 +11169,6 @@ def test_a_losing_merge_refusal_never_clobbers_the_winners_state():
         assert fresh["state"] == core.STATE_VERIFYING and fresh["note"] == "landed by the other pass"
 
 
-# --- the uk poller ----------------------------------------------------------------
-
-def test_the_uk_poller_keeps_a_monitors_tags_for_label_routing():
-    wp = core.wp_module()
-    saved = wp.http_get
-    wp.http_get = lambda url, headers: [
-        {"id": 11, "name": "Tagged", "type": "http", "status": 0, "tags": [{"name": "repo", "value": "weatherorb"}]},
-        {"id": 12, "name": "Untagged", "type": "http", "status": 0, "tags": []}]
-    try:
-        out = {o["title"]: o["payload"] for o in wp.poll_uk({"HOMELAB_API_KEY": "k"})}
-    finally:
-        wp.http_get = saved
-    assert out["Tagged"] == {"type": "http", "status": 0, "tags": [{"name": "repo", "value": "weatherorb"}]}
-    assert out["Untagged"] == {"type": "http", "status": 0}
-
-
 # --- review fixes: claims, ambiguous submits, strike CAS, notify claim, origin answers ----
 
 def _spy_calls(fn):

@@ -2,14 +2,13 @@
 event -> the `events` ledger. `scripts/api.py` is the HTTP shell (auth, body cap, status codes);
 nothing here touches a socket.
 
-Both senders feed STATE sources, level-based like `uk` has always been through watchdog-poll.py's
-`poll_uk()` + `reconcile()`: one `events` row per (source, external_id), open while the alert fires,
+Both senders feed STATE sources, level-based like `uk` was when watchdog-poll.py polled it
+(`reconcile()`): one `events` row per (source, external_id), open while the alert fires,
 `resolved_at` set when the sender says it is over, re-armed (a new occurrence mark) the next time it
 fires. The open / reopen / refresh branches below are `reconcile()`'s, statement for statement
-(tests/test_ingest.py runs both over the same sequence and compares the rows), so a `uk` event the
-webhook opened is the same row the poll refreshes and folds. Coexistence until the poll is retired:
-`poll_uk()` resolves any open `uk` row whose monitor is no longer DOWN in Argo's list, webhook-opened
-or not. One (source, external_id) row means one item either way.
+(tests/test_ingest.py runs both over the same sequence and compares the rows), so the webhook
+keeps the row semantics the snapshot poll had. The `uk` poll is retired: Kuma's UP webhook is the only
+thing that resolves a `uk` row. One (source, external_id) row means one item.
 
 Pure of I/O apart from the connection the caller hands in: `normalize_*()` take a parsed JSON object
 and raise `IngestError` on a malformed one (the shell's 400); `apply()` runs one `BEGIN IMMEDIATE`
@@ -75,9 +74,9 @@ def _text(value: Any, limit: int) -> str:
 
 def normalize_kuma(body: dict[str, Any]) -> IngestEvent:
     """Kuma's webhook body `{heartbeat: {status, msg, time}, monitor: {id, name, url, type, tags}, msg}`
-    in the shape `poll_uk()` produces. A body with neither `heartbeat` nor `monitor` is the
+    in the shape the retired snapshot poll produced. A body with neither `heartbeat` nor `monitor` is the
     notification's own "Test" button: accepted and ignored, so the sender's setup screen reads success.
-    A group monitor is dropped exactly as `poll_uk()` drops it (its children alert on their own);
+    A group monitor is dropped as the retired poll dropped it (its children alert on their own);
     PENDING and MAINTENANCE are not a state change either way."""
     heartbeat, monitor = body.get("heartbeat"), body.get("monitor")
     if heartbeat is None and monitor is None:
