@@ -4327,6 +4327,22 @@ def test_an_empty_pr_file_listing_strikes_and_never_confirms_a_repeat():
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
 
 
+def test_a_non_empty_pr_file_listing_with_no_usable_filenames_strikes_and_never_confirms():
+    """A listing that is present but yields no usable filename (entries that are not dicts, or
+    names _file_name() normalises to None) must fail closed exactly like an empty listing: the
+    drop depends on `changed`, and a repeat is never read as resolved on a guess."""
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-no-usable-filenames", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": None}, {"previous_filename": ""}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] not in ("confirmed", "blocked"), dict(status)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
+
+
 def test_a_repeat_whose_pr_url_names_no_pr_strikes_and_drops_nothing():
     with _triage_env() as (conn, ctx):
         eid, _ = _seed_repeat_round(
