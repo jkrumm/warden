@@ -220,8 +220,7 @@ def _signal_not_quiet(item: sqlite3.Row, event: sqlite3.Row) -> list[str]:
     return problems
 
 
-def _job_closure(item: sqlite3.Row, event: sqlite3.Row | None, started: dt.datetime,
-                 now: dt.datetime) -> tuple[str, str]:
+def _job_closure(event: sqlite3.Row | None, started: dt.datetime, now: dt.datetime) -> tuple[str, str]:
     """Verified closure of a `job` item (ops-signals.md §6): its fix is `fixed` only when the job's own
     run record shows a success AFTER the deploy (`verify_started_at`, stamped once `make deploy`
     returned). Returns (`done` | `pending` | `expired`, evidence).
@@ -235,13 +234,21 @@ def _job_closure(item: sqlite3.Row, event: sqlite3.Row | None, started: dt.datet
     rows = _jobs_grade.fetch(env={**os.environ, "PATH": _rollout.host_path()})
     row = next((r for r in rows or [] if r["label"] == label), None)
     every = (row or payload).get("every")
-    window = max(core.JOB_VERIFY_MIN_MINUTES,
-                 (2 * float(every) / 60 if isinstance(every, (int, float)) else 0) + core.JOB_VERIFY_MARGIN_MINUTES)
+    cadence_minutes = 2 * float(every) / 60 if isinstance(every, (int, float)) else 0.0
+    window = max(core.JOB_VERIFY_MIN_MINUTES, cadence_minutes + core.JOB_VERIFY_MARGIN_MINUTES)
     last_ok = core.parse_ts(row.get("last_ok")) if row else None
-    if last_ok is not None and last_ok > started:
+    # A success alone is not enough: the LATEST run must be a success too (consecutive_fail == 0), or a job
+    # that ran once and failed again would be `fixed` while it is red.
+    if last_ok is not None and last_ok > started and row.get("consecutive_fail") == 0:
         return "done", f"job {label} succeeded at {core.now_iso(last_ok)}, after the deploy at {core.now_iso(started)}"
-    seen = ("jobs-grade could not be read" if rows is None else f"job {label} is not in the jobs-grade output"
-            if row is None else f"job {label} is {row['grade']}, last success {row.get('last_ok') or 'never'}")
+    if rows is None:
+        seen = "jobs-grade could not be read"
+    elif row is None:
+        seen = f"job {label} is not in the jobs-grade output"
+    elif last_ok is not None and last_ok > started:
+        seen = f"job {label} succeeded at {core.now_iso(last_ok)} but its latest run failed again ({row['grade']})"
+    else:
+        seen = f"job {label} is {row['grade']}, last success {row.get('last_ok') or 'never'}"
     if now - started >= dt.timedelta(minutes=window):
         return "expired", f"no success after the deploy at {core.now_iso(started)} within {window:g} min — {seen}"
     return "pending", f"waiting for a success of {label} after the deploy ({window:g} min window) — {seen}"
@@ -319,7 +326,7 @@ def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         conn.commit()
         return
     if item["origin"] == core.JOB_ORIGIN:
-        outcome, evidence = _job_closure(item, event, started, now)
+        outcome, evidence = _job_closure(event, started, now)
         if outcome == "expired":
             _on_job_closure_expired(conn, item, evidence, now)
             return

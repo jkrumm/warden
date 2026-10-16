@@ -10698,5 +10698,16 @@ Verified closure: `_verify_item()` asks `_job_closure()` for a `job` item once `
 revert (nothing proves the change wrong). `strikes` is given back whenever an item re-advances to `merging`, so the cap is
 the count of earlier expiry transitions in `item_transitions`: the third ends it `failed(work)`.
 
-Tests: `test_triage.py` 655 -> 663 (brief content and cap, the gatherer with a fake runner and Cellar, the tier raise,
-closure done / pending / expired / blind / daily window, the third expiry); `_triage_env()` stubs `gather_job_context`.
+Tests: `test_triage.py` 655 -> 665 (brief content and cap, hostile/oversized fields and a tail that tries to close the
+fence, the gatherer with a fake runner and Cellar and a failed `git log`, the tier raise, closure done / pending /
+expired / blind / daily window / succeeded-then-failed-again, the third expiry); `_triage_env()` stubs `gather_job_context`.
+
+Review (agent-gateway, 1 round): 4 blocking fixed — a failed `git log` no longer reads as "no commits"; every untrusted
+head field is capped and the rules reserve their space; the tail is trimmed by whole lines and its fence is built after the
+trim (a tail line containing a fence is defanged); `done` also needs the latest run to have succeeded
+(`consecutive_fail == 0`). The brief tells the episode a job whose tail names its own fix is a normal implement, never a
+needs_decision (the canary prints `canary unhealthy: … the fix is to set healthy:true and commit`). Declined: moving
+`gather_job_context` into `clients/` (a read-only host fact, injectable runner, one caller), a `closure_expiries` column
+(a schema change for a count the transition history already holds), a per-origin closure strategy (one origin), caching the
+context per pass (bounded by `MAX_OPEN_INVESTIGATIONS`-sized bad-job counts), keeping the first deploy pass at `investigate`
+(the plan and the owner decide the implement tier from day one).
