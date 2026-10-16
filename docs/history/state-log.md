@@ -10868,5 +10868,5 @@ empty (loop, `watchdog_poll`, `dispatch_sweep` each within 3x their interval, an
 through Kuma (~30 min) and not only through an endpoint nobody watches. `watchdog-poll.py` no longer pushes the
 `Hermes Watchdog - Push` monitor (`_push_uptime_heartbeat` and the `UPTIME_PUSH_WATCHDOG` ref are gone; `--post` is
 accepted and inert); that monitor is removed from `monitors.yaml`. The Slack-blind withholding it carried moved into
-the freshness test. Tests: `test_freshness.py` (7), `test_triage.py` push gating (674 -> 675 with it),
+the freshness test. Tests: `test_freshness.py` (7), `test_triage.py` push gating (673 -> 674),
 `test_watchdog_delivery.py` rewritten around the cursor.
