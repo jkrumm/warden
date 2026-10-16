@@ -49,16 +49,16 @@ class RemoteError(WardenError):
 
 
 class CheckRunsUnreadable(RemoteError):
-    """The credential may not read a commit's check-runs — a fine-grained PAT
-    without `Checks: read`, which only bites on a private repository (§110:
-    `GET …/commits/<sha>/check-runs` → 403 "Resource not accessible by personal
-    access token", `x-accepted-github-permissions: checks=read`, on
-    `weatherorb`).
+    """The credential cannot read a commit's check-runs. Not a missing grant: the
+    Checks API is GitHub-App-only for fine-grained tokens, which have no Checks
+    permission to give, so `GET …/commits/<sha>/check-runs` answers 403 "Resource
+    not accessible by personal access token" (§110, `weatherorb`) while
+    `/actions/runs` works with the same token. Nothing to fix on the token.
 
     Its own class because this is a fact about the token, not about the commit,
     and the *caller* owns the answer: `lifecycle/merge.py` falls back to the
-    commit's GitHub Actions workflow runs, and an empty fallback is pending,
-    never "no checks to gate on"."""
+    commit's GitHub Actions workflow runs (the normal path for such a token), and
+    an empty fallback is pending, never "no checks to gate on"."""
 
 
 class SubmitRefused(RemoteError):

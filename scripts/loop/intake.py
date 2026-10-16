@@ -6,15 +6,17 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 import sqlite3
 import sys
 from typing import Any
 
-from clients import github as _github
+from clients import github as _github, jobs_grade as _jobs_grade
 from clients.errors import RemoteError
 from lifecycle import intake as _intake
 from lifecycle import items as _items
+from lifecycle import rollout as _rollout
 from loop import core, triaging
 
 
@@ -228,6 +230,150 @@ def ingest_github_issues(conn: sqlite3.Connection, now: dt.datetime) -> None:
         if issue.get("state") != "closed":
             continue
         conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (now_iso, row["id"]))
+    conn.commit()
+
+
+def ingest_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool = False) -> None:
+    """The `job` source. Once per loop tick: `jobs-grade` (clients/jobs_grade.py) grades this machine's
+    background jobs; every label in a bad grade (failing | stale | flapping | unloaded) is one
+    `events` row `job:<machine>:<label>`, folded in by watchdog-poll.py's reconcile() exactly as a
+    `uk` monitor is. That makes the source LEVEL-based: the event stays one row while the grade stays
+    bad (its payload refreshes every tick), it resolves when the label grades `ok` or leaves the
+    output, and it re-arms (a new occurrence mark, so reopen_if_needed() sees a recurrence) when the
+    label goes bad again.
+
+    A job event opens a `triage_items` row of origin `job`, state `new`, `max_tier=investigate`, with
+    the brief stored on the row. Its repo is NOT chosen here or by a triage job: route_job_items()
+    sends it to the `owner` the job's own state file names. An item still `new`/`triaged` keeps its
+    brief current (the grade text moves); one past that is not touched, so its claim is not disturbed.
+
+    Blind is not recovered: when jobs-grade cannot answer (client returns None) nothing is opened and
+    nothing is resolved this pass. Under --dry-run nothing runs (the contract is "never shells out")."""
+    if dry_run:
+        print("[dry-run] would run jobs-grade for the job source (skipped under --dry-run)")
+        return
+    rows = _jobs_grade.fetch(env={**os.environ, "PATH": _rollout.host_path()})
+    if rows is None:
+        return
+    machine = _jobs_grade.machine_name()
+    observed = [
+        {"external_id": f"{machine}:{row['label']}", "title": f"job {row['label']} is {row['grade']}", "url": "",
+         "payload": {**row, "machine": machine}}
+        for row in rows if row["grade"] in _jobs_grade.BAD_GRADES
+    ]
+    open_events = conn.execute("SELECT external_id FROM events WHERE source=? AND resolved_at IS NULL",
+                                (core.JOB_SOURCE,)).fetchall()
+    graded = {f"{machine}:{row['label']}" for row in rows}
+    for ev in open_events:
+        if ev["external_id"] not in graded:   # an ok label resolves silently; a vanished one is said
+            print(f"triage: job {ev['external_id']} left the jobs-grade output (plist removed or state file "
+                  f"deleted) — resolving its event", file=sys.stderr)
+    if observed or open_events:   # nothing observed and nothing open: all-ok passes touch no table
+        wp = core.wp_module()
+        if wp is None:
+            print("triage: watchdog-poll.py did not load — the job source is skipped this pass", file=sys.stderr)
+            return
+        wp.reconcile(conn, core.JOB_SOURCE, observed, now, 0)
+        conn.commit()
+
+    now_iso = core.now_iso(now)
+    for ev in conn.execute("SELECT * FROM events WHERE source=? AND resolved_at IS NULL",
+                            (core.JOB_SOURCE,)).fetchall():
+        brief = _intake.job_brief(core.safe_json(ev["payload_json"]), machine)
+        item = core.get_item(conn, ev["id"])
+        if item is None:
+            conn.execute(
+                "INSERT INTO triage_items(event_id, signature, repo, state, origin, max_tier, brief, "
+                "occurrences, first_seen, last_seen, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ev["id"], core.signature(ev), None, core.STATE_NEW, core.JOB_ORIGIN, core.JOB_MAX_TIER, brief,
+                 1, ev["first_seen"], now_iso, now_iso, now_iso),
+            )
+            core.record_created_transition(conn, ev["id"], core.STATE_NEW, now_iso)
+        elif item["state"] in (core.STATE_NEW, core.STATE_TRIAGED) and item["brief"] != brief:
+            conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?", (brief, ev["id"]))
+    conn.commit()
+
+
+def job_chronic_reason(conn: sqlite3.Connection, item: sqlite3.Row, policy: dict[str, Any],
+                       label: str) -> str | None:
+    """Why a REOPENED `job` item goes to the owner instead of another dispatch, or None. Reads the
+    reopen that reopen_if_needed() just made (the item's latest terminal -> `new` transition) and the
+    terminal transition it reopened from; `label` (the job's, for the note) comes from the event payload. Two rules, both only for an item warden had already acted on
+    (it carries a `dispatch_job`; an item that healed `quiet` before any dispatch is simply new work):
+
+    - REGRESSION: the item was `fixed` and its job failed again within `jobRegressionHours` — the fix
+      did not hold a day. Counts whatever `jobChronicRecurrences` says.
+    - CHRONIC: it reopened `jobChronicRecurrences` times within `jobChronicWindowDays` (default one
+      reopen within 7 days of the terminal state it left).
+
+    A first-ever item has no reopen transition and is never chronic."""
+    if not item["dispatch_job"]:
+        return None
+    states = (core.STATE_FIXED, core.STATE_QUIET, core.STATE_CLOSED)
+    reopen = conn.execute(
+        "SELECT id, from_state, at FROM item_transitions WHERE event_id=? AND to_state=? "
+        f"AND from_state IN ({','.join('?' * len(states))}) ORDER BY id DESC LIMIT 1",
+        (item["event_id"], core.STATE_NEW, *states),
+    ).fetchone()
+    if reopen is None:
+        return None
+    reopened_at = core.parse_ts(reopen["at"])
+    left = conn.execute(
+        "SELECT at FROM item_transitions WHERE event_id=? AND to_state=? AND id < ? ORDER BY id DESC LIMIT 1",
+        (item["event_id"], reopen["from_state"], reopen["id"]),
+    ).fetchone()
+    left_at = core.parse_ts(left["at"]) if left else None
+    if reopened_at is None or left_at is None:
+        return None
+    gap = reopened_at - left_at
+    if reopen["from_state"] == core.STATE_FIXED and gap < dt.timedelta(hours=policy["jobRegressionHours"]):
+        return (f"the fix did not hold: {label} failed again {gap.total_seconds() / 3600:.1f} h after it was "
+                f"marked fixed (limit {policy['jobRegressionHours']:g} h)")
+    window = policy["jobChronicWindowDays"]
+    if gap < dt.timedelta(days=window):
+        recurrences = _recurrence_count(conn, item["event_id"], reopened_at, window)
+        if recurrences >= policy["jobChronicRecurrences"]:
+            return f"{label} came back {recurrences}x within {window:g} days of warden acting on it"
+    return None
+
+
+def route_job_items(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> None:
+    """The `job` item's whole triage: no model call. Every `new` job item goes, in this order, to
+
+    1. `needs_decision` when its owner is no repo warden knows (a state file the grader could not
+       attribute, `?`, or a repo outside the repos root) — nothing can be dispatched to it;
+    2. `needs_decision` when it is CHRONIC (job_chronic_reason()): a fix that did not hold, or a
+       reopen inside the window. The owner repo is recorded so the card names it;
+    3. `triaged` in the owner repo, where escalate_origin_items() dispatches it (unless paused: then it
+       waits here, which is the point — ingest and routing continue, dispatch does not).
+
+    A reopened item re-enters `triaged` with its old `dispatch_job` cleared: that pointer is the
+    alert path's cooldown anchor, and escalate_origin_items() claims only a row without one."""
+    rows = conn.execute(
+        "SELECT * FROM triage_items WHERE state=? AND origin=?", (core.STATE_NEW, core.JOB_ORIGIN),
+    ).fetchall()
+    if not rows:
+        return
+    known = {name.lower(): name for name in _intake.known_repos()}
+    for item in rows:
+        event = core.get_event(conn, item["event_id"])
+        if event is None:
+            continue
+        payload = core.safe_json(event["payload_json"])
+        owner = known.get(str(payload.get("owner") or "").strip().lower())
+        if owner is None:
+            core.set_state(conn, item["event_id"], core.STATE_NEEDS_DECISION, now, expect_state=core.STATE_NEW,
+                           note=f"[blocker] job owner {payload.get('owner')!r} is not a repo warden can dispatch to — "
+                                f"fix `jobrun --owner` or the checkout")
+            continue
+        chronic = job_chronic_reason(conn, item, policy, str(payload.get("label") or event["external_id"]))
+        if chronic is not None:
+            core.set_state(conn, item["event_id"], core.STATE_NEEDS_DECISION, now, expect_state=core.STATE_NEW,
+                           repo=owner, note=f"[chronic] {chronic}")
+            continue
+        core.set_state(conn, item["event_id"], core.STATE_TRIAGED, now, expect_state=core.STATE_NEW, repo=owner,
+                       note=str(payload.get("reason") or event["title"] or "")[:200], dispatch_job=None,
+                       strikes=0, retry_at=None)
     conn.commit()
 
 

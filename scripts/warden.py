@@ -24,6 +24,9 @@ VERBS
   reinvestigate <event-id>  send an item back for a fresh investigation (--why required)
   adopt <event-id>    point an item at an open pull request warden itself opened for it
                      and rejoin the merge train (--pr <number>)
+  pause               the kill-switch: stop the loop's dispatches, merges and deploys (an explicit
+                     `warden merge` is not stopped); ingest and triage continue (--reason <text>); `resume` lifts it. Needs no ledger.
+  resume
   help
 
 Global flags, anywhere on the line, `--flag value` or `--flag=value`:
@@ -31,6 +34,7 @@ Global flags, anywhere on the line, `--flag value` or `--flag=value`:
   --why --tier --brief-file --context-file
   --origin-channel --origin-thread --origin-event --auto-from-item --model --pr
   --reason resolved|ignored    (close only; default resolved — `ignored` is a human's "this is noise")
+  --reason <text>              (pause only: why warden was paused, shown on /health and in Argo)
 
 There is deliberately no `--brief`: the brief is data, never an argv string.
 
@@ -58,7 +62,7 @@ if str(REPO_SCRIPTS) not in sys.path:
 import ledger  # noqa: E402
 from clients import github, agent_gateway  # noqa: E402
 from clients.errors import PolicyError, PreconditionError, RemoteError, UsageError, WardenError  # noqa: E402
-from lifecycle import dispatch, items, merge, operations, policy  # noqa: E402
+from lifecycle import dispatch, items, merge, operations, pause, policy  # noqa: E402
 # The `run` verb opens its triage_items row through the loop's own functions, not a copy.
 from loop import core, intake, train, triaging, work  # noqa: E402
 
@@ -148,6 +152,10 @@ def _mode(verb: str | None, state: _State) -> str:
         if state.did_mutate:
             return "adopted"
         return "dry-run" if state.dry_run else "refused"
+    if verb == "pause":
+        return "paused" if state.did_mutate else "refused"
+    if verb == "resume":
+        return "resumed" if state.did_mutate else "noop"
     if verb == "close":
         if state.did_mutate:
             return "closed"
@@ -460,6 +468,43 @@ def cmd_dispatch(conn, flags: Flags, positional: list[str], state: _State) -> di
     return out
 
 
+# --- pause / resume (the kill-switch) -----------------------------------------
+
+
+def cmd_pause(flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
+    """`warden pause [--reason <text>]`: write the flag file every loop pass, the sweep and the API
+    read (lifecycle/pause.py). Idempotent: pausing a paused warden keeps its `since`. Touches no
+    ledger and no network, so it works with the ledger behind or agent-gateway down — the moments
+    it is wanted."""
+    if positional:
+        raise UsageError("usage: warden pause [--reason <text>]")
+    if flags.dry_run:
+        return {"verb": "pause", "ok": True, "dryRun": True, "paused": pause.state(),
+                "note": "nothing changed — no flag file was written"}
+    already = pause.state()
+    out_state = pause.pause(flags.reason)
+    state.did_mutate = True
+    state.target = str(pause.flag_path())
+    return {"verb": "pause", "ok": True, "paused": out_state, "alreadyPaused": already is not None,
+            "note": "The loop starts no dispatch, merge or deploy until `warden resume`. Ingest, classify and "
+                    "triage continue; work already in flight is polled and folded."}
+
+
+def cmd_resume(flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
+    if positional:
+        raise UsageError("usage: warden resume")
+    if flags.dry_run:
+        return {"verb": "resume", "ok": True, "dryRun": True, "paused": pause.state(),
+                "note": "nothing changed — the flag file was not removed"}
+    lifted = pause.resume()
+    state.did_mutate = lifted is not None
+    state.noop = lifted is None
+    state.target = str(pause.flag_path())
+    return {"verb": "resume", "ok": True, "wasPaused": lifted is not None, "lifted": lifted,
+            "note": "Dispatch resumes on the next loop pass (at most 10 minutes)." if lifted
+                    else "warden was not paused."}
+
+
 # --- run (Wave 6.1: the `human` origin) --------------------------------------
 
 
@@ -541,6 +586,11 @@ def cmd_run(conn, flags: Flags, positional: list[str], state: _State) -> dict[st
         "origin": "human", "maxTier": max_tier, "repo": name, "queued": queued,
         "triage": triaged, "note": item["note"] if item else None,
     }
+    paused = pause.state()
+    if paused is not None and queued:
+        # Opened and triaged, not dispatched: the kill-switch holds every start, this one's included.
+        out["paused"] = paused
+        out["note"] = f"warden is {pause.describe(paused)} — the item waits in {item_state} until `warden resume`"
 
     if flags.wait and job_id:
         job = agent_gateway.wait(job_id, timeout_s=WAIT_TIMEOUT, interval_s=WAIT_INTERVAL)
@@ -1131,6 +1181,10 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
     elif verb == "close":
         print(f"item {out['eventId']}: {out['fromState']} -> {out['toState']}")
         print(f"note: {out['note']}")
+    elif verb in ("pause", "resume"):
+        print(f"warden is {pause.describe(out.get('paused'))}" if verb == "pause" else out["note"])
+        if verb == "pause":
+            print(out["note"])
     else:
         print(json.dumps(out, indent=2))
 
@@ -1154,6 +1208,9 @@ VERBS
   reinvestigate <event-id>  send an item back for a fresh investigation (--why required)
   adopt <event-id>    point an item at an open pull request warden itself opened for it
                      and rejoin the merge train (--pr <number>)
+  pause [--reason <text>]  the kill-switch: the loop starts no dispatch, merge or deploy (an explicit
+                     `warden merge` is not stopped); ingest and triage continue
+  resume             lift it
   help
 
 Global flags, anywhere on the line, --flag value or --flag=value:
@@ -1161,6 +1218,7 @@ Global flags, anywhere on the line, --flag value or --flag=value:
   --why --tier --brief-file --context-file
   --origin-channel --origin-thread --origin-event --auto-from-item --model --pr
   --reason resolved|ignored    (close only; default resolved)
+  --reason <text>              (pause only)
 
 There is deliberately no --brief: the brief is data, never an argv string.
 Pass it on stdin with a QUOTED heredoc (<<'BRIEF' ... BRIEF) or --brief-file.
@@ -1198,6 +1256,15 @@ def main(argv: list[str]) -> int:
 
         if verb in ("", "help"):
             _print_help()
+            return 0
+
+        # The kill-switch is a flag file: no ledger, no backend, so it works when those do not.
+        if verb in ("pause", "resume"):
+            out = (cmd_pause if verb == "pause" else cmd_resume)(flags, rest, state)
+            if json_flag:
+                print(json.dumps(out, indent=2))
+            else:
+                _print_text(state.verb, out)
             return 0
 
         # `ledger.connect(migrate=False)` asserts the schema version and
@@ -1247,6 +1314,8 @@ def main(argv: list[str]) -> int:
                     "  retry <event-id>  put a failed item back where it failed (--why)\n"
                     "  reinvestigate <event-id>  send an item back for a fresh investigation (--why)\n"
                     "  adopt <event-id>  point an item at an open warden PR and rejoin the merge train (--pr)\n"
+                    "  pause             stop the loop's dispatches, merges and deploys (--reason <text>)\n"
+                    "  resume            lift the pause\n"
                     "  help"
                 )
         finally:

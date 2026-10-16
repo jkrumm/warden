@@ -10610,3 +10610,73 @@ reads every earlier round instead of storing drops and matches files exactly (a 
 as no repeat, so the finding keeps blocking). Tests: `test_triage.py` 618 -> 625, `test_clients.py`
 113 -> 115. Review: process-only findings of an earlier round name their file too; the drop is named on a
 needs-human note as well.
+
+## 171. Wave 6 of the background-jobs chain: the kill-switch and the `job` source (2026-10-16)
+
+Dotfiles `docs/waves/PLAN.md` Wave 6, spec `docs/ops-signals.md` (its *Owner decisions* win). Built in a
+worktree (`warden-w6`) because the checkout is live; not merged or deployed by this session. No ledger
+migration: a job item reuses `origin` (a free-text column, new value `job`), `max_tier`, `brief`, and the
+events/cursors machinery `uk` rides. Tried on a `VACUUM INTO` copy of the live ledger through the loop's own
+`connect(migrate=True)` (v23 -> v23, nothing to run): with a fake `jobs-grade` printing a failing canary it
+opened exactly one item, `job:mini:com.jkrumm.jobrun-canary`, `triaged` in `dotfiles`; with the real
+`jobs-grade` all six jobs graded `ok` and nothing opened.
+
+**The kill-switch.** `lifecycle/pause.py`: `warden pause [--reason]` writes `~/.warden/paused` atomically
+(`{reason, since}`; `$WARDEN_PAUSE_FILE`, then `$WARDEN_HOME`, resolve it at call time, like
+`rollout.deploy_lock()`), `warden resume` removes it, neither needs the ledger or the backend. A flag that
+exists but cannot be read or parsed still pauses; only a missing file is "running". Every site that STARTS
+something asks `core.is_paused()` and returns before claiming: `escalate`, `escalate_origin_items` (so
+`warden run` opens and triages its item but dispatches nothing), `maybe_auto_remediate`,
+`maybe_auto_implement`, `maybe_revise_blocked`, `maybe_submit_reverts`, `advance_merge_trains` (update, review,
+merge), and in `maybe_verify` the deploy of an item with no `verify_started_at`; Argo's `implement` action is
+rejected before its claim. Backstop: `dispatch.open_episode()` / `open_review()` raise `PausedError` (a
+`PolicyError`, exit 4), which the implement and revert callers already read as "deferred", so a race costs a
+note, never a dispatch; `warden dispatch` is gated by it alone. The loop logs the pause at the top of the pass,
+the sweep once per pass. `/health` carries `paused` (`null` | `{reason, since}`) and never fails `ok`
+(`make deploy`'s health gate would otherwise roll a deploy back for it); the Argo snapshot carries it at the
+top level and inside `health`. Decision between the two readings of "merge/deploy of already-dispatched work
+may continue": held. The loop's merge and deploy are the production-touching acts, and a kill-switch that still
+lands code on its own is not one; `make verify` on an already-deployed item keeps running (observation), and the owner's
+explicit `warden merge` / Argo `merge` is not gated (a hand action on a PR they chose). `redrive_failed` and
+the state-only CLI verbs are not gated either: they move an item, the held stage pollers do the starting.
+
+**The `job` source.** `clients/jobs_grade.py` runs `~/.local/bin/jobs-grade` (override
+`$WARDEN_JOBS_GRADE_BIN`, 30 s) and returns its array, or None on a missing binary, a timeout, a non-zero exit,
+non-JSON, or ANY malformed row (one dropped row would read as that job's recovery); a None pass opens and
+resolves nothing. `intake.ingest_jobs()` (after `ingest_github_issues`, skipped under `--dry-run`: the
+contract is "never shells out") folds the bad grades into events `job:<machine>:<label>` with watchdog-poll's
+`reconcile()` and opens the item (origin `job`, `max_tier=investigate`, a stopgap brief from
+`lifecycle/intake.job_brief()`). `<machine>` is `$WARDEN_MACHINE` else the short hostname. `route_job_items()`
+(after the silence paths, so a job that healed before it was routed goes `quiet`) sends a `new` job item to the
+`owner` repo its state file names (case-insensitive over the repos root) with no triage job and no debounce
+(the grader's thresholds are the debounce): an owner no checkout matches (`?`, an IuRoot repo) is
+`needs_decision`, not a guess. Dispatch is the existing `escalate_origin_items()`. A job item past `new` is
+untouched by recovery (silence never discharges work in flight).
+
+**Chronic.** `intake.job_chronic_reason()` reads the reopen `reopen_if_needed()` just made. Reopened item
+warden had acted on (it has a `dispatch_job`, kept as the cooldown anchor; a `quiet` item that healed before any
+dispatch is new work) -> `needs_decision` `[chronic] …` when the reopen came within `jobChronicWindowDays` (7)
+of the terminal state it left and `jobChronicRecurrences` (1) times in that window; a `fixed` item failing
+again within `jobRegressionHours` (24) -> the same verdict, worded as a fix that did not hold, whatever the
+count. Not the alert path's `chronic_recurrences()` (3 reopens in 7 days, built to stop a self-clearing alert
+being silence-resolved): the spec's bar is one, so the policy keys are separate. The "work strike" of the
+24 h rule is read as "the fix failed", i.e. chronic; no `strikes` counter or `failed(work)` is involved, because
+`failed` posts nothing to the owner and this case must reach one. A non-chronic reopen re-enters `triaged`
+with `dispatch_job` cleared (`escalate_origin_items()` claims only a row without one).
+
+Tests: `test_triage.py` 625 -> 655 (`_triage_env()` now stubs the `jobs-grade` client and points the flag into the
+temp dir), new `test_pause.py` (15) and `test_jobs_grade_client.py` (13), `test_warden_cli.py` +7,
+`test_api.py` +1, `test_dispatch_sweep_pipeline.py` +1, `test_merge.py` +1. `make test` exports `WARDEN_PAUSE_FILE=/nonexistent/…`
+to every suite. Each gate (the stage gates, the deploy hold, the Argo rejection and the `open_episode()` backstop) was mutation-checked by removing it. Not live-validated: the loop and the sweep with a
+real flag file, and the first dispatch of a real `job` item. Wave 7 raises the tier and builds the real brief
+and the verified closure; a `job` item closes `resolved` with the investigation's answer until then.
+
+Review fixes: the switch is asked again at every start (per item before a deploy in `maybe_verify`, per repo
+and per hop in the merge train), not snapshotted once per pass; the owner's explicit merge stays exempt and the
+wording everywhere says the LOOP's merges, deploys and dispatches stop; a flag of non-UTF-8 bytes pauses too; a
+job event resolved because its label left the `jobs-grade` output logs one stderr line.
+
+The check-runs 403 on the fine-grained PAT is not a missing grant: the Checks API is GitHub-App-only for
+fine-grained tokens, `/actions/runs` works. `CheckRunsUnreadable`'s message and docstrings, the `workflow_runs()`
+docstring and STATE.md/DESIGN.md now say so, and `merge.read_check_runs()` announces the Actions fallback once
+per commit per process (`_FALLBACK_LOGGED`) instead of on every tick.

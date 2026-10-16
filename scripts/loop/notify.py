@@ -13,7 +13,7 @@ from typing import Any
 
 from clients import argo as _argo
 from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError
-from lifecycle import dispatch as _dispatch, items as _items
+from lifecycle import dispatch as _dispatch, items as _items, pause as _pause
 from loop import core, work, train
 
 
@@ -184,6 +184,9 @@ _ARGO_REVERTED_REFUSAL = "this item was reverted (revert_pr is set) — implemen
 
 def _apply_argo_implement(conn: sqlite3.Connection, item: sqlite3.Row, event_id: int,
                            now: dt.datetime) -> tuple[str, dict[str, Any] | None, str | None]:
+    if core.is_paused():
+        # Before the claim below: a refused dispatch must leave the item exactly as the owner saw it.
+        return "rejected", None, f"warden is {_pause.describe()} — `warden resume`, then retry from Argo"
     if item["state"] not in _ARGO_IMPLEMENT_ALLOWED_STATES:
         return "rejected", None, f"item is in state {item['state']!r}, not needs_decision/failed"
     if item["revert_pr"] is not None:
@@ -496,6 +499,9 @@ def build_argo_snapshot(conn: sqlite3.Connection, now: dt.datetime) -> dict[str,
     return {
         "machine": os.environ.get("WARDEN_MACHINE", "mini"),
         "generatedAt": core.now_iso(now),
+        # The kill-switch (lifecycle/pause.py): null while running, {reason, since} while paused. Also
+        # inside `health`, from the same builder /health serves.
+        "paused": _pause.state(),
         "health": core.api.health_payload(conn),
         "metrics": core.api.metrics_payload(conn),
         "board": board,

@@ -33,6 +33,7 @@ triage → investigate → implement → merge train → deploy → verify, visi
 | `abort` / `revert` / `close` | `warden abort <event-id> --why …` · `warden revert <event-id> --pr <n> --why …` · `warden close <event-id> --why … [--reason resolved\|ignored]` | stop, record a revert, close by hand |
 | `retry` | `warden retry <event-id> [--why …]` | puts a `failed` item back where it failed, with a fresh re-drive budget |
 | `reinvestigate` | `warden reinvestigate <event-id> --why …` | sends an item back to `triaged` for a fresh investigation |
+| `pause` / `resume` | `warden pause [--reason <text>]` · `warden resume` | the kill-switch: the loop dispatches, merges and deploys nothing until `resume` (your own explicit `warden merge` is not stopped); ingest and triage continue. Shown on `/health` |
 
 `warden help` has the exact flags.
 
@@ -40,5 +41,6 @@ triage → investigate → implement → merge train → deploy → verify, visi
 |-|-|
 | Nothing seems to be running | `make status`, then `make logs` |
 | A poller might be dead | `GET http://127.0.0.1:7735/health` — each poller's heartbeat age |
+| Nothing dispatches, items wait in `triaged` | `warden pause` is on: `GET /health` shows `paused {reason, since}`; `warden resume` |
 | An item won't move | `warden status <id>`'s `note`, or the item's Argo timeline |
 | An item is `failed` | its `note` carries the error and `failure_class` says whether the loop re-drives it (`infra`, `policy`) or waits for you (`work`); `warden retry` or Argo's retry puts it back |

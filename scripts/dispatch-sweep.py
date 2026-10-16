@@ -148,6 +148,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from clients import secrets as _secrets, agent_gateway as _agent_gateway  # noqa: E402
 from clients.errors import RemoteError  # noqa: E402
+from lifecycle import pause as _pause  # noqa: E402
 
 HERMES_HOME = Path.home() / ".hermes"
 # The ledger. `~/.warden/warden.db` since the extraction — the same file
@@ -895,6 +896,14 @@ def main(argv: list[str] | None = None) -> int:
         # is not a second loop. Runs unconditionally, once per pass, exactly
         # like run() does — every step re-derives its own eligibility from
         # the DB, so an empty ledger costs one cheap SELECT per step.
+        #
+        # KILL-SWITCH (`warden pause`): read here, once per pass, like the loop does. The chain's
+        # starting steps (revert, revision, auto-implement, the merge train) each check it themselves
+        # and return; what still runs is polling and folding episodes already in flight.
+        paused = _pause.state()
+        if paused is not None:
+            print(f"dispatch-sweep: {_pause.describe(paused)} — folding and delivering only; "
+                  f"the implement chain starts nothing this pass", file=sys.stderr)
         try:
             work.advance_implement_chain(conn, core.load_policy(),
                                           dt.datetime.now(dt.timezone.utc), dry_run=dry_run)

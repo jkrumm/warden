@@ -17,7 +17,7 @@ from typing import Any, NamedTuple
 
 from clients import github as _github
 from clients.errors import WardenError
-from lifecycle import items as _items
+from lifecycle import items as _items, pause as _pause
 
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent
@@ -55,6 +55,20 @@ POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
 # tuple, which is `ingest()`'s alert-source door.
 INGEST_SOURCES = ("slack_alert", "uk", "docker_homelab", "docker_vps", "hermes_log",
                    "op_refs_homelab", "op_refs_vps")
+
+# The `job` source. Each loop pass asks `jobs-grade` for this machine's graded background jobs
+# (loop/intake.py `ingest_jobs()`) and folds the bad ones into `events` with watchdog-poll.py's
+# reconcile(), the state-source path `uk` rides: identity `job:<machine>:<label>`, level-based (one
+# event while the grade stays bad), resolved when the label grades `ok` or leaves the output.
+# NOT in INGEST_SOURCES: ingest() opens an `alert` item that goes through the debounce and the triage
+# job, and a job is routed straight to its owner repo with no model call (route_job_items()).
+JOB_SOURCE = "job"
+# `triage_items.origin` of a job item. It takes the non-alert half of the machine (escalate_origin_items:
+# no debounce, no cluster, no triage job) like `human` and `github_issue`.
+JOB_ORIGIN = "job"
+# A job item may investigate and answer; it does not implement on its own until the job brief and the
+# verified closure exist (dotfiles docs/waves/PLAN.md, Wave 7).
+JOB_MAX_TIER = "investigate"
 
 # The two INGEST_SOURCES that are grouped (upsert_grouped()-based, append-only) rather than
 # state (reconcile()-based, disappearance-resolved): watchdog-poll.py's GROUPED_SOURCES minus
@@ -216,6 +230,16 @@ DEFAULT_QUIET_RESOLVE_HOURS = 2.0
 # _is_chronic().
 DEFAULT_CHRONIC_RECURRENCES = 3
 DEFAULT_CHRONIC_WINDOW_DAYS = 7.0
+
+# A `job` item is CHRONIC when it reopens (a terminal item recurs) this many times inside the window
+# AND warden had already acted on it (it carries a `dispatch_job`): the fix, or the grade, was wrong,
+# so it goes to the owner instead of back to an agent. Unlike DEFAULT_CHRONIC_RECURRENCES (3, an alert
+# that clears itself) the bar is ONE: ops-signals.md §6, "a reopen within 7 days goes to
+# needs_decision". A `fixed` job item that fails again within DEFAULT_JOB_REGRESSION_HOURS is the same
+# verdict whatever the count: a fix that did not hold a day. See intake.job_chronic_reason().
+DEFAULT_JOB_CHRONIC_RECURRENCES = 1
+DEFAULT_JOB_CHRONIC_WINDOW_DAYS = 7.0
+DEFAULT_JOB_REGRESSION_HOURS = 24.0
 
 # Stalled rounds an item may spend (the first attempt included) before it ends for the owner. A
 # round is a blocked review, failed checks or a base that moved (see maybe_revise_blocked()); it is stalled when the review still blocks on a finding of the round before (the reviewer marks it,
@@ -501,6 +525,10 @@ def load_policy() -> dict[str, Any]:
         "quietResolveHours": float(data.get("quietResolveHours") or DEFAULT_QUIET_RESOLVE_HOURS),
         "chronicRecurrences": int(data.get("chronicRecurrences") or DEFAULT_CHRONIC_RECURRENCES),
         "chronicWindowDays": float(data.get("chronicWindowDays") or DEFAULT_CHRONIC_WINDOW_DAYS),
+        # The `job` source's chronic rule (intake.job_chronic_reason()).
+        "jobChronicRecurrences": int(data.get("jobChronicRecurrences") or DEFAULT_JOB_CHRONIC_RECURRENCES),
+        "jobChronicWindowDays": float(data.get("jobChronicWindowDays") or DEFAULT_JOB_CHRONIC_WINDOW_DAYS),
+        "jobRegressionHours": float(data.get("jobRegressionHours") or DEFAULT_JOB_REGRESSION_HOURS),
         # Routing rules: a signature glob -> repo, the deterministic label tier (see label_route()).
         # Validated here, at load, like hostVerbs.
         "rules": [r for r in (data.get("rules") or []) if _valid_rule(r)],
@@ -525,6 +553,13 @@ def load_policy() -> dict[str, Any]:
         # they were alerts; routed to `closed(ignored)` (see classify()).
         "ignoreUnstructuredSlackProse": bool(data.get("ignoreUnstructuredSlackProse")),
     }
+
+
+def is_paused() -> bool:
+    """The kill-switch (lifecycle/pause.py): True while `warden pause` is in force. Every site that
+    starts an agent job, a host verb, a merge or a deploy asks this first; ingest, classify and
+    triage never do. Reads the flag file on each call, so a pause set mid-pass holds the next stage."""
+    return _pause.is_paused()
 
 
 def card_channel(policy: dict[str, Any]) -> str:

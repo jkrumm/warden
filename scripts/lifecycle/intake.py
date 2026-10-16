@@ -91,9 +91,42 @@ _SOURCE_NOTES = {
     "slack_alert": "a message in the #alerts Slack channel (Uptime Kuma, HyperDX, Beszel and script webhooks)",
     "op_refs_homelab": "a 1Password reference in a .env.tpl that no longer resolves",
     "op_refs_vps": "a 1Password reference in a .env.tpl that no longer resolves",
+    "job": "a launchd background job that jobs-grade grades failing, stale, flapping or unloaded",
     "github_go": "a GitHub issue",
     "human": "a request typed by the owner",
 }
+
+MAX_JOB_BRIEF_CHARS = 4000
+
+
+def job_brief(payload: dict[str, Any], machine: str) -> str:
+    """The brief of a `job` item's investigation: what jobs-grade says about one label, as plain
+    facts, and what is asked. A stopgap until the job brief proper (git log since `last_ok`, the last
+    runs, a stderr tail, the allowed and forbidden actions; dotfiles docs/ops-signals.md §6) exists —
+    the tier is `investigate`, so the episode reads and answers and changes nothing."""
+    def field(key: str) -> str:
+        value = payload.get(key)
+        return "-" if value is None or value == "" else str(value)
+
+    lines = [
+        f"Background job `{field('label')}` on `{machine}` is graded {field('grade')} by jobs-grade: {field('reason')}.",
+        "",
+        f"- owner repo: {field('owner')}",
+        f"- runs every: {field('every')} s",
+        f"- last success: {field('last_ok')}",
+        f"- last started: {field('last_started')}",
+        f"- last exit code: {field('rc')}",
+        f"- consecutive failures: {field('consecutive_fail')}",
+        f"- failures in the last 24 h: {field('fails_24h')}",
+        f"- run record: ~/.local/state/jobs/{field('label')}.json (written by jobrun; read-only for you)",
+        "",
+        "Find out why this job fails (or why it stopped running) and what change in the owner repo "
+        "fixes it. Read the host READ-ONLY through the repo's own AGENTS.md commands before "
+        "concluding. Never touch secret values, launchctl state or the live plist. Answer with the "
+        "root cause and the concrete fix; the job is fixed when its next scheduled run exits 0.",
+    ]
+    return "\n".join(lines)[:MAX_JOB_BRIEF_CHARS]
+
 
 def known_repos() -> list[str]:
     """Directories under the repos root that hold an AGENTS.md, sorted. A git worktree

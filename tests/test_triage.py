@@ -51,6 +51,7 @@ TRIAGE_PATH = REPO_ROOT / "scripts" / "triage.py"
 # the very ones scripts/triage.py (loaded by path below) and its stages read at call time.
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from clients import argo as _argo, github as _github, agent_gateway as _agent_gateway, kuma as _kuma  # noqa: E402
+from clients import jobs_grade as _jobs_grade  # noqa: E402
 KUMA_PINGS: list[int] = []
 from clients.errors import HeadMoved, PolicyError, PreconditionError, RemoteError, SubmitRefused  # noqa: E402
 from lifecycle import dispatch as _dispatch, intake as _intake, items as _items  # noqa: E402
@@ -263,6 +264,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_rollout", "sync_checkout"): _rollout.sync_checkout,
         ("_rollout", "checkout_in_use"): _rollout.checkout_in_use,
         ("_kuma", "ping_loop"): _kuma.ping_loop,
+        ("_jobs_grade", "fetch"): _jobs_grade.fetch,
         ("_rollout", "deploy"): _rollout.deploy,
         ("_rollout", "verify"): _rollout.verify,
         ("_argo", "push_snapshot"): _argo.push_snapshot,
@@ -270,7 +272,12 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_argo", "ack_action"): _argo.ack_action,
     }
     saved_repos_root = os.environ.get("WARDEN_REPOS_ROOT")
+    saved_pause_file = os.environ.get("WARDEN_PAUSE_FILE")
     try:
+        # The kill-switch flag lives in the fixture's temp dir (absent = running), never ~/.warden/paused.
+        os.environ["WARDEN_PAUSE_FILE"] = str(tmp_dir / "paused")
+        # `jobs-grade` is a local subprocess: no job source from a test unless it registers one.
+        _jobs_grade.fetch = lambda **kw: []
         core.DB_PATH = tmp_dir / "watchdog.db"
         core.POLICY_PATH = tmp_dir / "triage-policy.json"
         _write_json(core.POLICY_PATH, policy if policy is not None else DEFAULT_POLICY)
@@ -411,6 +418,10 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
             os.environ.pop("WARDEN_REPOS_ROOT", None)
         else:
             os.environ["WARDEN_REPOS_ROOT"] = saved_repos_root
+        if saved_pause_file is None:
+            os.environ.pop("WARDEN_PAUSE_FILE", None)
+        else:
+            os.environ["WARDEN_PAUSE_FILE"] = saved_pause_file
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -14430,6 +14441,569 @@ def test_the_drifting_chains_of_1478_1480_and_1565_stop_at_the_ceiling():
             assert item["revision_count"] == core.MAX_REVISIONS and n == core.MAX_REVISIONS + 1, (ledger_id, n)
             assert max(item["stalled_rounds"], 1) < core.MAX_IMPLEMENT_ATTEMPTS, "the stalled cap never fired"
             assert f"{ledger_id} narrower finding {n}" in item["note"], item["note"]
+
+
+# --- Wave 6: the kill-switch and the `job` source -----------------------------------------------------
+#
+# The kill-switch (lifecycle/pause.py): `warden pause` writes a flag file; while it exists nothing
+# starts — no investigate / implement / revision / revert episode, no host verb, no review, no merge,
+# no deploy — and ingest, classify and triage run as always. The `job` source (loop/intake.py
+# ingest_jobs()): `jobs-grade` rows in a bad grade become `job:<machine>:<label>` events, level-based,
+# routed to the owner repo with no model call, chronic on a quick reopen.
+
+from lifecycle import pause as _pause  # noqa: E402
+
+JOB_LABEL = "com.jkrumm.jobrun-canary"
+JOB_BASE = NOW - dt.timedelta(days=10)   # a fixed instant the time-controlled passes count from
+
+
+def _job_row(**overrides) -> dict[str, Any]:
+    """A `jobs-grade` row exactly as dotfiles' `Graded` prints it (the owner is a repo the fixture knows)."""
+    return {"label": JOB_LABEL, "owner": "demo-repo", "rc": 1, "consecutive_fail": 3, "fails_24h": 3,
+            "last_ok": "2026-10-16T10:00:00.000Z", "last_started": "2026-10-16T11:00:00.000Z", "every": 300,
+            "grade": "failing", "reason": "3 consecutive failures (rc=1)", **overrides}
+
+
+@contextlib.contextmanager
+def _job_machine(name: str = "testbox"):
+    saved = os.environ.get("WARDEN_MACHINE")
+    os.environ["WARDEN_MACHINE"] = name
+    try:
+        yield name
+    finally:
+        if saved is None:
+            os.environ.pop("WARDEN_MACHINE", None)
+        else:
+            os.environ["WARDEN_MACHINE"] = saved
+
+
+def _grading(rows: list[dict[str, Any]] | None):
+    """Registers the jobs-grade fake; the returned box is what the next pass reads (None = blind)."""
+    box = {"rows": rows, "calls": 0}
+
+    def _fetch(**kw):
+        box["calls"] += 1
+        return box["rows"]
+    _jobs_grade.fetch = _fetch
+    return box
+
+
+def _job_pass(conn, now) -> None:
+    """The job half of one loop pass at an injected clock: ingest, reopen, classify, silence paths,
+    route, dispatch — the order run() has them in."""
+    policy = core.load_policy()
+    intake.ingest_jobs(conn, now)
+    intake.reopen_if_needed(conn, now, policy)
+    intake.classify(conn, policy, now)
+    intake.apply_resolutions(conn, now, policy)
+    intake.route_job_items(conn, policy, now)
+    work.escalate_origin_items(conn, now)
+
+
+def _job_item(conn, label: str = JOB_LABEL, machine: str = "testbox"):
+    return conn.execute("SELECT * FROM triage_items WHERE signature=?", (f"job:{machine}:{label}",)).fetchone()
+
+
+def test_a_bad_job_grade_opens_one_event_and_one_item_routed_to_its_owner_with_no_triage_model():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _grading([_job_row(), _job_row(label="com.jkrumm.brain-sync", grade="ok", reason="ok", consecutive_fail=0)])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        _agent_gateway.submit_triage = lambda **kw: (_ for _ in ()).throw(AssertionError("a job is routed, never triaged"))
+        triage.run(conn, dry_run=False)
+
+        events = conn.execute("SELECT * FROM events WHERE source='job'").fetchall()
+        assert [e["external_id"] for e in events] == [f"testbox:{JOB_LABEL}"], "an ok label opens nothing"
+        item = _job_item(conn)
+        assert item["origin"] == "job" and item["max_tier"] == "investigate", dict(item)
+        assert item["repo"] == "demo-repo" and item["state"] == core.STATE_WORKING, dict(item)
+        assert item["triage_job"] is None
+        assert len(calls) == 1 and calls[0]["tier"] == "investigate" and calls[0]["cwd"].endswith("demo-repo"), calls
+        assert JOB_LABEL in calls[0]["brief"] and "3 consecutive failures" in calls[0]["brief"], calls[0]["brief"]
+        assert "testbox" in calls[0]["brief"]
+
+
+def test_a_job_event_is_level_based_one_event_and_one_dispatch_while_the_grade_stays_bad():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        triage.run(conn, dry_run=False)
+        box["rows"] = [_job_row(grade="flapping", reason="3 failures in 24 h", consecutive_fail=0)]
+        triage.run(conn, dry_run=False)
+        triage.run(conn, dry_run=False)
+
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE source='job'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM triage_items WHERE origin='job'").fetchone()[0] == 1
+        assert len(calls) == 1, "the item is in flight: a worse or different bad grade is not a new dispatch"
+        ev = conn.execute("SELECT * FROM events WHERE source='job'").fetchone()
+        assert ev["resolved_at"] is None and "flapping" in ev["title"], dict(ev)
+
+
+def test_each_bad_grade_opens_an_event_and_ok_never_does():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _add_repo(ctx, "demo-repo")
+        rows = [_job_row(label=f"com.jkrumm.job-{g}", grade=g) for g in ("failing", "stale", "flapping", "unloaded", "ok")]
+        _grading(rows)
+        intake.ingest_jobs(conn, NOW)
+        ids = sorted(r["external_id"] for r in conn.execute("SELECT external_id FROM events WHERE source='job'"))
+        assert ids == sorted(f"testbox:com.jkrumm.job-{g}" for g in ("failing", "stale", "flapping", "unloaded"))
+
+
+def test_a_job_that_recovers_resolves_its_event_and_silences_a_still_new_item_only():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row(), _job_row(label="com.jkrumm.other")])
+        t0 = NOW - dt.timedelta(hours=3)
+        intake.ingest_jobs(conn, t0)               # both items are `new`
+        policy = core.load_policy()
+        intake.route_job_items(conn, policy, t0)   # the second one goes on to be worked
+        other = _job_item(conn, "com.jkrumm.other")
+        core.set_state(conn, other["event_id"], core.STATE_WORKING, t0, dispatch_job="inv-other")
+        conn.execute("UPDATE triage_items SET state='new', repo=NULL WHERE event_id=?",
+                     (_job_item(conn)["event_id"],))   # keep the first as an unrouted `new` item
+        conn.commit()
+
+        box["rows"] = [_job_row(grade="ok", reason="ok"), _job_row(label="com.jkrumm.other", grade="ok")]
+        later = t0 + dt.timedelta(hours=1)
+        intake.ingest_jobs(conn, later)
+        intake.apply_resolutions(conn, later, policy)
+
+        assert all(e["resolved_at"] for e in conn.execute("SELECT * FROM events WHERE source='job'"))
+        assert _job_item(conn)["state"] == core.STATE_QUIET, "silence cancels the need to start"
+        assert _job_item(conn, "com.jkrumm.other")["state"] == core.STATE_WORKING, "silence never discharges work in flight"
+
+
+def test_a_blind_jobs_grade_pass_opens_nothing_and_resolves_nothing():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading(None)   # the client could not grade: it logged and returned None
+        intake.ingest_jobs(conn, NOW)
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0, "blind opens nothing"
+        box["rows"] = [_job_row()]
+        intake.ingest_jobs(conn, NOW)
+        box["rows"] = None
+        intake.ingest_jobs(conn, NOW + dt.timedelta(minutes=10))
+        ev = conn.execute("SELECT * FROM events WHERE source='job'").fetchone()
+        assert ev["resolved_at"] is None, "a blind pass is not a recovery"
+
+
+def test_the_job_source_never_shells_out_under_dry_run():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row()])
+        triage.run(conn, dry_run=True)
+        assert box["calls"] == 0, "the dry-run contract: never shells out"
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE source='job'").fetchone()[0] == 0
+
+
+def test_a_job_whose_owner_is_no_repo_warden_knows_goes_to_the_owner_not_to_a_guess():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _grading([_job_row(label="com.iu.thing", owner="prometheus-scripts"), _job_row(label="com.jkrumm.corrupt", owner="?")])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        _agent_gateway.submit_triage = lambda **kw: (_ for _ in ()).throw(AssertionError("no triage guess"))
+        triage.run(conn, dry_run=False)
+        for label in ("com.iu.thing", "com.jkrumm.corrupt"):
+            item = _job_item(conn, label)
+            assert item["state"] == core.STATE_NEEDS_DECISION and item["repo"] is None, dict(item)
+            assert "not a repo warden can dispatch to" in item["note"], item["note"]
+        assert calls == []
+
+
+def test_a_job_owner_matches_a_repo_regardless_of_case():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _grading([_job_row(owner="Demo-Repo")])
+        _job_pass(conn, NOW)
+        assert _job_item(conn)["repo"] == "demo-repo"
+
+
+def test_a_job_item_brief_follows_the_grade_while_it_waits():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row()])
+        _pause.pause("test", NOW)
+        _job_pass(conn, NOW)
+        assert _job_item(conn)["state"] == core.STATE_TRIAGED
+        box["rows"] = [_job_row(grade="stale", reason="last run 90 min ago, window 30 min")]
+        _job_pass(conn, NOW + dt.timedelta(minutes=10))
+        item = _job_item(conn)
+        assert "graded stale" in item["brief"] and "90 min ago" in item["brief"], item["brief"]
+
+
+def _job_fixed_then_failing_again(conn, box, calls, *, fixed_after: dt.timedelta, back_after: dt.timedelta):
+    """First failure at JOB_BASE (dispatched), `fixed` `fixed_after` later, the job ok an hour on,
+    failing again `back_after` after the fix. Returns the item after the second failure's pass."""
+    box["rows"] = [_job_row()]
+    _job_pass(conn, JOB_BASE)
+    first = _job_item(conn)
+    assert first["state"] == core.STATE_WORKING and first["dispatch_job"] and len(calls) == 1, dict(first)
+    fixed_at = JOB_BASE + fixed_after
+    core.set_state(conn, first["event_id"], core.STATE_FIXED, fixed_at, note="verified")
+    conn.commit()
+    box["rows"] = [_job_row(grade="ok", reason="ok", consecutive_fail=0)]
+    _job_pass(conn, fixed_at + dt.timedelta(hours=1))
+    assert core.get_item(conn, first["event_id"])["state"] == core.STATE_FIXED
+    box["rows"] = [_job_row()]
+    _job_pass(conn, fixed_at + back_after)
+    return core.get_item(conn, first["event_id"])
+
+
+def test_a_job_reopened_within_seven_days_of_warden_acting_goes_to_needs_decision_not_a_dispatch():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        item = _job_fixed_then_failing_again(conn, box, calls, fixed_after=dt.timedelta(minutes=30),
+                                              back_after=dt.timedelta(days=2))
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["note"].startswith("[chronic] ") and "within 7 days" in item["note"], item["note"]
+        assert item["repo"] == "demo-repo"
+        assert len(calls) == 1, "chronic goes to the owner instead of back to an agent"
+
+
+def test_a_fixed_job_that_fails_again_within_24h_is_a_regression_of_the_fix():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        item = _job_fixed_then_failing_again(conn, box, calls, fixed_after=dt.timedelta(minutes=30),
+                                              back_after=dt.timedelta(hours=3))
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert "the fix did not hold" in item["note"] and "3.0 h after it was marked fixed" in item["note"], item["note"]
+        assert len(calls) == 1
+
+
+def test_a_job_that_fails_again_after_the_window_is_new_work_and_dispatches_again():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        item = _job_fixed_then_failing_again(conn, box, calls, fixed_after=dt.timedelta(minutes=30),
+                                              back_after=dt.timedelta(days=8))
+        assert item["state"] == core.STATE_WORKING and item["dispatch_job"] == "job-000002", dict(item)
+        assert len(calls) == 2
+
+
+def test_a_job_that_healed_before_warden_acted_is_not_chronic_when_it_comes_back():
+    """`quiet` with no dispatch on record: nothing was tried, so nothing failed to hold."""
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        policy = core.load_policy()
+        t0 = NOW - dt.timedelta(hours=5)
+        intake.ingest_jobs(conn, t0)                       # an unrouted `new` item …
+        box["rows"] = [_job_row(grade="ok", reason="ok")]
+        intake.ingest_jobs(conn, t0 + dt.timedelta(minutes=10))
+        intake.apply_resolutions(conn, t0 + dt.timedelta(minutes=10), policy)
+        assert _job_item(conn)["state"] == core.STATE_QUIET   # … silenced before it was ever routed
+        box["rows"] = [_job_row()]
+        _job_pass(conn, t0 + dt.timedelta(hours=2))
+        item = _job_item(conn)
+        assert item["state"] == core.STATE_WORKING and len(calls) == 1, dict(item)
+
+
+def test_the_job_chronic_thresholds_come_from_the_policy_file():
+    policy = core.load_policy()
+    assert (policy["jobChronicRecurrences"], policy["jobChronicWindowDays"], policy["jobRegressionHours"]) == (1, 7.0, 24.0)
+    shipped = json.loads((core.TRIAGE_REPO_DIR / "config" / "triage-policy.json").read_text())
+    assert (shipped["jobChronicRecurrences"], shipped["jobChronicWindowDays"], shipped["jobRegressionHours"]) == (1, 7, 24)
+    with _triage_env(policy=dict(DEFAULT_POLICY, jobChronicWindowDays=1, jobRegressionHours=1)) as (conn, ctx), _job_machine():
+        assert core.load_policy()["jobChronicWindowDays"] == 1.0 and core.load_policy()["jobRegressionHours"] == 1.0
+        box = _grading([])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        item = _job_fixed_then_failing_again(conn, box, calls, fixed_after=dt.timedelta(minutes=30),
+                                              back_after=dt.timedelta(days=2))
+        assert item["state"] == core.STATE_WORKING, "two days is outside a one-day window"
+
+
+def test_a_job_item_answered_by_its_investigation_closes_and_a_recurrence_goes_to_the_owner():
+    """max_tier=investigate: the verdict is the answer, the item closes `resolved` (Wave 7 raises the tier)."""
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row()])
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        _job_pass(conn, JOB_BASE)
+        item = _job_item(conn)
+        conn.execute("UPDATE dispatches SET status='done', finished_at=?, verdict_json=? WHERE job_id=?",
+                     (JOB_BASE.isoformat(), json.dumps({"summary": "raise the timeout", "nextAction": "implement",
+                                                        "confidence": "high"}), item["dispatch_job"]))
+        conn.commit()
+        work.fold_dispatch_verdict(conn, origin_event_id=item["event_id"], job_id=item["dispatch_job"],
+                                   now=JOB_BASE + dt.timedelta(minutes=20), dry_run=False)
+        closed = _job_item(conn)
+        assert closed["state"] == core.STATE_CLOSED and closed["close_reason"] == core.CLOSE_RESOLVED, dict(closed)
+        box["rows"] = [_job_row(grade="ok", reason="ok")]
+        _job_pass(conn, JOB_BASE + dt.timedelta(hours=1))
+        box["rows"] = [_job_row()]
+        _job_pass(conn, JOB_BASE + dt.timedelta(hours=30))
+        again = _job_item(conn)
+        assert again["state"] == core.STATE_NEEDS_DECISION and "[chronic]" in again["note"], dict(again)
+        assert len(calls) == 1
+
+
+# --- the kill-switch at every dispatch site ---
+
+
+def _no_agent_jobs():
+    """Every way to start an agent job raises: a paused warden must reach none of them."""
+    def _boom(name):
+        return lambda *a, **kw: (_ for _ in ()).throw(AssertionError(f"a paused warden started a job through {name}"))
+    _agent_gateway.submit = _boom("submit")
+    _agent_gateway.submit_review = _boom("submit_review")
+    _agent_gateway.submit_update_pr = _boom("submit_update_pr")
+
+
+def test_a_paused_loop_ingests_and_triages_but_dispatches_nothing_until_resumed():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _grading([_job_row()])
+        eid_alert = _insert_event(conn, source="slack_alert", external_id="paused-alert", title="Paused alert",
+                                   first_seen=OLD, reminder_count=2)
+        human = intake.open_origin_item(conn, origin="human", repo="demo-repo", brief="look into the flaky test",
+                                         max_tier="implement", external_id="human:paused-1", title="flaky", now=NOW)
+        triage_calls: list[dict[str, Any]] = []
+        _agent_gateway.submit_triage = _fake_triage({"Paused alert": "demo-repo", "flaky": "demo-repo"},
+                                                     calls=triage_calls)
+        _no_agent_jobs()
+        _pause.pause("testing the switch", NOW)
+
+        triage.run(conn, dry_run=False)
+
+        assert len(triage_calls) == 2, "triage is a classification, not an action: it continues"
+        assert core.get_item(conn, eid_alert)["state"] == core.STATE_TRIAGED
+        assert core.get_item(conn, human)["state"] == core.STATE_TRIAGED
+        assert _job_item(conn)["state"] == core.STATE_TRIAGED, "the job source ingests and routes while paused"
+        assert conn.execute("SELECT COUNT(*) FROM dispatches").fetchone()[0] == 0
+        assert len(ctx.argo_pushes) == 1 and ctx.argo_pushes[0]["paused"]["reason"] == "testing the switch"
+        assert ctx.argo_pushes[0]["health"]["paused"]["reason"] == "testing the switch"
+
+        _pause.resume()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        triage.run(conn, dry_run=False)
+        assert len(calls) == 3, "resume: the waiting items dispatch on the next pass"
+        assert ctx.argo_pushes[-1]["paused"] is None
+        for e in (eid_alert, human, _job_item(conn)["event_id"]):
+            assert core.get_item(conn, e)["state"] == core.STATE_WORKING
+
+
+def test_pause_holds_a_verdict_waiting_for_its_implement_dispatch():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-pause-impl")
+        _no_agent_jobs()
+        _pause.pause(None, NOW)
+        work.maybe_auto_implement(conn, core.load_policy(), NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["implement_job"] is None and item["state"] == core.STATE_WORKING and not item["note"], dict(item)
+        _pause.resume()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_auto_implement(conn, core.load_policy(), NOW, dry_run=False)
+        assert len(calls) == 1 and core.get_item(conn, eid)["implement_job"], "the same call, un-paused, starts it"
+
+
+def test_pause_holds_a_revision():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-pause-rev")
+        _blocked_review_round(conn, eid, 1, [_finding("blocking")])
+        before = dict(core.get_item(conn, eid))
+        assert before["state"] == core.STATE_WORKING and work.revisable(core.get_item(conn, eid))
+        _no_agent_jobs()
+        _pause.pause(None, NOW)
+        work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+        assert dict(core.get_item(conn, eid)) == before
+        _pause.resume()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
+        assert len(calls) == 1, "the same call, un-paused, starts the revision"
+
+
+def test_pause_holds_a_revert():
+    with _triage_env() as (conn, ctx):
+        eid = _reverting(conn, "sig-pause-revert", state=core.STATE_WORKING)
+        _no_agent_jobs()
+        _pause.pause(None, NOW)
+        verify.maybe_submit_reverts(conn, core.load_policy(), NOW, dry_run=False)
+        held = core.get_item(conn, eid)
+        assert held["implement_job"] is None and held["note"] is None, (
+            "held by the stage's own gate: the open_episode() backstop would leave a `deferred:` note")
+        _pause.resume()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        verify.maybe_submit_reverts(conn, core.load_policy(), NOW, dry_run=False)
+        assert len(calls) == 1 and core.get_item(conn, eid)["implement_job"], "the revert starts the moment the switch is off"
+
+
+def test_pause_holds_the_merge_train_without_moving_an_item():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "pause-train", 41)
+        _no_agent_jobs()
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("a paused warden merged"))
+        _agent_gateway.get = lambda job_id: (_ for _ in ()).throw(AssertionError("a paused train polls nothing"))
+        before = dict(core.get_item(conn, eid))
+        _pause.pause(None, NOW)
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert dict(core.get_item(conn, eid)) == before
+
+
+def test_pause_holds_a_deploy_but_still_verifies_what_is_already_deployed():
+    with _triage_env() as (conn, ctx):
+        undeployed = _seed_verifying(conn, "sig-pause-undeployed")
+        deployed = _seed_verifying(conn, "sig-pause-deployed", started=NOW - dt.timedelta(minutes=5))
+        ran = _fake_rollout(targets=("deploy", "verify"), deploy=_ran(tail="deployed"), verify=_ran())
+        _pause.pause(None, NOW)
+        verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert ran == [("verify", "demo-repo")], f"no `make deploy` while paused, `make verify` still observes: {ran}"
+        assert core.get_item(conn, undeployed)["verify_started_at"] is None
+        assert core.get_item(conn, deployed)["verify_started_at"] is not None
+        _pause.resume()
+        verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert ("deploy", "demo-repo") in ran
+
+
+def test_pause_holds_a_host_verb():
+    with _triage_env(policy=HOST_VERB_POLICY) as (conn, ctx):
+        calls_file = ctx.tmp_dir / "verb-calls"
+        stub = _write_host_verb_stub(ctx.tmp_dir, calls_file=calls_file)
+        core.HOST_VERB_ALLOWLIST = {"restart-hermes-gateway": [str(stub)]}
+        eid = _seed_host_verb_item(conn, confidence="high")
+        _pause.pause(None, NOW)
+        work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        assert not calls_file.exists() and core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
+        _pause.resume()
+        work.maybe_auto_remediate(conn, HOST_VERB_POLICY, NOW, dry_run=False)
+        assert calls_file.exists()
+
+
+def test_pause_is_the_backstop_under_open_episode_and_open_review_and_leaves_no_row():
+    with _triage_env() as (conn, ctx):
+        _no_agent_jobs()
+        _pause.pause("backstop", NOW)
+        for call in (
+            lambda: _dispatch.open_episode(conn, repo="demo-repo", tier="investigate", brief="b", context=None,
+                                           why=None, origin=_dispatch.Origin(), authorized_by=None),
+            lambda: _dispatch.open_review(conn, repo="demo-repo", pr=3, context=None, origin=_dispatch.Origin()),
+        ):
+            try:
+                call()
+            except _pause.PausedError as e:
+                assert isinstance(e, PolicyError) and e.exit_code == 4 and "backstop" in str(e), str(e)
+            else:
+                raise AssertionError("a paused warden opened an episode")
+        assert conn.execute("SELECT COUNT(*) FROM dispatches").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
+
+
+def test_pause_rejects_an_argo_implement_action_before_it_claims_the_item():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_item(conn, external_id="sig-pause-argo", state=core.STATE_NEEDS_DECISION, dispatch_job="inv-x",
+                         max_tier="implement")
+        _no_agent_jobs()
+        _pause.pause("argo", NOW)
+        item = core.get_item(conn, eid)
+        status, result, error = notify._apply_argo_implement(conn, item, eid, NOW)
+        assert status == "rejected" and "paused" in error and "argo" in error, (status, error)
+        assert dict(core.get_item(conn, eid)) == dict(item), "a refused dispatch leaves the item as the owner saw it"
+
+
+def test_a_pause_set_mid_pass_holds_the_next_stage():
+    """The flag is read by each starting stage, not once: pausing while a pass runs stops the rest of it."""
+    with _triage_env() as (conn, ctx):
+        _seed_item(conn, external_id="sig-mid-pass", state=core.STATE_TRIAGED, occurrences=3)
+        _no_agent_jobs()
+        real = work.escalate_origin_items
+        work.escalate_origin_items = lambda *a, **kw: (_pause.pause("mid-pass", NOW), real(*a, **kw))[1]
+        try:
+            triage.run(conn, dry_run=False)
+        finally:
+            work.escalate_origin_items = real
+        assert conn.execute("SELECT COUNT(*) FROM dispatches").fetchone()[0] == 0
+
+
+def test_a_paused_loop_says_so_and_the_unpaused_one_does_not():
+    with _triage_env() as (conn, ctx):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            triage.run(conn, dry_run=False)
+        assert "paused" not in err.getvalue()
+        _pause.pause("because", NOW)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            triage.run(conn, dry_run=False)
+        assert "paused since" in err.getvalue() and "because" in err.getvalue(), err.getvalue()
+
+
+# --- the kill-switch is asked again at every start, not once per pass ---
+
+
+def test_a_pause_set_while_one_deploy_runs_holds_the_next_deploy():
+    with _triage_env() as (conn, ctx):
+        first = _seed_verifying(conn, "sig-deploy-a")
+        second = _seed_verifying(conn, "sig-deploy-b")
+        ran = _fake_rollout(targets=("deploy", "verify"), deploy=_ran(tail="deployed"), verify=_ran())
+        real_deploy = _rollout.deploy
+        _rollout.deploy = lambda cwd, **kw: (_pause.pause("mid-deploy", NOW), real_deploy(cwd, **kw))[1]
+        verify.maybe_verify(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert [r for r in ran if r[0] == "deploy"] == [("deploy", "demo-repo")], f"the second deploy ran: {ran}"
+        assert core.get_item(conn, first)["verify_started_at"] is not None
+        assert core.get_item(conn, second)["verify_started_at"] is None
+
+
+def _seed_update_stage_item(conn, name: str, repo: str, pr: int) -> int:
+    return _seed_item(conn, external_id=name, state=core.STATE_MERGING, repo=repo, train_stage="update",
+                      implement_job=f"impl-{name}", pr_url=f"https://github.com/jkrumm/{repo}/pull/{pr}")
+
+
+def test_a_pause_set_during_one_repos_train_holds_every_repo_after_it():
+    with _triage_env() as (conn, ctx):
+        x = _seed_update_stage_item(conn, "sig-train-x", "demo-repo", 51)
+        y = _seed_update_stage_item(conn, "sig-train-y", "other-repo", 52)
+        started: list[int] = []
+
+        def _update_pr(*, cwd, pr):
+            started.append(pr)
+            _pause.pause("mid-train", NOW)
+            return {"id": f"update-{pr}", "status": "queued"}
+
+        _agent_gateway.submit_update_pr = _update_pr
+        train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert started == [51], f"repo Y's train started after the pause: {started}"
+        assert core.get_item(conn, x)["train_job"] == "update-51"
+        assert core.get_item(conn, y)["train_job"] is None
+
+
+def test_a_pause_set_between_two_train_hops_stops_before_the_next_stage():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_review_item(conn, "pause-hop", 53)
+        conn.execute("UPDATE triage_items SET reviewed_sha=train_sha WHERE event_id=?", (eid,))
+        conn.commit()
+        _merge.plan_or_land = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("a paused train merged"))
+        real_stage = train._TRAIN_STAGES[train.TRAIN_REVIEW]
+
+        def _review_then_pause(*a, **kw):
+            hopped = real_stage(*a, **kw)     # reviewed already: hops to the merge stage, True
+            _pause.pause("between hops", NOW)
+            return hopped
+
+        train._TRAIN_STAGES[train.TRAIN_REVIEW] = _review_then_pause
+        try:
+            train.advance_merge_trains(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        finally:
+            train._TRAIN_STAGES[train.TRAIN_REVIEW] = real_stage
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["train_stage"] == train.TRAIN_MERGE, dict(item)
+
+
+def test_a_job_that_leaves_the_grader_output_is_resolved_with_one_stderr_line_and_ok_is_silent():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([_job_row(), _job_row(label="com.jkrumm.other")])
+        intake.ingest_jobs(conn, NOW)
+        box["rows"] = [_job_row(label="com.jkrumm.other", grade="ok", reason="ok")]   # canary vanished, other is ok
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            intake.ingest_jobs(conn, NOW + dt.timedelta(minutes=10))
+        lines = [l for l in err.getvalue().splitlines() if "left the jobs-grade output" in l]
+        assert lines == [l for l in lines if f"testbox:{JOB_LABEL}" in l] and len(lines) == 1, err.getvalue()
+        assert all(e["resolved_at"] for e in conn.execute("SELECT * FROM events WHERE source='job'"))
 
 
 if __name__ == "__main__":

@@ -341,6 +341,28 @@ def test_unreadable_check_runs_fall_back_to_actions_runs_and_pass_when_green():
         conn.close()
 
 
+def test_the_actions_fallback_is_announced_once_per_commit_not_every_tick():
+    """The merge train reads checks every tick. A fine-grained token can never read the Checks API
+    (GitHub-App-only, nothing to grant), so the fallback is the normal path: one stderr line per SHA."""
+    import contextlib
+    import io
+    sha_a, sha_b = "a" * 40, "b" * 40
+    merge._FALLBACK_LOGGED.clear()
+    runs = [{"name": "CI", "status": "completed", "conclusion": "success"}]
+    with fakes(check_runs_error=github.CheckRunsUnreadable("HTTP 403"), workflow_runs=runs):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(3):
+                assert merge.read_check_runs("jkrumm", "weatherorb", sha_a) == runs
+            merge.read_check_runs("jkrumm", "weatherorb", sha_b)
+            merge.read_check_runs("jkrumm", "weatherorb", sha_b)
+    lines = [l for l in err.getvalue().splitlines() if l.startswith("merge:")]
+    assert len(lines) == 2, err.getvalue()
+    assert sha_a[:12] in lines[0] and sha_b[:12] in lines[1], lines
+    assert "no grant needed" in lines[0] and "GitHub-App-only" in lines[0], lines[0]
+    merge._FALLBACK_LOGGED.clear()
+
+
 def test_fallback_actions_run_failed_refuses():
     """The fallback keeps the green-or-none semantics: a completed Actions run
     that did not pass refuses the merge exactly as a bad check-run would."""

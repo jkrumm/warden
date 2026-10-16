@@ -16,16 +16,16 @@ item moves.
 
 | Path | Is |
 |-|-|
-| `scripts/triage.py` | the loop's entry point: `run()` (one pass), CLI flags, heartbeat |
-| `scripts/loop/` | the loop by stage: `core` (paths, states, `set_state`, strikes, policy), `intake`, `triaging`, `work`, `train`, `verify`, `notify` |
-| `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate (check runs, falling back to Actions workflow runs when the token cannot read checks), rollout (`make deploy`/`verify`), dispatch, operations |
-| `scripts/clients/` | the only HTTP/CLI boundaries: agent-gateway, GitHub, Argo, Slack, Kuma (the loop heartbeat), secrets |
-| `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`, `reinvestigate`) |
+| `scripts/triage.py` | the loop's entry point: `run()` (one pass; reads the kill-switch first), CLI flags, heartbeat |
+| `scripts/loop/` | the loop by stage: `core` (paths, states, `set_state`, strikes, policy), `intake` (alerts, issues, and the `job` source: `ingest_jobs`, `route_job_items`, `job_chronic_reason`), `triaging`, `work`, `train`, `verify`, `notify` |
+| `scripts/lifecycle/` | pure-ish helpers the loop and CLI share: label routing, merge gate (check runs, falling back to Actions workflow runs when the token cannot read checks), rollout (`make deploy`/`verify`), dispatch, operations, `pause` (the kill-switch flag file) |
+| `scripts/clients/` | the only HTTP/CLI boundaries: agent-gateway, GitHub, Argo, Slack, Kuma (the loop heartbeat), secrets, `jobs_grade` (the local `~/.local/bin/jobs-grade` subprocess: timeout, failure = None, injectable) |
+| `scripts/warden.py` | the `warden` CLI (`run`, `dispatch`, `status`, `list`, `merge`, `abort`, `revert`, `close`, `retry`, `reinvestigate`, `adopt`, and the kill-switch `pause [--reason]` / `resume`) |
 | `scripts/watchdog-poll.py`, `dispatch-sweep.py`, `api.py` | the other LaunchAgents |
 | `scripts/improve-trigger.py` | read-only: outcomes (`failed` / `needs_decision`) since the improve loop's cursor, or `quiet` |
 | `scripts/lifecycle/shadow.py`, `scripts/shadow-replay.py` | the decision-model shadow lane next to the LLM triage (`decision_shadow`, ledger v21; nothing decides from it) and its replay over labelled history; measured table + promotion rule: `docs/decision-shadow.md`; report: `python3 scripts/lifecycle/shadow.py report` |
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
-| `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns |
+| `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns, the `job` source's chronic thresholds (`jobChronicRecurrences`, `jobChronicWindowDays`, `jobRegressionHours`) |
 
 ## Validate
 
@@ -47,9 +47,12 @@ installs `requirements.txt`; `make test` on its own still needs a venv.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**625/625** — any other number is a finding to report, not a count to edit.
+**655/655** — any other number is a finding to report, not a count to edit.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
-and every client boundary, so nothing reaches Slack, agent-gateway, GitHub or Argo.
+and every client boundary (the `jobs-grade` client returns no jobs; the kill-switch flag is a file in
+its temp dir), so nothing reaches Slack, agent-gateway, GitHub, Argo or the host. `make test` runs every
+suite with `WARDEN_PAUSE_FILE` pointing at a path that never exists, so an owner's live `warden pause`
+cannot fail one; run a suite by hand while paused and those that set no flag of their own see it.
 Patch a name on the module that defines it (`loop.core.DB_PATH`, `loop.core.post_line`) —
 cross-module references are attribute lookups, so that is the one place it takes
 effect. **Never delete, skip or weaken a test to make it pass**; if it cannot pass
@@ -80,7 +83,8 @@ tool even though launchd hands the loop a minimal PATH.
 ## Verify & Monitor
 
 - Health: `http://127.0.0.1:7735/health` (loopback only, no auth) — schema version
-  and each poller's heartbeat age vs. 3× its interval. `make verify` = `/health`
+  and each poller's heartbeat age vs. 3× its interval, plus `paused` (`null`, or `{reason, since}`
+  while the kill-switch is on; it never fails `ok`). `make verify` = `/health`
   answering 200 with the expected schema and a fresh loop heartbeat; the other pollers
   and agents are `make status`'s business.
 - `make status` — agents, last exits, API, ledger file. `make logs` — tail of
@@ -89,6 +93,12 @@ tool even though launchd hands the loop a minimal PATH.
   `Warden Loop - Push` (the loop pings it at the end of every completed pass, from
   `clients/kuma.py`; URL in `~/.config/uptime-kuma/warden-loop-push-url`, mode 600; ~40 min of
   silence pages). Declared in `homelab/uptime-kuma/monitors.yaml`.
+- **Kill-switch:** `warden pause [--reason <text>]` stops every loop-driven dispatch, merge and deploy of every origin (the
+  loop, the sweep, `warden run` / `dispatch`, Argo's `implement`) while ingest, triage and polling continue;
+  the owner's own explicit `warden merge` / Argo merge is not stopped (a human act);
+  `warden resume` lifts it on the next pass. The state is the flag file `~/.warden/paused`
+  (`$WARDEN_PAUSE_FILE` overrides; unreadable still means paused). What is held and what is not:
+  DESIGN.md § The kill-switch. It shows on `/health` and the Argo snapshot, and every pass logs it.
 - OTel `service.name`: none — warden does not export telemetry.
 - The queue: Argo `/warden`. Slack #agents: one line per `fixed` / `needs_decision`.
 - Continuous improvement: a herdr tab `improve` in this workspace runs `/loop` on `docs/improve/LOOP.md`, **outcome-triggered** (`scripts/improve-trigger.py`; a quiet wakeup writes and commits nothing); one line per acted-on iteration in `docs/improve/JOURNAL.md`. Steer it with `rd say`.
@@ -100,6 +110,12 @@ tool even though launchd hands the loop a minimal PATH.
   in a git worktree and fast-forward master when green. `make link`/`agents`/`setup`
   refuse from a worktree (`make venv`/`check` still work there) — they write `~/.local/bin/warden` from `$(shell pwd)`,
   which would point every shell at a checkout that is deleted with the worktree.
+- **A `job` item is only as good as `jobs-grade`'s grade.** The loop runs `~/.local/bin/jobs-grade` (a `bun`
+  script) on every pass under a PATH widened with `rollout.HOST_TOOL_DIRS`; a failed, hung or malformed run
+  logs `jobs-grade: …` and skips the source for that pass — nothing opens, nothing resolves. A job whose
+  `--owner` is no checkout under the repos root goes to `needs_decision`, never to a triage guess. The first
+  pass after a deploy dispatches an investigation for every job already in a bad grade (up to
+  `MAX_OPEN_INVESTIGATIONS` per pass): `warden pause` first if that is not wanted.
 - **Never start a second loop.** Two loops against one ledger double every post and
   every dispatch. Check `make status` before loading anything.
 - **The ledger** `~/.warden/warden.db` is live and not in git. Never migrate it from

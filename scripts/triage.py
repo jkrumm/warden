@@ -16,12 +16,21 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from clients import kuma  # noqa: E402
+from lifecycle import pause  # noqa: E402
 from loop import core, intake, notify, triaging, verify, work  # noqa: E402
 
 
 def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     now = dt.datetime.now(dt.timezone.utc)
     policy = core.load_policy()
+
+    # The kill-switch is read at the start of every pass (and again by each stage that dispatches,
+    # so a pause set mid-pass holds the next one). Paused: ingest, classify and triage run as always;
+    # the loop dispatches, merges and deploys nothing (lifecycle/pause.py names what is and is not held).
+    paused = pause.state()
+    if paused is not None:
+        print(f"triage: {pause.describe(paused)} — ingesting and triaging only; no dispatch, merge or deploy "
+              f"this pass", file=sys.stderr)
 
     # Runs first, before any poller can retry the same external call: an item under an in-flight
     # operation (a crashed process, an ambiguous submit) is reconciled before anything else.
@@ -33,9 +42,13 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
 
     intake.ingest(conn, now)
     intake.ingest_github_issues(conn, now)
+    intake.ingest_jobs(conn, now, dry_run=dry_run)
     intake.reopen_if_needed(conn, now, policy, dry_run=dry_run)
     intake.classify(conn, policy, now)
     intake.apply_resolutions(conn, now, policy)
+    # After the silence paths: a job item whose job recovered before it was routed goes `quiet`, not
+    # to its owner repo.
+    intake.route_job_items(conn, policy, now)
     intake.resolve_recovery_paired(conn, policy, now, dry_run=dry_run)
     intake.resolve_quiet_grouped(conn, policy, now)
     work.maybe_dissolve_clusters(conn, now, dry_run=dry_run)

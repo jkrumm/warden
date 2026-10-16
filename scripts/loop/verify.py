@@ -278,9 +278,16 @@ def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
 
 def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime, *, dry_run: bool) -> None:
     """Step 10, see the block comment above. Dry-run prints what each item would run and shells out
-    to nothing."""
+    to nothing.
+
+    Paused (`warden pause`): an item not yet deployed waits for its `make deploy` (a production
+    action); one already deployed is still verified, which is observation, and its revert, should
+    verification fail, is held by maybe_submit_reverts()."""
     for item in conn.execute("SELECT * FROM triage_items WHERE state=? ORDER BY event_id",
                              (core.STATE_VERIFYING,)).fetchall():
+        # Asked per item, not once per pass: a pause set while one deploy runs holds the next.
+        if item["verify_started_at"] is None and core.is_paused():
+            continue
         if dry_run:
             what = (f"signal-only verification (swept by {item['fixed_by_pr']})" if item["fixed_by_pr"]
                     else "make deploy, then make verify" if item["verify_started_at"] is None else "make verify")
@@ -702,7 +709,11 @@ def maybe_submit_reverts(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
     "Busy" for the revert itself is a running episode only (an implement, or a train's
     `update_pr`): a PR merely waiting on its train never holds it back — the revert would starve
-    behind a PR waiting on CI — and its own PR then goes first on the train (advance_merge_trains())."""
+    behind a PR waiting on CI — and its own PR then goes first on the train (advance_merge_trains()).
+
+    Paused (`warden pause`): the revert waits, its claim untaken."""
+    if core.is_paused():
+        return
     ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND implement_job IS NULL AND revert_json IS NOT NULL "

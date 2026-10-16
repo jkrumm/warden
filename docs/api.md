@@ -31,6 +31,11 @@ that does reach it can write).
 the schema matches and every poller's heartbeat age is at most **3x its LaunchAgent's
 `StartInterval`**; a poller that never recorded a heartbeat is not ok.
 
+`paused` is the kill-switch (`warden pause`, DESIGN.md § The kill-switch): `null` while warden
+runs, `{reason, since}` while paused (`reason` may be `null`). It never affects `ok`: a paused
+warden is deliberately idle, not unhealthy, and `make deploy`'s health gate must not roll back
+for it. The flag file is read on every request, so the answer is never stale.
+
 | Poller key | Cursor key | Interval | Stale threshold |
 |-|-|-|-|
 | `loop` | `triage_last_run` | 600s | 30 min |
@@ -171,7 +176,8 @@ projection. `triage.py`'s `run()` ends every 10-minute pass (after `record_heart
 `apply_argo_actions()`) with `push_argo_snapshot()`, which POSTs `build_argo_snapshot()` via
 `clients.argo.push_snapshot()`. The snapshot/push helpers live in `scripts/loop/notify.py`:
 
-`machine` (`WARDEN_MACHINE`, default `mini`), `generatedAt`, `health`, `metrics`, `board`
+`machine` (`WARDEN_MACHINE`, default `mini`), `generatedAt`, `paused` (the kill-switch, same
+shape as `/health`'s; also inside `health`), `health`, `metrics`, `board`
 (this module's payloads verbatim), `items` (`item_payload()` for the first
 `ARGO_SNAPSHOT_ITEMS_CAP = 50` board items, keyed by `event_id` as a string, each with
 `history_limit=ARGO_SNAPSHOT_HISTORY_LIMIT = 50`), and `itemsTruncated`.

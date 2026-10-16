@@ -2,14 +2,14 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§150).
+build log (§1–§171).
 
 | | |
 |-|-|
-| Last updated | 2026-10-16 (§170 — a repeated finding on a file the PR dropped is resolved, not a block) |
-| Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
+| Last updated | 2026-10-16 (§171 — Wave 6 of the background-jobs chain: the kill-switch and the `job` source) |
+| Current work | Background jobs → warden self-healing (dotfiles `docs/waves/PLAN.md`; spec `~/SourceRoot/dotfiles/docs/ops-signals.md`, its *Owner decisions* win): **Wave 6 built, not yet merged or deployed**; Wave 7 (job brief, verified closure, the canary end to end) is next. The agent-platform rewrite (`docs/waves/PLAN.md` here; spec `~/SourceRoot/dotfiles/docs/agent-platform.md`) is done |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 23 (live ledger migrates on the loop's next boot after the deploy) |
+| Ledger | `~/.warden/warden.db`, schema 23 (Wave 6 changed no schema: a `job` item reuses `origin`, `max_tier`, `brief` and the event cursor columns) |
 | Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names |
 
 ## What is live
@@ -22,6 +22,26 @@ verify` + the item's own signal quiet → automatic revert on failure → fixed-
 after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a daily
 `failed` count; Argo `/warden` is the queue.
 
+- **Kill-switch (§171, built, live after the deploy).** `warden pause [--reason]` / `warden resume` write and remove
+  `~/.warden/paused` (JSON `{reason, since}`; `$WARDEN_PAUSE_FILE` overrides). While it exists the loop STARTS nothing: no
+  investigate / implement / revision / revert episode, no host verb, no review or `update_pr`, no loop-driven merge, no deploy,
+  no `warden run` / `dispatch`, no Argo `implement` — in the loop and the sweep alike. Ingest, classify, triage jobs,
+  the `job` routing, polling and folding of running episodes, `make verify` on an already-deployed item and
+  state-only CLI verbs continue; the owner's explicit `warden merge` / Argo `merge` is NOT stopped (a human act; the deploy after it is held). One predicate
+  (`lifecycle/pause.py`, `core.is_paused()`), checked by each starting stage, with `dispatch.open_episode()` /
+  `open_review()` refusing with `PausedError` (a `PolicyError`, exit 4) as the backstop. Unreadable flag = paused. Shown
+  on `/health` (`paused`, never fails `ok`) and in the Argo snapshot; no Slack message. DESIGN.md § The kill-switch.
+- **The `job` source (§171, built, live after the deploy).** Each loop pass runs `jobs-grade`
+  (`clients/jobs_grade.py`, the local subprocess; None on any failure = a blind pass that opens and resolves nothing).
+  A label graded failing | stale | flapping | unloaded is the event `job:<machine>:<label>`, folded by
+  watchdog-poll's `reconcile()` like a `uk` monitor: level-based, resolved on `ok`, re-armed on the next bad grade.
+  The item is origin `job`, `max_tier=investigate`, routed by `route_job_items()` straight to the state file's `owner`
+  repo (no triage job, no debounce; an owner warden cannot dispatch to is `needs_decision`), then dispatched by
+  `escalate_origin_items()`. Chronic: a reopened job item warden had already acted on goes to `needs_decision`
+  (`[chronic] …`) instead of a dispatch when it reopens within 7 days of the terminal state it left, or when a `fixed`
+  one fails again within 24 h (`job_chronic_reason()`; `jobChronicRecurrences` / `jobChronicWindowDays` /
+  `jobRegressionHours` in `config/triage-policy.json`). Not built (Wave 7): the real job brief, the `implement` tier,
+  closure verified by the job's next `last_ok`.
 - **Shape.** `scripts/triage.py` is the entry point; the loop lives in
   `scripts/loop/` by stage. warden meets the repo contract itself: `make check`,
   `make deploy` (kickstart `warden-api`, health check, roll back to the
@@ -175,9 +195,16 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 
 ## Open — owner actions
 
-- The fine-grained PAT (`op://mini/github/token`) has no Checks permission (fine-grained
-  PATs cannot have one); the merge gate already falls back to Actions workflow runs, which
-  it can read — that is **not** what stalled weatherorb. It lacks `Issues: Read` on
+- **Before the Wave 6 deploy:** `jobs-grade` grades `com.jkrumm.drift-check` `failing` whenever a drift is open
+  (all six jobs graded `ok` at the time of writing, so nothing would dispatch). The first pass after the deploy
+  dispatches an investigation (tier investigate, owner repo) for every job then in a bad grade, up to 3 per pass;
+  `warden pause` before deploying if that is not wanted. `job` items close `resolved` with the investigation's answer
+  (no Slack line: they have no origin thread) until Wave 7 raises their tier.
+
+- The fine-grained PAT (`op://mini/github/token`) cannot read check-runs: the Checks API is
+  GitHub-App-only for fine-grained tokens, so there is **no grant to ask for** (the 403 on
+  `/check-runs` is expected; `/actions/runs` works). The merge gate falls back to Actions
+  workflow runs, logged once per commit — that is **not** what stalled weatherorb. It lacks `Issues: Read` on
   `dispatch-scratch` and `Issues: Write` repo-wide (issue comment-back 403s).
 - Repo contract: every repo in scope now has `check`/`deploy`/`verify`/`logs`
   (`free-planning-poker` and `basalt-ui` already had them on master; `homelab-private`, 681a836).
@@ -219,7 +246,7 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   modules' import cycle (`tests/test_loop_imports.py` guards the function-body-only
   rule meanwhile).
 
-## Wave 6 (2026-10-10)
+## Wave 6 of the earlier agent-platform chain (2026-10-10)
 
 - **Parking.** A repo whose checkout is dirty, off-default or ahead of origin, or has a herdr agent
   working in it, parks its merge (`train._train_merge`) and deploy (`verify._deploy_item`): same state,
@@ -238,7 +265,13 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
 
 ## Next action
 
-After the deploy: watch the first merge that rides the train in a repo with a `make verify` target
+Wave 6's live check (dotfiles `docs/waves/PLAN.md`), after merging and deploying this: the canary unhealthy locally
+(uncommitted `"healthy": false`) → exactly one `job` item for `job:mini:com.jkrumm.jobrun-canary` in `dotfiles`;
+`warden pause` → the next pass dispatches nothing and `/health` shows `paused`; `warden resume` → it dispatches;
+restore the canary. Then Wave 7 (job brief next to `_build_cluster_brief()`, `implement` tier, `verifying` →
+`fixed` only on a `last_ok` after the deployed SHA, the canary end to end with no second item).
+
+Still open from before: watch the first merge that rides the train in a repo with a `make verify` target
 store a baseline (`verify_baseline` non-NULL on the `verifying` item), and the first red-before-and-after
 item land `fixed` with "pre-existing" in its note. Also still: the first live re-drives after the W7 deploy: 1398/1400 (infra → re-investigate),
 1370 (dotfiles PR #12 → merge train), 1389/1390 (owner-retried into the train). Then

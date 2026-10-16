@@ -349,6 +349,60 @@ def test_a_pruned_item_backed_dispatch_is_folded_so_its_item_strikes_instead_of_
         conn.close()
 
 
+# --- the kill-switch: a paused sweep folds and delivers, and starts nothing ----
+
+def test_a_paused_sweep_says_so_still_folds_and_starts_no_episode():
+    import json
+    import os
+    from clients import agent_gateway
+    from clients.errors import RemoteError
+
+    db_path = _fresh_db()
+    conn = _ledger.connect(db_path)
+    now = _now().isoformat()
+    # A `working` item whose investigation concluded `implement`: the chain would claim and submit it.
+    conn.execute("INSERT INTO events(id, source, external_id, title, first_seen) VALUES (1,'slack_alert','a','t',?)", (now,))
+    conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,status,verdict_json,created_at) VALUES (?,?,?,?,?,?,?)",
+                 ("inv-1", "investigate", "demo-repo", "b", "done",
+                  json.dumps({"summary": "s", "nextAction": "implement", "confidence": "high"}), now))
+    conn.execute("INSERT INTO triage_items(event_id, signature, repo, state, occurrences, first_seen, last_seen, "
+                 "created_at, updated_at, dispatch_job) VALUES (1,'slack_alert:a','demo-repo','working',3,?,?,?,?,'inv-1')",
+                 (now, now, now, now))
+    conn.commit()
+    conn.close()
+
+    reached: list[str] = []
+
+    def _boom(name):
+        return lambda *a, **kw: reached.append(name) or (_ for _ in ()).throw(RemoteError(f"{name}: must not be reached"))
+
+    saved_env = os.environ.get("WARDEN_PAUSE_FILE")
+    os.environ["WARDEN_PAUSE_FILE"] = str(Path(tempfile.mkdtemp(prefix="sweep-pause-")) / "paused")
+    from lifecycle import pause
+    pause.pause("sweep test")
+    try:
+        with _patch(agent_gateway, "submit", _boom("submit")), \
+             _patch(agent_gateway, "dispatch_policy", _boom("dispatch_policy")), \
+             _patch(agent_gateway, "get", lambda job_id: None):
+            rc, err = _run_main_capturing_stderr(db_path)
+    finally:
+        if saved_env is None:
+            os.environ.pop("WARDEN_PAUSE_FILE", None)
+        else:
+            os.environ["WARDEN_PAUSE_FILE"] = saved_env
+
+    assert rc == 0 and "paused since" in err and "sweep test" in err, err
+    assert reached == [], f"a paused sweep reached agent-gateway through {reached}"
+    conn = _ledger.connect(db_path)
+    try:
+        item = conn.execute("SELECT state, implement_job FROM triage_items WHERE event_id=1").fetchone()
+        assert (item["state"], item["implement_job"]) == ("working", None), dict(item)
+        assert conn.execute("SELECT COUNT(*) FROM cursors WHERE key=?",
+                            (dispatch_sweep.HEARTBEAT_CURSOR_KEY,)).fetchone()[0] == 1, "the heartbeat still beats"
+    finally:
+        conn.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

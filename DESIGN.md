@@ -81,6 +81,17 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    keyed by `fingerprint(title)` — timestamps, hex ids, UUIDs, paths, numbers and
    the log-file name stripped, so the same line from two log files is one event.
    Alerts, GitHub issues and `warden run` become `new` items in one pool.
+   The `job` source joins them without a poller: each pass runs `jobs-grade`
+   (`clients/jobs_grade.py`) and a label graded `failing | stale | flapping |
+   unloaded` is one event `job:<machine>:<label>` (`ingest_jobs()`, folded by
+   watchdog-poll.py's `reconcile()` as a `uk` monitor is). It is level-based: one
+   event while the grade stays bad, resolved when the label grades `ok` or leaves
+   the output, re-armed when it turns bad again. Its item has origin `job`,
+   `max_tier=investigate`, and is routed by `route_job_items()` straight to the
+   `owner` repo its state file names — no triage job, no debounce (the grader's
+   own thresholds are the debounce). An owner warden cannot dispatch to
+   (`?`, a repo outside the repos root) is `needs_decision`, not a guess. A pass
+   in which `jobs-grade` cannot answer is blind: nothing opens, nothing resolves.
    `classify()` closes `ignore`-list and chat-prose alerts `closed(ignored)` with
    no model call. A `new` alert whose signal goes quiet resolves `quiet`
    (recovery-paired first, `quietResolveHours` as the fallback); silence resolves
@@ -101,7 +112,13 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    `rootCause` and a `nextAction`. `implement` dispatches at any confidence —
    review is the gate. A `human` verdict whose optional `owningRepo` names a
    different known repo re-routes the item to `triaged` in that repo instead of
-   paging (`_reroute_repo()`, once per item). A matching `rootCause` on another
+   paging (`_reroute_repo()`, once per item). A reopened `job` item is CHRONIC when
+   warden had already acted on it (it has a `dispatch_job`) and it reopens within
+   `jobChronicWindowDays` (7) of the terminal state it left, `jobChronicRecurrences`
+   (1) times; a `fixed` one that fails again within `jobRegressionHours` (24) is a
+   fix that did not hold. Both go to `needs_decision` (`[chronic] …`) instead of
+   another dispatch (`job_chronic_reason()`; thresholds in `config/triage-policy.json`).
+   An item that healed `quiet` before any dispatch is new work, not chronic. A matching `rootCause` on another
    open item merges them (older survives, the other `closed(duplicate)`). A
    blocked review is a revision on the same item and PR (`revisionOf`). The review's context
    (`work.validation_context()`) carries the owner's brief and the investigation's goal; when both
@@ -142,8 +159,8 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    younger item with an episode, a claim, or a `merging` train still defers the revision.
 4. **Merge train** (`train.py`). One per repo, oldest item first, single-flight:
    agent-gateway `update_pr` onto the latest base → GitHub checks green (or none — only
-   a readable check-runs API may say so; unreadable, the gate reads Actions runs
-   and none there is still pending) on that SHA → review `confirmed` on that SHA → squash merge pinned to it. A head
+   a readable check-runs API may say so; unreadable — a fine-grained token has no Checks
+   permission, nothing to grant — the gate reads Actions runs, and none there is still pending) on that SHA → review `confirmed` on that SHA → squash merge pinned to it. A head
    that moves goes back to `update`. A red check that also fails on the base the SHA was rebased onto
    (`train_base_sha`, captured at `update`) is the
    base's, not the PR's: the item parks (no strike, no revision) until the base goes green, re-entering
@@ -201,6 +218,41 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
 implement chain (`work.advance_implement_chain()`) so a verdict does not wait for
 the loop's 10-minute tick.
 
+## The kill-switch
+
+`warden pause [--reason <text>]` writes `~/.warden/paused` (JSON `{reason, since}`;
+`$WARDEN_PAUSE_FILE` overrides, `$WARDEN_HOME` moves it); `warden resume` removes it.
+`lifecycle/pause.py` is the only reader (`core.is_paused()` re-exports it): the loop reads
+it at the start of every pass and again in each stage that starts something, the sweep
+at the start of its pass, `/health` and the Argo snapshot on every build. It needs no
+ledger, backend or agent-gateway, so it works when those are the problem.
+
+**While paused, held:** every episode start — investigate (`escalate`,
+`escalate_origin_items`, so `warden run` opens and triages its item but dispatches
+nothing), implement (`maybe_auto_implement`), revision (`maybe_revise_blocked`), revert
+(`maybe_submit_reverts`), host verbs (`maybe_auto_remediate`), `warden dispatch`, the
+owner's Argo `implement` — plus the whole merge train (`advance_merge_trains`: `update_pr`,
+review, merge) and the **deploy** of a merged item (`maybe_verify` skips an item with no
+`verify_started_at`). Under all of them `dispatch.open_episode()` / `open_review()` refuse
+with `PausedError` (a `PolicyError`, exit 4), which the callers already read as a deferral.
+
+**While paused, running:** ingest (alerts, GitHub issues, `jobs-grade`), `classify`, the
+silence paths, the `job` routing, every triage job and its fold (a classification, not an
+action), polling and folding episodes already in flight, `make verify` on an
+already-deployed item (observation; its revert, should it fail, is held), the fixed-by
+sweep, Slack lines, the Argo snapshot, `redrive_failed` (state only), the owner's explicit
+Argo `merge` / `warden merge` (an explicit human act on a PR the owner chose) and every state-only
+CLI verb (`close`, `retry`, `reinvestigate`, `adopt`: they move an item, the held stage pollers
+do the starting). Conservative on purpose where it touches production: the loop's merge and
+deploy are held even though neither starts an agent job. The owner's explicit merge is the one
+deliberate exception — a human act, not the loop's — so the switch stops what warden does on its own,
+not what the owner does by hand.
+
+Fail closed: a flag file that exists but cannot be read or parsed still pauses; only a
+missing file is "running". `/health` carries `paused: null | {reason, since}` and a pause
+never fails `ok` (a deliberately idle warden is healthy, and `make deploy`'s health gate
+must not roll back for it). Nothing is posted to Slack for a pause.
+
 ## Boundaries
 
 - **agent-gateway is the only boundary.** warden depends on `submit(tier, repo, brief)
@@ -241,7 +293,7 @@ same facts; `make logs` tails every agent.
 
 ## What must not be lost
 
-Nine details that read like accidents and are not. Check against them before
+Ten details that read like accidents and are not. Check against them before
 every merge.
 
 1. **Silence may cancel the need to start work, never discharge a verdict or an
@@ -264,8 +316,13 @@ every merge.
    the third strike is `failed` carrying `dispatches.error`.
 8. **Dissolving a cluster leaves `dispatch_job` set** as a cooldown anchor;
    clearing it lets `escalate()` re-fuse the pair in the same pass.
-9. **The dry-run contract**: never touches Slack, never shells out, never submits
-   a triage job, everything else real. It is the only pre-production surface.
+9. **The dry-run contract**: never touches Slack, never shells out (the `jobs-grade`
+   subprocess included), never submits a triage job, everything else real. It is the only
+   pre-production surface.
+10. **Pause holds starts, never observation, and fails closed.** Every site that starts an
+   agent job, a host verb, a merge or a deploy asks `core.is_paused()`; ingest, triage,
+   polling and folding do not. A new dispatch site without that gate (and without the
+   `open_episode()` backstop behind it) is a hole in the only kill-switch.
 
 ## Known limits
 

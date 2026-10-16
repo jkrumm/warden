@@ -1562,6 +1562,115 @@ def test_warden_py_never_shells_out_freeform():
 
 # --- runner ------------------------------------------------------------------------
 
+# --- pause / resume: the kill-switch ---------------------------------------------
+
+
+def _paused_env(h, **kw) -> dict[str, str]:
+    env = h.base_env(**kw)
+    env["WARDEN_PAUSE_FILE"] = str(h.tmp / "paused")
+    return env
+
+
+def test_pause_and_resume_round_trip_through_the_flag_file():
+    h = Harness()
+    env = _paused_env(h)
+    flag = h.tmp / "paused"
+
+    first = h.run(["pause", "--reason", "canary rollback", "--json"], env=env)
+    out = _json_or_fail(first)
+    assert first.returncode == 0 and out["ok"] is True and out["alreadyPaused"] is False, out
+    assert out["paused"]["reason"] == "canary rollback" and out["paused"]["since"], out
+    assert json.loads(flag.read_text()) == out["paused"]
+
+    again = _json_or_fail(h.run(["pause", "--json"], env=env))
+    assert again["alreadyPaused"] is True and again["paused"] == out["paused"], "idempotent: since and reason kept"
+
+    resumed = _json_or_fail(h.run(["resume", "--json"], env=env))
+    assert resumed["wasPaused"] is True and resumed["lifted"] == out["paused"] and not flag.exists(), resumed
+    nothing = _json_or_fail(h.run(["resume", "--json"], env=env))
+    assert nothing["wasPaused"] is False and nothing["lifted"] is None, nothing
+
+
+def test_pause_prints_a_plain_line_and_is_audited():
+    h = Harness()
+    log = h.new_log("audit")
+    env = _paused_env(h, log=log)
+    text = h.run(["pause", "--reason=because"], env=env)
+    assert text.returncode == 0 and text.stdout.startswith("warden is paused since ") and "because" in text.stdout, text.stdout
+    h.run(["resume"], env=env)
+    h.run(["resume"], env=env)
+    modes = [line.split("| mode=")[1].split(" |")[0] for line in log.read_text().splitlines()]
+    assert modes == ["paused", "resumed", "noop"], modes
+
+
+def test_pause_and_resume_need_no_ledger_no_backend_and_no_agent_gateway():
+    """The moments the switch is wanted are the moments those are broken."""
+    h = Harness()
+    env = _paused_env(h)
+    env["WARDEN_DB"] = str(h.tmp / "no-such-ledger.db")
+    env["SECRETS_BACKEND_FILE"] = str(h.tmp / "no-such-backend")
+    proc = h.run(["pause", "--json"], env=env)
+    assert proc.returncode == 0, proc
+    assert not (h.tmp / "no-such-ledger.db").exists(), "pause must not create a ledger"
+    assert h.run(["resume"], env=env).returncode == 0
+
+
+def test_pause_dry_run_and_stray_arguments():
+    h = Harness()
+    env = _paused_env(h)
+    dry = _json_or_fail(h.run(["pause", "--dry-run", "--json"], env=env))
+    assert dry["dryRun"] is True and not (h.tmp / "paused").exists(), dry
+    assert h.run(["pause", "extra"], env=env).returncode == 64
+    assert h.run(["resume", "extra"], env=env).returncode == 64
+
+
+def test_dispatch_is_refused_while_paused_and_reaches_nothing():
+    h = Harness()
+    srv = stubs.StubServer({"default": (500, {"error": "must not be reached"})})
+    try:
+        env = _paused_env(h, agent_gateway=srv.base)
+        h.run(["pause", "--reason", "stop"], env=env)
+        proc = h.run(["dispatch", "alpha", "--json"], env=env, stdin=VALID_BRIEF)
+        out = _json_or_fail(proc)
+        assert proc.returncode == 4 and out["ok"] is False, out
+        assert "paused" in out["error"] and "stop" in out["error"] and "warden resume" in out["error"], out
+        assert srv.requests == [], srv.requests
+        h.run(["resume"], env=env)
+    finally:
+        srv.stop()
+
+
+def test_run_while_paused_opens_and_triages_the_item_but_dispatches_nothing():
+    h = Harness()
+    db = h.new_db()
+    srv = stubs.StubServer(_run_routes({"id": "job-never", "status": "running"}))
+    try:
+        env = _paused_env(h, db=db, agent_gateway=srv.base)
+        h.run(["pause", "--reason", "holding"], env=env)
+        proc = h.run(["run", "alpha", "--json"], env=env, stdin=VALID_BRIEF)
+        out = _json_or_fail(proc)
+        assert proc.returncode == 0 and out["queued"] is True and out["state"] == "triaged" and out["jobId"] is None, out
+        assert out["paused"]["reason"] == "holding" and "warden resume" in out["note"], out
+        tools = [r["body"]["tool"] for r in srv.requests if r["method"] == "POST"]
+        assert tools == ["triage", "decide"], tools   # triage continues (decide = the shadow lane); no dispatch
+        text = h.run(["run", "alpha"], env=env, stdin=VALID_BRIEF + " again, and differently worded so it is no duplicate")
+        assert "queued" in text.stdout and "paused" in text.stdout, text.stdout
+    finally:
+        srv.stop()
+
+
+def test_read_only_and_state_only_verbs_work_while_paused():
+    h = Harness()
+    db = h.new_db()
+    env = _paused_env(h, db=db)
+    h.run(["pause"], env=env)
+    proc = h.run(["list", "open", "--json"], env=env)
+    assert proc.returncode == 0 and _json_or_fail(proc)["count"] == 0
+    _seed_item(db, 7, state="needs_decision", repo="alpha", dispatch_job="d")
+    closed = h.run(["close", "7", "--why", "by hand", "--json"], env=env)
+    assert closed.returncode == 0, closed.stdout + closed.stderr
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

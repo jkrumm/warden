@@ -156,12 +156,18 @@ class MergeResult:
 # rule or per-repo carve-out exists any more.
 
 
+# Commits whose Actions-runs fallback was already announced in this process: the train reads checks
+# every tick, and one line per tick for the same SHA is noise, not information.
+_FALLBACK_LOGGED: set[str] = set()
+
+
 def read_check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     """Every check run on `sha`, mapped to the shape the gate consumes.
 
-    A 403 (a fine-grained PAT without `Checks: read` on a private repository, §110:
-    `weatherorb`) falls back to the commit's GitHub Actions workflow runs, mapped to
-    the same shape — the same credential can often read those. Unreadable is still not
+    A 403 (a fine-grained PAT: the Checks API is GitHub-App-only for those, so there is no
+    permission to grant; §110, `weatherorb`) falls back to the commit's GitHub Actions
+    workflow runs, mapped to the same shape — the same token reads those. The fallback is
+    logged once per commit (`_FALLBACK_LOGGED`), not on every tick. Unreadable is still not
     "none exist": if the fallback is unreadable too, the unknown CI state refuses with
     the fallback's own `RemoteError`, and an EMPTY fallback is `ChecksPending` — only a
     readable check-runs API may conclude that no CI exists, so the green-or-none gate is
@@ -170,11 +176,15 @@ def read_check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
         return github.check_runs(owner, repo, sha)
     except CheckRunsUnreadable as e:
         runs = github.workflow_runs(owner, repo, sha)
-        print(
-            f"merge: check runs unreadable on {owner}/{repo}@{sha[:12]} ({e}); gating on "
-            f"{len(runs)} GitHub Actions workflow run(s) instead",
-            file=sys.stderr,
-        )
+        key = f"{owner}/{repo}@{sha}"
+        if key not in _FALLBACK_LOGGED:
+            _FALLBACK_LOGGED.add(key)
+            print(
+                f"merge: check runs unavailable on {owner}/{repo}@{sha[:12]} (fine-grained tokens have no Checks "
+                f"permission — GitHub-App-only; no grant needed, nothing to fix); gating on {len(runs)} GitHub "
+                f"Actions workflow run(s) instead [{e}]",
+                file=sys.stderr,
+            )
         if not runs:
             raise ChecksPending(
                 f"check runs on {owner}/{repo}@{sha[:12]} are unreadable and the commit has no GitHub "

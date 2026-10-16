@@ -144,6 +144,10 @@ venv: ensure-venv
 # exits non-zero on the first failure it reports. There is no pytest in this venv
 # and the suites do not need one — every test function is argument-free, so the
 # files stay valid pytest input if that ever changes.
+#
+# WARDEN_PAUSE_FILE points at a path that never exists: the suites must not read the live
+# kill-switch flag (~/.warden/paused), or an owner's `warden pause` would fail them. The ones that
+# exercise the flag set their own file.
 .PHONY: test
 test:
 	@[ -x "$(PY)" ] || { echo "warden: no venv — run 'make venv'"; exit 1; }
@@ -152,7 +156,7 @@ test:
 		[ -e "$$t" ] || continue; \
 		ran=$$((ran+1)); \
 		printf '  %-32s ' "$$(basename $$t)"; \
-		if out=$$("$(PY)" "$$t" 2>&1); then \
+		if out=$$(WARDEN_PAUSE_FILE=/nonexistent/warden-paused "$(PY)" "$$t" 2>&1); then \
 			echo "$$out" | tail -1; \
 		else \
 			echo "FAILED"; echo "$$out"; fail=1; \

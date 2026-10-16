@@ -1169,6 +1169,51 @@ def test_serve_opens_connection_with_readonly_true():
         ro.close()
 
 
+# --- the kill-switch on /health ----------------------------------------------------
+
+def test_health_surfaces_the_pause_and_a_paused_warden_is_still_healthy():
+    import contextlib
+    import os
+    from lifecycle import pause
+
+    @contextlib.contextmanager
+    def flag_file():
+        saved = os.environ.get("WARDEN_PAUSE_FILE")
+        os.environ["WARDEN_PAUSE_FILE"] = str(Path(tempfile.mkdtemp(prefix="api-pause-")) / "paused")
+        try:
+            yield
+        finally:
+            if saved is None:
+                os.environ.pop("WARDEN_PAUSE_FILE", None)
+            else:
+                os.environ["WARDEN_PAUSE_FILE"] = saved
+
+    conn, path = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    for key in ("triage_last_run", "watchdog_poll_last_run", "dispatch_sweep_last_run"):
+        _cursor(conn, key, now)
+    conn.commit()
+    with flag_file():
+        running = api.health_payload(conn)
+        assert running["paused"] is None and running["ok"] is True, running
+
+        pause.pause("rolling back the canary")
+        paused = api.health_payload(conn)
+        assert paused["paused"]["reason"] == "rolling back the canary" and paused["paused"]["since"], paused
+        assert paused["ok"] is True, "a deliberately idle warden is healthy: make deploy's health gate must not fail on it"
+
+        conn.close()
+        handle = _ServerHandle(path)
+        try:
+            status, body = handle.get("/health")
+            assert status == 200 and body["ok"] is True and body["paused"]["reason"] == "rolling back the canary", body
+            pause.resume()
+            status, body = handle.get("/health")
+            assert status == 200 and body["paused"] is None, body
+        finally:
+            handle.stop()
+
+
 # --- runner ------------------------------------------------------------------
 
 def main() -> int:

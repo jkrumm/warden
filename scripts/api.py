@@ -80,6 +80,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from clients import github as _github  # noqa: E402
+from lifecycle import pause as _pause  # noqa: E402
 
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 7735
@@ -513,7 +514,11 @@ def metrics_payload(conn: sqlite3.Connection) -> dict[str, Any]:
 def health_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     """The whole `/health` body — schema version, ledger file identity, every
     poller's heartbeat age against its own named threshold, and one `ok`
-    boolean folding all of it together."""
+    boolean folding all of it together.
+
+    `paused` is the kill-switch (lifecycle/pause.py): null while warden runs, `{reason, since}` while
+    `warden pause` is in force. It never touches `ok` — a paused warden is healthy, deliberately idle,
+    and `make deploy`'s health gate must not roll a deploy back because the owner paused it."""
     now = dt.datetime.now(dt.timezone.utc)
     version_row = conn.execute("SELECT version FROM schema_version").fetchone()
     version = version_row["version"] if version_row is not None else None
@@ -544,6 +549,7 @@ def health_payload(conn: sqlite3.Connection) -> dict[str, Any]:
         "db_path": db_file,
         "db_mtime": db_mtime,
         "pollers": pollers,
+        "paused": _pause.state(),
         "checked_at": now.isoformat(),
     }
 

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from clients import agent_gateway
 from clients.errors import PolicyError, RemoteError, UsageError
 
-from . import operations, policy
+from . import operations, pause, policy
 
 MAX_BRIEF_CHARS = 8000
 MAX_CONTEXT_CHARS = 16000
@@ -118,7 +118,11 @@ def open_episode(
     BEFORE the submit — DESIGN.md § Crash recovery. A submit that fails definitively
     resolves it `failed`; one that MAY have reached agent-gateway (`maybe_mutated`) leaves it
     open, annotated, for reconcile_operations(). `authorized_by` is the
-    audit label that row records and is required for a gated tier."""
+    audit label that row records and is required for a gated tier.
+
+    Refused with PausedError while `warden pause` is in force (lifecycle/pause.py): the backstop under
+    the stages' own checks, and the whole gate for `warden dispatch` and the owner's Argo `implement`."""
+    pause.require_running(f"a {tier} episode in {repo}")
     now = now or dt.datetime.now(dt.timezone.utc)
     gated = tier in policy.GATED_TIERS
 
@@ -219,7 +223,10 @@ def open_review(
 
     `model` mirrors `open_episode()`'s own parameter — `None` leaves the job
     on agent-gateway's own routing, a non-Claude IU model id pins it there
-    instead."""
+    instead.
+
+    Refused with PausedError while `warden pause` is in force, like open_episode()."""
+    pause.require_running(f"a review of {repo}#{pr}")
     now = now or dt.datetime.now(dt.timezone.utc)
     job = agent_gateway.submit_review(cwd=policy.repo_cwd(repo), pr=pr, context=context, model=model)
     job_id = job["id"]

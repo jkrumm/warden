@@ -165,18 +165,19 @@ def check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     """Every check-run GitHub recorded for `sha`.
 
     A 403 carrying GitHub's own "Resource not accessible by personal access
-    token" is raised as `CheckRunsUnreadable`, not a plain RemoteError: it means
-    the credential lacks `Checks: read` (only reachable on a private repo), so
-    the caller (`lifecycle/merge.py`) decides (§110). Every other non-200 stays a
-    loud refusal."""
+    token" is raised as `CheckRunsUnreadable`, not a plain RemoteError: a fine-grained
+    token cannot read the Checks API at all (it is GitHub-App-only; there is no
+    permission to grant), so the caller (`lifecycle/merge.py`) reads Actions runs
+    instead (§110). Every other non-200 stays a loud refusal."""
     if not _SHA_RE.match(sha):
         raise PreconditionError(f"{sha!r} is not a 40-hex commit sha — refusing before the request")
     path = f"/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100"
     status, body = api("GET", path)
     if status == 403 and isinstance(body, dict) and _TOKEN_CANNOT_READ_RE.search(body.get("message") or ""):
         raise CheckRunsUnreadable(
-            f"GitHub returned HTTP 403 reading check-runs for {owner}/{repo}@{sha} — the token may "
-            f"not read checks (Checks: read): {body.get('message')}"
+            f"GitHub returned HTTP 403 reading check-runs for {owner}/{repo}@{sha}: a fine-grained token "
+            f"cannot use the Checks API (GitHub-App-only, no permission to grant); the Actions-runs "
+            f"fallback is in use ({body.get('message')})"
         )
     return _all_pages(status, body, path, "check_runs", f"check-runs for {owner}/{repo}@{sha}")
 
@@ -221,9 +222,9 @@ def workflow_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
     """Every GitHub Actions workflow run on `sha`, mapped to the check-run shape
     `lifecycle/merge.py`'s green-or-none gate consumes ({name, status, conclusion}).
 
-    The fallback when `check_runs()` is unreadable (a fine-grained PAT without
-    `Checks: read` on a private repository, §110): the same credential can often
-    still read Actions runs. Only the latest run per workflow is kept — a re-run
+    The fallback when `check_runs()` is unreadable (a fine-grained PAT cannot use the
+    Checks API, which is GitHub-App-only, so there is no grant to ask for; §110): the
+    same token reads `/actions/runs` fine, which makes this the normal path for it. Only the latest run per workflow is kept — a re-run
     or a second trigger of one workflow for one commit must not let a stale green
     run mask the current one. A non-200 here raises a plain `RemoteError`: with no
     check-runs to fall back to, an unreadable CI state still refuses."""

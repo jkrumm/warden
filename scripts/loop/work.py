@@ -590,7 +590,11 @@ def escalate(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime,
     broken loop.
 
     Concurrency is checked once per run, decremented as clusters are opened, so later repos in the
-    same run see an exhausted cap."""
+    same run see an exhausted cap.
+
+    Paused (`warden pause`): nothing is dispatched; the items wait in `triaged`."""
+    if core.is_paused():
+        return
     open_investigations = count_open_investigation_clusters(conn)
 
     ready_sql, ready_params = core.retry_ready_sql(now)
@@ -780,7 +784,13 @@ def escalate_origin_items(conn: sqlite3.Connection, now: dt.datetime, *, dry_run
     orphan-reclaim pass at the top is the claim's crash-recovery counterpart (claimed `working`, but
     `dispatch_job` never written because the process died). It only takes a claim older than
     ORIGIN_CLAIM_STALE_MINUTES: a younger one is another caller still mid-dispatch, and reclaiming
-    it would open the investigation twice."""
+    it would open the investigation twice.
+
+    Paused (`warden pause`): returns before anything, the reclaim included. The item waits in
+    `triaged`; this is also the gate behind `warden run`, which opens and triages its item but
+    dispatches nothing."""
+    if core.is_paused():
+        return
     policy = core.load_policy()
     open_investigations = count_open_investigation_clusters(conn)
     if not dry_run:
@@ -1685,7 +1695,11 @@ def maybe_auto_remediate(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     reconstructable from the row alone. Every claimed item releases its claim before this function
     returns, together, with the SAME note: STATE_VERIFYING on `exitCode == 0`, an infrastructure
     strike (back to `working`, see strike()) otherwise. There is no async poll step: a host verb's
-    subprocess IS the whole operation."""
+    subprocess IS the whole operation.
+
+    Paused (`warden pause`): no verb runs and no claim is taken."""
+    if core.is_paused():
+        return
     host_verbs = policy.get("hostVerbs") or []
     if not host_verbs:
         return
@@ -1868,7 +1882,11 @@ def maybe_auto_implement(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     first resubmitted once without it, open_implement_episode()). A submit that MAY have reached
     agent-gateway (a timeout) is never retried blind: the claim and the open operation stay put for
     reconcile_operations() (hold_ambiguous_submit()), which strikes the item back to `working` once
-    the grace window has passed."""
+    the grace window has passed.
+
+    Paused (`warden pause`): nothing is claimed or submitted; the verdict waits."""
+    if core.is_paused():
+        return
     ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND dispatch_job IS NOT NULL AND implement_job IS NULL "
@@ -2978,7 +2996,11 @@ def maybe_revise_blocked(conn: sqlite3.Connection, policy: dict[str, Any], now: 
     the PR, a pointer to its branch), without `revisionOf`; the PR on record is closed when its
     replacement opens (poll_implement_jobs()). Attempt ESCALATION_ATTEMPT and later run on the
     escalation model (implement_model()); an agent-gateway refusal of that model is retried once without
-    it (open_implement_episode())."""
+    it (open_implement_episode()).
+
+    Paused (`warden pause`): no revision starts; the blocked item waits in `working`."""
+    if core.is_paused():
+        return
     ready_sql, ready_params = core.retry_ready_sql(now)
     candidates = conn.execute(
         f"SELECT * FROM triage_items WHERE state=? AND implement_job IS NOT NULL AND implement_job != ? "

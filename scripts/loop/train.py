@@ -807,6 +807,8 @@ def _walk_train(conn: sqlite3.Connection, policy: dict[str, Any], event_id: int,
         item = core.get_item(conn, event_id)
         if item is None or item["state"] != core.STATE_MERGING or not _retry_ready(item, now):
             break
+        if core.is_paused():   # before any update_pr / review / merge this hop would start
+            break
         stage = _TRAIN_STAGES.get(item["train_stage"])
         if stage is None:
             # A `merging` row on no stage (an entry path that set none, e.g. a redrive of a `failed`
@@ -829,13 +831,19 @@ def advance_merge_trains(conn: sqlite3.Connection, policy: dict[str, Any], now: 
 
     A revert (is_revert()) goes first, ahead of older items: it undoes a change failing in
     production, and maybe_submit_reverts() opened it without waiting for the PRs already queued
-    here."""
-    if dry_run:
+    here.
+
+    Paused (`warden pause`): no train moves — no `update_pr`, no review, no merge — and every item
+    keeps the stage it is on."""
+    if dry_run or core.is_paused():
         return
     rows = conn.execute("SELECT event_id, repo, signature, pr_url, implement_job FROM triage_items "
                         "WHERE state=? ORDER BY reverting_sha IS NULL, event_id", (core.STATE_MERGING,)).fetchall()
     seen: set[str | None] = set()
     for row in rows:
+        # Per repo, not once at entry: a pause set while one train walks holds every train after it.
+        if core.is_paused():
+            return
         if row["repo"] in seen:
             continue
         seen.add(row["repo"])
