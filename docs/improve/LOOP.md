@@ -46,6 +46,11 @@ since the cursor (`~/.warden/improve.cursor`), or `quiet`.
      `docs/decision-shadow.md` holds (≥ 50 settled rows, ≥ 95% action / ≥ 90% target agreement at
      confidence ≥ 0.95, no new→ignore), file the promotion as a normal `warden run` item. Until then
      report only "N/50 rows" in the journal line — never promote on the replay.
+   - Route moves to the OpenCode Haiku route (agw `docs/routing-and-quota.md`, 2026-10-15): on
+     frontend-heavy PRs, compare the `frontend` angle's findings with what a later fix names
+     (a miss or a nit flood is the friction; the revert is one env line in that doc). An OpenCode
+     server restart still kills attached episodes: a restart in the window plus lost episodes is the
+     item to file, not a re-drive.
    - Hermes: replies in #agents / #hermes since the last entry and their length
      (`~/.hermes/state.db`, read-only); any reply over 3 lines is friction.
    - Argo `/warden`: every few iterations, have `@verifier` screenshot it and confirm
