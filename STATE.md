@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-16 (§170 — the review fold drops a repeat of a prior finding on a file the PR no longer changes) |
+| Last updated | 2026-10-16 (§171 — the repeat drop fails closed on every unreadable input and records what it dropped) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 23 (live ledger migrates on the loop's next boot after the deploy) |

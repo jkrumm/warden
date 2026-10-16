@@ -498,29 +498,57 @@ def _train_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
     return False
 
 
+def _file_name(name: Any) -> str | None:
+    """A file as a finding and the PR's file list spell it: `./` dropped, a numeric `:line` suffix dropped."""
+    if not isinstance(name, str):
+        return None
+    name = name.removeprefix("./")
+    path, sep, line = name.rpartition(":")
+    if sep and line.isdigit():
+        name = path
+    return name or None
+
+
+def _finding_file(f: Any) -> str | None:
+    return _file_name(f.get("file")) if isinstance(f, dict) else None
+
+
 def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
                               blocking: list[Any]) -> list[dict[str, Any]] | None:
     """The blocking findings that repeat a prior round's finding on a file this PR no longer changes.
     The spec's rule (dotfiles docs/agent-platform.md, § Revisions): such a repeat is not a block, the
-    revision dropped that change, so the diff resolved it. A repeat is matched on the file alone; a
-    finding with no file, or on a file the PR still changes (renames count as changed), is never
-    dropped. None when the PR's file list cannot be read whole: a strike, never a guess."""
-    def _file(f: Any) -> str | None:
-        name = f.get("file") if isinstance(f, dict) else None
-        return name if isinstance(name, str) and name else None
-
-    prior_files = {_file(f) for f in work.prior_blocking_findings(conn, item)} - {None}
-    repeats = [f for f in blocking if _file(f) in prior_files and not work.is_process_only_finding(f)]
+    revision dropped that change, so the diff resolved it. A repeat is matched on the file alone (both
+    sides normalized by _file_name()); a finding with no file, or on a file the PR still changes
+    (renames count as changed), is never dropped. A PR URL that names no PR, or an empty file listing
+    (not yet populated), is a strike and None: a repeat is never read as resolved on a guess. An
+    unreadable listing drops nothing, so the verdict falls through to `blocked`."""
+    prior_files = {_finding_file(f) for f in work.prior_blocking_findings(conn, item)} - {None}
+    repeats = [f for f in blocking if _finding_file(f) in prior_files and not work.is_process_only_finding(f)]
     if not repeats:
         return []
-    owner, name, number = _github.parse_pr_url(item["pr_url"] or "")
+    ref = _github.parse_pr_url(item["pr_url"] or "")
+    if ref is None:
+        _train_strike(conn, item, now, f"could not parse the PR number from {item['pr_url']!r}",
+                      failure_class=core.FAILURE_WORK)
+        return None
+    owner, name, number = ref
     try:
         files = _github.pr_files(owner, name, number)
-    except RemoteError as e:
-        _train_strike(conn, item, now, f"could not read the files of {owner}/{name}#{number}: {e}")
+    except RemoteError:
+        return []
+    if not files:
+        _train_strike(conn, item, now, f"GitHub listed no files for {owner}/{name}#{number}; "
+                                       "a repeat is not read as resolved on an empty listing")
         return None
-    changed = {f.get(key) for f in files if isinstance(f, dict) for key in ("filename", "previous_filename")}
-    return [f for f in repeats if _file(f) not in changed]
+    changed = {_file_name(f.get(key)) for f in files if isinstance(f, dict)
+               for key in ("filename", "previous_filename")} - {None}
+    return [f for f in repeats if _finding_file(f) not in changed]
+
+
+def _dropped_note(resolved: list[dict[str, Any]]) -> str:
+    files = sorted({_finding_file(f) for f in resolved} - {None})
+    return (f"dropped {len(resolved)} prior finding(s) on files the PR no longer changes: "
+            + ", ".join(files))
 
 
 def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row,
@@ -703,8 +731,11 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     conn.commit()
 
     if validation_status == "confirmed":
+        confirmed_note = decided_note or f"review confirmed {sha[:12]}"
+        if resolved:
+            confirmed_note = f"{_dropped_note(resolved)}; {confirmed_note}"
         return _train_hop(conn, item, now, train_stage=TRAIN_MERGE, reviewed_sha=sha, retry_at=None,
-                          note=decided_note or f"review confirmed {sha[:12]}", **_stage_success(item))
+                          note=confirmed_note, **_stage_success(item))
     if validation_status == "unknown":
         core.set_state(conn, event_id, core.STATE_FAILED, now, strikes=0, failure_class=core.FAILURE_INFRA,
                         note=f"step-7 validation: {unknown_outcome_note}")

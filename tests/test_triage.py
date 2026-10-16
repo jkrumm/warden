@@ -4232,6 +4232,13 @@ def _run_repeat_review(conn, pr_files_fn) -> None:
             train.advance_merge_trains(conn, _MERGE_FIXTURE_POLICY, NOW, dry_run=False)
 
 
+def _fold_repeat_review(conn, eid, pr_files_fn) -> None:
+    """The review fold alone: the merge stage that follows a confirm overwrites the item's note."""
+    with _env(WARDEN_TRIAGE_POLICY=str(core.POLICY_PATH)):
+        with _patched(_github, pr_files=pr_files_fn):
+            train._fold_review(conn, _MERGE_FIXTURE_POLICY, core.get_item(conn, eid), NOW)
+
+
 _GONE_FINDING = {"file": "scripts/gone.py", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}
 
 
@@ -4241,10 +4248,13 @@ def test_a_repeat_of_a_prior_finding_on_a_file_the_pr_no_longer_changes_is_not_a
             conn, "sig-repeat-dropped", prior_findings=[_GONE_FINDING],
             current_findings=[dict(_GONE_FINDING, message="still wrong")],
             pr_files=[{"filename": "scripts/other.py"}])
-        _run_repeat_review(conn, pr_files_fn)
+        _fold_repeat_review(conn, eid, pr_files_fn)
         status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
         assert status["validation_status"] == "confirmed", dict(status)
-        assert core.get_item(conn, eid)["train_stage"] == train.TRAIN_MERGE
+        item = core.get_item(conn, eid)
+        assert item["train_stage"] == train.TRAIN_MERGE
+        assert item["note"].startswith("dropped 1 prior finding(s) on files the PR no longer changes: "
+                                       "scripts/gone.py; review confirmed "), item["note"]
 
 
 def test_a_repeat_on_a_file_the_pr_still_changes_is_still_a_block():
@@ -4269,7 +4279,7 @@ def test_a_new_finding_on_a_file_the_pr_no_longer_changes_is_still_a_block():
         assert status["validation_status"] == "blocked", dict(status)
 
 
-def test_an_unreadable_pr_file_list_strikes_and_never_confirms_a_repeat():
+def test_an_unreadable_pr_file_list_drops_nothing_and_blocks():
     with _triage_env() as (conn, ctx):
         eid, pr_files_fn = _seed_repeat_round(
             conn, "sig-repeat-unreadable", prior_findings=[_GONE_FINDING],
@@ -4277,9 +4287,57 @@ def test_an_unreadable_pr_file_list_strikes_and_never_confirms_a_repeat():
             pr_files=RemoteError("GitHub returned HTTP 502"))
         _run_repeat_review(conn, pr_files_fn)
         status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+        assert core.get_item(conn, eid)["strikes"] == 0
+
+
+def test_an_empty_pr_file_listing_strikes_and_never_confirms_a_repeat():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-empty-listing", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
         assert status["validation_status"] not in ("confirmed", "blocked"), dict(status)
         item = core.get_item(conn, eid)
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
+
+
+def test_a_repeat_whose_pr_url_names_no_pr_strikes_and_drops_nothing():
+    with _triage_env() as (conn, ctx):
+        eid, _ = _seed_repeat_round(
+            conn, "sig-repeat-no-pr", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": "scripts/other.py"}])
+        conn.execute("UPDATE triage_items SET pr_url='' WHERE event_id=?", (eid,))
+        conn.commit()
+        blocking = [dict(_GONE_FINDING, message="still wrong")]
+        assert train._repeats_resolved_by_diff(conn, core.get_item(conn, eid), NOW, blocking) is None
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
+
+
+def test_a_repeat_spelled_with_dot_slash_or_line_number_on_a_changed_file_is_still_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-spelled-changed", prior_findings=[dict(_GONE_FINDING, file="./scripts/gone.py")],
+            current_findings=[dict(_GONE_FINDING, file="scripts/gone.py:3", message="still wrong")],
+            pr_files=[{"filename": "scripts/gone.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
+
+def test_a_repeat_spelled_with_dot_slash_or_line_number_on_a_dropped_file_is_not_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-spelled-dropped", prior_findings=[dict(_GONE_FINDING, file="./scripts/gone.py")],
+            current_findings=[dict(_GONE_FINDING, file="scripts/gone.py:3", message="still wrong")],
+            pr_files=[{"filename": "scripts/other.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "confirmed", dict(status)
 
 
 def test_validation_outcome_needs_decision_routes_to_needs_decision():
