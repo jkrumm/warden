@@ -115,11 +115,16 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    dropped, never a block (`_repeats_resolved_by_diff()`), and the drop is fail-closed — an
    unreadable, empty, or partially unreadable file listing (an entry that yields no usable
    filename), or an unparsable PR URL, drops nothing rather than read a repeat as resolved.
-   A repeat resolves only when neither its raw `_file_name()` nor its `_finding_file()` names a
-   changed file, so a `:<line>` suffix that matches a still-changed file fails closed. The raw
+   A repeat matches a prior finding's raw `_file_name()` spelling on the prior side (never
+   normalised, so a literal colon-named prior file `src/report:3` stays `src/report:3`); the current
+   side adds the `_finding_file()` fallback, which strips a `:<n>` suffix only when it is the
+   finding's own `line`. A repeat resolves only when neither its raw `_file_name()` nor its
+   `_finding_file()` names a changed file, so a `:<line>` suffix that matches a still-changed file
+   fails closed. The raw
    review verdict stays immutable and the drop is recorded beside it in `dispatches.dropped_blocking`
    (the sweep and `sync_record` rewrite `verdict_json` from the raw job), so the revision brief
-   subtracts the drop while the next round still recognises the dropped file as a prior finding.
+   subtracts the drop — by finding identity, never file name, so a new finding on the same file as a
+   dropped repeat stays — while the next round still recognises the dropped file as a prior finding.
    A blocked round with no such finding is converging (the earlier findings are fixed, the
    new ones consequences of the narrow fix) and keeps revising up to the absolute ceiling
    `core.MAX_REVISIONS` = 5 on `revision_count`; a round with

@@ -4506,6 +4506,45 @@ def test_a_real_file_named_with_a_numeric_suffix_matching_the_line_is_not_droppe
         status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
         assert status["validation_status"] == "blocked", dict(status)
 
+
+def test_a_new_finding_on_the_base_of_a_colon_named_prior_file_is_not_dropped_as_a_repeat():
+    # A literal colon-named prior file `src/report:3` (line 3) must not normalise to `src/report` and
+    # swallow a NEW finding on the base file. The PR still changes `src/report:3`, so the repeat of the
+    # prior finding blocks, and the new base-file finding is a fresh block too (never read as a repeat).
+    prior = {"file": "src/report:3", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}
+    base = {"file": "src/report", "line": 5, "message": "new defect on the base file", "angle": "senior-dev"}
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-colon-prior-base-new", prior_findings=[prior],
+            current_findings=[dict(prior, message="still wrong"), base],
+            pr_files=[{"filename": "src/report:3"}])
+        _fold_repeat_review(conn, eid, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+        review = conn.execute("SELECT dropped_blocking FROM dispatches WHERE job_id='review-repeat'").fetchone()
+        assert review["dropped_blocking"] is None, review["dropped_blocking"]
+        text = work._revision_findings(conn, core.get_item(conn, eid))
+        assert text is not None and "new defect on the base file" in text, text
+
+
+def test_a_kept_finding_sharing_a_file_with_a_dropped_one_stays_in_the_brief_and_prior_comparison():
+    # The drop keys on the finding, not the file name: a new defect on the same file as a dropped repeat
+    # must still reach the revision brief and the next round's prior-findings comparison.
+    dropped = {"file": "scripts/gone.py", "line": 3, "message": "wrong comparator", "angle": "senior-dev"}
+    kept = {"file": "scripts/gone.py", "line": 9, "message": "new defect on the same file", "angle": "senior-dev"}
+    text = work._review_findings_text({"blocking": [dropped, kept]}, dropped=[dropped])
+    assert text is not None and "new defect on the same file" in text and "wrong comparator" not in text, text
+    with _triage_env() as (conn, ctx):
+        eid, _ = _seed_repeat_round(
+            conn, "sig-repeat-same-file-kept", prior_findings=[dropped, kept],
+            current_findings=[kept], pr_files=[{"filename": "scripts/other.py"}])
+        conn.execute("UPDATE dispatches SET dropped_blocking=? WHERE job_id='review-prev'",
+                     (json.dumps([dropped]),))
+        conn.commit()
+        prior = work.prior_blocking_findings(conn, core.get_item(conn, eid))
+        assert [f["message"] for f in prior] == ["new defect on the same file"], [f["message"] for f in prior]
+
+
 def test_validation_outcome_needs_decision_routes_to_needs_decision():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-needs-human")

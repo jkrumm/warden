@@ -10654,3 +10654,25 @@ line: 3}` while the PR changes `pkg/a:3` — normalised to a name not in `change
 PR still changed it. A repeat now resolves only when NEITHER the raw `_file_name()` NOR `_finding_file()` is
 in `changed`, failing closed on an ambiguous name. Tests: `test_triage.py` 633 -> 636 (a re-raised dropped
 finding still drops; both colon-suffixed cases keep the block). AGENTS.md's gate line reads 636.
+
+## 176. The repeat matches raw on both sides and the drop keys on finding identity, not file (2026-10-16)
+
+Independent review blocked PR #45 (the §175 attempt) on two points.
+
+(1) The repeat match was one-sided. `_repeats_resolved_by_diff()` built `prior_files` with
+`_finding_file()` (which strips a `:<n>` suffix equal to the finding's own `line`), so a literal
+colon-named prior file `src/report:3` (line 3) normalised to `src/report`, and a NEW finding on the
+base file `src/report` (line 5) read as the same repeat. When the PR still changed only `src/report:3`,
+the new base-file blocker was dropped as a repeat, the merge confirmed, and a live blocker shipped on a
+file the spec's rule never covers. The prior side is now raw `_file_name()` only (never normalised); the
+current side matches raw, with `_finding_file()` as the fallback that strips the current finding's own
+`:<line>` suffix, so an ambiguous name fails closed as a non-repeat. Tests: `test_triage.py` 636 -> 637
+(a new finding on the base of a colon-named prior file stays blocked).
+
+(2) `_review_findings_text()` and `prior_blocking_findings()` subtracted the dropped repeats by raw file
+name (`f.get("file") not in dropped_files`), so a kept finding that named the same file as a dropped
+repeat was dropped from the revision brief and the next round's comparison — a still-blocking defect
+with an empty work order. The drop now keys on finding identity (dict equality, `f not in dropped`), and
+`_fold_review()`'s own `id()`-based drop is the same keying (`f not in resolved`). Tests: `test_triage.py`
+637 -> 638 (a kept finding sharing a file with a dropped one reaches the brief and the prior comparison).
+AGENTS.md's gate line reads 638.

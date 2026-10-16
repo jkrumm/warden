@@ -6,7 +6,7 @@ build log (§1–§150).
 
 | | |
 |-|-|
-| Last updated | 2026-10-16 (§175 — the dropped repeat is kept beside the raw verdict, not folded into it) |
+| Last updated | 2026-10-16 (§176 — the repeat matches raw on both sides; the drop keys on finding identity, not file) |
 | Current work | agent-platform rewrite (`docs/waves/PLAN.md`) — Waves 1–6 done; spec `~/SourceRoot/dotfiles/docs/agent-platform.md` |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 24 (live ledger migrates on the loop's next boot after the deploy) |

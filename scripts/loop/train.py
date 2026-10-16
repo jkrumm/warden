@@ -522,9 +522,12 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
                               blocking: list[Any]) -> list[dict[str, Any]] | None:
     """The blocking findings that repeat a prior round's finding on a file this PR no longer changes.
     The spec's rule (dotfiles docs/agent-platform.md, § Revisions): such a repeat is not a block, the
-    revision dropped that change, so the diff resolved it. A repeat is matched on the file alone (both
-    sides read by _finding_file()); a finding with no file, or on a file the PR still changes
-    (renames count as changed), is never dropped. A repeat resolves only when neither its raw
+    revision dropped that change, so the diff resolved it. A repeat matches a prior finding's raw
+    `_file_name()` spelling on the prior side (never normalised: a literal colon-named prior file
+    `src/report:3` stays `src/report:3`), and the current side adds the `_finding_file()` fallback,
+    which strips a `:<n>` suffix only when it is the finding's own `line`; a finding with no file, or
+    on a file the PR still changes (renames count as changed), is never dropped. A repeat resolves
+    only when neither its raw
     `_file_name()` nor its `_finding_file()` names a changed file, so a `:<line>` suffix that
     normalises one spelling away from a still-changed file fails closed (kept, not dropped). A PR URL
     that names no PR, or a file listing where ANY entry yields no usable filename (an empty listing,
@@ -533,13 +536,17 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
     because the entry that yielded nothing could be the very file the repeat names — a file left off
     the listing reads as no longer changed. An unreadable listing drops nothing, so the verdict falls
     through to `blocked`."""
-    prior_files = {_finding_file(f) for f in work.prior_blocking_findings(conn, item)} - {None}
+    prior_files = {_file_name(f.get("file")) for f in work.prior_blocking_findings(conn, item)} - {None}
     # A finding the previous round already dropped (resolved by the diff) is still a prior finding
     # for the next round's comparison: a later round that re-raises it on the same still-absent file
     # must drop it again, not read it as a fresh block (item 1559). prior_blocking_findings() excludes
     # the dropped ones (they do not block), so read them back here.
-    prior_files |= {_finding_file(f) for f in work.prior_dropped_findings(conn, item)} - {None}
-    repeats = [f for f in blocking if _finding_file(f) in prior_files]
+    prior_files |= {_file_name(f.get("file")) for f in work.prior_dropped_findings(conn, item)} - {None}
+    # The prior side is raw `_file_name()` only; the current side matches raw, with `_finding_file()` as
+    # the fallback that strips the current finding's own `:<line>` suffix. A prior `src/report:3` that is
+    # a literal file never collapses to `src/report`, so a new finding on the base file is not a repeat.
+    repeats = [f for f in blocking
+               if _file_name(f.get("file")) in prior_files or _finding_file(f) in prior_files]
     if not repeats:
         return []
     ref = _github.parse_pr_url(item["pr_url"] or "")
@@ -700,8 +707,11 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     if resolved is None:
         _release_review_claim(conn, event_id, claim_until)
         return False
-    dropped = {id(f) for f in resolved}
-    blocking = [f for f in blocking if id(f) not in dropped]
+    # Drop by finding identity: `resolved` holds the same dicts as `blocking`, so value equality (f not
+    # in resolved) keys on the finding itself, never its file name — a new finding on the same file as a
+    # dropped repeat stays. `id()` would be right here too (same objects), but equality is the same keying
+    # `_review_findings_text()`/`prior_blocking_findings()` use after the JSON round-trip, so one rule.
+    blocking = [f for f in blocking if f not in resolved]
     if resolved:
         # The dropped repeats are recorded on their own column, not folded into `verdict_json`:
         # `verdict_json` is agent-gateway's raw result, and both `dispatch.sync_record()` (`warden status

@@ -2760,10 +2760,10 @@ def _review_findings_text(verdict: dict[str, Any], *,
     parked `blocked` by an older round from spending its remaining attempt on text no episode can
     write. `dropped` are the findings the fold dropped as resolved-by-the-diff (a repeat on a file
     the PR no longer changes): they are taken off the brief, so a revision is never sent to fix a
-    file the PR no longer changes."""
-    dropped_files = {f.get("file") for f in (dropped or []) if isinstance(f, dict) and f.get("file")}
+    file the PR no longer changes. The drop is by finding identity (dict equality), never by file name,
+    so a new finding that happens to name the same file as a dropped repeat stays on the brief."""
     blocking = [f for f in (verdict.get("blocking") or [])
-                if not is_process_only_finding(f) and f.get("file") not in dropped_files]
+                if not is_process_only_finding(f) and f not in (dropped or [])]
     if not blocking:
         return None
     lines = []
@@ -2813,7 +2813,9 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
     findings an earlier attempt was blocked on still apply to it. Findings the fold dropped as
     resolved-by-the-diff (`dispatches.dropped_blocking`) are excluded — they do not block, so neither
     the revision brief nor the review context may quote them; the repeat-drop comparison reads them
-    back via prior_dropped_findings()."""
+    back via prior_dropped_findings(). The exclusion is by finding identity (dict equality), not file
+    name, so a kept finding that names the same file as a dropped repeat still reaches the next
+    round's comparison."""
     job_id = _prior_blocked_review(conn, item, same_pr=same_pr)
     if job_id is None:
         return []
@@ -2821,9 +2823,8 @@ def prior_blocking_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
                        (job_id,)).fetchone()
     verdict = core.safe_json(rev["verdict_json"] if rev else None)
     dropped = safe_json_list(rev["dropped_blocking"] if rev else None)
-    dropped_files = {f.get("file") for f in dropped if isinstance(f, dict) and f.get("file")}
     return [f for f in (verdict.get("blocking") or [])
-            if isinstance(f, dict) and not is_process_only_finding(f) and f.get("file") not in dropped_files]
+            if isinstance(f, dict) and not is_process_only_finding(f) and f not in dropped]
 
 
 def prior_dropped_findings(conn: sqlite3.Connection, item: sqlite3.Row, *,
