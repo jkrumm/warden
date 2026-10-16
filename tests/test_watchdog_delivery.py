@@ -89,11 +89,9 @@ def post_env(*, run_poll_result=None):
         "DB_PATH": wp.DB_PATH,
         "_run_poll": wp._run_poll,
         "resolve_secret": wp.resolve_secret,
-        "_push_uptime_heartbeat": wp._push_uptime_heartbeat,
     }
 
-    heartbeats = {"n": 0}
-    secrets = {"UPTIME_PUSH_WATCHDOG": "https://push.example/x"}
+    secrets = {}
     result = run_poll_result if run_poll_result is not None else ([], [])
 
     def _fake_run_poll(conn, now, env, deliver=True):
@@ -102,18 +100,13 @@ def post_env(*, run_poll_result=None):
     def _fake_resolve_secret(key):
         return secrets.get(key) or ""
 
-    def _fake_heartbeat():
-        heartbeats["n"] += 1
-
     try:
         wp.DB_PATH = tmp_db
         wp._run_poll = _fake_run_poll
         wp.resolve_secret = _fake_resolve_secret
-        wp._push_uptime_heartbeat = _fake_heartbeat
 
         class Ctx:
             def __init__(self):
-                self.heartbeats = heartbeats
                 self.db_path = tmp_db
 
         yield Ctx()
@@ -203,32 +196,24 @@ row = conn.execute("SELECT resolved_at FROM events WHERE external_id='sig-a'").f
 check("disappearance still resolves under suppression", row["resolved_at"] is not None, True)
 conn.close()
 
-print("\n6. a poll with news posts nothing to Slack and still heartbeats")
+print("\n6. a poll with news posts nothing to Slack and pushes nothing to Kuma")
 check("no digest composer left", hasattr(wp, "compose_slack_body"), False)
 check("no Slack post path left", hasattr(wp, "post_text"), False)
+# The Hermes Watchdog push was retired: the poller's liveness is the `watchdog_poll_last_run` cursor,
+# which the `Warden Loop` push requires fresh (lifecycle/freshness.py).
+check("no Kuma push path left", hasattr(wp, "_push_uptime_heartbeat"), False)
 with post_env(run_poll_result=NEWS) as ctx:
     rc = wp.main(["--post"])
     check("rc == 0", rc, 0)
-    # The monitor this feeds answers "is the poller still running", not "did it have
-    # news": a quiet half hour is the normal case and must still ping.
-    check("heartbeat fires on a clean run", ctx.heartbeats["n"], 1)
+    row = wp.db_connect().execute("SELECT value FROM cursors WHERE key=?", (wp.HEARTBEAT_CURSOR_KEY,)).fetchone()
+    check("the liveness cursor is written", row is not None, True)
 
-print("\n7. no --post, no heartbeat")
+print("\n7. --post --dry-run completes the temp-copy poll")
 with post_env(run_poll_result=NEWS) as ctx:
-    rc = wp.main([])
-    check("rc == 0", rc, 0)
-    check("zero heartbeat calls", ctx.heartbeats["n"], 0)
-
-print("\n8. --post --dry-run makes zero heartbeat calls")
-with post_env(run_poll_result=NEWS) as ctx:
-    # main()'s --dry-run branch still runs the full temp-copy-then-poll path
-    # (see main(): "Run poll against a temp copy of the DB…") — a clean rc here is
-    # evidence that path completed.
     rc = wp.main(["--post", "--dry-run"])
     check("rc == 0", rc, 0)
-    check("zero heartbeat calls under dry-run", ctx.heartbeats["n"], 0)
 
-print("\n9. the heartbeat fires on rc == 0 and not while Slack polling is blind")
+print("\n8. Slack polling blind: rc != 0 and the alarm is reported")
 with post_env(run_poll_result=NEWS) as ctx:
     _seed_slack_blind(ctx.db_path)
     stderr = io.StringIO()
@@ -236,9 +221,8 @@ with post_env(run_poll_result=NEWS) as ctx:
         rc = wp.main(["--post"])
     check("rc != 0 (slack polling blind)", rc == 0, False)
     check("the blindness alarm is still reported", "Slack polling is blind" in stderr.getvalue(), True)
-    check("no heartbeat on a non-zero rc", ctx.heartbeats["n"], 0)
 
-print("\n10. ledger behind this process's schema, --post — pass skipped, heartbeat still fires")
+print("\n9. ledger behind this process's schema — pass skipped, rc 0")
 with post_env(run_poll_result=NEWS) as ctx:
     behind_conn = sqlite3.connect(ctx.db_path)
     behind_conn.execute("UPDATE schema_version SET version = ?", (wp._ledger.LEDGER_SCHEMA_VERSION - 1,))
@@ -249,21 +233,7 @@ with post_env(run_poll_result=NEWS) as ctx:
     with contextlib.redirect_stderr(stderr):
         rc = wp.main(["--post"])
     check("rc == 0", rc, 0)
-    # The Kuma monitor measures "is the poller alive", not "did the ledger open" —
-    # a pass deliberately skipped during a migration window is a live poller.
-    check("heartbeat still fires", ctx.heartbeats["n"], 1)
     check("stderr names the skip", "ledger behind this process's schema" in stderr.getvalue(), True)
-
-print("\n11. ledger behind this process's schema, no --post — heartbeat NOT pushed")
-with post_env(run_poll_result=NEWS) as ctx:
-    behind_conn = sqlite3.connect(ctx.db_path)
-    behind_conn.execute("UPDATE schema_version SET version = ?", (wp._ledger.LEDGER_SCHEMA_VERSION - 1,))
-    behind_conn.commit()
-    behind_conn.close()
-
-    rc = wp.main([])
-    check("rc == 0", rc, 0)
-    check("heartbeat NOT pushed without --post", ctx.heartbeats["n"], 0)
 
 print()
 if failures:

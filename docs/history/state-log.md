@@ -10857,3 +10857,16 @@ Accepted: a different sender whose #alerts text starts with `🚨 ` or `✅ ` is
 today, the MAM monitor, starts with `*`). weatherorb's four alerts keep their own `ops.alert` webhook and are not in the
 `vps` directory. Test: `test_watchdog_slack_blindness.py` §6.
 
+
+## §180 — `Warden Loop` push requires poll and sweep freshness; the Hermes Watchdog push is retired (2026-10-17)
+
+Dotfiles plan Wave 16 (Kuma as the calm backstop). `lifecycle/freshness.py` now owns the poller table
+(`POLLERS`, `STALE_MULTIPLE`) that `/health` used to hold, plus `stale_pollers()`; `api.py` re-exports it, so the
+endpoint and the page cannot disagree. `triage.run()` pings `Warden Loop - Push` only when `stale_pollers()` is
+empty (loop, `watchdog_poll`, `dispatch_sweep` each within 3x their interval, and the poll's cursor not reporting
+`slack_blind`); otherwise it names the stale ones on stderr and stays silent, so a dead sweep or poller pages
+through Kuma (~30 min) and not only through an endpoint nobody watches. `watchdog-poll.py` no longer pushes the
+`Hermes Watchdog - Push` monitor (`_push_uptime_heartbeat` and the `UPTIME_PUSH_WATCHDOG` ref are gone; `--post` is
+accepted and inert); that monitor is removed from `monitors.yaml`. The Slack-blind withholding it carried moved into
+the freshness test. Tests: `test_freshness.py` (7), `test_triage.py` push gating (674 -> 675 with it),
+`test_watchdog_delivery.py` rewritten around the cursor.

@@ -16,7 +16,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from clients import kuma  # noqa: E402
-from lifecycle import pause  # noqa: E402
+from lifecycle import freshness, pause  # noqa: E402
 from loop import core, intake, notify, triaging, verify, work  # noqa: E402
 
 
@@ -92,9 +92,15 @@ def run(conn: sqlite3.Connection, *, dry_run: bool) -> int:
     # Last step of every pass: the Argo snapshot.
     notify.push_argo_snapshot(conn, now, dry_run=dry_run)
 
-    # After the last step: a pass that dies before here must stay silent for Kuma to page on.
+    # After the last step: a pass that dies before here must stay silent for Kuma to page on. The
+    # push also requires the poll and the sweep to be fresh (the same test `/health` applies), so a
+    # dead sweep or poller pages through Kuma and not only through an endpoint nobody watches.
     if not dry_run:
-        kuma.ping_loop()
+        stale = freshness.stale_pollers(conn, dt.datetime.now(dt.timezone.utc))
+        if stale:
+            print(f"triage: Kuma loop heartbeat withheld, stale: {', '.join(stale)}", file=sys.stderr)
+        else:
+            kuma.ping_loop()
     return 0
 
 

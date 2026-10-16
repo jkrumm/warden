@@ -605,6 +605,28 @@ def test_repeated_signature_one_investigation_and_no_slack_post():
         assert item["dispatch_job"] == "job-000001"
 
 
+def test_loop_kuma_push_requires_poll_and_sweep_heartbeats():
+    """`Warden Loop - Push` (ops-signals §2): a completed pass pings Kuma only when the poller and the
+    sweep are fresh too, so a dead sweep pages through Kuma and not only through `/health`."""
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    with _triage_env() as (conn, ctx):
+        KUMA_PINGS.clear()
+        assert triage.run(conn, dry_run=False) == 0
+        assert KUMA_PINGS == [], "no poll or sweep heartbeat recorded: the push must be withheld"
+
+        for key in ("watchdog_poll_last_run", "dispatch_sweep_last_run"):
+            conn.execute("INSERT OR REPLACE INTO cursors(key, value, updated_at) VALUES (?, '{}', ?)", (key, now))
+        conn.commit()
+        assert triage.run(conn, dry_run=False) == 0
+        assert KUMA_PINGS == [1]
+
+        stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=16)).isoformat()   # > 3 x 300 s
+        conn.execute("UPDATE cursors SET updated_at=? WHERE key='dispatch_sweep_last_run'", (stale,))
+        conn.commit()
+        assert triage.run(conn, dry_run=False) == 0
+        assert KUMA_PINGS == [1], "a stale sweep must withhold the push"
+
+
 def test_new_state_item_gets_no_post():
     """An item still in `new` — mapped or not — never posts anything."""
     policy = dict(DEFAULT_POLICY, minOccurrences=5, minOpenMinutes=999999)

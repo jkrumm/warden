@@ -11,7 +11,7 @@ later from silent heartbeats), and stray agent-created skills under
 warden item reaches Slack only as `fixed`/`needs_decision`, loop/notify.py's
 notify_cluster(); everything else lives in Argo). What stays is the poller's own
 health: the blind-Slack-poll alarm on stderr and the exit code, and the UptimeKuma
-heartbeat on a clean run. Uptime Kuma monitors are not polled: Kuma pushes DOWN/UP to
+poller's own liveness cursor (read by `Warden Loop`'s Kuma push). Uptime Kuma monitors are not polled: Kuma pushes DOWN/UP to
 `POST /ingest/kuma` (lifecycle/ingest.py).
 
 Source of truth: ~/SourceRoot/warden/scripts/watchdog-poll.py
@@ -162,7 +162,6 @@ OP_RUN_MISSING_UUID_RE = re.compile(r"could not resolve item UUID for item ([^:\
 _CACHE_REFS: dict[str, str] = {
     "GITHUB_TOKEN": "op://hermes/github/token",
     "HOMELAB_API_KEY": "op://common/api/SECRET",
-    "UPTIME_PUSH_WATCHDOG": "op://hermes/uptime-kuma/watchdog-push-url",
 }
 
 
@@ -358,7 +357,7 @@ def poll_slack_messages(env: dict[str, str], channel_id: str, since_ts: str | No
     A failure here is indistinguishable from "no new messages" at the call site, which is
     how a broken Slack token left #alerts and #updates unwatched for hours on 2026-09-07
     with every run still reporting success. The caller turns a sustained streak into a
-    non-zero exit so the UptimeKuma heartbeat is withheld.
+    non-zero exit; the cursor carries `slack_blind`, which withholds the `Warden Loop` push.
     """
     headers = {"Authorization": f"Bearer {env.get('HOMELAB_API_KEY', '')}"}
     data = http_get(f"{API_BASE}/slack/channels/{channel_id}/messages?limit=50", headers)
@@ -1101,27 +1100,6 @@ def slack_poll_failure(conn: sqlite3.Connection) -> str | None:
     return "watchdog: Slack polling is blind: " + ", ".join(blind)
 
 
-def _push_uptime_heartbeat() -> None:
-    """Self-health heartbeat, inherited from hermes-agent's watchdog-slack.py
-    wrapper (the cron entry-point this replaces) — ping the UptimeKuma push
-    monitor, best-effort, exceptions swallowed. Callers fire this only on a
-    clean run (rc == 0), so a crash, hang, or non-zero exit trips the
-    "Watchdog last successful run" Kuma alert. This is the only thing that
-    notices the ingest poller itself has died.
-    """
-    push_url = resolve_secret("UPTIME_PUSH_WATCHDOG")
-    if not push_url:
-        return
-    # uptime.jkrumm.com sits behind Cloudflare, which 403s the default
-    # Python-urllib User-Agent — send a curl-like UA so the heartbeat lands.
-    req = urllib.request.Request(push_url, headers={"User-Agent": "curl/8.7.1"})
-    try:
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-    except Exception:
-        pass
-
-
 # --- Heartbeat ----------------------------------------------------------------
 #
 # Mirrors triage.py's record_heartbeat() exactly — same key shape, same
@@ -1154,15 +1132,14 @@ def record_heartbeat(conn: sqlite3.Connection, *,
 
 
 def main(argv: list[str] | None = None) -> int:
-    """One poll pass. `--post` is what the LaunchAgent passes: on a clean run (rc == 0) it
-    pings the UptimeKuma push monitor, which is the only thing that notices this poller
-    itself has died. `--dry-run` polls a temp copy of the ledger and writes, pings and posts
-    nothing. Nothing is ever posted to Slack from here.
+    """One poll pass. `--post` is still passed by the LaunchAgent but no longer does anything: the
+    Hermes Watchdog Kuma push is retired, the poller's liveness is its `watchdog_poll_last_run`
+    cursor, which the `Warden Loop` push requires (lifecycle/freshness.py). `--dry-run` polls a
+    temp copy of the ledger and writes and posts nothing. Nothing is ever posted to Slack from here.
 
-    rc is 1 while a Slack source is blind (SLACK_FAIL_STREAK_ALERT consecutive failed
-    polls), reported on stderr, so the heartbeat is withheld and Kuma raises it."""
+    rc is 1 while a Slack source is blind (SLACK_FAIL_STREAK_ALERT consecutive failed polls),
+    reported on stderr and in the cursor."""
     args = set(argv if argv is not None else sys.argv[1:])
-    post = "--post" in args
     dry_run = "--dry-run" in args
 
     env = load_env()
@@ -1198,11 +1175,6 @@ def main(argv: list[str] | None = None) -> int:
                 "the loop migrates at its next tick",
                 file=sys.stderr,
             )
-            # The Kuma monitor measures "is the poller alive", not "did the ledger
-            # open": a pass deliberately skipped during a migration window is a
-            # live poller.
-            if post:
-                _push_uptime_heartbeat()
             return 0
         all_new, all_res = _run_poll(conn, now, env)
         conn.commit()
@@ -1214,11 +1186,6 @@ def main(argv: list[str] | None = None) -> int:
     if slack_blind:
         print(slack_blind, file=sys.stderr)
     rc = 1 if slack_blind else 0
-    # The ping answers "is the poller still running", not "did it have news": a quiet
-    # poll is the normal case and must still ping, or the alert pages on every silent
-    # half hour and gets ignored — which is how an eleven-day blindness goes unnoticed.
-    if post and not dry_run and rc == 0:
-        _push_uptime_heartbeat()
     return rc
 
 

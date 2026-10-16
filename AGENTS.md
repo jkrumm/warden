@@ -92,8 +92,10 @@ tool even though launchd hands the loop a minimal PATH.
   `~/Library/Logs/warden-{loop,poll,sweep,backup,api}.{log,err}`.
 - Kuma monitors: `Warden Backup - Push` (the daily backup pings it on success) and
   `Warden Loop - Push` (the loop pings it at the end of every completed pass, from
-  `clients/kuma.py`; URL in `~/.config/uptime-kuma/warden-loop-push-url`, mode 600; ~40 min of
-  silence pages). Declared in `homelab/uptime-kuma/monitors.yaml`.
+  `clients/kuma.py`, only while the loop, poll and sweep heartbeats are fresh and the poll is not
+  Slack-blind — `lifecycle/freshness.py`, the same test as `/health`; URL in
+  `~/.config/uptime-kuma/warden-loop-push-url`, mode 600; ~30 min of silence pages). The poller's own
+  `Hermes Watchdog - Push` is retired. Declared in `homelab/uptime-kuma/monitors.yaml`.
 - **Kill-switch:** `warden pause [--reason <text>]` stops every loop-driven dispatch, merge and deploy of every origin (the
   loop, the sweep, `warden run` / `dispatch`, Argo's `implement`) while ingest, triage and polling continue;
   the owner's own explicit `warden merge` / Argo merge is not stopped (a human act);

@@ -101,6 +101,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from clients import github as _github  # noqa: E402
 from clients import secrets as _secrets  # noqa: E402
+from lifecycle import freshness as _freshness  # noqa: E402
 from lifecycle import ingest as _ingest  # noqa: E402
 from lifecycle import pause as _pause  # noqa: E402
 
@@ -177,30 +178,9 @@ def _available_actions(state: str, mergeable: bool = False, reverted: bool = Fal
         actions.append("note")
     return actions
 
-# cursors key -> the LaunchAgent StartInterval it heartbeats against (seconds),
-# read straight from each plist template. Named individually, not folded into
-# one "poller last ran" number, so /health and /metrics can answer "which one
-# is blind" rather than only "something is."
-LOOP_INTERVAL_S = 600      # com.jkrumm.warden-loop.plist.template
-POLL_INTERVAL_S = 1800     # com.jkrumm.warden-poll.plist.template
-SWEEP_INTERVAL_S = 300     # com.jkrumm.warden-sweep.plist.template
-STALE_MULTIPLE = 3         # a poller silent for 3x its own interval is a finding, not noise
-
-POLLERS: dict[str, tuple[str, int]] = {
-    "loop": ("triage_last_run", LOOP_INTERVAL_S),
-    "watchdog_poll": ("watchdog_poll_last_run", POLL_INTERVAL_S),
-    "dispatch_sweep": ("dispatch_sweep_last_run", SWEEP_INTERVAL_S),
-}
-
-
-def _poller_age_minutes(conn: sqlite3.Connection, now: dt.datetime, key: str) -> tuple[float | None, str | None]:
-    """(age_minutes, last_run_iso) for one poller's heartbeat cursor, or
-    (None, None) if it has never recorded one."""
-    row = conn.execute("SELECT updated_at FROM cursors WHERE key=?", (key,)).fetchone()
-    if row is None:
-        return None, None
-    last_run = dt.datetime.fromisoformat(row["updated_at"])
-    return (now - last_run).total_seconds() / 60, row["updated_at"]
+POLLERS = _freshness.POLLERS
+STALE_MULTIPLE = _freshness.STALE_MULTIPLE
+_poller_age_minutes = _freshness.poller_age_minutes
 
 
 # --- The six funnel numbers ----------------------------------------------------
