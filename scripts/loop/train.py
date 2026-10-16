@@ -523,7 +523,7 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
     (not yet populated), is a strike and None: a repeat is never read as resolved on a guess. An
     unreadable listing drops nothing, so the verdict falls through to `blocked`."""
     prior_files = {_finding_file(f) for f in work.prior_blocking_findings(conn, item)} - {None}
-    repeats = [f for f in blocking if _finding_file(f) in prior_files and not work.is_process_only_finding(f)]
+    repeats = [f for f in blocking if _finding_file(f) in prior_files]
     if not repeats:
         return []
     ref = _github.parse_pr_url(item["pr_url"] or "")
@@ -669,8 +669,8 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     dropped = {id(f) for f in resolved}
     blocking = [f for f in blocking if id(f) not in dropped]
     # The wrapper class is not the implementer's (see is_process_only_finding()). It must not
-    # read as `blocked` (that spends a revision) but must not be dropped either, so it goes to the
-    # owner with the finding on the card.
+    # read as `blocked` (that spends a revision); apart from a repeat already dropped above, it
+    # is not dropped here either, so it goes to the owner with the finding on the card.
     code_blocking = [f for f in blocking if not work.is_process_only_finding(f)]
     process_blocking = [f for f in blocking if work.is_process_only_finding(f)]
     summary = verdict.get("summary") or "no further detail"

@@ -4257,6 +4257,29 @@ def test_a_repeat_of_a_prior_finding_on_a_file_the_pr_no_longer_changes_is_not_a
                                        "scripts/gone.py; review confirmed "), item["note"]
 
 
+def test_a_process_only_repeat_on_a_file_the_pr_no_longer_changes_is_dropped_not_escalated():
+    """A wrapper (process-only) finding repeating a prior code finding on a file the PR no longer
+    changes is resolved by the diff exactly like a code repeat: dropped, confirming the merge, not
+    parked on the owner (item 1559)."""
+    with _triage_env() as (conn, ctx):
+        process_only = {
+            "file": "scripts/gone.py", "line": 3,
+            "message": "Add 'Closes #20' to the PR description or commit trailer.",
+            "angle": "adversary",
+        }
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-process-only", prior_findings=[_GONE_FINDING],
+            current_findings=[process_only],
+            pr_files=[{"filename": "scripts/other.py"}])
+        _fold_repeat_review(conn, eid, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "confirmed", dict(status)
+        item = core.get_item(conn, eid)
+        assert item["train_stage"] == train.TRAIN_MERGE
+        assert item["note"].startswith("dropped 1 prior finding(s) on files the PR no longer changes: "
+                                       "scripts/gone.py; review confirmed "), item["note"]
+
+
 def test_a_repeat_on_a_file_the_pr_still_changes_is_still_a_block():
     with _triage_env() as (conn, ctx):
         eid, pr_files_fn = _seed_repeat_round(

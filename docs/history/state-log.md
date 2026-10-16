@@ -10598,3 +10598,15 @@ Item 1559 (weatherorb PR #104): revision 3 dropped every `spots/db.py` change, y
 ## 171. The repeat drop fails closed on every unreadable input and says what it dropped (2026-10-16)
 
 Independent review of § 170 blocked it on five points. Four were real: an empty `pr_files()` listing read every repeat as resolved (every repeat dropped, the PR confirmed with its blocking findings unchecked); a `./`-prefixed or `:line`-suffixed finding never matched its file, so a repeat was dropped or kept by spelling; a confirmed PR whose repeats were dropped left no trace in its hop note; and a `pr_files` RemoteError struck where the verdict should have stood as `blocked`. The fifth, an unparsable PR URL crashing the fold, was not reachable from `_fold_review()`: `_open_pr_head()` already strikes an unparsable URL before the repeat check runs. The guard is kept in `_repeats_resolved_by_diff()` itself, which now parses first. Now: a URL that names no PR, or an empty listing, strikes and drops nothing; a `RemoteError` drops nothing and the verdict falls through to `blocked`; `_file_name()` strips `./` and a numeric `:line` on both the finding and the PR file list; a confirm whose repeats were dropped writes `dropped N prior finding(s) on files the PR no longer changes: <files>` ahead of the confirm note. Tests: `test_triage.py` 622 -> 626 (four new, one realigned). AGENTS.md still says 622; the count is a finding for the reviewer to confirm, not edited here.
+
+## 172. A process-only repeat on a dropped file is dropped too (2026-10-16)
+
+Independent review of § 171 blocked it on the one point left: `_repeats_resolved_by_diff()` built its
+`repeats` filter with `and not work.is_process_only_finding(f)`, so a wrapper (process-only) finding
+that repeated a prior code finding on a file the PR no longer changes was kept and routed to the owner
+(`needs_decision`) instead of dropped as resolved. The drop rule is file-scoped and should not care
+which class a finding is: it now drops every blocking finding that repeats a prior finding on a file
+the PR no longer names, and the `code_blocking`/`process_blocking` split that follows the drop is
+unchanged — a wrapper finding not dropped still goes to the owner, never `blocked`, and the comment on
+the split now says so. Tests: `test_triage.py` 626 -> 627 (a process-only repeat on a dropped file
+confirms, not escalates). AGENTS.md's gate line reads 627.
