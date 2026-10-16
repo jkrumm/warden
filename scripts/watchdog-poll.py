@@ -67,7 +67,6 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from clients import secrets as _secrets  # noqa: E402
 
-JOBS_PATH = HERMES_HOME / "cron" / "jobs.json"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 SKILLS_DIR = HERMES_HOME / "skills"
 BUNDLED_MANIFEST_PATH = SKILLS_DIR / ".bundled_manifest"
@@ -510,30 +509,6 @@ def poll_hermes_logs(conn: sqlite3.Connection, now: dt.datetime, now_iso: str) -
             })
             g["count"] += 1
     return list(sigs.values())
-
-
-def poll_hermes_cron() -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    try:
-        data = json.loads(JOBS_PATH.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return out
-    for j in data.get("jobs", []):
-        if not j.get("enabled", True):
-            continue
-        status = j.get("last_status")
-        if status and status != "ok":
-            out.append({
-                "external_id": j["id"],
-                "title": f"Cron '{j.get('name', j['id'])}' status={status}",
-                "url": "",
-                "payload": {
-                    "error": j.get("last_error"),
-                    "last_run_at": j.get("last_run_at"),
-                    "next_run_at": j.get("next_run_at"),
-                },
-            })
-    return out
 
 
 def poll_op_refs(host: str, remote_cmd: str) -> tuple[list[dict[str, Any]], bool]:
@@ -1116,7 +1091,9 @@ def _run_poll(conn: sqlite3.Connection, now: dt.datetime, env: dict[str, str],
         all_new += n; all_res += res
         conn.commit()
 
-    n, res = reconcile(conn, "hermes_cron", poll_hermes_cron(), now, 0, deliver=deliver)
+    # `hermes_cron` is retired: jobs-grade grades Hermes cron jobs and the `job` source opens their items.
+    # Reconciling it against nothing resolves the events it left open; delete this line once none are.
+    n, res = reconcile(conn, "hermes_cron", [], now, 0, deliver=deliver)
     all_new += n; all_res += res
     conn.commit()
 

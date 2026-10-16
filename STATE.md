@@ -6,11 +6,11 @@ build log (§1–§174).
 
 | | |
 |-|-|
-| Last updated | 2026-10-16 (§174 — Wave 9 of the background-jobs chain: the warden-api ingest door, `POST /ingest/kuma` and `/ingest/hyperdx`) |
+| Last updated | 2026-10-16 (§175 — Wave 11 of the background-jobs chain: `hermes_cron` retired for the `job` source, cron-aware job brief, warden-backup under jobrun) |
 | Current work | Background jobs → warden self-healing (dotfiles `docs/waves/PLAN.md`; spec `~/SourceRoot/dotfiles/docs/ops-signals.md`, its *Owner decisions* win): Waves 6-8 live (kill-switch, `job` source, brief and verified closure, review cycle 1); Wave 9 (warden-api ingest door) is built on branch `wave9-ingest` and goes live with its merge and deploy, then needs the token seeded and the off-box door (done elsewhere); Wave 10 (retire the `uk` poll) is next. The agent-platform rewrite (`docs/waves/PLAN.md` here; spec `~/SourceRoot/dotfiles/docs/agent-platform.md`) is done |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
 | Ledger | `~/.warden/warden.db`, schema 23 (Wave 6 changed no schema: a `job` item reuses `origin`, `max_tier`, `brief` and the event cursor columns) |
-| Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names (671); `tests/test_ingest.py` 37 |
+| Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names (672); `tests/test_ingest.py` 37 |
 
 ## What is live
 

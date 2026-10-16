@@ -14842,6 +14842,14 @@ def test_the_job_brief_carries_the_runs_the_tail_the_commits_and_the_rules_insid
     assert "line 59" in brief and "line 20" in brief and "line 19" not in brief, "a 40-line tail, newest last"
 
 
+def test_a_hermes_cron_job_brief_points_at_the_cron_registry_not_a_plist():
+    row = _job_row(label="hermes-cron.brain-drift-audit", owner="hermes-agent",
+                   tail=["hermes cron job 'Brain drift audit' ended status=error: HTTP 404"])
+    brief = _intake.job_brief({**row, "machine": "testbox"}, "testbox", {})
+    assert "~/.hermes/cron/jobs.json" in brief and "HTTP 404" in brief
+    assert "LaunchAgents/hermes-cron" not in brief and "local/state/jobs/hermes-cron" not in brief
+
+
 def test_an_oversized_job_brief_trims_the_variable_parts_and_keeps_the_rules():
     row = _job_row(tail=["x" * 400 for _ in range(60)])
     brief = _intake.job_brief({**row, "machine": "testbox"}, "testbox", {"git_log": "y" * 20000, "brew": "z" * 20000})

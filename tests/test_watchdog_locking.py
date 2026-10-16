@@ -84,7 +84,6 @@ def _stub_every_probe(conn: sqlite3.Connection, seen: list[tuple[str, bool]]) ->
     wp.poll_docker = probe("poll_docker", _observed("docker-1"))
     wp.poll_op_refs = probe("poll_op_refs", (_observed("opref-1"), True))
     wp.poll_github = probe("poll_github", {"github_pr": _observed("pr-1")})
-    wp.poll_hermes_cron = probe("poll_hermes_cron", _observed("cron-1"))
     wp.poll_stray_skills = probe("poll_stray_skills", _observed("skill-1"))
     wp.poll_hermes_logs = probe("poll_hermes_logs", [
         {"external_id": "log-1", "title": "slack_bolt: Failed to connect",

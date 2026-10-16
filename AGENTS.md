@@ -47,7 +47,7 @@ installs `requirements.txt`; `make test` on its own still needs a venv.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**671/671** — any other number is a finding to report, not a count to edit. `tests/test_ingest.py` (the ingest door) is its own suite, 37/37.
+**672/672** — any other number is a finding to report, not a count to edit. `tests/test_ingest.py` (the ingest door) is its own suite, 37/37.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary (the `jobs-grade` client returns no jobs; the kill-switch flag is a file in
 its temp dir), so nothing reaches Slack, agent-gateway, GitHub, Argo or the host. `make test` runs every

@@ -192,6 +192,18 @@ def _bullets(lines: list[str]) -> str:
     return "\n".join(f"- {line}" for line in lines)
 
 
+def _job_where(label: str) -> list[str]:
+    """Where a job's definition and run record live. A `hermes-cron.*` label is a Hermes cron job: the
+    gateway runs it and ~/.hermes/cron/jobs.json holds its last outcome; there is no plist or jobrun record."""
+    if label.startswith("hermes-cron."):
+        return ["- scheduled by the Hermes gateway cron (a cron job, not a launchd job): its definition and last "
+                "outcome are in ~/.hermes/cron/jobs.json (runtime state: read-only for you); the job's prompt and "
+                "scripts are in the owner repo's cron/ and docs/scheduled-jobs.md",
+                "- the 'output tail' below is the job's recorded last_error"]
+    return [f"- plist: ~/Library/LaunchAgents/{label}.plist (live: read it, never edit it)",
+            f"- run record: ~/.local/state/jobs/{label}.json (written by jobrun; read-only for you)"]
+
+
 def job_brief(payload: dict[str, Any], machine: str, context: dict[str, str] | None = None) -> str:
     """The brief of a `job` item (dotfiles docs/ops-signals.md §6), one template next to the cluster
     brief: what jobs-grade says about one label, its last five runs and a 40-line output tail, the
@@ -215,8 +227,7 @@ def job_brief(payload: dict[str, Any], machine: str, context: dict[str, str] | N
         f"Background job `{label}` on `{machine}` is graded {field('grade')} by jobs-grade: {field('reason')}.",
         "",
         f"- owner repo: {field('owner')} (HEAD when the last run started: {field('owner_sha')})",
-        f"- plist: ~/Library/LaunchAgents/{label}.plist (live: read it, never edit it)",
-        f"- run record: ~/.local/state/jobs/{label}.json (written by jobrun; read-only for you)",
+        *_job_where(label),
         f"- cadence: every {field('every')} s; last exit code {field('rc')}; "
         f"{field('consecutive_fail')} consecutive failures, {field('fails_24h')} in 24 h",
         f"- last success: {field('last_ok')}; last started: {field('last_started')}",

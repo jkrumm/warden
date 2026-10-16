@@ -44,7 +44,7 @@ _env_policy = os.environ.get("WARDEN_TRIAGE_POLICY") or os.environ.get("HERMES_T
 POLICY_PATH = (Path(_env_policy).expanduser() if _env_policy
                else TRIAGE_REPO_DIR / "config" / "triage-policy.json")
 
-# Sources watchdog-poll.py dedups that this loop acts on. github_*, hermes_cron and stray_skill
+# Sources watchdog-poll.py dedups that this loop acts on. github_* and stray_skill
 # are excluded: they are self-describing (a GitHub issue/PR IS the durable card) or
 # governance-cadence, not the reactive-alert firehose. op_refs_homelab/op_refs_vps ARE included: a
 # dead 1Password ref blocks every future reseal of the mini's offline secrets cache, so it must

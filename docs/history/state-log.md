@@ -10783,3 +10783,14 @@ Declined: sender text reaching triage as an injection risk (the event is already
 like every Slack and Kuma line before it; the bearer token is the control), per-source event caps, versioned hyperdx keys,
 extracting a shared identity/row module, a source descriptor table. Known race kept: a `poll_uk()` snapshot taken before a
 Kuma UP webhook can reopen that row once, until Wave 10 retires the poll.
+
+## §175 — Wave 11: Hermes cron joins the `job` source, `hermes_cron` retired (2026-10-16)
+
+- `jobs-grade` (dotfiles) now translates `~/.hermes/cron/jobs.json` into run records (`hermes-cron.<slug>`, owner
+  `hermes-agent`, loaded = the gateway is loaded), so a failing cron job reaches the existing `job` source with no new
+  code path. `watchdog-poll.py`'s `poll_hermes_cron()` is gone; its reconcile now runs against an empty list once, to
+  resolve the one event the old source left open (#1119), and is to be deleted after that pass.
+- `job_brief()` names `~/.hermes/cron/jobs.json` instead of a plist and a jobrun record for `hermes-cron.*` labels.
+- `com.jkrumm.warden-backup` runs under `jobrun --every 86400` (no `--kuma`: its push URL is a mode-600 file the
+  `--kuma op-ref` cannot read, and the script already pushes only after a clean run).
+- Tests: `test_triage.py` 672/672 (one new brief test).

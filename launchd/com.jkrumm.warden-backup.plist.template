@@ -14,9 +14,26 @@
        wake rather than replaying every skipped firing. -->
   <key>ProgramArguments</key>
   <array>
+    <string>__HOME__/.local/bin/jobrun</string>
+    <string>com.jkrumm.warden-backup</string>
+    <string>--owner</string>
+    <string>warden</string>
+    <string>--every</string>
+    <string>86400</string>
+    <string>--</string>
     <string>/bin/zsh</string>
     <string>__HOME__/SourceRoot/warden/scripts/warden-backup.sh</string>
   </array>
+  <!-- Under `jobrun` (dotfiles): every run is recorded in ~/.local/state/jobs and graded by jobs-grade
+       (the job source opens an item for warden when it fails). No `--kuma`: the script pushes its own
+       "Warden Backup - Push" heartbeat only after a clean snapshot, bundle and rsync, and its push URL
+       lives in a mode-600 file because the op:// ref cannot be seeded from the mini (see the script),
+       which jobrun's `--kuma op-ref` cannot read. jobrun is a `#!/usr/bin/env bun` script and
+       launchd's PATH has neither bun nor ~/.local/bin. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key><integer>3</integer>
