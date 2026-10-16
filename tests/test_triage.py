@@ -4359,6 +4359,53 @@ def test_a_file_listing_with_a_malformed_entry_beside_a_valid_one_strikes_and_ne
         assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
 
 
+def test_a_file_listing_entry_with_only_a_previous_filename_strikes_and_never_confirms():
+    """An entry with no usable `filename` is a strike even when its `previous_filename` is a usable
+    name: the entry's own file is unknown, so the listing is partial and a repeat is not read as resolved."""
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-previous-only", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": None, "previous_filename": "scripts/other.py"},
+                      {"filename": "scripts/third.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] not in ("confirmed", "blocked"), dict(status)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["strikes"] == 1, dict(item)
+
+
+def test_a_rename_counts_the_previous_filename_as_changed_so_a_repeat_on_it_is_still_a_block():
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-renamed-from", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong")],
+            pr_files=[{"filename": "scripts/renamed.py", "previous_filename": "scripts/gone.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
+
+def test_a_mixed_round_persists_the_dropped_repeat_off_the_revision_brief():
+    """One repeat dropped (its file the PR no longer changes) beside a new finding that stays: the
+    revision brief names only the finding that stays, because the review row's blocking list is
+    filtered at fold time (item 1559)."""
+    kept = {"file": "scripts/kept.py", "line": 9, "message": "new defect", "angle": "senior-dev"}
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-mixed", prior_findings=[_GONE_FINDING],
+            current_findings=[dict(_GONE_FINDING, message="still wrong"), kept],
+            pr_files=[{"filename": "scripts/kept.py"}])
+        _fold_repeat_review(conn, eid, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+        item = core.get_item(conn, eid)
+        text = work._revision_findings(conn, item)
+        assert text is not None and "scripts/kept.py:9" in text and "scripts/gone.py" not in text, text
+        review = conn.execute("SELECT verdict_json FROM dispatches WHERE job_id='review-repeat'").fetchone()
+        assert [f["file"] for f in json.loads(review["verdict_json"])["blocking"]] == ["scripts/kept.py"]
+
+
 def test_a_repeat_whose_pr_url_names_no_pr_strikes_and_drops_nothing():
     with _triage_env() as (conn, ctx):
         eid, _ = _seed_repeat_round(

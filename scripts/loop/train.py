@@ -5,6 +5,7 @@ walk it. Also the owner's merge path, merge_and_rollout()."""
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -545,14 +546,16 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
         return []
     changed: set[str] = set()
     for entry in files:
-        names = ({_file_name(entry.get(key)) for key in ("filename", "previous_filename")}
-                 if isinstance(entry, dict) else set()) - {None}
-        if not names:
+        current = _file_name(entry.get("filename")) if isinstance(entry, dict) else None
+        if current is None:
             _train_strike(conn, item, now,
                           f"GitHub's file listing for {owner}/{name}#{number} has an entry with no "
                           "usable filename; a repeat is not read as resolved on a partial listing")
             return None
-        changed |= names
+        changed.add(current)
+        previous = _file_name(entry.get("previous_filename"))
+        if previous is not None:
+            changed.add(previous)
     if not changed:
         _train_strike(conn, item, now, f"GitHub listed no files for {owner}/{name}#{number}; "
                                        "a repeat is not read as resolved on an empty listing")
@@ -683,6 +686,12 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
         return False
     dropped = {id(f) for f in resolved}
     blocking = [f for f in blocking if id(f) not in dropped]
+    if resolved:
+        # The revision brief reads this row's `blocking` (work._review_findings_text()), so the dropped
+        # repeats are taken off it here, not only in memory: a mixed round must not send the revision
+        # to fix a finding on a file the PR no longer changes. The raw list stays under `droppedBlocking`.
+        conn.execute("UPDATE dispatches SET verdict_json=? WHERE job_id=?",
+                     (json.dumps(dict(verdict, blocking=blocking, droppedBlocking=resolved)), item["validation_job"]))
     # The wrapper class is not the implementer's (see is_process_only_finding()). It must not
     # read as `blocked` (that spends a revision); apart from a repeat already dropped above, it
     # is not dropped here either, so it goes to the owner with the finding on the card.
