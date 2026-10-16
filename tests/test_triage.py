@@ -4395,6 +4395,19 @@ def test_a_repeat_spelled_with_dot_slash_or_line_number_on_a_dropped_file_is_not
         assert status["validation_status"] == "confirmed", dict(status)
 
 
+
+def test_a_numeric_suffix_that_is_not_the_line_is_part_of_the_file_name():
+    # A real file `scripts/report:2024` is not `scripts/report`: the suffix is stripped only when it
+    # repeats the finding's own line, so a new finding on another file is no repeat of the prior one.
+    with _triage_env() as (conn, ctx):
+        eid, pr_files_fn = _seed_repeat_round(
+            conn, "sig-repeat-colon-name", prior_findings=[dict(_GONE_FINDING, file="scripts/report:2024")],
+            current_findings=[dict(_GONE_FINDING, file="scripts/report", message="new defect")],
+            pr_files=[{"filename": "scripts/other.py"}])
+        _run_repeat_review(conn, pr_files_fn)
+        status = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-repeat'").fetchone()
+        assert status["validation_status"] == "blocked", dict(status)
+
 def test_validation_outcome_needs_decision_routes_to_needs_decision():
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-val-needs-human")

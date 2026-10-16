@@ -499,18 +499,22 @@ def _train_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite
 
 
 def _file_name(name: Any) -> str | None:
-    """A file as a finding and the PR's file list spell it: `./` dropped, a numeric `:line` suffix dropped."""
+    """A file as a finding and the PR's file list spell it, `./` dropped."""
     if not isinstance(name, str):
         return None
-    name = name.removeprefix("./")
-    path, sep, line = name.rpartition(":")
-    if sep and line.isdigit():
-        name = path
-    return name or None
+    return name.removeprefix("./") or None
 
 
 def _finding_file(f: Any) -> str | None:
-    return _file_name(f.get("file")) if isinstance(f, dict) else None
+    """A finding's file, with a `:<line>` suffix dropped only when it repeats the finding's own `line`
+    (a reviewer writes `x.py:12` beside `line: 12`), so a real file named `report:2024` stays itself."""
+    name = _file_name(f.get("file")) if isinstance(f, dict) else None
+    if name is None:
+        return None
+    path, sep, suffix = name.rpartition(":")
+    if sep and path and suffix.isdigit() and str(f.get("line")) == suffix:
+        return path
+    return name
 
 
 def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
@@ -518,7 +522,7 @@ def _repeats_resolved_by_diff(conn: sqlite3.Connection, item: sqlite3.Row, now: 
     """The blocking findings that repeat a prior round's finding on a file this PR no longer changes.
     The spec's rule (dotfiles docs/agent-platform.md, § Revisions): such a repeat is not a block, the
     revision dropped that change, so the diff resolved it. A repeat is matched on the file alone (both
-    sides normalized by _file_name()); a finding with no file, or on a file the PR still changes
+    sides read by _finding_file()); a finding with no file, or on a file the PR still changes
     (renames count as changed), is never dropped. A PR URL that names no PR, or a file listing where
     ANY entry yields no usable filename (an empty listing, an entry that is not a dict, or a name
     `_file_name()` reads as None), is a strike and None: a repeat is never read as resolved on a
