@@ -242,8 +242,9 @@ def ingest_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool = F
     output, and it re-arms (a new occurrence mark, so reopen_if_needed() sees a recurrence) when the
     label goes bad again.
 
-    A job event opens a `triage_items` row of origin `job`, state `new`, `max_tier=investigate`, with
-    the brief stored on the row. Its repo is NOT chosen here or by a triage job: route_job_items()
+    A job event opens a `triage_items` row of origin `job`, state `new`, `max_tier=implement`, with
+    the brief stored on the row (job_brief(): the grade, the last runs and output tail, the owner repo's
+    commits since `last_ok`). Its repo is NOT chosen here or by a triage job: route_job_items()
     sends it to the `owner` the job's own state file names. An item still `new`/`triaged` keeps its
     brief current (the grade text moves); one past that is not touched, so its claim is not disturbed.
 
@@ -279,8 +280,11 @@ def ingest_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool = F
     now_iso = core.now_iso(now)
     for ev in conn.execute("SELECT * FROM events WHERE source=? AND resolved_at IS NULL",
                             (core.JOB_SOURCE,)).fetchall():
-        brief = _intake.job_brief(core.safe_json(ev["payload_json"]), machine)
         item = core.get_item(conn, ev["id"])
+        if item is not None and item["state"] not in (core.STATE_NEW, core.STATE_TRIAGED):
+            continue   # past triage the brief is fixed: its claim is not disturbed, and no host fact is read for it
+        payload = core.safe_json(ev["payload_json"])
+        brief = _intake.job_brief(payload, machine, _intake.gather_job_context(payload))
         if item is None:
             conn.execute(
                 "INSERT INTO triage_items(event_id, signature, repo, state, origin, max_tier, brief, "
@@ -289,8 +293,11 @@ def ingest_jobs(conn: sqlite3.Connection, now: dt.datetime, *, dry_run: bool = F
                  1, ev["first_seen"], now_iso, now_iso, now_iso),
             )
             core.record_created_transition(conn, ev["id"], core.STATE_NEW, now_iso)
-        elif item["state"] in (core.STATE_NEW, core.STATE_TRIAGED) and item["brief"] != brief:
-            conn.execute("UPDATE triage_items SET brief=? WHERE event_id=?", (brief, ev["id"]))
+        elif item["brief"] != brief or item["max_tier"] != core.JOB_MAX_TIER:
+            # max_tier too: an item opened before the implement tier (Wave 6's) must not keep the old ceiling
+            # when it is reopened or re-investigated.
+            conn.execute("UPDATE triage_items SET brief=?, max_tier=? WHERE event_id=?",
+                         (brief, core.JOB_MAX_TIER, ev["id"]))
     conn.commit()
 
 

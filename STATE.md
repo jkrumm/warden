@@ -35,13 +35,16 @@ after every fix merge. Slack hears one line on `fixed` / `needs_decision` and a 
   (`clients/jobs_grade.py`, the local subprocess; None on any failure = a blind pass that opens and resolves nothing).
   A label graded failing | stale | flapping | unloaded is the event `job:<machine>:<label>`, folded by
   watchdog-poll's `reconcile()` like a `uk` monitor: level-based, resolved on `ok`, re-armed on the next bad grade.
-  The item is origin `job`, `max_tier=investigate`, routed by `route_job_items()` straight to the state file's `owner`
+  The item is origin `job`, `max_tier=implement`, routed by `route_job_items()` straight to the state file's `owner`
   repo (no triage job, no debounce; an owner warden cannot dispatch to is `needs_decision`), then dispatched by
   `escalate_origin_items()`. Chronic: a reopened job item warden had already acted on goes to `needs_decision`
   (`[chronic] …`) instead of a dispatch when it reopens within 7 days of the terminal state it left, or when a `fixed`
   one fails again within 24 h (`job_chronic_reason()`; `jobChronicRecurrences` / `jobChronicWindowDays` /
-  `jobRegressionHours` in `config/triage-policy.json`). Not built (Wave 7): the real job brief, the `implement` tier,
-  closure verified by the job's next `last_ok`.
+  `jobRegressionHours` in `config/triage-policy.json`). **Wave 7 (§172):** the real brief (`lifecycle/intake.job_brief()` +
+  `gather_job_context()`: last 5 runs, 40-line tail, owner `git log` and Cellar changes since `last_ok`, allowed / forbidden
+  actions, acceptance), the `implement` tier, and **verified closure** — a `job` item reaches `fixed` only when `jobs-grade`
+  shows a `last_ok` after the deploy (`verify._job_closure()`); no success within `max(30, 2×every+10)` min is a `work` strike
+  back to `triaged`, the third ends it `failed`.
 - **Shape.** `scripts/triage.py` is the entry point; the loop lives in
   `scripts/loop/` by stage. warden meets the repo contract itself: `make check`,
   `make deploy` (kickstart `warden-api`, health check, roll back to the

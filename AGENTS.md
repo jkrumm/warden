@@ -47,7 +47,7 @@ installs `requirements.txt`; `make test` on its own still needs a venv.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**655/655** — any other number is a finding to report, not a count to edit.
+**663/663** — any other number is a finding to report, not a count to edit.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary (the `jobs-grade` client returns no jobs; the kill-switch flag is a file in
 its temp dir), so nothing reaches Slack, agent-gateway, GitHub, Argo or the host. `make test` runs every
@@ -110,12 +110,14 @@ tool even though launchd hands the loop a minimal PATH.
   in a git worktree and fast-forward master when green. `make link`/`agents`/`setup`
   refuse from a worktree (`make venv`/`check` still work there) — they write `~/.local/bin/warden` from `$(shell pwd)`,
   which would point every shell at a checkout that is deleted with the worktree.
-- **A `job` item is only as good as `jobs-grade`'s grade.** The loop runs `~/.local/bin/jobs-grade` (a `bun`
+- **A `job` item is only as good as `jobs-grade`'s grade, and is `fixed` only by its own success.** The loop runs `~/.local/bin/jobs-grade` (a `bun`
   script) on every pass under a PATH widened with `rollout.HOST_TOOL_DIRS`; a failed, hung or malformed run
   logs `jobs-grade: …` and skips the source for that pass — nothing opens, nothing resolves. A job whose
   `--owner` is no checkout under the repos root goes to `needs_decision`, never to a triage guess. The first
   pass after a deploy dispatches an investigation for every job already in a bad grade (up to
-  `MAX_OPEN_INVESTIGATIONS` per pass): `warden pause` first if that is not wanted.
+  `MAX_OPEN_INVESTIGATIONS` per pass): `warden pause` first if that is not wanted. A job item
+  implements (`max_tier=implement`) and `verifying` waits for a `last_ok` newer than the deploy (`verify._job_closure()`), so a
+  merged fix that never makes the job succeed strikes back to `triaged`; the third such expiry is `failed(work)`, not a revert.
 - **Never start a second loop.** Two loops against one ledger double every post and
   every dispatch. Check `make status` before loading anything.
 - **The ledger** `~/.warden/warden.db` is live and not in git. Never migrate it from

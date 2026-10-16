@@ -11,8 +11,9 @@ import datetime as dt
 import json
 import re
 import sqlite3
+import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import policy
 
@@ -96,36 +97,124 @@ _SOURCE_NOTES = {
     "human": "a request typed by the owner",
 }
 
-MAX_JOB_BRIEF_CHARS = 4000
+MAX_JOB_BRIEF_CHARS = 8000
+JOB_TAIL_LINES = 40
+JOB_GIT_LOG_LINES = 25
+JOB_BREW_LINES = 20
+_CONTEXT_TIMEOUT_S = 15
+
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
-def job_brief(payload: dict[str, Any], machine: str) -> str:
-    """The brief of a `job` item's investigation: what jobs-grade says about one label, as plain
-    facts, and what is asked. A stopgap until the job brief proper (git log since `last_ok`, the last
-    runs, a stderr tail, the allowed and forbidden actions; dotfiles docs/ops-signals.md §6) exists —
-    the tier is `investigate`, so the episode reads and answers and changes nothing."""
+def _iso(value: Any) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def gather_job_context(payload: dict[str, Any], *, runner: Runner = subprocess.run,
+                       cellar: Path | None = None) -> dict[str, str]:
+    """The host facts a job's brief quotes beyond what jobs-grade says: the owner repo's `git log`
+    since the job's last success and the Homebrew formulae installed since then (a silent-revert
+    class: dotfiles docs/homebrew.md). Read-only, bounded, and never raises: a fact that cannot be
+    read is a short "unavailable" line, because the brief must still go out."""
+    owner = str(payload.get("owner") or "")
+    last_ok = _iso(payload.get("last_ok"))
+    since = last_ok.isoformat() if last_ok else None
+    out = {"git_log": "(owner repo checkout not readable)", "brew": "(Homebrew Cellar not readable)"}
+
+    try:
+        cwd = policy.repo_cwd(owner)
+    except Exception:  # noqa: BLE001 — an unroutable owner has no log, not a crash
+        cwd = None
+    if cwd is not None and cwd.is_dir():
+        argv = ["git", "-C", str(cwd), "log", "--no-merges", f"-n{JOB_GIT_LOG_LINES}", "--format=%h %cs %s"]
+        argv += [f"--since={since}"] if since else ["-n5"]
+        try:
+            done = runner(argv, capture_output=True, text=True, timeout=_CONTEXT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+            lines = done.stdout.strip() if done.returncode == 0 else ""
+            out["git_log"] = lines or ("(no commits since the last success)" if since else "(no history)")
+        except (OSError, subprocess.SubprocessError):
+            out["git_log"] = "(git log unavailable)"
+
+    root = cellar or Path("/opt/homebrew/Cellar")
+    if last_ok is not None and root.is_dir():
+        changed: list[str] = []
+        try:
+            for formula in root.iterdir():
+                for version in formula.iterdir() if formula.is_dir() else ():
+                    stamp = dt.datetime.fromtimestamp(version.stat().st_mtime, dt.timezone.utc)
+                    if stamp > last_ok:
+                        changed.append(f"{formula.name} {version.name} ({stamp.strftime('%Y-%m-%d %H:%M')}Z)")
+        except OSError:
+            changed = ["(Cellar scan failed)"]
+        out["brew"] = "\n".join(sorted(changed)[:JOB_BREW_LINES]) or "(no formula installed since the last success)"
+    elif last_ok is None:
+        out["brew"] = "(the job has never succeeded)"
+    return out
+
+
+def _bullets(lines: list[str]) -> str:
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def job_brief(payload: dict[str, Any], machine: str, context: dict[str, str] | None = None) -> str:
+    """The brief of a `job` item (dotfiles docs/ops-signals.md §6), one template next to the cluster
+    brief: what jobs-grade says about one label, its last five runs and a 40-line output tail, the
+    owner repo's commits and the Homebrew changes since the last success, what the episode may and
+    may not do, and the acceptance check. The tier is `implement`: an investigation that finds a code
+    or config fault in the owner repo hands over to an implement episode.
+
+    Capped at MAX_JOB_BRIEF_CHARS like every brief; the variable parts (tail, log) are trimmed first
+    so the instructions at the end always survive."""
     def field(key: str) -> str:
         value = payload.get(key)
         return "-" if value is None or value == "" else str(value)
 
-    lines = [
-        f"Background job `{field('label')}` on `{machine}` is graded {field('grade')} by jobs-grade: {field('reason')}.",
+    context = context or {}
+    label = field("label")
+    runs = [f"{r.get('started', '?')}  rc={r.get('rc', '?')}  {r.get('duration_ms', '?')} ms"
+            for r in (payload.get("runs") or []) if isinstance(r, dict)][-5:]
+    tail_lines = [str(x) for x in (payload.get("tail") or [])][-JOB_TAIL_LINES:]
+
+    head = "\n".join([
+        f"Background job `{label}` on `{machine}` is graded {field('grade')} by jobs-grade: {field('reason')}.",
         "",
-        f"- owner repo: {field('owner')}",
-        f"- runs every: {field('every')} s",
-        f"- last success: {field('last_ok')}",
-        f"- last started: {field('last_started')}",
-        f"- last exit code: {field('rc')}",
-        f"- consecutive failures: {field('consecutive_fail')}",
-        f"- failures in the last 24 h: {field('fails_24h')}",
-        f"- run record: ~/.local/state/jobs/{field('label')}.json (written by jobrun; read-only for you)",
+        f"- owner repo: {field('owner')} (HEAD when the last run started: {field('owner_sha')})",
+        f"- plist: ~/Library/LaunchAgents/{label}.plist (live: read it, never edit it)",
+        f"- run record: ~/.local/state/jobs/{label}.json (written by jobrun; read-only for you)",
+        f"- cadence: every {field('every')} s; last exit code {field('rc')}; "
+        f"{field('consecutive_fail')} consecutive failures, {field('fails_24h')} in 24 h",
+        f"- last success: {field('last_ok')}; last started: {field('last_started')}",
+    ])
+    tail = "\n".join(["\nLast runs (newest last):", _bullets(runs) if runs else "(none recorded)",
+                       f"\nOutput tail of the last run ({len(tail_lines)} lines):",
+                       "```", "\n".join(tail_lines) or "(empty)", "```"])
+    since = "\n".join([f"\n`git log` of {field('owner')} since the last success:", context.get("git_log") or "(not gathered)",
+                        "\nHomebrew formulae installed since then:", context.get("brew") or "(not gathered)"])
+    rules = "\n".join([
         "",
-        "Find out why this job fails (or why it stopped running) and what change in the owner repo "
-        "fixes it. Read the host READ-ONLY through the repo's own AGENTS.md commands before "
-        "concluding. Never touch secret values, launchctl state or the live plist. Answer with the "
-        "root cause and the concrete fix; the job is fixed when its next scheduled run exits 0.",
-    ]
-    return "\n".join(lines)[:MAX_JOB_BRIEF_CHARS]
+        "Allowed: read the host READ-ONLY (the owner repo's AGENTS.md names its read-only commands: logs, "
+        "status, health checks; the run record and the plist above), and change the OWNER REPO. Do not "
+        "stop at a diagnosis when the fault is in that repo: answer nextAction=implement.",
+        "\nForbidden: `launchctl` bootout/kickstart/load, editing a live plist or anything under "
+        "~/Library/LaunchAgents, touching a secret value or the secret cache, and running the job by hand to "
+        "test it. A fault outside the owner repo (a missing grant, a TCC or Full Disk Access prompt, a "
+        "biometric step) is not yours to fix: answer nextAction=human with the exact ask.",
+        "\nAcceptance: the job's next scheduled run writes rc=0. warden marks this fixed only when the run "
+        "record shows a success after the fix was merged and deployed, so a change that cannot make the "
+        "next run succeed is not a fix. Fix the cause, not the symptom (no `|| true`, no widened grade).",
+    ])
+    # The instructions survive; the variable sections give way, longest first.
+    budget = MAX_JOB_BRIEF_CHARS - len(head) - len(rules)
+    if len(tail) + len(since) > budget:
+        marker = "\n[truncated]"
+        since_budget = max(budget // 3, 400)
+        since = since[:since_budget].rstrip() + marker
+        tail = tail[: max(budget - len(since) - len(marker) - 4, 400)].rstrip() + marker + "\n```"
+    return (head + tail + since + rules)[:MAX_JOB_BRIEF_CHARS]
 
 
 def known_repos() -> list[str]:

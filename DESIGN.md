@@ -87,7 +87,7 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    watchdog-poll.py's `reconcile()` as a `uk` monitor is). It is level-based: one
    event while the grade stays bad, resolved when the label grades `ok` or leaves
    the output, re-armed when it turns bad again. Its item has origin `job`,
-   `max_tier=investigate`, and is routed by `route_job_items()` straight to the
+   `max_tier=implement`, and is routed by `route_job_items()` straight to the
    `owner` repo its state file names — no triage job, no debounce (the grader's
    own thresholds are the debounce). An owner warden cannot dispatch to
    (`?`, a repo outside the repos root) is `needs_decision`, not a guess. A pass

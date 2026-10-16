@@ -10680,3 +10680,23 @@ The check-runs 403 on the fine-grained PAT is not a missing grant: the Checks AP
 fine-grained tokens, `/actions/runs` works. `CheckRunsUnreadable`'s message and docstrings, the `workflow_runs()`
 docstring and STATE.md/DESIGN.md now say so, and `merge.read_check_runs()` announces the Actions fallback once
 per commit per process (`_FALLBACK_LOGGED`) instead of on every tick.
+
+
+## 172. Wave 7 of the background-jobs chain: the job brief, the implement tier and verified closure (2026-10-16)
+
+`lifecycle/intake.job_brief()` is the ops-signals §6 template: grade and reason, owner repo and its HEAD at the last
+run, plist and run-record paths, cadence, the last five runs, a 40-line output tail, the owner repo's `git log` since
+`last_ok` and the Cellar entries newer than it (`gather_job_context()`: read-only, bounded, never raises), the allowed and
+forbidden actions, and the acceptance check; capped at 8000 characters with the variable sections trimmed first so the
+rules survive. dotfiles' `jobs-grade` rows now carry `owner_sha`, `runs` and `tail` (the client already keeps extra fields).
+`JOB_MAX_TIER` is `implement`; `ingest_jobs()` also raises an existing `new`/`triaged` item's tier, so a Wave 6 item that
+reopens is not stuck at the old ceiling.
+
+Verified closure: `_verify_item()` asks `_job_closure()` for a `job` item once `make deploy`/`make verify` are fine. `done`
+= `jobs-grade` shows `last_ok` after `verify_started_at`; `pending` = not yet (or jobs-grade unreadable); `expired` =
+`max(30 min, 2 x every + 10 min)` since the deploy, which is a `work` strike to `triaged` with every handle cleared, never a
+revert (nothing proves the change wrong). `strikes` is given back whenever an item re-advances to `merging`, so the cap is
+the count of earlier expiry transitions in `item_transitions`: the third ends it `failed(work)`.
+
+Tests: `test_triage.py` 655 -> 663 (brief content and cap, the gatherer with a fake runner and Cellar, the tier raise,
+closure done / pending / expired / blind / daily window, the third expiry); `_triage_env()` stubs `gather_job_context`.

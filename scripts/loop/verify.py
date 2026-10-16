@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
 
-from clients import github as _github, agent_gateway as _agent_gateway
+from clients import github as _github, agent_gateway as _agent_gateway, jobs_grade as _jobs_grade
 from clients.errors import PolicyError, PreconditionError, RemoteError, SubmitRefused, UsageError, WardenError
 from lifecycle import dispatch as _dispatch, intake as _intake, policy as _policy, rollout as _rollout, shadow as _shadow
 from loop import core, triaging, work
@@ -219,6 +220,61 @@ def _signal_not_quiet(item: sqlite3.Row, event: sqlite3.Row) -> list[str]:
     return problems
 
 
+def _job_closure(item: sqlite3.Row, event: sqlite3.Row | None, started: dt.datetime,
+                 now: dt.datetime) -> tuple[str, str]:
+    """Verified closure of a `job` item (ops-signals.md §6): its fix is `fixed` only when the job's own
+    run record shows a success AFTER the deploy (`verify_started_at`, stamped once `make deploy`
+    returned). Returns (`done` | `pending` | `expired`, evidence).
+
+    The record is read through jobs-grade, the only grader, once per call. jobs-grade unreadable or the
+    label absent from its output is `pending` — the job may simply not have run yet — until the window
+    is over: twice the job's cadence plus JOB_VERIFY_MARGIN_MINUTES, never under JOB_VERIFY_MIN_MINUTES.
+    An expired window is the caller's `work` strike; a revert would punish a change nobody proved wrong."""
+    payload = core.safe_json(event["payload_json"]) if event is not None else {}
+    label = str(payload.get("label") or "")
+    rows = _jobs_grade.fetch(env={**os.environ, "PATH": _rollout.host_path()})
+    row = next((r for r in rows or [] if r["label"] == label), None)
+    every = (row or payload).get("every")
+    window = max(core.JOB_VERIFY_MIN_MINUTES,
+                 (2 * float(every) / 60 if isinstance(every, (int, float)) else 0) + core.JOB_VERIFY_MARGIN_MINUTES)
+    last_ok = core.parse_ts(row.get("last_ok")) if row else None
+    if last_ok is not None and last_ok > started:
+        return "done", f"job {label} succeeded at {core.now_iso(last_ok)}, after the deploy at {core.now_iso(started)}"
+    seen = ("jobs-grade could not be read" if rows is None else f"job {label} is not in the jobs-grade output"
+            if row is None else f"job {label} is {row['grade']}, last success {row.get('last_ok') or 'never'}")
+    if now - started >= dt.timedelta(minutes=window):
+        return "expired", f"no success after the deploy at {core.now_iso(started)} within {window:g} min — {seen}"
+    return "pending", f"waiting for a success of {label} after the deploy ({window:g} min window) — {seen}"
+
+
+JOB_CLOSURE_EXPIRED_NOTE = f"{VERIFY_FAILED_NOTE_PREFIX}no success after the deploy"
+
+
+def _on_job_closure_expired(conn: sqlite3.Connection, item: sqlite3.Row, evidence: str, now: dt.datetime) -> None:
+    """A merged, deployed job fix that never produced a success: a `work` strike back to `triaged` with
+    every handle of the failed attempt cleared, so the next investigation reads the merged change in the
+    owner repo's `git log` and tries again.
+
+    `strikes` alone cannot bound the attempts: it is given back each time the item advances to `merging`,
+    which every retry does. The bound is the number of earlier expiries in the item's own transition
+    history: the STRIKE_LIMIT-th ends it `failed` (class `work`, the change left deployed) for the owner."""
+    event_id = item["event_id"]
+    earlier = conn.execute("SELECT COUNT(*) FROM item_transitions WHERE event_id=? AND note LIKE ?",
+                           (event_id, f"{JOB_CLOSURE_EXPIRED_NOTE}%")).fetchone()[0]
+    if earlier + 1 >= core.STRIKE_LIMIT:
+        core.set_state(conn, event_id, core.STATE_FAILED, now, expect_state=core.STATE_VERIFYING,
+                       failure_class=core.FAILURE_WORK, verify_result=evidence[:VERIFY_RESULT_MAX],
+                       note=f"{VERIFY_FAILED_NOTE_PREFIX}{evidence} — {earlier + 1} deployed fixes in a row did not make the "
+                            f"job succeed; the last change is still deployed")
+        conn.commit()
+        return
+    core.strike(conn, event_id, now, f"{VERIFY_FAILED_NOTE_PREFIX}{evidence}", retry_state=core.STATE_TRIAGED,
+                failure_class=core.FAILURE_WORK, expect_state=core.STATE_VERIFYING,
+                dispatch_job=None, implement_job=None, validation_job=None, pr_url=None, reviewed_sha=None,
+                blocked_sha=None, revision_count=0, stalled_rounds=0, **core.VERIFY_RESET)
+    conn.commit()
+
+
 def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3.Row, now: dt.datetime) -> None:
     if item["fixed_by_pr"]:
         _verify_swept(conn, item, now)
@@ -262,6 +318,17 @@ def _verify_item(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
                         verify_failures=failures, verify_result=evidence[:VERIFY_RESULT_MAX])
         conn.commit()
         return
+    if item["origin"] == core.JOB_ORIGIN:
+        outcome, evidence = _job_closure(item, event, started, now)
+        if outcome == "expired":
+            _on_job_closure_expired(conn, item, evidence, now)
+            return
+        if outcome == "pending":
+            core.set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING,
+                            verify_failures=0, verify_result=f"{verify_note}; {evidence}"[:VERIFY_RESULT_MAX])
+            conn.commit()
+            return
+        verify_note = f"{verify_note}; {evidence}"
     if signal and not window_over:
         core.set_state(conn, event_id, core.STATE_VERIFYING, now, expect_state=core.STATE_VERIFYING, verify_failures=0,
                         verify_result=f"{verify_note}; signal window open ({core.VERIFY_WINDOW_HOURS:g}h)")

@@ -66,9 +66,15 @@ JOB_SOURCE = "job"
 # `triage_items.origin` of a job item. It takes the non-alert half of the machine (escalate_origin_items:
 # no debounce, no cluster, no triage job) like `human` and `github_issue`.
 JOB_ORIGIN = "job"
-# A job item may investigate and answer; it does not implement on its own until the job brief and the
-# verified closure exist (dotfiles docs/waves/PLAN.md, Wave 7).
-JOB_MAX_TIER = "investigate"
+# A job item implements from day one (ops-signals.md §6): the investigation's verdict hands a code or
+# config fault in the owner repo to an implement episode. What stops a bad fix is the verified closure
+# (loop/verify.py `_job_closure()`: `fixed` only after a success of the job's own run record following
+# the deploy), the chronic rule and the kill-switch.
+JOB_MAX_TIER = "implement"
+# How long a deployed job fix has to produce a success before the closure gives up: twice the job's
+# cadence plus a margin, never under JOB_VERIFY_MIN_MINUTES. A timeout is a `work` strike.
+JOB_VERIFY_MIN_MINUTES = 30.0
+JOB_VERIFY_MARGIN_MINUTES = 10.0
 
 # The two INGEST_SOURCES that are grouped (upsert_grouped()-based, append-only) rather than
 # state (reconcile()-based, disappearance-resolved): watchdog-poll.py's GROUPED_SOURCES minus

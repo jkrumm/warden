@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -56,6 +57,7 @@ KUMA_PINGS: list[int] = []
 from clients.errors import HeadMoved, PolicyError, PreconditionError, RemoteError, SubmitRefused  # noqa: E402
 from lifecycle import dispatch as _dispatch, intake as _intake, items as _items  # noqa: E402
 from lifecycle import merge as _merge, rollout as _rollout  # noqa: E402
+_REAL_GATHER = _intake.gather_job_context   # _triage_env() swaps in a hermetic one
 from loop import core, intake, notify, train, triaging, verify, work  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("triage", TRIAGE_PATH)
@@ -265,6 +267,7 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         ("_rollout", "checkout_in_use"): _rollout.checkout_in_use,
         ("_kuma", "ping_loop"): _kuma.ping_loop,
         ("_jobs_grade", "fetch"): _jobs_grade.fetch,
+        ("_intake", "gather_job_context"): _intake.gather_job_context,
         ("_rollout", "deploy"): _rollout.deploy,
         ("_rollout", "verify"): _rollout.verify,
         ("_argo", "push_snapshot"): _argo.push_snapshot,
@@ -278,6 +281,8 @@ def _triage_env(*, policy: dict[str, Any] | None = None):
         os.environ["WARDEN_PAUSE_FILE"] = str(tmp_dir / "paused")
         # `jobs-grade` is a local subprocess: no job source from a test unless it registers one.
         _jobs_grade.fetch = lambda **kw: []
+        # …and its brief reads no host: no `git log`, no Cellar (test_job_brief_* exercise the real gatherer).
+        _intake.gather_job_context = lambda payload, **kw: {"git_log": "abc1234 2026-10-16 fix the thing", "brew": "(none)"}
         core.DB_PATH = tmp_dir / "watchdog.db"
         core.POLICY_PATH = tmp_dir / "triage-policy.json"
         _write_json(core.POLICY_PATH, policy if policy is not None else DEFAULT_POLICY)
@@ -14515,7 +14520,7 @@ def test_a_bad_job_grade_opens_one_event_and_one_item_routed_to_its_owner_with_n
         events = conn.execute("SELECT * FROM events WHERE source='job'").fetchall()
         assert [e["external_id"] for e in events] == [f"testbox:{JOB_LABEL}"], "an ok label opens nothing"
         item = _job_item(conn)
-        assert item["origin"] == "job" and item["max_tier"] == "investigate", dict(item)
+        assert item["origin"] == "job" and item["max_tier"] == "implement", dict(item)
         assert item["repo"] == "demo-repo" and item["state"] == core.STATE_WORKING, dict(item)
         assert item["triage_job"] is None
         assert len(calls) == 1 and calls[0]["tier"] == "investigate" and calls[0]["cwd"].endswith("demo-repo"), calls
@@ -14716,7 +14721,7 @@ def test_the_job_chronic_thresholds_come_from_the_policy_file():
 
 
 def test_a_job_item_answered_by_its_investigation_closes_and_a_recurrence_goes_to_the_owner():
-    """max_tier=investigate: the verdict is the answer, the item closes `resolved` (Wave 7 raises the tier)."""
+    """A `none` verdict (a transient the investigation read past) is the answer: the item closes `resolved`."""
     with _triage_env() as (conn, ctx), _job_machine():
         box = _grading([_job_row()])
         calls: list[dict[str, Any]] = []
@@ -14724,7 +14729,7 @@ def test_a_job_item_answered_by_its_investigation_closes_and_a_recurrence_goes_t
         _job_pass(conn, JOB_BASE)
         item = _job_item(conn)
         conn.execute("UPDATE dispatches SET status='done', finished_at=?, verdict_json=? WHERE job_id=?",
-                     (JOB_BASE.isoformat(), json.dumps({"summary": "raise the timeout", "nextAction": "implement",
+                     (JOB_BASE.isoformat(), json.dumps({"summary": "a one-off network blip", "nextAction": "none",
                                                         "confidence": "high"}), item["dispatch_job"]))
         conn.commit()
         work.fold_dispatch_verdict(conn, origin_event_id=item["event_id"], job_id=item["dispatch_job"],
@@ -14738,6 +14743,156 @@ def test_a_job_item_answered_by_its_investigation_closes_and_a_recurrence_goes_t
         again = _job_item(conn)
         assert again["state"] == core.STATE_NEEDS_DECISION and "[chronic]" in again["note"], dict(again)
         assert len(calls) == 1
+
+
+# --- Wave 7: the job brief, the implement tier and the verified closure -----------------------------------
+
+def test_the_job_brief_carries_the_runs_the_tail_the_commits_and_the_rules_inside_the_cap():
+    row = _job_row(runs=[{"run_id": f"r{i}", "started": f"2026-10-16T11:0{i}:00.000Z", "rc": 1, "duration_ms": 40 + i}
+                         for i in range(7)],
+                   tail=[f"line {i}" for i in range(60)], owner_sha="deadbeef")
+    brief = _intake.job_brief({**row, "machine": "testbox"}, "testbox",
+                              {"git_log": "abc1234 2026-10-16 touch the canary", "brew": "jq 1.8 (2026-10-16 09:00Z)"})
+    assert len(brief) <= _intake.MAX_JOB_BRIEF_CHARS
+    for needle in (JOB_LABEL, "testbox", "demo-repo", "deadbeef", "LaunchAgents/com.jkrumm.jobrun-canary.plist",
+                   "abc1234 2026-10-16 touch the canary", "jq 1.8", "nextAction=implement", "Forbidden:", "Acceptance:"):
+        assert needle in brief, needle
+    assert brief.count("  rc=1  ") == 5 and "2026-10-16T11:06:00" in brief and "2026-10-16T11:01:00" not in brief, \
+        "the last five runs, not seven"
+    assert "line 59" in brief and "line 20" in brief and "line 19" not in brief, "a 40-line tail, newest last"
+
+
+def test_an_oversized_job_brief_trims_the_variable_parts_and_keeps_the_rules():
+    row = _job_row(tail=["x" * 400 for _ in range(60)])
+    brief = _intake.job_brief({**row, "machine": "testbox"}, "testbox", {"git_log": "y" * 20000, "brew": "z" * 20000})
+    assert len(brief) <= _intake.MAX_JOB_BRIEF_CHARS
+    assert "Acceptance:" in brief and "Forbidden:" in brief and brief.rstrip().endswith("Fix the cause, not the symptom (no `|| true`, no widened grade).")
+
+
+def test_gather_job_context_reads_the_owner_log_since_last_ok_and_the_cellar_and_never_raises():
+    calls: list[list[str]] = []
+
+    def _git(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "abc1234 2026-10-16 fix\n", "")
+    with tempfile.TemporaryDirectory() as td:
+        cellar = Path(td) / "Cellar"
+        (cellar / "newtool" / "2.0").mkdir(parents=True)
+        (cellar / "oldtool" / "1.0").mkdir(parents=True)
+        old = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc).timestamp()
+        os.utime(cellar / "oldtool" / "1.0", (old, old))
+        with _triage_env() as (conn, ctx):
+            _intake.gather_job_context = _REAL_GATHER
+            got = _intake.gather_job_context({"owner": "demo-repo", "last_ok": "2026-10-10T00:00:00.000Z"},
+                                             runner=_git, cellar=cellar)
+            assert got["git_log"] == "abc1234 2026-10-16 fix"
+            assert "--since=2026-10-10T00:00:00+00:00" in calls[0] and calls[0][2].endswith("demo-repo")
+            assert "newtool 2.0" in got["brew"] and "oldtool" not in got["brew"]
+            boom = lambda argv, **kw: (_ for _ in ()).throw(OSError("no git"))  # noqa: E731
+            assert _intake.gather_job_context({"owner": "demo-repo", "last_ok": None}, runner=boom,
+                                              cellar=cellar)["git_log"] == "(git log unavailable)"
+            assert _intake.gather_job_context({"owner": "../etc", "last_ok": None}, runner=_git,
+                                              cellar=cellar)["git_log"].startswith("(owner repo")
+
+
+def test_a_reopened_job_item_opened_at_the_old_tier_is_raised_to_implement():
+    with _triage_env() as (conn, ctx), _job_machine():
+        _grading([_job_row()])
+        _job_pass(conn, JOB_BASE)
+        eid = _job_item(conn)["event_id"]
+        conn.execute("UPDATE triage_items SET max_tier='investigate', state=?, dispatch_job=NULL WHERE event_id=?",
+                     (core.STATE_TRIAGED, eid))
+        conn.commit()
+        intake.ingest_jobs(conn, JOB_BASE + dt.timedelta(minutes=10))
+        assert _job_item(conn)["max_tier"] == "implement"
+
+
+def _job_verifying(conn, box, *, started: dt.datetime, merged_sha: str = "abc123def456") -> int:
+    """A job item whose fix merged and deployed at `started`, the window open (the canary's every = 300 s)."""
+    box["rows"] = [_job_row()]
+    _job_pass(conn, JOB_BASE)
+    eid = _job_item(conn)["event_id"]
+    core.set_state(conn, eid, core.STATE_VERIFYING, started, pr_url="https://github.com/jkrumm/demo-repo/pull/9",
+                   merged_sha=merged_sha, merge_method="squash", verify_started_at=started.isoformat(),
+                   verify_failures=0)
+    conn.commit()
+    return eid
+
+
+def test_a_job_fix_is_fixed_only_by_a_success_after_the_deploy_and_not_by_make_verify_alone():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([])
+        _agent_gateway.submit = _fake_submit([])
+        started = JOB_BASE + dt.timedelta(hours=1)
+        eid = _job_verifying(conn, box, started=started)
+        _fake_rollout(targets=("verify",), verify=_ran())
+        # make verify is green, but the job's last success predates the deploy: pending
+        box["rows"] = [_job_row(grade="failing", last_ok=(started - dt.timedelta(minutes=5)).isoformat())]
+        verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(minutes=5), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_VERIFYING and "waiting for a success" in item["verify_result"], dict(item)
+        # a success after the deploy closes it, with that evidence on the note
+        ok_at = started + dt.timedelta(minutes=7)
+        box["rows"] = [_job_row(grade="ok", reason="ok", consecutive_fail=0, last_ok=ok_at.isoformat())]
+        verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(minutes=10), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FIXED, dict(item)
+        assert "succeeded at" in item["note"] and "after the deploy at" in item["note"], item["note"]
+
+
+def test_a_job_fix_with_no_success_inside_the_window_is_a_work_strike_back_to_triage_not_a_revert():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([])
+        _agent_gateway.submit = _fake_submit([])
+        started = JOB_BASE + dt.timedelta(hours=1)
+        eid = _job_verifying(conn, box, started=started)
+        _fake_rollout(targets=())
+        box["rows"] = [_job_row(grade="failing", last_ok=(started - dt.timedelta(minutes=5)).isoformat())]
+        verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(minutes=29), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_VERIFYING, "30 min is the floor of the window"
+        verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(minutes=31), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and item["strikes"] == 1, dict(item)
+        assert item["reverting_sha"] is None and item["revert_json"] is None, "a revert punishes an unproven change"
+        assert item["dispatch_job"] is None and item["pr_url"] is None and item["merged_sha"] is None, dict(item)
+        assert item["verify_started_at"] is None and "no success after the deploy" in item["note"], item["note"]
+        # the retry is a fresh investigation, and three strikes end the item
+        for n in (2, 3):
+            core.set_state(conn, eid, core.STATE_VERIFYING, started, merged_sha="abc", merge_method="squash",
+                           verify_started_at=started.isoformat())
+            conn.commit()
+            verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(minutes=31), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_WORK, dict(item)
+
+
+def test_a_blind_jobs_grade_waits_out_the_window_before_it_strikes():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([])
+        _agent_gateway.submit = _fake_submit([])
+        started = JOB_BASE + dt.timedelta(hours=1)
+        eid = _job_verifying(conn, box, started=started)
+        _fake_rollout(targets=())
+        box["rows"] = None
+        verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(minutes=10), dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_VERIFYING and "could not be read" in item["verify_result"], dict(item)
+        verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(minutes=45), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
+
+
+def test_a_daily_jobs_closure_window_is_twice_its_cadence_plus_a_margin():
+    with _triage_env() as (conn, ctx), _job_machine():
+        box = _grading([])
+        _agent_gateway.submit = _fake_submit([])
+        started = JOB_BASE + dt.timedelta(hours=1)
+        eid = _job_verifying(conn, box, started=started)
+        _fake_rollout(targets=())
+        box["rows"] = [_job_row(every=86400, grade="failing", last_ok=(started - dt.timedelta(days=1)).isoformat())]
+        verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(hours=47), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_VERIFYING
+        verify.maybe_verify(conn, DEFAULT_POLICY, started + dt.timedelta(hours=49), dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
 
 
 # --- the kill-switch at every dispatch site ---
