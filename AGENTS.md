@@ -27,6 +27,10 @@ item moves.
 | `scripts/ledger.py` | the one migrator; owns the schema and `schema_version` |
 | `config/triage-policy.json` | debounce, cooldowns, host verbs, label `rules`, `ignore` patterns, the `job` source's chronic thresholds (`jobChronicRecurrences`, `jobChronicWindowDays`, `jobRegressionHours`, `jobStillRedHours`) |
 
+## Alert sources and the job chain
+
+Sources: `job` (`jobs-grade`), `uk` (Kuma webhook), `hyperdx` (webhook), `slack_alert`, `hermes_log`, GitHub, `warden run`. Their model (flow, thresholds, the self-improvement checklist the improve loop runs) is dotfiles `docs/ops-signals.md` and `docs/background-jobs.md`; the one shared ingest bearer is recorded in `docs/agent-platform.md` §Ingest trust model.
+
 ## Validate
 
 ```bash
