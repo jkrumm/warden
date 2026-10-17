@@ -14306,7 +14306,7 @@ def test_coexist_repo_deploy_waits_on_a_matching_hold_path_without_a_strike_and_
         assert verify._deploy_item(conn, core.get_item(conn, eid), NOW, _COEXIST_POLICY) is None
         item = core.get_item(conn, eid)
         assert item["strikes"] == 0 and item["state"] == core.STATE_VERIFYING, dict(item)
-        assert item["note"] == "parked: deploy waits: demo-repo is building products/blend/.building-20261017T0700Z", item["note"]
+        assert item["note"] == "parked: deploy waits: demo-repo is held by products/blend/.building-20261017T0700Z", item["note"]
         assert not any(c[0] == "sync_checkout" for c in ROLLOUT_CALLS), ROLLOUT_CALLS
 
         building.rmdir()

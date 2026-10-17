@@ -152,9 +152,24 @@ def test_deploy_held_names_the_first_matching_path_and_is_none_without_one():
         globs = ["products/*/.building-*"]
         assert rollout.deploy_held(root, globs) is None
         (root / "products" / "blend" / ".building-20261017T0700Z").mkdir()
-        assert rollout.deploy_held(root, globs) == "orb is building products/blend/.building-20261017T0700Z"
+        assert rollout.deploy_held(root, globs) == "orb is held by products/blend/.building-20261017T0700Z"
         for bad in (None, "products/*", [], [3, "", "/etc/*", "../*"]):
             assert rollout.deploy_held(root, bad) is None, bad
+
+
+def test_deploy_held_ignores_a_marker_untouched_past_the_stale_bound():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "orb"
+        marker = root / "products" / "blend" / ".building-20261017T0100Z"
+        marker.mkdir(parents=True)
+        (marker / "chunk.om").write_text("x")
+        globs = ["products/*/.building-*"]
+        old = time.time() - rollout.DEPLOY_HOLD_STALE_S - 60
+        for path in (marker / "chunk.om", marker):
+            os.utime(path, (old, old))
+        assert rollout.deploy_held(root, globs) is None  # a crashed build's leftover holds nothing
+        (marker / "chunk2.om").write_text("y")  # a live build writes below it again
+        assert rollout.deploy_held(root, globs) == "orb is held by products/blend/.building-20261017T0100Z"
 
 
 def test_deploy_runs_only_make_deploy_with_the_deploy_timeout():

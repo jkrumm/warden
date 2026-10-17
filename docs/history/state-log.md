@@ -10898,7 +10898,7 @@ off, today's behaviour), loaded by `core.load_policy()` and read through `core.c
 `rollout.checkout_in_use(cwd, coexist=True)` skips ONLY `_herdr_agent_working`; a non-default branch, uncommitted
 tracked changes and commits origin lacks still return a reason, so the merge still parks ("merge waits: ...") and so
 does the deploy. `weatherorb.deployHoldGlobs = ["products/*/.building-*"]`: `rollout.deploy_held(cwd, globs)` names the
-first existing match ("weatherorb is building products/..."), and `verify._deploy_item` parks the DEPLOY on it exactly
+first existing match ("weatherorb is held by products/..."), and `verify._deploy_item` parks the DEPLOY on it exactly
 like the busy park (`deploy waits: ...`, same state, no strike), so a deploy never lands mid-build. The merge is never
 held by a glob. `_deploy_item` takes the loop's policy (optional; falls back to `load_policy()`); `sync_checkout`'s own
 refusals, strikes and rollback are unchanged. Tests: `test_triage.py` 679 -> 685 (opted-in merge proceeds under a

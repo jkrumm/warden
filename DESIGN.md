@@ -194,7 +194,10 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    policy's `coexist` map (weatherorb, whose back-to-back waves never leave the
    checkout idle) skips only the herdr half of that check: the hard git conflicts
    still park, and its deploy also parks while a `deployHoldGlobs` path exists
-   (`rollout.deploy_held`, e.g. an in-flight build directory). Then
+   (`rollout.deploy_held`, e.g. an in-flight build directory; a marker untouched
+   for `DEPLOY_HOLD_STALE_S`, 6 h, is a crashed build's leftover and holds nothing;
+   the hold is read before the sync, so a build starting during `make deploy` is an
+   accepted window — the repo's builder does not take warden's deploy lock). Then
    `make verify` if defined; then, for an alert, its own signal quiet for
    `VERIFY_WINDOW_HOURS`. No signal → `fixed` once `make verify` passes. A red
    `make verify` that was already red before the merge is not the merge's: the

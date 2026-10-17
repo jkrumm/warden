@@ -323,18 +323,42 @@ def _herdr_agent_working(cwd: Path) -> str | None:
     return None
 
 
-def deploy_held(cwd: Path, globs: object) -> str | None:
+DEPLOY_HOLD_STALE_S = 6 * 3600
+
+
+def _newest_mtime(path: Path) -> float:
+    """The newest mtime of `path` and its direct children: a live build keeps writing below it."""
+    newest = path.stat().st_mtime
+    try:
+        for child in path.iterdir():
+            newest = max(newest, child.stat().st_mtime)
+    except OSError:
+        pass
+    return newest
+
+
+def deploy_held(cwd: Path, globs: object, *, now_s: float | None = None) -> str | None:
     """Why a deploy into `cwd` must wait, else None: the first existing path matching one of `globs`
     (relative to `cwd`; a repo's own in-flight marker, e.g. a build directory). A non-list or a
-    non-string entry is ignored, and a glob that is absolute or climbs out of `cwd` never matches."""
+    non-string entry is ignored, and a glob that is absolute or climbs out of `cwd` never matches.
+    A marker nothing has touched for DEPLOY_HOLD_STALE_S (it and its direct children) is a crashed
+    build's leftover and holds nothing, so a dead build can never wedge deploys silently.
+
+    Check-then-act: the hold is read before the sync and `make deploy`; a build that starts in
+    that window is not caught (the repo's builder does not take warden's deploy lock). Accepted."""
     if not isinstance(globs, list):
         return None
+    now = time.time() if now_s is None else now_s
     for pattern in globs:
         if not isinstance(pattern, str) or not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
             continue
-        match = next(iter(sorted(cwd.glob(pattern))), None)
-        if match is not None:
-            return f"{cwd.name} is building {match.relative_to(cwd)}"
+        for match in sorted(cwd.glob(pattern)):
+            try:
+                if now - _newest_mtime(match) > DEPLOY_HOLD_STALE_S:
+                    continue
+            except OSError:
+                continue
+            return f"{cwd.name} is held by {match.relative_to(cwd)}"
     return None
 
 
