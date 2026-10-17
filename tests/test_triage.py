@@ -172,6 +172,7 @@ def _default_fake_submit_review(*, cwd, pr, context=None, model=None):
 # goes straight through; a test that wants a target registers its own fake.
 ROLLOUT_CALLS: list[tuple[str, str]] = []
 _SYNCED = _rollout.Synced("a" * 40, "b" * 40)  # what the default sync_checkout fake reports
+_REAL_CHECKOUT_IN_USE = _rollout.checkout_in_use  # _triage_env() fakes it; the coexist tests run the real one
 
 # Every PR a test's revision closed — reset per _triage_env().
 CLOSED_PRS: list[tuple[str, str, int, str | None]] = []
@@ -14222,6 +14223,117 @@ def test_a_working_herdr_agent_parks_the_deploy_too():
         item = core.get_item(conn, eid)
         assert item["strikes"] == 0 and item["note"] == "parked: deploy waits: herdr agent wave-2 is working in demo-repo"
         assert not any(c[0] == "sync_checkout" for c in ROLLOUT_CALLS), ROLLOUT_CALLS
+
+
+@contextlib.contextmanager
+def _real_checkout_check(*, herdr: str | None, branch: str = "main", dirty: str = "", ahead: str = "0"):
+    """The real rollout.checkout_in_use() over a faked herdr listing and a faked git (on `branch`,
+    `dirty` porcelain output, `ahead` commits of origin/main)."""
+    answers = {"symbolic-ref": "origin/main\n", "rev-parse --abbrev-ref HEAD": f"{branch}\n",
+               "status --porcelain": dirty, "rev-list --count": f"{ahead}\n"}
+
+    def runner(argv, **kw):
+        joined = " ".join(argv)
+        out = next((v for k, v in answers.items() if k in joined), "")
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    saved = _rollout._herdr_agent_working, _rollout.checkout_in_use
+    _rollout._herdr_agent_working = lambda cwd: herdr
+    _rollout.checkout_in_use = lambda cwd, **kw: _REAL_CHECKOUT_IN_USE(cwd, runner=runner, **kw)
+    try:
+        yield
+    finally:
+        _rollout._herdr_agent_working, _rollout.checkout_in_use = saved
+
+
+_COEXIST_POLICY = dict(DEFAULT_POLICY, coexist={"demo-repo": {"deployHoldGlobs": ["products/*/.building-*"]}})
+
+
+def _merge_stage_item(conn, ext: str) -> int:
+    eid = _train_item(conn, ext, job=f"update-job-{ext}")
+    conn.execute("UPDATE triage_items SET train_stage=?, train_sha=?, reviewed_sha=? WHERE event_id=?",
+                 (train.TRAIN_MERGE, TRAIN_SHA, TRAIN_SHA, eid))
+    conn.commit()
+    return eid
+
+
+def _coexist_merge_pass(conn, policy) -> list[dict[str, Any]]:
+    merges: list[dict[str, Any]] = []
+    _merge.plan_or_land = lambda conn_, **kw: merges.append(kw) or types.SimpleNamespace(
+        merge_method="squash", repo_slug="jkrumm/demo-repo", pull_request=10, merge_commit="d" * 40)
+    train.advance_merge_trains(conn, policy, NOW, dry_run=False)
+    return merges
+
+
+def test_coexist_repo_merges_while_a_herdr_agent_works_on_a_clean_default_branch():
+    with _triage_env() as (conn, ctx), _real_checkout_check(herdr="wave-1"):
+        eid = _merge_stage_item(conn, "sig-coexist-merge")
+        merges = _coexist_merge_pass(conn, _COEXIST_POLICY)
+        item = core.get_item(conn, eid)
+        assert len(merges) == 1 and item["state"] == core.STATE_VERIFYING, (merges, dict(item))
+        assert not (item["note"] or "").startswith("parked"), item["note"]
+
+
+def test_coexist_repo_merge_still_parks_on_a_hard_git_conflict():
+    for kw, reason in (({"dirty": " M scripts/a.py\n"}, "uncommitted changes"),
+                       ({"branch": "feat/x"}, "checked out on feat/x"),
+                       ({"ahead": "2"}, "2 commit(s) origin does not")):
+        with _triage_env() as (conn, ctx), _real_checkout_check(herdr="wave-1", **kw):
+            eid = _merge_stage_item(conn, "sig-coexist-hard")
+            merges = _coexist_merge_pass(conn, _COEXIST_POLICY)
+            item = core.get_item(conn, eid)
+            assert merges == [] and item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
+            assert item["note"].startswith("parked: merge waits:") and reason in item["note"], item["note"]
+
+
+def test_a_repo_outside_the_coexist_map_still_parks_the_merge_for_a_working_herdr_agent():
+    with _triage_env() as (conn, ctx), _real_checkout_check(herdr="wave-1"):
+        eid = _merge_stage_item(conn, "sig-no-coexist")
+        for policy in (DEFAULT_POLICY, dict(DEFAULT_POLICY, coexist={"other-repo": {}})):
+            merges = _coexist_merge_pass(conn, policy)
+            item = core.get_item(conn, eid)
+            assert merges == [] and item["state"] == core.STATE_MERGING and item["strikes"] == 0, dict(item)
+            assert item["note"] == "parked: merge waits: herdr agent wave-1 is working in demo-repo", item["note"]
+
+
+def test_coexist_repo_deploy_waits_on_a_matching_hold_path_without_a_strike_and_runs_without_one():
+    with _triage_env(policy=_COEXIST_POLICY) as (conn, ctx), _real_checkout_check(herdr="wave-2"):
+        eid = _seed_row(conn, external_id="sig-coexist-deploy", title="t", repo="demo-repo", state=core.STATE_VERIFYING)
+        conn.execute("UPDATE triage_items SET merged_sha=? WHERE event_id=?", ("c" * 40, eid))
+        conn.commit()
+        building = Path(os.environ["WARDEN_REPOS_ROOT"]) / "demo-repo" / "products" / "blend" / ".building-20261017T0700Z"
+        building.mkdir(parents=True)
+        assert verify._deploy_item(conn, core.get_item(conn, eid), NOW, _COEXIST_POLICY) is None
+        item = core.get_item(conn, eid)
+        assert item["strikes"] == 0 and item["state"] == core.STATE_VERIFYING, dict(item)
+        assert item["note"] == "parked: deploy waits: demo-repo is building products/blend/.building-20261017T0700Z", item["note"]
+        assert not any(c[0] == "sync_checkout" for c in ROLLOUT_CALLS), ROLLOUT_CALLS
+
+        building.rmdir()
+        verify._deploy_item(conn, core.get_item(conn, eid), NOW + dt.timedelta(hours=1), _COEXIST_POLICY)
+        item = core.get_item(conn, eid)
+        assert item["strikes"] == 0 and not (item["note"] or "").startswith("parked"), dict(item)
+        assert any(c[0] == "sync_checkout" for c in ROLLOUT_CALLS), ROLLOUT_CALLS
+
+
+def test_deploy_hold_globs_do_not_apply_to_a_repo_outside_the_coexist_map():
+    with _triage_env() as (conn, ctx), _real_checkout_check(herdr=None):
+        eid = _seed_row(conn, external_id="sig-no-hold", title="t", repo="demo-repo", state=core.STATE_VERIFYING)
+        conn.execute("UPDATE triage_items SET merged_sha=? WHERE event_id=?", ("c" * 40, eid))
+        conn.commit()
+        (Path(os.environ["WARDEN_REPOS_ROOT"]) / "demo-repo" / "products" / "blend" / ".building-1").mkdir(parents=True)
+        verify._deploy_item(conn, core.get_item(conn, eid), NOW, DEFAULT_POLICY)
+        assert any(c[0] == "sync_checkout" for c in ROLLOUT_CALLS), ROLLOUT_CALLS
+
+
+def test_load_policy_reads_the_coexist_map_and_drops_malformed_entries():
+    with _triage_env(policy=dict(DEFAULT_POLICY, coexist={"a": {"deployHoldGlobs": ["x"]}, "b": "nope"})) as (conn, ctx):
+        policy = core.load_policy()
+        assert policy["coexist"] == {"a": {"deployHoldGlobs": ["x"]}}, policy["coexist"]
+        assert core.coexist_options(policy, "a") == {"deployHoldGlobs": ["x"]}
+        assert core.coexist_options(policy, "b") is None and core.coexist_options(policy, "c") is None
+    with _triage_env(policy=dict(DEFAULT_POLICY, coexist=["a"])) as (conn, ctx):
+        assert core.load_policy()["coexist"] == {}
 
 
 def test_herdr_agent_listing_finds_a_working_agent_inside_the_checkout_and_degrades_to_nobody():

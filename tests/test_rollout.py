@@ -121,6 +121,42 @@ def test_sync_is_deferred_when_the_checkout_is_ahead_of_origin():
     assert "111111111111" in result.reason and "222222222222" in result.reason, result.reason
 
 
+def _in_use(*, herdr: str | None, coexist: bool = False, answers: dict[str, tuple[int, str, str]] | None = None):
+    saved = rollout._herdr_agent_working
+    rollout._herdr_agent_working = lambda cwd: herdr
+    try:
+        return rollout.checkout_in_use(CWD, runner=Script({"rev-list --count": (0, "0\n", ""), **_CLEAN_ON_MAIN,
+                                                           **(answers or {})}), coexist=coexist)
+    finally:
+        rollout._herdr_agent_working = saved
+
+
+def test_checkout_in_use_reports_a_working_herdr_agent_unless_the_repo_coexists():
+    assert _in_use(herdr="wave-1") == "herdr agent wave-1 is working in demo"
+    assert _in_use(herdr="wave-1", coexist=True) is None
+    assert _in_use(herdr=None) is None
+
+
+def test_coexist_skips_only_the_herdr_check_not_the_git_conflicts():
+    for answers, reason in (({"rev-parse --abbrev-ref HEAD": (0, "feature/x\n", "")}, "checked out on feature/x"),
+                            ({"status --porcelain": (0, " M a.py\n", "")}, "uncommitted changes"),
+                            ({"rev-list --count": (0, "3\n", "")}, "3 commit(s) origin does not")):
+        assert reason in (_in_use(herdr="wave-1", coexist=True, answers=answers) or ""), answers
+
+
+def test_deploy_held_names_the_first_matching_path_and_is_none_without_one():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "orb"
+        (root / "products" / "blend").mkdir(parents=True)
+        (root / "products" / "blend" / "keep").write_text("x")
+        globs = ["products/*/.building-*"]
+        assert rollout.deploy_held(root, globs) is None
+        (root / "products" / "blend" / ".building-20261017T0700Z").mkdir()
+        assert rollout.deploy_held(root, globs) == "orb is building products/blend/.building-20261017T0700Z"
+        for bad in (None, "products/*", [], [3, "", "/etc/*", "../*"]):
+            assert rollout.deploy_held(root, bad) is None, bad
+
+
 def test_deploy_runs_only_make_deploy_with_the_deploy_timeout():
     run = Script({"make": (0, "deployed ok\n", "")})
     result = rollout.deploy(CWD, runner=run)

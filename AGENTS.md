@@ -51,7 +51,7 @@ installs `requirements.txt`; `make test` on its own still needs a venv.
 Tests are hand-rolled runners, **not pytest**: each file collects its own
 argument-free `test_*` functions and exits non-zero on failure. `make test` fails
 when it finds zero tests. `tests/test_triage.py` is the regression gate at
-**679/679** — any other number is a finding to report, not a count to edit. `tests/test_ingest.py` (the ingest door) is its own suite, 39/39.
+**685/685** — any other number is a finding to report, not a count to edit. `tests/test_ingest.py` (the ingest door) is its own suite, 39/39.
 `_triage_env()` builds a throwaway DB and monkeypatches the loop modules' globals
 and every client boundary (the `jobs-grade` client returns no jobs; the kill-switch flag is a file in
 its temp dir), so nothing reaches Slack, agent-gateway, GitHub, Argo or the host. `make test` runs every
@@ -136,7 +136,9 @@ tool even though launchd hands the loop a minimal PATH.
   or a herdr agent `working` inside it (`rollout.checkout_in_use`), **parks** that repo's merge and
   deploy (`core.park`: same state, `retry_at` +25 min, note `parked: …`, no strike). A failed fetch
   still strikes. That includes this checkout: an agent working in `~/SourceRoot/warden` holds warden's
-  own merges.
+  own merges. Except a repo opted into `coexist` in `config/triage-policy.json` (weatherorb): there only
+  the hard conflicts (off-default, uncommitted tracked changes, ahead of origin) park, a working herdr
+  agent does not, and its deploy also parks on its `deployHoldGlobs` (an in-flight `.building-*` path).
 - **`scripts/triage.py` has no `--help`**: any flag it does not know runs a full live
   pass against the real ledger. Run the loop by hand only with `--dry-run` and `env -u CLAUDECODE …` (agent-gateway's
   recursion guard refuses dispatches from inside a Claude session).

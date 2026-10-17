@@ -187,7 +187,14 @@ One pass of `triage.run()`; module per stage under `scripts/loop/`.
    verifies by signal only (no deploy, no `make verify`).
 5. **Deploy + verify** (`verify.py`, `lifecycle/rollout.py`). A merged item waits
    in `verifying`. If the checkout is clean, on the default branch and ends at
-   origin, it is fast-forwarded and `make deploy` runs (else a strike); then
+   origin, it is fast-forwarded and `make deploy` runs (else a strike). A checkout
+   somebody else is working in (a herdr agent `working` in it, or those same git
+   conflicts seen locally) parks the deploy, and the merge before it, with no
+   strike (`rollout.checkout_in_use`, `core.park`). A repo the owner opted into the
+   policy's `coexist` map (weatherorb, whose back-to-back waves never leave the
+   checkout idle) skips only the herdr half of that check: the hard git conflicts
+   still park, and its deploy also parks while a `deployHoldGlobs` path exists
+   (`rollout.deploy_held`, e.g. an in-flight build directory). Then
    `make verify` if defined; then, for an alert, its own signal quiet for
    `VERIFY_WINDOW_HOURS`. No signal → `fixed` once `make verify` passes. A red
    `make verify` that was already red before the merge is not the merge's: the

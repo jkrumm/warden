@@ -572,6 +572,10 @@ def load_policy() -> dict[str, Any]:
         # Filters Hermes's own conversational replies that watchdog-poll.py ingested from #alerts as if
         # they were alerts; routed to `closed(ignored)` (see classify()).
         "ignoreUnstructuredSlackProse": bool(data.get("ignoreUnstructuredSlackProse")),
+        # Repos whose merge and deploy proceed while a herdr agent is working in the checkout
+        # (see coexist_options()). Absent = off.
+        "coexist": {repo: opts for repo, opts in data["coexist"].items() if isinstance(opts, dict)}
+                   if isinstance(data.get("coexist"), dict) else {},
     }
 
 
@@ -584,6 +588,16 @@ def is_paused() -> bool:
 
 def card_channel(policy: dict[str, Any]) -> str:
     return policy["cardChannel"]
+
+
+def coexist_options(policy: dict[str, Any], repo: str) -> dict[str, Any] | None:
+    """The `coexist` options of a repo the owner opted in (config/triage-policy.json), else None:
+    its merge and deploy ignore a herdr agent working in the checkout (the hard git conflicts
+    still park), and its deploy also waits on `deployHoldGlobs`. A repo absent from the map
+    behaves as before."""
+    table = policy.get("coexist")
+    opts = table.get(repo) if isinstance(table, dict) else None
+    return opts if isinstance(opts, dict) else None
 
 
 # The sources whose identity is `fingerprint(title)` (watchdog-poll.py GROUPED_SOURCES, plus the

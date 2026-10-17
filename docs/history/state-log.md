@@ -10886,3 +10886,22 @@ out `minOpenMinutes` instead of being 'open 30 min' at once; both columns joined
 sources keep their item's `first_seen`. (3) `job_brief()` embeds the `~/.hermes/cron/jobs.json` entry (model,
 provider, schedule, last outcome; never the prompt) for `hermes-cron.*` labels, via `gather_job_context(registry=)`.
 Tests: `test_triage.py` 674 -> 679 (AGENTS.md said 673; the baseline before this change was 674).
+
+
+## §182 — opt-in `coexist`: weatherorb merges and deploys while its herdr waves work in the checkout (2026-10-17)
+
+Owner decision, 2026-10-17, explicit and for weatherorb only. `checkout_in_use()` parked every merge and every deploy
+while ANY herdr agent was `working` with its cwd in the repo; weatherorb runs back-to-back orchestrated waves, so the
+checkout is never idle. Measured: six green PRs (#113, #117, #120, #128, #129, ...) waited from 2026-10-16 11:07Z with
+nothing wrong but the park. `config/triage-policy.json` gained a top-level `coexist` map (repo -> options; absent =
+off, today's behaviour), loaded by `core.load_policy()` and read through `core.coexist_options(policy, repo)`.
+`rollout.checkout_in_use(cwd, coexist=True)` skips ONLY `_herdr_agent_working`; a non-default branch, uncommitted
+tracked changes and commits origin lacks still return a reason, so the merge still parks ("merge waits: ...") and so
+does the deploy. `weatherorb.deployHoldGlobs = ["products/*/.building-*"]`: `rollout.deploy_held(cwd, globs)` names the
+first existing match ("weatherorb is building products/..."), and `verify._deploy_item` parks the DEPLOY on it exactly
+like the busy park (`deploy waits: ...`, same state, no strike), so a deploy never lands mid-build. The merge is never
+held by a glob. `_deploy_item` takes the loop's policy (optional; falls back to `load_policy()`); `sync_checkout`'s own
+refusals, strikes and rollback are unchanged. Tests: `test_triage.py` 679 -> 685 (opted-in merge proceeds under a
+working agent; dirty / off-default / ahead still park; a repo outside the map still parks; deploy parks on a `.building-*`
+path and runs without one; no hold outside the map; the policy loader), `test_rollout.py` 36 -> 39 (`checkout_in_use`
+with and without `coexist`, `deploy_held`). Brief said 674; master was 679 (§181).

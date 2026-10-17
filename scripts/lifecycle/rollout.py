@@ -28,6 +28,9 @@ Three questions live here and nowhere else:
   checkout_in_use()  is the checkout somebody else's right now (a herdr agent working in it, or
                 the local git states sync_checkout() would defer on)? Read-only, no fetch; the
                 loop parks the repo's merge and deploy on it (core.park) instead of striking.
+                A repo opted into policy `coexist` skips the herdr check only.
+  deploy_held() a repo-declared in-flight marker (policy `coexist.<repo>.deployHoldGlobs`) the
+                deploy waits on.
 
 One lock, `deploy_lock()` (~/.warden/deploy.lock, override WARDEN_DEPLOY_LOCK), serialises
 scripts/deploy.sh's deploy/verify (which re-execs itself under `exec_locked`) with
@@ -320,12 +323,29 @@ def _herdr_agent_working(cwd: Path) -> str | None:
     return None
 
 
-def checkout_in_use(cwd: Path, *, runner: Runner = _run_in_group) -> str | None:
+def deploy_held(cwd: Path, globs: object) -> str | None:
+    """Why a deploy into `cwd` must wait, else None: the first existing path matching one of `globs`
+    (relative to `cwd`; a repo's own in-flight marker, e.g. a build directory). A non-list or a
+    non-string entry is ignored, and a glob that is absolute or climbs out of `cwd` never matches."""
+    if not isinstance(globs, list):
+        return None
+    for pattern in globs:
+        if not isinstance(pattern, str) or not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+            continue
+        match = next(iter(sorted(cwd.glob(pattern))), None)
+        if match is not None:
+            return f"{cwd.name} is building {match.relative_to(cwd)}"
+    return None
+
+
+def checkout_in_use(cwd: Path, *, runner: Runner = _run_in_group, coexist: bool = False) -> str | None:
     """Why `cwd` is somebody else's right now, else None: a herdr agent working in it, or local git
     state that would stop a fast-forward (a branch other than the default, uncommitted tracked
     changes, commits origin lacks). Reads local refs only. The loop parks its merge and deploy
-    for that repo (core.park) instead of racing the work or striking out against it."""
-    name = _herdr_agent_working(cwd)
+    for that repo (core.park) instead of racing the work or striking out against it.
+    `coexist` (a repo the owner opted in, policy `coexist`) skips only the herdr check: an agent
+    working on the default branch is not in the way, a hard git conflict still is."""
+    name = None if coexist else _herdr_agent_working(cwd)
     if name is not None:
         return f"herdr agent {name} is working in {cwd.name}"
     default = _default_branch(cwd, runner)

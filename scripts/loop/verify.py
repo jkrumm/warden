@@ -146,7 +146,8 @@ def _interrupted_deploy(conn: sqlite3.Connection, item: sqlite3.Row) -> bool:
         (item["event_id"], f"sha:{item['merged_sha']}")).fetchone() is not None
 
 
-def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) -> sqlite3.Row | None:
+def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime,
+                 policy: dict[str, Any] | None = None) -> sqlite3.Row | None:
     """The deploy stage. Returns the item with its verify window open, or None when it has to
     wait (a strike's backoff) or just struck.
 
@@ -161,7 +162,10 @@ def _deploy_item(conn: sqlite3.Connection, item: sqlite3.Row, now: dt.datetime) 
     if cwd is None:
         _start_verify(conn, item, now, note="no checkout to deploy; verifying")
         return core.get_item(conn, event_id)
-    busy = _rollout.checkout_in_use(cwd)
+    coexist = core.coexist_options(policy if policy is not None else core.load_policy(), item["repo"])
+    busy = _rollout.checkout_in_use(cwd, coexist=coexist is not None)
+    if busy is None and coexist is not None:
+        busy = _rollout.deploy_held(cwd, coexist.get("deployHoldGlobs"))
     if busy is not None:
         core.park(conn, event_id, now, f"deploy waits: {busy}", state=core.STATE_VERIFYING)
         return None
@@ -368,7 +372,7 @@ def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datet
             print(f"[dry-run] would run {what} for {item['signature']} ({item['repo']})")
             continue
         if item["verify_started_at"] is None:
-            item = _deploy_item(conn, item, now)
+            item = _deploy_item(conn, item, now, policy)
             if item is None:
                 continue
         _verify_item(conn, policy, item, now)

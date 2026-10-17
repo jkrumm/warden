@@ -59,7 +59,13 @@
     "`verb` names a KEY of HOST_VERB_ALLOWLIST in scripts/triage.py, never an argv, and an unknown key drops the",
     "rule at load. maybe_auto_remediate() also needs the item's own investigation verdict to rank at or above",
     "`hostVerbMinConfidence` (high/medium/low, default medium). `hostVerbCooldownHours` (default 6) and",
-    "`hostVerbMaxAttempts` (default 2) bound repeats of one verb."
+    "`hostVerbMaxAttempts` (default 2) bound repeats of one verb.",
+    "",
+    "`coexist` (map, repo name -> options) opts a repo out of the herdr half of the busy-checkout park: its merge",
+    "and deploy proceed while an owner agent is `working` in the checkout, and only the hard git conflicts (a branch",
+    "other than the default, uncommitted tracked changes, commits origin lacks) still park. `deployHoldGlobs` (globs",
+    "relative to the checkout) additionally parks the DEPLOY, never the merge, while any of them matches an existing",
+    "path. A repo absent from the map behaves as before (loop/core.py coexist_options(), lifecycle/rollout.py)."
   ],
   "cardChannel": "C0BVDE5R562",
   "minOccurrences": 3,
@@ -74,6 +80,11 @@
   "hostVerbMaxAttempts": 2,
   "hostVerbMinConfidence": "medium",
   "ignoreUnstructuredSlackProse": true,
+  "coexist": {
+    "weatherorb": {
+      "deployHoldGlobs": ["products/*/.building-*"]
+    }
+  },
   "hostVerbs": [
     {
       "match": "uk:hermes-agent",

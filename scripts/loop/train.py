@@ -774,7 +774,8 @@ def _train_merge(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     if work.already_merged(conn, item["implement_job"]):
         work.land_already_merged_item(conn, policy, item, now)
         return False
-    busy = _rollout.checkout_in_use(Path(_policy.repo_cwd(item["repo"])))
+    busy = _rollout.checkout_in_use(Path(_policy.repo_cwd(item["repo"])),
+                                    coexist=core.coexist_options(policy, item["repo"]) is not None)
     if busy is not None:
         core.park(conn, item["event_id"], now, f"merge waits: {busy}", state=core.STATE_MERGING,
                   expect_eq=_train_expect(item))
