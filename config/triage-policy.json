@@ -476,11 +476,18 @@
       "reason": "Auto-Update push monitor belongs to the rollhook auto-update service."
     },
     {
-      "match": "slack_alert:public-files-http-red-circle-down-read-econnreset",
+      "match": "uk:253",
       "repo": "homelab",
-      "proposedAt": "2026-09-28T00:29:42.370225+00:00",
-      "proposedBy": "triage-auto",
-      "reason": "CORRECTED 2026-09-28 (was \"image-share\"): \"Public Files - HTTP\" is UptimeKuma monitor 64 on https://public.jkrumm.com/ \u2014 the Dufs container defined in homelab/docker-compose.yml, so homelab owns the compose file and the deploy target (this file's infra-signal convention). image-share serves share.jkrumm.com and owns nothing in the Dufs path."
+      "proposedAt": "2026-10-20T00:00:00+00:00",
+      "proposedBy": "homelab-session",
+      "reason": "\"S3 Gateway - Docker\": the VersityGW container (s3.jkrumm.com) defined in homelab/docker-compose.yml; homelab owns compose + deploy. Replaces the retired Dufs/Public Files rule (dufs removed 2026-10-19)."
+    },
+    {
+      "match": "uk:254",
+      "repo": "homelab",
+      "proposedAt": "2026-10-20T00:00:00+00:00",
+      "proposedBy": "homelab-session",
+      "reason": "\"S3 Gateway - HTTP\": VersityGW /_/health over the cloudflared bridge; same owner as uk:253."
     },
     {
       "match": "uk:207",
