@@ -476,18 +476,11 @@
       "reason": "Auto-Update push monitor belongs to the rollhook auto-update service."
     },
     {
-      "match": "uk:253",
+      "match": "uk:s3-gateway-*",
       "repo": "homelab",
       "proposedAt": "2026-10-20T00:00:00+00:00",
       "proposedBy": "homelab-session",
-      "reason": "\"S3 Gateway - Docker\": the VersityGW container (s3.jkrumm.com) defined in homelab/docker-compose.yml; homelab owns compose + deploy. Replaces the retired Dufs/Public Files rule (dufs removed 2026-10-19)."
-    },
-    {
-      "match": "uk:254",
-      "repo": "homelab",
-      "proposedAt": "2026-10-20T00:00:00+00:00",
-      "proposedBy": "homelab-session",
-      "reason": "\"S3 Gateway - HTTP\": VersityGW /_/health over the cloudflared bridge; same owner as uk:253."
+      "reason": "\"S3 Gateway - Docker\" / \"S3 Gateway - HTTP\": the VersityGW container (s3.jkrumm.com) defined in homelab/docker-compose.yml; homelab owns compose + deploy. Replaces the retired Dufs/Public Files rule (dufs removed 2026-10-19)."
     },
     {
       "match": "uk:207",
