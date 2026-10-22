@@ -14610,7 +14610,7 @@ def test_the_follow_up_is_opened_once_per_head_and_a_failed_open_keeps_the_item_
         again = work.open_followup_item(conn, item, [_finding("a")], "a" * 40, NOW)
         assert first is not None and again == first, "the same item and head open nothing twice"
         real = intake.open_origin_item
-        intake.open_origin_item = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("ledger busy"))
+        intake.open_origin_item = lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))
         try:
             _blocked_review_round(conn, eid, 1, [_finding("first problem")])
             item = _blocked_review_round(conn, eid, core.MAX_REVISIONS + 1, [_finding("a narrower problem", 7)])
@@ -16185,6 +16185,176 @@ def test_leaving_triaged_ends_the_feature_hold():
         assert core.get_item(conn, eid)["kind"] == core.KIND_FEATURE, "a same-state write keeps the hold"
         core.set_state(conn, eid, core.STATE_WORKING, NOW)
         assert core.get_item(conn, eid)["kind"] is None
+
+
+# --- Wave 8 review fixes ---------------------------------------------------------------------------------
+
+def test_a_feature_hold_stays_held_when_its_monitor_recovers():
+    with _triage_env() as (conn, _ctx):
+        uk = _insert_event(conn, source="uk", external_id="uk-feat", title="Gluetun - Docker", first_seen=OLD)
+        plain = _insert_event(conn, source="uk", external_id="uk-plain", title="Samba - Docker", first_seen=OLD)
+        down = _relay(conn, "Traefik - HTTP", "Down", -600)
+        _relay(conn, "Traefik - HTTP", "Up", -300, detail="200 - OK")
+        intake.ingest(conn, NOW)
+        for eid in (uk, down):
+            core.hold_as_feature(conn, eid, NOW, "a feature to scope")
+        core.set_state(conn, plain, core.STATE_TRIAGED, NOW, note="x")
+        conn.execute("UPDATE events SET resolved_at=? WHERE id IN (?, ?)", (NOW.isoformat(), uk, plain))
+        conn.commit()
+        intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
+        for eid in (uk, down):
+            item = _rows(conn, eid)
+            assert item["state"] == core.STATE_TRIAGED and item["kind"] == core.KIND_FEATURE, dict(item)
+        assert _rows(conn, plain)["state"] == core.STATE_QUIET, "the control recovers as before"
+
+
+def test_a_recovered_item_whose_investigation_is_still_running_waits_a_pass():
+    with _triage_env() as (conn, _ctx):
+        uk = _insert_event(conn, source="uk", external_id="uk-fly", title="Gluetun - Docker", first_seen=OLD)
+        down = _relay(conn, "Traefik - HTTP", "Down", -600)
+        _relay(conn, "Traefik - HTTP", "Up", -300, detail="200 - OK")
+        intake.ingest(conn, NOW)
+        for eid, job in ((uk, "job-fly-uk"), (down, "job-fly-relay")):
+            conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,created_at) "
+                         "VALUES(?,?,?,?,?,?,?)", (job, "investigate", "demo-repo", "b", eid, "running", NOW.isoformat()))
+            core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job=job)
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), uk))
+        conn.commit()
+        intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
+        assert _rows(conn, uk)["state"] == core.STATE_WORKING and _rows(conn, down)["state"] == core.STATE_WORKING
+        conn.execute("UPDATE dispatches SET status='done', finished_at=? WHERE job_id IN ('job-fly-uk', 'job-fly-relay')",
+                     (NOW.isoformat(),))
+        conn.commit()
+        intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
+        assert _rows(conn, uk)["state"] == core.STATE_QUIET and _rows(conn, down)["state"] == core.STATE_QUIET
+
+
+def test_a_third_uncategorised_implement_question_ends_the_chain_needs_decision():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-impl-nocat3", job_id="impl-nocat3-1")
+        ask = _dispatch_result("no_changes", next_action="human", summary="which one?", extra={
+            "decisionQuestion": "Narrow or wide fix?", "recommendation": "Use the narrow fix"})
+        for n in (1, 2):
+            job = f"impl-nocat3-{n}"
+            if n == 2:
+                conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,created_at) "
+                             "VALUES(?,?,?,?,?,?,?)", (job, "implement", "demo-repo", "b", eid, "done", NOW.isoformat()))
+                core.set_state(conn, eid, core.STATE_WORKING, NOW, implement_job=job)
+                conn.commit()
+            conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id=?", (eid, job))
+            _agent_gateway.get = lambda j: {"id": j, "status": "done", "result": ask}
+            work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+            assert core.get_item(conn, eid)["state"] == core.STATE_WORKING, n
+        job = "impl-nocat3-3"
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,created_at) "
+                     "VALUES(?,?,?,?,?,?,?)", (job, "implement", "demo-repo", "b", eid, "done", NOW.isoformat()))
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, implement_job=job)
+        conn.commit()
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
+        assert item["note"].startswith("[no category] "), item["note"]
+
+
+def test_a_failed_follow_up_write_does_not_roll_back_the_shared_connection():
+    with _triage_env() as (conn, _ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-followup-tx")
+        conn.execute("UPDATE triage_items SET note='pending' WHERE event_id=?", (eid,))   # uncommitted work of the fold
+        real = intake.open_origin_item
+        intake.open_origin_item = lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))
+        try:
+            assert work.open_followup_item(conn, core.get_item(conn, eid), [_finding("a")], "a" * 40, NOW) is None
+        finally:
+            intake.open_origin_item = real
+        assert core.get_item(conn, eid)["note"] == "pending"
+        intake.open_origin_item = lambda *a, **kw: (_ for _ in ()).throw(KeyError("a bug is not a ledger error"))
+        try:
+            work.open_followup_item(conn, core.get_item(conn, eid), [_finding("a")], "a" * 40, NOW)
+            raise AssertionError("only ledger errors are swallowed")
+        except KeyError:
+            pass
+        finally:
+            intake.open_origin_item = real
+
+
+def _uk_event(conn, name: str, at: dt.datetime) -> int:
+    return _insert_event(conn, source="uk", external_id=f"uk-{core.fingerprint(name)}", title=name, first_seen=at)
+
+
+def _slack_relay(conn, name: str, ts: dt.datetime, *, polled: dt.datetime | None = None) -> int:
+    title = f"[{name}] [:red_circle: Down] timeout of 90000ms exceeded"
+    return _insert_event(conn, source="slack_alert", external_id=core.fingerprint(title), title=title,
+                         first_seen=polled or ts, payload={"ts_first": str(ts.timestamp()), "ts_last": str(ts.timestamp())})
+
+
+def test_a_kuma_relay_restating_a_uk_event_is_an_occurrence_of_that_item_polled_late():
+    with _triage_env() as (conn, _ctx):
+        t0 = NOW - dt.timedelta(hours=1)
+        uk = _uk_event(conn, "Traefik - HTTP", t0)
+        # polled 16 min after the uk event (median relay lag), but the message itself is 1 min after it
+        relay = _slack_relay(conn, "Traefik - HTTP", t0 + dt.timedelta(minutes=1), polled=t0 + dt.timedelta(minutes=16))
+        intake.ingest(conn, NOW)
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        item = _rows(conn, relay)
+        assert (item["state"], item["close_reason"], item["duplicate_of"]) == (core.STATE_CLOSED, core.CLOSE_DUPLICATE, uk), dict(item)
+        assert item["note"].startswith(f"{intake.COFIRE_NOTE_PREFIX}{uk}:") and item["triage_job"] is None
+        assert _open_non_duplicates(conn) == [uk]
+        assert _rows(conn, uk)["occurrences"] == 2, "the relay is counted on the uk item, also after ingest() rewrites it"
+        intake.ingest(conn, NOW)
+        assert _rows(conn, uk)["occurrences"] == 2
+
+
+def test_a_relay_that_arrived_before_its_uk_event_still_folds_onto_the_uk_item():
+    with _triage_env() as (conn, _ctx):
+        t0 = NOW - dt.timedelta(hours=1)
+        relay = _slack_relay(conn, "Traefik - HTTP", t0)                       # the message is 2 min older ...
+        uk = _uk_event(conn, "Traefik - HTTP", t0 + dt.timedelta(minutes=2))   # ... than the webhook
+        intake.ingest(conn, NOW)
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        assert _open_non_duplicates(conn) == [uk]
+        assert _rows(conn, relay)["duplicate_of"] == uk
+        assert _rows(conn, uk)["first_seen"] <= core.now_iso(t0), "the item's `since` reflects the earliest real time"
+
+
+def test_a_relay_for_a_uk_item_that_already_recovered_is_folded_not_paged():
+    with _triage_env() as (conn, _ctx):
+        t0 = NOW - dt.timedelta(hours=1)
+        uk = _uk_event(conn, "Traefik - HTTP", t0)
+        intake.ingest(conn, NOW)
+        core.set_state(conn, uk, core.STATE_QUIET, NOW, note="recovered")
+        relay = _slack_relay(conn, "Traefik - HTTP", t0 + dt.timedelta(minutes=3), polled=NOW)
+        intake.ingest(conn, NOW)
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        assert _rows(conn, relay)["state"] == core.STATE_CLOSED and _rows(conn, relay)["duplicate_of"] == uk
+        assert _rows(conn, uk)["state"] == core.STATE_QUIET
+
+
+def test_a_relay_of_another_monitor_or_outside_the_window_is_not_a_uk_duplicate():
+    with _triage_env() as (conn, _ctx):
+        t0 = NOW - dt.timedelta(hours=1)
+        uk = _uk_event(conn, "Traefik - HTTP", t0)
+        other = _slack_relay(conn, "Hermes - HTTP", t0 + dt.timedelta(minutes=1))
+        later = _slack_relay(conn, "Traefik - HTTP", t0 + dt.timedelta(minutes=20))
+        intake.ingest(conn, NOW)
+        intake.fold_cofiring(conn, NOW)
+        assert _rows(conn, later)["state"] == core.STATE_NEW and _rows(conn, later)["duplicate_of"] is None
+        # the other monitor is only a generic co-fire (family `kuma`, within the window of the uk event)
+        assert _rows(conn, other)["duplicate_of"] == uk and "Kuma relay of the monitor" not in _rows(conn, other)["note"]
+
+
+def test_cofire_windows_use_the_slack_message_ts_not_the_poll_time():
+    with _triage_env() as (conn, _ctx):
+        base = NOW - dt.timedelta(hours=2)
+        # polled together, but the messages are 20 min apart: two items
+        a = _slack_relay(conn, "A - HTTP", base, polled=NOW - dt.timedelta(minutes=5))
+        b = _slack_relay(conn, "B - HTTP", base + dt.timedelta(minutes=20), polled=NOW - dt.timedelta(minutes=5))
+        # polled 16 min apart (outside the window by poll time), messages 2 min apart: folds
+        c = _slack_relay(conn, "C - HTTP", base + dt.timedelta(minutes=2), polled=NOW - dt.timedelta(minutes=1))
+        intake.ingest(conn, NOW)
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        assert _open_non_duplicates(conn) == [a, b], _open_non_duplicates(conn)
+        assert _rows(conn, c)["duplicate_of"] == a
+        assert _rows(conn, a)["first_seen"] <= core.now_iso(base)
 
 
 if __name__ == "__main__":

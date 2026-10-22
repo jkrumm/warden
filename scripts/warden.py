@@ -1004,7 +1004,7 @@ def cmd_feature(conn, flags: Flags, positional: list[str], state: _State) -> dic
     `triaged` (`kind='feature'`, `retry_at` far out, the dispatch/implement handles cleared like
     reinvestigate()) and stays off every dispatch, escalate, triage and page path until an owner closes
     it. A terminal item (a feature the loop once closed "resolved") comes back; a `working`, `merging`
-    or `verifying` one is refused (`abort` first). Writes the local ledger only; no GitHub or
+    or `verifying` one is refused (`abort` ends a working or merging one; a verifying one runs its window). Writes the local ledger only; no GitHub or
     agent-gateway call, and the pull request on record, if any, is left alone."""
     if not positional:
         raise UsageError('usage: warden feature <event-id> [--why "<reason>"] [--json]')
@@ -1015,9 +1015,11 @@ def cmd_feature(conn, flags: Flags, positional: list[str], state: _State) -> dic
     if item is None:
         raise UsageError(f"no triage_items row for event_id {event_id}")
     if item["state"] in _FEATURE_REFUSED_STATES:
+        how = ("'abort' it first" if item["state"] in (core.STATE_WORKING, core.STATE_MERGING)
+               else "wait for its verify window to end, or close it once it has")
         raise PreconditionError(
             f"triage item {event_id} is in state '{item['state']}' — an episode or operation is in flight; "
-            f"'abort' it first, a feature is held, not worked"
+            f"{how}, a feature is held, not worked"
         )
     why = flags.why or "marked as a feature by the owner"
     if item["state"] == core.STATE_TRIAGED and core.is_feature(item):
@@ -1033,7 +1035,8 @@ def cmd_feature(conn, flags: Flags, positional: list[str], state: _State) -> dic
 
     now = dt.datetime.now(dt.timezone.utc)
     rowcount = core.hold_as_feature(conn, event_id, now, why, expect_state=item["state"], reviewed_sha=None,
-                                    blocked_sha=None, revision_count=0, stalled_rounds=0)
+                                    blocked_sha=None, revision_count=0, stalled_rounds=0,
+                                    triage_job=None)
     if not rowcount:
         conn.rollback()
         raise PreconditionError(f"triage item {event_id} moved while this feature mark was applied — look again")

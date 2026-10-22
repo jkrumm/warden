@@ -2596,10 +2596,17 @@ def _redrive_implement_human(conn: sqlite3.Connection, item: sqlite3.Row, result
     """An implement attempt answered nextAction=human naming no owner-only category. The first one hands
     the attempt back exactly as a strike would (_attempt_rewind_columns(): a fresh attempt, or the
     revision again) so the next brief carries implement_decide_paragraph(); the second takes the
-    attempt's own `recommendation` the same way. Marked on the dispatch row, so it is judged once.
-    A compare-and-set on the implement job, committed here."""
+    attempt's own `recommendation` the same way. A third uncategorised question, after the recommendation
+    was taken, ends the chain: `needs_decision` tagged `[no category]`, so it terminates. Marked on the
+    dispatch row, so it is judged once. A compare-and-set on the implement job, committed here."""
     event_id, job_id = item["event_id"], item["implement_job"]
-    if _implement_decide_row(conn, event_id) is None:
+    prior = _implement_decide_row(conn, event_id)
+    if prior is not None and prior["validation_status"] == IMPLEMENT_DECIDED:
+        core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, expect_state=core.STATE_WORKING,
+                       expect_eq={"implement_job": job_id}, note=_decision_note(result))
+        conn.commit()
+        return
+    if prior is None:
         status, note = IMPLEMENT_DECIDE_REDRIVEN, f"{DECIDE_NOTE_PREFIX}: {_decision_text(result)}"
     else:
         taken = str(result.get("recommendation") or result.get("summary") or "no recommendation")
@@ -3022,7 +3029,7 @@ def open_followup_item(conn: sqlite3.Connection, item: sqlite3.Row, findings: li
     revision ceiling left behind (the brief = the findings and the PR). One grouped item, not one per
     finding: each item is a whole investigate+implement+review run. `external_id` is keyed by the
     item and the head, so a repeat of the same fold opens nothing twice. None when no item could be
-    opened (a failure is logged, never raised): the caller then keeps the findings on the item."""
+    opened (a ledger error is logged, not raised): the caller then keeps the findings on the item."""
     pr = item["pr_url"] or "(no pull request on record)"
     brief = (f"Follow-up from item #{item['event_id']} ({item['signature']}): its pull request {pr} reached the "
              f"revision ceiling and is merging as it is. These review findings were left unresolved; fix them "
@@ -3036,8 +3043,10 @@ def open_followup_item(conn: sqlite3.Connection, item: sqlite3.Row, findings: li
             external_id=f"{FOLLOWUP_EXTERNAL_PREFIX}{item['event_id']}:{sha}",
             title=f"follow-up: review findings left on {item['signature']}"[:200],
             payload={"followup_of": item["event_id"], "pr_url": item["pr_url"]}, now=now)
-    except Exception as e:  # noqa: BLE001 — a follow-up that cannot be written must not strand the fold
-        conn.rollback()
+    except sqlite3.Error as e:
+        # Only the ledger write can fail here. No rollback of the shared connection: a failed statement
+        # leaves nothing half-applied, open_origin_item() commits each of its own inserts, and a retry
+        # reuses the event by its external_id.
         print(f"triage: could not open a follow-up for event {item['event_id']}: {e}", file=sys.stderr)
         return None
 

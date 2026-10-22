@@ -117,7 +117,9 @@ def _fingerprint(title: str) -> str:
 
 def normalize_hyperdx(body: dict[str, Any]) -> IngestEvent:
     """OUR contract, which the HyperDX webhook template renders to:
-    `{alert, state: ALERT|OK|firing|resolved, message?, url?, service?, value?}`. The dedup key is the
+    `{alert, state: ALERT|OK|firing|resolved, message?, url?, service?, host?, value?}`. `host` is the
+    OTel host label: stored on the event's payload, and loop/intake.py cofire_family() folds one host's
+    alerts that fire inside the co-fire window into a single item. The dedup key is the
     title fingerprint `slack_alert` uses, so one alert is one event across occurrences whatever numbers
     or timestamps its name carries."""
     alert = body.get("alert")

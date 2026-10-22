@@ -100,14 +100,16 @@ resolves one by disappearance any more, so a missed UP leaves the row open until
 ### `POST /ingest/hyperdx` (new source `hyperdx`)
 
 The body is **warden's own contract** (the HyperDX webhook template is written to it, not the other way
-round): `{"alert": "<alert name>", "state": "ALERT" | "OK", "message"?, "url"?, "service"?, "value"?}`.
+round): `{"alert": "<alert name>", "state": "ALERT" | "OK", "message"?, "url"?, "service"?, "host"?, "value"?}`.
 `state` is case-insensitive and also accepts `firing` / `resolved`.
 
 - `external_id` is `fingerprint(alert)` (`loop/core.py`, the function `slack_alert` identity uses:
   timestamps, hex ids, paths and numbers stripped), so one alert is one event across occurrences
   whatever numbers its name carries; `title` is the alert name (refreshed to the latest rendering).
 - `ALERT` / `firing`: open / reopen / refresh, payload `{"state": "ALERT", "message"?, "service"?,
-  "value"?, "via": "webhook"}`.
+  "host"?, "value"?, "via": "webhook"}`. `host` is the OTel host label (optional, capped like
+  `service`): alerts from one host that fire inside the co-fire window fold into a single item
+  (`cofire_family()` in `loop/intake.py`).
 - `OK` / `resolved`: set `resolved_at` (same no-op rules as Kuma's UP).
 - `alert` missing, empty or not a string, or `state` missing or unknown: `400`.
 

@@ -667,6 +667,12 @@ def _event_seen_at(event: sqlite3.Row) -> dt.datetime | None:
     return ts_last if ts_last is not None else _quiet_anchor(event)[0]
 
 
+# An investigation still running on the item (a dispatch on record that has not finished): closing the item
+# now would let its late verdict fold onto a quiet row, so a recovered item waits a pass.
+_INVESTIGATION_RUNNING_SQL = (
+    "EXISTS (SELECT 1 FROM dispatches d WHERE d.job_id = ti.dispatch_job AND d.finished_at IS NULL)")
+
+
 def resolve_recovered_decisions(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> None:
     """An open item whose condition has been observed healthy again has nothing left to do: quiet,
     never fixed. Two evidences, one rule:
@@ -677,13 +683,15 @@ def resolve_recovered_decisions(conn: sqlite3.Connection, policy: dict[str, Any]
     - a `slack_alert` relay whose monitor has a LATER recovery message closes its item in any open
       state (_resolve_recovered_relays()).
 
-    An item holding a written fix (a PR or an implement job) keeps its obligation, and a chronic
-    signature keeps its state: the recurrence is the defect."""
+    An item holding a written fix (a PR or an implement job) keeps its obligation, a chronic
+    signature keeps its state (the recurrence is the defect), a feature hold stays held, and an item
+    whose investigation is still running waits for a later pass."""
     placeholders = ",".join("?" * len(_RECOVERED_LEVEL_STATES))
     rows = conn.execute(
         f"SELECT ti.event_id, ti.repo, ti.state FROM triage_items ti JOIN events e ON e.id = ti.event_id "
         f"WHERE ti.state IN ({placeholders}) AND e.source IN (?, ?) AND e.resolved_at IS NOT NULL "
-        f"AND ti.pr_url IS NULL AND ti.implement_job IS NULL",
+        f"AND ti.pr_url IS NULL AND ti.implement_job IS NULL AND ti.{core.NOT_FEATURE_SQL} "
+        f"AND NOT {_INVESTIGATION_RUNNING_SQL}",
         (*_RECOVERED_LEVEL_STATES, *LEVEL_EVENT_SOURCES),
     ).fetchall()
     window, threshold = chronic_policy(policy)
@@ -708,7 +716,8 @@ def _resolve_recovered_relays(conn: sqlite3.Connection, policy: dict[str, Any], 
     rows = conn.execute(
         f"SELECT ti.event_id AS event_id, ti.repo AS repo, ti.state AS item_state, e.* FROM triage_items ti "
         f"JOIN events e ON e.id = ti.event_id WHERE e.source='slack_alert' AND ti.origin='alert' "
-        f"AND ti.state IN ({placeholders}) AND ti.pr_url IS NULL AND ti.implement_job IS NULL",
+        f"AND ti.state IN ({placeholders}) AND ti.pr_url IS NULL AND ti.implement_job IS NULL "
+        f"AND ti.{core.NOT_FEATURE_SQL} AND NOT {_INVESTIGATION_RUNNING_SQL}",
         _RECOVERED_RELAY_STATES,
     ).fetchall()
     downs = [(row, sig[0]) for row in rows if (sig := recovery_signal(row["title"])) and not sig[1]]
@@ -993,9 +1002,82 @@ def cofire_occurrences(conn: sqlite3.Connection) -> dict[int, int]:
     ).fetchall()}
 
 
+def _cofire_started(row: sqlite3.Row) -> dt.datetime | None:
+    """When the alert really began, for the co-fire window. A `slack_alert` is judged by its own Slack
+    message `ts` (`ts_first`, else `ts_last`), never by when it was polled: relay lag is a median 16 minutes,
+    so poll times would fold alerts that were an hour apart and split ones that fired together. Every other
+    source (a webhook) is stamped on arrival, so its item's `first_seen` is the real time."""
+    if row["source"] == "slack_alert":
+        payload = core.safe_json(row["payload_json"])
+        for key in ("ts_first", "ts_last"):
+            ts = _slack_ts_to_dt(payload.get(key))
+            if ts is not None:
+                return ts
+    return core.parse_ts(row["item_first_seen"])
+
+
+def _absorb_cofired(conn: sqlite3.Connection, parent_id: int, row: sqlite3.Row,
+                    since: dt.datetime | None) -> None:
+    """Count the folded item's occurrences on its parent, and let the parent's `since` reflect the
+    earliest real time any of them was seen. ingest() recomputes the count as own + folded
+    (cofire_occurrences()) on the next pass, to the same number. `since` is the earliest real time of
+    the parent and the folded item."""
+    conn.execute("UPDATE triage_items SET occurrences=occurrences+?, last_seen=MAX(last_seen, ?), "
+                 "first_seen=MIN(first_seen, ?) WHERE event_id=?",
+                 (row["item_occurrences"], row["item_last_seen"],
+                  core.now_iso(since) if since is not None else row["item_first_seen"], parent_id))
+
+
+def _fold_kuma_relays_onto_uk(conn: sqlite3.Connection, now: dt.datetime) -> None:
+    """A Kuma Down relay in #alerts restates a monitor the `uk` webhook already reported (37 of 40 since
+    the webhook went live). When a `uk` event of the same monitor (the relay's `[<monitor>]` against the
+    event title, by fingerprint) was seen within COFIRE_WINDOW_MINUTES of the relay's own Slack `ts`, the
+    relay is an occurrence of THAT item: `closed(duplicate)` onto it, whichever of the two arrived first
+    and whatever state the uk item is in (a 5-minute outage is long over when the relay is polled). A
+    relay already submitted for triage is left alone (compare-and-set on `triage_job`)."""
+    window = dt.timedelta(minutes=COFIRE_WINDOW_MINUTES)
+    twins: dict[str, list[tuple[int, list[dt.datetime]]]] = {}
+    twin_seen: dict[int, list[dt.datetime]] = {}
+    for uk in conn.execute(
+            "SELECT ti.event_id AS event_id, e.title AS title, e.first_seen AS first_seen, "
+            "e.last_reminder_at AS last_reminder_at, e.notified_at AS notified_at FROM triage_items ti "
+            "JOIN events e ON e.id = ti.event_id WHERE ti.origin='alert' AND e.source='uk'").fetchall():
+        seen = [t for r in (uk["first_seen"], uk["last_reminder_at"], uk["notified_at"])
+                if r and (t := core.parse_ts(r)) is not None]
+        key = core.fingerprint(uk["title"] or "")
+        if key and seen:
+            twins.setdefault(key, []).append((uk["event_id"], seen))
+            twin_seen[uk["event_id"]] = seen
+    if not twins:
+        return
+    relays = conn.execute(
+        "SELECT ti.event_id AS event_id, ti.occurrences AS item_occurrences, ti.last_seen AS item_last_seen, "
+        "ti.first_seen AS item_first_seen, e.* FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        "WHERE ti.origin='alert' AND ti.state=? AND ti.triage_job IS NULL AND e.source='slack_alert' "
+        "AND e.resolved_at IS NULL ORDER BY ti.event_id", (core.STATE_NEW,)).fetchall()
+    for relay in relays:
+        m = _KUMA_RELAY_RE.match(relay["title"] or "")
+        started = _cofire_started(relay)
+        if not m or m["word"] != "Down" or started is None:
+            continue
+        near = [(min(abs(started - t) for t in seen), uk_id)
+                for uk_id, seen in twins.get(core.fingerprint(m["name"]), ())
+                if any(abs(started - t) <= window for t in seen)]
+        if not near:
+            continue
+        _gap, uk_id = min(near)
+        if core.set_state(conn, relay["event_id"], core.STATE_CLOSED, now, expect_state=core.STATE_NEW,
+                          expect_null=("triage_job",), close_reason=core.CLOSE_DUPLICATE, duplicate_of=uk_id,
+                          note=f"{COFIRE_NOTE_PREFIX}{uk_id}: Kuma relay of the monitor the uk webhook already "
+                               f"reported, within {COFIRE_WINDOW_MINUTES} min"):
+            _absorb_cofired(conn, uk_id, relay, min([started, *twin_seen[uk_id]]))
+    conn.commit()
+
+
 def fold_cofiring(conn: sqlite3.Connection, now: dt.datetime) -> None:
     """Attach every `new` alert that has not been submitted for triage to the open item of its family
-    whose first event is at most COFIRE_WINDOW_MINUTES older: `closed(duplicate)` onto that parent, so
+    whose first event is at most COFIRE_WINDOW_MINUTES older (a Slack relay by its own message `ts`,
+    _cofire_started()): `closed(duplicate)` onto that parent, so
     it costs no triage job and no investigation. Runs before submit_triage_jobs(), is a compare-and-set
     on `triage_job IS NULL`, and is idempotent (a folded item is no longer `new`).
 
@@ -1003,7 +1085,9 @@ def fold_cofiring(conn: sqlite3.Connection, now: dt.datetime) -> None:
     a fold is closed, so it can never be a parent, and the window is measured from the parent's first
     event, never chained through a fold. A parent is any open item (not terminal, not `failed`) of the
     family. A fold never closes, quiets or reopens on its own: only `new` is ever resolved by silence,
-    and reopen_if_needed() leaves a `closed(duplicate)` alone while its parent is open."""
+    and reopen_if_needed() leaves a `closed(duplicate)` alone while its parent is open. Before any of
+    that, a Kuma Down relay folds onto the `uk` item of the same monitor (_fold_kuma_relays_onto_uk())."""
+    _fold_kuma_relays_onto_uk(conn, now)
     placeholders = ",".join("?" * len(core.NOT_OPEN_STATES))
     rows = conn.execute(
         f"SELECT ti.event_id AS event_id, ti.state AS item_state, ti.first_seen AS item_first_seen, "
@@ -1014,9 +1098,11 @@ def fold_cofiring(conn: sqlite3.Connection, now: dt.datetime) -> None:
     ).fetchall()
     window = dt.timedelta(minutes=COFIRE_WINDOW_MINUTES)
     parents: list[tuple[dt.datetime, int, str]] = []   # open, unfolded, oldest first
-    for row in rows:
+    starts = {row["event_id"]: _cofire_started(row) for row in rows}
+    epoch = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    for row in sorted(rows, key=lambda r: (starts[r["event_id"]] or epoch, r["event_id"])):
         family = cofire_family(row)
-        started = core.parse_ts(row["item_first_seen"])
+        started = starts[row["event_id"]]
         if family is None or started is None or row["resolved_at"] is not None:
             continue   # a recovered event is the silence paths' to close, and no parent to fold more into
         parent = next((p for p in parents if p[2] == family and dt.timedelta(0) <= started - p[0] <= window), None)
@@ -1027,9 +1113,7 @@ def fold_cofiring(conn: sqlite3.Connection, now: dt.datetime) -> None:
                                      note=f"{COFIRE_NOTE_PREFIX}{parent[1]}: {family} alert within {COFIRE_WINDOW_MINUTES} min "
                                           f"of its first event"))
         if folded:
-            # ingest() recomputes this as own + folded (cofire_occurrences()) on the next pass, to the same number.
-            conn.execute("UPDATE triage_items SET occurrences=occurrences+?, last_seen=MAX(last_seen, ?) WHERE event_id=?",
-                         (row["item_occurrences"], row["item_last_seen"], parent[1]))
+            _absorb_cofired(conn, parent[1], row, min(t for t in (started, parent[0]) if t is not None))
         else:
             parents.append((started, row["event_id"], family))
     conn.commit()

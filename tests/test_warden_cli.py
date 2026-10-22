@@ -1413,6 +1413,28 @@ def test_feature_dry_run_writes_nothing_and_in_flight_items_are_refused():
     conn.close()
 
 
+def test_feature_clears_a_submitted_triage_job_and_the_in_flight_refusal_does_not_misname_abort():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 87, state="new", repo="gamma")
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET triage_job='triage-1', triage_job_at='2026-10-22T00:00:00+00:00' WHERE event_id=87")
+    conn.commit()
+    conn.close()
+    assert h.run(["feature", "87", "--json"], env=h.base_env(db=db)).returncode == 0
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, kind, triage_job, triage_job_at FROM triage_items WHERE event_id=87")
+    assert row["state"] == "triaged" and row["kind"] == "feature", dict(row)
+    assert row["triage_job"] is None and row["triage_job_at"] is None, "a submitted triage job must not be orphaned"
+    conn.close()
+    _seed_item(db, 88, state="verifying", repo="gamma")
+    _seed_item(db, 89, state="working", repo="gamma", implement_job="job-x")
+    verifying = _json_or_fail(h.run(["feature", "88", "--json"], env=h.base_env(db=db)))
+    working = _json_or_fail(h.run(["feature", "89", "--json"], env=h.base_env(db=db)))
+    assert "abort" not in verifying["error"] and "verify window" in verifying["error"], verifying
+    assert "'abort' it first" in working["error"], working
+
+
 def test_closing_a_feature_by_hand_ends_the_hold():
     h = Harness()
     db = h.new_db()
