@@ -123,3 +123,24 @@ Why: after the program, Argo's "needs you" list held 21 `failed` items — nearl
 - **Watch:** hermes-agent's sideclaw ceiling is still `investigate` — its implement re-drives will be refused again and wait for a policy change (lift the ceiling or close them). The first infra re-drives (1398, 1400) and the train runs of 1370/1389/1390 are the first field test.
 - **Judgment calls:** a work failure out of `verifying` keeps `verifying` as its retry stage (re-merging a merged item would fail); `redrives` counts infra re-drives only and resets on a real advance to merging+; a refused triage submit stays infra (3 bounded re-drives). `deploy.sh`'s `WARDEN_LIVE_REPO` override exists only for tests. A pre-existing wall-clock flake in the daily-digest test (failed after 21:00 UTC, also on master) is pinned.
 - **No next wave.**
+
+## Wave 8 — Factory Phase 0: stop the bleeding            <!-- status: active -->
+Why: 74 of 228 new items (32 %) reached the owner in 14 days, about 7 of them genuine
+(Round 5 audit, `~/SourceRoot/dotfiles/docs/waves/PLAN.md` §Established facts and Wave 2).
+This is Phase 0 of the factory design (`~/SourceRoot/dotfiles/docs/factory/BRIEF.md`):
+only the Round 5 Wave 2 fixes no open design decision can invalidate. **Out of scope —
+do not do them:** the timeout default, the improve loop as a scheduled job, decision-shadow
+promotion, the rebase-merge auto-revert, Argo's `adopt` verb, GitHub issues as a feature
+store. agent-gateway Wave 12 runs in parallel (host read verbs, `_common.md` policy lines);
+read its **Left behind** in `~/SourceRoot/agent-gateway/docs/waves/PLAN.md` for the verb set
+and the verdict field. Work in a worktree (the loop runs from the live checkout), land on
+master, `make deploy`.
+
+- [ ] **Investigate brief tells the truth.** `scripts/loop/work.py:264` lists exactly the host-read verbs agent-gateway Wave 12 grants (`make logs|verify|status`, `launchctl print|list`, bounded `tail`/`head` on `~/Library/Logs/**`, loopback `curl` GET) and nothing it does not. A verdict blocked on host access (Wave 12's field) is re-driven once after Wave 12 is deployed, then closed `quiet` with the reason — never `needs_decision`.
+- [ ] **Recovered alerts close themselves.** Extend `resolve_recovered_decisions` and the intake recovery path (`scripts/loop/intake.py:444,619`) from `uk`/`hyperdx` to `slack_alert` (Kuma, homelab watchdog and HyperDX relays: a recovery message for the same monitor) and to direct Kuma signals. An item whose condition is observed healthy again closes `quiet`, recovery event linked, in any open state including `needs_decision`.
+- [ ] **Co-firing alerts fold into one item.** Alerts from the same host or monitor family inside one window (start: 15 min, a named constant) attach to the open item as occurrences instead of opening new items. Regression test from the ledger: replay the 2026-10-17 21:22 outage's events and assert one item, not 16. A folded occurrence never closes while its parent is open.
+- [ ] **No terminal non-questions.** `no_changes` plus "already on master" closes the PR and resolves. Revision ceiling: residual findings become follow-up items when checks are green and no blocker is security or data, otherwise `failed(work)` — no page. An uncategorised `human` verdict from an implement episode is re-driven once, then the agent's recommendation is taken.
+- [ ] **Features are never dropped.** A feature-shaped item is never closed "resolved — a feature, not a fix". It stays open on the ledger, marked as a feature (smallest schema change that works: one column or tag), off the page path and visible on the board. No new store: the factory design decides the task system. Re-open 1708, 1709, 1711, 1712 this way.
+- [ ] **Drain `needs_decision`** once agent-gateway Wave 12 shows `done`: re-run every `needs_decision` item through triage with the new `_common.md` policy. Only genuine owner decisions (product direction, spend, irreversible data loss, other people) stay. Record before and after counts and each item's disposition (id, old question, new outcome) in **Left behind**.
+- [ ] Gate: `make check`, `/review` on the diff, `make deploy`, `make verify`. Exit: the share of new items that reached `needs_decision` in the first 24 h after deploy (`needs_decision` transitions / new items); the factory session measures the full 72 h window.
+**Left behind:**
