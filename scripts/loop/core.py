@@ -152,6 +152,14 @@ FAILURE_POLICY = "policy"
 FAILURE_WORK = "work"
 FAILURE_CLASSES = (FAILURE_INFRA, FAILURE_POLICY, FAILURE_WORK)
 
+# `triage_items.kind`: NULL for an ordinary item, `feature` for work that is a feature to scope and not
+# a bounded fix. A feature item is held in `triaged` with `retry_at` pushed to FEATURE_RETRY_AT and is
+# skipped by every dispatch, escalate, triage, strike, sweep and page path (NOT_FEATURE_SQL on the
+# queries that select `triaged` rows); it is never closed "resolved", so the work stays on the ledger.
+KIND_FEATURE = "feature"
+FEATURE_RETRY_AT = "9999-12-31T00:00:00+00:00"
+NOT_FEATURE_SQL = "kind IS NOT 'feature'"
+
 # Automatic re-drives of a `failed` item (redrive_failed()): an `infra` failure waits
 # REDRIVE_BACKOFF_MINUTES[redrives] before its next re-drive, REDRIVE_LIMIT times (`redrives` counts
 # infra re-drives only); a `policy` failure is re-driven once per change of agent-gateway's dispatch policy
@@ -276,8 +284,10 @@ MAX_IMPLEMENT_ATTEMPTS = 3
 # (work.revisions_left()). A converging round (every blocking finding new) is free against
 # MAX_IMPLEMENT_ATTEMPTS, so a reviewer that drifts to a new narrower finding each round would
 # otherwise revise without bound (item 1565: 5 revisions, 2.5 h, for a 71-line prune; 1478/1480 the
-# same). At the ceiling a review that blocks lands `needs_decision` with its findings (a review that
-# does not block already goes to the merge train; the ceiling never loosens what blocks a merge).
+# same). At the ceiling a review that still blocks no longer pages: with no
+# security or data-loss finding the PR merges as it is and the residue becomes a follow-up item, else
+# the item is `failed(work)` (train._fold_review(), work.open_followup_item()). A chain that stalled
+# (MAX_IMPLEMENT_ATTEMPTS) is `failed(work)` as before.
 MAX_REVISIONS = 5
 
 # Attempt N >= this one runs on agent-gateway's escalation implement model (GET /api/routing), when
@@ -725,7 +735,7 @@ _SET_STATE_COLUMNS = (
     "blocked_sha",
     "sweep_pr", "sweep_job", "sweep_job_at", "sweep_attempts", "sweep_candidates", "fixed_by_pr",
     "failure_class", "redrive_json", "redrives", "verify_baseline", "ci_rerun_sha",
-    "first_seen", "occurrences",
+    "first_seen", "occurrences", "kind",
 )
 
 # The states an item can be re-driven INTO: a stage of the pipeline that has a poller.
@@ -885,6 +895,10 @@ def set_state(conn: sqlite3.Connection, event_id: int, state: str, now: dt.datet
     if state in (STATE_NEW, STATE_TRIAGED):
         columns.setdefault("reverting_sha", None)
         columns.setdefault("revert_json", None)
+    if state != STATE_TRIAGED:
+        # A feature hold (hold_as_feature()) lives in `triaged` only: leaving it, by any route (an owner's
+        # close, a re-drive), ends the hold, so a stale `kind` never keeps a live item out of the loop.
+        columns.setdefault("kind", None)
     if columns.get("triage_job", "") is None:
         columns.setdefault("triage_job_at", None)   # no job, no job age
     if state != STATE_MERGING:
@@ -1106,6 +1120,21 @@ def reinvestigate(conn: sqlite3.Connection, event_id: int, now: dt.datetime, *,
                          dispatch_job=None, implement_job=None, validation_job=None,
                          pr_url=None, reviewed_sha=None, blocked_sha=None, revision_count=0, stalled_rounds=0)
     return rowcount, (old_pr if rowcount else None)
+
+
+def is_feature(item: sqlite3.Row) -> bool:
+    return item["kind"] == KIND_FEATURE
+
+
+def hold_as_feature(conn: sqlite3.Connection, event_id: int, now: dt.datetime, why: str, *,
+                    expect_state: str | None = None, **columns: Any) -> int:
+    """Park the item as a feature: `triaged`, `kind='feature'`, `retry_at` far enough out that nothing
+    re-dispatches it, the dispatch/implement handles cleared (a stale handle would be polled again or
+    block a later start), the note `feature: <why>`. `strikes=0` is passed explicitly because leaving an
+    end state would otherwise reset `retry_at`. Returns set_state()'s rowcount; the caller commits."""
+    return set_state(conn, event_id, STATE_TRIAGED, now, expect_state=expect_state,
+                     note=f"feature: {' '.join(why.split())}", kind=KIND_FEATURE, retry_at=FEATURE_RETRY_AT,
+                     strikes=0, dispatch_job=None, implement_job=None, validation_job=None, **columns)
 
 
 def park(conn: sqlite3.Connection, event_id: int, now: dt.datetime, reason: str, *, state: str,

@@ -14,7 +14,7 @@ VERBS
                      implement only if the verdict says so and policy allows;
                      brief on stdin) — the intake for a human or for Hermes
   status <job-id>    poll one
-  list [scope]        open | today | all
+  list [scope]        open | today | all | features (the open items held as a feature)
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
                      --confirm needs a reviewed head to pin; with none on record it refuses
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
@@ -22,6 +22,8 @@ VERBS
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
   retry <event-id>    put a `failed` item back where it failed, with a fresh re-drive budget (--why)
   reinvestigate <event-id>  send an item back for a fresh investigation (--why required)
+  feature <event-id>  mark an item as a feature (a feature to scope, not a bounded fix): held in
+                     `triaged`, off every dispatch and page path, never closed as resolved (--why)
   adopt <event-id>    point an item at an open pull request warden itself opened for it
                      and rejoin the merge train (--pr <number>)
   pause               the kill-switch: stop the loop's dispatches, merges and deploys (an explicit
@@ -147,6 +149,12 @@ def _mode(verb: str | None, state: _State) -> str:
     if verb == "reinvestigate":
         if state.did_mutate:
             return "reinvestigated"
+        return "dry-run" if state.dry_run else "refused"
+    if verb == "feature":
+        if state.did_mutate:
+            return "featured"
+        if state.noop:
+            return "noop"
         return "dry-run" if state.dry_run else "refused"
     if verb == "adopt":
         if state.did_mutate:
@@ -672,6 +680,12 @@ def cmd_list(conn, flags: Flags, positional: list[str], state: _State) -> dict[s
     scope = positional[0] if positional else "open"
     state.target = scope
     now = dt.datetime.now(dt.timezone.utc)
+    if scope == "features":
+        # Items, not dispatches: a feature hold has no episode (core.hold_as_feature() clears the handles).
+        features = [dict(r) for r in conn.execute(
+            "SELECT event_id, repo, state, kind, origin, note, updated_at FROM triage_items "
+            "WHERE kind = 'feature' ORDER BY event_id")]
+        return {"verb": "list", "ok": True, "scope": scope, "count": len(features), "features": features}
     rows = dispatch.list_dispatches(conn, scope, now)
     out: dict[str, Any] = {"verb": "list", "ok": True, "scope": scope, "count": len(rows), "dispatches": rows}
     return out
@@ -978,6 +992,57 @@ def cmd_reinvestigate(conn, flags: Flags, positional: list[str], state: _State) 
             "state": core.STATE_TRIAGED, "note": core.get_item(conn, event_id)["note"]}
 
 
+# --- feature ---------------------------------------------------------------------
+
+# In flight: an episode, a merge or a verify window is running against the item. `abort` ends the
+# episode; a merging or verifying item is not a feature, it is a fix on its way out.
+_FEATURE_REFUSED_STATES = (core.STATE_WORKING, core.STATE_MERGING, core.STATE_VERIFYING)
+
+
+def cmd_feature(conn, flags: Flags, positional: list[str], state: _State) -> dict[str, Any]:
+    """Mark an existing item as a feature — a feature to scope, not a bounded fix. The item is held in
+    `triaged` (`kind='feature'`, `retry_at` far out, the dispatch/implement handles cleared like
+    reinvestigate()) and stays off every dispatch, escalate, triage and page path until an owner closes
+    it. A terminal item (a feature the loop once closed "resolved") comes back; a `working`, `merging`
+    or `verifying` one is refused (`abort` first). Writes the local ledger only; no GitHub or
+    agent-gateway call, and the pull request on record, if any, is left alone."""
+    if not positional:
+        raise UsageError('usage: warden feature <event-id> [--why "<reason>"] [--json]')
+    event_id = _parse_int(positional[0], "event-id")
+    state.target = str(event_id)
+
+    item = core.get_item(conn, event_id)
+    if item is None:
+        raise UsageError(f"no triage_items row for event_id {event_id}")
+    if item["state"] in _FEATURE_REFUSED_STATES:
+        raise PreconditionError(
+            f"triage item {event_id} is in state '{item['state']}' — an episode or operation is in flight; "
+            f"'abort' it first, a feature is held, not worked"
+        )
+    why = flags.why or "marked as a feature by the owner"
+    if item["state"] == core.STATE_TRIAGED and core.is_feature(item):
+        state.noop = True
+        return {"verb": "feature", "ok": True, "eventId": event_id, "fromState": item["state"],
+                "state": item["state"], "note": f"item {event_id} is already held as a feature — nothing to do"}
+
+    if flags.dry_run:
+        state.dry_run = True
+        return {"verb": "feature", "ok": True, "dryRun": True, "eventId": event_id,
+                "fromState": item["state"], "state": core.STATE_TRIAGED,
+                "note": "nothing written — no transition row, no state change"}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    rowcount = core.hold_as_feature(conn, event_id, now, why, expect_state=item["state"], reviewed_sha=None,
+                                    blocked_sha=None, revision_count=0, stalled_rounds=0)
+    if not rowcount:
+        conn.rollback()
+        raise PreconditionError(f"triage item {event_id} moved while this feature mark was applied — look again")
+    conn.commit()
+    state.did_mutate = True
+    return {"verb": "feature", "ok": True, "eventId": event_id, "fromState": item["state"],
+            "state": core.STATE_TRIAGED, "kind": core.KIND_FEATURE, "note": core.get_item(conn, event_id)["note"]}
+
+
 # --- adopt -----------------------------------------------------------------------
 
 
@@ -1182,6 +1247,14 @@ def _print_text(verb: str | None, out: dict[str, Any]) -> None:
                     print(f"summary: {v.get('summary', '')}")
     elif verb == "status":
         _print_result_text(out)
+    elif verb == "list" and out.get("scope") == "features":
+        for r in out["features"]:
+            print(f"{r['event_id']:<6} {r['state']:<10} {r['repo'] or '-':<18} {r['note'] or ''}")
+        if not out["features"]:
+            print("no features")
+    elif verb == "feature":
+        print(f"item {out['eventId']}: {out['fromState']} -> {out['state']} (feature)")
+        print(f"note: {out['note']}")
     elif verb == "list":
         rows = out.get("dispatches") or []
         if not rows:
@@ -1208,7 +1281,7 @@ VERBS
                      implement only if the verdict says so and policy allows;
                      brief on stdin) — the intake for a human or for Hermes
   status <job-id>    poll one
-  list [scope]        open | today | all
+  list [scope]        open | today | all | features
   merge <job-id>      land the draft PR a dispatch opened (--why --confirm)
                      --confirm needs a reviewed head to pin; with none on record it refuses
   abort <event-id>    cancel an in-flight implement/validate episode (--why)
@@ -1216,6 +1289,7 @@ VERBS
   close <event-id>    resolve an open item by hand (--why required; --reason resolved|ignored)
   retry <event-id>    put a `failed` item back where it failed, with a fresh re-drive budget (--why)
   reinvestigate <event-id>  send an item back for a fresh investigation (--why required)
+  feature <event-id>  mark an item as a feature: held in `triaged`, off every dispatch and page path (--why)
   adopt <event-id>    point an item at an open pull request warden itself opened for it
                      and rejoin the merge train (--pr <number>)
   pause [--reason <text>]  the kill-switch: the loop starts no dispatch, merge or deploy (an explicit
@@ -1307,6 +1381,8 @@ def main(argv: list[str]) -> int:
                 out = cmd_retry(conn, flags, rest, state)
             elif verb == "reinvestigate":
                 out = cmd_reinvestigate(conn, flags, rest, state)
+            elif verb == "feature":
+                out = cmd_feature(conn, flags, rest, state)
             elif verb == "adopt":
                 out = cmd_adopt(conn, flags, rest, state)
             else:
@@ -1316,13 +1392,14 @@ def main(argv: list[str]) -> int:
                     "  dispatch <repo>   open a bare episode, no item (brief on stdin)\n"
                     "  run <repo>        open an item riding the alert lifecycle (brief on stdin)\n"
                     "  status <job-id>   poll one\n"
-                    "  list [scope]      open | today | all\n"
+                    "  list [scope]      open | today | all | features\n"
                     "  merge <job-id>    land the draft PR that dispatch opened (--why --confirm)\n"
                     "  abort <event-id>  cancel an in-flight implement/validate episode (--why)\n"
                     "  revert <event-id> record a revert PR against a merged item (--pr --why)\n"
                     "  close <event-id>  resolve an open item by hand (--why required; --reason resolved|ignored)\n"
                     "  retry <event-id>  put a failed item back where it failed (--why)\n"
                     "  reinvestigate <event-id>  send an item back for a fresh investigation (--why)\n"
+                    "  feature <event-id>  mark an item as a feature, held off every dispatch and page path (--why)\n"
                     "  adopt <event-id>  point an item at an open warden PR and rejoin the merge train (--pr)\n"
                     "  pause             stop the loop's dispatches, merges and deploys (--reason <text>)\n"
                     "  resume            lift the pause\n"

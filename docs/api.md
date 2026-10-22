@@ -166,9 +166,10 @@ Every non-terminal `triage_items` row plus counts.
   "schema_version": 20,
   "counts": {"new": 0, "triaged": 0, "working": 1, "merging": 0,
              "verifying": 0, "needs_decision": 2, "failed": 0},
+  "features": 0,
   "items": [{
     "event_id": 42, "origin": "alert", "repo": "warden", "state": "needs_decision",
-    "close_reason": null, "failure_class": null, "redrives": 0,
+    "close_reason": null, "failure_class": null, "kind": null, "redrives": 0,
     "strikes": 0, "retry_at": null, "max_tier": "implement",
     "title": "...", "note": null, "pr_url": null, "dispatch_job": "j-abc",
     "implement_job": null, "validation_job": null, "occurrences": 3,
@@ -190,6 +191,9 @@ Every non-terminal `triage_items` row plus counts.
 - `counts` always carries all seven non-terminal states (`new`, `triaged`, `working`,
   `merging`, `verifying`, `needs_decision`, `failed`), zero when empty. Terminal states
   (`fixed`, `quiet`, `closed`) are not in `counts` or `items`.
+- `kind` is `null`, or `"feature"` for an item held as a feature (a feature to scope, not a bounded
+  fix: `triaged`, off every dispatch and page path, closed only by an owner); `features` counts the
+  open ones (they are inside `counts.triaged` too).
 - `items` is `ORDER BY updated_at DESC`, capped at 200; `truncated: true` appears only when
   the cap was hit (omitted otherwise, never `false`). `terminal_24h` counts terminal-state
   items with `updated_at` in the last 24 hours.

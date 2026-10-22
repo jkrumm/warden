@@ -1347,6 +1347,84 @@ def test_reinvestigate_takes_a_closed_job_item_only_while_its_job_is_still_red()
     conn.close()
 
 
+# --- feature -------------------------------------------------------------------
+
+
+def test_feature_marks_a_closed_item_back_as_a_held_feature():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 80, state="closed", repo="gamma", dispatch_job="old-investigate", implement_job="old-implement",
+               validation_job="old-validation")
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET close_reason='resolved', pr_url=?, revision_count=2, "
+                 "note='a feature to scope, not a bounded fix' WHERE event_id=80", ("https://github.com/o/r/pull/3",))
+    conn.commit()
+    conn.close()
+    proc = h.run(["feature", "80", "--why", "dark mode is roadmap work", "--json"], env=h.base_env(db=db))
+    out = _json_or_fail(proc)
+    assert proc.returncode == 0 and out["verb"] == "feature" and out["ok"] is True, out
+    assert out["fromState"] == "closed" and out["state"] == "triaged" and out["kind"] == "feature", out
+    assert out["note"] == "feature: dark mode is roadmap work", out
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT * FROM triage_items WHERE event_id=80")
+    assert row["state"] == "triaged" and row["kind"] == "feature" and row["close_reason"] is None, dict(row)
+    assert row["dispatch_job"] is None and row["implement_job"] is None and row["validation_job"] is None, dict(row)
+    assert row["retry_at"] == "9999-12-31T00:00:00+00:00" and row["revision_count"] == 0, dict(row)
+    assert row["pr_url"] == "https://github.com/o/r/pull/3", "the pull request on record is evidence, left alone"
+    trans = _row(conn, "SELECT from_state, to_state, note FROM item_transitions WHERE event_id=80 ORDER BY id DESC LIMIT 1")
+    assert trans["from_state"] == "closed" and trans["to_state"] == "triaged", dict(trans)
+    conn.close()
+    # it shows in `list features`, and a repeat is a no-op
+    listed = _json_or_fail(h.run(["list", "features", "--json"], env=h.base_env(db=db)))
+    assert listed["count"] == 1 and listed["features"][0]["event_id"] == 80 and listed["features"][0]["kind"] == "feature", listed
+    again = _json_or_fail(h.run(["feature", "80", "--json"], env=h.base_env(db=db)))
+    assert again["ok"] is True and "already held as a feature" in again["note"], again
+
+
+def test_feature_marks_a_needs_decision_item_and_takes_a_default_why():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 81, state="needs_decision", repo="gamma")
+    out = _json_or_fail(h.run(["feature", "81", "--json"], env=h.base_env(db=db)))
+    assert out["state"] == "triaged" and out["note"] == "feature: marked as a feature by the owner", out
+
+
+def test_feature_dry_run_writes_nothing_and_in_flight_items_are_refused():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 82, state="closed", repo="gamma")
+    conn, _ = _connect(db)
+    conn.execute("UPDATE triage_items SET close_reason='resolved' WHERE event_id=82")
+    conn.commit()
+    conn.close()
+    out = _json_or_fail(h.run(["feature", "82", "--dry-run", "--json"], env=h.base_env(db=db)))
+    assert out["dryRun"] is True and out["state"] == "triaged", out
+    for event_id, state in ((83, "working"), (84, "merging"), (85, "verifying")):
+        _seed_item(db, event_id, state=state, repo="gamma", implement_job="job-x")
+        proc = h.run(["feature", str(event_id), "--json"], env=h.base_env(db=db))
+        assert proc.returncode == 2 and _json_or_fail(proc)["ok"] is False, (state, proc.stdout)
+    assert h.run(["feature", "999", "--json"], env=h.base_env(db=db)).returncode == 64
+    assert h.run(["feature", "--json"], env=h.base_env(db=db)).returncode == 64
+    conn, _ = _connect(db)
+    assert _row(conn, "SELECT state, kind FROM triage_items WHERE event_id=82")["state"] == "closed"
+    assert _row(conn, "SELECT COUNT(*) AS n FROM item_transitions WHERE event_id IN (82,83,84,85)")["n"] == 0
+    for event_id in (83, 84, 85):
+        assert _row(conn, "SELECT kind FROM triage_items WHERE event_id=?", (event_id,))["kind"] is None
+    conn.close()
+
+
+def test_closing_a_feature_by_hand_ends_the_hold():
+    h = Harness()
+    db = h.new_db()
+    _seed_item(db, 86, state="needs_decision", repo="gamma")
+    assert h.run(["feature", "86", "--json"], env=h.base_env(db=db)).returncode == 0
+    assert h.run(["close", "86", "--why", "not wanted", "--json"], env=h.base_env(db=db)).returncode == 0
+    conn, _ = _connect(db)
+    row = _row(conn, "SELECT state, kind FROM triage_items WHERE event_id=86")
+    assert row["state"] == "closed" and row["kind"] is None, dict(row)
+    conn.close()
+
+
 # --- adopt ---------------------------------------------------------------------
 
 

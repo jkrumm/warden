@@ -589,6 +589,11 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     truncated = len(rows) > BOARD_ITEMS_CAP
     items = [_board_item(row) for row in rows[:BOARD_ITEMS_CAP]]
 
+    # Feature holds (loop/core.py KIND_FEATURE) sit in `triaged`, so `counts` already includes them;
+    # this is how many of those are features, counted over every open row and not only the capped list.
+    features = conn.execute("SELECT COUNT(*) AS n FROM triage_items WHERE kind = 'feature' "
+                            f"AND state NOT IN ({terminal_placeholders})", _ledger.TERMINAL_STATES).fetchone()["n"]
+
     terminal_24h_start = (now - dt.timedelta(hours=24)).isoformat()
     terminal_24h = conn.execute(
         f"SELECT COUNT(*) AS n FROM triage_items "
@@ -600,6 +605,7 @@ def board_payload(conn: sqlite3.Connection) -> dict[str, Any]:
         "generated_at": now.isoformat(),
         "schema_version": _ledger.LEDGER_SCHEMA_VERSION,
         "counts": counts,
+        "features": features,
         "items": items,
         "terminal_24h": terminal_24h,
         "awaiting_owner": awaiting_owner(conn, now),
@@ -686,6 +692,7 @@ def _board_item(row: sqlite3.Row) -> dict[str, Any]:
         "state": row["state"],
         "close_reason": row["close_reason"],
         "failure_class": row["failure_class"],
+        "kind": row["kind"],
         "redrives": row["redrives"],
         "strikes": row["strikes"],
         "retry_at": row["retry_at"],

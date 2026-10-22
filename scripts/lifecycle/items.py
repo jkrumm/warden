@@ -148,8 +148,10 @@ def transition(
             raise ValueError(f"a `closed` transition must carry extra={{'close_reason': one of {ledger.CLOSE_REASONS}}}")
     else:
         extra = {**extra, "close_reason": None}
-    # `duplicate_of` belongs to `closed(duplicate)` alone (only the loop writes that).
-    extra = {**extra, "duplicate_of": None}
+    # `duplicate_of` belongs to `closed(duplicate)` alone (only the loop writes that); a feature hold
+    # (`kind`) lives in `triaged` only, and this module never targets it, so a hand-closed feature
+    # item ends its hold like any other exit from `triaged` (loop/core.py set_state()).
+    extra = {**extra, "duplicate_of": None, "kind": None}
     # `failed` always carries its class (and a CLI-written one has no stage to re-enter: it was a
     # human's call); every other state clears both, so a closed item never keeps a failure's class.
     if to_state == "failed":

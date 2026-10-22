@@ -548,7 +548,11 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
     own reviewer would not stand behind. A finding about the PR's own *wrapper* never
     blocks-and-revises either, since no episode can satisfy it; it also goes to the owner with the
     finding on the card. A `blocked` review goes back to `working` for a revision attempt
-    (maybe_revise_blocked()) while any are left, else `failed` carrying the blocking findings.
+    (maybe_revise_blocked()) while any are left. With none left the owner is not paged: stalled
+    rounds land `failed(work)`; the absolute ceiling core.MAX_REVISIONS, reached by a chain that
+    kept converging, lets the PR go on to merge as it is when no blocking finding reads as security or
+    data loss (work.is_security_or_data_loss_finding()) — the findings become ONE follow-up item
+    (work.open_followup_item()) — and lands `failed(work)` with the PR left open when one does.
 
     A review whose OWN pipeline broke — a `discussions` entry marked `REVIEW_PIPELINE_MARKER`, one per
     reviewer session that failed without examining the diff — is an infrastructure failure even though
@@ -749,12 +753,35 @@ def _fold_review(conn: sqlite3.Connection, policy: dict[str, Any], item: sqlite3
                     f"no revision left; {note}")
         if (not revise and not revert and item["max_tier"] == "implement" and work.revision_ceiling_hit(item)
                 and stalled < core.MAX_IMPLEMENT_ATTEMPTS):
-            # The absolute ceiling, reached by a chain that kept converging: the review still blocks, so
-            # the findings go to the owner (a non-blocking review never gets here: it is `confirmed`).
-            core.set_state(conn, event_id, core.STATE_NEEDS_DECISION, now, strikes=0, blocked_sha=sha,
-                            stalled_rounds=stalled,
-                            note=f"revision ceiling ({item['revision_count']}), review still blocks: "
-                                 f"{work.format_blocking_findings(blocking)}")
+            # The absolute ceiling, reached by a chain that kept converging (a chain that stalled ends
+            # `failed(work)` below, its findings unresolved rather than narrowing). The train only gets
+            # here past its checks stage, so the checks are green. If no blocking finding is about
+            # security or data loss the PR merges as it is and the residue becomes ONE follow-up item;
+            # otherwise the item is `failed(work)` with the PR left open. Neither pages the owner.
+            if any(work.is_security_or_data_loss_finding(f) for f in code_blocking):
+                core.set_state(conn, event_id, core.STATE_FAILED, now, strikes=0, failure_class=core.FAILURE_WORK,
+                                note=f"revision ceiling, a blocking finding is security or data loss — PR left "
+                                     f"open: {item['pr_url']}; {note}", blocked_sha=sha, stalled_rounds=stalled)
+            else:
+                followup = work.open_followup_item(conn, item, code_blocking, sha, now)
+                if followup is None:
+                    core.set_state(conn, event_id, core.STATE_FAILED, now, strikes=0,
+                                    failure_class=core.FAILURE_WORK, blocked_sha=sha, stalled_rounds=stalled,
+                                    note=f"revision ceiling, no follow-up could be opened — PR left open: "
+                                         f"{item['pr_url']}; {note}")
+                else:
+                    # The merge gate reads `confirmed` off the dispatch row and the pin off `reviewed_sha`:
+                    # this is the one place a blocked review is let through, on purpose, with its findings
+                    # carried by the follow-up.
+                    conn.execute("UPDATE dispatches SET validation_status='confirmed' WHERE job_id=?",
+                                 (item["implement_job"],))
+                    conn.commit()
+                    _train_hop(conn, core.get_item(conn, event_id), now, train_stage=TRAIN_MERGE, reviewed_sha=sha,
+                               retry_at=None, blocked_sha=sha, stalled_rounds=stalled,
+                               note=f"revision ceiling ({item['revision_count']}): merging as it is, "
+                                    f"{len(code_blocking)} residual finding(s) filed as follow-up #{followup}: "
+                                    f"{work.format_blocking_findings(code_blocking)}",
+                               **_stage_success(item))
         else:
             core.set_state(conn, event_id, core.STATE_WORKING if revise else core.STATE_FAILED, now, strikes=0,
                             failure_class=core.FAILURE_WORK, note=note, blocked_sha=sha, stalled_rounds=stalled)

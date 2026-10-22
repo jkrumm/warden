@@ -64,7 +64,7 @@ DB_PATH = Path(os.environ["WARDEN_DB"]).expanduser() if os.environ.get("WARDEN_D
 # DISPATCH_SCHEMA_VERSION/REVIEW_SCHEMA_VERSION, which pin agent-gateway's published
 # verdict schemas and are asserted per job by assert_result_schema — two independent pins that must
 # never be conflated.
-LEDGER_SCHEMA_VERSION = 23
+LEDGER_SCHEMA_VERSION = 24
 
 
 class LedgerBehind(RuntimeError):
@@ -872,6 +872,17 @@ _MIGRATION_23 = """
 ALTER TABLE triage_items ADD COLUMN ci_rerun_sha TEXT;
 """
 
+# Version 24 — `kind` (one column, no backfill). NULL = an ordinary item; `feature` = work that is a
+# feature to scope, not a bounded fix. The loop used to close such an item `closed(resolved)` with
+# "a feature, not a fix" (items 1708, 1709, 1711, 1712), which dropped the work. A feature item
+# stays `triaged` with `retry_at` far in the future and is skipped by every dispatch, escalate,
+# triage, strike and page path (loop/core.py FEATURE_KIND, core.is_feature()); it shows on `warden
+# list|status` and the API snapshot, and `warden feature <event-id>` marks an existing item. Nothing
+# is backfilled: the four dropped rows are re-opened by hand with that verb.
+_MIGRATION_24 = """
+ALTER TABLE triage_items ADD COLUMN kind TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: BASE_SCHEMA,
     2: _MIGRATION_2,
@@ -896,6 +907,7 @@ MIGRATIONS: dict[int, str] = {
     21: _MIGRATION_21,
     22: _MIGRATION_22,
     23: _MIGRATION_23,
+    24: _MIGRATION_24,
 }
 
 # The four tables BASE_SCHEMA declares, i.e. what "this is the live

@@ -1926,8 +1926,10 @@ _UNCATEGORIZED_HUMAN = {"nextAction": "human", "decisionQuestion": "Keep it stri
 
 
 def test_every_owner_only_category_pages_and_is_tagged_on_the_note():
+    """`blocker` is not owner-only for an investigation: it is a host-access gap, handled by the
+    host-access tests below, and never pages."""
     with _triage_env() as (conn, ctx):
-        for cat in work.ESCALATION_CATEGORIES:
+        for cat in (c for c in work.ESCALATION_CATEGORIES if c != "blocker"):
             item = _fold_alert_verdict(conn, f"sig-cat-{cat}", verdict={**_UNCATEGORIZED_HUMAN, "escalationCategory": cat})
             assert item["state"] == core.STATE_NEEDS_DECISION, (cat, dict(item))
             assert item["note"] == f"[{cat}] Keep it strict, or dampen it?", item["note"]
@@ -3508,7 +3510,8 @@ def _seed_implementing_item(conn, *, external_id: str, job_id: str) -> int:
 def _dispatch_result(outcome: str, *, next_action: str | None = None, summary: str = "s",
                       artifact_url: str | None = None, branch: str | None = None,
                       schema_version: int | None = None,
-                      escalation_category: str | None = None) -> dict[str, Any]:
+                      escalation_category: str | None = None,
+                      extra: dict[str, Any] | None = None) -> dict[str, Any]:
     """A literal implement-job `result` shaped per DISPATCH_OUTPUT — every
     field the outcome table (poll_implement_jobs()'s own docstring) branches
     on, none of the tier's other VERDICT_FIELDS (this suite never asserts on
@@ -3525,6 +3528,7 @@ def _dispatch_result(outcome: str, *, next_action: str | None = None, summary: s
         out["artifactUrl"] = artifact_url
     if branch is not None:
         out["branch"] = branch
+    out.update(extra or {})
     return out
 
 
@@ -3557,7 +3561,7 @@ def test_implement_outcome_checks_failed_waits_for_a_revision_then_fails_when_no
 def test_checks_failed_with_an_uncategorised_human_verdict_is_a_revision_while_revisions_are_left():
     """Item 1577: a revision episode's checks failed on its own lint error and the verdict said
     nextAction=human with no escalationCategory. With revisions left that is another revision, never a
-    page; a valid category, or no revisions left, keeps the old routing."""
+    page; a valid category still pages, and with no revisions left it is `failed(work)`, not a page."""
     with _triage_env() as (conn, ctx):
         def run(external_id, job_id, category=None, stalled=0):
             eid = _seed_implementing_item(conn, external_id=external_id, job_id=job_id)
@@ -3579,7 +3583,8 @@ def test_checks_failed_with_an_uncategorised_human_verdict_is_a_revision_while_r
         assert categorised["state"] == core.STATE_NEEDS_DECISION, dict(categorised)
 
         spent = run("sig-1577-c", "impl-1577-c", stalled=core.MAX_IMPLEMENT_ATTEMPTS - 1)
-        assert spent["state"] == core.STATE_NEEDS_DECISION, "no revisions left: the old routing stands"
+        assert spent["state"] == core.STATE_FAILED and spent["failure_class"] == core.FAILURE_WORK, (
+            "no revisions left: `failed(work)` through the red-checks path, no longer a page", dict(spent))
 
 
 def test_implement_outcome_checks_tool_failed_is_an_infra_strike_never_a_revision():
@@ -3791,12 +3796,13 @@ def test_a_blocking_review_records_the_refused_head_for_a_later_revision():
 
 def test_implement_no_changes_next_action_human_wins_over_the_close():
     """`nextAction=human` is judged before the outcome branches, so a no_changes episode that
-    asks for a decision goes to needs_decision, never closed(resolved), even on a first attempt."""
+    asks an owner-only question (a category) goes to needs_decision, never closed(resolved), even
+    on a first attempt."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-no-changes-human", job_id="impl-no-changes-human")
         _agent_gateway.get = lambda job_id: {
             "status": "done",
-            "result": _dispatch_result("no_changes", next_action="human",
+            "result": _dispatch_result("no_changes", next_action="human", escalation_category="product",
                                         summary="two ways to fix this, the owner must pick"),
         }
         work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
@@ -3920,15 +3926,16 @@ def test_implement_outcome_unrecognized_is_a_strike_never_guessed():
 
 
 def test_implement_next_action_human_overrides_pr_opened():
-    """`nextAction == "human"` overrides every outcome, per the poll's own
+    """A categorised `nextAction == "human"` overrides every outcome, per the poll's own
     docstring — even a `pr_opened` that would otherwise open validation —
     and lands `needs_decision` (the summary stands in when agent-gateway sent no
-    `decisionQuestion`)."""
+    `decisionQuestion`). An uncategorised one beside an opened PR is moot: see
+    test_an_uncategorised_human_beside_an_opened_pr_joins_the_train."""
     with _triage_env() as (conn, ctx):
         eid = _seed_implementing_item(conn, external_id="sig-outcome-next-action-human", job_id="impl-next-human")
         _agent_gateway.get = lambda job_id: {
             "status": "done",
-            "result": _dispatch_result("pr_opened", next_action="human",
+            "result": _dispatch_result("pr_opened", next_action="human", escalation_category="product",
                                         artifact_url="https://github.com/jkrumm/demo-repo/pull/50",
                                         summary="needs a human to decide"),
         }
@@ -14557,16 +14564,69 @@ def test_below_the_ceiling_a_converging_round_still_continues():
         assert item["state"] == core.STATE_WORKING and item["stalled_rounds"] == 1, dict(item)
 
 
-def test_at_the_ceiling_a_review_that_still_blocks_lands_needs_decision_with_its_findings():
+def test_at_the_ceiling_a_review_that_still_blocks_merges_as_it_is_and_files_a_follow_up():
+    """Wave 8: the converging chain's last review still blocks, checks are green (the train reviews only
+    past its checks stage) and no finding is security or data loss: the owner is not paged. The PR goes on
+    to merge as it is and the residual findings become ONE follow-up item in the same repo."""
     with _triage_env() as (conn, ctx):
         eid = _seed_verdict_item(conn, external_id="sig-at-ceiling")
         _blocked_review_round(conn, eid, 1, [_finding("first problem")])
         item = _blocked_review_round(conn, eid, core.MAX_REVISIONS + 1,
                                      [_finding("a brand new narrower problem", 7)])
         assert item["revision_count"] == core.MAX_REVISIONS
-        assert item["state"] == core.STATE_NEEDS_DECISION, dict(item)
-        assert item["stalled_rounds"] == 1 and item["blocked_sha"] == "a" * 40, dict(item)
-        assert "revision ceiling" in item["note"] and "scripts/x.py:7 — a brand new narrower problem" in item["note"], item["note"]
+        assert item["state"] == core.STATE_MERGING and item["train_stage"] == "merge", dict(item)
+        assert item["reviewed_sha"] == "a" * 40 and item["blocked_sha"] == "a" * 40, dict(item)
+        assert item["stalled_rounds"] == 1, dict(item)
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id=?", (item["implement_job"],)).fetchone()
+        assert d["validation_status"] == "confirmed", "the merge gate reads `confirmed` off the dispatch row"
+        followup = conn.execute("SELECT * FROM triage_items WHERE origin='human' AND event_id != ?", (eid,)).fetchone()
+        assert followup is not None, "the residue must become a follow-up item"
+        assert followup["repo"] == "demo-repo" and followup["max_tier"] == "implement", dict(followup)
+        assert followup["state"] == core.STATE_NEW, dict(followup)
+        assert "scripts/x.py:7 — a brand new narrower problem" in followup["brief"], followup["brief"]
+        assert "https://github.com/jkrumm/demo-repo/pull/10" in followup["brief"], followup["brief"]
+        assert "revision ceiling" in item["note"] and f"follow-up #{followup['event_id']}" in item["note"], item["note"]
+
+
+def test_at_the_ceiling_a_security_or_data_loss_finding_lands_failed_work_with_no_page_and_no_follow_up():
+    with _triage_env() as (conn, ctx):
+        for ext, message in (("sig-ceiling-sec", "the new endpoint skips the auth check: a security hole"),
+                             ("sig-ceiling-data", "this migration can delete data from the ledger table")):
+            eid = _seed_verdict_item(conn, external_id=ext, investigate_job=f"inv-{ext}")
+            _blocked_review_round(conn, eid, 1, [_finding("first problem")])
+            item = _blocked_review_round(conn, eid, core.MAX_REVISIONS + 1,
+                                         [_finding("a brand new narrower problem", 7), _finding(message, 9)])
+            assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_WORK, dict(item)
+            assert "security or data loss" in item["note"], item["note"]
+            assert "https://github.com/jkrumm/demo-repo/pull/10" in item["note"], "the PR is left open and named"
+        assert conn.execute("SELECT COUNT(*) c FROM triage_items WHERE origin='human'").fetchone()["c"] == 0
+
+
+def test_the_follow_up_is_opened_once_per_head_and_a_failed_open_keeps_the_item_failed_work():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_verdict_item(conn, external_id="sig-ceiling-once")
+        item = core.get_item(conn, eid)
+        first = work.open_followup_item(conn, item, [_finding("a")], "a" * 40, NOW)
+        again = work.open_followup_item(conn, item, [_finding("a")], "a" * 40, NOW)
+        assert first is not None and again == first, "the same item and head open nothing twice"
+        real = intake.open_origin_item
+        intake.open_origin_item = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("ledger busy"))
+        try:
+            _blocked_review_round(conn, eid, 1, [_finding("first problem")])
+            item = _blocked_review_round(conn, eid, core.MAX_REVISIONS + 1, [_finding("a narrower problem", 7)])
+        finally:
+            intake.open_origin_item = real
+        assert item["state"] == core.STATE_FAILED and item["failure_class"] == core.FAILURE_WORK, dict(item)
+        assert "no follow-up could be opened" in item["note"], item["note"]
+
+
+def test_security_and_data_loss_findings_are_read_off_the_message_both_ways():
+    yes = ("SQL injection through the title", "leaks the API key into the log", "an auth bypass on /ingest",
+           "can lose data when the copy fails", "drops the table before the backup", "irreversible rename")
+    no = ("the retry loop never backs off", "docstring is stale", "off-by-one in the window", "token budget is wrong")
+    assert all(work.is_security_or_data_loss_finding({"message": m}) for m in yes)
+    assert not any(work.is_security_or_data_loss_finding({"message": m}) for m in no)
+    assert not work.is_security_or_data_loss_finding({})
 
 
 def test_at_the_ceiling_a_review_that_does_not_block_goes_to_the_merge_train():
@@ -14611,7 +14671,7 @@ def test_the_drifting_chains_of_1478_1480_and_1565_stop_at_the_ceiling():
                     assert item["revision_count"] == observed_revisions - 1 and work.revisable(item)
                     _set_revision_state(conn, eid, item["revision_count"], observed_stalled)
                 work.maybe_revise_blocked(conn, core.load_policy(), NOW, dry_run=False)
-            assert item["state"] == core.STATE_NEEDS_DECISION, (ledger_id, dict(item))
+            assert item["state"] == core.STATE_MERGING and item["train_stage"] == "merge", (ledger_id, dict(item))
             assert item["revision_count"] == core.MAX_REVISIONS and n == core.MAX_REVISIONS + 1, (ledger_id, n)
             assert max(item["stalled_rounds"], 1) < core.MAX_IMPLEMENT_ATTEMPTS, "the stalled cap never fired"
             assert f"{ledger_id} narrower finding {n}" in item["note"], item["note"]
@@ -15562,6 +15622,242 @@ def test_a_chronic_level_item_keeps_its_open_question_even_when_it_was_investiga
         assert _rows(conn, eid)["state"] == core.STATE_NEEDS_DECISION
 
 
+# -- recovered alerts close themselves (recovery_signal / resolve_recovered_decisions) --
+
+def _ts(offset_s: float) -> str:
+    return f"{(NOW + dt.timedelta(seconds=offset_s)).timestamp():.6f}"
+
+
+def _relay(conn, name: str, word: str, at: float, *, detail: str = "timeout of 90000ms exceeded") -> int:
+    icon = ":red_circle: Down" if word == "Down" else ":white_check_mark: Up"
+    title = f"[{name}] [{icon}] {detail}"
+    return _insert_event(conn, source="slack_alert", external_id=core.fingerprint(title), title=title,
+                         first_seen=OLD, payload={"ts_last": _ts(at)})
+
+
+def _open_item(conn, eid: int, state: str, **columns) -> None:
+    intake.ingest(conn, NOW)
+    if state != core.STATE_NEW:
+        core.set_state(conn, eid, state, NOW, note="x", **columns)
+
+
+def test_recovery_signal_shapes():
+    sig = intake.recovery_signal
+    assert sig("[Traefik - HTTP] [:red_circle: Down] timeout of 90000ms exceeded") == ("kuma:traefik-http", False)
+    assert sig("[Traefik - HTTP] [:white_check_mark: Up] 200 - OK <!channel>") == ("kuma:traefik-http", True)
+    assert sig("New incident for FPP - Analytics and 2 similar incidents") == ("incident:fpp-analytics", False)
+    assert sig("Automatically resolved FPP - Analytics incident") == ("incident:fpp-analytics", True)
+    assert sig("🚨 VPS edge 5xx rate > 5% (5m)") == sig("✅ VPS edge 5xx rate > 5% (5m) (×3 in batch)")[0:1] + (False,)
+    assert sig("✅ VPS edge 5xx rate > 5% (5m) (×3 in batch)")[1] is True
+    assert sig("HomeLab CPU above threshold") == ("threshold:homelab-cpu", False)
+    assert sig("HomeLab CPU below threshold") == ("threshold:homelab-cpu", True)
+    assert sig("HomeLab WatchDog • *⚠️ Still Unhealthy*: still failing") == ("watchdog:homelab", False)
+    assert sig("HomeLab WatchDog • *🟢 System Restored*: All services healthy") == ("watchdog:homelab", True)
+    for prose in ("Wieder da. :+1:", "Erledigt. :ok_hand:", "", "[x] no state word"):
+        assert sig(prose) is None, prose
+
+
+def test_a_later_up_relay_closes_the_down_item_quiet_in_every_open_state():
+    for state in (core.STATE_NEW, core.STATE_TRIAGED, core.STATE_WORKING, core.STATE_NEEDS_DECISION):
+        with _triage_env() as (conn, _ctx):
+            down = _relay(conn, "Traefik - HTTP", "Down", -600)
+            up = _relay(conn, "Traefik - HTTP", "Up", -300, detail="200 - OK")
+            _open_item(conn, down, state)
+            intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
+            item = _rows(conn, down)
+            assert item["state"] == core.STATE_QUIET, (state, dict(item))
+            assert item["note"].startswith(f"recovered: event {up} "), item["note"]
+
+
+def test_an_up_relay_older_than_the_down_does_not_close_it():
+    with _triage_env() as (conn, _ctx):
+        _relay(conn, "Traefik - HTTP", "Up", -900, detail="200 - OK")
+        down = _relay(conn, "Traefik - HTTP", "Down", -600)
+        other = _relay(conn, "Hermes - HTTP", "Down", -1200)   # another monitor's Up never counts
+        for eid in (down, other):
+            _open_item(conn, eid, core.STATE_NEEDS_DECISION)
+        intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
+        assert _rows(conn, down)["state"] == core.STATE_NEEDS_DECISION
+        assert _rows(conn, other)["state"] == core.STATE_NEEDS_DECISION
+
+
+def test_a_down_item_holding_a_pr_or_an_implement_job_keeps_its_state_on_an_up_relay():
+    for column, value in (("pr_url", "https://github.com/x/y/pull/1"), ("implement_job", "job-1")):
+        with _triage_env() as (conn, _ctx):
+            down = _relay(conn, "Traefik - HTTP", "Down", -600)
+            _relay(conn, "Traefik - HTTP", "Up", -300, detail="200 - OK")
+            _open_item(conn, down, core.STATE_WORKING)
+            conn.execute(f"UPDATE triage_items SET {column}=? WHERE event_id=?", (value, down))
+            conn.commit()
+            intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
+            assert _rows(conn, down)["state"] == core.STATE_WORKING, column
+
+
+def test_a_chronic_down_item_keeps_its_state_on_an_up_relay():
+    with _triage_env() as (conn, _ctx):
+        down = _relay(conn, "Traefik - HTTP", "Down", -600)
+        _relay(conn, "Traefik - HTTP", "Up", -300, detail="200 - OK")
+        _open_item(conn, down, core.STATE_NEW)
+        conn.execute("UPDATE triage_items SET repo='demo-repo' WHERE event_id=?", (down,))
+        for _ in range(3):
+            core.set_state(conn, down, core.STATE_QUIET, NOW)
+            core.set_state(conn, down, core.STATE_NEW, NOW)
+        core.set_state(conn, down, core.STATE_NEEDS_DECISION, NOW, note="why does it flap?")
+        conn.commit()
+        intake.resolve_recovered_decisions(conn, {**DEFAULT_POLICY, "chronicRecurrences": 3}, NOW)
+        assert _rows(conn, down)["state"] == core.STATE_NEEDS_DECISION
+
+
+def test_a_recovered_uk_event_closes_its_item_quiet_in_triaged_and_working():
+    for state in (core.STATE_TRIAGED, core.STATE_WORKING):
+        with _triage_env() as (conn, _ctx):
+            eid = _insert_event(conn, source="uk", external_id=f"uk-{state}", title="Gluetun - Docker", first_seen=OLD)
+            still = _insert_event(conn, source="uk", external_id=f"uk-still-{state}", title="Samba - Docker", first_seen=OLD)
+            for e in (eid, still):
+                _open_item(conn, e, state)
+            conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), eid))
+            conn.commit()
+            intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW)
+            assert _rows(conn, eid)["state"] == core.STATE_QUIET, state
+            assert _rows(conn, still)["state"] == state, state
+
+
+# -- co-firing alerts fold into one item (cofire_family / fold_cofiring) --
+
+# The 2026-10-17 21:22 outage, slack_alert events with a Down title, as the ledger holds them
+# (event id, external_id, title): every one first_seen 2026-10-17T21:22:25.418414+00:00.
+_OUTAGE_FIRST_SEEN = dt.datetime(2026, 10, 17, 21, 22, 25, 418414, tzinfo=dt.timezone.utc)
+_OUTAGE_DOWNS = (
+    (1173, "fpp-db-mysql-red-circle-down-database-connection-query-failed-can-t-add-new-command-when-connection-is-in-closed-state",
+     "[FPP - DB - MySQL] [:red_circle: Down] Database connection/query failed: Can't add new command when connection is in closed state"),
+    (1656, "traefik-http-red-circle-down-timeout-of-ms-exceeded", "[Traefik - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1657, "hermes-http-red-circle-down-timeout-of-ms-exceeded", "[Hermes - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1658, "image-gen-gateway-http-red-circle-down-timeout-of-ms-exceeded", "[Image Gen Gateway - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1659, "dashboard-http-red-circle-down-timeout-of-ms-exceeded", "[Dashboard - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1661, "audio-gateway-http-red-circle-down-timeout-of-ms-exceeded", "[Audio Gateway - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1662, "api-http-red-circle-down-timeout-of-ms-exceeded", "[API - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1663, "hyperdx-http-red-circle-down-timeout-of-ms-exceeded", "[HyperDX - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1664, "imagecdn-origin-http-red-circle-down-timeout-of-ms-exceeded", "[ImageCDN Origin - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1665, "clickstack-otel-http-red-circle-down-timeout-of-ms-exceeded", "[ClickStack OTel - HTTP] [:red_circle: Down] timeout of 90000ms exceeded"),
+    (1666, "rollhook-http-red-circle-down-request-failed-with-status-code", "[RollHook - HTTP] [:red_circle: Down] Request failed with status code 530"),
+    (1667, "emailgateway-http-red-circle-down-request-failed-with-status-code", "[EmailGateway - HTTP] [:red_circle: Down] Request failed with status code 530"),
+    (1669, "umami-http-red-circle-down-request-failed-with-status-code", "[Umami - HTTP] [:red_circle: Down] Request failed with status code 530"),
+    (1670, "fpp-analytics-http-red-circle-down-request-failed-with-status-code", "[FPP - Analytics - HTTP] [:red_circle: Down] Request failed with status code 530"),
+    (1671, "photos-http-red-circle-down-request-failed-with-status-code", "[Photos - HTTP] [:red_circle: Down] Request failed with status code 530"),
+    (1672, "fpp-server-http-red-circle-down-request-failed-with-status-code", "[FPP - Server - HTTP] [:red_circle: Down] Request failed with status code 530"),
+    (1673, "weatherorb-http-red-circle-down-request-failed-with-status-code", "[WeatherOrb - HTTP] [:red_circle: Down] Request failed with status code 530"),
+    (1674, "rollhook-ready-http-red-circle-down-request-failed-with-status-code", "[RollHook - Ready - HTTP] [:red_circle: Down] Request failed with status code 530"),
+)
+
+
+def _open_non_duplicates(conn) -> list[int]:
+    return [r["event_id"] for r in conn.execute(
+        "SELECT event_id FROM triage_items WHERE NOT (state=? AND close_reason=?) ORDER BY event_id",
+        (core.STATE_CLOSED, core.CLOSE_DUPLICATE)).fetchall()]
+
+
+def test_cofire_family_shapes():
+    def ev(source, title="t", **payload):
+        return {"source": source, "title": title, "payload_json": json.dumps(payload)}
+    assert intake.cofire_family(ev("uk", "Gluetun - Docker")) == "kuma"
+    assert intake.cofire_family(ev("slack_alert", "[A - HTTP] [:red_circle: Down] boom")) == "kuma"
+    assert intake.cofire_family(ev("hyperdx", "x")) == "hyperdx"
+    assert intake.cofire_family(ev("hyperdx", "x", host="vps-1")) == "host:vps-1"
+    for never in (ev("slack_alert", "[A - HTTP] [:white_check_mark: Up] 200 - OK"), ev("slack_alert", "🚨 research-gateway job.error"),
+                  ev("slack_alert", "Wieder da"), ev("github_go"), ev("human"), ev("job"), ev("hermes_log"), ev("warden_self")):
+        assert intake.cofire_family(never) is None, never
+
+
+def test_the_2026_10_17_outage_folds_into_one_item():
+    assert intake.COFIRE_WINDOW_MINUTES == 15
+    with _triage_env() as (conn, _ctx):
+        ids = [_insert_event(conn, source="slack_alert", external_id=ext, title=title, first_seen=_OUTAGE_FIRST_SEEN,
+                             payload={"ts_last": "1792270500.0", "batch_count": 1}) for _eid, ext, title in _OUTAGE_DOWNS]
+        intake.ingest(conn, NOW)
+        assert len(_open_non_duplicates(conn)) == len(_OUTAGE_DOWNS) == 18   # before: one open item per monitor
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        assert _open_non_duplicates(conn) == [ids[0]]
+        assert _rows(conn, ids[0])["occurrences"] == len(ids)
+        for eid in ids[1:]:
+            item = _rows(conn, eid)
+            assert (item["state"], item["close_reason"], item["duplicate_of"]) == (core.STATE_CLOSED, core.CLOSE_DUPLICATE, ids[0])
+            assert item["note"].startswith(intake.COFIRE_NOTE_PREFIX) and item["triage_job"] is None
+        # idempotent across passes, and the parent's count survives ingest()'s rewrite
+        intake.ingest(conn, NOW)
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        assert _open_non_duplicates(conn) == [ids[0]]
+        assert _rows(conn, ids[0])["occurrences"] == len(ids)
+        # no triage job is spent on a fold
+        submitted: list[Any] = []
+        _agent_gateway.submit_triage = lambda **kw: submitted.append(kw) or {"id": "t1", "status": "running"}
+        triaging.submit_triage_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(submitted) == 1, submitted
+
+
+def test_two_down_alerts_twenty_minutes_apart_do_not_fold():
+    with _triage_env() as (conn, _ctx):
+        a = _insert_event(conn, source="slack_alert", external_id="a", title="[A - HTTP] [:red_circle: Down] boom", first_seen=OLD)
+        b = _insert_event(conn, source="slack_alert", external_id="b", title="[B - HTTP] [:red_circle: Down] boom",
+                          first_seen=OLD + dt.timedelta(minutes=20))
+        c = _insert_event(conn, source="slack_alert", external_id="c", title="[C - HTTP] [:red_circle: Down] boom",
+                          first_seen=OLD + dt.timedelta(minutes=14))
+        intake.ingest(conn, NOW)
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        assert _open_non_duplicates(conn) == [a, b] and _rows(conn, c)["duplicate_of"] == a
+
+
+def test_a_non_family_alert_never_folds():
+    with _triage_env() as (conn, _ctx):
+        ids = [_insert_event(conn, source=src, external_id=f"nf-{i}", title=title, first_seen=OLD)
+               for i, (src, title) in enumerate((("slack_alert", "[A - HTTP] [:red_circle: Down] boom"),
+                                                 ("slack_alert", "[A - HTTP] [:white_check_mark: Up] 200 - OK"),
+                                                 ("slack_alert", "🚨 research-gateway job.error >= 1 (15m)"),
+                                                 ("hermes_log", "something broke"), ("hermes_log", "something else broke"),
+                                                 ("slack_alert", "🚨 VPS error logs >= 20 (15m)")))]
+        intake.ingest(conn, NOW)
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        assert _open_non_duplicates(conn) == ids
+
+
+def test_a_terminal_parent_does_not_absorb():
+    for parent_state in (core.STATE_QUIET, core.STATE_CLOSED, core.STATE_FIXED, core.STATE_FAILED):
+        with _triage_env() as (conn, _ctx):
+            a = _insert_event(conn, source="slack_alert", external_id="a", title="[A - HTTP] [:red_circle: Down] boom", first_seen=OLD)
+            intake.ingest(conn, NOW)
+            columns = {"close_reason": core.CLOSE_RESOLVED} if parent_state == core.STATE_CLOSED else (
+                {"failure_class": core.FAILURE_WORK} if parent_state == core.STATE_FAILED else {})
+            core.set_state(conn, a, parent_state, NOW, **columns)
+            b = _insert_event(conn, source="slack_alert", external_id="b", title="[B - HTTP] [:red_circle: Down] boom",
+                              first_seen=OLD + dt.timedelta(minutes=2))
+            intake.ingest(conn, NOW)
+            intake.classify(conn, DEFAULT_POLICY, NOW)
+            assert _rows(conn, b)["state"] == core.STATE_NEW, parent_state
+
+
+def test_a_fold_stays_closed_while_its_parent_is_open_and_reopens_after():
+    with _triage_env() as (conn, _ctx):
+        a = _insert_event(conn, source="slack_alert", external_id="a", title="[A - HTTP] [:red_circle: Down] boom", first_seen=OLD)
+        b = _insert_event(conn, source="slack_alert", external_id="b", title="[B - HTTP] [:red_circle: Down] boom",
+                          first_seen=OLD + dt.timedelta(minutes=1), payload={"ts_last": _ts(-3000)})
+        intake.ingest(conn, NOW)
+        intake.classify(conn, DEFAULT_POLICY, NOW)
+        assert _rows(conn, b)["duplicate_of"] == a
+        # a recurrence of the fold's own event and an event-side resolve change nothing while the parent is open
+        _recur_ts(conn, b, _ts(-10))
+        conn.execute("UPDATE events SET resolved_at=? WHERE id=?", (NOW.isoformat(), b))
+        conn.commit()
+        for step in (lambda: intake.reopen_if_needed(conn, NOW), lambda: intake.apply_resolutions(conn, NOW, DEFAULT_POLICY),
+                     lambda: intake.resolve_recovered_decisions(conn, DEFAULT_POLICY, NOW),
+                     lambda: intake.resolve_quiet_grouped(conn, DEFAULT_POLICY, NOW + dt.timedelta(days=3))):
+            step()
+            assert (_rows(conn, b)["state"], _rows(conn, b)["duplicate_of"]) == (core.STATE_CLOSED, a)
+        # parent terminal: the next genuine recurrence of the fold reopens it like any closed row
+        core.set_state(conn, a, core.STATE_QUIET, NOW)
+        _recur_ts(conn, b, _ts(-5))
+        intake.reopen_if_needed(conn, NOW)
+        assert _rows(conn, b)["state"] == core.STATE_NEW
+
+
 def test_a_hermes_cron_job_brief_embeds_the_registry_entry():
     with tempfile.TemporaryDirectory() as td:
         reg = Path(td) / "jobs.json"
@@ -15587,6 +15883,308 @@ def test_a_hermes_cron_job_brief_embeds_the_registry_entry():
         assert "(registry entry not readable)" in _intake.hermes_cron_entry("hermes-cron.nope", reg)
         assert "registry" not in _REAL_GATHER({**_job_row(), "machine": "testbox"}, registry=reg,
                                               runner=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""))
+
+
+# --- Wave 8: host-access gaps never page, no terminal non-questions, features are never dropped ----------
+
+# agent-gateway Wave 12's host-access-gap shape: human + blocker + the constant root cause.
+_HOST_BLOCKED = {"nextAction": "human", "escalationCategory": "blocker", "rootCause": "host-access-gap",
+                 "summary": "could not read the container's memory: `docker stats` is denied"}
+
+
+def test_the_live_state_instruction_lists_exactly_the_granted_host_reads():
+    """The brief must promise only what agent-gateway's investigate permissions grant (its Wave 12), and say
+    how to report a read that is STILL denied: as a verdict field, not as a question."""
+    text = work.LIVE_STATE_INSTRUCTION
+    for granted in ("`make logs`", "`make verify`", "`make status`", "make -C ~/SourceRoot/<repo>",
+                    "`launchctl print <domain>/<label>`", "`launchctl list`", "`tail` or `head` with an explicit line bound",
+                    "~/Library/Logs/**", "localhost/127.0.0.1", "no -X, -d, --data*, -T, -F",
+                    "git, rg, cat, ls, head, tail, wc, jq, curl to loopback"):
+        assert granted in text, granted
+    for promised_before in ("names its read-only commands", "health and monitor checks", "read-only database or API reads",
+                            "kickstart", "bootout"):
+        assert promised_before not in text, promised_before
+    assert "escalationCategory=blocker" in text and 'rootCause="host-access-gap"' in text, (
+        "the shape must match agent-gateway's Wave 12 host-access-gap signal")
+    assert "nextAction=none" in text and "NOT a blocker" in text and "exact command you ran" in text
+
+
+def test_a_host_access_blocked_verdict_is_redriven_once_with_the_verbs_then_closes_quiet():
+    with _triage_env() as (conn, ctx):
+        first = _fold_alert_verdict(conn, "sig-host-twice", verdict=_HOST_BLOCKED)
+        eid = first["event_id"]
+        assert first["state"] == core.STATE_TRIAGED and first["dispatch_job"] is None, dict(first)
+        assert first["note"] == f"{work.HOST_RETRY_NOTE_PREFIX}: {_HOST_BLOCKED['summary']}", first["note"]
+        paragraph = work._host_brief_paragraph(conn, eid)
+        assert "`make logs|verify|status`" in paragraph and "`launchctl list`" in paragraph, paragraph
+        assert "~/Library/Logs/**" in paragraph and "loopback" in paragraph and "docker stats" in paragraph, paragraph
+        assert work._host_brief_paragraph(conn, eid + 99) == ""
+
+        # the fresh investigation carries it
+        conn.execute("UPDATE triage_items SET repo='demo-repo' WHERE event_id=?", (eid,))
+        conn.commit()
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.escalate(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and "PRIOR HOST-ACCESS GAP" in calls[0]["brief"], calls
+        assert work.LIVE_STATE_INSTRUCTION in calls[0]["brief"]
+
+        second = _fold_again(conn, eid, "sig-host-twice", _HOST_BLOCKED)
+        assert second["state"] == core.STATE_QUIET and second["close_reason"] is None, dict(second)
+        assert second["note"] == f"{work.HOST_QUIET_NOTE_PREFIX}{_HOST_BLOCKED['summary']}", second["note"]
+        assert second["failure_class"] is None
+
+
+def test_every_shape_of_the_host_access_signal_is_read_and_a_constant_root_cause_never_merges_items():
+    for shape in ({"escalationCategory": "blocker"}, {"rootCause": "host-access-gap"}, {"blocked_on": "host_access"},
+                  {"blockedOn": "Host_Access"}, _HOST_BLOCKED):
+        assert work.host_access_blocked(shape), shape
+    for shape in ({}, {"rootCause": "a real defect"}, {"escalationCategory": "product"}, {"blocked_on": "other"}):
+        assert not work.host_access_blocked(shape), shape
+    with _triage_env() as (conn, ctx):
+        a = _fold_alert_verdict(conn, "sig-gap-a", verdict={"nextAction": "none", "rootCause": "host-access-gap",
+                                                              "summary": "could not read A"})
+        b = _fold_alert_verdict(conn, "sig-gap-b", verdict={"nextAction": "none", "rootCause": "host-access-gap",
+                                                              "summary": "could not read B"})
+        for item in (a, b):
+            conn.execute("UPDATE triage_items SET repo='demo-repo' WHERE event_id=?", (item["event_id"],))
+        conn.commit()
+        a, b = core.get_item(conn, a["event_id"]), core.get_item(conn, b["event_id"])
+        assert a["state"] == b["state"] == core.STATE_TRIAGED and a["duplicate_of"] is None and b["duplicate_of"] is None
+        assert a["root_cause"] is None and b["root_cause"] is None
+
+
+def test_the_blocker_category_is_a_host_access_gap_never_needs_decision():
+    with _triage_env() as (conn, ctx):
+        verdict = {"nextAction": "human", "escalationCategory": "blocker", "decisionQuestion": "Cannot read launchd state",
+                   "summary": "launchctl print was denied"}
+        first = _fold_alert_verdict(conn, "sig-blocker", verdict=verdict)
+        assert first["state"] == core.STATE_TRIAGED and first["note"].startswith(work.HOST_RETRY_NOTE_PREFIX), dict(first)
+        assert "Cannot read launchd state" in first["note"]
+        second = _fold_again(conn, first["event_id"], "sig-blocker", verdict)
+        assert second["state"] == core.STATE_QUIET, dict(second)
+        assert second["note"] == f"{work.HOST_QUIET_NOTE_PREFIX}Cannot read launchd state", second["note"]
+        assert work.host_access_blocked({"blockedOn": "host_access"}) and not work.host_access_blocked({})
+        assert not work.host_access_blocked({"escalationCategory": "product"})
+
+
+def test_every_other_owner_only_category_still_pages_even_with_a_host_access_item_next_to_it():
+    with _triage_env() as (conn, ctx):
+        for cat in ("product", "data_loss", "spend", "other_people", "security"):
+            item = _fold_alert_verdict(conn, f"sig-still-pages-{cat}", verdict={
+                "nextAction": "human", "escalationCategory": cat, "decisionQuestion": "Which way?"})
+            assert item["state"] == core.STATE_NEEDS_DECISION and item["note"] == f"[{cat}] Which way?", dict(item)
+        # an implement-tier host-access verdict is not an investigation's: unchanged path
+        assert core.get_item(conn, 1) is not None
+
+
+def test_a_job_item_blocked_on_host_access_closes_quiet_the_same_way():
+    with _triage_env() as (conn, ctx):
+        eid = intake.open_origin_item(conn, origin="human", repo="demo-repo", brief="why is the box slow",
+                                      max_tier="implement", external_id="human:host-1", title="slow", now=NOW)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job="job-host-1")
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+                     "VALUES(?,?,?,?,?,?,?,?)", ("job-host-1", "investigate", "demo-repo", "b", eid, "done",
+                                                   json.dumps(_HOST_BLOCKED), NOW.isoformat()))
+        conn.commit()
+        work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id="job-host-1", now=NOW, dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_TRIAGED
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.escalate_origin_items(conn, NOW)
+        assert "PRIOR HOST-ACCESS GAP" in calls[0]["brief"], calls[0]["brief"]
+
+
+def test_an_uncategorised_human_from_an_implement_episode_is_redriven_once_then_its_recommendation_is_taken():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-impl-nocat", job_id="impl-nocat-1")
+        conn.execute("UPDATE dispatches SET origin_event_id=? WHERE job_id='impl-nocat-1'", (eid,))   # as open_episode() writes it
+        conn.commit()
+        ask = _dispatch_result("no_changes", next_action="human", summary="two ways to fix it", extra={
+            "decisionQuestion": "Narrow or wide fix?", "recommendation": "Use the narrow fix"})
+        _agent_gateway.get = lambda j: {"id": j, "status": "done", "result": ask}
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["implement_job"] is None, dict(item)
+        assert item["note"] == f"{work.DECIDE_NOTE_PREFIX}: Narrow or wide fix?", item["note"]
+        d = conn.execute("SELECT validation_status FROM dispatches WHERE job_id='impl-nocat-1'").fetchone()
+        assert d["validation_status"] == work.IMPLEMENT_DECIDE_REDRIVEN
+
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 1 and "PRIOR QUESTION" in calls[0]["brief"], calls
+        assert "Narrow or wide fix?" in calls[0]["brief"]
+        second_job = core.get_item(conn, eid)["implement_job"]
+        assert second_job and second_job != "impl-nocat-1"
+
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_WORKING and item["implement_job"] is None, dict(item)
+        assert item["note"].startswith(work.DECIDED_NOTE_PREFIX) and "Use the narrow fix" in item["note"], item["note"]
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert len(calls) == 2 and "DECISION TAKEN" in calls[1]["brief"] and "Use the narrow fix" in calls[1]["brief"], calls
+        assert core.get_item(conn, eid)["state"] == core.STATE_WORKING
+        assert work.implement_decide_paragraph(conn, eid + 99) == ""
+
+
+def test_an_uncategorised_human_beside_an_opened_pr_joins_the_train():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-impl-pr-ask", job_id="impl-pr-ask")
+        _agent_gateway.get = lambda j: {"status": "done", "result": _dispatch_result(
+            "pr_opened", next_action="human", artifact_url="https://github.com/jkrumm/demo-repo/pull/61",
+            summary="opened it; unsure about the name")}
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_MERGING and item["pr_url"].endswith("/pull/61"), dict(item)
+
+
+def test_already_on_the_default_branch_is_read_off_the_verdict_text_both_ways():
+    yes = ("the fix is already on master", "This change is Already On Main.", "already merged in #12",
+           "already present on master since 3f2a", "already fixed on the default branch", "it already landed on main")
+    no = ("the change is not already merged", "this isn't already on master", "nothing to change in the config",
+          "a change on main would fix it", "already reviewed")
+    assert all(work.already_on_default_branch({"summary": t}) for t in yes), yes
+    assert not any(work.already_on_default_branch({"summary": t}) for t in no), no
+    assert work.already_on_default_branch({"verdict": "already on master"})
+    assert not work.already_on_default_branch({})
+
+
+def _closing_prs():
+    """Replaces core.close_pr_best_effort with a recorder; returns (calls, restore)."""
+    calls: list[tuple[str, str]] = []
+    real = core.close_pr_best_effort
+    core.close_pr_best_effort = lambda pr, comment: calls.append((pr, comment))
+    return calls, lambda: setattr(core, "close_pr_best_effort", real)
+
+
+def test_no_changes_already_on_master_closes_the_pr_and_resolves_never_a_page():
+    with _triage_env() as (conn, ctx):
+        calls, restore = _closing_prs()
+        try:
+            for ext, columns in (("sig-aom-pr", "revision_count=1, pr_url='https://github.com/jkrumm/demo-repo/pull/7'"),
+                                 ("sig-aom-pr0", "pr_url='https://github.com/jkrumm/demo-repo/pull/8'"),
+                                 ("sig-aom-none", "revision_count=0")):
+                eid = _seed_implementing_item(conn, external_id=ext, job_id=f"impl-{ext}")
+                conn.execute(f"UPDATE triage_items SET {columns} WHERE event_id=?", (eid,))
+                conn.commit()
+            _agent_gateway.get = lambda j: {"status": "done", "result": _dispatch_result(
+                "no_changes", summary="the fix is already on master (commit 3f2a1b)")}
+            work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        finally:
+            restore()
+        for ext in ("sig-aom-pr", "sig-aom-pr0", "sig-aom-none"):
+            item = conn.execute("SELECT * FROM triage_items WHERE signature=?", (f"slack_alert:{ext}",)).fetchone()
+            assert item["state"] == core.STATE_CLOSED and item["close_reason"] == core.CLOSE_RESOLVED, dict(item)
+            assert "already on master" in item["note"] and item["implement_job"] is None, dict(item)
+        assert sorted(pr for pr, _ in calls) == ["https://github.com/jkrumm/demo-repo/pull/7",
+                                                  "https://github.com/jkrumm/demo-repo/pull/8"], calls
+        assert all("already on the default branch" in c for _, c in calls)
+
+
+def test_no_changes_with_a_negated_already_merged_keeps_the_old_routing():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-aom-neg", job_id="impl-aom-neg")
+        conn.execute("UPDATE triage_items SET pr_url='https://github.com/jkrumm/demo-repo/pull/9', revision_count=1 "
+                     "WHERE event_id=?", (eid,))
+        conn.commit()
+        _agent_gateway.get = lambda j: {"status": "done", "result": _dispatch_result(
+            "no_changes", summary="the finding does not apply; it is not already merged either")}
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        assert core.get_item(conn, eid)["state"] == core.STATE_NEEDS_DECISION
+
+
+def test_is_feature_verdict_matches_feature_shaped_verdicts_and_not_the_word_alone():
+    yes = ("a feature to scope, not a bounded fix", "This is a new capability for the board",
+           "roadmap work, not a bug", "It is a feature request", "treat it as a new feature",
+           "needs a new capability in Argo", "this is not a bounded fix")
+    no = ("the config has a stale value", "enable the feature flag for the canary", "merge the feature branch",
+          "this is not a feature, it is a regression", "isn't a feature: the endpoint 500s", "nothing else to see")
+    assert all(work.is_feature_verdict({"summary": t}) for t in yes), [t for t in yes if not work.is_feature_verdict({"summary": t})]
+    assert not any(work.is_feature_verdict({"summary": t}) for t in no), [t for t in no if work.is_feature_verdict({"summary": t})]
+    assert work.is_feature_verdict({"recommendation": "scope this as a feature"})
+    assert work.is_feature_verdict({"verdict": "roadmap item"})
+    assert not work.is_feature_verdict({})
+
+
+def test_a_feature_verdict_is_held_visible_never_closed_resolved():
+    with _triage_env() as (conn, ctx):
+        # nextAction=none on an alert item
+        item = _fold_alert_verdict(conn, "sig-feat-none", verdict={
+            "nextAction": "none", "summary": "a feature to scope, not a bounded fix"})
+        assert item["state"] == core.STATE_TRIAGED and item["kind"] == core.KIND_FEATURE, dict(item)
+        assert item["close_reason"] is None and item["dispatch_job"] is None, dict(item)
+        assert item["retry_at"] == core.FEATURE_RETRY_AT and item["strikes"] == 0, dict(item)
+        assert item["note"] == "feature: a feature to scope, not a bounded fix", item["note"]
+        # an investigate-capped human item answered with a feature
+        eid = intake.open_origin_item(conn, origin="human", repo="demo-repo", brief="add dark mode", max_tier="investigate",
+                                      external_id="human:feat-1", title="dark mode", now=NOW)
+        core.set_state(conn, eid, core.STATE_WORKING, NOW, dispatch_job="job-feat-1")
+        conn.execute("INSERT INTO dispatches(job_id,tier,repo,brief,origin_event_id,status,verdict_json,created_at) "
+                     "VALUES(?,?,?,?,?,?,?,?)", ("job-feat-1", "investigate", "demo-repo", "b", eid, "done",
+                                                   json.dumps({"nextAction": "implement", "summary": "this is roadmap work, a new capability"}),
+                                                   NOW.isoformat()))
+        conn.commit()
+        work.fold_dispatch_verdict(conn, origin_event_id=eid, job_id="job-feat-1", now=NOW, dry_run=False)
+        held = core.get_item(conn, eid)
+        assert held["state"] == core.STATE_TRIAGED and held["kind"] == core.KIND_FEATURE, dict(held)
+        # a plain none still closes resolved
+        plain = _fold_alert_verdict(conn, "sig-plain-none", verdict={"nextAction": "none", "summary": "benign one-off"})
+        assert plain["state"] == core.STATE_CLOSED and plain["kind"] is None, dict(plain)
+
+
+def test_an_implement_no_changes_that_concludes_a_feature_is_held_not_closed():
+    with _triage_env() as (conn, ctx):
+        eid = _seed_implementing_item(conn, external_id="sig-impl-feature", job_id="impl-feature")
+        _agent_gateway.get = lambda j: {"status": "done", "result": _dispatch_result(
+            "no_changes", summary="this was a feature, not a fix: it needs a new capability")}
+        work.poll_implement_jobs(conn, DEFAULT_POLICY, NOW, dry_run=False)
+        item = core.get_item(conn, eid)
+        assert item["state"] == core.STATE_TRIAGED and item["kind"] == core.KIND_FEATURE, dict(item)
+        assert item["implement_job"] is None and item["validation_job"] is None, dict(item)
+        assert item["note"].startswith("feature: "), item["note"]
+
+
+def test_a_feature_item_is_skipped_by_every_dispatch_path_and_never_counts_as_needs_decision():
+    with _triage_env() as (conn, ctx):
+        calls: list[dict[str, Any]] = []
+        _agent_gateway.submit = _fake_submit(calls)
+        _agent_gateway.submit_triage = lambda **kw: (_ for _ in ()).throw(AssertionError("a feature is never triaged"))
+        origin = intake.open_origin_item(conn, origin="human", repo="demo-repo", brief="add dark mode",
+                                         max_tier="implement", external_id="human:feat-skip", title="dark mode", now=NOW)
+        alert = _insert_event(conn, source="slack_alert", external_id="sig-feat-alert", title="alert", first_seen=OLD)
+        intake.ingest(conn, NOW)
+        for eid in (origin, alert):
+            core.set_state(conn, eid, core.STATE_TRIAGED, NOW, repo="demo-repo")
+            core.hold_as_feature(conn, eid, NOW, "a feature to scope")
+            conn.execute("UPDATE triage_items SET retry_at=NULL WHERE event_id=?", (eid,))   # only `kind` can hold it now
+        conn.commit()
+        before = {r["event_id"]: dict(r) for r in conn.execute("SELECT * FROM triage_items WHERE kind='feature'")}
+        later = NOW + dt.timedelta(days=30)
+        work.escalate(conn, DEFAULT_POLICY, later, dry_run=False)
+        work.escalate_origin_items(conn, later)
+        work.maybe_auto_implement(conn, DEFAULT_POLICY, later, dry_run=False)
+        triage.run(conn, dry_run=False)
+        assert calls == [], calls
+        for eid, row in before.items():
+            now_row = core.get_item(conn, eid)
+            assert now_row["state"] == core.STATE_TRIAGED and now_row["kind"] == core.KIND_FEATURE, dict(now_row)
+            assert now_row["dispatch_job"] is None and now_row["note"] == row["note"], dict(now_row)
+        assert conn.execute("SELECT COUNT(*) c FROM triage_items WHERE state=?", (core.STATE_NEEDS_DECISION,)).fetchone()["c"] == 0
+
+
+def test_leaving_triaged_ends_the_feature_hold():
+    with _triage_env() as (conn, ctx):
+        eid = intake.open_origin_item(conn, origin="human", repo="demo-repo", brief="x", max_tier="implement",
+                                      external_id="human:feat-leave", title="x", now=NOW)
+        core.hold_as_feature(conn, eid, NOW, "scope it")
+        conn.commit()
+        item = core.get_item(conn, eid)
+        assert item["kind"] == core.KIND_FEATURE and item["retry_at"] == core.FEATURE_RETRY_AT and core.is_feature(item)
+        core.set_state(conn, eid, core.STATE_TRIAGED, NOW, note="queued")
+        assert core.get_item(conn, eid)["kind"] == core.KIND_FEATURE, "a same-state write keeps the hold"
+        core.set_state(conn, eid, core.STATE_WORKING, NOW)
+        assert core.get_item(conn, eid)["kind"] is None
 
 
 if __name__ == "__main__":

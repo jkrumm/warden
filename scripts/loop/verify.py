@@ -395,10 +395,10 @@ def maybe_verify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datet
 # repo is never swept: nothing in it may reach the model. Dry-run prints, never submits.
 
 SWEEP_ATTEMPT_LIMIT = 3
-# `triaged`, or `working` with no implement/review episode, no revert in progress and no
+# `triaged` (a feature hold excepted: core.NOT_FEATURE_SQL), or `working` with no implement/review episode, no revert in progress and no
 # investigation still running: the items a fix may pre-empt. Also re-checked at fold time.
 _SWEEPABLE_SQL = (
-    "(state='triaged' OR (state='working' AND implement_job IS NULL AND validation_job IS NULL "
+    "((state='triaged' AND kind IS NOT 'feature') OR (state='working' AND implement_job IS NULL AND validation_job IS NULL "
     "AND reverting_sha IS NULL AND NOT (dispatch_job IS NOT NULL AND NOT EXISTS "
     "(SELECT 1 FROM dispatches d WHERE d.job_id = triage_items.dispatch_job AND d.finished_at IS NOT NULL))))"
 )

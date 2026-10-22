@@ -532,13 +532,31 @@ def test_board_counts_items_shape_ordering_and_terminal_24h():
 
     one = next(item for item in payload["items"] if item["event_id"] == 1)
     assert set(one.keys()) == {
-        "event_id", "origin", "repo", "state", "close_reason", "failure_class", "redrives", "strikes", "retry_at",
-        "max_tier", "title", "note",
+        "event_id", "origin", "repo", "state", "close_reason", "failure_class", "kind", "redrives", "strikes",
+        "retry_at", "max_tier", "title", "note",
         "pr_url", "dispatch_job", "implement_job", "validation_job", "occurrences",
         "revision_count", "train_stage", "created_at", "updated_at", "origin_channel", "origin_thread_ts",
         "availableActions", "issue",
     }
     assert one["title"] == "title1"
+    conn.close()
+
+
+def test_board_shows_a_feature_hold_with_its_kind_and_counts_it_in_features():
+    conn, _ = _fresh_conn()
+    now = dt.datetime.now(dt.timezone.utc)
+    for i, (state, kind) in enumerate((("triaged", "feature"), ("triaged", None), ("closed", "feature"), ("triaged", "feature")),
+                                      start=1):
+        _event(conn, i, now)
+        _item(conn, i, state=state, now=now)
+        conn.execute("UPDATE triage_items SET kind=? WHERE event_id=?", (kind, i))
+    conn.commit()
+    payload = api.board_payload(conn)
+    assert payload["features"] == 2, "open feature holds only: the closed row is terminal"
+    assert payload["counts"]["triaged"] == 3 and payload["counts"]["needs_decision"] == 0, payload["counts"]
+    kinds = {item["event_id"]: item["kind"] for item in payload["items"]}
+    assert kinds == {1: "feature", 2: None, 4: "feature"}, kinds
+    assert api.item_payload(conn, 1)["item"]["kind"] == "feature"
     conn.close()
 
 
