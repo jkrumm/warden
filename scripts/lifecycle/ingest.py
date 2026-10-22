@@ -141,6 +141,9 @@ def normalize_hyperdx(body: dict[str, Any]) -> IngestEvent:
     service = _text(body.get("service"), MAX_LABEL_CHARS)
     if service:
         payload["service"] = service
+    host = _text(body.get("host"), MAX_LABEL_CHARS)
+    if host:
+        payload["host"] = host   # the OTel host label; loop/intake.py cofire_family() folds one host's alerts
     value = body.get("value")
     if value is not None:
         payload["value"] = value if isinstance(value, (int, float, bool)) else _text(value, MAX_LABEL_CHARS)

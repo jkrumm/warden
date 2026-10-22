@@ -354,6 +354,13 @@ def test_kuma_malformed_shapes_are_400():
 
 # --- /ingest/hyperdx ---------------------------------------------------------------------
 
+def test_hyperdx_host_label_is_kept_in_the_payload_when_sent():
+    with_host = ingest_mod.normalize_hyperdx(hyperdx_body("Edge 5xx", "ALERT", host="vps-1", service="edge"))
+    assert with_host.payload["host"] == "vps-1" and with_host.payload["service"] == "edge"
+    assert "host" not in ingest_mod.normalize_hyperdx(hyperdx_body("Edge 5xx", "ALERT")).payload
+    assert ingest_mod.normalize_hyperdx(hyperdx_body("Edge 5xx", "ALERT", host="  ")).payload.get("host") is None
+
+
 def test_hyperdx_alert_opens_and_ok_resolves_with_our_contract():
     with door() as d:
         body = hyperdx_body("Audio Gateway error rate", "ALERT", message="5xx above 5%", url="https://example.com/a",

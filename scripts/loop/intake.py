@@ -23,19 +23,22 @@ from loop import core, triaging
 def ingest(conn: sqlite3.Connection, now: dt.datetime) -> None:
     """Upsert one triage_items row per open ingest-source event. Occurrences and last_seen refresh
     every run; repo/state are left alone on an existing row, since classify() owns those, so a
-    re-run never clobbers an escalation in progress."""
+    re-run never clobbers an escalation in progress. An item's occurrences include the co-fired
+    alerts folded into it (cofire_occurrences()), so the rewrite does not drop them."""
     placeholders = ",".join("?" * len(core.INGEST_SOURCES))
     rows = conn.execute(
         f"SELECT * FROM events WHERE resolved_at IS NULL AND source IN ({placeholders})",
         core.INGEST_SOURCES,
     ).fetchall()
     now_iso = core.now_iso(now)
+    folded = cofire_occurrences(conn)
     for ev in rows:
         event_id = ev["id"]
         payload = core.safe_json(ev["payload_json"])
         occurrences = payload.get("batch_count")
         if not isinstance(occurrences, int):
             occurrences = int(ev["reminder_count"] or 0) + 1
+        occurrences += folded.get(event_id, 0)
         last_seen = ev["last_reminder_at"] or ev["notified_at"] or ev["first_seen"] or now_iso
         existing = core.get_item(conn, event_id)
         if existing is None:
@@ -616,16 +619,72 @@ def apply_resolutions(conn: sqlite3.Connection, now: dt.datetime,
     conn.commit()
 
 
+# States a recovery may close. `new` is the silence paths' (and apply_resolutions()'s) for a level source
+# that recovered; the rest carry no PR and no implement job here, so nothing written is abandoned.
+_RECOVERED_LEVEL_STATES = (core.STATE_TRIAGED, core.STATE_WORKING, core.STATE_NEEDS_DECISION)
+_RECOVERED_RELAY_STATES = (core.STATE_NEW, *_RECOVERED_LEVEL_STATES)
+RECOVERED_NOTE_PREFIX = "recovered: event "
+
+_KUMA_RELAY_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*\[:(?:red_circle|white_check_mark):\s*(?P<word>Down|Up)\]")
+_INCIDENT_OPENED_RE = re.compile(r"^New incident for (?P<name>.+?)(?: and \d+ similar incidents?)?\s*$")
+_INCIDENT_RESOLVED_RE = re.compile(r"^Automatically resolved (?P<name>.+) incident\s*$")
+_BATCH_SUFFIX_RE = re.compile(r"\s*\(×\d+ in batch\)\s*$")
+_THRESHOLD_RE = re.compile(r"^(?P<name>.+?) (?P<side>above|below) threshold\s*$")
+_WATCHDOG_PREFIX = "HomeLab WatchDog •"
+
+
+def recovery_signal(title: str) -> tuple[str, bool] | None:
+    """`(key, recovered)` for a #alerts relay message that is one half of a down/up pair, or None. Two
+    messages with the same key are the same monitor going down and coming back; `recovered` says which
+    half this one is. The shapes in the ledger, no others:
+
+    - Kuma relay `[<monitor>] [:red_circle: Down] ...` / `[<monitor>] [:white_check_mark: Up] ...`;
+    - Better Stack `New incident for <name> [and N similar incidents]` / `Automatically resolved <name> incident`;
+    - HyperDX relay `🚨 <alert>` / `✅ <alert>` (a `(×N in batch)` suffix is not part of the alert);
+    - Beszel `<HomeLab metric> above threshold` / `... below threshold`;
+    - the homelab watchdog's `HomeLab WatchDog • ...`: recovered when it carries a 🟢, one monitor."""
+    text = (title or "").strip()
+    if m := _KUMA_RELAY_RE.match(text):
+        return f"kuma:{core.fingerprint(m['name'])}", m["word"] == "Up"
+    if m := _INCIDENT_OPENED_RE.match(text):
+        return f"incident:{core.fingerprint(m['name'])}", False
+    if m := _INCIDENT_RESOLVED_RE.match(text):
+        return f"incident:{core.fingerprint(m['name'])}", True
+    if text.startswith(("🚨", "✅")):
+        alert = _BATCH_SUFFIX_RE.sub("", text[1:]).strip()
+        return (f"alert:{core.fingerprint(alert)}", text.startswith("✅")) if alert else None
+    if m := _THRESHOLD_RE.match(text):
+        return f"threshold:{core.fingerprint(m['name'])}", m["side"] == "below"
+    if text.startswith(_WATCHDOG_PREFIX):
+        return "watchdog:homelab", "🟢" in text
+    return None
+
+
+def _event_seen_at(event: sqlite3.Row) -> dt.datetime | None:
+    """When an event last occurred, on ONE clock: the Slack `ts_last` of a relayed message, else the
+    ISO clocks (_quiet_anchor()). A down and its up compare on this, never on poll times."""
+    ts_last = _slack_ts_to_dt(core.safe_json(event["payload_json"]).get("ts_last"))
+    return ts_last if ts_last is not None else _quiet_anchor(event)[0]
+
+
 def resolve_recovered_decisions(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> None:
-    """A `uk`/`hyperdx` item parked in `needs_decision` whose event has since RECOVERED (the source's own
-    UP/OK, not silence) has nothing left to decide: the question was asked about an outage that is over
-    (item 1543). Quiet, never fixed. An item holding a written fix (a PR or an implement job) keeps its
-    obligation, and a chronic signature keeps its needs_decision: the recurrence is the defect."""
+    """An open item whose condition has been observed healthy again has nothing left to do: quiet,
+    never fixed. Two evidences, one rule:
+
+    - a `uk`/`hyperdx` event that RECOVERED (the source's own UP/OK, `resolved_at`, not silence) closes its
+      item in `triaged`, `working` or `needs_decision` (item 1543: a question asked about an outage that
+      is over). `new` is apply_resolutions()'s;
+    - a `slack_alert` relay whose monitor has a LATER recovery message closes its item in any open
+      state (_resolve_recovered_relays()).
+
+    An item holding a written fix (a PR or an implement job) keeps its obligation, and a chronic
+    signature keeps its state: the recurrence is the defect."""
+    placeholders = ",".join("?" * len(_RECOVERED_LEVEL_STATES))
     rows = conn.execute(
-        "SELECT ti.event_id, ti.repo FROM triage_items ti JOIN events e ON e.id = ti.event_id "
-        "WHERE ti.state=? AND e.source IN (?, ?) AND e.resolved_at IS NOT NULL "
-        "AND ti.pr_url IS NULL AND ti.implement_job IS NULL",
-        (core.STATE_NEEDS_DECISION, *LEVEL_EVENT_SOURCES),
+        f"SELECT ti.event_id, ti.repo, ti.state FROM triage_items ti JOIN events e ON e.id = ti.event_id "
+        f"WHERE ti.state IN ({placeholders}) AND e.source IN (?, ?) AND e.resolved_at IS NOT NULL "
+        f"AND ti.pr_url IS NULL AND ti.implement_job IS NULL",
+        (*_RECOVERED_LEVEL_STATES, *LEVEL_EVENT_SOURCES),
     ).fetchall()
     window, threshold = chronic_policy(policy)
     for row in rows:
@@ -633,8 +692,45 @@ def resolve_recovered_decisions(conn: sqlite3.Connection, policy: dict[str, Any]
         # row was. The recurrence count alone says whether the recurrence is the defect.
         if row["repo"] and _recurrence_count(conn, row["event_id"], now, window) >= threshold:
             continue
-        core.set_state(conn, row["event_id"], core.STATE_QUIET, now, expect_state=core.STATE_NEEDS_DECISION,
-                       note="event recovered on its own; nothing left to decide")
+        core.set_state(conn, row["event_id"], core.STATE_QUIET, now, expect_state=row["state"],
+                       expect_null=("pr_url", "implement_job"), note="event recovered on its own; nothing left to decide")
+    conn.commit()
+    _resolve_recovered_relays(conn, policy, now)
+
+
+def _resolve_recovered_relays(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime) -> None:
+    """A Kuma / watchdog / HyperDX relay recovery is a SEPARATE event, not a flip of the down's own
+    (`[Traefik - HTTP] [:red_circle: Down]` is recovered by its own `[Traefik - HTTP] [:white_check_mark: Up]`),
+    so the pairing is by recovery_signal() key and by time: the item closes `quiet` when the newest
+    recovery of its key is later than the down event's last occurrence. The note names the recovery
+    event (`recovered: event <id> ...`)."""
+    placeholders = ",".join("?" * len(_RECOVERED_RELAY_STATES))
+    rows = conn.execute(
+        f"SELECT ti.event_id AS event_id, ti.repo AS repo, ti.state AS item_state, e.* FROM triage_items ti "
+        f"JOIN events e ON e.id = ti.event_id WHERE e.source='slack_alert' AND ti.origin='alert' "
+        f"AND ti.state IN ({placeholders}) AND ti.pr_url IS NULL AND ti.implement_job IS NULL",
+        _RECOVERED_RELAY_STATES,
+    ).fetchall()
+    downs = [(row, sig[0]) for row in rows if (sig := recovery_signal(row["title"])) and not sig[1]]
+    if not downs:
+        return
+    latest_up: dict[str, tuple[dt.datetime, sqlite3.Row]] = {}
+    for ev in conn.execute("SELECT * FROM events WHERE source='slack_alert'").fetchall():
+        sig = recovery_signal(ev["title"])
+        seen = _event_seen_at(ev) if sig and sig[1] else None
+        if seen is not None and (sig[0] not in latest_up or seen > latest_up[sig[0]][0]):
+            latest_up[sig[0]] = (seen, ev)
+    window, threshold = chronic_policy(policy)
+    for row, key in downs:
+        up = latest_up.get(key)
+        down_seen = _event_seen_at(row)
+        if up is None or down_seen is None or up[0] <= down_seen:
+            continue
+        if row["repo"] and _recurrence_count(conn, row["event_id"], now, window) >= threshold:
+            continue
+        core.set_state(conn, row["event_id"], core.STATE_QUIET, now, expect_state=row["item_state"],
+                       expect_null=("pr_url", "implement_job"),
+                       note=f"{RECOVERED_NOTE_PREFIX}{up[1]['id']} ({str(up[1]['title'])[:80]}) at {up[0].isoformat()}")
     conn.commit()
 
 
@@ -862,6 +958,83 @@ def resolve_quiet_grouped(conn: sqlite3.Connection, policy: dict[str, Any], now:
     conn.commit()
 
 
+# Alerts of one family that fire inside this window of the FIRST event of an open item are occurrences
+# of that item, not new items: one outage that trips seventeen monitors is one problem.
+COFIRE_WINDOW_MINUTES = 15
+COFIRE_FAMILY_KUMA = "kuma"
+COFIRE_FAMILY_HYPERDX = "hyperdx"
+COFIRE_NOTE_PREFIX = "co-fired with #"
+
+
+def cofire_family(event: sqlite3.Row) -> str | None:
+    """The family an alert folds with, or None when it never folds. `kuma`: a `uk` event, or a Kuma
+    relay `[<monitor>] [:red_circle: Down]` (the Up half is recovery_signal()'s, never an occurrence).
+    A `hyperdx` alert: `host:<h>` when its payload names a host, else `hyperdx`. Everything else
+    (issues, jobs, hermes_log, `warden run`, GitHub, the other relays) is its own item."""
+    source = event["source"]
+    if source == "uk":
+        return COFIRE_FAMILY_KUMA
+    if source == "slack_alert":
+        m = _KUMA_RELAY_RE.match(event["title"] or "")
+        return COFIRE_FAMILY_KUMA if m and m["word"] == "Down" else None
+    if source == "hyperdx":
+        host = core.safe_json(event["payload_json"]).get("host")
+        return f"host:{host.strip()}" if isinstance(host, str) and host.strip() else COFIRE_FAMILY_HYPERDX
+    return None
+
+
+def cofire_occurrences(conn: sqlite3.Connection) -> dict[int, int]:
+    """Per parent event id, the occurrences folded into it (fold_cofiring()), for ingest() to add to
+    the parent's own count: bump_open_target() cannot, ingest() rewrites an alert's count every pass."""
+    return {row["duplicate_of"]: row["n"] for row in conn.execute(
+        "SELECT duplicate_of, SUM(occurrences) AS n FROM triage_items WHERE state=? AND close_reason=? "
+        "AND duplicate_of IS NOT NULL AND note LIKE ? GROUP BY duplicate_of",
+        (core.STATE_CLOSED, core.CLOSE_DUPLICATE, f"{COFIRE_NOTE_PREFIX}%"),
+    ).fetchall()}
+
+
+def fold_cofiring(conn: sqlite3.Connection, now: dt.datetime) -> None:
+    """Attach every `new` alert that has not been submitted for triage to the open item of its family
+    whose first event is at most COFIRE_WINDOW_MINUTES older: `closed(duplicate)` onto that parent, so
+    it costs no triage job and no investigation. Runs before submit_triage_jobs(), is a compare-and-set
+    on `triage_job IS NULL`, and is idempotent (a folded item is no longer `new`).
+
+    Items are taken oldest first, so of a burst the first stays the parent and the rest fold into it;
+    a fold is closed, so it can never be a parent, and the window is measured from the parent's first
+    event, never chained through a fold. A parent is any open item (not terminal, not `failed`) of the
+    family. A fold never closes, quiets or reopens on its own: only `new` is ever resolved by silence,
+    and reopen_if_needed() leaves a `closed(duplicate)` alone while its parent is open."""
+    placeholders = ",".join("?" * len(core.NOT_OPEN_STATES))
+    rows = conn.execute(
+        f"SELECT ti.event_id AS event_id, ti.state AS item_state, ti.first_seen AS item_first_seen, "
+        f"ti.triage_job AS triage_job, ti.occurrences AS item_occurrences, ti.last_seen AS item_last_seen, e.* FROM triage_items ti "
+        f"JOIN events e ON e.id = ti.event_id WHERE ti.origin='alert' AND ti.state NOT IN ({placeholders}) "
+        f"ORDER BY ti.first_seen, ti.event_id",
+        core.NOT_OPEN_STATES,
+    ).fetchall()
+    window = dt.timedelta(minutes=COFIRE_WINDOW_MINUTES)
+    parents: list[tuple[dt.datetime, int, str]] = []   # open, unfolded, oldest first
+    for row in rows:
+        family = cofire_family(row)
+        started = core.parse_ts(row["item_first_seen"])
+        if family is None or started is None or row["resolved_at"] is not None:
+            continue   # a recovered event is the silence paths' to close, and no parent to fold more into
+        parent = next((p for p in parents if p[2] == family and dt.timedelta(0) <= started - p[0] <= window), None)
+        folded = (parent is not None and row["item_state"] == core.STATE_NEW and row["triage_job"] is None
+                  and core.set_state(conn, row["event_id"], core.STATE_CLOSED, now, expect_state=core.STATE_NEW,
+                                     expect_null=("triage_job",), close_reason=core.CLOSE_DUPLICATE,
+                                     duplicate_of=parent[1],
+                                     note=f"{COFIRE_NOTE_PREFIX}{parent[1]}: {family} alert within {COFIRE_WINDOW_MINUTES} min "
+                                          f"of its first event"))
+        if folded:
+            # ingest() recomputes this as own + folded (cofire_occurrences()) on the next pass, to the same number.
+            conn.execute("UPDATE triage_items SET occurrences=occurrences+?, last_seen=MAX(last_seen, ?) WHERE event_id=?",
+                         (row["item_occurrences"], row["item_last_seen"], parent[1]))
+        else:
+            parents.append((started, row["event_id"], family))
+    conn.commit()
+
+
 def label_route(item: sqlite3.Row, event: sqlite3.Row, policy: dict[str, Any] | None = None) -> str | None:
     """The repo the signal's own label names, or None. Native labels first (intake.route_by_label():
     the repo an issue or `warden run` carries, a Kuma tag, a container name, an OTel
@@ -883,7 +1056,8 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
        match targets) -> `closed(ignored)`;
     2. with `ignoreUnstructuredSlackProse`, a `slack_alert` with no label route whose title does not
        start with a recognized bot-alert shape (`looks_like_bot_alert`) is chat prose that
-       watchdog-poll.py ingested from #alerts, not an alert -> `closed(ignored)` with a note.
+       watchdog-poll.py ingested from #alerts, not an alert -> `closed(ignored)` with a note;
+    3. a co-firing alert of an open item's family folds into it (fold_cofiring()) -> `closed(duplicate)`.
 
     **The prose filter runs after the label route, and that order is load-bearing.** It is a prefix
     test on the title, and a producer that emits bare sentences (Beszel's `HomeLab CPU above
@@ -911,3 +1085,4 @@ def classify(conn: sqlite3.Connection, policy: dict[str, Any], now: dt.datetime)
             core.set_state(conn, row["event_id"], core.STATE_CLOSED, now, expect_state=core.STATE_NEW,
                             close_reason=core.CLOSE_IGNORED, note="unstructured #alerts prose, not a bot alert")
     conn.commit()
+    fold_cofiring(conn, now)
