@@ -1,32 +1,39 @@
-# warden — a self-driving loop with quality gates only
+# warden — factory rewrite, lane A (Waves 9+); Waves 1–8 are history
 
-**Goal:** warden matches `~/SourceRoot/dotfiles/docs/agent-platform.md` §Warden: nine
-states, single-shot triage dedup, one merge train per repo, `make deploy` /
-`make verify` instead of per-repo config, `needs_decision` as the only human exit,
-terse output.
+**Goal:** the warden lane of the factory design. Waves 9+ map to the rewrite's waves:
+- Wave 9 (W1a): stops the old loop, starts a fresh `ledger.db` and imports history.
+- Wave 10 (W1b): registers effects and fences leases.
+- Wave 11 (W3a): takes intake from every primary source.
 
-**Gate:** `make test` green (and `make check` once W5 adds it), plus `/review` on each wave's diff.
+**Spec:** `~/SourceRoot/dotfiles/docs/factory/` — `waves.md`, `adr/`, `design/model.md`,
+`BRIEF.md` §Owner-intent addendum. For Waves 9+ it supersedes `docs/agent-platform.md`
+§Warden (the nine-state model), `DESIGN.md`, `STATE.md` and the Waves 1–8 rules below,
+including this repo's AGENTS.md line that the agent-platform spec wins.
 
-**Spec:** `~/SourceRoot/dotfiles/docs/agent-platform.md` — read it first. The audit
-numbers behind it are in its "Why this rewrite" table. Where this repo's
-DESIGN.md / docs contradict the spec, the spec wins; W5 rewrites the docs.
+**Gate:** `make test` and `make check` green, `/review` on each wave's diff, plus the
+wave's own proof gate and rollback line (`wave-gate.py --orchestrated`).
 
-**Live system:** the LaunchAgents run from this checkout. The orchestrator paused
-`warden-loop`, `warden-sweep` and `warden-poll` before W1; they stay paused until
-the orchestrator redeploys. Never `launchctl` or `make agents` from a wave. The
-ledger is `~/.warden/warden.db` — schema changes ship as a migration in
-`ledger.py`, tested against a copy (`cp ~/.warden/warden.db /tmp/`), never run
-against the live file by a wave.
+**Live system:**
+- **Stop and archive:** W1a's own bullets stop the old loop. They unload warden's
+  LaunchAgents, keep the plists on disk, and archive `~/.warden/warden.db` read-only
+  inside W1a's gate.
+- **LaunchAgents:** after W1a, a wave loads or unloads only the LaunchAgents its own
+  bullets name.
+- **Ledger:** the archived `warden.db` is never written again. Schema work targets
+  `ledger.db` and is tested on a copy first, never on the live file.
 
-**Model:** spawn successors with `RD_WAVE_MODEL=opus`.
+**Model:** spawn this lane with `RD_WAVE_MODEL=opus`. Ledger, effect and lease logic
+is novel and hard, the one case the global contract allows for raising a worker.
 
-**From Wave 3 on the loop is LIVE from this checkout.** Do all work in a git worktree
-(`git worktree add ../warden-wN -b wave-N`), run `make test` there, and fast-forward
-master only at close-out (`git -C ~/SourceRoot/warden merge --ff-only wave-N`), then remove
-the worktree. A half-edited `triage.py` in the live checkout gets imported by the next tick.
+**Work in a git worktree:**
+- `git worktree add ../warden-wN -b wave-N`, then run `make test` there.
+- At close-out, fast-forward master (`git -C ~/SourceRoot/warden merge --ff-only wave-N`)
+  and remove the worktree.
+- This checkout stays live: from W1a on, the new warden runs from it.
 
-**Deleting is the job.** Delete code together with its tests and docs. No
-compatibility shims, no feature flags for removed gates. Git history is the archive.
+**Deleting is the job.**
+- Delete code together with its tests and docs. No compatibility shims.
+- The `warden-legacy` tag is the way back, and git history is the archive.
 
 ## Wave 1 — cut the gates            <!-- status: done -->
 - [x] Delete the signed-approval stack: `lifecycle/approvals.py`, `clients/signer.py`, `intents.py`, `config/approval-spec.json`, the `warden dispatch --tier implement` approval path and `--why`, the `dispatch_approvals` table (migration drops it). Leave a note for Hermes (its `plugins/dispatch-approval` is removed in hermes-agent's plan).

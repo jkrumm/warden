@@ -5,7 +5,8 @@ drives every unattended item from a signal to `fixed`, through agent-gateway job
 **Read `STATE.md` first** (where the implementation is, what is next), then
 `DESIGN.md` (what exists, and § *What must not be lost* — check it before every
 merge). The spec is `~/SourceRoot/dotfiles/docs/agent-platform.md`; it wins over
-anything here. `docs/history/` is the archive: the append-only build log
+anything here, except for the factory rewrite: Waves 9+ of `docs/waves/PLAN.md`, with
+the design record in `~/SourceRoot/dotfiles/docs/factory/`, supersede it. `docs/history/` is the archive: the append-only build log
 (`state-log.md`, §1 onward), old flows, design reviews.
 
 **Code owns every state transition.** The only LLM inputs are agent-gateway's episode
