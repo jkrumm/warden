@@ -2,15 +2,15 @@
 
 **Read this first. It is the memory; the conversation is not.** `DESIGN.md` is what
 warden is; this file is where it is; `docs/history/state-log.md` is the append-only
-build log (§1–§182).
+build log (§1–§183).
 
 | | |
 |-|-|
-| Last updated | 2026-10-17 (§182 — opt-in `coexist` lets weatherorb merge and deploy under its herdr waves; §181 — a recovered `uk`/`hyperdx` item leaves `needs_decision`, a level reopen restarts its debounce, the hermes-cron brief embeds the registry entry; §180 — `Warden Loop` push requires poll + sweep freshness, Hermes Watchdog push retired; §179 — HyperDX alerts by webhook, #alerts HyperDX lines no longer polled; §178 — the `uk` snapshot poll retired, Kuma pushes by webhook; §177 — a parked merge frees the implement lane; §176 — red checks with revisions left revise instead of paging; §175 — Wave 11 of the background-jobs chain: `hermes_cron` retired for the `job` source, cron-aware job brief, warden-backup under jobrun) |
+| Last updated | 2026-10-22 (§183 — factory Phase 0: recovered alerts close, co-firing alerts fold, host-access gaps and terminal non-questions never page, features stay on the ledger (`kind`); §182 — opt-in `coexist` lets weatherorb merge and deploy under its herdr waves; §181 — a recovered `uk`/`hyperdx` item leaves `needs_decision`, a level reopen restarts its debounce, the hermes-cron brief embeds the registry entry; §180 — `Warden Loop` push requires poll + sweep freshness, Hermes Watchdog push retired; §179 — HyperDX alerts by webhook, #alerts HyperDX lines no longer polled; §178 — the `uk` snapshot poll retired, Kuma pushes by webhook; §177 — a parked merge frees the implement lane; §176 — red checks with revisions left revise instead of paging; §175 — Wave 11 of the background-jobs chain: `hermes_cron` retired for the `job` source, cron-aware job brief, warden-backup under jobrun) |
 | Current work | Background jobs → warden self-healing (dotfiles `docs/waves/PLAN.md`; spec `~/SourceRoot/dotfiles/docs/ops-signals.md`, its *Owner decisions* win): Waves 6-8 live (kill-switch, `job` source, brief and verified closure, review cycle 1); Wave 9 (warden-api ingest door) is built on branch `wave9-ingest` and goes live with its merge and deploy, then needs the token seeded and the off-box door (done elsewhere); the `uk` poll is retired (§178: Kuma's DOWN/UP webhook is the only `uk` writer); HyperDX alerts arrive by webhook too (§179) and their #alerts lines are no longer polled. The agent-platform rewrite (`docs/waves/PLAN.md` here; spec `~/SourceRoot/dotfiles/docs/agent-platform.md`) is done |
 | Repo | `master`, pushed to `jkrumm/warden` (public); five LaunchAgents run this checkout |
-| Ledger | `~/.warden/warden.db`, schema 23 (Wave 6 changed no schema: a `job` item reuses `origin`, `max_tier`, `brief` and the event cursor columns) |
-| Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names (685); `tests/test_ingest.py` 39 |
+| Ledger | `~/.warden/warden.db`, schema 24 (Wave 8 added `triage_items.kind`; Wave 6 changed no schema: a `job` item reuses `origin`, `max_tier`, `brief` and the event cursor columns) |
+| Tests | `make check` — `tests/test_triage.py` at the count AGENTS.md names (725); `tests/test_ingest.py` 40 |
 
 ## What is live
 

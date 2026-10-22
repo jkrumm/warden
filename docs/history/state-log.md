@@ -10905,3 +10905,20 @@ refusals, strikes and rollback are unchanged. Tests: `test_triage.py` 679 -> 685
 working agent; dirty / off-default / ahead still park; a repo outside the map still parks; deploy parks on a `.building-*`
 path and runs without one; no hold outside the map; the policy loader), `test_rollout.py` 36 -> 39 (`checkout_in_use`
 with and without `coexist`, `deploy_held`). Brief said 674; master was 679 (§181).
+
+
+## §183 — factory Phase 0: stop the bleeding (Wave 8, 2026-10-22)
+
+Round 5 audit: 74 of 228 new items (32 %) reached the owner in 14 days, about 7 genuine. (1) `LIVE_STATE_INSTRUCTION` lists exactly
+agent-gateway Wave 12's host read verbs; a host-access-blocked investigate verdict (`nextAction=human`, `escalationCategory=blocker`,
+`rootCause=host-access-gap`, or `blocked_on=host_access`) is re-driven once, then closes `quiet` (never `needs_decision`).
+(2) Recovered alerts close themselves: `resolve_recovered_decisions` covers uk/hyperdx in every non-obligation open state and
+`_resolve_recovered_relays` pairs a slack_alert Down with a later Up for the same monitor (Kuma relay, Better Stack, HyperDX relay,
+Beszel, homelab watchdog); items holding a PR or implement job, chronic ones, feature holds and running investigations are skipped.
+(3) `fold_cofiring` (`COFIRE_WINDOW_MINUTES` = 15): Kuma/hyperdx-family alerts inside the window attach to the open item as
+`closed(duplicate)`; a relay Down folds onto the `uk` item of the same monitor; the window uses the Slack message's own ts, not the poll
+time. (4) No terminal non-questions: `no_changes` + already-on-master closes the PR and resolves; at the absolute revision ceiling green
+checks and no security/data-loss finding open a follow-up item and the PR goes to the train, otherwise `failed(work)`; an implement
+episode's uncategorised `human` is re-driven once, then the recommendation is taken. (5) Features: ledger v24 `triage_items.kind`;
+`is_feature_verdict` holds the item in `triaged` with `kind='feature'` (skipped by every dispatch/page path, shown on `warden list features` and
+`/board`); `warden feature <id>` marks or re-opens one. Tests: `test_triage.py` 685 -> 725, `test_ingest.py` 39 -> 40.
