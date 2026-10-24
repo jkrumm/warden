@@ -1,5 +1,7 @@
 # warden — factory rewrite, lane A (Waves 9+); Waves 1–8 are history
 
+> **Superseded 2026-10-24.** The factory design v2 (`~/SourceRoot/dotfiles/docs/factory/tdd/`, §13) replaces this rewrite plan. Every v1 rewrite wave below is parked as `pending`; no wave in this file is to be run. The v2 plan moves to the new `factory` repo at its W0.
+
 **Goal:** the warden lane of the factory design. Waves 9+ map to the rewrite's waves:
 - Wave 9 (W1a): stops the old loop, starts a fresh `ledger.db` and imports history.
 - Wave 10 (W1b): registers effects and fences leases.
@@ -165,7 +167,7 @@ master, `make deploy`.
 Runnable copy of the factory rewrite plan (`~/SourceRoot/dotfiles/docs/factory/waves.md` is the design record and wins on any
 difference). Generated 2026-10-22 by the factory design session; the letters in each title are the plan's wave ids.
 
-## Wave 9 — (W1a) Stop the old loop, a fresh ledger, history imported            <!-- status: active -->
+## Wave 9 — (W1a) Stop the old loop, a fresh ledger, history imported            <!-- status: pending -->
 Repo: warden (new code tree; the old loop is stopped first) and dotfiles (the lane retirement, the heartbeat component and the conformance suite's core — files W2a does not touch). ADR-011, ADR-002, ADR-004. Days 1–2, lane A. W1b branches from its close-out; W2a's `warden manifest` module merges after it.
 
 - [ ] **Consumer inventory and lane proof first:** a generated list of every consumer of the old warden (grep of all SourceRoot repos and `docs/architecture.md` for warden, its API port and its ingest paths), each with a disposition — the known ones are the rows of *What stops when* — committed before anything stops. A consumer the list misses is a gate failure, not a Left-behind line. The inventory also lists the **active owner waves** and **live herdr agents** per repo (each repo's PLAN.md, `rd agents`), the input to the worktree rule in *Mode*, and **proves each lane engine** before day 1: a throwaway change taken end to end through `/check`, `/review` and the wave skill on OpenCode/IU and on Claude Code.
