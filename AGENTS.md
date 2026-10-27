@@ -1,3 +1,5 @@
+> **Status: switched off 2026-10-27 by agent-workflows P0; reference only.** LaunchAgents unloaded and removed, port 7735 closed, no caller left. The final ledger backup is in `homelab:hdd/backups/warden-final/`. Do not restart it; the design is archived here for the workflow platform (`~/SourceRoot/dotfiles/docs/agent-workflows/concept.md`).
+
 # warden — Developer Notes
 
 warden is the autonomous loop of the agent platform: it owns one SQLite ledger and
